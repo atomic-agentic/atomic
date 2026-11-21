@@ -1191,15 +1191,12 @@ pub async fn open_exec_workspace(
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     caches: Option<&crate::worktree::Caches>,
 ) -> Result<WorkspaceGuard, AtomError> {
-    let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
     if let Some(caches) = caches {
         caches
             .create()
             .map_err(|e| AtomError::Runtime(format!("the run's build caches: {e}")))?;
-        env.extend(caches.env());
-        writable_roots.push(caches.dir().to_owned());
     }
-    env.extend(declared_env(atom));
+    let (env, writable_roots) = exec_environment(atom, caches);
     open_workspace(
         backend,
         Open {
@@ -1214,6 +1211,23 @@ pub async fn open_exec_workspace(
         },
     )
     .await
+}
+
+/// What an exec atom's command opens with besides its scratch directory:
+/// the environment, its run's build caches' variables, when it has them,
+/// then what the atom declares in its `env`, which wins; and the
+/// directories it may write, the caches alone.
+fn exec_environment(
+    atom: &AtomFile,
+    caches: Option<&crate::worktree::Caches>,
+) -> (std::collections::BTreeMap<String, String>, Vec<PathBuf>) {
+    let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
+    if let Some(caches) = caches {
+        env.extend(caches.env());
+        writable_roots.push(caches.dir().to_owned());
+    }
+    env.extend(declared_env(atom));
+    (env, writable_roots)
 }
 
 /// The environment an atom declares in its `env`, by name.

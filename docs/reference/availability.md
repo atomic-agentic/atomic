@@ -103,12 +103,13 @@ sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
 Maven's `~/.m2` and the like. Every Codex turn's `CARGO_HOME` is `.cargo` in the
-attempt's own home. A worktree step's turn is also pointed at its run's own
-build caches, removed when the run ends, finished or failed, with a Cargo target
-directory for each worktree, and at your rustup toolchains, read-only (see
-[worktree steps](workflow-files.md#atom-steps)). Otherwise a codex or exec
-atom names what it needs in its `env`, as in `env: { RUSTUP_HOME:
-'/home/me/.rustup' }`. An
+attempt's own home. A worktree step's turn, and an exec atom's command in a run, is also pointed at
+its run's own build caches, removed when the run ends, finished or failed, with
+a Cargo target directory for each worktree and each exec step, and at your rustup
+toolchains, read-only, through `RUSTUP_HOME` (see
+[worktree steps](workflow-files.md#atom-steps)). Otherwise, as for a Codex atom
+outside a worktree or an exec atom in an eval, an atom names what it needs in
+its `env`, as in `env: { RUSTUP_HOME: '/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
 Scratch directories live in the project's state directory, where no sandboxed
 turn may write; atomic refuses to run when that would be under `/tmp`,
@@ -144,7 +145,7 @@ is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
 anywhere else are not covered. An
 exec atom's command may write only its scratch directory and its run's own
-build caches, which no other run sees and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
+build caches, which no other run's command may write, though one can still read them by their path, and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or

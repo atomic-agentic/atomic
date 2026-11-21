@@ -491,6 +491,18 @@ impl Caches {
         }
     }
 
+    /// These caches for exec step `name`: the same caches, with a Cargo
+    /// target directory of that step's own, so no step runs what another
+    /// built.
+    /// `cargo-target/<name>`, which no worktree's can be: a worktree's is
+    /// named `<run>.<step>`, and a name as a file name holds no `.`.
+    pub fn for_exec(&self, name: &str) -> Self {
+        Self {
+            target: Some(self.dir.join("cargo-target").join(component(name))),
+            ..self.clone()
+        }
+    }
+
     /// The person's rustup toolchains, as found when the caches were made.
     pub fn rustup(&self) -> Option<&Path> {
         self.rustup.as_deref()
@@ -502,8 +514,8 @@ impl Caches {
     }
 
     /// Create the cache directory, readable by its owner only. A link in
-    /// its place is refused: something else made it, since an exec atom's
-    /// command may write the project's caches beside it.
+    /// its place is refused: atomic did not make it, and following it
+    /// would put the run's caches wherever it points.
     pub fn create(&self) -> Result<()> {
         if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(WorktreeError::Invalid(format!(
@@ -790,6 +802,35 @@ mod tests {
             if name != "RUSTUP_HOME" {
                 assert!(Path::new(value).starts_with(caches.dir()), "{name}={value}");
             }
+        }
+        // Each exec step builds into a target of its own, never a
+        // worktree's, and shares the rest of the run's caches.
+        let tree = caches
+            .in_worktree(&Path::new("/state/worktrees").join(worktree_name("run-1", "a")))
+            .env();
+        let targets: Vec<String> = ["a", "b", "a.b", "_a"]
+            .iter()
+            .map(|turn| caches.for_exec(turn).env()["CARGO_TARGET_DIR"].clone())
+            .chain([
+                tree["CARGO_TARGET_DIR"].clone(),
+                env["CARGO_TARGET_DIR"].clone(),
+            ])
+            .collect();
+        let mut distinct = targets.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), targets.len(), "{targets:?}");
+        let exec = caches.for_exec("a").env();
+        assert!(
+            Path::new(&exec["CARGO_TARGET_DIR"]).starts_with(caches.dir().join("cargo-target"))
+        );
+        for name in [
+            "ATOMIC_CACHE_DIR",
+            "XDG_CACHE_HOME",
+            "GOCACHE",
+            "RUSTUP_HOME",
+        ] {
+            assert_eq!(exec[name], env[name], "{name}");
         }
     }
 

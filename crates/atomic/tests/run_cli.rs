@@ -133,15 +133,18 @@ fn project(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(project.join(sub)).expect("project");
     }
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
-    // How often it ran is read from the store (see [`count_log`]): an exec
-    // command may write only its scratch directory and its run's caches,
-    // which go with the run.
+    // It keeps its own tally of its runs in its run's caches, the only
+    // place besides its scratch directory it may write, and returns it
+    // (see [`TALLY`], [`count_log`]).
     let _ = dir;
     std::fs::write(
         project.join("tools/count.py"),
-        "import json, os, sys\n\
-         note = json.load(sys.stdin)\n\
-         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+        format!(
+            "import json, os, sys\n{TALLY}\
+             note = json.load(sys.stdin)\n\
+             json.dump({{'title': note['text'][:25], 'words': len(note['text'].split()), \
+             'ran': tally('count-note')}}, sys.stdout)\n"
+        ),
     )
     .expect("script");
     write_atom(
@@ -150,7 +153,9 @@ fn project(dir: &Path) -> PathBuf {
         "description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] }",
         "",
         object(json!({"text": {"type": "string"}})),
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(
+            json!({"title": {"type": "string"}, "words": {"type": "integer"}, "ran": {"type": "integer"}}),
+        ),
     );
     write_atom(
         &project,
@@ -190,23 +195,31 @@ fn project(dir: &Path) -> PathBuf {
     project
 }
 
+/// A tool's lines that keep its own tally, in its run's caches: each run of
+/// the command appends a line to `<atom>.tally` and returns how many lines
+/// the file has, as `ran` in its output. A command run again in the same
+/// run, by this execution or another, killed or not, is counted, since the
+/// run's caches last until the run ends.
+const TALLY: &str = "def tally(atom):\n\
+    \x20   at = os.path.join(os.environ['ATOMIC_CACHE_DIR'], atom + '.tally')\n\
+    \x20   open(at, 'a').write('ran\\n')\n\
+    \x20   return len(open(at).read().splitlines())\n";
+
 /// How many times the counting atom's command ran, in the store `rt` (see
 /// [`ran_in`]).
 #[cfg(feature = "postgres-tests")]
 async fn counted_in(rt: &Durare) -> usize {
-    ran_in(rt, "count-note").await
+    ran_in(rt, None, "count-note").await
 }
 
-/// How many times exec atom `atom`'s command ran, in the store `rt`, as
-/// the store records it: for each run of a workflow with a step of `atom`,
-/// once for every execution of the run that recorded that step's attempt
-/// (`<step>.attempt`, written just before the command starts) or its
-/// command's result (`<step>.turn`, without an error). An execution that
-/// ran the command to its end records both; one stopped while it ran
-/// records the attempt, and an execution that ran it again its result; one
-/// that parked the step without running it records only an error. Where
-/// the store keeps no executions, every row counts as one execution's.
-async fn ran_in(rt: &Durare, atom: &str) -> usize {
+/// How many times exec atom `atom`'s command ran, by the tally it keeps
+/// ([`TALLY`]), summed over the runs in the store `rt` whose workflow has a
+/// step of `atom`: for a run that still has its caches (in `state`), the
+/// tally there, which counts every run of the command so far; for one that
+/// has ended, the largest tally its step's recorded output gives, which
+/// counts every run up to the one whose result the run kept, or, where the
+/// run kept no result of it, how many of its executions began the step.
+async fn ran_in(rt: &Durare, state: Option<&Path>, atom: &str) -> usize {
     let mut ran = 0;
     let runs = rt.runs_after(None, 100_000).await.expect("runs");
     for (key, _) in runs {
@@ -226,35 +239,95 @@ async fn ran_in(rt: &Durare, atom: &str) -> usize {
         if counting.is_empty() {
             continue;
         }
+        if let Some(tally) = state.and_then(|state| live_tally(state, &key.id, atom)) {
+            ran += tally;
+            continue;
+        }
         let steps = rt.steps(&key.id).await.expect("steps");
-        let ran_it: Vec<_> = steps
+        let recorded = steps
             .iter()
             .filter(|s| {
-                counting.iter().any(|id| {
-                    s.name == format!("{id}.attempt")
-                        || (s.name == format!("{id}.turn") && s.error.is_none())
-                })
+                counting
+                    .iter()
+                    .any(|id| s.name == *id || s.name.starts_with(&format!("{id}.")))
             })
-            .collect();
-        let executions = atomic_durable::history::executions(rt, &key.id)
-            .await
-            .unwrap_or_default();
-        let mut by: Vec<i64> = ran_it
-            .iter()
-            .filter_map(|s| atomic_durable::history::recorded_by(s, &executions))
-            .collect();
-        by.sort_unstable();
-        by.dedup();
-        ran += if by.is_empty() {
-            usize::from(!ran_it.is_empty())
-        } else {
-            by.len()
+            .filter_map(|s| s.output.as_ref().and_then(tally_in))
+            .max();
+        ran += match recorded {
+            Some(tally) => tally,
+            None => began(rt, &key.id, &steps, &counting).await,
         };
     }
     ran
 }
 
-/// [`counted_in`] summed over the stores of every atomic home in `dir`.
+/// How many executions of run `run` began one of the steps `counting`, by
+/// the store: an execution that ran a command records its attempt, or its
+/// turn when the step has none.
+async fn began(
+    rt: &Durare,
+    run: &str,
+    steps: &[atomic_durable::StepRecord],
+    counting: &[String],
+) -> usize {
+    let ran_it: Vec<_> = steps
+        .iter()
+        .filter(|s| {
+            counting.iter().any(|id| {
+                s.name == format!("{id}.attempt")
+                    || (s.name == format!("{id}.turn") && s.error.is_none())
+            })
+        })
+        .collect();
+    let executions = atomic_durable::history::executions(rt, run)
+        .await
+        .unwrap_or_default();
+    let mut by: Vec<i64> = ran_it
+        .iter()
+        .filter_map(|s| atomic_durable::history::recorded_by(s, &executions))
+        .collect();
+    by.sort_unstable();
+    by.dedup();
+    if by.is_empty() {
+        usize::from(!ran_it.is_empty())
+    } else {
+        by.len()
+    }
+}
+
+/// The lines of `atom`'s tally in run `run`'s caches under `state`, if the
+/// run still has them.
+fn live_tally(state: &Path, run: &str, atom: &str) -> Option<usize> {
+    let prefix = format!("{run}-");
+    std::fs::read_dir(state.join("cache"))
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .find_map(|e| std::fs::read_to_string(e.path().join(format!("{atom}.tally"))).ok())
+        .map(|text| text.lines().count())
+}
+
+/// The largest `ran` in a recorded value, wherever the record nests it.
+fn tally_in(value: &Value) -> Option<usize> {
+    match value {
+        Value::Object(map) => map
+            .get("ran")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .into_iter()
+            .chain(map.values().filter_map(tally_in))
+            .max(),
+        Value::Array(items) => items.iter().filter_map(tally_in).max(),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|v| v.is_object() || v.is_array())
+            .as_ref()
+            .and_then(tally_in),
+        _ => None,
+    }
+}
+
+/// [`ran`] for the counting atom.
 fn count_log(dir: &Path) -> usize {
     ran(dir, "count-note")
 }
@@ -271,7 +344,7 @@ fn ran(dir: &Path, atom: &str) -> usize {
         {
             let db = project.path().join("atomic.db");
             if db.is_file() {
-                stores.push(db);
+                stores.push((db, home.path().join("projects").join(project.file_name())));
             }
         }
     }
@@ -283,9 +356,9 @@ fn ran(dir: &Path, atom: &str) -> usize {
             .expect("a runtime")
             .block_on(async move {
                 let mut ran = 0;
-                for db in stores {
+                for (db, state) in stores {
                     let rt = Durare::sqlite(&db).await.expect("store");
-                    ran += ran_in(&rt, &atom).await;
+                    ran += ran_in(&rt, Some(&state), &atom).await;
                 }
                 ran
             })
@@ -384,11 +457,13 @@ fn runner_of(marker: &str) -> Option<String> {
 /// run's caches, and this finds the `atomic runner` that started it, calls
 /// `act` on it and writes `.done` beside the `.ask`. A confined command
 /// cannot reach its runner itself. It counts how often each asked
-/// ([`acted`](Self::acted)). Stops when dropped.
+/// ([`acted`](Self::acted)), and the most lines `<log>` had in the run's
+/// caches when it did ([`ran`](Self::ran)), the command's own tally of its
+/// runs. Stops when dropped.
 struct RunnerWatch {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    acted: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, usize>>>,
+    acted: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, (usize, usize)>>>,
 }
 
 impl RunnerWatch {
@@ -410,12 +485,16 @@ impl RunnerWatch {
                     }
                     if let Some(runner) = runner_of(&log.display().to_string()) {
                         let _ = std::fs::remove_file(&ask);
+                        let tally = std::fs::read_to_string(ask.with_extension("log"))
+                            .unwrap_or_default()
+                            .lines()
+                            .count();
                         act(&runner);
-                        *counts
-                            .lock()
-                            .expect("counts")
-                            .entry(log.clone())
-                            .or_insert(0) += 1;
+                        let mut counts = counts.lock().expect("counts");
+                        let count = counts.entry(log.clone()).or_insert((0, 0));
+                        count.0 += 1;
+                        count.1 = count.1.max(tally);
+                        drop(counts);
                         std::fs::write(ask.with_extension("done"), "").expect("done");
                     }
                 }
@@ -431,12 +510,22 @@ impl RunnerWatch {
 
     /// How many times the command with `log` on its command line asked.
     fn acted(&self, log: &Path) -> usize {
+        self.counts(log).0
+    }
+
+    /// How many times, by its own tally, the command with `log` on its
+    /// command line had run when it last asked.
+    fn ran(&self, log: &Path) -> usize {
+        self.counts(log).1
+    }
+
+    fn counts(&self, log: &Path) -> (usize, usize) {
         self.acted
             .lock()
             .expect("counts")
             .get(log)
             .copied()
-            .unwrap_or(0)
+            .unwrap_or((0, 0))
     }
 
     /// Kill the asking command's runner.
@@ -735,7 +824,8 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
         ),
         (&project, vec!["run", "count-note", "--input", "-"], NOTE),
     ];
-    let expected = json!({"title": "Exporting a file named ca", "words": 8});
+    // Each run's command ran once, by the tally it keeps in its run's caches.
+    let expected = json!({"title": "Exporting a file named ca", "words": 8, "ran": 1});
     for (cwd, args, stdin) in &runs {
         let out = atomic(&dir, cwd, args, &[], stdin);
         assert!(out.status.success(), "{args:?}: {}", text(&out));
@@ -1339,7 +1429,7 @@ fn a_workflow_runs_by_name_and_by_file() {
     assert_eq!(stdout_json(&by_name), stdout_json(&by_file));
     assert_eq!(
         stdout_json(&by_name),
-        json!({"title": "Exporting a file named ca", "words": 8})
+        json!({"title": "Exporting a file named ca", "words": 8, "ran": 1})
     );
     // The run's artifact store took its lock where no atom can open it.
     let state = state_dir(&dir, &project);
@@ -2808,14 +2898,16 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
         let out = tokio::task::spawn_blocking(move || {
             let mut env = UNUSED_MODEL.to_vec();
             env.push(("PATH", e.as_str()));
-            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+            atomic(&d, &p, &["--json", "runs", "resume", "two-1"], &env, "")
         })
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        // Finished, its caches went with it: the store says each step's
-        // command ran once.
-        assert_eq!((ran(&dir, "first"), ran(&dir, "second")), (1, 1));
+        // Each step's command ran once, in order, by the log the run kept.
+        assert_eq!(
+            stdout_json(&out)["output"]["steps"],
+            json!(["first start", "first end", "second"])
+        );
     });
 }
 
@@ -2956,7 +3048,8 @@ fn write_runner_killer(
          \x20   open(log.removesuffix('.log') + '.ask', 'w').close()\n\
          \x20   time.sleep(30)\n\
          \x20   sys.exit(1)\n\
-         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+         json.dump({'title': note['text'][:25], 'words': len(note['text'].split()), \
+         'ran': len(open(log).read().splitlines())}, sys.stdout)\n",
     )
     .expect("script");
     write_atom(
@@ -2973,7 +3066,9 @@ fn write_runner_killer(
         ),
         "",
         object(json!({"text": {"type": "string"}})),
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(
+            json!({"title": {"type": "string"}, "words": {"type": "integer"}, "ran": {"type": "integer"}}),
+        ),
     );
     log
 }
@@ -3022,7 +3117,8 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
     );
     // Its runner was killed under it once, and it never ran again: run
     // again, it would have finished, since it kills only the first time.
-    assert_eq!(watch.acted(&undeclared), 1, "it ran once");
+    assert_eq!(watch.acted(&undeclared), 1, "killed once");
+    assert_eq!(watch.ran(&undeclared), 1, "it ran once");
 
     // Declared idempotent: the step is retried, and the second run finishes.
     let out = atomic(
@@ -3033,12 +3129,13 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
+    // Killed once, then run once more to its end, as declared: its own
+    // tally says it ran twice.
     assert_eq!(
         stdout_json(&out),
-        json!({"title": "Exporting a file named ca", "words": 8})
+        json!({"title": "Exporting a file named ca", "words": 8, "ran": 2})
     );
-    // Killed once, then run once more to its end, as declared.
-    assert_eq!(watch.acted(&idempotent), 1, "once more, as declared");
+    assert_eq!(watch.acted(&idempotent), 1, "killed once");
 }
 
 /// An idempotent exec atom whose command starts a child that sleeps, logs
@@ -3583,17 +3680,17 @@ fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
     assert_eq!(error["kind"], "run.dead_lettered", "{error}");
     let action = error["action"].as_str().unwrap_or_default();
     assert!(!action.contains("runs resume"), "{error}");
-    // Each try's runner was killed under it.
-    let ran = watch.acted(&doomed);
-    assert_eq!(
-        ran,
-        1 + atomic_app::pipeline::RECOVERY_LIMIT as usize,
-        "once, then once per recovery"
-    );
+    // Each try's runner was killed under it, and by its own tally it ran
+    // once, then once per recovery.
+    let tries = 1 + atomic_app::pipeline::RECOVERY_LIMIT as usize;
+    assert_eq!(watch.acted(&doomed), tries, "killed each try");
+    assert_eq!(watch.ran(&doomed), tries, "once, then once per recovery");
 }
 
 /// A workflow of two undeclared exec steps: `first` logs `first start`,
-/// takes three seconds and logs `first end`; `second` logs `second`.
+/// takes three seconds and logs `first end`; `second` logs `second`. The
+/// log is in the run's caches, and each returns it as `steps`, so the
+/// workflow's output says what ran in the run, and in what order.
 fn write_two_steps(project: &Path, dir: &Path) {
     let log = command_log(dir, "steps.log");
     for (name, body) in [
@@ -3610,7 +3707,8 @@ fn write_two_steps(project: &Path, dir: &Path) {
                  def log(line): open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['STEPS_LOG'])), 'a').write(line + '\\n')\n\
                  note = json.load(sys.stdin)\n\
                  {body}\
-                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+                 steps = open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['STEPS_LOG']))).read().splitlines()\n\
+                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split()), 'steps': steps}}, sys.stdout)\n"
             ),
         )
         .expect("script");
@@ -3623,7 +3721,9 @@ fn write_two_steps(project: &Path, dir: &Path) {
             ),
             "",
             object(json!({"text": {"type": "string"}})),
-            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+            object(
+                json!({"title": {"type": "string"}, "words": {"type": "integer"}, "steps": {"type": "array", "items": {"type": "string"}}}),
+            ),
         );
     }
     std::fs::write(
@@ -3678,14 +3778,16 @@ fn no_step_starts_after_the_first_signal() {
     let out = atomic(
         &dir,
         &project,
-        &["runs", "resume", "two-1"],
+        &["--json", "runs", "resume", "two-1"],
         &UNUSED_MODEL,
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    // Finished, its caches went with it: the store says each step's command
-    // ran once.
-    assert_eq!((ran(&dir, "first"), ran(&dir, "second")), (1, 1));
+    // Each step's command ran once, in order, by the log the run kept.
+    assert_eq!(
+        stdout_json(&out)["output"]["steps"],
+        json!(["first start", "first end", "second"])
+    );
 }
 
 // needs_sandbox
@@ -3795,14 +3897,17 @@ fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
 }
 
 /// A workflow of two exec steps: `mark`, and then `tally`, idempotent,
-/// which logs the run it ran for.
+/// which logs the run it ran for in the run's caches and returns the log as
+/// `tallied`.
 fn write_tally(project: &Path, dir: &Path) {
     let log = command_log(dir, "tally.log");
     for (name, body, effects) in [
-        ("mark", "", ""),
+        ("mark", "out['tallied'] = []\n", ""),
         (
             "tally",
-            "open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['TALLY_LOG'])), 'a').write(os.environ['ATOMIC_RUN_ID'] + '\\n')\n",
+            "at = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['TALLY_LOG']))\n\
+             open(at, 'a').write(os.environ['ATOMIC_RUN_ID'] + '\\n')\n\
+             out['tallied'] = open(at).read().splitlines()\n",
             ", effects: { external: 'idempotent' }",
         ),
     ] {
@@ -3811,8 +3916,9 @@ fn write_tally(project: &Path, dir: &Path) {
             format!(
                 "import json, os, sys\n\
                  note = json.load(sys.stdin)\n\
+                 out = {{'title': note['text'][:25], 'words': len(note['text'].split())}}\n\
                  {body}\
-                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+                 json.dump(out, sys.stdout)\n"
             ),
         )
         .expect("script");
@@ -3825,7 +3931,9 @@ fn write_tally(project: &Path, dir: &Path) {
             ),
             "",
             object(json!({"text": {"type": "string"}})),
-            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+            object(
+                json!({"title": {"type": "string"}, "words": {"type": "integer"}, "tallied": {"type": "array", "items": {"type": "string"}}}),
+            ),
         );
     }
     std::fs::write(
@@ -3901,13 +4009,12 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
             .await
             .expect("child");
         assert!(status.success());
-        // Each finished, so its caches went with it: the store says how
-        // often its command ran.
-        assert_eq!(
-            ran_in(&rt, "tally").await,
-            ids.len(),
-            "each run's command ran once"
-        );
+        // Each run's command ran once, for that run, by the log the run
+        // kept.
+        for id in &ids {
+            let out: Value = rt.result(id).await.expect("result");
+            assert_eq!(out["tallied"], json!([id]), "{id}'s command ran once");
+        }
     });
 }
 
@@ -4048,8 +4155,10 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     );
     assert!(out.status.success(), "{}", text(&out));
     for (i, log) in logs.iter().enumerate() {
-        // Killed once, then run again to its end.
+        // Killed once, then run again to its end: its recorded output keeps
+        // the tally it ran with.
         assert_eq!(watch.acted(log), 1, "step {i}");
+        assert_eq!(ran(&dir, &format!("bump-{i}")), 2, "step {i}");
     }
 }
 

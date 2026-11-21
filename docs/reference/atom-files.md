@@ -62,10 +62,13 @@ the network they need. It also:
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
 - finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
-  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, as a worktree
-  step does: they are the run's own, shared by its steps, and removed when
-  the run ends, so no run finds what another wrote (a variable the atom
-  declares in `env` wins);
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
+  toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
+  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
+  which is the step's own, and removed when the run ends. No other run's
+  command may write them, though one can still read them by their path while
+  they last, so keep nothing secret there. A variable the atom declares in
+  `env` wins. An eval gives the command no caches;
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor

@@ -878,8 +878,9 @@ async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
     }
 }
 
-/// [`run_pipeline`]'s work, leaving in `caches` the run's build caches once
-/// a worktree step has used them.
+/// [`run_pipeline`]'s work, leaving in `run_caches` the run's build caches,
+/// named before its first step, for [`run_pipeline`] to settle when the run
+/// ends.
 async fn run_pipeline_in<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
@@ -1436,8 +1437,8 @@ async fn turn<C: WorkflowContext>(
             step_id: t.name.clone(),
         };
         let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
-        // The run's own build caches, which no other run sees.
-        let exec_caches = run.caches.cloned();
+        // The run's own build caches, with a Cargo target of the turn's own.
+        let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
         let attempt_step = format!("{}.attempt", t.name);
         let (begun, opened) = if replay.is_some() {
@@ -1469,7 +1470,7 @@ async fn turn<C: WorkflowContext>(
     let serving = replay.clone();
     let repair = t.repair.clone();
     let charge = t.charge;
-    let step_caches = run.caches.cloned();
+    let step_caches = run.caches.map(|c| c.for_exec(&t.name));
     execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
@@ -2100,8 +2101,8 @@ pub struct Services {
     pub worktrees: Option<Arc<Worktrees>>,
     /// Where each run's build caches go, the state directory's `cache/`:
     /// a directory of the run's own there, which its worktree and exec
-    /// steps may write and which goes when the run ends. `None` puts a
-    /// worktree step's beside its worktrees and gives exec steps none.
+    /// steps may write and which goes when the run ends. `None` puts them
+    /// beside the run's worktrees, and a run with neither gets none.
     pub caches: Option<PathBuf>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,

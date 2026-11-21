@@ -4,8 +4,9 @@
 //! workflow whose exec step, under Codex's Linux sandbox, writes into the
 //! caches it is pointed at and tries to reach the directory that holds every
 //! run's caches. It may write its own, finds them empty, cannot create
-//! anything beside them, and they are gone when the run ends; the next run's
-//! exec step gets caches of its own, and finds nothing the first wrote.
+//! anything beside them, builds into a Cargo target of the step's own, and
+//! they are gone when the run ends; the next run's exec step gets caches of
+//! its own, and finds nothing the first wrote.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -38,7 +39,8 @@ def plant():
         f.write('from an earlier run')
 def beside():
     os.makedirs(os.path.join(os.path.dirname(caches), 'another-run'))
-json.dump({'caches': caches, 'listed': ' '.join(listed), 'planted': attempt(plant),
+json.dump({'caches': caches, 'target': os.environ.get('CARGO_TARGET_DIR', ''),
+           'listed': ' '.join(listed), 'planted': attempt(plant),
            'beside': attempt(beside)}, sys.stdout)
 "#;
 
@@ -70,9 +72,9 @@ fn project(at: &Path) -> PathBuf {
     write(
         &project.join("atoms/probe.output.schema.json"),
         &json!({"type": "object", "additionalProperties": false,
-                "required": ["caches", "listed", "planted", "beside"],
-                "properties": {"caches": field, "listed": field, "planted": field,
-                               "beside": field}})
+                "required": ["caches", "target", "listed", "planted", "beside"],
+                "properties": {"caches": field, "target": field, "listed": field,
+                               "planted": field, "beside": field}})
         .to_string(),
     );
     write(
@@ -153,6 +155,12 @@ fn an_exec_steps_caches_are_its_runs_alone_and_go_with_it() {
     let caches = PathBuf::from(first["caches"].as_str().unwrap());
     assert_eq!(caches.parent().and_then(Path::file_name).unwrap(), "cache");
     assert!(caches.starts_with(dir.join("data")), "{first}");
+    // Its Cargo target is the step's own, inside them.
+    assert_eq!(
+        Path::new(first["target"].as_str().unwrap()),
+        caches.join("cargo-target").join("probe"),
+        "{first}"
+    );
     // Its own, empty but for the sandbox's read-only placeholders, and
     // writable; nothing beside them.
     assert_eq!(found(&first), "", "{first}");

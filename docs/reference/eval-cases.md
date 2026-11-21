@@ -208,9 +208,9 @@ effects are all that stands between it and the project. It refuses:
 
 - a Codex atom with a `workspace-write` sandbox;
 - an exec atom that does not declare `effects: { external: 'read-only' }`. Its
-  command runs in the project, under the same confinement as in `atomic run`, for
-  every case and every replay, so only a command declared to read and nothing more
-  is run. One that declares `idempotent` writes to an outside system and is never
+  command runs in the project, under the same confinement as in `atomic run` but
+  with no build caches, so it may write only its scratch directory, for every case
+  and every replay, and only a command declared to read and nothing more is run. One that declares `idempotent` writes to an outside system and is never
   run; one that declares nothing could do anything. If a command only reads its
   input, declare it `read-only`, as the order-report example's atoms do;
 - a Codex atom under cassettes: it runs only with `--no-cassettes`, since cassettes

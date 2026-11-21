@@ -115,10 +115,11 @@ pub struct TurnSpec {
     /// The sandbox the thread runs in. The network is always restricted.
     pub sandbox: crate::typed::Sandbox,
     /// Environment variables set for every command the thread runs, such as
-    /// the project's shared caches (see [`crate::worktree::Caches`]).
+    /// those that point build tools at its run's caches (see
+    /// [`crate::worktree::Caches`]).
     pub env: BTreeMap<String, String>,
     /// Directories a `workspace-write` thread may write besides its working
-    /// directory, such as the project's shared caches. Absolute paths.
+    /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
 }
 
@@ -2734,7 +2735,7 @@ mod tests {
     /// An exec command, confined, is the sandbox helper running `env -i`
     /// with exactly the command's environment, then the command: its
     /// profile denies atomic's private state and lets it write only its own
-    /// directories and the project's caches.
+    /// directories and those it is given, such as its run's caches.
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
