@@ -155,7 +155,7 @@ fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
     let line = r.announcement().expect("announced");
     assert!(
         line.contains("gpt-5-codex on your ChatGPT sign-in"),
-        "{line}"
+        "the line names it"
     );
     // A key named beside the sign-in is not sent, and that is said.
     let r = resolved_signed_in(
@@ -582,9 +582,15 @@ fn a_detected_ollama_is_sent_no_key_and_is_announced() {
         r.notes
     );
     let said = r.announcement().expect("announced");
-    assert!(said.contains("qwen3:8b"), "{said}");
-    assert!(said.contains("http://127.0.0.1:11434/v1"), "{said}");
-    assert!(said.contains("detected: Ollama answered"), "{said}");
+    assert!(said.contains("qwen3:8b"), "the explanation names it");
+    assert!(
+        said.contains("http://127.0.0.1:11434/v1"),
+        "the explanation names it"
+    );
+    assert!(
+        said.contains("detected: Ollama answered"),
+        "the explanation names it"
+    );
 }
 
 #[test]
@@ -595,8 +601,11 @@ fn an_endpoint_from_the_projects_files_is_announced_and_one_the_runner_chose_is_
     )]);
     let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
     let said = r.announcement().expect("announced");
-    assert!(said.contains("https://example.com/v1"), "{said}");
-    assert!(said.contains("atomic.yaml:4"), "{said}");
+    assert!(
+        said.contains("https://example.com/v1"),
+        "the explanation names it"
+    );
+    assert!(said.contains("atomic.yaml:4"), "the explanation names it");
     let r = resolved(
         &d,
         &EngineArgs::default(),
@@ -1179,7 +1188,7 @@ fn openai_base_url_points_an_openai_keys_detection_elsewhere() {
     let said = r.announcement().expect("announced");
     assert!(
         said.contains("; OPENAI_API_KEY is sent to 127.0.0.1:8080;"),
-        "{said}"
+        "the explanation names it"
     );
     // Without the key, or with an endpoint set, it is not used, and that
     // is said.
