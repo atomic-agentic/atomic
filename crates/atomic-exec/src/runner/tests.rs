@@ -304,3 +304,23 @@ fn hex_round_trips() {
     assert_eq!(unhex("abc"), None);
     assert_eq!(unhex("zz"), None);
 }
+
+/// A runner the way the control plane starts one, from
+/// [`ProcessRunner::atomic`], has only `PATH` from the control plane's
+/// environment: a stand-in that prints its own environment shows it.
+#[test]
+fn a_runner_has_only_path_from_the_control_planes_environment() {
+    assert!(std::env::var_os("PATH").is_some(), "this test needs PATH");
+    let runner = ProcessRunner {
+        args: Vec::new(),
+        ..ProcessRunner::atomic(std::path::PathBuf::from("/usr/bin/env"))
+    };
+    let (_, done) = runner
+        .attempt(&command("true", &[], b""), b"")
+        .expect("the stand-in runs");
+    let names: Vec<String> = String::from_utf8_lossy(&done.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
+        .collect();
+    assert_eq!(names, ["PATH"]);
+}

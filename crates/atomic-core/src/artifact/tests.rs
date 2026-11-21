@@ -691,3 +691,40 @@ fn a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone() {
     assert!(!own.exists(), "a closed store's holds were left");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A hold is taken under the store's shared lock: while a sweep holds the
+/// lock, a hold waits for it, and gives up as Locked past its wait.
+#[test]
+fn a_hold_waits_out_a_sweep_in_progress() {
+    let (s, dir) = store();
+    let s = s.waiting_at_most(std::time::Duration::from_millis(100));
+    let a = ArtifactRef::from_digest(&"c".repeat(64)).expect("digest");
+    let sweeping = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("lock"))
+        .expect("the store's lock");
+    sweeping.lock().expect("a sweep's lock");
+    assert!(
+        matches!(s.hold(&a), Err(ArtifactError::Locked { .. })),
+        "held while a sweep held the store"
+    );
+    assert!(owner_holds(&s).is_empty());
+    drop(sweeping);
+    let hold = s.hold(&a).expect("held once the sweep let go");
+    assert_eq!(owner_holds(&s).len(), 1);
+    drop(hold);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The holds a store has written.
+fn owner_holds(s: &LocalStore) -> Vec<PathBuf> {
+    std::fs::read_dir(&s.owner.held)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect()
+}

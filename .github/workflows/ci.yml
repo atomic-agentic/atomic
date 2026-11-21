@@ -304,6 +304,14 @@ jobs:
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
+      # A compile-fail doctest checks that a test-only method is absent
+      # without its feature, which the test shards' features turn on; it runs
+      # only here, without them. The whole workspace is selected, as the
+      # shards select it, so dependencies resolve the same features and the
+      # cached builds serve (selecting one package rebuilds V8 differently).
+      - name: Doctests without the test features
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo test --workspace --locked --doc
       # The graph still resolves from scratch onto the libsqlite3-sys Codex
       # locks, which both Codex and the durare fork link.
       - name: Lockfile resolves from scratch
