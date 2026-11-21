@@ -407,10 +407,16 @@ pub fn resolve(
         && let Ok(file) = std::fs::canonicalize(file)
         && let Ok(root) = std::fs::canonicalize(project_root(dir))
     {
-        let checkout = root.ancestors().find(|d| d.join(".git").exists());
-        for (what, enclosing) in std::iter::once(("project", root.as_path()))
-            .chain(checkout.map(|c| ("checkout holding the project", c)))
-        {
+        // Every checkout around the project counts, not only the nearest:
+        // a submodule's superproject, the checkout a worktree sits in, and
+        // a linked worktree's main checkout, whose repository it shares.
+        let checkouts =
+            atomic_core::state::checkouts_holding(&root).map_err(ConfigError::Invalid)?;
+        for (what, enclosing) in std::iter::once(("project", root.as_path())).chain(
+            checkouts
+                .iter()
+                .map(|c| ("checkout holding the project", c.as_path())),
+        ) {
             if file.starts_with(enclosing) {
                 return Err(ConfigError::Invalid(format!(
                     "your own configuration, {}, is inside the {what} at {}, so the project \

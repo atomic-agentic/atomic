@@ -1198,12 +1198,24 @@ fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can()
         assert!(said.contains("atomic.local.yaml:4"), "{said}");
         assert!(said.contains(".config/atomic/config.yaml"), "{said}");
     }
-    // In the person's own configuration, under their home.
+    // In the person's own configuration, outside every checkout around the
+    // project (this test's own directory is inside atomic's).
     std::fs::remove_file(project.join("atomic.local.yaml")).expect("remove");
-    let config = dir.join("home/.config/atomic");
+    let config_home = std::env::temp_dir().join(format!(
+        "atomic-run-cli-person-config-{}",
+        std::process::id()
+    ));
+    let config = config_home.join("atomic");
     std::fs::create_dir_all(&config).expect("config dir");
     std::fs::write(config.join("config.yaml"), routing).expect("config");
-    let out = atomic(&dir, &project, &["--json", "config", "--explain"], &[], "");
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "config", "--explain"],
+        &[("XDG_CONFIG_HOME", config_home.to_str().expect("utf-8"))],
+        "",
+    );
+    let _ = std::fs::remove_dir_all(&config_home);
     assert!(out.status.success(), "{}", text(&out));
     let doc = stdout_json(&out);
     let row = doc["settings"]
@@ -1214,7 +1226,7 @@ fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can()
     assert!(
         row["source"]
             .as_str()
-            .is_some_and(|s| s.contains(".config/atomic/config.yaml")),
+            .is_some_and(|s| s.contains("person-config") && s.ends_with("atomic/config.yaml:4")),
         "{doc}"
     );
 }
