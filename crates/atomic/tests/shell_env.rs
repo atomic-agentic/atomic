@@ -695,8 +695,15 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     });
 }
 
+/// How long [`look_once`]'s run may take before the test fails instead of
+/// waiting on it: a turn of one short command takes seconds.
+const LOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Run `look` once through `atomic run` with home `home`, its command
-/// `command`, and return what the command printed.
+/// `command`, and return what the command printed. A run that has not
+/// ended within [`LOOK_LIMIT`] is killed, with its process group, and
+/// fails the test. Its atomic home is the test's own, named after `dir`:
+/// the tests that call this run at once, and each removes its home first.
 async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
@@ -709,8 +716,10 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
     .unwrap();
     let project = dir.join("project");
     write_project(&project);
-    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-shell-env-linked-{}", std::process::id()));
+    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-shell-env-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
     let _ = std::fs::remove_dir_all(&atomic_home);
     let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
     run.args(["run", "look", "--data", r#"{"text": "the note"}"#])
@@ -733,15 +742,45 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
     for (name, value) in env {
         run.env(name, value);
     }
-    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
-        .await
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let (stdout, stderr) = (dir.join("look.stdout"), dir.join("look.stderr"));
+    run.stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    std::os::unix::process::CommandExt::process_group(&mut run, 0);
+    let status = tokio::task::spawn_blocking(move || {
+        let mut child = run.spawn().unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if started.elapsed() > LOOK_LIMIT {
+                let _ = Command::new("kill")
+                    .args(["-KILL", &format!("-{}", child.id())])
+                    .status();
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    })
+    .await
+    .unwrap();
+    let said = || {
+        format!(
+            "stdout: {}\nstderr: {}",
+            std::fs::read_to_string(&stdout).unwrap_or_default(),
+            std::fs::read_to_string(&stderr).unwrap_or_default()
+        )
+    };
+    let Some(status) = status else {
+        panic!(
+            "the run had not ended after {LOOK_LIMIT:?}, so it was killed: {}",
+            said()
+        );
+    };
+    assert!(status.success(), "{}", said());
+    let _ = std::fs::remove_dir_all(&atomic_home);
     model.requests()[1]["input"]
         .as_array()
         .into_iter()
