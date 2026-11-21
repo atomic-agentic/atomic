@@ -20,9 +20,13 @@ fn unsafe_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             // Zero-width and directional marks, bidi embeddings, overrides
-            // and isolates, line and paragraph separators, the BOM.
-            '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{2069}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+            // and isolates, line and paragraph separators, invisible
+            // operators and deprecated format marks, the BOM, the soft
+            // hyphen, the Mongolian vowel separator, and the tag
+            // characters, which can hide text that a model wrote.
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 fn escape(c: char, out: &mut String) {
@@ -47,7 +51,7 @@ pub fn line(text: &str) -> String {
     out
 }
 
-/// JSON text, such as `serde_json` writes, with every unsafe character in
+/// JSON text, only as `serde_json` writes it, with every unsafe character in
 /// it written as a JSON escape: still valid JSON, and the same value, but
 /// safe on a terminal. `serde_json` escapes C0 controls itself; DEL, C1
 /// controls and the Unicode format and bidirectional controls it writes as
@@ -56,14 +60,33 @@ pub fn json(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         if c != '\n' && unsafe_char(c) {
-            // Every unsafe character is in the Basic Multilingual Plane, so
-            // one `\uXXXX` escape writes it.
-            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+            // One `\uXXXX` escape each, or a surrogate pair's two for a
+            // character outside the Basic Multilingual Plane.
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
         } else {
             out.push(c);
         }
     }
     out
+}
+
+/// `text` on as many lines as it has, with every other unsafe character
+/// escaped: for a model's answer, printed as text.
+pub fn block(text: &str) -> String {
+    text.split('\n').map(line).collect::<Vec<_>>().join("\n")
+}
+
+/// `value` as pretty JSON, safe on a terminal (see [`json`]).
+pub fn pretty(value: &impl serde::Serialize) -> serde_json::Result<String> {
+    serde_json::to_string_pretty(value).map(|text| json(&text))
+}
+
+/// `value` as compact JSON on one line, safe on a terminal (see [`json`]).
+pub fn compact(value: &impl serde::Serialize) -> serde_json::Result<String> {
+    serde_json::to_string(value).map(|text| json(&text))
 }
 
 /// A JSON value for a person: a string as its text, anything else as JSON,
@@ -161,6 +184,46 @@ mod tests {
         // Ordinary text, and the pretty form's line breaks, stay.
         let plain = serde_json::to_string_pretty(&json!({"a": "café · 日本"})).expect("JSON");
         assert_eq!(json(&plain), plain);
+    }
+
+    /// Every unsafe character, one at a time, in a JSON string as
+    /// serde_json writes it: escaped, astral ones as surrogate pairs, and
+    /// read back as the same text.
+    #[test]
+    fn json_escapes_every_unsafe_character_and_reads_back_the_same() {
+        let unsafe_chars: Vec<char> = (0..=0x10FFFF_u32)
+            .filter_map(char::from_u32)
+            .filter(|c| *c != '\n' && unsafe_char(*c))
+            .collect();
+        assert!(unsafe_chars.contains(&'\u{E0041}'), "the tag characters");
+        assert!(unsafe_chars.contains(&'\u{AD}') && unsafe_chars.contains(&'\u{180E}'));
+        for c in unsafe_chars {
+            let text = format!("a{c}b");
+            let written = json(&serde_json::to_string(&text).expect("JSON"));
+            assert!(
+                written.chars().all(|w| !unsafe_char(w)),
+                "U+{:04X}",
+                u32::from(c)
+            );
+            assert_eq!(
+                serde_json::from_str::<String>(&written).expect("still JSON"),
+                text,
+                "U+{:04X}",
+                u32::from(c)
+            );
+        }
+    }
+
+    /// A model's answer as text keeps its lines, and nothing else unsafe.
+    #[test]
+    fn a_block_keeps_its_lines_and_escapes_the_rest() {
+        let answer = "first\u{1b}[2J line\nsecond\u{202e}\u{E0041} line";
+        let shown = block(answer);
+        assert_eq!(shown.lines().count(), 2);
+        assert!(
+            shown.chars().all(|c| c == '\n' || !unsafe_char(c)),
+            "{shown:?}"
+        );
     }
 
     #[test]

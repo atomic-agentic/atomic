@@ -430,7 +430,8 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         }
         Some(Command::Debug(Debug::CodexPrompt(args))) => {
             let answer = prompt(&paths, &state, &args).await?;
-            println!("{answer}");
+            // A model's answer, as text, escaped for the terminal.
+            println!("{}", shown::block(&answer));
             Ok(())
         }
         Some(Command::Debug(Debug::Probe(args))) => {
@@ -440,7 +441,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
                 state.database().display()
             );
             let answer = prompt(&paths, &state, &args).await?;
-            println!("codex: {answer}");
+            println!("codex: {}", shown::block(&answer));
             Ok(())
         }
     }

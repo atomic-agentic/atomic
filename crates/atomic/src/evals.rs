@@ -540,7 +540,9 @@ pub async fn run(
                 "reason": "atomic eval has no judge to call, so scorers are not run",
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        // Cases' outputs are what models wrote: escaped for the terminal,
+        // and still the same JSON.
+        println!("{}", crate::shown::pretty(&out)?);
     } else {
         print(&reports, &tallies, &skipped, source);
         for r in &refused {

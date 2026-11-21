@@ -216,13 +216,15 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
 /// Report `failure`, with any secret its text carries redacted: an error
 /// can quote what a provider or a command said.
 pub fn report(failure: &Failure, json: bool) {
+    // An error can quote what a model or a command wrote: escaped for the
+    // terminal too.
     if json {
         let mut doc = serde_json::json!({ "error": failure });
         atomic_core::redact::value(&mut doc);
-        println!("{doc}");
+        println!("{}", crate::shown::compact(&doc).unwrap_or_default());
     } else {
-        atomic_core::log_line!("error: {}", failure.description);
-        atomic_core::log_line!("  to fix: {}", failure.action);
+        atomic_core::log_line!("error: {}", crate::shown::line(&failure.description));
+        atomic_core::log_line!("  to fix: {}", crate::shown::line(&failure.action));
     }
 }
 
