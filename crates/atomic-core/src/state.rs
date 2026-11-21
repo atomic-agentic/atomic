@@ -729,7 +729,7 @@ fn project_id(root: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// A worktree's `.git` or its repository's `commondir` that is a pipe,
+    /// A worktree's `.git` or its repository's `commondir` that is a device,
     /// or larger than git writes, is refused without being read to its end,
     /// and says which file; a well-formed pair names the main checkout.
     #[cfg(unix)]
@@ -755,12 +755,10 @@ mod tests {
             "{held:?}"
         );
 
-        // A pipe, which a blocking read would wait on for ever.
+        // A device, which never ends, as a pipe would never answer.
         std::fs::remove_file(&commondir).expect("remove");
-        let name = std::ffi::CString::new(commondir.as_os_str().as_encoded_bytes()).expect("path");
-        // SAFETY: `name` is a NUL-terminated path that outlives the call.
-        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
-        let refused = checkouts_holding(&project).expect_err("a pipe");
+        std::os::unix::fs::symlink("/dev/zero", &commondir).expect("link");
+        let refused = checkouts_holding(&project).expect_err("a device");
         assert!(refused.contains("is not a regular file"), "{refused}");
         assert!(refused.contains("commondir"), "{refused}");
 
