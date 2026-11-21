@@ -33,6 +33,7 @@ expect:
 | `expect` | Required nonempty list of CEL expressions; every expression must evaluate to `true` |
 | `case` | Optional metadata for the atom's [scorers](#scorers-and-baselines), checked against the atom's `case` schema |
 | `prepared` | Reserved for the values an atom [computes in code](atom-files.md) before its model call, from v0.7; the runner refuses a case that sets it today |
+| `origin` | Optional: how far the case's input may be trusted, `external` (the default), `agent` or `team`; see [where a case's input came from](#where-a-cases-input-came-from) |
 
 A case missing `input` or `expect`, with an empty `expect`, with any other key,
 with an input that does not fit the atom's input schema, or with an assertion
@@ -46,6 +47,22 @@ is an `int`, and a `number` field is a `double`.
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
 `atomic test`.
+
+## Where a case's input came from
+
+A case's input is external data unless its own file says otherwise with
+`origin: agent` or `origin: team`. A committed case file is not, by being
+committed, reviewed input: it can hold text copied from a ticket, a page or a
+model's answer, so only an explicit label raises it, and only in the case's own
+file. A case captured from a run keeps the origin its input was recorded with.
+
+The origin decides two things, the same way a workflow's binding does. An
+atom's `trust` is the riskiest origin it accepts, so a `trust: team` atom takes
+only team cases and a `trust: agent` atom takes agent and team cases; a case
+less trusted than its atom accepts fails the load, before any model call or
+command, naming the case, the atom, its trust and the case's origin. And the
+case's input is labelled with that origin in the atom's prompt, as data, never
+as instructions.
 
 The format uses these keys; there is no per-case `atomic`, `atom` or `output`
 field. Use JSON-compatible YAML values, quote CEL expressions and avoid duplicate

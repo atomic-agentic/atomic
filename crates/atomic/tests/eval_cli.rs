@@ -808,3 +808,37 @@ fn selection_sampling_reports_and_junit_cover_every_atom() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+#[test]
+fn a_team_atom_refuses_a_case_of_the_default_origin_before_any_call() {
+    on_codex_runtime(async {
+        let dir = scratch("case-origin");
+        let project = project(&dir, None);
+        // An atom that takes only team input, and a case that does not say
+        // where its input came from: external, by default.
+        add_atom(
+            &project,
+            "reviewed",
+            "trust: 'team'",
+            &[("Export crashes", "output.ticket.size() > 0")],
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let out = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &["reviewed", "--no-cassettes"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        for part in [
+            "cases.jsonl:1",
+            "is external data",
+            "atom `reviewed` accepts team input at most",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert_eq!(model.calls(), 0, "a model was called");
+    });
+}
