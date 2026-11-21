@@ -372,13 +372,18 @@ fn case_from(
         } else {
             ""
         };
+        let label = match crate::workflow::accepted_trust(atom) {
+            "team" => "label the case `origin: team` if a person on the team wrote or reviewed \
+                       its input"
+                .to_owned(),
+            accepts => format!(
+                "label the case `origin: {accepts}` if its input came from a model step, or \
+                 `origin: team` if a person on the team wrote or reviewed it"
+            ),
+        };
         return Err((
             at.to_owned(),
-            format!(
-                "{refused}; label the case `origin: {}` if a person has reviewed its input, \
-                 or declare a lower `trust` on the atom",
-                crate::workflow::accepted_trust(atom)
-            ),
+            format!("{refused}. For an eval case, {label}"),
         ));
     }
     let case = fields.get("case").cloned().unwrap_or(Value::Null);
@@ -1060,7 +1065,7 @@ fn escape(text: &str) -> String {
 }
 
 /// The atom itself as a [`Subject`]: each case's input run on `runtimes`,
-/// as external input, its output checked against the atom's contract and
+/// labelled with the case's origin, its output checked against the atom's contract and
 /// its `validate` rules as any run's is. An atom that writes to an outside
 /// system is never run, whatever loaded its cases.
 pub struct AtomSubject<'a> {
@@ -1079,6 +1084,15 @@ impl Subject for AtomSubject<'_> {
                      eval",
                     self.atom.name
                 ));
+            }
+            // Held to the atom's trust here too, for a case not built by
+            // the load.
+            if let Some(refused) = crate::workflow::untrusted_binding(
+                self.atom,
+                &format!("case {}'s input", case.id),
+                &case.origin,
+            ) {
+                return Err(refused);
             }
             if case.prepared.is_some() {
                 return Err(

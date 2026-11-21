@@ -62,7 +62,9 @@ only team cases and a `trust: agent` atom takes agent and team cases; a case
 less trusted than its atom accepts fails the load, before any model call or
 command, naming the case, the atom, its trust and the case's origin. And the
 case's input is labelled with that origin in the atom's prompt, as data, never
-as instructions.
+as instructions. Relabelling a case changes the prompt its atom is sent, so a
+recording of its answer no longer matches: re-record the case's cassette with
+`atomic eval <atom> --live`.
 
 The format uses these keys; there is no per-case `atomic`, `atom` or `output`
 field. Use JSON-compatible YAML values, quote CEL expressions and avoid duplicate
@@ -110,8 +112,8 @@ A run can be limited to chosen cases (a file's name selects all its cases) and t
 seeded sample of them; the same seed picks the same cases. A selector that names
 no case fails the run rather than run fewer cases than asked.
 
-Each case's input is rendered as external input, as anything that did not come
-from a person on the team is: a case file may hold text copied from anywhere.
+Each case's input is rendered with its [origin](#where-a-cases-input-came-from),
+external unless the case's file says otherwise.
 
 ## Scorers and baselines
 

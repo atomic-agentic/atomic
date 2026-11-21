@@ -252,6 +252,38 @@ async fn a_cases_origin_is_held_to_the_atoms_trust_and_labels_its_prompt() {
     );
     let captured = load_cases(&agent, &at(&root, "captured", 1.0)).expect("a captured case");
     assert_eq!(captured[0].origin, "agent");
+    // The hint fits the atom: an agent atom's case may say it came from a
+    // model step, or from a person on the team.
+    write(&root.join("hint/a.yaml"), &case_file(None));
+    let hint = load_cases(&agent, &at(&root, "hint", 1.0))
+        .expect_err("an external case for an agent atom")
+        .to_string();
+    assert!(
+        hint.contains("`origin: agent` if its input came from a model step")
+            && hint.contains("`origin: team` if a person on the team wrote or reviewed it"),
+        "{hint}"
+    );
+    // A case built outside the load is checked before it runs too.
+    let unchecked = Case {
+        id: "built.yaml".into(),
+        input: json!({"text": "Export crashes"}),
+        expect: vec!["true".into()],
+        case: Value::Null,
+        prepared: None,
+        origin: "external".into(),
+    };
+    let model = FakeModel::start(answers()).await.expect("fake model");
+    let rt = runtimes(&model, &root.join("rt-built"));
+    let subject = AtomSubject {
+        atom: &agent,
+        runtimes: &rt,
+    };
+    let refused = subject
+        .run(&unchecked)
+        .await
+        .expect_err("an unchecked case");
+    assert!(refused.contains("accepts agent input at most"), "{refused}");
+    assert_eq!(model.calls(), 0);
     // An origin that is not one of the three is refused where it is written.
     write(&root.join("odd/a.yaml"), &case_file(Some("Team")));
     let odd = load_cases(&agent, &at(&root, "odd", 1.0))
