@@ -624,7 +624,8 @@ fn an_excerpt_of_a_json_body_is_redacted_as_json() {
 }
 
 /// The runner writes its errors line by line: the body of a private key
-/// block one line opens is never written.
+/// block one line opens is never written, and each line is escaped for the
+/// terminal.
 #[test]
 fn the_lines_writer_holds_back_a_private_key_body() {
     use std::io::Write;
@@ -645,13 +646,14 @@ fn the_lines_writer_holds_back_a_private_key_body() {
     let block = concat!(
         "before\n-----BEGIN RSA PRIVATE",
         " KEY-----\nMIIEbodyLINEone\nMIIEbodyLINEtwo\n-----END RSA PRIVATE",
-        " KEY-----\nafter\n"
+        " KEY-----\nafter\nx\u{1b}[2Jy\n"
     );
     lines.write_all(block.as_bytes()).expect("write");
     drop(lines);
     let written = String::from_utf8(sink.0.lock().expect("lock").clone()).expect("UTF-8");
     assert!(!written.contains("MIIEbody"), "the key's body was written");
-    assert!(written.starts_with("before\n") && written.ends_with("after\n"));
+    assert!(written.starts_with("before\n"), "{written:?}");
+    assert!(written.ends_with("after\nx\\u{001b}[2Jy\n"), "{written:?}");
 }
 
 /// Shapes that could make a scanner rescan its input: text with no white
@@ -1309,6 +1311,24 @@ fn a_line_is_written_as_it_was_put_together() {
     let long = Line::new().shown(&"x".repeat(MAX_TEXT + 10));
     assert_eq!(long.written().chars().count(), MAX_TEXT + 1);
     assert!(long.written().ends_with('…'));
+}
+
+/// A log line names what a caller or a model chose, such as a run's id, so
+/// it reaches the terminal escaped; it is redacted first, so a token a
+/// terminal escape sequence colours is still found. Its lines and tabs
+/// stay.
+#[test]
+fn a_log_line_is_redacted_then_escaped() {
+    let logged = logged(&format!(
+        "run a\u{1b}[2J\u{202e}b: the push said \u{1b}[1;33m{SAMPLE}\u{1b}[0m\n\tmore"
+    ));
+    assert!(!logged.contains(&SAMPLE[4..]), "the token showed");
+    assert_eq!(
+        logged,
+        "run a\\u{001b}[2J\\u{202e}b: the push said \\u{001b}[1;33m[REDACTED]\\u{001b}[0m\n\tmore"
+    );
+    let line = Line::new().plain("run ").shown("a\u{1b}]0;owned\u{7}");
+    assert_eq!(line.written(), "run a\\u{001b}]0;owned\\u{0007}");
 }
 
 /// Many keys that redact alike are numbered in linear time: each name keeps

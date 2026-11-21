@@ -54,6 +54,11 @@ impl Terminal {
 
     /// `atomic` with `args` on a pseudo-terminal, as a person types it.
     fn at_terminal(&self, args: &str) -> Output {
+        self.at_terminal_as("dev", args)
+    }
+
+    /// [`Self::at_terminal`], as the account `user`.
+    fn at_terminal_as(&self, user: &str, args: &str) -> Output {
         let mut c = Command::new("script");
         c.args([
             "-qec",
@@ -63,7 +68,7 @@ impl Terminal {
         .current_dir(&self.project)
         .env("ATOMIC_HOME", &self.home)
         .env("ATOMIC_CREDENTIAL_STORE", "file")
-        .env("USER", "dev")
+        .env("USER", user)
         .env_remove("LOGNAME")
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
@@ -191,4 +196,32 @@ fn a_gate_is_approved_from_a_second_terminal_while_the_run_waits() {
         rt.shutdown(Duration::from_secs(5)).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     });
+}
+
+/// An account name is the operator's principal, and it reaches the terminal
+/// escaped: a control sequence in it cannot set the window title.
+#[test]
+fn a_hostile_account_name_is_shown_escaped() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-gates-cli-user-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["project", "home"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let t = Terminal {
+        project: dir.join("project"),
+        home: dir.join("home"),
+    };
+    let enrolled = t.at_terminal_as("dev\u{1b}]0;owned\u{7}", "gates enroll");
+    assert!(enrolled.status.success(), "{:?}", text(&enrolled));
+    let shown = text(&enrolled);
+    assert!(
+        !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+        "a control reached the terminal: {shown:?}"
+    );
+    assert!(
+        shown.contains("enrolled local:dev\\u{001b}]0;owned\\u{0007}"),
+        "{shown:?}"
+    );
 }
