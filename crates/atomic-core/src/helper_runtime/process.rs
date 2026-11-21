@@ -148,20 +148,21 @@ fn run(
         clock,
     })
     .map_err(|e| host(e.to_string()))?;
-    let mut child = std::process::Command::new(&command.program)
+    let mut process = std::process::Command::new(&command.program);
+    process
         .args(&command.args)
         .env_clear()
         .envs(command.env.iter().map(|(k, v)| (k, v)))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            host(format!(
-                "cannot start the helper process {}: {e}",
-                command.program.display()
-            ))
-        })?;
+        .stderr(std::process::Stdio::piped());
+    crate::compiler_process::new_session(&mut process);
+    let mut child = process.spawn().map_err(|e| {
+        host(format!(
+            "cannot start the helper process {}: {e}",
+            command.program.display()
+        ))
+    })?;
     let mut stdin = child.stdin.take().ok_or_else(|| host("no stdin".into()))?;
     let stdout = child
         .stdout

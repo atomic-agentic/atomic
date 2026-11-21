@@ -913,18 +913,22 @@ pub fn run_in(
         command.current_dir(cwd);
     }
     #[cfg(unix)]
-    if group != Group::Inherit {
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    }
-    #[cfg(unix)]
     {
         let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        let own = group != Group::Inherit;
         // SAFETY: between fork and exec the closure makes only
-        // async-signal-safe calls (signal, prctl, getppid, _exit) and
-        // allocates nothing.
+        // async-signal-safe calls (setsid, signal, prctl, getppid, _exit)
+        // and allocates nothing.
         #[allow(unsafe_code)]
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                // A session of its own, which is also a process group of its
+                // own (its id is the child's pid, which `killpg` stops): with
+                // no controlling terminal, the command cannot open atomic's
+                // `/dev/tty` and type into a gate's prompt.
+                if own && libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 // A runner ignores the stop signals, which its command,
                 // in its group, could send it; the command gets them back.
                 let restore = RESTORE.load(Ordering::SeqCst);

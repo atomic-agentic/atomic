@@ -92,6 +92,19 @@ const HARDENING: &[&str] = &[
     "i18n.logOutputEncoding=UTF-8",
 ];
 
+/// Read a git's stderr on a thread of its own: the start of it is kept for
+/// an error message, and the rest drained so git never blocks on a full pipe.
+fn keep_errors(mut stderr: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stderr)
+            .take(STDERR_BYTES as u64)
+            .read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        bytes
+    })
+}
+
 /// Why a git command failed or was never run.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
@@ -124,6 +137,30 @@ pub enum GitError {
     /// git's output was not in the form asked for.
     #[error("git's output could not be read")]
     Unreadable,
+}
+
+/// What a directory is to git (see [`Git::checkout_at`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Checkout {
+    /// The checkout's own git directory.
+    pub git_dir: PathBuf,
+    /// The repository's common git directory, which holds its objects.
+    pub common_dir: PathBuf,
+    /// The top of the work tree, `None` for a bare repository.
+    pub top: Option<PathBuf>,
+}
+
+/// One entry of a commit's tree (see [`Repo::entries`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeEntry {
+    /// Its mode, such as `100644`.
+    pub mode: String,
+    /// `blob`, `tree` or `commit` (a submodule).
+    pub kind: String,
+    /// Its object ID.
+    pub id: String,
+    /// Its path from the tree's top.
+    pub path: String,
 }
 
 /// A whole commit ID: 40 hex digits for SHA-1 or 64 for SHA-256, in lower
@@ -214,6 +251,17 @@ impl Git {
         }
     }
 
+    /// Make an empty bare repository at `path`, from no template, so no
+    /// sample hook or other file comes with it.
+    pub fn init_bare(&self, path: &Path) -> Result<Repo, GitError> {
+        let mut command = self.base();
+        command
+            .args(["init", "--bare", "--quiet", "--template="])
+            .arg(path);
+        self.run(command, "init", None, MAX_OUTPUT_BYTES)?;
+        Ok(self.repo(path))
+    }
+
     /// The repository whose git directory is `git_dir`, checked out at
     /// `work_tree`. Commands never look in `work_tree` for a git directory.
     pub fn worktree(&self, git_dir: impl Into<PathBuf>, work_tree: impl Into<PathBuf>) -> Repo {
@@ -240,6 +288,31 @@ impl Git {
     /// Like discovery, this is for a trusted source directory.
     pub fn worktree_root(&self, dir: &Path) -> Result<PathBuf, GitError> {
         self.path_at(dir, "--show-toplevel")
+    }
+
+    /// What `dir` is to git, found the way git finds it, for a trusted
+    /// directory: the checkout's own git directory (a linked worktree's is
+    /// not its repository's), the repository's common one, and the top of
+    /// its work tree, `None` for a bare repository.
+    pub fn checkout_at(&self, dir: &Path) -> Result<Checkout, GitError> {
+        let bare = {
+            let mut command = self.base();
+            let mut safe = OsString::from("safe.directory=");
+            safe.push(dir);
+            command.arg("-c").arg(safe).current_dir(dir);
+            command.args(["rev-parse", "--is-bare-repository"]);
+            self.run(command, "rev-parse", None, MAX_OUTPUT_BYTES)?
+        };
+        let top = if String::from_utf8_lossy(&bare).trim() == "true" {
+            None
+        } else {
+            Some(self.path_at(dir, "--show-toplevel")?)
+        };
+        Ok(Checkout {
+            git_dir: self.path_at(dir, "--git-dir")?,
+            common_dir: self.path_at(dir, "--git-common-dir")?,
+            top,
+        })
     }
 
     fn find_repo(&self, dir: &Path) -> Result<Repo, GitError> {
@@ -323,20 +396,11 @@ impl Git {
                 let _ = stdin.write_all(&input);
             });
         }
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
+        let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             stop(&mut child);
             return Err(GitError::Unreadable);
         };
-        let errors = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = (&mut stderr)
-                .take(STDERR_BYTES as u64)
-                .read_to_end(&mut bytes);
-            // Drain the rest so git never blocks on a full pipe.
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            bytes
-        });
+        let errors = keep_errors(stderr);
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -647,6 +711,158 @@ impl Repo {
             }
         })
         .collect()
+    }
+
+    /// Copy every object reachable from commit `sha` into `to`, with no
+    /// transport: this repository writes them as one pack, and `to` indexes
+    /// it. Both run within this repository's time limit, and a failure of
+    /// either stops the other. A shallow or grafted repository is refused by
+    /// the caller first: its history would be cut where git believes it
+    /// ends, so check the copy with [`Repo::has_everything`].
+    pub fn copy_reachable(&self, sha: &str, to: &Repo) -> Result<(), GitError> {
+        check_sha(sha)?;
+        let deadline = Instant::now() + self.git.timeout;
+        let mut pack = self.command();
+        pack.args(["pack-objects", "--revs", "--stdout", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut packer = pack.spawn()?;
+        let fail = |packer: &mut Child, e: GitError| {
+            stop(packer);
+            e
+        };
+        let written = packer
+            .stdin
+            .take()
+            .ok_or(GitError::Unreadable)
+            .and_then(|mut stdin| Ok(stdin.write_all(format!("{sha}\n").as_bytes())?));
+        if let Err(e) = written {
+            return Err(fail(&mut packer, e));
+        }
+        let (Some(stream), Some(pack_errors)) = (packer.stdout.take(), packer.stderr.take()) else {
+            return Err(fail(&mut packer, GitError::Unreadable));
+        };
+        let pack_errors = keep_errors(pack_errors);
+        let mut index = to.command();
+        index
+            .args(["index-pack", "--stdin"])
+            .stdin(Stdio::from(stream))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut indexer = match index.spawn() {
+            Ok(indexer) => indexer,
+            Err(e) => return Err(fail(&mut packer, e.into())),
+        };
+        let Some(index_errors) = indexer.stderr.take() else {
+            stop(&mut indexer);
+            return Err(fail(&mut packer, GitError::Unreadable));
+        };
+        let index_errors = keep_errors(index_errors);
+        let left = || deadline.saturating_duration_since(Instant::now());
+        let indexed = wait_for(&mut indexer, left())?;
+        let packed = match indexed {
+            Some(_) => wait_for(&mut packer, left())?,
+            None => None,
+        };
+        let (Some(indexed), Some(packed)) = (indexed, packed) else {
+            stop(&mut indexer);
+            stop(&mut packer);
+            return Err(GitError::Timeout(self.git.timeout));
+        };
+        let (pack_errors, index_errors) = (
+            pack_errors.join().unwrap_or_default(),
+            index_errors.join().unwrap_or_default(),
+        );
+        if !packed.success() {
+            return Err(GitError::Failed {
+                what: "pack-objects".into(),
+                code: packed.code(),
+                stderr: printable(&pack_errors),
+            });
+        }
+        if !indexed.success() {
+            return Err(GitError::Failed {
+                what: "index-pack".into(),
+                code: indexed.code(),
+                stderr: printable(&index_errors),
+            });
+        }
+        Ok(())
+    }
+
+    /// Whether this repository holds commit `sha` and every object it
+    /// reaches, as `git rev-list --objects` walks them.
+    pub fn has_everything(&self, sha: &str) -> Result<bool, GitError> {
+        check_sha(sha)?;
+        match self.run(&["rev-list", "--objects", "--quiet", sha, "--"], None) {
+            Ok(_) => Ok(true),
+            // A missing object is fatal to the walk; any other failure is
+            // not an answer.
+            Err(GitError::Failed {
+                code: Some(128), ..
+            }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether commit `ancestor` is `descendant` or one of its ancestors.
+    pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool, GitError> {
+        check_sha(ancestor)?;
+        check_sha(descendant)?;
+        match self.run(&["merge-base", "--is-ancestor", ancestor, descendant], None) {
+            Ok(_) => Ok(true),
+            Err(GitError::Failed { code: Some(1), .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The hash this repository names its objects with: `sha1` or `sha256`.
+    pub fn object_format(&self) -> Result<String, GitError> {
+        Ok(self
+            .text(&["rev-parse", "--show-object-format"])?
+            .trim()
+            .to_owned())
+    }
+
+    /// Whether this repository is shallow: its history is cut short.
+    pub fn is_shallow(&self) -> Result<bool, GitError> {
+        Ok(self.text(&["rev-parse", "--is-shallow-repository"])?.trim() == "true")
+    }
+
+    /// Every entry of commit `sha`'s tree, recursively: its mode, type
+    /// (`blob`, `tree` or `commit`, a submodule), object ID and path.
+    pub fn entries(&self, sha: &str) -> Result<Vec<TreeEntry>, GitError> {
+        check_sha(sha)?;
+        let out = self.run(&["ls-tree", "-r", "-z", "--full-tree", sha], None)?;
+        out.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|entry| {
+                let text = std::str::from_utf8(entry).map_err(|_| GitError::Unreadable)?;
+                let (head, path) = text.split_once('\t').ok_or(GitError::Unreadable)?;
+                let mut parts = head.split(' ');
+                let (Some(mode), Some(kind), Some(id)) = (parts.next(), parts.next(), parts.next())
+                else {
+                    return Err(GitError::Unreadable);
+                };
+                if !is_sha(id) {
+                    return Err(GitError::Unreadable);
+                }
+                Ok(TreeEntry {
+                    mode: mode.to_owned(),
+                    kind: kind.to_owned(),
+                    id: id.to_owned(),
+                    path: path.to_owned(),
+                })
+            })
+            .collect()
+    }
+
+    /// The contents of blob `id`, read by its object ID, so any path it has
+    /// in a tree is read the same.
+    pub fn blob_by_id(&self, id: &str) -> Result<Vec<u8>, GitError> {
+        check_sha(id)?;
+        self.run(&["cat-file", "blob", id], None)
     }
 
     /// The tree of commit `sha`.
