@@ -955,33 +955,6 @@ pub struct ExecSandbox {
     helper: PathBuf,
     guard: StateGuard,
     codex_home: PathBuf,
-    /// For crash and durability tests only (see [`test_log_dir`]).
-    test_log: Option<PathBuf>,
-}
-
-/// For crash and durability tests only, which count across runs how often
-/// a command ran: with the `failpoints` feature, `ATOMIC_TEST_EXEC_LOG`
-/// names a directory, by one plain name inside the state directory, that
-/// every confined command may also write. Compiled out without the feature,
-/// so a build for use has none.
-fn test_log_dir(guard: &StateGuard) -> Option<PathBuf> {
-    #[cfg(feature = "failpoints")]
-    {
-        let name = std::env::var("ATOMIC_TEST_EXEC_LOG").ok()?;
-        let plain = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        match guard {
-            StateGuard::Deny(private) if plain => Some(private.state_dir.join(name)),
-            _ => None,
-        }
-    }
-    #[cfg(not(feature = "failpoints"))]
-    {
-        let _ = guard;
-        None
-    }
 }
 
 impl ExecSandbox {
@@ -993,15 +966,10 @@ impl ExecSandbox {
             "this process has no Linux sandbox helper to confine exec atoms' commands with; \
              run atomic itself, which provides one",
         )?;
-        let test_log = test_log_dir(&guard);
-        if let Some(dir) = &test_log {
-            crate::state::private_dir(dir)?;
-        }
         Ok(Self {
             helper,
             guard,
             codex_home,
-            test_log,
         })
     }
 
@@ -1015,9 +983,6 @@ impl ExecSandbox {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
         };
-        let mut writes = writable.to_vec();
-        writes.extend(self.test_log.iter().cloned());
-        let writable = writes.as_slice();
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
