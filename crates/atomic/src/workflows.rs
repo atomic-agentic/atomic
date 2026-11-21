@@ -178,8 +178,9 @@ pub fn atom_failure(e: AtomError) -> DurableError {
             std::process::exit(NO_ROOM_EXIT);
         }
         // Like a crash before the checkpoint: recovery runs the step again,
-        // through its attempt guard.
-        e @ (AtomError::OutcomeUnknown(_) | AtomError::Stopping) => {
+        // through its attempt guard. A store held while a step's inputs were
+        // given, in the step that records its attempt, records nothing.
+        e @ (AtomError::OutcomeUnknown(_) | AtomError::Stopping | AtomError::StoreHeld(_)) => {
             DurableError::Interrupted(e.to_string())
         }
         e => DurableError::Failed(e.to_string()),
