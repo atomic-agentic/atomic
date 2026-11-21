@@ -182,7 +182,7 @@ impl Project {
              note = json.load(sys.stdin)\n\
              if os.fork() == 0:\n\
              \x20   os.setpgid(0, 0)\n\
-             \x20   log = open(note['text'], 'w')\n\
+             \x20   log = open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], note['text']), 'w')\n\
              \x20   try:\n\
              \x20       tty = os.open('/dev/tty', os.O_RDWR)\n\
              \x20   except OSError as e:\n\
@@ -698,9 +698,9 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     support::require_sandbox();
     let p = Project::new("inject");
     p.enroll();
-    // In the project's caches, which a confined command may write.
-    let log = p.state().join("cache/inject.log");
-    let data = json!({"text": log.display().to_string()}).to_string();
+    // In the run's caches, which a confined command may write, and which
+    // stay while the run waits at its gate.
+    let data = json!({"text": "inject.log"}).to_string();
     let out = p.at_terminal_with(
         &["run", "injected", "--run-id", "typed-in", "--data", &data],
         &[],
@@ -708,7 +708,12 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     );
     let t = text(&out);
     assert!(t.contains("gate typed-in:deploy is waiting for you"), "{t}");
-    let tried = std::fs::read_to_string(&log).unwrap_or_default();
+    let tried = std::fs::read_dir(p.state().join("cache"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find_map(|run| std::fs::read_to_string(run.path().join("inject.log")).ok())
+        .unwrap_or_default();
     assert!(
         tried.starts_with("no tty"),
         "the command reached the terminal: {tried} {t}"

@@ -55,7 +55,7 @@ state (every project's database and gate store under the atomic home's
 directories) and the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
 [configuration](#configuration)). It can write only its own scratch directory (its `HOME`
-and `TMPDIR`) and the project's build caches; a command that writes anywhere
+and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
 
@@ -63,8 +63,14 @@ the hosts it reaches (see [Network access](#network-access)). It also:
   sandbox keeps them in every writable directory;
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
-- is not told where the caches are: name the directory in `env` if a tool needs
-  it;
+- finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
+  toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
+  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
+  which is the step's own, and removed when the run ends. No other run's
+  command may write them, though one can still read them by their path while
+  they last, so keep nothing secret there. A variable the atom declares in
+  `env` wins. An eval gives the command no caches;
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor
@@ -193,7 +199,20 @@ another private suffix, a bare `*`, and anything with a scheme, a port, a path
 or a Unix socket are refused. That list of private names is a courtesy. The
 control is the proxy, which resolves each listed name before it connects and
 refuses one that resolves to an address on this machine or a private network,
-or that does not resolve.
+or that does not resolve. Every address the interfaces of atomic's network
+namespace have counts as this machine's, public ones included; a container's
+or a virtual machine's addresses on another namespace are refused only when
+they are private. Three IPv6 prefixes that carry an IPv4 address inside them
+are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
+(which holds the well-known `64:ff9b::/96` and the local-use
+`64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
+IPv6-only network that reaches IPv4 through DNS64, a listed host with only
+an IPv4 address therefore cannot be reached: the proxy refuses the address
+DNS64 makes up for it, and the IPv4 one has no route. A NAT64 prefix of the
+network's own, other than `64:ff9b::/32`, is not covered. The machine's
+addresses are read when a proxy starts: one it gains while that proxy runs is
+not refused by it, and a command that starts after the change gets a new
+proxy that refuses it.
 
 Know what a listed host can get:
 
@@ -204,9 +223,19 @@ Know what a listed host can get:
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
-- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
-  a shared-hosting suffix reaches every customer's buckets and sites there, not
-  only yours. List the exact names.
+- **Every name under a wildcard.** atomic checks a wildcard against the
+  Public Suffix List, its ICANN section (`co.uk`) and its private one, where
+  each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
+  is refused when the atom loads if the name under it is on the list, or if
+  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
+  others: name the exact hosts instead. A wildcard above a listed name, such
+  as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
+  it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
+  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  hold, such as `*.example.com`, still reaches whatever is served under it,
+  and a shared host missing from the list is not caught. List exact names
+  where you can.
 
 The rule is enforced on Linux only. On macOS and Windows exec commands run
 unconfined, with whatever network the machine has, and a declaration restricts
@@ -339,7 +368,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default); any other value fails the load. A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts. Before a run's first step, every step is checked again, on what the run recorded and what its bindings read; a resumed or served run is checked on its recorded data. See [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -560,7 +589,7 @@ protect against a process running as you.
 
 ## Related references
 
-- [Prompt components and expressions](../guides/template-tags.md)
+- [Prompt expressions and components](../guides/template-tags.md)
 - [VS Code](../guides/vs-code.md)
 - [Workflow files](workflow-files.md)
 - [Scripts and cloud SDKs](../guides/scripts-and-cloud-sdks.md)
