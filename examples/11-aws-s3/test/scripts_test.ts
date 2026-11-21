@@ -216,8 +216,10 @@ Deno.test("fetch-report reassembles a report that arrives in pieces", () =>
 Deno.test("fetch-report refuses an over-limit report without reading its body", () =>
   withFake(async (s3, host) => {
     // Well over the limit, length declared, and no byte on its way until
-    // 250 ms in: the refusal comes from the declared length while the body
-    // has only just begun, so a step that read any of it would show it had.
+    // 250 ms in: the declared length answers the refusal on its own, and the
+    // fake is left holding a body it never got to send. That the transfer
+    // ended with the refusal rather than with this child is what
+    // test/fetch_report_test.ts measures, in a process that stays alive.
     s3.stream(BUCKET, report, {
       total: 10 * 1024 * 1024,
       chunkBytes: 8192,

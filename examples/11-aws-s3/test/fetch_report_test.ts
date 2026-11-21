@@ -67,12 +67,12 @@ const refuse = async (key: string) => {
 
 /**
  * Says that this GET's transfer ended with the refusal that just happened, and
- * not later or not at all. Both clocks start when the request starts, so they
- * are comparable; a second is the leave given to a close that travels through
- * the SDK rather than the socket. Nothing here has exited, so the close the
- * fake sees can only be the fetch's own.
+ * not later or not at all, and returns what the fake saw. The two clocks start
+ * together — one when the call is made, one when its request reaches the fake —
+ * so they are comparable, with a second left for scheduling. Nothing here has
+ * exited, so the close the fake sees can only be the fetch's own.
  */
-const assertEnded = async (s3: FakeS3, refusedAfterMs: number) => {
+const assertEnded = async (s3: FakeS3, refusedAfterMs: number): Promise<Transfer> => {
   let seen = transfer(s3);
   for (let waited = 0; !seen.closedEarly && waited <= 1_000; waited += 10) {
     await new Promise((r) => setTimeout(r, 10));
@@ -92,6 +92,7 @@ const assertEnded = async (s3: FakeS3, refusedAfterMs: number) => {
   if (seen.finished) {
     throw new Error(`the whole body went out: ${JSON.stringify(seen)}`);
   }
+  return seen;
 };
 
 Deno.test("an in-process fetch ends the transfer of a report whose length was declared", () =>
@@ -100,7 +101,8 @@ Deno.test("an in-process fetch ends the transfer of a report whose length was de
     try {
       // 10 MB with its length declared, the first byte held back 250 ms and a
       // chunk every 25 ms after: nothing to refuse from but the length, and
-      // minutes of sending left running if the refusal does not end it.
+      // some sixteen seconds of sending left running if the refusal does not
+      // end it.
       s3.stream(BUCKET, report, {
         total: 10 * 1024 * 1024,
         chunkBytes: 16_384,
@@ -111,7 +113,12 @@ Deno.test("an in-process fetch ends the transfer of a report whose length was de
       if (message !== `${report} is larger than ${MAX_BYTES} bytes`) {
         throw new Error(`refused with: ${message}`);
       }
-      await assertEnded(s3, ms);
+      const seen = await assertEnded(s3, ms);
+      // Refused from the header alone: the body was never taken up, so there
+      // was nothing to give up on either.
+      if (seen.sent !== 0) {
+        throw new Error(`read ${seen.sent} bytes of the body: ${JSON.stringify(seen)}`);
+      }
     } finally {
       restore();
     }
