@@ -1475,31 +1475,31 @@ fn base_name(key: &str) -> &str {
         .map_or(key, |(base, _)| base)
 }
 
-/// How surely the field at `key` holds a secret: for a key renamed, what
-/// its new name says, before its number, or, under a secret's name
-/// (`held`), the surer of that and what its original key said, so a
-/// secret's name redacted whole is still one there; for any other key,
-/// what its name says, before any number.
+/// How surely the field at `key` holds a secret: what its name says (see
+/// [`name_strength`]), number and all, so a second pass reads it as this
+/// one does; for a key renamed, the surer of that and what its new name
+/// said before it was numbered, and, under a secret's name (`held`), what
+/// its original key said too, so a secret's name redacted whole is still
+/// one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
+    let whole = name_strength(key);
     match renamed.get(key) {
-        Some(r) if held => surer(name_strength(&r.original), name_strength(&r.name)),
-        Some(r) => name_strength(&r.name),
-        None => name_strength(key),
+        Some(r) if held => surer(
+            whole,
+            surer(name_strength(&r.original), name_strength(&r.name)),
+        ),
+        Some(r) => surer(whole, name_strength(&r.name)),
+        None => whole,
     }
 }
 
-/// How surely a key, which may carry a number, names a secret. Only a key
-/// redacted already is numbered by redaction, so only there is its number
-/// dropped before it is read; any other is read both whole and without what
-/// looks like a number, and the surer reading taken, so `token (2)` is never
-/// weaker than its whole name says.
+/// How surely a key, which may carry a number, names a secret: read both
+/// whole and without what looks like a number, and the surer reading
+/// taken, so `token (2)` is never weaker than its whole name or its name
+/// alone says. A key that redaction numbered can read surer than its name
+/// did, and so hide a count: a value hidden is better than a secret shown.
 fn name_strength(key: &str) -> Strength {
-    let base = base_name(key);
-    if base.contains(REDACTED) {
-        strength(base)
-    } else {
-        surer(strength(key), strength(base))
-    }
+    surer(strength(key), strength(base_name(key)))
 }
 
 /// The surer of two strengths.
@@ -1514,22 +1514,38 @@ fn surer(a: Strength, b: Strength) -> Strength {
 
 /// What a key under a secret's name becomes, if anything: wholly
 /// [`REDACTED`] when it looks like a credential itself, as in
-/// `{"token": {"<key>": 1}}`, whatever word it spells, else as any key
-/// redacts. A key redacted in part already is judged by what is left of
-/// it, so redacting again changes nothing, and still redacts as text.
+/// `{"token": {"<key>": 1}}`, whatever word it spells, or when what is
+/// left of it once it redacts as text does; else as it redacts as text.
+/// A key redacted in part is judged by what is left of it, so this gives
+/// its final form at once, and redacting again changes nothing.
 fn held_key(key: &str) -> Option<String> {
-    let base = base_name(key);
-    // What is left once the marker and the separators around it go: of
-    // `password= [REDACTED]`, the name `password`.
-    let rest = base.replace(REDACTED, "");
-    let rest = rest.trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ';' | ','));
-    if base != REDACTED && !rest.is_empty() && key_looks_like_credential(rest) {
+    if held_credential(key) {
         return Some(REDACTED.to_owned());
     }
     match text(key) {
+        Cow::Owned(new_key) if held_credential(&new_key) => Some(REDACTED.to_owned()),
         Cow::Owned(new_key) => Some(new_key),
         Cow::Borrowed(_) => None,
     }
+}
+
+/// Whether `key`, under a secret's name, looks like a credential: before
+/// its number, and when redacted in part, by what is left once the marker
+/// and the separators around it go (of `password= [REDACTED]`, the name
+/// `password`). A key with no marker is judged whole, separators and all.
+fn held_credential(key: &str) -> bool {
+    let base = base_name(key);
+    if base == REDACTED {
+        return false;
+    }
+    let rest = if base.contains(REDACTED) {
+        let rest = base.replace(REDACTED, "");
+        rest.trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ';' | ','))
+            .to_owned()
+    } else {
+        base.to_owned()
+    };
+    !rest.is_empty() && key_looks_like_credential(&rest)
 }
 
 /// Whether a key looks like a credential rather than a name: not a

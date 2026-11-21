@@ -90,7 +90,7 @@ untouched() {
 repo="$(fresh)"
 run honest
 [ "${code}" -eq 0 ] || fail "honest: exit ${code}: ${out}"
-[ "$(grep -c '^ok ' <<<"${out}")" -eq 17 ] || fail "honest: not seventeen controls ok: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq 21 ] || fail "honest: not twenty-one controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 

@@ -1374,8 +1374,11 @@ fn numbering_keys_that_redact_alike_stays_linear() {
     );
 }
 
-/// A numbered key's value is judged by its name before its number: a
-/// secret's name stays one, and a count's stays a count.
+/// A numbered key's value is judged by its name both with and without its
+/// number, the surer reading taken: a secret's name stays one, a count's
+/// name alone keeps its count, and a count that redaction numbered hides
+/// it. Redacting again then changes nothing.
+/// Redacting again then changes nothing more.
 #[test]
 fn a_numbered_keys_value_is_judged_by_its_name() {
     let (a, b) = (SHAPES[0], SHAPES[1]);
@@ -1395,14 +1398,45 @@ fn a_numbered_keys_value_is_judged_by_its_name() {
         format!("{b} token_count"): 13,
     });
     value(&mut counted);
-    let mut kept: Vec<i64> = counted
-        .as_object()
-        .expect("an object")
-        .values()
-        .filter_map(Value::as_i64)
-        .collect();
-    kept.sort_unstable();
-    assert_eq!(kept, [12, 13], "{counted}");
+    let fields = counted.as_object().expect("an object");
+    assert_eq!(fields.len(), 2, "{counted}");
+    let name = format!("{REDACTED} token_count");
+    assert!(
+        matches!(fields.get(&name).and_then(Value::as_i64), Some(12 | 13)),
+        "the count under its name alone was hidden: {counted}"
+    );
+    // Numbered, it reads as a token's name, as a second pass reads it.
+    assert_eq!(
+        fields.get(&format!("{name} (2)")),
+        Some(&json!(REDACTED)),
+        "{counted}"
+    );
+    let mut again = counted.clone();
+    value(&mut again);
+    assert_eq!(again, counted, "a second pass changed it");
+}
+
+/// A key numbered already, fed back in, is judged by its whole name and its
+/// name alone, and a second pass is the last that changes anything.
+#[test]
+fn a_numbered_key_fed_back_in_settles_after_one_more_pass() {
+    let mut once = json!({
+        format!("{REDACTED} token_count"): 12,
+        format!("{REDACTED} token_count (2)"): 13,
+        format!("{REDACTED}.token (2)"): "hunter2",
+        format!("{REDACTED} password_count (2)"): "hunter3",
+        "token": {"pass (2)": "abc", "pass (2) (3)": "abd"},
+    });
+    value(&mut once);
+    let shown = once.to_string();
+    for secret in ["hunter2", "hunter3", "\"abc\"", "\"abd\""] {
+        assert!(!shown.contains(secret), "a secret showed");
+    }
+    let mut twice = once.clone();
+    value(&mut twice);
+    let mut thrice = twice.clone();
+    value(&mut thrice);
+    assert_eq!(thrice, twice, "a third pass changed it");
 }
 
 /// The same object numbers its entries the same, whatever order its keys
@@ -1632,14 +1666,21 @@ fn a_flag_value_under_a_secrets_name_is_redacted() {
 /// would, at the top level and under a secret's name.
 #[test]
 fn a_key_that_looks_numbered_holds_its_value_as_its_whole_name_says() {
-    for held in [
+    for (case, held) in [
         json!({"token (2)": "hunter2", "pass (2)": "abc"}),
         json!({"secrets": {"token (2)": "hunter2", "pass (2)": "abc"}}),
-    ] {
+        json!({"token": {"pass (2)": "abc"}}),
+        json!({format!("{REDACTED}.token (2)"): "hunter2"}),
+        json!({format!("{REDACTED} password_count (2)"): "hunter2"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut out = held.clone();
         value(&mut out);
-        assert!(!out.to_string().contains("hunter2"), "{out}");
-        assert!(!out.to_string().contains("\"abc\""), "{out}");
+        let shown = out.to_string();
+        assert!(!shown.contains("hunter2"), "case {case}: a secret showed");
+        assert!(!shown.contains("\"abc\""), "case {case}: a secret showed");
     }
 }
 
@@ -1647,9 +1688,32 @@ fn a_key_that_looks_numbered_holds_its_value_as_its_whole_name_says() {
 /// redacted stays so when redacted again.
 #[test]
 fn a_held_name_and_value_key_redacted_again_stays() {
-    let mut once = json!({"token": {"password= hunter2x": 1}});
-    value(&mut once);
-    let mut twice = once.clone();
-    value(&mut twice);
-    assert_eq!(once, twice);
+    for (case, key) in ["password= hunter2x", "password=\"hunter2 x\""]
+        .into_iter()
+        .enumerate()
+    {
+        let mut once = json!({"token": {key: 1}});
+        value(&mut once);
+        assert!(
+            !once.to_string().contains("hunter2"),
+            "case {case}: a secret showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(once, twice, "case {case}: a second pass changed it");
+    }
+}
+
+/// Under a secret's name, a key with no marker in it is judged whole: one
+/// that looks like a credential only with its padding is hidden.
+#[test]
+fn a_held_key_with_no_marker_is_judged_whole() {
+    let mut out = json!({"token": {"MFRGGZDFMZTWQ===": 1}});
+    value(&mut out);
+    let keys: Vec<&String> = out["token"]
+        .as_object()
+        .expect("an object")
+        .keys()
+        .collect();
+    assert_eq!(keys, [REDACTED], "{out}");
 }
