@@ -551,6 +551,8 @@ dependencies = [
  "codex-core-api",
  "codex-extension-api",
  "codex-keyring-store",
+ "codex-login",
+ "codex-process-hardening",
  "codex-protocol",
  "deno_core",
  "dirs",
