@@ -41,6 +41,7 @@ test entry_point
 test examples
 test exec_private_state
 test exec_caches
+test exec_network
 test failpoints
 test fixture_cli
 test gate_prompt
@@ -63,6 +64,8 @@ test gates
 test nested_steps
 test step_positions
 test test_database
+test model_auth
+test model_auth_sandbox
 test stop_all
 test stop_bomb
 

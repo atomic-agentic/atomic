@@ -486,6 +486,7 @@ fn the_drift_check_sees_inputs_prepared_values_and_jsonl_rows() {
         expect: vec!["true".into()],
         case: Value::Null,
         prepared,
+        origin: "external".into(),
     };
     let write = |name: &str, text: &str| std::fs::write(fixtures.join(name), text).expect("write");
     write("one.input.json", r#"{"text": "a"}"#);

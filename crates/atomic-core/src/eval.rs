@@ -52,6 +52,12 @@ pub struct Case {
     pub case: Value,
     /// The values the atom's `prepare` would return, if the case gives them.
     pub prepared: Option<Value>,
+    /// How far its input may be trusted, as its own file says: `external`,
+    /// the default, `agent` or `team` (see [`crate::workflow::TRUST`]). A
+    /// case captured from a run keeps the origin its input was recorded
+    /// with. It decides both whether the atom may take the case and how
+    /// the input is labelled in the atom's prompt.
+    pub origin: String,
 }
 
 /// Where an atom's cases are and the pass rate they must reach.
@@ -81,7 +87,7 @@ pub struct CaseError {
 }
 
 /// The keys a case may have.
-const KEYS: &[&str] = &["input", "expect", "case", "prepared"];
+const KEYS: &[&str] = &["input", "expect", "case", "prepared", "origin"];
 
 /// `atom`'s eval settings in `project`. Its `evals` field is either the
 /// eval directory, relative to the atom file, or a mapping of `dir` and
@@ -214,22 +220,24 @@ pub fn load_cases(atom: &Atom, settings: &Settings) -> Result<Vec<Case>, CaseErr
                 let value = strict_json(line)
                     .map_err(|e| at(line_no, format!("a case is one JSON object per line: {e}")))?;
                 cases.push(
-                    case_from(&value, format!("{relative}:{}", n + 1), &contracts)
+                    case_from(&value, format!("{relative}:{}", n + 1), &contracts, atom)
                         .map_err(|(_, message)| at(line_no, message))?,
                 );
             }
         } else {
             let doc = atomic_schema::yaml::load(&file, &text)
                 .map_err(|e| at(Some(e.at.line), e.message))?;
-            cases.push(case_from(&doc.value, relative.clone(), &contracts).map_err(
-                |(pointer, message)| {
-                    let line = doc
-                        .position(&pointer)
-                        .or_else(|| doc.position(""))
-                        .map(|p| p.line);
-                    at(line, message)
-                },
-            )?);
+            cases.push(
+                case_from(&doc.value, relative.clone(), &contracts, atom).map_err(
+                    |(pointer, message)| {
+                        let line = doc
+                            .position(&pointer)
+                            .or_else(|| doc.position(""))
+                            .map(|p| p.line);
+                        at(line, message)
+                    },
+                )?,
+            );
         }
         if cases.len() > MAX_CASES {
             return Err(at_dir(format!(
@@ -297,7 +305,12 @@ fn fits(schema: &Value, value: &Value, what: &str) -> Result<(), String> {
 /// is wrong.
 type Refusal = (String, String);
 
-fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, Refusal> {
+fn case_from(
+    value: &Value,
+    id: String,
+    contracts: &Contracts,
+    atom: &Atom,
+) -> Result<Case, Refusal> {
     let root = |m: &str| (String::new(), m.to_owned());
     let Value::Object(fields) = value else {
         return Err(root("a case is a mapping of input and expect"));
@@ -333,6 +346,46 @@ fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, R
         }
     };
     fits(&contracts.input, &input, "the input").map_err(|m| ("/input".to_owned(), m))?;
+    // The case's origin: what its own file says, or external. A committed
+    // case file may still hold text copied from anywhere, so nothing but the
+    // file itself raises it.
+    let origin = match fields.get("origin") {
+        None => "external".to_owned(),
+        Some(Value::String(s)) if crate::workflow::TRUST.contains(&s.as_str()) => s.clone(),
+        Some(other) => {
+            return Err((
+                "/origin".to_owned(),
+                format!(
+                    "`origin` is {}, not {other}",
+                    crate::workflow::TRUST.join(", ")
+                ),
+            ));
+        }
+    };
+    // Refused here, before any call or command, as a workflow binding that
+    // risky data to the atom would be.
+    if let Some(refused) =
+        crate::workflow::untrusted_binding(atom, &format!("case {id}'s input"), &origin)
+    {
+        let at = if fields.contains_key("origin") {
+            "/origin"
+        } else {
+            ""
+        };
+        let label = match crate::workflow::accepted_trust(atom) {
+            "team" => "label the case `origin: team` if a person on the team wrote or reviewed \
+                       its input"
+                .to_owned(),
+            accepts => format!(
+                "label the case `origin: {accepts}` if its input came from a model step, or \
+                 `origin: team` if a person on the team wrote or reviewed it"
+            ),
+        };
+        return Err((
+            at.to_owned(),
+            format!("{refused}. For an eval case, {label}"),
+        ));
+    }
     let case = fields.get("case").cloned().unwrap_or(Value::Null);
     if fields.contains_key("case") {
         fits(&contracts.case, &case, "the case metadata").map_err(|m| ("/case".to_owned(), m))?;
@@ -356,6 +409,7 @@ fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, R
         expect,
         case,
         prepared: fields.get("prepared").cloned(),
+        origin,
     })
 }
 
@@ -1011,7 +1065,7 @@ fn escape(text: &str) -> String {
 }
 
 /// The atom itself as a [`Subject`]: each case's input run on `runtimes`,
-/// as external input, its output checked against the atom's contract and
+/// labelled with the case's origin, its output checked against the atom's contract and
 /// its `validate` rules as any run's is. An atom that writes to an outside
 /// system is never run, whatever loaded its cases.
 pub struct AtomSubject<'a> {
@@ -1031,6 +1085,15 @@ impl Subject for AtomSubject<'_> {
                     self.atom.name
                 ));
             }
+            // Held to the atom's trust here too, for a case not built by
+            // the load.
+            if let Some(refused) = crate::workflow::untrusted_binding(
+                self.atom,
+                &format!("case {}'s input", case.id),
+                &case.origin,
+            ) {
+                return Err(refused);
+            }
             if case.prepared.is_some() {
                 return Err(
                     "a case's `prepared` values are not supported by this runner yet".into(),
@@ -1046,9 +1109,10 @@ impl Subject for AtomSubject<'_> {
                 &mut registry,
                 &case.input,
                 &run_id,
-                // A case file is not team-reviewed input: it may hold text
-                // copied from anywhere, so it renders as external.
-                "external",
+                // The origin the case's file gives its input, external
+                // unless it says otherwise: the same one its load checked
+                // against the atom's trust.
+                &case.origin,
                 self.runtimes,
             )
             .await

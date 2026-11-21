@@ -27,6 +27,8 @@
 #                         checkouts outside this repository (a fork being worked on, say)
 #   ATOMIC_DEV_WAIT_LOCK  a file; while it exists, refuse to start (for hosts shared with
 #                         benchmarks that must not be disturbed)
+#   ATOMIC_DEV_DETACHED=1 let the run outlive the process that started it, as for
+#                         `nohup scripts/dev.sh … &`
 #   ATOMIC_DEV_MIN_FREE_GB  refuse to start when the disk holding the repository or the cargo
 #                         cache has less than this many GiB free (default 10; 0 turns it off)
 #   ATOMIC_TEST_*, RUST_LOG, RUST_BACKTRACE are passed through when set.
@@ -40,10 +42,65 @@
 #   75   ATOMIC_DEV_WAIT_LOCK exists, or the disk is too full, so nothing was started
 #   124  the command hit ATOMIC_DEV_TIMEOUT
 #   137  the command was killed, usually by the memory limit
+#   130, 143, 129  this script was stopped by SIGINT, SIGTERM or SIGHUP, or its parent died
+#                  (143)
+#
+# Stopping this script, by SIGINT, SIGTERM or SIGHUP, removes the container it started before it
+# exits. Killing it outright, or its process group, or the process that started it, removes the
+# container within a few seconds: a watcher in a session of its own sees to that. Only that
+# container: each run labels its own with a token of its own, and nothing else is touched. The
+# test Postgres stays up, since every run on the host shares it. With ATOMIC_DEV_DETACHED=1 the
+# run outlives the process that started it (for `nohup scripts/dev.sh … &`); started by the
+# system's first process, it always does.
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENGINE="${ATOMIC_CONTAINER:-docker}"
+LABEL_KEY="org.atomic-agentic.dev-run"
+
+# Whether process $1 is there and not a zombie. ps sees a process whoever owns it, where kill -0
+# would fail for one this user may not signal.
+running() {
+    local stat
+    stat="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+    case "${stat}" in
+        '' | Z*) return 1 ;;
+    esac
+}
+
+# Remove the containers labelled with token $1, if there are any.
+remove_container() {
+    local ids
+    ids="$("${ENGINE}" ps -aq --filter "label=${LABEL_KEY}=$1" 2>/dev/null || true)"
+    [ -n "${ids}" ] || return 0
+    # shellcheck disable=SC2086
+    "${ENGINE}" rm -f ${ids} >/dev/null 2>&1 || true
+}
+
+# The watcher, run as `dev.sh --watch-run TOKEN SCRIPT PARENT`, PARENT 0 for none: while the
+# script runs and its parent lives, wait; then stop the script, so its trap removes the
+# container and it says how it ended, and remove the container itself, again a little later,
+# in case a client was just starting one.
+if [ "${1:-}" = "--watch-run" ]; then
+    trap '' INT TERM HUP
+    token="$2" script="$3" parent="$4"
+    while running "${script}" && { [ "${parent}" = 0 ] || running "${parent}"; }; do
+        sleep 1
+    done
+    if running "${script}"; then
+        kill -TERM "${script}" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            running "${script}" || break
+            sleep 1
+        done
+    fi
+    for _ in 1 2 3; do
+        remove_container "${token}"
+        sleep 2
+    done
+    exit 0
+fi
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOCKERFILE="${ROOT}/dev/Dockerfile"
 
 if command -v sha256sum >/dev/null 2>&1; then
@@ -69,6 +126,47 @@ if [ -n "${ATOMIC_DEV_WAIT_LOCK:-}" ] && [ -e "${ATOMIC_DEV_WAIT_LOCK}" ]; then
     echo "scripts/dev.sh: ${ATOMIC_DEV_WAIT_LOCK} exists, so nothing was started. Try again when it is gone." >&2
     exit 75
 fi
+
+# The container is this run's alone, found by a label with a token of this run's: stopping it
+# never touches another run's container, or anything else on the host.
+TOKEN="$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"
+NAME="atomic-dev-${TOKEN}"
+
+# The watcher starts before anything else, so a parent that dies during setup is seen too. It runs
+# in a session of its own and is not this script's child, so what kills this script's process
+# group or tree leaves it to remove the container.
+parent="${PPID}"
+if [ "${parent}" -le 1 ] || [ "${ATOMIC_DEV_DETACHED:-0}" = 1 ]; then
+    parent=0
+fi
+if command -v setsid >/dev/null 2>&1; then
+    setsid -f "${BASH}" "${BASH_SOURCE[0]}" --watch-run "${TOKEN}" "$$" "${parent}" \
+        </dev/null >/dev/null 2>&1
+else
+    perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exec @ARGV' \
+        "${BASH}" "${BASH_SOURCE[0]}" --watch-run "${TOKEN}" "$$" "${parent}" \
+        </dev/null >/dev/null 2>&1
+fi
+
+# Stopped by a signal: end the client, giving it a moment, then remove the container, so it is
+# gone before this script exits. A signal before the client is known leaves the container, if
+# one is just starting, to the watcher.
+client=""
+stopped() {
+    trap '' INT TERM HUP
+    if [ -n "${client}" ]; then
+        kill "${client}" 2>/dev/null || true
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            kill -0 "${client}" 2>/dev/null || break
+            sleep 0.2
+        done
+    fi
+    remove_container "${TOKEN}"
+    exit "$1"
+}
+trap 'stopped 130' INT
+trap 'stopped 143' TERM
+trap 'stopped 129' HUP
 
 mkdir -p "${CACHE}/cargo"
 
@@ -160,11 +258,15 @@ if [ $# -eq 0 ]; then
     set -- bash
 fi
 
+
 # --memory-swap equal to --memory means no swap. A low --cpu-shares lets other work on the host
 # win when they compete for a CPU. timeout runs inside the container, because a timeout on the
-# host would only kill the client; --init ends everything left when the command exits.
-exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
-    --name "atomic-dev-$$" \
+# host would only kill the client; --init ends everything left when the command exits. The
+# client runs in the background, its standard input this script's, so that a signal reaches
+# the traps above while it runs.
+"${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
+    --name "${NAME}" \
+    --label "${LABEL_KEY}=${TOKEN}" \
     ${net_flags[@]+"${net_flags[@]}"} \
     ${env_flags[@]+"${env_flags[@]}"} \
     "${user_flags[@]}" \
@@ -184,4 +286,9 @@ exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
     ${mount_flags[@]+"${mount_flags[@]}"} \
     -w "${ROOT}" \
     "${IMAGE}" \
-    timeout --foreground --kill-after=30s "${LIMIT}" "$@"
+    timeout --foreground --kill-after=30s "${LIMIT}" "$@" <&0 &
+client=$!
+status=0
+wait "${client}" || status=$?
+remove_container "${TOKEN}"
+exit "${status}"

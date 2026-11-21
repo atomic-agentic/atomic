@@ -67,6 +67,11 @@ decision counts only with the credential its person enrolled. `atomic run` and
 question gates (`ask` with a typed `answer`, `remember`, and a default when time
 runs out) are built; `atomic gates answer` answers one from another terminal.
 
+Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
+`model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
+only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+Lite atoms need a model endpoint and say so.
+
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
 says so once, waits and tries again for a bounded time (about 7.4 minutes with
@@ -133,7 +138,9 @@ directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
 `KUBECONFIG`, put them), and the file or directory of yours that a link
 among them points at, up to four directory levels inside a denied directory;
-the kernel keyrings; the network; and sockets. Cargo's own configuration is
+the kernel keyrings; the network, unless an exec atom declares the hosts it
+reaches, and then all but those, which it reaches through atomic's proxy; and
+sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A link to something outside your own
 files, such as a history file linked to `/dev/null`, is left alone, and a

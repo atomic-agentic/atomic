@@ -17,57 +17,98 @@ fail() {
     failures=$((failures + 1))
 }
 
-# A stand-in for cargo. FAKE_CARGO says how it behaves: `honest` fails the
-# test while any control is switched off, `blind` always passes it, `lose`
-# also deletes the saved originals, `partial` fails only one of a
-# control's tests, `unreadable` makes the manifest
+# A stand-in for cargo. Each test a row names is in a test binary of its
+# own. FAKE_CARGO says how it behaves: `honest` fails every test while any
+# control is switched off, `blind` always passes them, `partial` fails only
+# the first a control names, `missing` finds no test for the second, `lose`
+# also deletes the saved originals, `unreadable` makes the manifest
 # unreadable, `kill` kills the script outright, and `hang` waits, with the
-# control off, until it is stopped.
+# control off, until it is stopped. It notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+# A control is off while any file the script edits differs from the copy's
+# commit.
 off() {
-    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|let _ = own;|let _ = arg; true|NetworkSandboxPolicy::Enabled;|CONTROL_OFF|Verdict::Changes => return Ok' \
-        crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-exec/src/lib.rs \
-        crates/atomic-exec/src/process.rs crates/atomic/src/pipeline.rs
+    ! git diff --quiet -- crates
 }
 case "${FAKE_CARGO}" in
 lose) rm -f target/controls-check/crates* ;;
 unreadable) chmod 000 target/controls-check/manifest ;;
 kill) kill -KILL "${PPID}"; exit 0 ;;
 hang) : >cargo-started; exec sleep 300 ;;
-partial)
-    if off; then
-        echo "test one ... FAILED"
-        echo "test two ... ok"
-        echo "test result: FAILED. 1 passed; 1 failed"
-        exit 101
-    fi
-    ;;
 esac
-if [ "${FAKE_CARGO}" != blind ] && off; then
-    echo "test guard ... FAILED"
-    echo "test result: FAILED. 0 passed; 1 failed"
-    exit 101
-fi
-echo "test guard ... ok"
-echo "test result: ok. 1 passed; 0 failed"
+# The tests the arguments name, after `--` or as positional filters, each
+# in a test binary of its own, run in order as cargo runs them: without
+# --no-fail-fast, cargo stops at the first binary that fails.
+echo "$*" >>cargo-args
+[ "${1:-}" = test ] && shift
+names=()
+after=0
+skip=0
+no_fail_fast=0
+for a in "$@"; do
+    if [ "${skip}" -eq 1 ]; then skip=0; continue; fi
+    if [ "${after}" -eq 1 ]; then
+        case "${a}" in -*) ;; *) names+=("${a}") ;; esac
+        continue
+    fi
+    case "${a}" in
+    --) after=1 ;;
+    --no-fail-fast) no_fail_fast=1 ;;
+    -p | --package | --features | --test | --bin | --example) skip=1 ;;
+    -*) ;;
+    *) names+=("${a}") ;;
+    esac
+done
+[ "${#names[@]}" -gt 0 ] || names=(guard)
+status=0
+i=0
+for n in "${names[@]}"; do
+    i=$((i + 1))
+    # `missing`: a second named test matches none, so nothing of it is said.
+    if [ "${FAKE_CARGO}" = missing ] && [ "${i}" -gt 1 ]; then
+        echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"
+        continue
+    fi
+    fails=0
+    if [ "${FAKE_CARGO}" != blind ] && off; then
+        fails=1
+        # `partial`: only the first named test fails.
+        [ "${FAKE_CARGO}" = partial ] && [ "${i}" -gt 1 ] && fails=0
+    fi
+    if [ "${fails}" -eq 1 ]; then
+        echo "test tests::${n} ... FAILED"
+        echo "test result: FAILED. 0 passed; 1 failed"
+        status=101
+        [ "${no_fail_fast}" -eq 1 ] || exit 101
+    else
+        echo "test tests::${n} ... ok"
+        echo "test result: ok. 1 passed; 0 failed"
+    fi
+done
+exit "${status}"
 SH
 chmod +x "${WORK}/bin/cargo"
+
+# The controls the script lists, and the files they edit.
+mapfile -t CONTROL_ROWS < <(grep -E '^    "[a-z0-9-]+\|' "${ROOT}/scripts/controls-check.sh")
+mapfile -t CONTROL_FILES < <(printf '%s\n' "${CONTROL_ROWS[@]}" | cut -d'|' -f2 | sort -u)
+[ "${#CONTROL_ROWS[@]}" -gt 0 ] || { echo "no controls found in scripts/controls-check.sh" >&2; exit 1; }
 
 # A fresh copy of the repository's part the script touches, committed.
 fresh() {
     local repo="${WORK}/repo"
     chmod -R u+w "${repo}" 2>/dev/null
     rm -rf "${repo}"
-    mkdir -p "${repo}/scripts" "${repo}/crates/atomic-core/src" "${repo}/crates/atomic-exec/src" \
-        "${repo}/crates/atomic/src"
+    mkdir -p "${repo}/scripts"
     cp "${ROOT}/scripts/controls-check.sh" "${repo}/scripts/"
-    cp "${ROOT}/crates/atomic-core/src/git.rs" "${ROOT}/crates/atomic-core/src/codex.rs" \
-        "${repo}/crates/atomic-core/src/"
-    cp "${ROOT}/crates/atomic-exec/src/lib.rs" "${ROOT}/crates/atomic-exec/src/process.rs" \
-        "${repo}/crates/atomic-exec/src/"
-    cp "${ROOT}/crates/atomic/src/pipeline.rs" "${repo}/crates/atomic/src/"
+    # Every file a control names.
+    local file
+    for file in "${CONTROL_FILES[@]}"; do
+        mkdir -p "${repo}/$(dirname "${file}")"
+        cp "${ROOT}/${file}" "${repo}/${file}"
+    done
     git -C "${repo}" init -q
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid add -A
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid -c commit.gpgSign=false \
@@ -92,7 +133,8 @@ untouched() {
 repo="$(fresh)"
 run honest
 [ "${code}" -eq 0 ] || fail "honest: exit ${code}: ${out}"
-[ "$(grep -c '^ok ' <<<"${out}")" -eq 17 ] || fail "honest: not seventeen controls ok: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq "${#CONTROL_ROWS[@]}" ] ||
+    fail "honest: not all ${#CONTROL_ROWS[@]} controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 
@@ -109,6 +151,19 @@ run partial sandbox-writes
 [ "${code}" -ne 0 ] && grep -q "FAIL sandbox-writes: its test passed with the control off" <<<"${out}" ||
     fail "partial: exit ${code}: ${out}"
 untouched || fail "partial: the source is left modified"
+
+# A control one of whose tests matches nothing, so it is never seen
+# failing, fails the check, though nothing passed.
+repo="$(fresh)"
+run missing sandbox-writes
+[ "${code}" -ne 0 ] && grep -q "FAIL sandbox-writes: with the control off, these tests were not seen failing: a_project_under_the_system_temporary_directory_stays_out_of_reach" <<<"${out}" ||
+    fail "missing: exit ${code}: ${out}"
+untouched || fail "missing: the source is left modified"
+
+# Every test binary runs, so a test after a failing one is seen too.
+repo="$(fresh)"
+run honest sandbox-writes
+grep -q -- "--no-fail-fast" "${repo}/cargo-args" || fail "no-fail-fast: cargo ran as $(cat "${repo}/cargo-args")"
 
 # An unknown name is refused, and nothing is edited.
 repo="$(fresh)"
