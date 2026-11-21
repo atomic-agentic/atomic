@@ -53,7 +53,9 @@
 
 mod support;
 
-use atomic_app::pipeline::{PIPELINE, Pipeline, PipelineRun, Services, prepare, register_pipeline};
+use atomic_app::pipeline::{
+    PIPELINE, Pipeline, PipelineRun, ProjectWorktrees, Services, prepare, register_pipeline,
+};
 use atomic_app::workflows::{CHANGE_REQUEST, ChangeRequestRun, register_change_request};
 use atomic_core::artifact::LocalStore;
 use atomic_core::budget::BudgetSettings;
@@ -504,7 +506,10 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
                     runtimes: runtimes(dir, &project, base_url),
                     store: LocalStore::open(dir.join("artifacts")).expect("artifact store"),
                     deployment: local(),
-                    worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
+                    worktrees: ProjectWorktrees::Found(Arc::new(Worktrees::new(
+                        repo,
+                        dir.join("state/worktrees"),
+                    ))),
                     caches: None,
                     budgets: Arc::new(if scenario == Scenario::Parked {
                         // Each call reserves 150 tokens: the workflow's cap

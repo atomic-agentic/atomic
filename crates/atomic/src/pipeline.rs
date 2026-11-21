@@ -80,7 +80,7 @@ use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The name `run_pipeline` is registered under.
@@ -406,23 +406,133 @@ impl Pipeline {
     }
 }
 
+/// What a run's `worktree: true` steps work in, or why the run has none.
+/// The why is kept in the words that said it, because the run has to fail
+/// with what was found: a repository atomic could not read is not a project
+/// outside every repository, and no worktree ever means a step may run.
+enum WorktreesForRun {
+    /// The run's worktrees: its fixture's snapshot, or the project's
+    /// repository.
+    Found(Arc<Worktrees>),
+    /// Why the run has none.
+    None(String),
+}
+
 /// The worktrees a run's worktree steps use: those of its fixture's
-/// snapshot when it is bound to one, else the services' own.
-fn worktrees_for(pipeline: &Pipeline, services: &Services) -> Result<Option<Arc<Worktrees>>> {
-    match &pipeline.fixture {
-        Some(fixture) => {
-            let git = atomic_core::git::Git::find()
-                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
-            let repo = git
-                .repo(&fixture.snapshot)
-                .without_filters()
-                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
-            Ok(Some(Arc::new(Worktrees::new(
-                repo,
-                fixture.worktrees.clone(),
-            ))))
+/// snapshot when it is bound to one, else what the services found for the
+/// project. Runs no git for a project it does not need one for.
+fn worktrees_for(pipeline: &Pipeline, services: &Services) -> WorktreesForRun {
+    let fixture = match &pipeline.fixture {
+        Some(fixture) => fixture,
+        None => return services.worktrees.for_run(),
+    };
+    // The snapshot is named by path, so this only starts git; a snapshot
+    // that is not there, or not readable, is what the commands on it say.
+    let git = match Git::find() {
+        Ok(git) => git,
+        Err(e) => return WorktreesForRun::None(format!("the fixture's snapshot: {e}")),
+    };
+    match git.repo(&fixture.snapshot).without_filters() {
+        Ok(repo) => {
+            WorktreesForRun::Found(Arc::new(Worktrees::new(repo, fixture.worktrees.clone())))
         }
-        None => Ok(services.worktrees.clone()),
+        Err(e) => WorktreesForRun::None(format!("the fixture's snapshot: {e}")),
+    }
+}
+
+/// What the project offers a `worktree: true` step whose run is bound to no
+/// fixture: its repository, or why it has none.
+///
+/// The ways there are none are kept apart on purpose, each with what said it.
+/// A project outside every repository and a repository git could not read are
+/// different news, and only the first is the person's own to act on; neither
+/// lets a worktree step run. `atomic` makes no worktrees of a project's own
+/// checkout — a run that changes code is bound to the repository its
+/// `--fixture` names — so it never hands out [`Self::Found`]; that is what an
+/// embedder that means it gives. What git said about the project is asked
+/// where a run that changes code is refused for naming no fixture (see
+/// `runs::bind_fixture`), so that the refusal says what was found instead of
+/// the same words for every project.
+#[derive(Clone, Debug)]
+pub enum ProjectWorktrees {
+    /// The project's repository, found; such a step works in a worktree of
+    /// it, kept under the state directory.
+    Found(Arc<Worktrees>),
+    /// git ran on the project's directory and refused it, which is what git
+    /// does both with a directory that holds no repository and with one it
+    /// cannot read. What it printed is kept, since its words name the
+    /// directory and are what a person needs to go on.
+    Refused(String),
+    /// git never answered for the project at all: no git at the paths atomic
+    /// looks at, git not startable, stopped, or printing what atomic cannot
+    /// read. Nothing is known about the project's repository, which is not
+    /// the same as its being absent.
+    Unknown(String),
+    /// Nothing, whatever the project holds: a run that changes code is bound
+    /// to a fixture repository of its own, and atomic makes no worktrees of
+    /// a checkout it was only asked to read.
+    FixtureOnly,
+}
+
+impl ProjectWorktrees {
+    /// What the repository `root` is in offers a worktree step: its worktrees,
+    /// kept under `trees`, or which of these it is, with what said so. Runs
+    /// git, so off the async workers.
+    pub fn at(root: &Path, trees: PathBuf) -> Self {
+        match Worktrees::open_at(root, trees) {
+            Ok(worktrees) => Self::Found(Arc::new(worktrees)),
+            Err(e) => match &e {
+                // git ran and said no. Anything else, including an argument
+                // atomic itself refused, means git never answered, which says
+                // nothing about whether the project is in a repository.
+                atomic_core::worktree::WorktreeError::Git(git) if git.refused() => {
+                    Self::Refused(e.to_string())
+                }
+                _ => Self::Unknown(e.to_string()),
+            },
+        }
+    }
+
+    /// [`ProjectWorktrees::at`] for the project at `state`, its worktrees kept
+    /// under the state directory. What `atomic`'s own commands ask of a
+    /// project, so that a refusal about worktrees can say what was found
+    /// about the project rather than the same words for every one.
+    pub fn find(state: &atomic_core::state::ProjectState) -> Self {
+        Self::at(state.root(), state.dir().join("worktrees"))
+    }
+
+    /// Why the project offers no worktree, as a clause. What git or the file
+    /// system said is kept in it, and a project git refused is never reported
+    /// as one git could not read, nor the other way round. A caller that must
+    /// tell [`Self::Found`] from the rest matches on it first; the sentence
+    /// for `Found` is only what its worktrees are.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Found(_) => "the project's repository was found, and its worktrees are kept \
+                 under its state directory"
+                .into(),
+            Self::Refused(why) => {
+                format!("git finds no repository in the project's directory: {why}")
+            }
+            Self::Unknown(why) => {
+                format!("atomic cannot tell whether the project is in a git repository: {why}")
+            }
+            Self::FixtureOnly => "atomic makes no worktrees of a project's own checkout".into(),
+        }
+    }
+
+    /// What a `worktree: true` step of a run bound to no fixture has to work
+    /// in, or why it has nothing.
+    fn for_run(&self) -> WorktreesForRun {
+        match self {
+            Self::Found(worktrees) => WorktreesForRun::Found(worktrees.clone()),
+            found => WorktreesForRun::None(format!(
+                "the run is bound to no fixture repository, and {}; a run that changes code is \
+                 bound to its fixture when it starts, so start it again with --fixture and \
+                 --fixture-rev",
+                found.describe()
+            )),
+        }
     }
 }
 
@@ -1112,13 +1222,20 @@ async fn run_pipeline_in<C: WorkflowContext>(
     }});
     let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
-    // The run's worktrees, found once and off the async workers, since
-    // finding them runs git.
+    // What the run's worktree steps work in, found once and off the async
+    // workers, since finding it runs git. A run that changes code needs it
+    // before any step: a repository atomic cannot read is said then, in the
+    // words that said it, and no step is paid for first. A run that changes
+    // no code is never asked about.
     let run_worktrees = if pipeline.changes_code() {
         let (p, s) = (pipeline.clone(), services.clone());
-        tokio::task::spawn_blocking(move || worktrees_for(&p, &s))
-            .await
-            .map_err(|e| failed(format!("the run's worktrees: {e}")))??
+        match tokio::task::spawn_blocking(move || worktrees_for(&p, &s)).await {
+            Ok(WorktreesForRun::Found(worktrees)) => Some(worktrees),
+            Ok(WorktreesForRun::None(why)) => {
+                return Err(failed(format!("the run's worktrees: {why}")));
+            }
+            Err(e) => return Err(failed(format!("the run's worktrees: {e}"))),
+        }
     } else {
         None
     };
@@ -1500,11 +1617,13 @@ async fn turn<C: WorkflowContext>(
         )));
     }
     let tree = if t.worktree {
+        // Never reached for a run that got this far: a run with a worktree
+        // step has its worktrees named, or failed for the reason they could
+        // not be named, before its first step. Kept so that a step is never
+        // run in a directory of the process's choosing.
         let worktrees = run.worktrees.cloned().ok_or_else(|| {
             failed(format!(
-                "step `{}` asks for a worktree, and the run is bound to no fixture \
-                 repository: a run started before atomic bound coding runs to one cannot \
-                 continue; start it again with --fixture and --fixture-rev",
+                "step `{}` asks for a worktree, and the run has none",
                 t.name
             ))
         })?;
@@ -2290,9 +2409,10 @@ pub struct Services {
     pub store: LocalStore,
     /// Where the project runs, which decides who may decide its gates.
     pub deployment: Deployment,
-    /// The project repository's worktrees, for `worktree: true` steps, or
-    /// `None` when the project is not in a git repository.
-    pub worktrees: Option<Arc<Worktrees>>,
+    /// What the project offers a `worktree: true` step whose run is bound to
+    /// no fixture, with the reason if it offers none (see
+    /// [`ProjectWorktrees`]).
+    pub worktrees: ProjectWorktrees,
     /// Where each run's build caches go, the state directory's `cache/`:
     /// a directory of the run's own there, which its worktree and exec
     /// steps may write and which goes when the run ends. `None` puts them
@@ -2598,6 +2718,7 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// A command runs again only through the effects rule: after an
     /// interrupted attempt, and after an earlier run of the step's body in
@@ -2608,6 +2729,80 @@ mod tests {
         assert!(ran_before("x", true, true).is_some_and(|why| why.contains("interrupted")));
         assert!(ran_before("x", true, false).is_some_and(|why| why.contains("interrupted")));
         assert!(ran_before("x", false, true).is_some_and(|why| why.contains("in this process")));
+    }
+
+    /// Why a project has no worktrees is what was found about it, and the
+    /// two findings are different news: git ran on the directory and refused
+    /// it, which is also what git does with a repository it cannot read; and
+    /// git never got to answer at all, which proves nothing about it. Neither
+    /// lets a worktree step go without one, and neither is reported as the
+    /// other.
+    #[test]
+    fn a_project_with_no_worktrees_says_whether_git_refused_it_or_never_answered() {
+        // Outside every repository, as the suites that need one check: the
+        // temporary directory is not inside the checkout atomic is built from.
+        let root = std::env::temp_dir().join(format!("atomic-worktrees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let trees = root.join("worktrees");
+
+        let refused = ProjectWorktrees::at(&root, trees.clone());
+        let ProjectWorktrees::Refused(why) = &refused else {
+            panic!("git was asked about {root:?} and said no: {refused:?}");
+        };
+        assert!(why.contains("not a git repository"), "{why}");
+        let said = refused.describe();
+        assert!(said.contains("git finds no repository"), "{said}");
+        assert!(!said.contains("cannot tell"), "{said}");
+
+        // A directory that cannot be entered: git is not asked anything, so
+        // nothing is known, and the refusal says so instead of naming a
+        // repository that may well be there.
+        std::fs::create_dir_all(root.join("blind")).expect("blind");
+        let blind = root.join("blind");
+        std::fs::set_permissions(&blind, std::fs::Permissions::from_mode(0o000))
+            .expect("unreadable");
+        let _seen = Unreadable(&blind);
+        let unknown = ProjectWorktrees::at(&blind, trees.clone());
+        let ProjectWorktrees::Unknown(why) = &unknown else {
+            panic!("git could not be asked about {blind:?} at all: {unknown:?}");
+        };
+        assert!(why.contains("Permission denied"), "{why}");
+        let said = unknown.describe();
+        assert!(said.contains("cannot tell"), "{said}");
+        assert!(!said.contains("no repository"), "{said}");
+
+        // The reason reaches the run that needs a worktree, with the words
+        // that said it, and with the way out.
+        for (found, keeps) in [
+            (&refused, "not a git repository"),
+            (&unknown, "Permission denied"),
+        ] {
+            let WorktreesForRun::None(why) = found.for_run() else {
+                panic!("a project with no repository offers no worktree: {found:?}");
+            };
+            assert!(why.contains(keeps), "{why}");
+            assert!(why.contains("--fixture"), "{why}");
+        }
+        assert_eq!(
+            ProjectWorktrees::FixtureOnly.describe(),
+            "atomic makes no worktrees of a project's own checkout",
+            "the reason `atomic` itself gives, which is not about the project"
+        );
+        drop(_seen);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Makes `0` unreadable until the test is done with it, however it ends.
+    struct Unreadable<'a>(&'a Path);
+
+    impl Drop for Unreadable<'_> {
+        fn drop(&mut self) {
+            // Never fails the test that is already failing: the mode is put
+            // back, and a refusal to do so is left for the next test to
+            // notice rather than added to this one.
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+        }
     }
 
     /// Only a recorded outcome, finished or failed, removes a run's caches:

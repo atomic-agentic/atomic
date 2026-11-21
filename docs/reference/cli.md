@@ -130,8 +130,9 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 
 | Kind | When |
 | --- | --- |
-| `fixture.required` | The workflow changes code and no fixture is named |
-| `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
+| `fixture.required` | The workflow changes code and no fixture is named. When the project's own directory holds no repository, or git could not be asked about it, the refusal says which |
+| `fixture.path` | git finds no repository at `--fixture`, or it names a directory inside a repository rather than that repository's top |
+| `fixture.unreadable` | Nothing was learned about `--fixture`, because git never got to answer for it: it could not be run on that directory, was stopped, or printed what atomic cannot read. The description carries what stopped git, and atomic does not guess whether a repository is there |
 | `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
 | `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
 | `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
