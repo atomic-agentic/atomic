@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecError> {
     LocalBackend::default().run(&Command {
@@ -231,12 +231,81 @@ fn opening_an_attempt_removes_only_what_no_open_attempt_of_its_step_holds() {
         "the step's directory goes with its last attempt"
     );
     // Nothing set aside is left behind.
-    let aside: Vec<_> = std::fs::read_dir(local.scratch_root())
-        .expect("read")
+    let aside = set_aside_left(local.scratch_root());
+    assert!(aside.is_empty(), "{aside:?}");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(local.scratch_root());
+}
+
+/// What is left set aside under `root`, to be removed.
+fn set_aside_left(root: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with(".removing-"))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// An attempt that is open already is not opened again, and nothing of it
+/// is taken.
+#[test]
+fn an_attempt_that_is_open_is_not_opened_again() {
+    let src = source("twice");
+    let local = backend("twice");
+    let open = local.open(&opening(&src, "fix", "a1")).expect("opens");
+    let scratch = open.scratch.clone().expect("scratch");
+    std::fs::write(scratch.join("working"), "x").expect("write");
+    // What a stopped process left: the refused open still removes it.
+    let left = scratch.parent().expect("step").join("999999999.1-a0");
+    std::fs::create_dir_all(&left).expect("left");
+    let again = local.open(&opening(&src, "fix", "a1"));
+    assert!(
+        matches!(&again, Err(e) if e.to_string().contains("exists already")),
+        "{again:?}"
+    );
+    assert!(scratch.join("working").exists());
+    assert!(!left.exists());
+    assert!(
+        set_aside_left(local.scratch_root()).is_empty(),
+        "a refused open left what it set aside"
+    );
+    local.close(&open).expect("closes");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(local.scratch_root());
+}
+
+/// Many threads opening and closing attempts of one step at once never
+/// take one another's scratch.
+#[test]
+fn attempts_of_one_step_opened_and_closed_at_once_keep_their_scratch() {
+    let src = source("crowd");
+    let local = std::sync::Arc::new(backend("crowd"));
+    let threads: Vec<_> = (0..16)
+        .map(|t| {
+            let (local, src) = (local.clone(), src.clone());
+            std::thread::spawn(move || {
+                for i in 0..300 {
+                    let ws = local
+                        .open(&opening(&src, "fix", &format!("t{t}-{i}")))
+                        .expect("opens");
+                    let scratch = ws.scratch.clone().expect("scratch");
+                    std::fs::write(scratch.join("mine"), format!("{t}-{i}"))
+                        .expect("its scratch is there");
+                    assert_eq!(
+                        std::fs::read_to_string(scratch.join("mine")).expect("still there"),
+                        format!("{t}-{i}")
+                    );
+                    local.close(&ws).expect("closes");
+                }
+            })
+        })
         .collect();
-    assert!(aside.is_empty(), "{aside:?}");
+    for t in threads {
+        t.join().expect("no attempt lost its scratch");
+    }
+    assert!(set_aside_left(local.scratch_root()).is_empty());
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(local.scratch_root());
 }
@@ -321,14 +390,29 @@ fn read_only_trees_are_removed_at_open_and_at_connect() {
     };
     let src = source("read-only");
     let local = backend("read-only");
-    // What a stopped process's attempt of the step left.
-    let first = workspace::step_dir(local.scratch_root(), "run-1", "fix").join("999999999.1-a1");
+    // What a stopped process's attempt of the step left: a read-only tree
+    // inside, one that is read-only itself, and a stray file.
+    let step = workspace::step_dir(local.scratch_root(), "run-1", "fix");
+    let first = step.join("999999999.1-a1");
     std::fs::create_dir_all(&first).expect("left");
     read_only(&first);
+    let unmovable = step.join("999999999.1-a0");
+    std::fs::create_dir_all(unmovable.join("inside")).expect("left");
+    std::fs::set_permissions(&unmovable, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+    std::fs::write(step.join("stray"), "x").expect("stray file");
     let second = local
         .open(&opening(&src, "fix", "a2"))
         .expect("opens over a read-only tree");
     assert!(!first.exists());
+    assert!(
+        !unmovable.exists(),
+        "a directory that cannot be moved is left"
+    );
+    assert!(!step.join("stray").exists(), "a stray file is left");
+    assert!(
+        set_aside_left(local.scratch_root()).is_empty(),
+        "something set aside is left"
+    );
     read_only(second.scratch.as_ref().expect("scratch"));
     local.close(&second).expect("closes a read-only tree");
     assert!(!second.scratch.as_ref().expect("scratch").exists());

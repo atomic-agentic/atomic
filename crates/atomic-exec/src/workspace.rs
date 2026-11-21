@@ -21,7 +21,8 @@
 //! one private directory (mode 0700), normally in the project's state
 //! directory, which is outside every directory a sandboxed turn may write.
 //! Each attempt's is named by its run and step, so opening an attempt removes
-//! what an earlier attempt of the same step left, and connecting removes what
+//! what earlier attempts of the same step left, except the scratch of any
+//! attempt this process still has open, and connecting removes what
 //! attempts of processes that no longer run left.
 
 use crate::ExecError;
@@ -285,30 +286,35 @@ pub(crate) fn open_local(
     // and must not take that one's directory from under it. Under the lock
     // of the open attempts, so none opens or closes meanwhile, what goes is
     // only moved aside; it is removed after.
-    let aside = {
+    let (aside, opened) = {
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         let aside = set_aside(scratch_root, &step, &open);
-        private_dir(&step).map_err(|e| failed("create the step's scratch directory", e))?;
-        if scratch.exists() {
-            return Err(fail(format!(
-                "{} exists already: an attempt is opened only once",
-                scratch.display()
-            )));
-        }
-        private_dir(&scratch).map_err(|e| failed("create its scratch directory", e))?;
-        open.insert(scratch.clone());
-        aside
+        let opened = (|| {
+            private_dir(&step).map_err(|e| failed("create the step's scratch directory", e))?;
+            if scratch.exists() {
+                return Err(fail(format!(
+                    "{} exists already: an attempt is opened only once",
+                    scratch.display()
+                )));
+            }
+            private_dir(&scratch).map_err(|e| failed("create its scratch directory", e))?;
+            open.insert(scratch.clone());
+            Ok(())
+        })();
+        (aside, opened)
     };
-    // What cannot be removed is left, with a warning: the new attempt's own
-    // directory is fresh either way.
+    // What was set aside goes whether or not this attempt opened: on a full
+    // disk, that space is what lets the next try succeed. What cannot be
+    // removed is left, with a warning.
     for left in aside {
-        if let Err(e) = remove_tree(&left) {
+        if let Err(e) = remove_entry(&left) {
             warn(&format!(
                 "could not remove an earlier attempt's scratch {}: {e}",
                 left.display()
             ));
         }
     }
+    opened?;
     Ok(Workspace {
         label: request.label.clone(),
         root: Some(source.clone()),
@@ -346,15 +352,31 @@ fn set_aside(
         }
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let to = scratch_root.join(format!("{REMOVING}{}-{n}", owner()));
+        // One that cannot be moved, such as a directory nobody may write,
+        // is removed where it is.
         match std::fs::rename(&path, &to) {
             Ok(()) => aside.push(to),
-            Err(e) => warn(&format!(
-                "could not remove an earlier attempt's scratch {}: {e}",
-                path.display()
-            )),
+            Err(_) => {
+                if let Err(e) = remove_entry(&path) {
+                    warn(&format!(
+                        "could not remove an earlier attempt's scratch {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
         }
     }
     aside
+}
+
+/// Remove `path`, a directory and everything under it, or a file.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => remove_tree(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// How a scratch directory moved aside to be removed is named, then its
@@ -407,7 +429,7 @@ pub(crate) fn sweep_local(scratch_root: &Path) -> usize {
             && tag != owner()
             && !owner_may_run(tag)
         {
-            match remove_tree(&step) {
+            match remove_entry(&step) {
                 Ok(()) => removed += 1,
                 Err(e) => warn(&format!(
                     "could not remove a dead attempt's scratch {}: {e}",
