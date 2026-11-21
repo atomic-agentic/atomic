@@ -230,6 +230,7 @@ fn real_main() -> anyhow::Result<()> {
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
     if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {
+        codex::harden_runner(); // the role first on the command line
         std::process::exit(runner());
     }
     let parsed = Cli::try_parse();
@@ -253,6 +254,7 @@ fn real_main() -> anyhow::Result<()> {
         ..
     }) = &parsed
     {
+        codex::harden_runner(); // the role after global flags
         std::process::exit(atomic_exec::runner::serve_stdio(
             &mut atomic_core::redact::stderr_lines(),
         ));
@@ -430,7 +432,8 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         }
         Some(Command::Debug(Debug::CodexPrompt(args))) => {
             let answer = prompt(&paths, &state, &args).await?;
-            println!("{answer}");
+            // A model's answer, as text, escaped for the terminal.
+            println!("{}", shown::block(&answer));
             Ok(())
         }
         Some(Command::Debug(Debug::Probe(args))) => {
@@ -440,7 +443,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
                 state.database().display()
             );
             let answer = prompt(&paths, &state, &args).await?;
-            println!("codex: {answer}");
+            println!("codex: {}", shown::block(&answer));
             Ok(())
         }
     }

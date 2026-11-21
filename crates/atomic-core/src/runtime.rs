@@ -387,6 +387,42 @@ pub fn limit_backend_wait(limit: Option<std::time::Duration>) {
     OPEN_WAIT_LIMIT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether this process is stopping (see [`stop_waiting_for_backend`]).
+pub fn stopping() -> bool {
+    STOP_WAITING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Sleep for `wait`, or until this process stops, whichever comes first:
+/// whether it stopped.
+pub fn sleep_unless_stopping(wait: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if stopping() {
+            return true;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(50)));
+    }
+}
+
+/// The runs a step of which stopped, to be run again, because the artifact
+/// store was held while its command's inputs were given.
+static HELD_STOPS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether a step of run `run` stopped for a held store since this was last
+/// asked, which it then forgets: such a stop is not the run's doing, and a
+/// durable runner does not count it toward giving the run up.
+pub fn take_held_stop(run: &str) -> bool {
+    HELD_STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(run)
+}
+
 /// This process is stopping: every step waiting for a workspace gives up
 /// within [`OPEN_WAIT_SLICE`], with [`AtomError::Stopping`], and none waits
 /// again.
@@ -479,6 +515,7 @@ pub(crate) async fn open_workspace(
         // one takes, closes it.
         let opened = tokio::task::spawn_blocking(move || {
             b.open(&r).map(|workspace| Closer {
+                inputs: Default::default(),
                 backend: b,
                 workspace: Some(workspace),
             })
@@ -647,6 +684,8 @@ pub struct WorkspaceGuard(Option<Arc<Closer>>);
 pub(crate) struct Closer {
     backend: Arc<dyn ExecutionBackend>,
     workspace: Option<Workspace>,
+    /// What its command was given already, by [`give_exec_inputs`].
+    inputs: std::sync::Mutex<Option<Result<Given, AtomError>>>,
 }
 
 impl WorkspaceGuard {
@@ -666,6 +705,24 @@ impl WorkspaceGuard {
             .as_ref()
             .map(|closer| closer.backend.clone())
             .expect("an open workspace")
+    }
+
+    /// Keep what [`give_exec_inputs`] gave, for [`run_exec_opened`].
+    fn keep_inputs(&self, given: Result<Given, AtomError>) {
+        if let Some(closer) = &self.0 {
+            *closer.inputs.lock().unwrap_or_else(|e| e.into_inner()) = Some(given);
+        }
+    }
+
+    /// What [`give_exec_inputs`] gave, once.
+    fn take_inputs(&self) -> Option<Result<Given, AtomError>> {
+        self.0.as_ref().and_then(|closer| {
+            closer
+                .inputs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        })
     }
 
     /// Keep the workspace open while the holder lives, such as a command
@@ -1576,6 +1633,138 @@ fn declared_network(atom: &AtomFile) -> Vec<String> {
     crate::network::check_hosts(&hosts).unwrap_or_default()
 }
 
+/// What an exec atom's command is given in its workspace: with a store, the
+/// exchange its backend gave (`None` from a backend that hands no files
+/// over), its inputs mounted in it; with no store, nothing.
+type Given = Option<Option<Arc<crate::artifact::files::Exchange>>>;
+
+/// How many more times giving a command its inputs tries for an artifact
+/// store held elsewhere, such as by a sweep, before the step stops to be
+/// run again, as a run's pin does: each try waits as long as the store
+/// waits for its lock, and the wait between tries doubles from
+/// [`STORE_HELD_BACKOFF`] up to that long.
+pub const STORE_HELD_RETRIES: u32 = 10;
+/// The first wait between those tries.
+pub const STORE_HELD_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Give `atom`'s command, in `workspace`, what [`run_exec_opened`] would
+/// give it before it runs: its exchange, and the artifacts `input`
+/// references in it. A durable step does this in the step that records its
+/// attempt, so a store held past [`STORE_HELD_RETRIES`] stops the step
+/// before its attempt is recorded, with nothing run: it fails with
+/// [`AtomError::StoreHeld`], and the run is run again. Any other result is
+/// kept in the workspace for [`run_exec_opened`], which then gives nothing
+/// again.
+pub async fn give_exec_inputs(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    input: &Value,
+    identity: &EffectIdentity,
+    workspace: &WorkspaceGuard,
+    artifacts: &Artifacts,
+) -> Result<(), AtomError> {
+    let Some(contract) = compiled.program.contracts.get("Input") else {
+        // The step itself says what is wrong.
+        return Ok(());
+    };
+    let given = exchange_for(atom, contract, input, identity, workspace, artifacts).await;
+    if let Err(e @ (AtomError::StoreHeld(_) | AtomError::Stopping)) = given {
+        return Err(e);
+    }
+    workspace.keep_inputs(given);
+    Ok(())
+}
+
+/// With a store, the command's exchange, from its workspace's backend,
+/// which alone touches the workspace's files: an outputs directory to hand
+/// files over in, and the artifacts its input references, read-only. A
+/// backend that hands no files over gives none: an input that references
+/// artifacts is then refused, and so is an output that names a file (see
+/// `finish_exec`). An input that references an artifact the store does not
+/// hold is refused. A wait for a held store ends early when this process
+/// stops, with [`AtomError::Stopping`]; one that runs out is noted for
+/// [`take_held_stop`].
+async fn exchange_for(
+    atom: &AtomFile,
+    contract: &Value,
+    input: &Value,
+    identity: &EffectIdentity,
+    workspace: &WorkspaceGuard,
+    artifacts: &Artifacts,
+) -> Result<Given, AtomError> {
+    let Some(store) = &artifacts.1 else {
+        return Ok(None);
+    };
+    let (store, input, contract) = (store.clone(), input.clone(), contract.clone());
+    let lookup = artifacts.0.clone();
+    let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
+    let (name, run) = (atom.name.clone(), identity.run_id.clone());
+    // The workspace stays open while its inputs are copied in, even when the
+    // run is cancelled meanwhile.
+    let held = workspace.hold();
+    let made = tokio::task::spawn_blocking(move || {
+        let _held = held;
+        let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref())
+            .map_err(|e| AtomError::Input(format!("{name}: {e}")))?;
+        let exchange = backend
+            .exchange(&opened)
+            .map_err(|e| AtomError::Runtime(format!("{name}: prepare its files: {e}")))?;
+        let Some(exchange) = exchange else {
+            return match given.first() {
+                Some(a) => Err(AtomError::Runtime(format!(
+                    "{name}: its input references {a}, and its backend gives commands no files"
+                ))),
+                None => Ok(None),
+            };
+        };
+        let exchange = crate::artifact::files::Exchange::new(exchange);
+        // A store held elsewhere is waited out a bounded time: a mount that
+        // found it held has given nothing, so it can start again. Held past
+        // it, nothing runs, and the step stops to be run again.
+        let cap = store.lock_wait().max(STORE_HELD_BACKOFF);
+        let mut wait = STORE_HELD_BACKOFF.min(cap);
+        let mut retries = 0;
+        loop {
+            match exchange.mount(store.as_ref(), &given) {
+                Err(crate::artifact::ArtifactError::Locked { .. })
+                    if retries < STORE_HELD_RETRIES =>
+                {
+                    if retries == 0 {
+                        crate::log_line!(
+                            "atomic: {name}: the artifact store is held by another process, such \
+                             as a sweep; the step waits for it and tries again"
+                        );
+                    }
+                    retries += 1;
+                    if sleep_unless_stopping(wait) {
+                        return Err(AtomError::Stopping);
+                    }
+                    wait = (wait * 2).min(cap);
+                }
+                Err(e @ crate::artifact::ArtifactError::Locked { .. }) => {
+                    HELD_STOPS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(run.clone());
+                    return Err(AtomError::StoreHeld(format!(
+                        "{name}: give the command its input files: {e}; its command did not \
+                         run, and the step is run again"
+                    )));
+                }
+                mounted => {
+                    mounted
+                        .map_err(|e| store_error(&name, "give the command its input files", e))?;
+                    break;
+                }
+            }
+        }
+        Ok(Some(Arc::new(exchange)))
+    })
+    .await
+    .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))??;
+    Ok(Some(made))
+}
+
 /// [`run_exec`] in a workspace [`open_exec_workspace`] opened, which it
 /// closes when the command has ended.
 #[allow(clippy::too_many_arguments)] // each is one thing the command needs
@@ -1623,48 +1812,21 @@ pub async fn run_exec_opened(
     }
     h.update(&stdin);
     let prompt_hash = format!("{:x}", h.finalize());
-    // With a store, the command gets its exchange, from its workspace's
-    // backend, which alone touches the workspace's files: an outputs
-    // directory to hand files over in, and the artifacts its input
-    // references, read-only. A backend that hands no files over gives none:
-    // an input that references artifacts is then refused, and so is an
-    // output that names a file (see `finish_exec`).
-    let exchange = match &artifacts.1 {
-        Some(store) => {
-            let (store, input, contract) =
-                (store.clone(), input.clone(), contract("Input")?.clone());
-            let lookup = artifacts.0.clone();
-            let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
-            let name = atom.name.clone();
-            // The workspace stays open while its inputs are copied in, even
-            // when the run is cancelled meanwhile.
-            let held = workspace.hold();
-            let made = tokio::task::spawn_blocking(move || {
-                let _held = held;
-                let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref());
-                let exchange = backend
-                    .exchange(&opened)
-                    .map_err(|e| AtomError::Runtime(format!("{name}: prepare its files: {e}")))?;
-                let Some(exchange) = exchange else {
-                    return match given.first() {
-                        Some(a) => Err(AtomError::Runtime(format!(
-                            "{name}: its input references {a}, and its backend gives commands \
-                             no files"
-                        ))),
-                        None => Ok(None),
-                    };
-                };
-                let exchange = crate::artifact::files::Exchange::new(exchange);
-                exchange
-                    .mount(store.as_ref(), &given)
-                    .map_err(|e| store_error(&name, "give the command its input files", e))?;
-                Ok(Some(Arc::new(exchange)))
-            })
-            .await
-            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))??;
-            Some(made)
+    // Given its inputs already, as a durable step's attempt gives them, or
+    // now.
+    let exchange = match workspace.take_inputs() {
+        Some(given) => given?,
+        None => {
+            exchange_for(
+                atom,
+                contract("Input")?,
+                input,
+                identity,
+                &workspace,
+                artifacts,
+            )
+            .await?
         }
-        None => None,
     };
     let (exchange_env, read_only) = match exchange.as_ref().and_then(Option::as_ref) {
         Some(x) => (
@@ -1782,7 +1944,8 @@ pub async fn run_exec_opened(
 
 /// How many times a gather that found the artifact store held by a sweep
 /// tries again, each after waiting for the store's lock, before the step's
-/// outcome is unknown.
+/// outcome is unknown. Giving a command its inputs waits longer (see
+/// [`STORE_HELD_RETRIES`]): nothing has run then.
 const GATHER_LOCKED_RETRIES: u32 = 3;
 /// The first wait between a gather's tries, doubled each time up to
 /// [`GATHER_LOCKED_BACKOFF_MAX`].

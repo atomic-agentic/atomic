@@ -6008,3 +6008,175 @@ fn a_pinned_plan_without_an_exec_atoms_caps_is_refused() {
             .expect("shutdown");
     });
 }
+
+/// The local backend, taking the artifact store's lock, as a sweep would,
+/// as it opens the first workspace, and counting the workspaces it opens.
+struct LocksTheStoreOnOpen {
+    lock: PathBuf,
+    holder: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+    local: atomic_exec::LocalBackend,
+}
+
+impl atomic_exec::ExecutionBackend for LocksTheStoreOnOpen {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        if self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&self.lock)
+                .expect("the store's lock");
+            held.lock().expect("held");
+            *self.holder.lock().expect("holder") = Some(held);
+        }
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.local.close(workspace)
+    }
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
+    }
+}
+
+/// An exec step whose inputs cannot be given while the artifact store is
+/// held elsewhere waits a bounded time, then stops the run to be run again,
+/// recording nothing as failed and running nothing, however many times it
+/// stops: it is never dead-lettered for it. Once the store is free, the run
+/// finishes, its command run once.
+#[test]
+fn an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-inputs-held");
+        let project = dir.join("project");
+        std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: inputs\n").expect("manifest");
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/use.py"),
+            "import json, os, sys\njson.load(sys.stdin)\n\
+             open('ran', 'a').write('x')\n\
+             json.dump({'runs': len(open('ran').read())}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("use-patch.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/use-patch';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Use a patch.', kind: 'exec', exec: { command: ['python3', 'tools/use.py'] } };\n---\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            atoms.join("use-patch.input.schema.json"),
+            object(json!({"patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}))
+                .to_string(),
+        )
+        .expect("input");
+        std::fs::write(
+            atoms.join("use-patch.output.schema.json"),
+            object(json!({"runs": {"type": "integer"}})).to_string(),
+        )
+        .expect("output");
+        let pipeline = load(
+            &project,
+            "use.workflow.yaml",
+            "atomic: 1\nname: use\n\
+             input: { $ref: ../atoms/use-patch.input.schema.json }\n\
+             output: { $ref: ../atoms/use-patch.output.schema.json }\n\
+             steps:\n  use:\n    atom: use-patch\n    with: { patch: input.patch }\n\
+             returns: steps.use.output\n",
+        );
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let patch = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                atomic_core::artifact::Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let holder = Arc::new(std::sync::Mutex::new(None));
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = atomic_exec::Backend::connect(LocksTheStoreOnOpen {
+            lock: dir.join("artifacts/lock"),
+            holder: holder.clone(),
+            opens: opens.clone(),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects");
+        let rt = engine_handing_over(&dir, &model.base_url(), store, Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"patch": patch.to_string()}),
+        };
+        rt.start(PIPELINE, "held-1", run).await.expect("start");
+        // Stopped more times than dead-lettering allows, with nothing
+        // failed, and opened again each time.
+        let executions = atomic_app::pipeline::RECOVERY_LIMIT as usize + 2;
+        let started = std::time::Instant::now();
+        while opens.load(std::sync::atomic::Ordering::SeqCst) < executions {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(240),
+                "{} executions so far",
+                opens.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert_eq!(
+                rt.status("held-1").await.expect("status"),
+                Some(RunStatus::Pending),
+                "it stopped waiting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!project.join("ran").exists(), "the command ran while held");
+        let failed: Vec<String> = rt
+            .steps("held-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.error.is_some())
+            .map(|s| s.name)
+            .collect();
+        assert!(failed.is_empty(), "recorded as failed: {failed:?}");
+        drop(holder.lock().expect("holder").take());
+        let started = std::time::Instant::now();
+        while rt.status("held-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "once the store was free, it did not finish: {:?}",
+                rt.status("held-1").await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.join("ran")).expect("ran"),
+            "x",
+            "its command ran once"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
