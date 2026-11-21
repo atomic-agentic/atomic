@@ -50,6 +50,7 @@ fn runtimes(base_url: &str, model: &str, root: &Path) -> Runtimes {
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
