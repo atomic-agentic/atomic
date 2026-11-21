@@ -57,6 +57,45 @@ impl Wire {
     }
 }
 
+/// The HTTP client a lite atom calls the model endpoint at `base_url` with,
+/// every request bounded by `timeout`. It follows no redirect: a redirect
+/// would resend the key, and reqwest keeps the `Authorization` header across
+/// a change from `https` to `http` on the same host and port. An endpoint
+/// on this machine over plain `http` goes by no proxy, since a proxy
+/// variable such as `HTTP_PROXY` would otherwise carry the key there in
+/// cleartext; any other endpoint uses the proxies the environment names.
+pub fn model_client(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if http_loopback(base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().context("build the HTTP client")
+}
+
+/// Whether `base_url` is plain `http` to this machine: a loopback address or
+/// `localhost`.
+fn http_loopback(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "http") else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    }
+}
+
 /// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
 /// a Responses API structured-output schema in decoding. Other servers may
 /// accept the schema on that API and ignore it.
@@ -245,10 +284,7 @@ where
         ),
         None => None,
     };
-    let client = reqwest::Client::builder()
-        .timeout(runtime.timeout)
-        .build()
-        .context("build the HTTP client")?;
+    let client = model_client(&runtime.endpoint.base_url, runtime.timeout)?;
 
     let mut exchange = vec![(Role::User, first.prompt.clone())];
     let mut schema = first.output_schema.clone();

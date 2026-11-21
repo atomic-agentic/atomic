@@ -63,6 +63,7 @@ test git_safety
 test cancelled_open
 test stopping_open
 test worktrees
+test model_client
 test dbos_schema
 test executor_identity
 test gates
