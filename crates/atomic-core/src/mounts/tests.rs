@@ -459,8 +459,7 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
     std::os::unix::fs::symlink("home", host.join("home")).expect("link");
     let place = host.join("home/u/.ssh");
     assert!(
-        std::fs::symlink_metadata(&place)
-            .is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
+        std::fs::symlink_metadata(&place).is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
     );
     let mounts = ninep(&host, &dir.0.join("also"), "/");
     assert!(
