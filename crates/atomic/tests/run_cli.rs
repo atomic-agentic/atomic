@@ -811,10 +811,11 @@ async fn await_gate(rt: &Durare, run: &str) -> gate::Gate {
         if let Some(g) = open.into_iter().next() {
             return g;
         }
+        // No row yet is a run still being admitted: its admission line is
+        // printed before the row is written.
         let status = rt.status(run).await.expect("status");
-        assert_eq!(
-            status,
-            Some(RunStatus::Pending),
+        assert!(
+            matches!(status, None | Some(RunStatus::Pending)),
             "{run} ended before it opened a gate: {status:?}"
         );
         assert!(
@@ -5108,7 +5109,8 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
-fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_being() {
+fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_as_it_was()
+{
     #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
@@ -5190,7 +5192,7 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
                 Reply::Tool {
                     name: "exec_command".into(),
                     arguments: json!({
-                        "cmd": "sed -i 's/return unit_cents$/return unit_cents * quantity/' pricing.py",
+                        "cmd": "sed 's/return unit_cents$/return unit_cents * quantity/' pricing.py > pricing.py.new && mv pricing.py.new pricing.py",
                         "yield_time_ms": 10000
                     }),
                 },
