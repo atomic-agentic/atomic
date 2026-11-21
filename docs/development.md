@@ -78,12 +78,18 @@ dependency debug info turned off, so keep that much space free.
 Exit code 124 means the command hit the time limit, and 137 usually means it
 hit the memory limit.
 
-Stopping `scripts/dev.sh`, with Ctrl-C, SIGTERM or SIGHUP, stops and removes
-the container it started within a few seconds, and so does killing it outright
-or killing the process that started it. Only that container: each run labels
-its own with a token of its own (`org.atomic-agentic.dev-run`), and nothing
-else on the host is touched. The test Postgres stays up, since every run shares
-it. `scripts/dev-sh-test.sh` runs on the host and checks each of these.
+Stopping `scripts/dev.sh` with Ctrl-C, SIGTERM or SIGHUP removes the
+container it started before it exits, with 130, 143 or 129. Killing it outright,
+or its whole process group, or the process that started it, removes the
+container within a few seconds: a watcher in a session of its own sees to that,
+and when the parent died it stops dev.sh first, which then exits 143. Only that
+container: each run labels its own with a token of its own
+(`org.atomic-agentic.dev-run`), and nothing else on the host is touched. The
+test Postgres stays up, since every run shares it. A run started with
+`ATOMIC_DEV_DETACHED=1`, as for `nohup scripts/dev.sh … &`, outlives the
+process that started it, as does one the system's first process starts.
+`scripts/dev-sh-test.sh` runs on the host, with docker or podman, and checks
+each of these; it exits 75 at once while `ATOMIC_DEV_WAIT_LOCK` exists.
 
 ## The test database
 
