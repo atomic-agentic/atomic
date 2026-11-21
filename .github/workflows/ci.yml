@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Linux and macOS are first-class platforms. Every push to main and every pull
-# request runs the checks on Linux. macOS is opt-in while atomic is built out:
+# Linux and macOS are first-class platforms. Every push to main, every pull
+# request and every merge group of the merge queue runs the checks on Linux.
+# macOS is opt-in while atomic is built out:
 # start the workflow by hand (Actions > CI > Run workflow) and tick "macos" to
 # add it. Actions are pinned by commit SHA.
 #
@@ -28,10 +29,10 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  # A newer push to a pull request makes its older run moot. A run on main,
-  # or on a merge group, is the check of what main holds, and it saves the
-  # caches, so it always runs to the end.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A newer run on a pull request or a merge group makes its older run moot.
+  # A run on main is the check of what main holds, and it saves the caches,
+  # so once started it runs to the end.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
