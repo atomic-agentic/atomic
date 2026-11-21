@@ -534,6 +534,12 @@ fn program(path: &Path) -> bool {
 /// a directory the thread may write, where a command could rename it out
 /// from under its denial.
 ///
+/// Each is denied too wherever else the mount table shows it, such as a
+/// home bound at a second path (see [`crate::mounts`]); nothing runs when
+/// the table cannot be read, or when such a place would cover what the
+/// thread needs or lies two or more levels inside a directory it may
+/// write.
+///
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
@@ -627,6 +633,7 @@ fn denied_paths(
             links.len()
         )));
     }
+    let link_count = links.len();
     denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -711,6 +718,42 @@ fn denied_paths(
         }
         all.push(path);
     }
+    // The same places wherever else they are mounted, such as a home bound
+    // at a second path or the host's files under /run/host: denied there
+    // too, or nothing runs (see `crate::mounts`).
+    // And Codex's home, whose databases a pattern denies (see below).
+    let home = [codex_home.to_owned()];
+    let found =
+        crate::mounts::second_mounts(&[&all, &home]).map_err(|e| refuse(format!("{e:#}")))?;
+    let (aliases, home_aliases) = (&found[0], &found[1]);
+    // One cap for both, as both go to the sandbox helper in one argument.
+    let second = aliases.len() + home_aliases.len();
+    if link_count + second > MAX_LINK_TARGETS {
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {link_count} links to files elsewhere and \
+             are mounted at {second} other places, more than the {MAX_LINK_TARGETS} atomic \
+             denies besides the places themselves"
+        )));
+    }
+    for alias in aliases.iter().chain(home_aliases) {
+        if let Some(needed) = covers(alias) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, and holds {}, which \
+                 they need, so atomic cannot deny it there",
+                alias.display(),
+                needed.display()
+            )));
+        }
+        if two_deep(alias, &writable) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, two or more levels \
+                 inside a directory they may write, so a command could move it out from under \
+                 its denial; mount it elsewhere",
+                alias.display()
+            )));
+        }
+    }
+    all.extend(aliases.iter().cloned());
     // A path inside another denied path is denied with it, and the sandbox
     // cannot mount a denial inside one: such as the credential store inside
     // the person's own configuration directory.
@@ -721,8 +764,21 @@ fn denied_paths(
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
-    let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    // And so at each second mount of Codex's home.
+    let mut globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    for alias in home_aliases {
+        globs.push(format!("{}/*.sqlite*", alias.display()));
+    }
     Ok((all, globs))
+}
+
+/// Whether `path` lies two or more levels inside a directory of `within`,
+/// where a command that may write it could rename a directory above `path`.
+fn two_deep(path: &Path, within: &[PathBuf]) -> bool {
+    within.iter().any(|w| {
+        path.strip_prefix(w)
+            .is_ok_and(|rest| rest.components().count() >= 2)
+    })
 }
 
 /// What Codex reads from its home at start: `.env` sets variables in
@@ -2995,6 +3051,94 @@ mod tests {
             );
         }
         assert!(denied.contains(&home.join(".ssh")), "{denied:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
+        let dir = scratch("second-mounts");
+        let codex = dir.join("codex");
+        for d in [&codex, &dir.join("home/.aws")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![dir.join("home/.aws")],
+        };
+        let real = std::fs::canonicalize(&dir).expect("real");
+        let rel = real.strip_prefix("/").expect("absolute");
+        // The whole filesystem bound again at `at`.
+        let bound = |at: &str| {
+            format!("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 / {at} rw - ext4 /dev/sda1 rw\n")
+        };
+        let refused = |table: String, cwd: Option<&Path>, writable: &[PathBuf]| {
+            let _table = crate::mounts::with_table(table.as_bytes());
+            denied_paths(&private, &codex, cwd, writable)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        // Bound where nothing needs it: denied there too, with Codex's
+        // databases.
+        {
+            let _table = crate::mounts::with_table(bound("/again").as_bytes());
+            let (denied, globs) = denied_paths(&private, &codex, None, &[]).expect("denied");
+            assert!(
+                denied.contains(&Path::new("/again").join(rel).join("home/.aws")),
+                "{denied:?}"
+            );
+            assert!(
+                globs.contains(&format!("/again/{}/codex/*.sqlite*", rel.display())),
+                "{globs:?}"
+            );
+        }
+        // Where its second mount would cover the thread's directory.
+        let cwd = Path::new("/again").join(rel).join("home/.aws/work");
+        let message = refused(bound("/again"), Some(&cwd), &[]);
+        assert!(
+            message.contains("is a second mount") && message.contains("which they need"),
+            "{message}"
+        );
+        // Where it lies two levels inside a directory the thread may write.
+        let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
+        assert!(
+            message.contains("is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Codex's home bound two levels inside a writable directory: its
+        // databases' pattern there is held to the same checks.
+        let codex_real = std::fs::canonicalize(&codex).expect("real");
+        let message = refused(
+            format!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /w/a/b rw - ext4 /dev/sda1 rw\n",
+                codex_real.display()
+            ),
+            None,
+            &[PathBuf::from("/w")],
+        );
+        assert!(
+            message.contains("/w/a/b is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Too many second mounts of Codex's home alone: they count too.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!(
+                "{} 1 8:1 {} /h{i} rw - ext4 /dev/sda1 rw\n",
+                i + 2,
+                codex_real.display()
+            ));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
+        // Too many second mounts to deny.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!("{} 1 8:1 / /m{i} rw - ext4 /dev/sda1 rw\n", i + 2));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
     }
 
     #[cfg(unix)]
