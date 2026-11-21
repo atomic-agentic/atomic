@@ -16,6 +16,7 @@ pipeline a_process_killed_at_a_gate_leaves_it_waiting_for_the_decision
 run_cli a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time
 run_cli a_gate_decided_while_its_run_was_down_wakes_it_on_resume
 gates_cli a_gate_is_approved_from_a_second_terminal_while_the_run_waits
+pending: under a local `atomic serve` the recovered gate is not shown to keep its first deadline; a test would capture the gate's opened_at and deadline before the kill and compare them once serve has recovered the run, and approve it with `atomic gates approve` from a second process.
 
 ## A gate whose time ran out while nothing was running is rejected when the run recovers.
 # The first pair waits out the deadline with no process running, then recovers
@@ -43,6 +44,7 @@ gates_cli a_gate_is_approved_from_a_second_terminal_while_the_run_waits
 atomic_durable gate::approvers::tests::server_mode_without_an_allowed_group_fails_load
 atomic_durable gate::approvers::tests::server_mode_takes_an_allowed_group_or_the_policy_default
 pipeline a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts
+pending: only the failing direction of the server-mode load is shown end to end; a test would prepare, in `Deployment::Server`, a workflow whose gate names an allowed group and see it load, and assert the refusal's text when it names none.
 
 ## Sending the same decision again returns the first result; a different decision on a decided gate gets a typed conflict that carries the winner.
 ### Sending the same decision again returns the first result
@@ -80,6 +82,7 @@ atomic_durable gate::tests::postgres::changed_content_cannot_reuse_an_approval
 atomic_durable gate::tests::sqlite::only_an_approver_on_the_shown_proposal_decides
 atomic_durable gate::tests::postgres::only_an_approver_on_the_shown_proposal_decides
 atomic_durable gate::tests::the_proposal_digest_ignores_key_order_and_sees_every_change
+pending: the candidate half is shown, the evidence half is not; a test would open two gates whose proposals differ only in an evidence digest and see the earlier approval refused with `ProposalChanged`.
 
 ## A question gate answered in the terminal resumes its step with the typed answer, writes the feedback entry when asked, and resumes with the declared default if nobody answers in time. An answer that is not one of the enum's values is refused.
 gate_prompt a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_remembers_it
