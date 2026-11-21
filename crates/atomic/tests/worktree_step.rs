@@ -163,6 +163,7 @@ fn register(rt: &mut Durare, dir: &Path, base_url: &str) {
                             let ((out, metadata), commit) = step.await.map_err(|e| match e {
                                 StepError::Body(e) => e,
                                 StepError::Worktree(e) => failed(e),
+                                StepError::Waited(e) => failed(e),
                             })?;
                             failpoint("worktree-step:after-commit");
                             let mut metadata = serde_json::to_value(metadata).map_err(failed)?;

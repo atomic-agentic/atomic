@@ -1580,6 +1580,10 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
         );
         let id = run_id(&String::from_utf8_lossy(&out.stderr));
         assert_eq!(model.calls(), 1, "rank ran");
+        assert!(
+            run_file(&dir, "count-note.tally").is_file(),
+            "the killed run's caches hold count's tally"
+        );
         assert_eq!(count_log(&dir), 1, "count ran");
 
         // Resumed, and killed again before the run ends, so its caches,
@@ -1599,6 +1603,10 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
         .expect("child");
         assert!(!out.status.success(), "killed again: {}", text(&out));
         assert_eq!(model.calls(), 2, "only summarize ran again");
+        assert!(
+            run_file(&dir, "count-note.tally").is_file(),
+            "the killed run still has its caches, and the tally in them"
+        );
         assert_eq!(count_log(&dir), 1, "count did not run again");
 
         let (d, p, e, i) = (dir.clone(), project.clone(), env.clone(), id.clone());

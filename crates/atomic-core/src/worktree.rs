@@ -66,6 +66,43 @@ pub enum WorktreeError {
 
 type Result<T> = std::result::Result<T, WorktreeError>;
 
+/// Directories whose next creations fail as on a full disk, each so many
+/// times, by path: for this crate's tests only.
+#[cfg(test)]
+pub(crate) static FULL_FOR_TESTS: std::sync::Mutex<Vec<(PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// A full disk at `path`, if a test asked for one there.
+#[cfg(test)]
+fn full_for_tests(path: &Path) -> Option<WorktreeError> {
+    let mut full = FULL_FOR_TESTS.lock().ok()?;
+    let (_, left) = full.iter_mut().find(|(p, left)| p == path && *left > 0)?;
+    *left -= 1;
+    Some(WorktreeError::Io {
+        what: "create",
+        path: path.to_owned(),
+        source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+    })
+}
+
+impl WorktreeError {
+    /// Whether trying again later may succeed, as when the disk or a quota
+    /// is full: an I/O error of the kind [`atomic_exec::workspace::transient`]
+    /// names, or git saying so (it runs in the C locale). A run waits for
+    /// room on such an error rather than failing.
+    pub fn may_pass(&self) -> bool {
+        match self {
+            WorktreeError::Io { source, .. } | WorktreeError::Git(GitError::Spawn(source)) => {
+                atomic_exec::workspace::transient(source)
+            }
+            WorktreeError::Git(GitError::Failed { stderr, .. }) => {
+                stderr.contains("No space left on device") || stderr.contains("Disk quota exceeded")
+            }
+            _ => false,
+        }
+    }
+}
+
 fn io(what: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> WorktreeError {
     let path = path.to_owned();
     move |source| WorktreeError::Io { what, path, source }
@@ -149,6 +186,11 @@ pub enum StepError<E> {
     /// The step's body failed; nothing was committed.
     #[error("{0}")]
     Body(E),
+    /// Waiting for room to prepare the worktree, on a full disk, ended
+    /// before there was any: the process waits no longer, or is stopping
+    /// ([`crate::runtime::wait_for_room`]). Nothing ran.
+    #[error("{0}")]
+    Waited(crate::typed::AtomError),
 }
 
 /// What [`Worktrees::cleanup`] removed.
@@ -241,6 +283,10 @@ impl Worktrees {
     /// check `base` out afresh, detached. Returns the worktree, ready for the
     /// atom.
     pub fn prepare(&self, run: &str, step: &str, base: &str) -> Result<Worktree> {
+        #[cfg(test)]
+        if let Some(full) = full_for_tests(&self.dir) {
+            return Err(full);
+        }
         if !is_sha(base) {
             return Err(WorktreeError::Invalid(format!(
                 "a step's base must be a whole commit ID, not {base:?}"
@@ -338,7 +384,25 @@ impl Worktrees {
             request.step.clone(),
             request.base.clone(),
         );
-        let worktree = blocking(move || this.prepare(&run, &step, &base)).await?;
+        // On a full disk the step waits for room, as for the execution
+        // backend's, rather than failing its run.
+        let waiting = crate::runtime::Waiting {
+            label: &request.step,
+            run: &request.run,
+            step: &request.step,
+            what: "the disk",
+            doing: "hold the step's worktree",
+        };
+        let worktree = crate::runtime::wait_for_room(waiting, move || {
+            match this.prepare(&run, &step, &base) {
+                Err(e) if e.may_pass() => Err(crate::runtime::NotYet::Room(format!(
+                    "the step's worktree: {e}"
+                ))),
+                prepared => Ok(prepared),
+            }
+        })
+        .await
+        .map_err(StepError::Waited)??;
         if crate::failpoint::armed() {
             crate::failpoint::failpoint(&format!("worktree:after-prepare:{}", request.step));
         }
@@ -517,17 +581,64 @@ impl Caches {
     /// its place is refused: atomic did not make it, and following it
     /// would put the run's caches wherever it points.
     pub fn create(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(full) = full_for_tests(&self.dir) {
+            return Err(full);
+        }
         if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(WorktreeError::Invalid(format!(
                 "{} is a link, not the run's cache directory; atomic did not make it",
                 self.dir.display()
             )));
         }
-        crate::state::private_dir(&self.dir).map_err(|e| WorktreeError::Io {
-            what: "create",
-            path: self.dir.clone(),
-            source: std::io::Error::other(e.to_string()),
+        crate::state::private_dir(&self.dir).map_err(|e| match e {
+            // As it failed, so a full disk reads as one (see
+            // [`WorktreeError::may_pass`]).
+            crate::state::StateError::Create { source, .. } => WorktreeError::Io {
+                what: "create",
+                path: self.dir.clone(),
+                source,
+            },
+            e => WorktreeError::Invalid(e.to_string()),
         })
+    }
+
+    /// [`create`](Self::create), as [`crate::runtime::wait_for_room`] reads
+    /// it: a full disk or quota is a reason to wait, anything else is for
+    /// good.
+    pub fn create_for_room(&self) -> std::result::Result<(), crate::runtime::NotYet> {
+        let Err(e) = self.create() else {
+            return Ok(());
+        };
+        let why = format!("the run's build caches: {e}");
+        if e.may_pass() {
+            Err(crate::runtime::NotYet::Room(why))
+        } else {
+            Err(crate::runtime::NotYet::Fail(crate::AtomError::Runtime(why)))
+        }
+    }
+
+    /// [`create`](Self::create) for step `step` of run `run`, whose atom is
+    /// `label`, waiting for room on a full disk as
+    /// [`crate::runtime::wait_for_room`] does.
+    pub async fn create_waiting(
+        &self,
+        label: &str,
+        run: &str,
+        step: &str,
+    ) -> std::result::Result<(), crate::AtomError> {
+        let caches = self.clone();
+        crate::runtime::wait_for_room(
+            crate::runtime::Waiting {
+                label,
+                run,
+                step,
+                what: "the disk",
+                doing: "hold the run's build caches",
+            },
+            move || caches.create_for_room(),
+        )
+        .await
     }
 
     /// Remove the cache directory and everything in it; a repeat finds
@@ -832,6 +943,120 @@ mod tests {
         ] {
             assert_eq!(exec[name], env[name], "{name}");
         }
+    }
+
+    /// A full disk or quota may pass, in a file operation or as git says
+    /// it; anything else is for good. A cache directory that cannot be made
+    /// says why as it failed, so a full disk reads as one.
+    #[test]
+    fn only_a_full_disk_or_quota_may_pass() {
+        use std::io::{Error, ErrorKind};
+        let io = |kind| WorktreeError::Io {
+            what: "create",
+            path: "/state/cache".into(),
+            source: Error::from(kind),
+        };
+        assert!(io(ErrorKind::StorageFull).may_pass());
+        assert!(io(ErrorKind::QuotaExceeded).may_pass());
+        assert!(!io(ErrorKind::PermissionDenied).may_pass());
+        assert!(!io(ErrorKind::NotADirectory).may_pass());
+        let git = |stderr: &str| {
+            WorktreeError::Git(GitError::Failed {
+                what: "worktree".into(),
+                code: Some(128),
+                stderr: stderr.into(),
+            })
+        };
+        assert!(git("fatal: could not create directory 'x': No space left on device").may_pass());
+        assert!(git("error: unable to write file: Disk quota exceeded").may_pass());
+        assert!(!git("fatal: invalid reference: abc").may_pass());
+        assert!(!WorktreeError::Invalid("No space left on device".into()).may_pass());
+
+        let dir = std::env::temp_dir().join(format!("atomic-caches-kind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::write(dir.join("file"), "").expect("file");
+        let refused = Caches::new(dir.join("file/run-1"))
+            .create()
+            .expect_err("not a directory");
+        assert!(
+            matches!(&refused, WorktreeError::Io { source, .. } if source.kind() == ErrorKind::NotADirectory),
+            "{refused:?}"
+        );
+        assert!(!refused.may_pass());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a full disk, a step's caches and its worktree wait for room, then
+    /// are made: through the calls a run makes, [`Caches::create_waiting`]
+    /// and [`Worktrees::run_step`]. Nothing else waits.
+    #[test]
+    fn a_full_disk_makes_a_steps_caches_and_worktree_wait_for_room() {
+        let full = |path: &Path, times: usize| {
+            FULL_FOR_TESTS
+                .lock()
+                .expect("full")
+                .push((path.to_owned(), times));
+        };
+        let left = |path: &Path| {
+            FULL_FOR_TESTS
+                .lock()
+                .expect("full")
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, left)| *left)
+        };
+        let dir = crate::git::tests::scratch("full-disk");
+        let (repo, first, _) = crate::git::tests::history(&dir);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let caches = Caches::new(dir.join("state/cache/run-1-ab"));
+            full(caches.dir(), 2);
+            caches
+                .create_waiting("implement", "run-1", "implement")
+                .await
+                .expect("made once there is room");
+            assert!(caches.dir().is_dir());
+            assert_eq!(left(caches.dir()), Some(0), "both full tries were made");
+
+            let worktrees = Arc::new(Worktrees::new(
+                crate::git::Git::find().expect("git").discover(&repo).expect("repo"),
+                dir.join("state/worktrees"),
+            ));
+            full(&dir.join("state/worktrees"), 2);
+            let request = StepRequest {
+                run: "run-1".into(),
+                step: "implement".into(),
+                base: first.clone(),
+                message: "Implement it".into(),
+                signature: Signature::default(),
+            };
+            let ran = std::sync::atomic::AtomicUsize::new(0);
+            let (out, _) = worktrees
+                .run_step(request, |tree| {
+                    ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move { Ok::<_, String>(tree.is_dir()) }
+                })
+                .await
+                .expect("prepared once there is room");
+            assert!(out, "the body ran in the worktree");
+            assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(left(&dir.join("state/worktrees")), Some(0));
+
+            // A cache directory that can never be made fails at once.
+            std::fs::write(dir.join("file"), "").expect("file");
+            let refused = Caches::new(dir.join("file/run-1"))
+                .create_waiting("implement", "run-1", "implement")
+                .await;
+            assert!(
+                matches!(&refused, Err(crate::AtomError::Runtime(m)) if m.contains("the run's build caches")),
+                "{refused:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
