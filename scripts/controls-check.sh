@@ -41,14 +41,17 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
 STATE="${ROOT}/target/controls-check"
 LOG="${STATE}/cargo.log"
 
 # Each control's row lives in its own file: scripts/controls/<name>.row holds
 # one line, name | file | text to replace | replacement | cargo test arguments.
 # A control guarded by several tests names them all after `--`; each must fail
-# with the control off.
+# with the control off. A row's arguments are taken as written, with no
+# expansion, so a row that needs the sandbox and Postgres suites names their
+# features itself. A row switches off the first place its text is found, so
+# where one control has two sites the text of each is unlike the other's
+# (stop-own-tool and stop-own-tool-wait), and there is a row for each.
 ROWS="${ROOT}/scripts/controls"
 
 die() {

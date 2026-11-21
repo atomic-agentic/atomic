@@ -1,0 +1,1 @@
+redact-numbered-redacted|crates/atomic-core/src/redact.rs|    surer(strength(key), strength(base_name(key)))|    if base_name(key).contains(REDACTED) { strength(base_name(key)) } else { surer(strength(key), strength(base_name(key))) } /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_key_that_looks_numbered_holds_its_value_as_its_whole_name_says

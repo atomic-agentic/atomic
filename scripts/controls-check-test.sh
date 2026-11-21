@@ -240,6 +240,17 @@ run missing sandbox-writes
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
 
+# A row's arguments reach cargo as written: no variable in them is expanded,
+# and none is left to be.
+repo="$(fresh)"
+run honest sandbox-writes
+grep -q -- "--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests" "${repo}/cargo-args" ||
+    fail "features: cargo was not given the row's features: $(cat "${repo}/cargo-args")"
+! grep -q '\${' "${repo}/cargo-args" ||
+    fail "features: a variable reached cargo unexpanded: $(cat "${repo}/cargo-args")"
+! grep -l '\${' "${ROOT}"/scripts/controls/*.row >/dev/null 2>&1 ||
+    fail "features: a row holds a variable: $(grep -l '\${' "${ROOT}"/scripts/controls/*.row)"
+
 # A row whose only argument after `--` is a flag of the test binary's, not a
 # test: the flag is not taken for a test that should have been seen failing.
 repo="$(fresh)"

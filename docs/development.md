@@ -220,7 +220,12 @@ name|file|text to replace|replacement|cargo test arguments
 where the control lives; the script switches the control off by replacing the
 first `text to replace` there with `replacement`; the rest are the arguments
 given to `cargo test`, with every test the control has named after `--`, each of
-which must fail with the control off. Add a control by adding a file: the script
+which must fail with the control off. The arguments are taken as written, with
+no variable expanded, so a control that needs the sandbox and Postgres suites
+names `--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests`
+itself. Only the first `text to replace` is switched, so a control with two
+sites has a row for each, and the text of each is unlike the other's. Add a
+control by adding a file: the script
 reads the directory in file-name order and refuses a file whose row names a
 different control, a file holding anything but one row, a second file naming a
 control again, and anything there that is not a `*.row` regular file. That is
