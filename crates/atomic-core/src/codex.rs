@@ -862,9 +862,9 @@ fn harden() {
 /// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
 /// runs arrive on its stdin with their environments, and a confined one's
 /// with its proxy token, so no process of the same user may read its memory
-/// or the /proc files that show it, such as `environ` and `mem`; its
-/// `cmdline` and `stat` stay readable. Call it first, before the request is
-/// read.
+/// or the /proc files that show it, such as `environ` and `mem`, unless it
+/// has `CAP_SYS_PTRACE` over the runner's user namespace; its `cmdline` and
+/// `stat` stay readable. Call it first, before the request is read.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
@@ -1057,8 +1057,10 @@ fn keep_sandbox_off_keyrings() {
     }
 }
 
-/// Make this process non-dumpable: its memory and its /proc files, its
-/// environment among them, become unreadable to other processes of its user.
+/// Make this process non-dumpable: its memory and the /proc files that show
+/// it, its environment among them, become unreadable to other processes of
+/// its user without `CAP_SYS_PTRACE` over its user namespace; its `cmdline`
+/// and `stat` stay readable.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn not_dumpable() -> std::io::Result<()> {

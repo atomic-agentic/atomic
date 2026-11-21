@@ -189,10 +189,9 @@ names one. Each connection must open with a token that atomic gives the
 command's sandbox and that the command itself never sees, so no sandboxed
 process and no other user's process can use the proxy, unless it has
 `CAP_SYS_PTRACE` over the sandbox helper's user namespace, as root does. A
-process of your own
-user that runs outside any sandbox is not kept out: it can enter the
-command's namespaces and use the sandbox's own route to the proxy. Once the
-command ends, its token admits no new connection.
+process of your own user that runs outside any sandbox is not kept out: it
+can enter the command's namespaces and use the sandbox's own route to the
+proxy. Once the command ends, its token admits no new connection.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling

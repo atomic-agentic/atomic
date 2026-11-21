@@ -37,9 +37,9 @@
 //! a process with `CAP_SYS_PTRACE` over their user namespace can read the
 //! token from the helpers' environment or from the runner's memory, where
 //! its request puts it; in the few milliseconds between the helper's exec
-//! and that prologue, a process of the same user can read it too. A command's token
-//! admits no new connection once the command ends, and the proxy stops once
-//! no command needs it.
+//! and that prologue, a process of the same user can read it too. A
+//! command's token admits no new connection once the command ends, and the
+//! proxy stops once no command needs it.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
