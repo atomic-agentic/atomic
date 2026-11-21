@@ -1359,6 +1359,145 @@ fn your_own_dollar_cap_holds_a_larger_one_and_leaves_none_as_none() {
     );
 }
 
+/// One way a layer above sets a cap to nothing: its name, the variables it
+/// sets and the project's files it writes.
+type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<(&'a str, String)>);
+
+/// A layer above the person's own configuration cannot remove their dollar
+/// cap by setting it to nothing: `null` in the project's committed file, in
+/// its local file, or from the variable, for an atom and for a run, all
+/// leave their number standing; a whole group set to `null` is refused.
+#[test]
+fn a_null_from_a_layer_above_cannot_remove_your_own_dollar_cap() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 1\n  workflow:\n    cost_usd: 2\n");
+    for level in ["atom", "workflow"] {
+        let want = if level == "atom" { 1.0 } else { 2.0 };
+        let line = if level == "atom" { 3 } else { 5 };
+        let variable = format!("ATOMIC_BUDGET_{}_COST_USD", level.to_uppercase());
+        let committed =
+            format!("atomic: 1\nname: notes\nbudget:\n  {level}:\n    cost_usd: null\n");
+        let local = format!("budget:\n  {level}:\n    cost_usd: null\n");
+        let group = format!("atomic: 1\nname: notes\nbudget:\n  {level}: null\n");
+        let cases: [Case; 3] = [
+            ("committed", vec![], vec![("atomic.yaml", committed)]),
+            (
+                "local",
+                vec![],
+                vec![
+                    ("atomic.yaml", MANIFEST_ONLY.to_owned()),
+                    ("atomic.local.yaml", local),
+                ],
+            ),
+            (
+                "variable",
+                vec![(variable.as_str(), "null")],
+                vec![("atomic.yaml", MANIFEST_ONLY.to_owned())],
+            ),
+        ];
+        for (case, vars, files) in cases {
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let d = dir(&files);
+            let mut env = vec![("HOME", home.as_str())];
+            env.extend(vars);
+            let r = resolved(&d, &EngineArgs::default(), &env, &nobody);
+            let budget = &r.settings.budget;
+            let (cap, ceiling) = if level == "atom" {
+                (budget.atom.cost_usd, budget.ceilings.atom.cost_usd)
+            } else {
+                (budget.workflow.cost_usd, budget.ceilings.workflow.cost_usd)
+            };
+            assert_eq!(cap, Some(want), "{level}, {case}");
+            assert_eq!(ceiling, Some(want), "{level}, {case}");
+            assert_eq!(
+                file_and_line(&r, &format!("budget.{level}.cost_usd")),
+                ("config.yaml".to_owned(), line),
+                "{level}, {case}"
+            );
+        }
+        // A whole group set to nothing is no setting at all, and refused.
+        let d = dir(&[("atomic.yaml", group.as_str())]);
+        let said = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            said.contains(&format!("budget.{level} is a section")),
+            "{level}: {said}"
+        );
+    }
+}
+
+/// Under the person's own dollar cap, a project cannot make a model they did
+/// not price free: a price of nothing for both input and output is refused,
+/// naming the model and where to price it. A price that is not nothing is
+/// the project's, and so is any price where they set no dollar cap, or for a
+/// model they priced themselves.
+#[test]
+fn under_your_own_dollar_cap_a_project_cannot_make_a_model_free() {
+    let priced = |input: &str, output: &str| {
+        format!(
+            "atomic: 1\nname: notes\nbudget:\n  pricing:\n    free-model:\n      \
+             input_usd_per_mtok: {input}\n      output_usd_per_mtok: {output}\n"
+        )
+    };
+    let free = priced("0", "0");
+    let (_home, home) = person("budget:\n  workflow:\n    cost_usd: 1\n");
+    let d = dir(&[("atomic.yaml", free.as_str())]);
+    let said = resolved_where(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("budget.pricing.free-model"), "{said}");
+    assert!(
+        said.contains("price free-model in your own configuration"),
+        "{said}"
+    );
+
+    let cheap = priced("0", "0.5");
+    let d = dir(&[("atomic.yaml", cheap.as_str())]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert_eq!(
+        r.settings.budget.pricing["free-model"].output_usd_per_mtok,
+        0.5
+    );
+
+    let d = dir(&[("atomic.yaml", free.as_str())]);
+    let (_theirs, priced_by_them) = person(
+        "budget:\n  atom:\n    cost_usd: 1\n  pricing:\n    free-model:\n      \
+         input_usd_per_mtok: 0\n      output_usd_per_mtok: 0\n",
+    );
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", priced_by_them.as_str())],
+        &nobody,
+    );
+    assert_eq!(
+        r.settings.budget.pricing["free-model"].input_usd_per_mtok,
+        0.0
+    );
+    let (_capless, no_dollars) = person("budget:\n  atom:\n    tokens: 1000\n");
+    resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", no_dollars.as_str())],
+        &nobody,
+    );
+}
+
 #[test]
 fn your_own_dollar_cap_holds_a_larger_one_across_the_levels() {
     let (_home, home) = person("budget:\n  atom:\n    cost_usd: 0.5\n");

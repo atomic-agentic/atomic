@@ -961,7 +961,16 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| atom.kind == "exec")
                 .map(|(name, _)| name.as_str())
                 .collect();
+            // And held to the ceilings of the person running it now, as
+            // well as to those it carries: a plan made elsewhere, or with
+            // none, cannot raise what their own configuration caps.
             plan.validate()
+                .and_then(|()| {
+                    plan.held_to(
+                        &services.budgets.ceilings,
+                        "your own configuration's ceilings",
+                    )
+                })
                 .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
                 .map(|()| plan.clone())
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))

@@ -803,6 +803,24 @@ fn slot<'v>(v: &'v mut Value, dotted: &str) -> Option<&'v mut Value> {
     Some(cur)
 }
 
+/// The value at `dotted` in `v`, as a slot to write through, made where
+/// it is missing: each step on the way that is not an object, as a layer's
+/// `null` leaves one, becomes an empty object.
+fn slot_made<'v>(v: &'v mut Value, dotted: &str) -> &'v mut Value {
+    let mut cur = v;
+    for key in dotted.split('.') {
+        if !cur.is_object() {
+            *cur = Value::Object(Map::new());
+        }
+        cur = cur
+            .as_object_mut()
+            .expect("an object, made so above")
+            .entry(key.to_owned())
+            .or_insert(Value::Null);
+    }
+    cur
+}
+
 /// The person's own configuration's `budget` section, held over the merged
 /// settings, and the remarks naming what it bound. With it, their
 /// [`Ceilings`], which travel with the settings so that a run holds an atom's
@@ -831,6 +849,7 @@ fn person_budget(
                 if let Some(Value::Object(written)) = doc.value.pointer("/budget") {
                     let (held, said) =
                         hold_budget(user, written, &lines_of(&doc), &mut budget, sources);
+                    nothing_free_under(user, written, &budget, &held)?;
                     ceilings = held;
                     notes = said;
                 }
@@ -856,14 +875,49 @@ fn person_budget(
     Ok(notes)
 }
 
+/// Refuse a project's zero price for a model under the person's own dollar
+/// cap: with any dollar cap in `ceilings`, a model in the merged `budget`
+/// that the person's `written` section does not price, priced at nothing
+/// for both input and output, would make every call to it free and the cap
+/// meaningless. A nonzero price for such a model is the project's to set.
+fn nothing_free_under(
+    user: &Path,
+    written: &Map<String, Value>,
+    budget: &Value,
+    ceilings: &Ceilings,
+) -> Result<(), ConfigError> {
+    if ceilings.atom.cost_usd.is_none() && ceilings.workflow.cost_usd.is_none() {
+        return Ok(());
+    }
+    let theirs = |model: &str| {
+        written
+            .get("pricing")
+            .and_then(Value::as_object)
+            .is_some_and(|pricing| pricing.contains_key(model))
+    };
+    let Some(table) = at(budget, "pricing").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (model, price) in table {
+        let zero = |field: &str| price.get(field).and_then(Value::as_f64) == Some(0.0);
+        if !theirs(model) && zero("input_usd_per_mtok") && zero("output_usd_per_mtok") {
+            return Err(ConfigError::Invalid(format!(
+                "budget.pricing.{model}: a price of nothing for {model} would leave your own \
+                 dollar cap ({}) nothing to count; price {model} in your own configuration",
+                user.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The `written` `budget` section of the person's own configuration file
 /// `user`, held over the merged `budget` section, which is changed in place:
 ///
 /// - every cap they wrote caps the merged one, so the effective limit is the
 ///   smaller of the two and a higher layer can only bring a cap down to
-///   theirs, never above it. A measure they leave unset caps nothing, and a
-///   cap nothing set stays unset: their cap never makes a cap where there was
-///   none;
+///   theirs, never above it, nor remove it with `null`. A measure they leave
+///   unset caps nothing;
 /// - every price they wrote holds for the model it names, so a project's
 ///   `budget.pricing` cannot make a model they priced look cheaper than they
 ///   priced it, and cannot give any model a per-call maximum above their own
@@ -913,17 +967,18 @@ fn hold_budget(
             let Some(want) = cap.as_f64() else {
                 continue;
             };
-            // A cap is held only by a cap smaller than it, which leaves a
-            // project's smaller cap tightening what they allow, and their own
-            // number standing where nothing above it raised it.
-            if at(budget, inside(&dotted))
-                .and_then(Value::as_f64)
-                .is_none_or(|have| want >= have)
+            // Their cap gives way only to a smaller one, which leaves a
+            // project's smaller cap tightening what they allow. A layer
+            // above that writes a larger cap, or none at all (`null`, or a
+            // whole group set to `null`), leaves their number standing.
+            let have = at(budget, inside(&dotted)).and_then(Value::as_f64);
+            if let Some(have) = have
+                && want >= have
             {
                 continue;
             }
             bound.push(format!("{dotted} at {}", show(cap)));
-            *slot(budget, inside(&dotted)).expect("a setting, read as one") = cap.clone();
+            *slot_made(budget, inside(&dotted)) = cap.clone();
             sources.insert(dotted.clone(), theirs(&dotted));
         }
         if !bound.is_empty() {

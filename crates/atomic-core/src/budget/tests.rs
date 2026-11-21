@@ -15,8 +15,8 @@
 //!   the settings that make up the reservation;
 //! - the caps the person who runs atomic set are ceilings: a written limit
 //!   and an inherited default are both held to them, a smaller limit still
-//!   tightens, a ceiling never makes a cap where there was none, and a refusal
-//!   says whose cap held;
+//!   tightens, a dollar ceiling binds where nothing else set a dollar cap,
+//!   and a refusal says whose cap held;
 //! - out-of-range settings and budget values are refused.
 
 use super::*;
@@ -253,19 +253,35 @@ fn a_persons_cap_holds_a_written_limit_and_says_whose_cap_held() {
 }
 
 #[test]
-fn a_persons_cap_causes_no_dollar_cap_where_none_was_set() {
-    // A dollar cap applies only where one was written or configured: their
-    // cap on the measure cannot make one, since there would be nothing to
-    // hold and a cap on an unpriced model would fail configuration.
+fn a_persons_dollar_cap_binds_where_nothing_else_set_one() {
+    // Neither the block nor any layer above the person sets a dollar cap:
+    // theirs still binds, by their setting, and needs the model priced.
     let mut settings = roomy();
+    settings.pricing = priced().pricing;
     settings.ceilings.atom = capped(100_000, 1.0, 1.0);
-    let r = atom(&Budget::default(), &settings);
-    assert_eq!(r.micro_usd, None);
+    let r = resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]).expect("resolves");
+    assert_eq!(r.micro_usd, Some(1_000_000));
     assert_eq!(
         r.origins[2],
-        Origin::Default("budget.atom.cost_usd".into()),
-        "no cap, so no origin claiming one"
+        Origin::Ceiled("budget.atom.cost_usd".into()),
+        "the person's cap, by its setting"
     );
+    settings.ceilings.workflow = capped(1_000_000, 60.0, 5.0);
+    let w = resolve(
+        &Budget::default(),
+        Level::Workflow,
+        &settings,
+        &["gpt-test"],
+    )
+    .expect("resolves");
+    assert_eq!(w.micro_usd, Some(5_000_000));
+    // On a model they did not price, their cap refuses the run rather than
+    // run it uncapped.
+    settings.pricing.clear();
+    assert!(matches!(
+        resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]),
+        Err(BudgetError::Unpriced { model }) if model == "gpt-test"
+    ));
 }
 
 #[test]

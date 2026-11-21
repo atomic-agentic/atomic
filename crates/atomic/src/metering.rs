@@ -182,6 +182,94 @@ impl BudgetPlan {
         }
     }
 
+    /// Check that nothing in the plan sits above `ceilings`, which `whose`
+    /// names: the run's caps above the workflow ceilings and each atom's,
+    /// exec atoms' included, above the atom ceilings, in tokens, minutes and
+    /// dollars, where a cap of no dollars at all is above any dollar
+    /// ceiling; and the plan's call bound, and each model's per-call maxima
+    /// in its prices, above the call ceilings.
+    pub fn held_to(&self, ceilings: &Ceilings, whose: &str) -> Result<(), String> {
+        let minutes = |ms: u64| format!("{}", ms as f64 / 60_000.0);
+        let usd = |micro: u64| format!("{:.6}", micro as f64 / 1e6);
+        let over = |what: &str, field: &str, cap: String, limit: String| {
+            Err(format!(
+                "{what}: its {field} cap ({cap}) is above the cap of {limit} {whose}"
+            ))
+        };
+        let held = |what: &str, caps: &Resolved, capped: &Budget| {
+            if let Some(tokens) = capped.tokens
+                && caps.tokens > tokens
+            {
+                return over(
+                    what,
+                    "tokens",
+                    caps.tokens.to_string(),
+                    format!("{tokens} tokens"),
+                );
+            }
+            if let Some(millis) = capped.millis
+                && caps.millis > millis
+            {
+                return over(what, "minutes", minutes(caps.millis), minutes(millis));
+            }
+            if let Some(limit) = capped.micro_usd {
+                match caps.micro_usd {
+                    Some(cap) if cap > limit => {
+                        return over(what, "cost_usd", usd(cap), usd(limit));
+                    }
+                    None => return over(what, "cost_usd", "none".into(), usd(limit)),
+                    Some(_) => {}
+                }
+            }
+            Ok(())
+        };
+        held("the run", &self.run, &ceilings.held_by(Level::Workflow))?;
+        for (atom, caps) in self.atoms.iter().chain(self.exec.iter()) {
+            held(
+                &format!("atom {atom}"),
+                caps,
+                &ceilings.held_by(Level::Atom),
+            )?;
+        }
+        let call = &ceilings.call;
+        let bound = |what: &str, field: &str, have: u64, cap: Option<u64>| match cap {
+            Some(cap) if have > cap => over(what, field, have.to_string(), format!("{cap} tokens")),
+            _ => Ok(()),
+        };
+        bound(
+            "the call bound",
+            "input_tokens",
+            self.call.input_tokens,
+            call.input_tokens,
+        )?;
+        bound(
+            "the call bound",
+            "output_tokens",
+            self.call.output_tokens,
+            call.output_tokens,
+        )?;
+        if let Some(cap) = call.minutes
+            && self.call.minutes > cap
+        {
+            return over(
+                "the call bound",
+                "minutes",
+                self.call.minutes.to_string(),
+                cap.to_string(),
+            );
+        }
+        for (model, price) in &self.pricing {
+            let what = format!("the price of {model}");
+            if let Some(max) = price.max_input_tokens {
+                bound(&what, "max_input_tokens", max, call.input_tokens)?;
+            }
+            if let Some(max) = price.max_output_tokens {
+                bound(&what, "max_output_tokens", max, call.output_tokens)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Check that the plan has caps and a model for each of `atoms`, every
     /// atom a run calls a model from, and caps for each of `exec`, every exec
     /// atom it runs: none runs unmetered.
@@ -205,57 +293,16 @@ impl BudgetPlan {
 
     /// Check a plan that came from outside, such as one pinned in a run's
     /// input: its settings in range, every cap leaving room for one call to
-    /// its models, a dollar cap only over priced models, and no cap above the
-    /// ceilings recorded with the plan.
+    /// its models, a dollar cap only over priced models, and nothing above
+    /// the ceilings recorded with the plan ([`held_to`](Self::held_to)).
     pub fn validate(&self) -> Result<(), String> {
         let settings = self.settings();
         settings.validate().map_err(|e| e.to_string())?;
-        // No cap of the plan's sits above the ceilings it was resolved under:
-        // a plan recorded elsewhere, or changed since, is held to them as one
-        // resolved here would be. A plan recorded before they were kept has
-        // none, and caps nothing by this.
-        let minutes = |ms: u64| format!("{}", ms as f64 / 60_000.0);
-        let usd = |micro: u64| format!("{:.6}", micro as f64 / 1e6);
-        let held = |whose: &str, caps: &Resolved, capped: &Budget| {
-            let over = |field: &str, cap: String, limit: String| {
-                Err(format!(
-                    "{whose}: its {field} cap ({cap}) is above the cap of {limit} the ceilings \
-                     it was resolved under"
-                ))
-            };
-            if let Some(tokens) = capped.tokens
-                && caps.tokens > tokens
-            {
-                return over(
-                    "tokens",
-                    caps.tokens.to_string(),
-                    format!("{tokens} tokens"),
-                );
-            }
-            if let Some(millis) = capped.millis
-                && caps.millis > millis
-            {
-                return over("minutes", minutes(caps.millis), minutes(millis));
-            }
-            if let (Some(cap), Some(limit)) = (caps.micro_usd, capped.micro_usd)
-                && cap > limit
-            {
-                return over("cost_usd", usd(cap), usd(limit));
-            }
-            Ok(())
-        };
-        held(
-            "the run",
-            &self.run,
-            &self.ceilings.held_by(Level::Workflow),
-        )?;
-        for (atom, caps) in self.atoms.iter().chain(self.exec.iter()) {
-            held(
-                &format!("atom {atom}"),
-                caps,
-                &self.ceilings.held_by(Level::Atom),
-            )?;
-        }
+        // A plan recorded elsewhere, or changed since, is held to the
+        // ceilings it says it was resolved under, as one resolved here would
+        // be. A plan recorded before they were kept has none, and caps
+        // nothing by this.
+        self.held_to(&self.ceilings, "the ceilings it was resolved under")?;
         let priced = |model: &str, caps: &Resolved, whose: &str| {
             if caps.micro_usd.is_some() && !settings.pricing.contains_key(model) {
                 let unpriced = BudgetError::Unpriced {

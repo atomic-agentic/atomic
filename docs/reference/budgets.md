@@ -103,14 +103,19 @@ measure you set — an atom's or a run's `tokens`, `minutes` or `cost_usd`, and 
 most one call may use — the cap that binds is the smaller of yours and what
 `atomic.yaml`, `atomic.local.yaml`, an `ATOMIC_BUDGET_*` variable or a written
 `budget` block asks for. A project may bring a cap down to what you allowed, never
-above it. A measure you leave unset caps nothing, and a cap nothing sets stays
-unset: your ceiling never makes a dollar cap where there was none.
+above it, and a layer that writes no cap at all, `null` included, leaves yours
+standing. A measure you leave unset caps nothing. A dollar cap of yours binds even
+where nothing else sets one, so every model a run calls under it must be priced.
 
 Your prices are ceilings too. A project's `budget.pricing` cannot make a model you
 priced look cheaper than you priced it, and cannot give a model a per-call
 maximum above your `budget.call` cap — which is how a model is made to look free
-under a dollar cap. A model only you priced stays priced when another layer
-replaces the table below it.
+under a dollar cap. Under any dollar cap of yours, a project may not make a model
+free either: a project price of nothing, input and output both, for a model you
+did not price is refused at load, naming the model and saying to price it in your
+own configuration. A project price above nothing for such a model is the
+project's. A model only you priced stays priced when another layer replaces the
+table below it.
 
 What holds is never shown without its reason: `atomic config --explain` shows the
 effective number with your file and line as its source, and says in a remark that
@@ -121,8 +126,12 @@ own budget.atom.tokens`.
 Ceilings come only from your own configuration file, which no project supplies:
 `budget.ceilings` is no setting, and a file that writes it is refused as an
 unknown setting. A run resolves them with its caps and records them with its plan,
-so a resumed run keeps the ceilings it began under, and a plan carrying caps above
-them is refused before its first call.
+so a resumed run keeps the ceilings it began under. A plan pinned in a run's input
+is held, before its first call, both to the ceilings it carries and to those of
+your own configuration now: its run's and atoms' tokens, minutes and dollars (no
+dollar cap at all counts as above a dollar ceiling), its call bound, and each
+model's per-call maxima in its prices, against your call ceilings. A plan carrying
+no ceilings is held to yours all the same.
 
 Every model call a run makes is metered: a step whose atom calls a model and
 that the run has no caps for is refused, never run without a meter. A live

@@ -175,8 +175,11 @@ pub struct Price {
 /// A cap the person's own configuration wrote, in the units the `budget`
 /// section is written in. `None` caps nothing: a measure they leave unset
 /// keeps whatever a project's file or a written `budget` block says.
+// Not `deny_unknown_fields`, as the person's own file is read field by
+// field and these are only ever read back from a budget plan, which reads
+// past the fields a later version adds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Caps {
     /// Cumulative tokens.
     pub tokens: Option<u64>,
@@ -187,8 +190,9 @@ pub struct Caps {
 }
 
 /// The most one model call the person's own configuration allows, as written.
+// Read past later fields, as [`Caps`] is.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct CallCaps {
     /// The most input tokens one call takes.
     pub input_tokens: Option<u64>,
@@ -204,9 +208,9 @@ pub struct CallCaps {
 /// A ceiling is a cap on the cap: for each measure it sets, the effective cap
 /// is the smaller of it and what the project's files, an `ATOMIC_*` variable
 /// or the atom's or workflow's own `budget` block says. A measure it leaves
-/// unset caps nothing, and a cap nothing sets stays unset: a ceiling never
-/// makes a cap where there was none. Where a ceiling binds, the cap's origin
-/// is [`Origin::Ceiled`], so a refusal says whose cap held.
+/// unset caps nothing. Its dollar ceiling binds even where nothing else sets
+/// a dollar cap. Where a ceiling binds, the cap's origin is
+/// [`Origin::Ceiled`], so a refusal says whose cap held.
 ///
 /// Ceilings are not a setting: no file may write `budget.ceilings`, and they
 /// come only from the person's own configuration file, which the configuration
@@ -214,8 +218,10 @@ pub struct CallCaps {
 /// also holds [`BudgetSettings::atom`], [`BudgetSettings::workflow`] and
 /// [`BudgetSettings::call`] to them, so what `atomic config` shows is what a
 /// run is held to.
+// Read past later fields, as [`Caps`] is: it is `serde(skip)` in
+// [`BudgetSettings`], so no configuration file is read through it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Ceilings {
     /// Ceilings on what an atom invocation may spend.
     pub atom: Caps,
@@ -535,10 +541,12 @@ pub fn resolve(
         (None, Some(usd)) => (Some(micro_of(usd)), Origin::Default(path("cost_usd"))),
         (None, None) => (None, Origin::Default(path("cost_usd"))),
     };
-    // A dollar cap the person caps, capped: their cap never sets one where
-    // nothing was capped, since there would be nothing to hold.
+    // The person's dollar cap holds a larger one down, and stands where
+    // nothing else set one: whatever a block or a layer above them leaves
+    // out, their cap still binds.
     let (micro_usd, cost_from) = match (micro_usd, capped.micro_usd) {
         (Some(c), Some(k)) if k < c => (Some(k), Origin::Ceiled(path("cost_usd"))),
+        (None, Some(k)) => (Some(k), Origin::Ceiled(path("cost_usd"))),
         _ => (micro_usd, cost_from),
     };
     if micro_usd.is_some()
