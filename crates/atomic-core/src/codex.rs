@@ -947,16 +947,21 @@ fn denied_paths(
     // The sandbox finds the denials inside a writable directory by the
     // spelling it is given that directory under: one given through a link
     // would not keep a denial inside it, under its real spelling, in force.
+    let codex = real_spelling(codex_home);
     for (named, root) in given.iter().zip(&roots) {
         if named.as_path() == root.as_path() {
             continue;
         }
-        let codex = real_spelling(codex_home);
-        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
+        // Codex's home, whose databases a pattern denies, is weighed with the
+        // places listed. The files planted in it at start are listed as well,
+        // so this is defence in depth for a home that holds them.
+        // `scripts/controls/deny-linked-codex-home.row` switches this off.
+        let mut weighed = all.iter().chain([&codex]);
+        if let Some(place) = weighed.find(|p| p.starts_with(root)) {
             return Err(refuse(format!(
                 "{} is inside {}, which atoms' commands may write, named {} through a link, so \
-                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
-                 their real paths, with no link above them",
+                 its denial would not hold; point ATOMIC_HOME (or XDG_DATA_HOME, or HOME) and \
+                 the project at their real paths, with no link above them",
                 place.display(),
                 root.display(),
                 named.display()
