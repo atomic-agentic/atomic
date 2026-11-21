@@ -4,6 +4,7 @@ use super::*;
 use crate::artifact::LocalStore;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 /// A store and a command's scratch directory, removed when the test ends.
 struct Fixture {
@@ -15,7 +16,7 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(
-            &self.exchange.inputs,
+            self.exchange.inputs(),
             std::fs::Permissions::from_mode(0o700),
         );
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -33,7 +34,9 @@ fn fixture(tag: &str) -> Fixture {
     ));
     std::fs::create_dir_all(dir.join("scratch")).expect("scratch");
     let store = LocalStore::open(dir.join("store")).expect("store");
-    let exchange = Exchange::create(&dir.join("scratch")).expect("exchange");
+    let exchange = Exchange::new(Box::new(
+        atomic_exec::exchange::LocalExchange::create(&dir.join("scratch")).expect("exchange"),
+    ));
     Fixture {
         dir,
         store,
@@ -84,14 +87,18 @@ fn validate(value: &Value) -> Result<(), String> {
 
 impl Fixture {
     fn write(&self, name: &str, bytes: &[u8]) {
-        std::fs::write(self.exchange.outputs.join(name), bytes).expect("write");
+        std::fs::write(self.exchange.outputs().join(name), bytes).expect("write");
     }
 
-    fn gather(&self, output: &mut Value) -> Result<(), ArtifactError> {
+    fn gather(&self, output: &mut Value) -> Result<Vec<Hold>, ArtifactError> {
         self.gather_within(output, Limits::default())
     }
 
-    fn gather_within(&self, output: &mut Value, limits: Limits) -> Result<(), ArtifactError> {
+    fn gather_within(
+        &self,
+        output: &mut Value,
+        limits: Limits,
+    ) -> Result<Vec<Hold>, ArtifactError> {
         self.exchange.gather(
             &self.store,
             &self.store,
@@ -209,12 +216,12 @@ fn links_fifos_directories_and_hard_links_are_refused() {
     // it tests: the link's target has one link, the hard link's two.
     let linked = f.dir.join("linked.txt");
     std::fs::write(&linked, b"not the command's").expect("outside");
-    std::os::unix::fs::symlink(&linked, f.exchange.outputs.join("link")).expect("link");
+    std::os::unix::fs::symlink(&linked, f.exchange.outputs().join("link")).expect("link");
     let outside = f.dir.join("outside.txt");
     std::fs::write(&outside, b"not the command's either").expect("outside");
-    std::fs::hard_link(&outside, f.exchange.outputs.join("hard")).expect("hard link");
-    std::fs::create_dir(f.exchange.outputs.join("dir")).expect("dir");
-    let fifo = std::ffi::CString::new(f.exchange.outputs.join("fifo").to_str().expect("UTF-8"))
+    std::fs::hard_link(&outside, f.exchange.outputs().join("hard")).expect("hard link");
+    std::fs::create_dir(f.exchange.outputs().join("dir")).expect("dir");
+    let fifo = std::ffi::CString::new(f.exchange.outputs().join("fifo").to_str().expect("UTF-8"))
         .expect("path");
     // SAFETY: a NUL-terminated path, for one call.
     #[allow(unsafe_code)]
@@ -236,8 +243,8 @@ fn a_swapped_outputs_directory_leads_nowhere() {
     let elsewhere = f.dir.join("elsewhere");
     std::fs::create_dir(&elsewhere).expect("elsewhere");
     std::fs::write(elsewhere.join("change.diff"), b"from elsewhere").expect("decoy");
-    std::fs::rename(&f.exchange.outputs, f.dir.join("moved")).expect("move");
-    std::os::unix::fs::symlink(&elsewhere, &f.exchange.outputs).expect("swap");
+    std::fs::rename(f.exchange.outputs(), f.dir.join("moved")).expect("move");
+    std::os::unix::fs::symlink(&elsewhere, f.exchange.outputs()).expect("swap");
     let mut output = json!({"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}});
     let e = f.gather(&mut output).expect_err("the decoy is not read");
     assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
@@ -292,7 +299,7 @@ fn a_file_or_a_step_past_its_limit_is_refused() {
     )
     .expect("one file, named twice");
     // Sparse: the size is what counts, not the blocks it takes.
-    let sparse = std::fs::File::create(f.exchange.outputs.join("sparse")).expect("sparse");
+    let sparse = std::fs::File::create(f.exchange.outputs().join("sparse")).expect("sparse");
     sparse.set_len(1 << 40).expect("a terabyte, sparse");
     let mut output = json!({"patch": {"$file": "sparse", "mediaType": "text/x-diff"}});
     let e = f.gather(&mut output).expect_err("a sparse terabyte");
@@ -306,7 +313,13 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
     let f = fixture("inputs");
     let patch = f
         .store
-        .put(&mut &b"the patch"[..], provenance())
+        .put(
+            &mut &b"the patch"[..],
+            Provenance {
+                media_type: "text/x-diff".into(),
+                ..provenance()
+            },
+        )
         .expect("put")
         .artifact;
     let other = f
@@ -315,15 +328,15 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
         .expect("put")
         .artifact;
     let input = json!({"patch": patch.to_string(), "note": other.to_string()});
-    let given = referenced(&contract(), &input, &f.store);
+    let given = referenced(&contract(), &input, &f.store).expect("referenced");
     assert_eq!(given, vec![patch.clone()], "only the typed reference");
     f.exchange.mount(&f.store, &given).expect("mounted");
-    let copy = f.exchange.inputs.join(patch.digest());
+    let copy = f.exchange.inputs().join(patch.digest());
     assert_eq!(std::fs::read(&copy).expect("copy"), b"the patch");
-    assert!(!f.exchange.inputs.join(other.digest()).exists());
+    assert!(!f.exchange.inputs().join(other.digest()).exists());
     let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
     assert_eq!(mode(&copy), 0o444);
-    assert_eq!(mode(&f.exchange.inputs), 0o555);
+    assert_eq!(mode(f.exchange.inputs()), 0o555);
     // A copy is the command's own: writing it, were it allowed, leaves the
     // store as it was.
     assert_ne!(
@@ -355,7 +368,7 @@ fn a_damaged_blob_is_not_given_to_a_command() {
         .mount(&f.store, std::slice::from_ref(&patch))
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Corrupt(_)), "{e}");
-    assert!(!f.exchange.inputs.join(patch.digest()).exists());
+    assert!(!f.exchange.inputs().join(patch.digest()).exists());
 }
 
 /// A store that changes a file as it is about to read the `at`-th, counting
@@ -390,6 +403,9 @@ impl ArtifactStore for Tampering<'_> {
     }
     fn discard(&self, staged: crate::artifact::Staged) {
         self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
     }
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         self.inner.contains(artifact)
@@ -466,6 +482,9 @@ impl ArtifactStore for Counting<'_> {
     fn discard(&self, staged: crate::artifact::Staged) {
         self.inner.discard(staged)
     }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         self.inner.contains(artifact)
     }
@@ -485,7 +504,7 @@ impl Fixture {
         &self,
         store: &dyn ArtifactStore,
         output: &mut Value,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<Vec<Hold>, ArtifactError> {
         self.exchange.gather(
             store,
             &self.store,
@@ -506,7 +525,7 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
     f.write("change.diff", b"0123456789");
     let shrinking = Tampering {
         inner: &f.store,
-        path: f.exchange.outputs.join("change.diff"),
+        path: f.exchange.outputs().join("change.diff"),
         change: |path| {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -534,7 +553,7 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
     f.write("grow.diff", b"0123456789");
     let growing = Tampering {
         inner: &f.store,
-        path: f.exchange.outputs.join("grow.diff"),
+        path: f.exchange.outputs().join("grow.diff"),
         change: |path| {
             use std::io::Write;
             std::fs::OpenOptions::new()
@@ -557,7 +576,8 @@ fn a_refusal_of_any_file_stores_none() {
     let f = fixture("any");
     f.write("a.diff", b"first");
     f.write("big.diff", &[b'b'; 200]);
-    std::os::unix::fs::symlink(f.dir.join("store"), f.exchange.outputs.join("link")).expect("link");
+    std::os::unix::fs::symlink(f.dir.join("store"), f.exchange.outputs().join("link"))
+        .expect("link");
     for (second, limits) in [
         ("link", Limits::default()),
         ("missing", Limits::default()),
@@ -744,4 +764,217 @@ fn the_outputs_own_file_objects_are_not_counted() {
     f.gather(&mut output).expect("gathered");
     assert_eq!(output["patch"], json!(reference_of(b"x")));
     assert_eq!(output["meta"]["files"], json!(own));
+}
+
+/// A store that sweeps itself after each commit as a sweep that began
+/// reading what to keep long after the commit would, keeping nothing it was
+/// told of and nothing recent, while a gather has more files to store and
+/// its step has recorded none of them.
+struct Sweeping<'a> {
+    inner: &'a LocalStore,
+}
+
+impl Sweeping<'_> {
+    fn sweep(&self) -> crate::artifact::Swept {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 3600);
+        self.inner
+            .sweep(
+                &BTreeSet::new(),
+                crate::artifact::Grace::none_for_tests(),
+                later,
+            )
+            .expect("sweep")
+    }
+}
+
+impl ArtifactStore for Sweeping<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        let manifests = self.inner.commit(staged, provenance)?;
+        self.sweep();
+        Ok(manifests)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A sweep that lands while a gather stores its files, or after it and
+/// before its step records them, keeps every file it stored, however long
+/// the step takes: the gather holds them until they are let go. A sweep
+/// after that removes them.
+#[test]
+fn a_sweep_racing_a_slow_gather_keeps_the_gathered_files() {
+    let f = fixture("racing");
+    f.write("a.diff", b"first");
+    f.write("b.diff", b"second");
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "more": [{"$file": "b.diff"}]
+    });
+    let sweeping = Sweeping { inner: &f.store };
+    let held = f
+        .gather_through(&sweeping, &mut output)
+        .expect("gathered while swept");
+    let refs = [&output["patch"], &output["more"][0]];
+    for reference in refs {
+        let a: ArtifactRef = reference
+            .as_str()
+            .expect("a reference")
+            .parse()
+            .expect("parses");
+        assert!(f.store.contains(&a).expect("contains"), "{reference} swept");
+    }
+    assert_eq!(held.len(), 2);
+    // Long after, and still not recorded.
+    assert!(sweeping.sweep().removed.is_empty());
+    drop(held);
+    assert_eq!(sweeping.sweep().removed.len(), 2);
+}
+
+/// An exchange that fails every give with invalid data of its own.
+struct Refusing;
+
+impl atomic_exec::exchange::Exchange for Refusing {
+    fn outputs(&self) -> &Path {
+        Path::new("/nowhere/outputs")
+    }
+    fn inputs(&self) -> &Path {
+        Path::new("/nowhere/inputs")
+    }
+    fn give(&self, _: &str, _: &mut dyn Read) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the runner refused it",
+        ))
+    }
+    fn seal(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn take(
+        &self,
+        _: &str,
+    ) -> Result<atomic_exec::exchange::Taken, atomic_exec::exchange::TakeError> {
+        Err(atomic_exec::exchange::TakeError::Missing)
+    }
+}
+
+/// An exchange's own failure to give an input is its failure, not a sign
+/// that the store's content is damaged: only the store's reader says that.
+#[test]
+fn an_exchanges_own_failure_is_not_a_damaged_blob() {
+    let f = fixture("refusing");
+    let patch = f
+        .store
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance())
+        .expect("put")
+        .artifact;
+    let e = Exchange::new(Box::new(Refusing))
+        .mount(&f.store, std::slice::from_ref(&patch))
+        .expect_err("refused");
+    assert!(matches!(e, ArtifactError::Io { .. }), "{e:?}");
+}
+
+/// A store that sweeps itself as each input is about to be read, as a
+/// sweep that does not see the input's reference (a run's input not yet
+/// recorded, say) would, keeping nothing it was told of and nothing recent.
+struct SweepingOnOpen<'a> {
+    inner: &'a LocalStore,
+}
+
+impl ArtifactStore for SweepingOnOpen<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        Sweeping { inner: self.inner }.sweep();
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A sweep that lands while a command's inputs are copied in, and does not
+/// see the reference to them, keeps them: the mount holds each input until
+/// every copy is made. Once the mount is done, a sweep removes them.
+#[test]
+fn a_sweep_racing_a_mount_keeps_the_inputs() {
+    let f = fixture("mount-race");
+    let patch = f
+        .store
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance())
+        .expect("put")
+        .artifact;
+    let other = f
+        .store
+        .put(&mut &b"another input"[..], provenance())
+        .expect("put")
+        .artifact;
+    f.exchange
+        .mount(
+            &SweepingOnOpen { inner: &f.store },
+            &[patch.clone(), other.clone()],
+        )
+        .expect("mounted while swept");
+    for given in [&patch, &other] {
+        assert!(f.store.contains(given).expect("contains"), "{given} swept");
+        assert!(f.exchange.inputs().join(given.digest()).is_file());
+    }
+    let swept = Sweeping { inner: &f.store }.sweep();
+    assert_eq!(swept.removed.len(), 2, "{swept:?}");
+}
+
+/// An input that references an artifact the store does not hold is refused,
+/// never given without it.
+#[test]
+fn an_input_referencing_a_missing_artifact_is_refused() {
+    let f = fixture("missing-input");
+    let missing = ArtifactRef::from_digest(&"d".repeat(64)).expect("digest");
+    let input = json!({"patch": missing.to_string()});
+    let e = referenced(&contract(), &input, &f.store).expect_err("refused");
+    assert!(
+        matches!(&e, atomic_schema::artifact::ArtifactCheckError::Missing { text, .. } if *text == missing.to_string()),
+        "{e}"
+    );
 }

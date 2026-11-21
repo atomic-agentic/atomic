@@ -267,9 +267,18 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
         std::fs::write(dir.join("staging").join(name), b"left").expect("leftover");
     }
     let staged = |name: &str| dir.join("staging").join(name).exists();
+    // Each store's holds: the live one's, and the dead one's.
+    let live_holds = live.owner.held.clone();
+    let _hold = live
+        .hold(&ArtifactRef::from_digest(&"a".repeat(64)).expect("digest"))
+        .expect("hold");
+    let dead_holds = dir.join("artifact-held").join(&dead_id);
+    std::fs::create_dir_all(&dead_holds).expect("dead holds");
+    std::fs::write(dead_holds.join(format!("{}-1", "b".repeat(64))), b"").expect("hold");
     // Too new to judge: kept.
     let again = LocalStore::open(&dir).expect("open again");
     assert!(leftovers.iter().all(|n| staged(n)), "a new file was swept");
+    assert!(dead_holds.exists(), "a new owner's holds were cleared");
     assert!(
         dir.join("artifact-owners").join(&dead_id).exists(),
         "a new owner was judged"
@@ -283,6 +292,8 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
     assert!(staged(&leftovers[2]), "the live store's file was swept");
     assert!(!dir.join("artifact-owners").join(&dead_id).exists());
     assert!(dir.join("artifact-owners").join(&live_id).exists());
+    assert!(!dead_holds.exists(), "the dead store's holds were kept");
+    assert!(live_holds.is_dir(), "the live store's holds were cleared");
     drop((swept, live));
 }
 
@@ -619,4 +630,101 @@ fn a_blob_committed_after_a_sweep_began_reading_is_kept() {
     assert!(swept.removed.is_empty(), "{swept:?}");
     assert!(s.contains(&m[0].artifact).expect("contains"));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A hold keeps content from every sweep, however old, until it is let go
+/// or its store is gone; a dead store's holds, and ones whose owner is gone
+/// once they are old, are cleared.
+#[test]
+fn a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone() {
+    let (s, dir) = store();
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let put = |bytes: &[u8]| {
+        let a = s
+            .put(&mut &bytes[..], provenance("make"))
+            .expect("put")
+            .artifact;
+        written_ago(&s.blob_path(&a), day);
+        a
+    };
+    let sweep = || {
+        s.sweep(
+            &BTreeSet::new(),
+            Grace::none_for_tests(),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep")
+    };
+    let (held, dead, orphaned) = (put(b"held"), put(b"dead"), put(b"orphaned"));
+    let hold = s.hold(&held).expect("hold");
+    // A store that died a day ago, with a hold.
+    let dead_id = "d".repeat(32);
+    let dead_owner = dir.join("artifact-owners").join(&dead_id);
+    std::fs::write(&dead_owner, b"").expect("dead owner");
+    written_ago(&dead_owner, day);
+    let dead_holds = dir.join("artifact-held").join(&dead_id);
+    std::fs::create_dir_all(&dead_holds).expect("dead holds");
+    std::fs::write(dead_holds.join(format!("{}-1", dead.digest())), b"").expect("hold");
+    // Holds whose owner file is gone: a store may be opening.
+    let orphan = dir.join("artifact-held").join("e".repeat(32));
+    std::fs::create_dir_all(&orphan).expect("orphan");
+    std::fs::write(orphan.join(format!("{}-1", orphaned.digest())), b"").expect("hold");
+    let swept = sweep();
+    assert_eq!(swept.removed, vec![dead.clone()], "{swept:?}");
+    assert!(!dead_holds.exists(), "a dead store's holds were kept");
+    assert!(orphan.exists(), "a new store's holds were cleared");
+    // Once old, holds with no owner go.
+    written_ago(&orphan, day);
+    assert_eq!(sweep().removed, vec![orphaned]);
+    assert!(!orphan.exists());
+    // Let go, the content goes.
+    assert!(sweep().removed.is_empty());
+    drop(hold);
+    assert_eq!(sweep().removed, vec![held]);
+    // A store's holds go with it.
+    let other = LocalStore::open(&dir).expect("another store");
+    let mine = other.hold(&dead).expect("hold");
+    let own = other.owner.held.clone();
+    assert!(own.is_dir());
+    std::mem::forget(mine);
+    drop(other);
+    assert!(!own.exists(), "a closed store's holds were left");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A hold is taken under the store's shared lock: while a sweep holds the
+/// lock, a hold waits for it, and gives up as Locked past its wait.
+#[test]
+fn a_hold_waits_out_a_sweep_in_progress() {
+    let (s, dir) = store();
+    let s = s.waiting_at_most(std::time::Duration::from_millis(100));
+    let a = ArtifactRef::from_digest(&"c".repeat(64)).expect("digest");
+    let sweeping = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.join("lock"))
+        .expect("the store's lock");
+    sweeping.lock().expect("a sweep's lock");
+    assert!(
+        matches!(s.hold(&a), Err(ArtifactError::Locked { .. })),
+        "held while a sweep held the store"
+    );
+    assert!(owner_holds(&s).is_empty());
+    drop(sweeping);
+    let hold = s.hold(&a).expect("held once the sweep let go");
+    assert_eq!(owner_holds(&s).len(), 1);
+    drop(hold);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The holds a store has written.
+fn owner_holds(s: &LocalStore) -> Vec<PathBuf> {
+    std::fs::read_dir(&s.owner.held)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .collect()
 }

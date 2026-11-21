@@ -192,7 +192,9 @@ when its process is stopped by a signal is settled this way as the process
 stops. While a call runs, its meter records every few seconds that it is still
 alive, so a call whose process was killed outright is charged only until shortly
 after the last such record, however long the process stayed down, once its atom,
-run again, admits its next call.
+run again, admits its next call. A call's active time is measured on a clock
+that, on Linux and macOS, stops while the machine sleeps, so a laptop suspended
+mid-call is not charged the sleep.
 
 A Codex turn can make several provider requests and run tools between them, so
 the `call` time does not bound it. A turn reserves the active time its atom has
