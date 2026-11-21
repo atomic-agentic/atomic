@@ -2112,25 +2112,28 @@ fn rewritten_held_json_settles_in_one_pass() {
 /// after an open assignment, has already read it.
 #[test]
 fn text_redacted_again_changes_nothing() {
-    for (case, input) in [
-        "api_key=Authorization: Cookie: =12",
-        "PASSWORD=Authorization: Authorization: Basic ;",
-        "secret: Authorization: x-api-key: =",
-        "--password Authorization: Cookie: Cookie: =12",
-        "=secret: Cookie: x-api-key: '&",
-        "123456x-api-key: Cookie: Authorization: Basic [REDACTED]",
-        "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij",
-        "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij:Authorization: Cookie: sid=s3cr3tvalue",
-        "Proxy-Authorization: --token \\x-api-key: api.telegram.org/bot[",
+    // Whether each is hidden whole: a header before a run of backslashed
+    // chunks reads one chunk more each time, and is still changing when the
+    // readings run out.
+    for (case, (input, whole)) in [
+        ("api_key=Authorization: Cookie: =12", false),
+        ("PASSWORD=Authorization: Authorization: Basic ;", false),
+        ("secret: Authorization: x-api-key: =", false),
+        ("--password Authorization: Cookie: Cookie: =12", false),
+        ("=secret: Cookie: x-api-key: '&", false),
+        ("123456x-api-key: Cookie: Authorization: Basic [REDACTED]", false),
+        ("Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij", true),
+        (
+            "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij:Authorization: Cookie: sid=s3cr3tvalue",
+            true,
+        ),
+        ("Proxy-Authorization: --token \\x-api-key: api.telegram.org/bot[", false),
     ]
     .into_iter()
     .enumerate()
     {
         let once = text(input).into_owned();
-        assert_ne!(
-            once, REDACTED,
-            "case {case}: it did not settle within the bound"
-        );
+        assert_eq!(once == REDACTED, whole, "case {case}: {once:?}");
         assert_eq!(text(&once), once, "case {case}: a second pass changed it");
     }
     // Generated: names, separators, headers and values strung together.
@@ -2197,20 +2200,80 @@ fn text_redacted_again_changes_nothing() {
     assert_eq!(unstable, 0, "a second pass changed generated text");
 }
 
-/// A backslash after a marker ends the value the marker stands for, so a
-/// run of backslashed chunks after a header settles at once rather than a
-/// chunk a reading, and a credential at its end is hidden.
+/// A credential a header's value runs into past a backslash is hidden with
+/// the rest of the value; a long run of backslashed chunks after a header,
+/// which a reading at a time would never finish, is hidden whole.
 #[test]
-fn a_marker_before_a_backslash_ends_its_value() {
+fn a_value_past_a_backslash_stays_hidden() {
+    let out = text("Authorization: Bearer abcd1234efgh\\/Qk9Lx3sR2tY7uV8w").into_owned();
+    assert!(
+        !out.contains("Qk9Lx3sR2tY7uV8w"),
+        "the rest of the credential showed"
+    );
     let chunks: String = (0..1000).map(|i| format!(" \\c{i}")).collect();
     let input = format!("Authorization: Bearer x{chunks} password=s3cr3tvalue");
-    let once = text(&input).into_owned();
-    assert!(!once.contains("s3cr3tvalue"), "the credential showed");
-    assert!(
-        once.ends_with("\\c999 password=[REDACTED]"),
-        "it did not settle within the bound"
-    );
-    assert_eq!(text(&once), once, "a second pass changed it");
+    assert_eq!(text(&input), REDACTED);
+}
+
+/// Reading text until it settles hides at least everything one reading
+/// hides: over generated strings with planted secrets, none that one
+/// reading of the rules hides is shown.
+#[test]
+fn reading_until_settled_hides_all_one_reading_hides() {
+    const PARTS: &[&str] = &[
+        "password=",
+        "token=",
+        "Authorization: ",
+        "Bearer ",
+        "Cookie: ",
+        "sid=",
+        "x-api-key: ",
+        "--password ",
+        " ",
+        "\\",
+        "\\/",
+        "\\ab ",
+        "=",
+        ":",
+        ";",
+        "\"",
+        "api_key=",
+        "Proxy-Authorization: ",
+        "--token ",
+        "abcd1234efgh",
+    ];
+    let mut seed: u64 = 9001;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut shown = 0;
+    for _ in 0..30_000 {
+        let mut input = String::new();
+        let mut planted = Vec::new();
+        for _ in 0..=next(7) {
+            if next(3) == 0 {
+                let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+                let mut secret = String::from("Q");
+                for _ in 0..15 {
+                    secret.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+                }
+                input.push_str(&secret);
+                planted.push(secret);
+            } else {
+                input.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+            }
+        }
+        let one = text_once(&input).into_owned();
+        let settled = text(&input).into_owned();
+        shown += planted
+            .iter()
+            .filter(|p| !one.contains(p.as_str()) && settled.contains(p.as_str()))
+            .count();
+    }
+    assert_eq!(shown, 0, "reading until settled shows what one reading hid");
 }
 
 /// Text still changing when the readings run out is hidden whole.

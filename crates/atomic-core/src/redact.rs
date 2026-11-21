@@ -865,15 +865,6 @@ fn bare_value_len(rest: &str) -> usize {
                 end = i;
                 break;
             }
-            // A marker another rule wrote ends the value when a backslash
-            // follows it, so a later reading does not read the marker and
-            // what follows as one value, a chunk a reading.
-            b'[' if rest[i..].starts_with(REDACTED)
-                && bytes.get(i + REDACTED.len()) == Some(&b'\\') =>
-            {
-                end = i + REDACTED.len();
-                break;
-            }
             b',' | b';' | b'&' if i + 1 == bytes.len() || starts_assignment(&rest[i + 1..]) => {
                 end = i;
                 break;
@@ -1137,8 +1128,10 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
 
 /// How many readings [`text`] takes at most: a reading can leave what
 /// another rule reads as a secret only once a first rule has redacted
-/// around it, as a header after an assignment's marker. Text seen to need
-/// three; text still changing at the last is hidden whole.
+/// around it, as a header after an assignment's marker. Most text settles
+/// in one or two; text still changing at the last, such as a header before
+/// a long run of backslashed chunks that a reading takes one at a time, is
+/// hidden whole.
 const TEXT_PASSES: usize = 4;
 
 /// Replaces secrets in text, read again until a reading changes nothing,
