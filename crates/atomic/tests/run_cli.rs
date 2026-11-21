@@ -3415,9 +3415,26 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
 
 /// When Codex cannot make its links to atomic under its helpers' names, as
 /// when another atomic process sweeping the same Codex home takes their
-/// directory away, it runs atomic itself as its Linux sandbox helper: an
-/// exec atom's confined command still runs, rather than its run waiting for
-/// a sandbox that never starts.
+/// directory away, and atomic cannot make its own link either, Codex runs
+/// atomic itself as its Linux sandbox helper: an exec atom's confined
+/// command still runs, rather than its run waiting for a sandbox that never
+/// starts.
+/// Where Codex makes its links to atomic in `state`, and, with `own`, where
+/// atomic makes its own, made unusable: a file where each directory goes.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn unlink_helpers(state: &Path, own: bool) {
+    let mut places = vec!["codex/tmp/arg0-linux"];
+    if own {
+        places.push("codex/tmp/atomic-helper");
+    }
+    for place in places {
+        let at = state.join(place);
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("dir");
+        std::fs::write(&at, "not a directory").expect("file");
+    }
+}
+
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
@@ -3427,12 +3444,7 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
     let dir = scratch("no-helper-links");
     let project = project(&dir);
     let state = state_dir(&dir, &project);
-    // Where Codex makes its links, made unusable: a file where their
-    // directory goes.
-    let links = state.join("codex/tmp/arg0-linux");
-    let _ = std::fs::remove_dir_all(&links);
-    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
-    std::fs::write(&links, "not a directory").expect("file");
+    unlink_helpers(&state, true);
     let out = atomic(
         &dir,
         &project,
@@ -3451,24 +3463,46 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
 }
 
 /// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
-/// the helper's inner stage by the name it was started under, a program a
-/// command put on `PATH` under the helper's name is never run in its place:
-/// the name is a path that cannot exist, so the run fails at once instead,
-/// saying the helper could not be set up.
+/// the helper's inner stage by the name it was started under, an exec atom's
+/// command still runs: Codex runs atomic's own link to itself as the
+/// helper, by its absolute path, and a program a command put on `PATH`
+/// under the helper's name is never run in the inner stage's place.
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
 #[test]
-fn a_helper_run_by_name_is_never_found_along_path() {
+fn an_exec_atom_runs_under_an_old_bubblewrap_through_atomics_own_link() {
+    old_bubblewrap_run(false);
+}
+
+/// With no link at all, Codex's or atomic's own, the same bubblewrap would
+/// run the inner stage by the helper's bare name, looking it up along
+/// `PATH`: atomic runs again under a name that is a path that cannot exist
+/// instead, so the run fails at once, saying the helper could not be set
+/// up, and a program a command put on `PATH` under that name never runs.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn with_no_helper_link_at_all_an_old_bubblewrap_fails_closed() {
+    old_bubblewrap_run(true);
+}
+
+/// `count-only` through `atomic run` with Codex's links unmade, and with
+/// `no_own_link` atomic's own too, under a bubblewrap without `--argv0`,
+/// with a program planted on `PATH` under the helper's name.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn old_bubblewrap_run(no_own_link: bool) {
     use std::os::unix::fs::PermissionsExt;
     support::require_sandbox();
-    let dir = scratch("helper-by-name");
+    let dir = scratch(if no_own_link {
+        "no-link-at-all"
+    } else {
+        "own-link"
+    });
     let project = project(&dir);
     let state = state_dir(&dir, &project);
-    let links = state.join("codex/tmp/arg0-linux");
-    let _ = std::fs::remove_dir_all(&links);
-    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
-    std::fs::write(&links, "not a directory").expect("file");
+    unlink_helpers(&state, no_own_link);
     let script = |path: &Path, text: &str| {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, text).expect("script");
@@ -3476,15 +3510,20 @@ fn a_helper_run_by_name_is_never_found_along_path() {
     };
     // A bubblewrap from before `--argv0`: it runs what follows `--` as it
     // is named, looking a bare name up along PATH.
+    let bwrap_ran = dir.join("bwrap-ran");
     script(
         &dir.join("bwrap/bwrap"),
-        "#!/bin/sh\n\
-         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
-         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-         shift\n\
-         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
-         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
-         exit 1\n",
+        &format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+             touch '{}'\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+             shift\n\
+             if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+             echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+             exit 1\n",
+            bwrap_ran.display()
+        ),
     );
     let ran = dir.join("planted-ran");
     script(
@@ -3505,6 +3544,16 @@ fn a_helper_run_by_name_is_never_found_along_path() {
         "",
     );
     assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(
+        bwrap_ran.exists(),
+        "the old bubblewrap never ran: {}",
+        text(&out)
+    );
+    if !no_own_link {
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(count_log(&dir), 1, "the command ran once");
+        return;
+    }
     assert!(!out.status.success(), "{}", text(&out));
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(

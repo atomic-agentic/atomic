@@ -1,0 +1,1 @@
+sandbox-helper-link-tighten|crates/atomic-core/src/codex.rs|    let narrow = ours && st.st_mode & 0o022 != 0;|    let narrow = false;|-p atomic-agentic-core --lib --features fake-model the_helpers_link_is_made_only_in_this_users_own_directories
