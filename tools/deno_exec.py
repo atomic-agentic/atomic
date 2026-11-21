@@ -19,6 +19,7 @@ import errno
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 CHECKED = []
@@ -55,6 +56,25 @@ SETTINGS = {}  # project directory -> its runtime.deno settings
 def _require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def _shape(value):
+    """What a JSON value read from a file is, in the words a refusal shows.
+
+    `json.loads` returns only these six kinds, so every value it can hand back
+    is named: a refusal never says `a str` and never has to guess.
+    """
+    if value is None:
+        return "nothing"
+    if isinstance(value, bool):
+        return "true or false"
+    if isinstance(value, str):
+        return "a string"
+    if isinstance(value, list):
+        return "a list"
+    if isinstance(value, dict):
+        return "an object"
+    return "a number"
 
 
 LOCK_FIX = "name a lockfile inside the project, such as deno.lock"
@@ -116,9 +136,10 @@ def _settled(path, where, fix):
     # comparison the caller makes -- each caller compares the settled path
     # against the project without resolving it again. The walk only peels a
     # component it cannot see, so this is reached by a directory that is
-    # missing and by one the checker may not enter alike; neither has a place
-    # a `..` could go up from.
-    _require(".." not in missing, f"{where} goes up from a directory that is not there or cannot be read; {fix}")
+    # missing, by one the checker may not enter, and by a name that is there
+    # but is not a directory at all -- a lockfile used as a directory, say.
+    # None of the three has a place a `..` could go up from.
+    _require(".." not in missing, f"{where} goes up from a directory that is not there, cannot be read, or is not a directory; {fix}")
     for name in reversed(missing):
         settled = settled / name
     return settled
@@ -174,10 +195,13 @@ def check_manifest(config, manifest):
              f"{manifest}: runtime.deno.lock {declared!r} is {lock}, which is outside the project; {LOCK_FIX}")
     # What the manifest names is the manifest's own fault to put right, so a
     # route to the lock that the checker cannot walk is refused here, whether
-    # or not an atom ever reads it. That the lockfile is not there yet is left
+    # or not an atom ever reads it. So is a name that leads to something that is
+    # no lockfile at all -- a directory, a queue, a device -- which is asked
+    # only where something is there: that the lockfile is not there yet is left
     # to the atom that needs it, which is the check that says which import a
     # missing lock cannot vouch for.
-    _can_see(lock, manifest)
+    mode = _seen(lock, manifest, "lockfile")
+    _require(mode is None or stat.S_ISREG(mode), f"{manifest}: lockfile {lock.name} is not a regular file")
     SETTINGS[project] = deno
 
 
@@ -198,30 +222,87 @@ def _specifiers(text, origin, project, seen):
             continue
         if target.startswith("."):
             local = _settled(origin.parent / target, f"{origin}: import {target}", "import a module inside the project")
-            _require(local.is_file() and local.is_relative_to(project), f"{origin}: import {target} is missing or leaves the project")
+            # A module behind a directory the checker may not enter is refused
+            # by that route, which is not what a module that is not there says.
+            # What is there is compared as it settled, as every caller compares
+            # what it settled, and is opened once the way to it is settled: a
+            # module whose contents the checker may not have is refused as that
+            # too, and never read as one that imports nothing.
+            _require(_can_see(local, origin, "import"), f"{origin}: import {target} is missing or leaves the project")
+            _require(local.is_relative_to(project), f"{origin}: import {target} is missing or leaves the project")
             if local not in seen:
                 seen.add(local)
-                found |= _specifiers(local.read_text(), local, project, seen)
+                found |= _specifiers(_read(local, origin, "import"), local, project, seen)
         else:
             found.add((origin, target))
     return found
 
 
-def _can_see(lock_path, where):
-    """Whether the settled lockfile is a file there, refusing a path nothing can see.
+# What the file system says when a path has nothing at it: the name is not
+# there, or a name above it is not a directory to look in. Everything else it
+# reports -- a directory the checker may not enter, a link that points round --
+# is a path it cannot see, not a path with nothing at it.
+ABSENT = (errno.ENOENT, errno.ENOTDIR)
 
-    A directory above the lockfile that the checker may not enter is not a
-    lockfile that is missing: the file system reports a permission error for
-    it, and a lock the checker cannot see cannot vouch for an import either.
-    So that permission error becomes a refusal naming the path, rather than an
-    error escaping the check with nothing to say about the file at fault.
-    Whether the lockfile is simply absent is left to the caller, who knows
-    whether the project needed it.
+
+def _seen(path, where, what):
+    """What the file system says the settled `path` holds, refusing what it will not say.
+
+    `where` and `what` name the thing the caller is looking for -- a lockfile,
+    an import, a named script -- so that a refusal says which one, at which
+    path, as the file system told it. What comes back is `stat`'s own mode, or
+    None where there is nothing to look at.
+
+    `Path.is_file` cannot carry this. It answers some errors as its own
+    judgement of them rather than as the file system reported them, and which
+    errors those are has changed between Python versions, so a directory above
+    the file that the checker may not enter reads as no file at all on one
+    version and raises on the next. What is asked here is what the inode is.
+
+    Only `ABSENT` is answered None, which leaves it to the caller whether the
+    project needed the file. Anything else the file system reports -- a
+    directory it may not enter, a link that points round -- becomes a refusal
+    naming the path, because a file the checker cannot see cannot vouch for an
+    import either, and an error escaping the check says nothing about the file
+    at fault.
     """
     try:
-        return lock_path.is_file()
+        return path.stat().st_mode
     except OSError as error:
-        raise ValueError(f"{where}: lockfile {lock_path.name} cannot be read ({error})") from error
+        if error.errno in ABSENT:
+            return None
+        raise ValueError(f"{where}: {what} {path.name} cannot be read ({error})") from error
+
+
+def _can_see(path, where, what):
+    """Whether a regular file sits at the settled `path`, with a directory answered as no file.
+
+    A name that holds a directory is no file, and is answered as the caller
+    answers a missing one, because a lockfile or a script that is a directory is
+    a name to put right. A name holding anything else a file system can hold --
+    a queue, a socket, a device -- is refused here instead: what the caller does
+    next is open it, and opening a queue waits for a writer that will never
+    come.
+    """
+    mode = _seen(path, where, what)
+    if mode is None or stat.S_ISDIR(mode):
+        return False
+    _require(stat.S_ISREG(mode), f"{where}: {what} {path.name} is not a regular file")
+    return True
+
+
+def _read(path, where, what):
+    """The text of a file the checker settled on, refused by name where it cannot be opened.
+
+    Being a regular file is not being readable, so a file whose contents the
+    checker may not have is refused as that -- as a lock whose contents it may
+    not have is -- and not as an error escaping the check. Text that is not text
+    is refused the same way, since nothing else can be said about it.
+    """
+    try:
+        return path.read_text()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"{where}: {what} {path.name} cannot be read ({error})") from error
 
 
 def _lock(path, deno, settings, project):
@@ -253,14 +334,26 @@ def _declaration(path, fm, project, specifiers):
     _require(set(deno.get("sys", [])) <= HARMLESS_SYS, f"{path}: runtime.deno.sys may hold only {sorted(HARMLESS_SYS)}")
     settings = SETTINGS.get(project, {})
     lock_path = _lock(path, deno, settings, project)
-    _require(_can_see(lock_path, path), f"{path}: lockfile {lock_path.name} is missing")
+    _require(_can_see(lock_path, path, "lockfile"), f"{path}: lockfile {lock_path.name} is missing")
     # The lock is read once, for every import. Settled and shown to be a file,
     # it is still one the checker may not be able to open, and a lock that
-    # cannot be read vouches for nothing.
+    # cannot be opened or is no JSON this Python can read -- JSON nested deeper
+    # than this Python reads is that -- vouches for nothing and is refused as
+    # what it is rather than raising. What it holds is taken as what it records,
+    # so its shape is checked before one import is answered from it: a body that
+    # is not an object, and a `specifiers` that is not the map from each package
+    # to its version, say nothing about any import -- and a string answers every
+    # import that is a substring of it.
+    text = _read(lock_path, path, "lockfile")
     try:
-        recorded = json.loads(lock_path.read_text()).get("specifiers", {})
-    except OSError as error:
-        raise ValueError(f"{path}: lockfile {lock_path.name} cannot be read ({error})") from error
+        body = json.loads(text)
+    except (ValueError, RecursionError) as error:
+        raise ValueError(f"{path}: lockfile {lock_path.name} cannot be read as JSON ({error})") from error
+    _require(isinstance(body, dict),
+             f"{path}: lockfile {lock_path.name} is {_shape(body)}, not a JSON object holding what the project recorded")
+    recorded = body.get("specifiers", {})
+    _require(isinstance(recorded, dict),
+             f"{path}: lockfile {lock_path.name} records specifiers as {_shape(recorded)}, not as the map from each package to its version")
     for source, target in sorted(specifiers):
         _require(PINNED.fullmatch(target), f"{source}: import {target!r} must be an npm: or jsr: package pinned to an exact version")
         _require("allow_packages" not in settings or _allowed(target, settings["allow_packages"]),
@@ -315,9 +408,14 @@ def check_script(path, fm, project):
     # References in an atom file are relative to that file.
     script = _settled(path.parent / fm["exec"]["script"], f"{path}: exec.script {fm['exec']['script']!r}",
                       "name a TypeScript file inside the project")
-    _require(script.is_file() and script.suffix == ".ts", f"{path}: script {fm['exec']['script']} is not a TypeScript file")
+    # A script the checker may not open is refused as that, which is not what a
+    # script that is not there says; either way it is not read. What is there
+    # is compared as it settled, as every caller compares what it settled.
+    _require(_can_see(script, path, "exec.script"),
+             f"{path}: exec.script {fm['exec']['script']!r} is missing or cannot be read")
+    _require(script.suffix == ".ts", f"{path}: script {fm['exec']['script']} is not a TypeScript file")
     _require(script.is_relative_to(project), f"{path}: script {fm['exec']['script']} is outside the project")
-    specifiers = _specifiers(script.read_text(), script, project, {script})
+    specifiers = _specifiers(_read(script, path, "exec.script"), script, project, {script})
     _require(specifiers, f"{path}: {fm['exec']['script']} imports no package; a plain exec command would do")
     _require("network" in fm, f"{path}: declare the hosts the script may reach in network.allow")
     CHECKED.append((path, "script", *_declaration(path, fm, project, specifiers)))

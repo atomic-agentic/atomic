@@ -479,6 +479,14 @@ latest release, it applies that candidate itself on any branch. To finish a
 bump, commit the `Cargo.lock` the workflow uploads, account for what
 `scripts/lock-check.sh` reports, and follow the other steps the script prints.
 
+atomic knows Codex's Linux sandbox helper by how Codex starts it, and a bump
+that changes that changes what atomic recognises as the helper. Check, in the
+candidate's `sandboxing` and `linux-sandbox` crates, that the helper's first
+arguments are still `--sandbox-policy-cwd`, alone or after
+`--inherit-pid-namespace`, and that the helper is still started under the
+name `codex-linux-sandbox`. Then update `LINUX_SANDBOX_ARG1` and
+`INHERIT_PID_NAMESPACE` in `crates/atomic-core/src/codex.rs` to match.
+
 `scripts/milestone-tests.sh` also runs locally:
 
 ```bash
