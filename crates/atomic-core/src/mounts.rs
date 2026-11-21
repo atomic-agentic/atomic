@@ -308,41 +308,134 @@ fn aliases_of(
             first.at.display()
         );
     }
-    let (Some(root), Ok(rel)) = (&home.root, path.strip_prefix(&home.at)) else {
+    let start = out.len();
+    if let (Some(root), Ok(rel)) = (&home.root, path.strip_prefix(&home.at)) {
+        let inside = root.join(rel);
+        for other in same.iter().copied() {
+            let Some(other_root) = &other.root else {
+                continue;
+            };
+            // The second place, and what it shows of the place: the place itself,
+            // or, for a mount of part of it, that part.
+            let (alias, shows) = if let Ok(below) = inside.strip_prefix(other_root) {
+                if below.as_os_str().is_empty() {
+                    (other.at.clone(), path.to_owned())
+                } else {
+                    (other.at.join(below), path.to_owned())
+                }
+            } else if let Ok(part) = other_root.strip_prefix(&inside) {
+                (other.at.clone(), path.join(part))
+            } else {
+                continue;
+            };
+            if alias == path {
+                continue;
+            }
+            // Off a local filesystem, a root may be stale with nothing in the
+            // table to say so: an ancestor of it lost, or renamed on the server
+            // and not checked again yet. Where the place is there, its second
+            // place must be the same file or directory as what it shows. Where
+            // what it shows is not there, it is denied unchecked: a stale root
+            // then denies more, never less.
+            if !local(&home.kind) {
+                same_file(&shows, &alias)?;
+            }
+            out.push(alias);
+        }
+    }
+    // What the table's roots say, checked against the directories the
+    // mounts are of.
+    shown_unlisted(home, &same, path, &out[start..])?;
+    Ok(())
+}
+
+/// Refused when another mount of `home`'s filesystem, of `same`, shows
+/// `path` with nothing in the table to say so: its mount point is the same
+/// directory as `path` or one above it on `home`, and the table did not
+/// yield that second place among `found`. A root can go stale with no
+/// marker, as an overlay's does once a lower directory under a bound one is
+/// renamed, or a remote filesystem's when a directory above it is renamed
+/// on the server; the second mount then looks unrelated to the place. A
+/// mount point that is not there, or that atomic, and so a command run as
+/// the same user, cannot reach, shows nothing to it.
+#[cfg(unix)]
+fn shown_unlisted(
+    home: &Mount,
+    same: &[&Mount],
+    path: &Path,
+    found: &[PathBuf],
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(rel) = path.strip_prefix(&home.at) else {
         return Ok(());
     };
-    let inside = root.join(rel);
-    for other in same {
-        let Some(other_root) = &other.root else {
-            continue;
-        };
-        // The second place, and what it shows of the place: the place itself,
-        // or, for a mount of part of it, that part.
-        let (alias, shows) = if let Ok(below) = inside.strip_prefix(other_root) {
-            if below.as_os_str().is_empty() {
-                (other.at.clone(), path.to_owned())
-            } else {
-                (other.at.join(below), path.to_owned())
-            }
-        } else if let Ok(part) = other_root.strip_prefix(&inside) {
-            (other.at.clone(), path.join(part))
-        } else {
-            continue;
-        };
-        if alias == path {
-            continue;
-        }
-        // Off a local filesystem, a root may be stale with nothing in the
-        // table to say so: an ancestor of it lost, or renamed on the server
-        // and not checked again yet. Where the place is there, its second
-        // place must be the same file or directory as what it shows. Where
-        // what it shows is not there, it is denied unchecked: a stale root
-        // then denies more, never less.
-        if !local(&home.kind) {
-            same_file(&shows, &alias)?;
-        }
-        out.push(alias);
+    // The place and each directory above it on its home mount, as the
+    // file each is, with what of the place lies below it.
+    let mut chain = vec![home.at.clone()];
+    for part in rel.components() {
+        let next = chain[chain.len() - 1].join(part);
+        chain.push(next);
     }
+    let mut above = Vec::new();
+    for dir in &chain {
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) => {
+                let below = path.strip_prefix(dir).unwrap_or(Path::new("")).to_owned();
+                above.push(((m.dev(), m.ino()), dir, below));
+            }
+            Err(e) if not_there(&e) => break,
+            Err(e) => bail!(
+                "{} cannot be looked at ({e}), so atomic cannot check which other mounts show \
+                 {}; it cannot deny it at each",
+                dir.display(),
+                path.display()
+            ),
+        }
+    }
+    for other in same {
+        let shown = match std::fs::symlink_metadata(&other.at) {
+            Ok(m) => (m.dev(), m.ino()),
+            Err(e) if not_there(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => {
+                continue;
+            }
+            Err(e) => bail!(
+                "the mount at {} cannot be looked at ({e}), so atomic cannot check whether it \
+                 shows {}; it cannot deny it at each",
+                other.at.display(),
+                path.display()
+            ),
+        };
+        for (id, dir, below) in &above {
+            if shown != *id {
+                continue;
+            }
+            let alias = if below.as_os_str().is_empty() {
+                other.at.clone()
+            } else {
+                other.at.join(below)
+            };
+            if alias == path || found.contains(&alias) {
+                continue;
+            }
+            bail!(
+                "the mount at {} shows {}, which its root in the mount table ({}) does not say, \
+                 so the table's word for where that filesystem's mounts are is stale; atomic \
+                 cannot deny {} at each",
+                other.at.display(),
+                dir.display(),
+                other
+                    .root
+                    .as_deref()
+                    .map_or_else(|| "none".to_owned(), |r| r.display().to_string()),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn shown_unlisted(_: &Mount, _: &[&Mount], _: &Path, _: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 

@@ -467,3 +467,42 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
             .is_err_and(|e| e.to_string().contains("cannot be looked at"))
     );
 }
+
+/// Another mount of the place's filesystem whose mount point is the place,
+/// or a directory above it, shows the place there whatever its root says:
+/// where the table yields that second place it passes, and where its root
+/// says another directory, the table is stale and the list is refused. (A
+/// mount point reached through a linked directory stands in here for a
+/// mount of the same directory; the sandbox suite's `stale_roots` makes
+/// real ones.)
+#[test]
+fn a_mount_of_a_directory_above_the_place_is_checked_whatever_its_root_says() {
+    let dir = scratch("above");
+    let home = dir.0.join("host/home");
+    let place = home.join("u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::os::unix::fs::symlink(&home, dir.0.join("link")).expect("link");
+    let shown = dir.0.join("link/u");
+    let table = |root: &Path| {
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            root.display(),
+            shown.display()
+        )
+    };
+    // Its root names the directory it is: the table yields it, and it passes.
+    let mounts = parse(table(&home.join("u")).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&mounts, std::slice::from_ref(&place)).expect("yielded"),
+        [shown.join(".ssh")]
+    );
+    // Its root names another: refused.
+    let mounts = parse(table(Path::new("/elsewhere")).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
+            let e = e.to_string();
+            e.contains(&format!("the mount at {} shows", shown.display()))
+                && e.contains("(/elsewhere) does not say")
+        })
+    );
+}
