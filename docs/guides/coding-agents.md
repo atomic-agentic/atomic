@@ -32,8 +32,10 @@ where a change to it shows.
 
 Nothing of yours is deleted, as long as the record is the one atomic wrote: what
 setup removes is only what the record says atomic wrote and nothing has touched
-since, and — when it is the only thing in the way — an empty directory atomic did
-not write, named in the refusal that removes it. A file an older release wrote
+since, and — when it is the only thing in the way — an empty directory the record
+lists files under, the shell of one an earlier setup wrote, named in the refusal
+that removes it. An empty directory the record knows nothing of, such as one you
+made, is refused and left where it is. A file an older release wrote
 that this one no longer ships does come out on that basis, and a directory that
 only held such files goes with them.
 
@@ -53,8 +55,7 @@ what atomic cannot account for is refused rather than installed beside.
 One case is still a deliberate step. A directory written by a version of atomic
 that kept no record cannot be checked, so setup accepts it only while it holds
 nothing but the current pack's files, each with the current pack's bytes.
-Upgrading from
-such a version, delete `.claude/skills/atomic-create-atom`, or its
+Upgrading from such a version, delete `.claude/skills/atomic-create-atom`, or its
 `.agents/skills/` counterpart, and run setup again; from then on an upgrade takes
 nothing away. Where nothing has changed, running setup again writes the same files
 and adds nothing to the instructions file.

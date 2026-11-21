@@ -138,8 +138,9 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
 /// wrote. What passes may be rewritten; the only things removed are a file the
 /// manifest says atomic wrote, still holding what it recorded, that this pack no
 /// longer ships, the directories that removing those files leaves empty, and an
-/// empty directory atomic has no reason to write in -- the last only when it is
-/// all there was to refuse, and named in the refusal that comes with it. The
+/// empty directory atomic has no reason to write in whose record lists a path
+/// under it, the shell of one an earlier setup wrote -- the last only when it
+/// is all there was to refuse, and named in the refusal that comes with it. The
 /// manifest goes down after the files it records.
 pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let root =
@@ -207,17 +208,18 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     // anything is written: an instructions file atomic cannot read, or one whose
     // atomic section is broken, is refused here, so a refusal leaves the skill
     // not partly installed for an agent to find.
-    let current = match std::fs::read_to_string(root.join(&instructions_target)) {
-        Ok(text) => Some(text),
-        Err(e) if e.kind() == ErrorKind::NotFound => None,
-        Err(e) => return Err(e).with_context(|| format!("read {}", instructions.display())),
+    let current = match at::read_plain(&root, &instructions_target, READ_BYTES_MAX)? {
+        Some(bytes) => Some(String::from_utf8(bytes).map_err(|_| {
+            anyhow::anyhow!("{} is not text atomic can read", instructions.display())
+        })?),
+        None => None,
     };
     let updated = with_section(current.as_deref(), &section())
         .with_context(|| format!("update {}", instructions.display()))?;
     for (dir, stale) in &owned {
         let mut emptied: BTreeSet<&str> = BTreeSet::new();
         for gone in stale {
-            std::fs::remove_file(dir.path.join(gone))
+            at::remove(&root, &dir.at.join(gone), false)
                 .with_context(|| format!("remove {}", dir.shown(gone)))?;
             emptied.extend(parents_of(gone));
         }
@@ -230,7 +232,7 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         let mut emptied: Vec<&str> = emptied.into_iter().collect();
         emptied.sort_by_key(|parent| std::cmp::Reverse(parent.split('/').count()));
         for parent in emptied {
-            let _ = std::fs::remove_dir(dir.path.join(parent));
+            let _ = at::remove(&root, &dir.at.join(parent), true);
         }
     }
     let mut written = Vec::new();
@@ -569,10 +571,11 @@ impl<'a> OwnedDir<'a> {
             if report.is_empty() {
                 return Ok(self.leftovers(&manifest, &report));
             }
-            // An empty directory atomic has no reason to write in is the one
-            // thing a person is told to remove that they cannot see to remove --
-            // often the shell of a directory an earlier pack wrote, whose files a
-            // later one stopped removing. Setup clears those, and only when they
+            // An empty directory atomic has no reason to write in, whose record
+            // lists a path under it, is the one thing a person is told to remove
+            // that they cannot see to remove: the shell of a directory an earlier
+            // pack wrote, whose files a later one stopped removing. Setup clears
+            // those, and only when they
             // are the whole of what is refused: a run that has anything else to
             // complain of leaves every directory exactly as it found it, so what
             // comes out of a skill directory is only ever an empty shell, and the
@@ -607,7 +610,7 @@ impl<'a> OwnedDir<'a> {
         empty.sort_by_key(|at| std::cmp::Reverse(at.split('/').count()));
         let mut cleared = Vec::new();
         for at in empty {
-            if std::fs::remove_dir(self.path.join(&at)).is_ok() {
+            if at::remove(self.root, &self.at.join(&at), true).is_ok_and(|removed| removed) {
                 cleared.push(self.shown(&at));
             }
         }
@@ -964,17 +967,22 @@ impl<'a> OwnedDir<'a> {
     }
 }
 
-/// The bytes of the plain file at `path`, opened once and never through a
-/// link, or `None` when it holds more than `max`: a file that grew since its
-/// size was seen is read no further than that.
+/// The bytes of the plain file at `path`, opened once, never through a link
+/// and never waiting, as opening a fifo would, or `None` when it holds more
+/// than `max`: a file that grew since its size was seen is read no further
+/// than that, and one that is no longer a plain file is refused.
 fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NOFOLLOW);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, at::READ_FLAGS);
+    let file = open.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
     let mut bytes = Vec::new();
-    open.open(path)?.take(max + 1).read_to_end(&mut bytes)?;
+    file.take(max + 1).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= max).then_some(bytes))
 }
 
@@ -1103,11 +1111,16 @@ mod at {
         CString::new(name.as_bytes()).context("a name holds a NUL byte")
     }
 
-    fn openat(dir: BorrowedFd<'_>, name: &CString, flags: libc::c_int) -> std::io::Result<OwnedFd> {
+    fn openat(
+        dir: BorrowedFd<'_>,
+        name: &CString,
+        flags: libc::c_int,
+        mode: libc::c_uint,
+    ) -> std::io::Result<OwnedFd> {
         // SAFETY: `name` is a NUL-terminated string that outlives the call,
         // and `dir` is an open descriptor; the result is owned below.
         #[allow(unsafe_code)]
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, 0o666) };
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags, mode) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1145,6 +1158,17 @@ mod at {
     /// at a time and never through a link, making each that is not there
     /// yet: the directory the file belongs in, held open.
     pub(super) fn open_chain(root: &Path, relative: &Path) -> anyhow::Result<OwnedFd> {
+        Ok(walk(root, relative, true)?.expect("every directory is made"))
+    }
+
+    /// [`open_chain`], making nothing: `None` when a directory on the way is
+    /// not there, which is the one failure that means there is nothing to
+    /// read or remove.
+    pub(super) fn find_chain(root: &Path, relative: &Path) -> anyhow::Result<Option<OwnedFd>> {
+        walk(root, relative, false)
+    }
+
+    fn walk(root: &Path, relative: &Path, make: bool) -> anyhow::Result<Option<OwnedFd>> {
         let mut dir: OwnedFd = std::fs::File::open(root)
             .with_context(|| format!("open {}", line(&root.to_string_lossy())))?
             .into();
@@ -1154,7 +1178,8 @@ mod at {
             below.push(part);
             let shown = || line(&below.to_string_lossy());
             let name = c_name(part.as_os_str())?;
-            let opened = match openat(dir.as_fd(), &name, flags) {
+            let opened = match openat(dir.as_fd(), &name, flags, 0) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !make => return Ok(None),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // SAFETY: `name` is valid for the call, and `dir` is open.
                     #[allow(unsafe_code)]
@@ -1163,7 +1188,7 @@ mod at {
                     if r < 0 && made.kind() != std::io::ErrorKind::AlreadyExists {
                         return Err(made).with_context(|| format!("create {}", shown()));
                     }
-                    openat(dir.as_fd(), &name, flags)
+                    openat(dir.as_fd(), &name, flags, 0)
                 }
                 other => other,
             };
@@ -1185,7 +1210,76 @@ mod at {
                 }
             };
         }
-        Ok(dir)
+        Ok(Some(dir))
+    }
+
+    /// How a file is opened to be read besides: never through a link standing
+    /// at its name, and never waiting, as opening a fifo would.
+    /// `scripts/controls/skill-dir-read-at.row` switches the first off, and
+    /// `scripts/controls/skill-dir-read-waits.row` the second.
+    const READ_NOT_THROUGH_A_LINK: libc::c_int = libc::O_NOFOLLOW;
+    const READ_WITHOUT_WAITING: libc::c_int = libc::O_NONBLOCK;
+    /// Both, as one set of flags, for a file read by its path.
+    pub(super) const READ_FLAGS: libc::c_int = READ_NOT_THROUGH_A_LINK | READ_WITHOUT_WAITING;
+
+    /// The bytes of the plain file at `relative` below `root`, read through
+    /// the directories held open on the way and never through a link: `None`
+    /// when it is not there, and refused when it is anything but a plain file
+    /// or holds more than `max` bytes.
+    pub(super) fn read_plain(
+        root: &Path,
+        relative: &Path,
+        max: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        let shown = line(&relative.to_string_lossy());
+        let Some(dir) = find_chain(root, relative)? else {
+            return Ok(None);
+        };
+        let name = c_name(relative.file_name().context("a file has a name")?)?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | READ_FLAGS;
+        let file = match openat(dir.as_fd(), &name, flags, 0) {
+            Ok(fd) => std::fs::File::from(fd),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+                bail!("{shown} is a symbolic link, and atomic never reads through one")
+            }
+            Err(e) => return Err(e).with_context(|| format!("read {shown}")),
+        };
+        let meta = file.metadata().with_context(|| format!("read {shown}"))?;
+        anyhow::ensure!(meta.is_file(), "{shown} is not a plain file");
+        let mut bytes = Vec::new();
+        file.take(max + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("read {shown}"))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= max,
+            "{shown} is more than {max} bytes, larger than atomic reads there"
+        );
+        Ok(Some(bytes))
+    }
+
+    /// Remove the file, or with `dir` the empty directory, at `relative`
+    /// below `root`, by its name in the directory held open on the way, never
+    /// through a link: `false` when it is not there.
+    pub(super) fn remove(root: &Path, relative: &Path, dir: bool) -> anyhow::Result<bool> {
+        let shown = line(&relative.to_string_lossy());
+        let Some(parent) = find_chain(root, relative)? else {
+            return Ok(false);
+        };
+        let name = c_name(relative.file_name().context("a path has a name")?)?;
+        let how = if dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: `name` is valid for the call, and `parent` is open.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), how) };
+        if r == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        Err(e).with_context(|| format!("remove {shown}"))
     }
 
     /// Put `contents` at `name` in `dir`: written to a temporary made new
@@ -1200,7 +1294,7 @@ mod at {
             .ok()
             .filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG)
             .map(|st| u32::from(st.st_mode) & 0o7777);
-        let (temp, made) = make_temp(dir.as_fd(), name)?;
+        let (temp, made) = make_temp(dir.as_fd(), name, mode)?;
         let unmade = |e: anyhow::Error| {
             // SAFETY: `temp` is valid for the call, and `dir` is open.
             #[allow(unsafe_code)]
@@ -1210,13 +1304,7 @@ mod at {
             e
         };
         let mut file = std::fs::File::from(made);
-        let written = file
-            .write_all(contents)
-            .and_then(|()| match mode {
-                Some(mode) => file.set_permissions(std::fs::Permissions::from_mode(mode)),
-                None => Ok(()),
-            })
-            .and_then(|()| file.sync_all());
+        let written = file.write_all(contents).and_then(|()| file.sync_all());
         drop(file);
         written.map_err(|e| unmade(e.into()))?;
         // SAFETY: both names are valid for the call, and `dir` is open.
@@ -1236,8 +1324,15 @@ mod at {
     }
 
     /// A temporary for `name` made new in `dir`: `.{name}.{random}.atomic-writing`,
-    /// tried again under another name while one is taken.
-    fn make_temp(dir: BorrowedFd<'_>, name: &OsStr) -> anyhow::Result<(CString, OwnedFd)> {
+    /// tried again under another name while one is taken. When the file it
+    /// replaces is there, with `mode`, it is made readable by its owner only
+    /// and given that mode before anything is written to it, so what it holds
+    /// is never readable by more than the file it replaces lets read.
+    pub(super) fn make_temp(
+        dir: BorrowedFd<'_>,
+        name: &OsStr,
+        mode: Option<u32>,
+    ) -> anyhow::Result<(CString, OwnedFd)> {
         for _ in 0..TEMP_TRIES {
             let mut random = [0u8; 8];
             getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random name: {e}"))?;
@@ -1247,8 +1342,22 @@ mod at {
                 format!(".{:016x}.atomic-writing", u64::from_le_bytes(random)).as_bytes(),
             );
             let temp = CString::new(temp).context("a name holds a NUL byte")?;
-            match create_new(dir, &temp) {
-                Ok(fd) => return Ok((temp, fd)),
+            match create_new(dir, &temp, if mode.is_some() { 0o600 } else { 0o666 }) {
+                Ok(fd) => {
+                    let file = std::fs::File::from(fd);
+                    if let Some(mode) = mode {
+                        let given = file.set_permissions(std::fs::Permissions::from_mode(mode));
+                        if let Err(e) = given {
+                            // SAFETY: `temp` is valid for the call, and `dir` is open.
+                            #[allow(unsafe_code)]
+                            unsafe {
+                                libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+                            }
+                            return Err(e).context("give a temporary its file's permissions");
+                        }
+                    }
+                    return Ok((temp, file.into()));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e).context("make a temporary"),
             }
@@ -1256,13 +1365,17 @@ mod at {
         bail!("no temporary could be made new after {TEMP_TRIES} names")
     }
 
-    /// Create `temp` in `dir`, new and not through a link.
-    pub(super) fn create_new(dir: BorrowedFd<'_>, temp: &CString) -> std::io::Result<OwnedFd> {
+    /// Create `temp` in `dir` with `mode`, new and not through a link.
+    pub(super) fn create_new(
+        dir: BorrowedFd<'_>,
+        temp: &CString,
+        mode: libc::c_uint,
+    ) -> std::io::Result<OwnedFd> {
         let flags = NEW_NOT_THROUGH_A_LINK.into_iter().fold(
             libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC,
             std::ops::BitOr::bitor,
         );
-        openat(dir, temp, flags)
+        openat(dir, temp, flags, mode)
     }
 }
 
@@ -1289,6 +1402,33 @@ mod at {
             }
         }
         Ok(dir)
+    }
+
+    pub(super) fn read_plain(
+        root: &Path,
+        relative: &Path,
+        max: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        match super::read_at_most(&root.join(relative), max) {
+            Ok(Some(bytes)) => Ok(Some(bytes)),
+            Ok(None) => anyhow::bail!("{} is larger than atomic reads there", relative.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(super) fn remove(root: &Path, relative: &Path, dir: bool) -> anyhow::Result<bool> {
+        let path = root.join(relative);
+        let done = if dir {
+            std::fs::remove_dir(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match done {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub(super) fn replace(dir: &Path, name: &OsStr, contents: &[u8]) -> anyhow::Result<()> {
@@ -2578,7 +2718,7 @@ mod tests {
         std::os::unix::fs::symlink("theirs", root.join("planted")).expect("link");
         let dir: std::os::fd::OwnedFd = std::fs::File::open(&root).expect("open").into();
         let name = std::ffi::CString::new("planted").expect("name");
-        let made = at::create_new(std::os::fd::AsFd::as_fd(&dir), &name);
+        let made = at::create_new(std::os::fd::AsFd::as_fd(&dir), &name, 0o600);
         assert!(made.is_err(), "a temporary was made through the link");
         assert_eq!(
             std::fs::read_to_string(&theirs).expect("theirs"),
@@ -2616,6 +2756,140 @@ mod tests {
             .filter(|n| n.ends_with(".atomic-writing") && n != "AGENTS.atomic-writing")
             .collect();
         assert!(leftovers.is_empty(), "temporaries were left: {leftovers:?}");
+    }
+
+    /// The instructions file is read through the directories held open on
+    /// the way and never through a link: one swapped in after it was weighed,
+    /// leading to a key of the person's, is refused, not read into the file.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_never_read_through_a_link() {
+        let root = std::fs::canonicalize(scratch("read-link")).expect("canonical root");
+        std::fs::write(root.join("secret"), "a key\n").expect("secret");
+        std::os::unix::fs::symlink("secret", root.join("AGENTS.md")).expect("link");
+        let refused = at::read_plain(&root, Path::new("AGENTS.md"), 1024)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert_eq!(
+            refused,
+            "AGENTS.md is a symbolic link, and atomic never reads through one"
+        );
+    }
+
+    /// A file is removed by its name in the directories held open on the way:
+    /// a directory above it swapped for a link to somewhere else is refused,
+    /// and what the link leads to keeps its file.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_refuses_a_directory_reached_through_a_link() {
+        let root = std::fs::canonicalize(scratch("remove-chain")).expect("canonical root");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::fs::write(elsewhere.join("old.md"), "theirs\n").expect("theirs");
+        std::fs::create_dir_all(root.join(".agents/skills/atomic-create-atom")).expect("skill");
+        std::os::unix::fs::symlink(
+            "../../../elsewhere",
+            root.join(".agents/skills/atomic-create-atom/references"),
+        )
+        .expect("link");
+        let refused = at::remove(
+            &root,
+            Path::new(".agents/skills/atomic-create-atom/references/old.md"),
+            false,
+        )
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+        assert_eq!(
+            refused,
+            ".agents/skills/atomic-create-atom/references/old.md is reached through \
+             .agents/skills/atomic-create-atom/references, which is a symbolic link"
+        );
+        assert!(
+            elsewhere.join("old.md").is_file(),
+            "the file the link led to went"
+        );
+    }
+
+    /// A temporary that replaces a file already has that file's permissions
+    /// before a byte is written to it: what it holds is never readable by
+    /// more than the file it replaces lets read.
+    #[cfg(unix)]
+    #[test]
+    fn a_temporary_has_its_files_permissions_before_it_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(scratch("temp-mode")).expect("canonical root");
+        let dir: std::os::fd::OwnedFd = std::fs::File::open(&root).expect("open").into();
+        let (temp, made) = at::make_temp(
+            std::os::fd::AsFd::as_fd(&dir),
+            std::ffi::OsStr::new("AGENTS.md"),
+            Some(0o640),
+        )
+        .expect("a temporary");
+        let meta = std::fs::File::from(made).metadata().expect("meta");
+        let _ = std::fs::remove_file(root.join(temp.to_str().expect("text")));
+        assert_eq!(meta.len(), 0, "the temporary was written to");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o640);
+    }
+
+    /// Run `read` on a fifo with no writer, which a read that waits would wait
+    /// on forever: it must come back, refused, at once.
+    #[cfg(unix)]
+    fn read_of_a_fifo_comes_back(read: fn(&Path) -> bool) {
+        let root = std::fs::canonicalize(scratch("fifo")).expect("canonical root");
+        let fifo = root.join("AGENTS.md");
+        let name = std::ffi::CString::new(fifo.to_str().expect("text")).expect("name");
+        // SAFETY: `name` is a valid NUL-terminated path for the call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        let (send, came) = std::sync::mpsc::channel();
+        std::thread::spawn(move || send.send(read(&fifo)));
+        let refused = came
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read of a fifo waited");
+        assert!(refused, "a fifo was read as a file");
+    }
+
+    /// The instructions file's read does not wait on a fifo standing there.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_for_the_instructions_file_is_refused_without_waiting() {
+        read_of_a_fifo_comes_back(|fifo| {
+            let root = fifo.parent().expect("root");
+            at::read_plain(root, Path::new("AGENTS.md"), 1024)
+                .is_err_and(|e| format!("{e:#}") == "AGENTS.md is not a plain file")
+        });
+    }
+
+    /// Nor does the read of a skill directory's file, swapped for a fifo after
+    /// the walk saw a file there.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_for_a_skill_file_is_refused_without_waiting() {
+        read_of_a_fifo_comes_back(|fifo| {
+            read_at_most(fifo, 1024).is_err_and(|e| e.to_string() == "not a plain file")
+        });
+    }
+
+    /// A pack path that is not plain names no file inside a skill directory.
+    #[test]
+    fn a_pack_path_that_is_not_plain_is_refused() {
+        for path in ["atomic-create-atom/../x", "atomic-create-atom//x"] {
+            let pack = vec![skills::SkillFile {
+                path: path.to_owned(),
+                contents: String::new(),
+            }];
+            let refused = owned_dirs(&pack)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(
+                refused.contains("which is not a plain path"),
+                "{path}: {refused}"
+            );
+        }
     }
 
     /// The file a write replaces keeps its permissions: an instructions file
