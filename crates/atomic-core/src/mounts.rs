@@ -16,11 +16,13 @@
 //! line it cannot read, one with a mount on a mount it does not list, a
 //! denied path it finds no mount for, a denied path on NFS or SMB
 //! ([`unknowable`]) that is mounted more than once, since the table cannot
-//! be trusted to say which directory each such mount shows, or one on a
-//! FUSE, 9p or virtiofs filesystem mounted more than once whose root the
-//! kernel has lost ([`may_lose_roots`]). A mount
-//! whose root is not a path, such as a namespace file (`net:[4026531840]`),
-//! shows no directory, and is never a second place.
+//! be trusted to say which directory each such mount shows; one on any
+//! filesystem but a local one ([`local`]) mounted more than once whose root
+//! the kernel shows as lost (`<path>//deleted`); and one there now whose
+//! second place, on such a filesystem, is missing or is another file or
+//! directory, since the table's roots there can be stale. A mount whose
+//! root is not a path, such as a namespace file (`net:[4026531840]`), shows
+//! no directory, and is never a second place.
 //!
 //! What it cannot see:
 //!
@@ -39,7 +41,9 @@
 //!   mount a superblock of its own; Ceph, which has one per server path;
 //!   two SMB sessions; or two FUSE daemons serving the same files. Neither
 //!   is a second mount of the other, so neither is denied for the other,
-//!   nor refused.
+//!   nor refused;
+//! - a stale root on a filesystem that is not local, for a place not there
+//!   yet: its second place is only checked against it once it is.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -67,22 +71,25 @@ struct Mount {
 /// Whether a filesystem of type `kind` is one whose mounts' roots in the
 /// table cannot be trusted to say what directory each shows: NFS, which
 /// gives every mount `/`, and SMB, whose root is found by walking from the
-/// share's and is the least known. FUSE, 9p and virtiofs show the directory
-/// a bind of part of them shows, as local filesystems do, unless the kernel
-/// has lost it ([`may_lose_roots`]).
+/// share's and is the least known. Others show the directory a bind of part
+/// of them shows, unless the kernel has lost it (see [`local`]).
 fn unknowable(kind: &str) -> bool {
     matches!(kind, "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs")
 }
 
-/// Whether a filesystem of type `kind` is one whose mount's root the kernel
-/// shows as `<dir>//deleted` once a lookup of it fails, as a FUSE
-/// filesystem's does when its server is away: the directory it names is not
-/// the one the mount shows.
-fn may_lose_roots(kind: &str) -> bool {
+/// Whether a filesystem of type `kind` is a local one, on which a root the
+/// table shows as `<path>//deleted` was deleted or replaced, as a file a
+/// container binds is when it is replaced by a rename: what the mount shows
+/// is the old file or directory, at no path now. On every other filesystem
+/// (FUSE, 9p, virtiofs, Ceph, AFS, cluster and guest filesystems) the kernel
+/// shows that when it can no longer check that a live directory is where
+/// it was, such as when its server is away, and the directory it names may
+/// not be the one the mount shows.
+fn local(kind: &str) -> bool {
     matches!(
         kind,
-        "fuse" | "fuseblk" | "virtiofs" | "9p" | "cifs" | "smb3"
-    ) || kind.starts_with("fuse.")
+        "ext2" | "ext3" | "ext4" | "xfs" | "btrfs" | "f2fs" | "tmpfs" | "ramfs" | "overlay"
+    )
 }
 
 /// A path field of the mount table with its octal escapes (`\040` for a
@@ -134,9 +141,13 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
             if major.parse::<u32>().is_err() || minor.parse::<u32>().is_err() {
                 return None;
             }
-            // Before `//` is collapsed by reading it as a path.
+            // Before `//` is collapsed by reading it as a path. A lost root
+            // names where it was: what is there now is not what it shows.
             let lost = fields.get(3)?.ends_with(b"//deleted");
-            let root = unescape(fields.get(3)?)?;
+            let mut root = unescape(fields.get(3)?)?;
+            if lost {
+                root = root.parent()?.to_owned();
+            }
             let at = unescape(fields.get(4)?)?;
             // The optional fields end with a lone `-`, then the type.
             let dash = 6 + fields.iter().skip(6).position(|f| *f == b"-")?;
@@ -168,10 +179,9 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
     // is not was cut from the table, or the table is not one.
     let listed = ids(&mounts);
     if let Some(root) = root_of(&mounts, &listed) {
-        let ids = listed;
         if let Some(orphan) = mounts
             .iter()
-            .find(|m| m.id != root.id && !ids.contains(&m.parent))
+            .find(|m| m.id != root.id && !listed.contains(&m.parent))
         {
             bail!(
                 "the mount table lists {} on mount {}, which it does not list, so atomic cannot \
@@ -220,8 +230,12 @@ fn root_of<'a>(mounts: &'a [Mount], ids: &std::collections::HashSet<u64>) -> Opt
 
 /// The mount `path` is in, as this process sees it: from the root mount,
 /// down the mounts on each directory of the path, each the top of its stack.
-fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-    let root = root_of(mounts, &ids(mounts))?;
+fn mount_of<'a>(
+    mounts: &'a [Mount],
+    listed: &std::collections::HashSet<u64>,
+    path: &Path,
+) -> Option<&'a Mount> {
+    let root = root_of(mounts, listed)?;
     let mut here = top(mounts, root);
     let mut at = PathBuf::from("/");
     for part in path.components().skip(1) {
@@ -237,8 +251,13 @@ fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
 /// in it: under each other mount of the same filesystem whose directory
 /// holds it, the same file or directory there; and each such mount whose
 /// directory lies inside it, whole.
-fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
-    let Some(home) = mount_of(mounts, path) else {
+fn aliases_of(
+    mounts: &[Mount],
+    listed: &std::collections::HashSet<u64>,
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    let Some(home) = mount_of(mounts, listed, path) else {
         bail!(
             "{} is under no mount in the mount table, so atomic cannot tell where else it is \
              mounted",
@@ -252,7 +271,7 @@ fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::
     let Some(first) = same.first() else {
         return Ok(());
     };
-    if may_lose_roots(&home.kind)
+    if !local(&home.kind)
         && let Some(lost) = std::iter::once(home)
             .chain(same.iter().copied())
             .find(|m| m.lost)
@@ -298,25 +317,60 @@ fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::
         } else {
             continue;
         };
-        if alias != path {
-            out.push(alias);
+        if alias == path {
+            continue;
         }
+        // Off a local filesystem, a root may be stale with nothing in the
+        // table to say so: an ancestor of it lost, or renamed on the server
+        // and not checked again yet. Where the place is there, its second
+        // place must be the same file or directory.
+        if !local(&home.kind) {
+            same_file(path, &alias)?;
+        }
+        out.push(alias);
     }
     Ok(())
+}
+
+/// Whether `alias` is the same file or directory as `path`, when `path` is
+/// there: refused when it is not there, or is another.
+fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(place) = std::fs::metadata(path) else {
+            return Ok(());
+        };
+        match std::fs::metadata(alias) {
+            Ok(there) if (there.dev(), there.ino()) == (place.dev(), place.ino()) => Ok(()),
+            _ => bail!(
+                "{} should show {}, and does not, so the mount table's word for where that \
+                 filesystem's mounts are is stale; atomic cannot deny it at each",
+                alias.display(),
+                path.display()
+            ),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, alias);
+        Ok(())
+    }
 }
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
 /// paths with no link in them, and each filesystem mounted inside one.
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let listed = ids(mounts);
     let mut out = Vec::new();
     for path in denied {
-        aliases_of(mounts, path, &mut out)?;
+        aliases_of(mounts, &listed, path, &mut out)?;
         // What is mounted inside a denied directory is hidden there too.
         for inner in mounts
             .iter()
             .filter(|m| m.at != *path && m.at.starts_with(path))
         {
-            aliases_of(mounts, &inner.at, &mut out)?;
+            aliases_of(mounts, &listed, &inner.at, &mut out)?;
         }
     }
     out.sort();
