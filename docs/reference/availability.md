@@ -254,7 +254,9 @@ project's parks: releasing another project's park is refused as a park that
 does not exist. A project is told apart by its id, which comes from its path, so
 the same project checked out at another path is another project there, and a
 park recorded before atomic kept parks' projects is no project's and is listed
-and released by none.
+and released by none. No atomic command can release such a park: its run stays
+parked, with its record kept in the store, and the work goes on only as a new
+run, started again with `atomic run`.
 The commands that show budgets and spend come with run inspection.
 
 ## Observability stages
