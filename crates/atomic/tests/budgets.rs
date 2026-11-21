@@ -47,7 +47,7 @@ use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes, run_lite_atom};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::usage::Metering;
 use atomic_durable::usage::{Attempt, Caps, Settlement, heartbeat_every};
-use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, release, run_atom_at};
+use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, run_atom_at};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -82,6 +82,44 @@ fn settings(atom: u64, run: u64) -> BudgetSettings {
     s.atom.tokens = atom;
     s.workflow.tokens = run;
     s
+}
+
+/// Release `park` as the local operator, with their credential, raising
+/// `raise` first if given: the person's action, as `atomic` exposes it.
+async fn release_raising(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+    raise: Option<atomic_durable::release::Raise>,
+) -> Result<atomic_durable::release::Release, atomic_durable::release::ReleaseError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let me = atomic_durable::gate::HumanCredential::new(
+        atomic_durable::gate::Principal::local("dev"),
+        "the operator's secret",
+    );
+    let _ = atomic_durable::gate::enroll(rt, &me).await;
+    atomic_durable::release::release_park(
+        rt,
+        &me,
+        atomic_durable::release::ReleaseCommand {
+            command_id: format!(
+                "{}-{}",
+                park.id,
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            park: park.id.clone(),
+            raise,
+            comment: None,
+        },
+    )
+    .await
+}
+
+/// [`release_raising`] with no raise.
+async fn release(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+) -> Result<atomic_durable::release::Release, atomic_durable::release::ReleaseError> {
+    release_raising(rt, park, None).await
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -333,9 +371,25 @@ fn a_released_park_admits_again_against_the_caps_as_stored() {
         assert!(matches!(outcome(&rt, "released").await, Outcome::Parked(_)));
         assert_eq!(model.calls(), 1);
 
-        // Released with no more room: admission refuses again, with no call.
+        // Released with no more room (a raise below the cap changes
+        // nothing, and says so): admission refuses again, with no call.
         let first = parks(&rt, "released").await.expect("parks")[0].clone();
-        release(&rt, &first).await.expect("release");
+        assert_eq!(first.scope(), Some("atom:released:0"));
+        let lower = release_raising(
+            &rt,
+            &first,
+            Some(atomic_durable::release::Raise {
+                scope: "atom:released:0".into(),
+                caps: Caps {
+                    tokens: 1,
+                    millis: 0,
+                    micro_usd: None,
+                },
+            }),
+        )
+        .await
+        .expect("release");
+        assert!(lower.raised_nothing);
         let Outcome::Parked(again) = parked(&rt, "released", 2).await else {
             panic!("parks again");
         };
@@ -344,20 +398,22 @@ fn a_released_park_admits_again_against_the_caps_as_stored() {
 
         // Raised by a person and released: the turn runs again, from its
         // first call, as new attempts at the same requests.
-        rt.ledger()
-            .raise(
-                "atom:released:0",
-                Caps {
+        let second = parks(&rt, "released").await.expect("parks")[1].clone();
+        let released = release_raising(
+            &rt,
+            &second,
+            Some(atomic_durable::release::Raise {
+                scope: "atom:released:0".into(),
+                caps: Caps {
                     tokens: 1_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        let second = parks(&rt, "released").await.expect("parks")[1].clone();
-        release(&rt, &second).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
+        assert_eq!(released.released.raised.map(|a| a.caps.tokens), Some(1_000));
         let out: ChangeRequestResult = rt.result("released").await.expect("finishes");
         assert_eq!(out.verdict.summary, "The two-unit criterion holds.");
         assert_eq!(model.calls(), 3);
@@ -461,6 +517,28 @@ fn budgets_child() {
     }
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
+        // A person releasing run `run`'s first park, raising its atom's cap:
+        // killed, at its failpoint, after the release is recorded.
+        if role == "release" {
+            let rt = reader(&dir).await;
+            let park = parks(&rt, &run).await.expect("parks")[0].clone();
+            release_raising(
+                &rt,
+                &park,
+                Some(atomic_durable::release::Raise {
+                    scope: format!("atom:{run}:0"),
+                    caps: Caps {
+                        tokens: 1_000,
+                        millis: 0,
+                        micro_usd: None,
+                    },
+                }),
+            )
+            .await
+            .expect("release");
+            std::fs::write(dir.join("outcome"), "released").expect("write the outcome");
+            return;
+        }
         let rt = engine(&dir, &url, budgets).await;
         rt.launch().await.expect("launch");
         if let Ok(stop) = std::env::var(ENV_STOP_AT) {
@@ -1377,6 +1455,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
                 input_bound: None,
                 turn: true,
                 work: false,
+                longest: None,
             })
             .await
             .expect("admitted");
@@ -1455,6 +1534,7 @@ fn a_call_whose_task_panics_stops_its_heartbeat() {
                 input_bound: None,
                 turn: false,
                 work: true,
+                longest: None,
             })
             .await
             .expect("admitted");
@@ -1478,6 +1558,108 @@ fn a_call_whose_task_panics_stops_its_heartbeat() {
         assert_eq!(seen(&dir, "panicked:1:0").await, before, "it beat on");
         let attempt = &rt.ledger().attempts("panicked").await.expect("attempts")[0];
         assert_eq!(attempt.state, "reserved", "{attempt:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn an_exec_cap_too_small_to_start_a_command_fails_configuration() {
+    use atomic_app::metering::BudgetPlan;
+    let settings = settings(10_000_000, 100_000_000);
+    let small = Budget {
+        millis: Some(400),
+        ..Budget::default()
+    };
+    // An exec atom's own cap.
+    let (atom, e) = BudgetPlan::resolve(&settings, &Budget::default(), &[], &[("nap", &small)])
+        .expect_err("refused");
+    assert_eq!(atom.as_deref(), Some("nap"));
+    assert!(matches!(e, BudgetError::BelowWork { .. }), "{e}");
+    assert!(
+        e.to_string().contains(
+            "the atom minutes cap (0.4 seconds, written in its budget block) is smaller than \
+             the 0.5 seconds"
+        ),
+        "{e}"
+    );
+    // The run's, over an exec atom; with none, nothing needs to start.
+    let (atom, e) = BudgetPlan::resolve(&settings, &small, &[], &[("nap", &Budget::default())])
+        .expect_err("refused");
+    assert_eq!(atom, None);
+    assert!(matches!(e, BudgetError::BelowWork { .. }), "{e}");
+    BudgetPlan::resolve(&settings, &small, &[], &[]).expect("no command to start");
+    // A plan that came from outside is held to the same.
+    let mut plan = BudgetPlan::resolve(
+        &settings,
+        &Budget::default(),
+        &[],
+        &[("nap", &Budget::default())],
+    )
+    .expect("a plan");
+    plan.validate().expect("valid");
+    let mut run_small = plan.clone();
+    plan.exec.get_mut("nap").expect("nap").millis = 400;
+    let refused = plan.validate().expect_err("refused");
+    assert!(
+        refused.starts_with("atom nap: the atom minutes cap (0.4 seconds"),
+        "{refused}"
+    );
+    // The run's cap, under its exec atom's.
+    run_small.run.millis = 400;
+    let refused = run_small.validate().expect_err("refused");
+    assert!(
+        refused.starts_with("the run: the workflow minutes cap (0.4 seconds"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_command_reserves_no_more_than_its_own_limit() {
+    on_codex_runtime(async {
+        let dir = scratch("command-longest");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &Budget::default())],
+        )
+        .expect("a plan");
+        assert!(plan.exec["nap"].millis > 60_000, "{plan:?}");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "longest".into(),
+                step_id: 1,
+            },
+            &plan.exec["nap"],
+        );
+        let (ticket, limit) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: atomic_core::usage::WORK_MODEL.into(),
+                input_bound: None,
+                turn: false,
+                work: true,
+                longest: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("admitted");
+        // Ten seconds, not the minutes its atom has left: its own limit
+        // bounds it, so a cut-off is not the cap's.
+        assert_eq!(limit.time, Some(Duration::from_secs(10)));
+        assert_eq!(ticket.as_ref().and_then(|t| t.bounded_by.clone()), None);
+        let attempt = &rt.ledger().attempts("longest").await.expect("attempts")[0];
+        assert_eq!(attempt.reserved.millis, 10_000, "{attempt:?}");
+        meter
+            .settle(
+                ticket,
+                atomic_core::usage::Outcome::Reported(Default::default()),
+            )
+            .await
+            .expect("settled");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -1623,6 +1805,7 @@ fn a_dead_commands_reservation_is_settled_when_it_is_found() {
                 reserve: least,
                 maximum: least,
                 turn: true,
+                longest: None,
             })
             .await
             .expect("admit");
@@ -1836,5 +2019,63 @@ fn a_codex_turn_killed_mid_turn_is_charged_what_it_reported() {
         // The draft's two tokens, the dead turn's six, the new turn's two.
         assert_eq!(charged(&rt, &format!("run:{run}")).await, 2 + 6 + 2);
         assert_eq!(charged(&rt, &format!("atom:{run}:2")).await, 6 + 2);
+    });
+}
+
+/// A release recorded by a person whose process then stopped, before the
+/// run was woken, still reaches the run: the next resume or server start
+/// redelivers it.
+#[test]
+fn a_release_whose_wake_was_lost_is_redelivered() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text("not json".into()),
+            Reply::Text(DRAFT.into()),
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("lost-wake");
+        let rt = engine(&dir, &model.base_url(), settings(150, 100_000)).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "lost", input())
+            .await
+            .expect("start");
+        assert!(matches!(outcome(&rt, "lost").await, Outcome::Parked(_)));
+        let park = parks(&rt, "lost").await.expect("parks")[0].clone();
+        // The releaser is killed between its commit and the wake.
+        let seen = child(
+            &dir,
+            &model.base_url(),
+            "lost",
+            "release",
+            "150,100000",
+            Some("release:before-wake"),
+        )
+        .await;
+        assert_eq!(seen, None, "the releaser stopped at its failpoint");
+        assert!(
+            atomic_durable::release::is_released(&rt, &park.id)
+                .await
+                .expect("released"),
+            "the release was recorded"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(model.calls(), 1, "woken by nothing yet");
+        assert_eq!(
+            rt.status("lost").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+        // What every resume and server start does: the run wakes, and runs on
+        // the raised cap.
+        assert_eq!(
+            atomic_durable::release::redeliver(&rt)
+                .await
+                .expect("redeliver"),
+            1
+        );
+        let out: ChangeRequestResult = rt.result("lost").await.expect("finishes");
+        assert_eq!(out.verdict.summary, "The two-unit criterion holds.");
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }

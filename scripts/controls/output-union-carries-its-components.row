@@ -1,0 +1,1 @@
+output-union-carries-its-components|crates/atomic-schema/src/openapi.rs|                union.insert("$defs".into(), Value::Object(defs.clone()));|                union.insert("$defs".into(), Value::Object(Map::new()));|-p atomic-agentic-schema --lib -- openapi::tests::the_union_of_component_schemas_validates_a_reply_of_either_shape

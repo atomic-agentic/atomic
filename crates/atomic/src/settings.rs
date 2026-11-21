@@ -13,7 +13,12 @@
 //!
 //! - `OPENAI_API_KEY`: when it is set, OpenAI's API is the model endpoint, and
 //!   `OPENAI_API_KEY` the variable its key is read from. Its value is never
-//!   read here, shown or sent anywhere.
+//!   read here, shown or sent anywhere. `OPENAI_BASE_URL`, as OpenAI's own
+//!   SDKs read it, names another endpoint for the key: read from the
+//!   person's environment only, since it decides where the key is sent, and
+//!   used only when it is `https`, or `http` to a loopback IP address, with
+//!   no credential, query or fragment in it; otherwise nothing is detected,
+//!   and a command that would send the key refuses to start.
 //! - A local Ollama: when no key is set, one request, `GET /api/tags`, to
 //!   Ollama's default address on the loopback interface, and nowhere else.
 //!   When it answers, it is the endpoint, with the first model it lists.
@@ -22,12 +27,13 @@
 //! belongs to the application, is never read.
 
 use crate::engine::{EngineArgs, RunnerKind};
-use atomic_core::budget::BudgetSettings;
+use atomic_core::budget::{BudgetSettings, CallCaps, Caps, Ceilings};
 use atomic_core::codex::ModelEndpoint;
 use atomic_core::config::{self, ConfigError, Layers, Source};
 use atomic_core::signin::SignIn;
+use atomic_schema::yaml;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -36,6 +42,9 @@ use std::time::{Duration, Instant};
 
 /// OpenAI's API, when `OPENAI_API_KEY` is set.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Names another base URL for `OPENAI_API_KEY`'s endpoint, as OpenAI's SDKs
+/// read it. Only a variable of the person's sets it: no file does.
+pub const OPENAI_BASE_URL_VARIABLE: &str = "OPENAI_BASE_URL";
 /// The model atomic uses on OpenAI's API when none is set.
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5-mini";
 /// Where a local Ollama listens by default.
@@ -222,6 +231,11 @@ pub struct Resolved {
     /// Why the sign-in could not be read, when it was looked for and could
     /// not be: said, never taken for "signed out".
     pub sign_in_unreadable: Option<String>,
+    /// Why the person's `OPENAI_BASE_URL` is not used for `OPENAI_API_KEY`,
+    /// when it is not fit to send the key to: no endpoint is detected, and a
+    /// run that calls a model refuses to start, while a command that sends
+    /// no key, such as `atomic check`, carries on.
+    pub refused_endpoint: Option<String>,
 }
 
 /// What looking for the person's sign-in found: the sign-in, if someone is
@@ -231,12 +245,26 @@ pub type SignInFound = Result<Option<SignIn>, String>;
 /// What resolution reads from outside: the environment, a local Ollama, and
 /// the person's sign-in. Passed in, so tests choose what is there.
 pub struct Surroundings<'a> {
-    /// A variable's value.
+    /// A variable's value, as text, so a value the operating system gives as
+    /// bytes that are not text is no value here. That is why the person's
+    /// configuration directory, which is a path and not text, does not come
+    /// from `env` but from [`Surroundings::user_config_dir`].
     pub env: &'a dyn Fn(&str) -> Option<String>,
     /// The variables there are.
     pub env_names: Vec<String>,
     /// The models a local Ollama at an address lists, if one answers.
     pub ollama: &'a dyn Fn(SocketAddr) -> Option<Vec<String>>,
+    /// The person's own configuration directory, where their `config.yaml`
+    /// lives: [`atomic_core::state::user_config_dir`] in a person's run.
+    ///
+    /// It is the resolution the denial of that directory to atoms' commands and
+    /// the refusal of a state directory inside it are made from — not
+    /// `env`, which reads the same `XDG_CONFIG_HOME` and `HOME` as text and so
+    /// sees nothing where the operating system gives bytes that are not text.
+    /// Read the same way, all three name one directory or none; read two ways,
+    /// settings would come from a directory no atom is denied while the denial
+    /// covered another.
+    pub user_config_dir: &'a dyn Fn() -> Option<PathBuf>,
     /// The person's sign-in, kept apart from the project rooted at the path
     /// when there is one.
     pub sign_in: &'a dyn Fn(Option<&Path>) -> SignInFound,
@@ -271,6 +299,7 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
+            user_config_dir: &atomic_core::state::user_config_dir,
             sign_in: &|_| Ok(None),
         }
     }
@@ -282,7 +311,13 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
     match SignIn::located(project) {
         Ok(sign_in) => found(sign_in),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        // Refused where it is kept: with no directory there no one ever
+        // signed in, and nothing is refused; with one, it may hold a
+        // sign-in, and that it cannot be used is said.
+        Err(e) => match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d)) {
+            Some(Err(gone)) if absent(&gone) => Ok(None),
+            _ => Err(e.to_string()),
+        },
     }
 }
 
@@ -292,14 +327,42 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
 /// unreachable keyring among them, is said, never taken for "signed out":
 /// that would move model calls to another account without a word.
 fn found(sign_in: SignIn) -> SignInFound {
-    if !sign_in.auth_home().is_dir() {
-        return Ok(None);
+    match std::fs::metadata(sign_in.auth_home()) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(gone) if absent(&gone) => return Ok(None),
+        // Something else there, or a directory that cannot be looked at, as
+        // under an ancestor this user cannot enter: not taken for absent.
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory",
+                sign_in.auth_home().display()
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", sign_in.auth_home().display())),
     }
     match sign_in.account() {
         Ok(Some(_)) => Ok(Some(sign_in)),
         Ok(None) => Ok(None),
         Err(e) => Err(format!("{e:#}")),
     }
+}
+
+/// The note for a sign-in that is there and cannot be used.
+fn unusable(why: &str) -> String {
+    format!(
+        "the ChatGPT sign-in could not be read: {why}; a run that calls a model is refused \
+         until it can be"
+    )
+}
+
+/// Whether looking at a path failed because nothing is there: no entry, or
+/// a component that is a file. Anything else, a permission refused among
+/// them, is no answer, and never taken for absent.
+fn absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// The root of the project configured in `dir`: `dir`, or its parent for an
@@ -314,10 +377,14 @@ fn project_root(dir: &Path) -> &Path {
 
 /// The person's own configuration file, which no project supplies:
 /// `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
-/// `~/.config/atomic/config.yaml`. `None` when neither variable names an
-/// absolute directory.
-pub fn user_config(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    atomic_core::state::user_config_dir_in(env).map(|d| d.join("config.yaml"))
+/// `~/.config/atomic/config.yaml`, and under the home the password database
+/// gives when the environment names no absolute one. `config_dir` is where that
+/// directory is — [`atomic_core::state::user_config_dir`] in a person's run, the
+/// same resolution the denial of that directory to atoms' commands and the
+/// refusal of a state directory inside it are made from, so the three cannot
+/// name different directories. `None` when it names none.
+pub fn user_config(config_dir: &dyn Fn() -> Option<PathBuf>) -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("config.yaml"))
 }
 
 /// The directory whose `atomic.yaml` and siblings configure the project at
@@ -378,7 +445,7 @@ pub fn resolve(
     args: &EngineArgs,
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
-    let user = user_config(around.env);
+    let user = user_config(around.user_config_dir);
     // A project could supply a "personal" file inside itself, or inside the
     // checkout that holds it, as when the home directory is where the
     // repository is mounted. Only for a project: outside one, such as
@@ -388,10 +455,16 @@ pub fn resolve(
         && let Ok(file) = std::fs::canonicalize(file)
         && let Ok(root) = std::fs::canonicalize(project_root(dir))
     {
-        let checkout = root.ancestors().find(|d| d.join(".git").exists());
-        for (what, enclosing) in std::iter::once(("project", root.as_path()))
-            .chain(checkout.map(|c| ("checkout holding the project", c)))
-        {
+        // Every checkout around the project counts, not only the nearest:
+        // a submodule's superproject, the checkout a worktree sits in, and
+        // a linked worktree's main checkout, whose repository it shares.
+        let checkouts =
+            atomic_core::state::checkouts_holding(&root).map_err(ConfigError::Invalid)?;
+        for (what, enclosing) in std::iter::once(("project", root.as_path())).chain(
+            checkouts
+                .iter()
+                .map(|c| ("checkout holding the project", c.as_path())),
+        ) {
             if file.starts_with(enclosing) {
                 return Err(ConfigError::Invalid(format!(
                     "your own configuration, {}, is inside the {what} at {}, so the project \
@@ -443,6 +516,11 @@ pub fn resolve(
         );
         notes.push(why.clone());
     }
+    // The person's own caps bind every layer above their file, and their
+    // prices hold over a project's: a project can only tighten what they
+    // allowed. What bound is said, so a number that is not the highest
+    // layer's is never shown without its reason.
+    notes.extend(person_budget(&mut settings, user.as_deref(), &mut sources)?);
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     let unset = |sources: &BTreeMap<String, Source>, path: &str| {
         matches!(sources.get(path), None | Some(Source::Default))
@@ -485,7 +563,7 @@ pub fn resolve(
         match (around.sign_in)(project) {
             Ok(found) => sign_in = found,
             Err(why) => {
-                notes.push(format!("the ChatGPT sign-in could not be read: {why}"));
+                notes.push(unusable(&why));
                 sign_in_unreadable = Some(why);
             }
         }
@@ -506,10 +584,35 @@ pub fn resolve(
     }
 
     // Detection, for what nothing set, when no one is signed in.
+    let other_openai = set((around.env)(OPENAI_BASE_URL_VARIABLE));
+    let mut other_openai_used = false;
+    let mut refused_endpoint = None;
     if unset(&sources, "model.base_url") && sign_in.is_none() {
-        if set((around.env)("OPENAI_API_KEY")).is_some() {
-            let why = "OPENAI_API_KEY is set".to_owned();
-            settings.model.base_url = Some(OPENAI_BASE_URL.into());
+        if set((around.env)("OPENAI_API_KEY")).is_some()
+            && let Err(why) = other_openai
+                .as_deref()
+                .map_or(Ok(()), |u| openai_base_url(u).map(drop))
+        {
+            // Not fit for the key: nothing is detected, and only a command
+            // that would send it refuses to start.
+            other_openai_used = true;
+            notes.push(why.clone());
+            refused_endpoint = Some(why);
+        } else if set((around.env)("OPENAI_API_KEY")).is_some() {
+            // The key goes where the person's own OPENAI_BASE_URL says, as
+            // OpenAI's SDKs send it, once that is seen to be fit for a key.
+            let (base_url, why) = match &other_openai {
+                Some(url) => (
+                    url.clone(),
+                    format!("OPENAI_API_KEY and {OPENAI_BASE_URL_VARIABLE} are set"),
+                ),
+                None => (
+                    OPENAI_BASE_URL.to_owned(),
+                    "OPENAI_API_KEY is set".to_owned(),
+                ),
+            };
+            other_openai_used = other_openai.is_some();
+            settings.model.base_url = Some(base_url);
             sources.insert("model.base_url".into(), Source::Detected(why.clone()));
             if unset(&sources, "model.api_key_env") {
                 settings.model.api_key_env = Some("OPENAI_API_KEY".into());
@@ -519,7 +622,11 @@ pub fn resolve(
                 settings.model.name = Some(OPENAI_DEFAULT_MODEL.into());
                 sources.insert(
                     "model.name".into(),
-                    Source::Detected(format!("{why}: atomic's default model on OpenAI's API")),
+                    Source::Detected(if other_openai_used {
+                        format!("{why}: atomic's default model for an OpenAI API key")
+                    } else {
+                        format!("{why}: atomic's default model on OpenAI's API")
+                    }),
                 );
             }
         } else {
@@ -567,6 +674,12 @@ pub fn resolve(
             }
         }
     }
+    if other_openai.is_some() && !other_openai_used {
+        notes.push(format!(
+            "{OPENAI_BASE_URL_VARIABLE} is set and not used: atomic reads it only to send \
+             OPENAI_API_KEY there, when the key is set and no model endpoint is set or signed in"
+        ));
+    }
     Ok(Resolved {
         settings,
         sources,
@@ -575,6 +688,7 @@ pub fn resolve(
         withheld_key,
         sign_in,
         sign_in_unreadable,
+        refused_endpoint,
     })
 }
 
@@ -608,6 +722,41 @@ fn users_base_url(user: Option<&Path>) -> Option<String> {
         .pointer("/model/base_url")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Whether `url`, the person's `OPENAI_BASE_URL`, is fit to send
+/// `OPENAI_API_KEY` to: a URL, `https`, or `http` only to a loopback IP
+/// address written as one, such as a local proxy's, and with no user,
+/// password, query or fragment, which a log or a proxy could keep. Why not,
+/// when it is not.
+fn openai_base_url(url: &str) -> Result<(), String> {
+    let refuse = |why: &str| {
+        format!(
+            "{OPENAI_BASE_URL_VARIABLE} {why}, and it decides where atomic sends \
+             OPENAI_API_KEY, so the key is sent nowhere: give an https URL, such as \
+             https://host/v1, or http to 127.0.0.1 or [::1], or unset it"
+        )
+    };
+    let parsed = url::Url::parse(url).map_err(|_| refuse("does not read as a URL"))?;
+    if has_credential(&parsed) {
+        return Err(refuse("carries a user, password, query or fragment"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(refuse("carries a user, password, query or fragment"));
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        "http" => Err(refuse(
+            "is http to an address that is not this machine's loopback",
+        )),
+        _ => Err(refuse("is neither https nor http")),
+    }
 }
 
 /// Whether `url` carries a credential: a user name or password, which may
@@ -720,6 +869,549 @@ fn refuse_from_project(
         )));
     }
     Ok(withheld)
+}
+
+/// The `budget` groups the person's own configuration can cap, and the only
+/// ones it can.
+const GROUPS: [&str; 3] = ["atom", "workflow", "call"];
+
+/// Where in a parsed document each dotted setting path sits, so a setting
+/// taken from it can be named with the line it is on. A mapping is recorded
+/// too, so a path the loader has no line for falls back to the section above
+/// it instead of to no line at all.
+fn lines_of(doc: &yaml::Document) -> BTreeMap<String, usize> {
+    fn walk(
+        doc: &yaml::Document,
+        value: &Value,
+        pointer: &str,
+        dotted: &str,
+        out: &mut BTreeMap<String, usize>,
+    ) {
+        out.insert(
+            dotted.to_owned(),
+            doc.position(pointer).map_or(1, |p| p.line),
+        );
+        if let Value::Object(map) = value {
+            for (key, child) in map {
+                // The loader records positions by JSON Pointer, whose tokens
+                // escape `~` and `/`.
+                let token = key.replace('~', "~0").replace('/', "~1");
+                let child_dotted = if dotted.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{dotted}.{key}")
+                };
+                walk(
+                    doc,
+                    child,
+                    &format!("{pointer}/{token}"),
+                    &child_dotted,
+                    out,
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(doc, &doc.value, "", "", &mut out);
+    out
+}
+
+/// The line `dotted` is on, or, when nothing records one for it, the line of
+/// the deepest part of it that has one.
+fn line_of(at: &BTreeMap<String, usize>, dotted: &str) -> usize {
+    let mut path = dotted;
+    loop {
+        if let Some(line) = at.get(path) {
+            return *line;
+        }
+        match path.rfind('.') {
+            Some(below) => path = &path[..below],
+            None => return 1,
+        }
+    }
+}
+
+/// The value at `dotted` in `v`, or `None` when nothing is there.
+fn at<'v>(v: &'v Value, dotted: &str) -> Option<&'v Value> {
+    dotted.split('.').try_fold(v, |v, key| v.get(key))
+}
+
+/// The value at `dotted` in `v`, as a slot to write through, or `None` when
+/// nothing is there.
+fn slot<'v>(v: &'v mut Value, dotted: &str) -> Option<&'v mut Value> {
+    let mut cur = v;
+    for key in dotted.split('.') {
+        cur = cur.as_object_mut()?.get_mut(key)?;
+    }
+    Some(cur)
+}
+
+/// The value at `dotted` in `v`, as a slot to write through, made where
+/// it is missing: each step on the way that is not an object, as a layer's
+/// `null` leaves one, becomes an empty object.
+fn slot_made<'v>(v: &'v mut Value, dotted: &str) -> &'v mut Value {
+    let mut cur = v;
+    for key in dotted.split('.') {
+        if !cur.is_object() {
+            *cur = Value::Object(Map::new());
+        }
+        cur = cur
+            .as_object_mut()
+            .expect("an object, made so above")
+            .entry(key.to_owned())
+            .or_insert(Value::Null);
+    }
+    cur
+}
+
+/// The person's own configuration's `budget` section, held over the merged
+/// settings, and the remarks naming what it bound. With it, their
+/// [`Ceilings`], which travel with the settings so that a run holds an atom's
+/// or workflow's own `budget` block to them too (see
+/// [`atomic_core::budget::resolve`]).
+///
+/// [`config::resolve`] read this file already, and refused every key of it
+/// that is not a setting; the section is read again here as a whole for one
+/// reason: a ceiling needs to know what each layer set, not only what the
+/// last of them set.
+fn person_budget(
+    settings: &mut Settings,
+    user: Option<&Path>,
+    sources: &mut BTreeMap<String, Source>,
+) -> Result<Vec<String>, ConfigError> {
+    let mut budget = serde_json::to_value(&settings.budget)
+        .map_err(|e| ConfigError::Invalid(format!("the budget settings cannot be held: {e}")))?;
+    let mut ceilings = Ceilings::default();
+    let mut priced_by_project = std::collections::BTreeSet::new();
+    let mut notes = Vec::new();
+    if let Some(user) = user {
+        match std::fs::read_to_string(user) {
+            Ok(text) => {
+                let doc = yaml::load(user, &text)?;
+                // A `budget` that is not a mapping was refused with its file
+                // and line while the layers merged, so nothing caps from it.
+                if let Some(Value::Object(written)) = doc.value.pointer("/budget") {
+                    let lines = lines_of(&doc);
+                    own_budget_read(user, written, &lines)?;
+                    let (held, said) = hold_budget(user, written, &lines, &mut budget, sources);
+                    nothing_free_under(user, written, &budget, &held)?;
+                    priced_by_project = project_priced(written, &budget, &held);
+                    ceilings = held;
+                    notes = said;
+                    if !priced_by_project.is_empty() {
+                        notes.push(format!(
+                            "budget.pricing: your own dollar cap ({}) counts calls to {} at \
+                             prices only a layer above yours sets (the project's files or \
+                             ATOMIC_BUDGET_PRICING); price them in your own configuration to \
+                             hold them to yours",
+                            user.display(),
+                            priced_by_project
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                }
+            }
+            // No file of their own: nothing caps, as [`config::resolve`] read
+            // nothing from it either.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: user.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    settings.budget = serde_json::from_value(budget).map_err(|e| {
+        ConfigError::Invalid(format!(
+            "the budget settings cannot be read back: {}",
+            config::without_values(&e.to_string())
+        ))
+    })?;
+    settings.budget.ceilings = ceilings;
+    settings.budget.priced_by_project = priced_by_project;
+    Ok(notes)
+}
+
+/// Refuse what the person's own `budget` section writes that its setting
+/// cannot take, by its file and line: a cap that is neither a number nor
+/// `null` (a count that is not a whole number), and a price that is not a
+/// price. It is checked on its own, as a value a project's layer replaces is
+/// never read otherwise, and a cap of theirs that could not be read would
+/// otherwise be dropped without a word.
+fn own_budget_read(
+    user: &Path,
+    written: &Map<String, Value>,
+    at_line: &BTreeMap<String, usize>,
+) -> Result<(), ConfigError> {
+    let refuse = |dotted: &str, what: &str| {
+        Err(ConfigError::Setting {
+            path: user.to_owned(),
+            line: line_of(at_line, dotted),
+            message: format!("{dotted} {what}"),
+        })
+    };
+    let whole = |v: &Value| v.is_null() || v.as_u64().is_some();
+    let number = |v: &Value| v.is_null() || v.as_f64().is_some();
+    for group in GROUPS {
+        let Some(section) = written.get(group) else {
+            continue;
+        };
+        let Some(fields) = section.as_object() else {
+            return refuse(&format!("budget.{group}"), "is a section, not a value");
+        };
+        for (field, value) in fields {
+            let dotted = format!("budget.{group}.{field}");
+            if ["tokens", "input_tokens", "output_tokens"].contains(&field.as_str()) {
+                if !whole(value) {
+                    return refuse(&dotted, "is not a whole number");
+                }
+            } else if !number(value) {
+                return refuse(&dotted, "is not a number");
+            }
+        }
+    }
+    let Some(pricing) = written.get("pricing") else {
+        return Ok(());
+    };
+    let Some(models) = pricing.as_object() else {
+        return refuse("budget.pricing", "is a section, not a value");
+    };
+    for (model, price) in models {
+        let dotted = format!("budget.pricing.{model}");
+        let Some(fields) = price.as_object() else {
+            return refuse(
+                &dotted,
+                "is not a price: write its input_usd_per_mtok and output_usd_per_mtok",
+            );
+        };
+        for field in ["input_usd_per_mtok", "output_usd_per_mtok"] {
+            match fields.get(field) {
+                Some(v) if v.is_number() => {}
+                Some(_) => return refuse(&format!("{dotted}.{field}"), "is not a number"),
+                None => {
+                    return refuse(
+                        &format!("{dotted}.{field}"),
+                        "is missing: a price needs both input_usd_per_mtok and \
+                         output_usd_per_mtok",
+                    );
+                }
+            }
+        }
+        for field in ["max_input_tokens", "max_output_tokens"] {
+            if fields.get(field).is_some_and(|v| !whole(v)) {
+                return refuse(&format!("{dotted}.{field}"), "is not a whole number");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Under any dollar cap of the person's in `ceilings`, the models of the
+/// merged `budget`'s price table that their own `written` section does not
+/// price: a project prices them alone.
+fn project_priced(
+    written: &Map<String, Value>,
+    budget: &Value,
+    ceilings: &Ceilings,
+) -> std::collections::BTreeSet<String> {
+    if ceilings.atom.cost_usd.is_none() && ceilings.workflow.cost_usd.is_none() {
+        return Default::default();
+    }
+    let theirs = written.get("pricing").and_then(Value::as_object);
+    at(budget, "pricing")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|table| table.keys())
+        .filter(|model| !theirs.is_some_and(|t| t.contains_key(*model)))
+        .cloned()
+        .collect()
+}
+
+/// Refuse a project's zero price for a model under the person's own dollar
+/// cap: with any dollar cap in `ceilings`, a model in the merged `budget`
+/// that the person's `written` section does not price, priced at nothing
+/// for both input and output, would make every call to it free and the cap
+/// meaningless. A nonzero price for such a model is the project's to set.
+fn nothing_free_under(
+    user: &Path,
+    written: &Map<String, Value>,
+    budget: &Value,
+    ceilings: &Ceilings,
+) -> Result<(), ConfigError> {
+    if ceilings.atom.cost_usd.is_none() && ceilings.workflow.cost_usd.is_none() {
+        return Ok(());
+    }
+    let theirs = |model: &str| {
+        written
+            .get("pricing")
+            .and_then(Value::as_object)
+            .is_some_and(|pricing| pricing.contains_key(model))
+    };
+    let Some(table) = at(budget, "pricing").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    for (model, price) in table {
+        let zero = |field: &str| price.get(field).and_then(Value::as_f64) == Some(0.0);
+        if !theirs(model) && zero("input_usd_per_mtok") && zero("output_usd_per_mtok") {
+            return Err(ConfigError::Invalid(format!(
+                "budget.pricing.{model}: a price of nothing for {model} would leave your own \
+                 dollar cap ({}) nothing to count; price {model} in your own configuration",
+                user.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The `written` `budget` section of the person's own configuration file
+/// `user`, held over the merged `budget` section, which is changed in place:
+///
+/// - every cap they wrote caps the merged one, so the effective limit is the
+///   smaller of the two and a higher layer can only bring a cap down to
+///   theirs, never above it, nor remove it with `null`. A measure they leave
+///   unset caps nothing;
+/// - every price they wrote holds for the model it names, so a project's
+///   `budget.pricing` cannot make a model they priced look cheaper than they
+///   priced it, and cannot give any model a per-call maximum above their own
+///   `budget.call` cap;
+/// - what binds is recorded in `sources` as theirs, at the line `at_line`
+///   gives, so `atomic config --explain` names the file the effective number
+///   came from, and is said in a remark, so a number that is not the highest
+///   layer's is never shown without its reason.
+///
+/// Nothing here fails: `config::resolve` refused every key that is not a
+/// setting, and [`own_budget_read`] every value of theirs a setting cannot
+/// take, each with its file and line.
+fn hold_budget(
+    user: &Path,
+    written: &Map<String, Value>,
+    at_line: &BTreeMap<String, usize>,
+    budget: &mut Value,
+    sources: &mut BTreeMap<String, Source>,
+) -> (Ceilings, Vec<String>) {
+    let yours = user.display().to_string();
+    let theirs = |dotted: &str| Source::File {
+        path: user.to_owned(),
+        line: line_of(at_line, dotted),
+    };
+    // `budget` is the merged `budget` section on its own, so a lookup drops
+    // the section's own name from the setting path.
+    fn inside(dotted: &str) -> &str {
+        dotted.strip_prefix("budget.").unwrap_or(dotted)
+    }
+    let mut notes = Vec::new();
+    // 1. Their caps, held over the merged ones, and gathered as the ceilings
+    //    that travel with the settings to hold a run's own budget block.
+    //
+    // Every key of a group is one of its settings (`config::resolve` refused
+    // any other), and `own_budget_read` checked this section on its own
+    // before this ran: what is here is a number for the limit it names, a
+    // whole one for a count, or `null`, which is how every layer says it sets
+    // no cap. What is in range from there, and what is too large to account
+    // for, `BudgetSettings::validate` says by its setting.
+    let mut ceilings = Ceilings::default();
+    for group in GROUPS {
+        let Some(wrote) = written.get(group).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut bound = Vec::new();
+        for (field, cap) in wrote {
+            let dotted = format!("budget.{group}.{field}");
+            let Some(want) = cap.as_f64() else {
+                continue;
+            };
+            // Their cap gives way only to a smaller one, which leaves a
+            // project's smaller cap tightening what they allow. A layer
+            // above that writes a larger cap, or none at all (`null`, or a
+            // whole group set to `null`), leaves their number standing.
+            let have = at(budget, inside(&dotted)).and_then(Value::as_f64);
+            if let Some(have) = have
+                && want >= have
+            {
+                continue;
+            }
+            bound.push(format!("{dotted} at {}", show(cap)));
+            *slot_made(budget, inside(&dotted)) = cap.clone();
+            sources.insert(dotted.clone(), theirs(&dotted));
+        }
+        if !bound.is_empty() {
+            notes.push(format!(
+                "budget.{group}: your own configuration ({yours}) caps {}, which no project or \
+                 variable can raise",
+                bound.join(", ")
+            ));
+        }
+        let count = |what: &str| wrote.get(what).and_then(Value::as_u64);
+        let number = |what: &str| wrote.get(what).and_then(Value::as_f64);
+        match group {
+            "atom" | "workflow" => {
+                let caps = Caps {
+                    tokens: count("tokens"),
+                    minutes: number("minutes"),
+                    cost_usd: number("cost_usd"),
+                };
+                if group == "atom" {
+                    ceilings.atom = caps;
+                } else {
+                    ceilings.workflow = caps;
+                }
+            }
+            _ => {
+                ceilings.call = CallCaps {
+                    input_tokens: count("input_tokens"),
+                    output_tokens: count("output_tokens"),
+                    minutes: number("minutes"),
+                };
+            }
+        }
+    }
+    // 2. Their prices, over a project's, and their call cap over a project's
+    //    per-call maxima. A price of the wrong shape was refused with its file
+    //    and line while the layers merged, as any other setting is.
+    let mut their_prices: BTreeMap<&str, &Map<String, Value>> = BTreeMap::new();
+    if let Some(Value::Object(pricing)) = written.get("pricing") {
+        for (model, price) in pricing {
+            if let Value::Object(price) = price {
+                their_prices.insert(model, price);
+            }
+        }
+    }
+    let mut bound = Vec::new();
+    let mut clamped = Vec::new();
+    if let Some(Value::Object(table)) = slot(budget, inside("budget.pricing")) {
+        // A model they priced and a project named too: their fields, and the
+        // project's only where they wrote none. A model they never named is
+        // held to their call cap below, so it needs no fields of its own.
+        let none = Map::new();
+        for (model, entry) in table.iter_mut() {
+            let Value::Object(entry) = entry else {
+                continue;
+            };
+            let their = their_prices.get(model.as_str()).copied().unwrap_or(&none);
+            let mut held = Vec::new();
+            let mut capped = Vec::new();
+            for field in [
+                "input_usd_per_mtok",
+                "output_usd_per_mtok",
+                "max_input_tokens",
+                "max_output_tokens",
+            ] {
+                let dotted = format!("budget.pricing.{model}.{field}");
+                // A field they wrote is theirs, at their line. A maximum held
+                // down is cited from the cap that holds it, so the number is
+                // never shown against a file that says a larger one.
+                let mut held_by: Option<&str> = None;
+                let keep = match their.get(field) {
+                    // Their price for a model holds: a project cannot make a
+                    // model they priced look cheaper, nor give a call to it a
+                    // larger bound than they gave it.
+                    Some(written) => {
+                        if same(Some(written), entry.get(field)) {
+                            None
+                        } else {
+                            Some(written.clone())
+                        }
+                    }
+                    // A maximum a project gave a model cannot pass their cap
+                    // on the most one call may use, whether or not they priced
+                    // the model at all.
+                    None => {
+                        let (cap, cap_of) = match field {
+                            "max_input_tokens" => {
+                                (ceilings.call.input_tokens, "budget.call.input_tokens")
+                            }
+                            "max_output_tokens" => {
+                                (ceilings.call.output_tokens, "budget.call.output_tokens")
+                            }
+                            // A price is no cap on what one call may use.
+                            _ => (None, ""),
+                        };
+                        match (cap, entry.get(field).and_then(Value::as_f64)) {
+                            (Some(cap), Some(have)) if (cap as f64) < have => {
+                                held_by = Some(cap_of);
+                                Some(Value::from(cap))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some(keep) = keep {
+                    entry.insert(field.to_owned(), keep);
+                    match held_by {
+                        Some(cap_of) => {
+                            capped.push(field.to_string());
+                            sources.insert(dotted.clone(), theirs(cap_of));
+                        }
+                        None => {
+                            held.push(field.to_string());
+                            sources.insert(dotted.clone(), theirs(&dotted));
+                        }
+                    }
+                }
+            }
+            if !held.is_empty() {
+                bound.push(format!("{model}: {}", held.join(", ")));
+            }
+            if !capped.is_empty() {
+                clamped.push(format!("{model}: {}", capped.join(", ")));
+            }
+        }
+        // A model only they priced: a layer that writes `budget.pricing`
+        // replaces the whole table below it, so their price for it would be
+        // lost without this, and a project could leave it out to the same end.
+        for (model, price) in &their_prices {
+            if table.contains_key(*model) {
+                continue;
+            }
+            let mut fields = Vec::new();
+            for field in price.keys() {
+                let dotted = format!("budget.pricing.{model}.{field}");
+                sources.insert(dotted.clone(), theirs(&dotted));
+                fields.push(field.as_str());
+            }
+            table.insert((*model).to_owned(), Value::Object((*price).clone()));
+            bound.push(format!("{model}: {}", fields.join(", ")));
+        }
+    }
+    if !bound.is_empty() {
+        notes.push(format!(
+            "budget.pricing: priced by your own configuration ({yours}), which a project's \
+             budget.pricing cannot change: {}",
+            bound.join("; ")
+        ));
+    }
+    if !clamped.is_empty() {
+        notes.push(format!(
+            "budget.pricing: your own configuration ({yours}) caps the most one call may use, \
+             which a project's budget.pricing cannot raise: {}",
+            clamped.join("; ")
+        ));
+    }
+    (ceilings, notes)
+}
+
+/// `v` as `atomic config` shows it, for a remark that names a cap.
+fn show(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a price written in two files is the same: `2` and `2.0` are the
+/// same price, and holding one over the other would say so for nothing.
+fn same(written: Option<&Value>, merged: Option<&Value>) -> bool {
+    match (written, merged) {
+        (Some(a), Some(b)) => {
+            a == b || matches!((a.as_f64(), b.as_f64()), (Some(x), Some(y)) if x == y)
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Read the settings of the project configured in `dir` as `atomic run`
@@ -940,9 +1632,22 @@ impl Resolved {
             Source::File { path, .. } => self.user.as_deref() != Some(path.as_path()),
             _ => false,
         };
+        // A key, and where it goes, is said too.
+        let key = m.api_key_env.as_deref().map_or_else(String::new, |key| {
+            let host = url::Url::parse(base_url)
+                .ok()
+                .and_then(|u| {
+                    u.host_str().map(|h| match u.port() {
+                        Some(port) => format!("{h}:{port}"),
+                        None => h.to_owned(),
+                    })
+                })
+                .unwrap_or_else(|| mask_url(base_url));
+            format!("; {key} is sent to {host}")
+        });
         announced.then(|| {
             format!(
-                "atomic: model {name} at {} ({}); `atomic config --explain` says why",
+                "atomic: model {name} at {} ({}){key}; `atomic config --explain` says why",
                 mask_url(base_url),
                 describe(source)
             )
@@ -1044,9 +1749,27 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
     let signed_in = match SignIn::located(in_project.then_some(root.as_path())) {
         Ok(sign_in) => sign_in.explain(),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
+        // Said as resolution says it, when there is a sign-in's directory
+        // there to say it of.
         Err(e) => {
-            let note = format!("the ChatGPT sign-in could not be read: {e}");
-            if !notes.contains(&note) {
+            let there = match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d))
+            {
+                Some(Err(gone)) => !absent(&gone),
+                _ => true,
+            };
+            // With an endpoint configured, the sign-in is not looked for and
+            // a run uses the endpoint.
+            let configured =
+                resolved.sign_in_unreadable.is_none() && resolved.settings.model.base_url.is_some();
+            let note = if configured {
+                format!(
+                    "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \
+                     configured, which comes first"
+                )
+            } else {
+                unusable(&e.to_string())
+            };
+            if there && !notes.contains(&note) {
                 notes.push(note);
             }
             None

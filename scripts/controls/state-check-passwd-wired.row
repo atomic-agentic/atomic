@@ -1,0 +1,1 @@
+state-check-passwd-wired|crates/atomic-core/src/state.rs|&process_passwd_home(), &placed)|&None, &placed) // CONTROL_OFF|-p atomic-agentic-core --lib -- state::tests::a_process_with_no_home_in_its_environment_is_placed_by_the_password_home

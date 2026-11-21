@@ -189,10 +189,18 @@ of `/tmp`, and its denial of atomic's private state, to turns and to exec
 atoms' commands; the confinement of exec atoms' commands itself; and their
 network: none unless declared, and through the proxy only the declared hosts,
 on ports 80 and 443, never through another proxy, with the declaration checked
-when the atom loads and again before the command runs; and the artifact store's
+when the atom loads and again before the command runs, and loopback reachable
+only in a build with the test-only `exec-loopback-tests` feature; the runner
+process, `atomic runner`, hardened against same-user reads of its memory
+whether it is named first or after global flags, and given only `PATH` from
+the control plane's environment; the sandbox helper's outer stage, which
+holds a confined command's proxy token, made non-dumpable; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded; and that an exec atom's files move only through its
-workspace's backend), it
+turn is recorded, and what a run's input names from every sweep until the input
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
+that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -242,7 +250,9 @@ it, and `scripts/acceptance.py` runs them as one check. CI runs it in the
 features, so nothing rebuilds:
 
 ```bash
+scripts/dev.sh scripts/acceptance.py m42a # lists no Postgres or sandbox tests
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m39a
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m45
 ```
 
@@ -265,8 +275,12 @@ states a marker opens a block, and only a block holds clauses, so what is
 written under a line that opens none, or under a deeper heading that states
 none, is read as nothing. Each such line is refused with its line number:
 outside a block, every line that leads with a spelling of `accept` and ends in
-a colon, however it is wrapped or spelt (`Acceptance:`, `__Acceptance:__`,
-`**Acceptence:**`, `- **Acceptance, files and data:**`); within a block, every
+a colon, however that word is spelt, and however it is wrapped in markdown
+punctuation (`-`, `_`, `*`, `~`, `>` and `#`, with spaces), which may carry one
+bullet's mark in front of the word (`- `, `* `, `+ `, or a number, then `.` or
+`)`, then a space), as in `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+`- **Acceptance, files and data:**` and `1. **Acceptance, files and data:**`;
+within a block, every
 line that begins `**Acceptance` and is not a marker; and under a deeper
 heading, every bullet, of whatever shape. A clause carried onto its next line
 is read as one clause only when that line is indented by at least two spaces
@@ -338,8 +352,8 @@ in turn:
 | Clippy | `cargo fmt --check`, and clippy with and without the test features |
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
-| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
-| Build, lockfile and SBOM | `cargo build`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
+| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a, M39a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
+| Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and

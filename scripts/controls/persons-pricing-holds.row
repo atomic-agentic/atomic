@@ -1,0 +1,1 @@
+persons-pricing-holds|crates/atomic/src/settings.rs|            let their = their_prices.get(model.as_str()).copied().unwrap_or(&none);|            let their = &none; // CONTROL_OFF|-p atomic-agentic --bins -- --exact settings::tests::your_own_price_holds_where_a_project_writes_a_cheaper_one

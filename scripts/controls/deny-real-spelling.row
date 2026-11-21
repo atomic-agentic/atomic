@@ -1,0 +1,1 @@
+deny-real-spelling|crates/atomic-core/src/codex.rs|        spelled.push(real_spelling(&path));|        spelled.push(path);|-p atomic-agentic-core --lib --features fake-model a_place_behind_a_linked_directory_is_denied_by_its_real_path

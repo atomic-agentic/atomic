@@ -265,12 +265,14 @@ async fn run_once(
         .remove(0)
 }
 
-/// The value of `name=` that a command printed on a line of its own.
+/// The value of `name=` that a command printed on a line of its own. A
+/// command that printed no such line fails the test, saying so, rather than
+/// reading as an empty value.
 fn printed_value(output: &str, name: &str) -> String {
     output
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{name}=")))
-        .unwrap_or_default()
+        .unwrap_or_else(|| panic!("no line {name}=… in: {output}"))
         .to_owned()
 }
 
@@ -305,17 +307,21 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         let project = dir.join("project");
         write_project(&project);
         let base = git(&project);
+        // What the command says on stderr arrives beside its stdout in no
+        // set order, and can land inside a line this test reads, so every
+        // part that may fail sends its stderr nowhere: what is asserted is
+        // on stdout.
         let command = format!(
-            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l; echo linked; \
+            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l 2>/dev/null; echo linked; \
              for d in {PROTECTED}; do ls -A \"$HOME/$d\" 2>/dev/null; done; echo protected; \
-             mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\"; \
-             cat {0}/.ssh/id_ed25519 {0}/.profile; echo \"home=$HOME\"; \
+             (mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\") 2>/dev/null; \
+             cat {0}/.ssh/id_ed25519 {0}/.profile 2>/dev/null; echo \"home=$HOME\"; \
              echo \"cargo=$CARGO_HOME\"; echo \"rustup=$RUSTUP_HOME\"; echo \"gomod=$GOMODCACHE\"; \
              echo \"target=$CARGO_TARGET_DIR\"; \
-             mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
+             (mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written) 2>/dev/null; \
              touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
-             mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
-             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\"; \
+             (mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
+             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\" && echo gomod-locked) 2>/dev/null; \
              echo looked",
             home.display(),
             PROTECTED = PROTECTED.join(" ")
@@ -341,6 +347,8 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         assert_eq!(inside.trim(), "", "the placeholders hold: {inside}");
         // The turn may write it.
         assert!(rest.contains("cached\n"), "{printed}");
+        // The read-only module cache the run's end must remove was made.
+        assert!(rest.contains("gomod-locked\n"), "{printed}");
         // And reads nothing of the person's.
         assert!(!rest.contains("canary"), "{printed}");
         assert!(
@@ -428,8 +436,8 @@ fn a_run_that_fails_leaves_no_build_caches() {
         write_project(&project);
         let base = git(&project);
         let data = json!({"base": base, "text": "the note"}).to_string();
-        let build = "mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\"; \
-                     echo \"xdg=$XDG_CACHE_HOME\"";
+        let build = "(mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\") \
+                     2>/dev/null && echo built-ok; echo \"xdg=$XDG_CACHE_HOME\"";
         let printed = run_ending(
             &home,
             &project,
@@ -440,6 +448,8 @@ fn a_run_that_fails_leaves_no_build_caches() {
             false,
         )
         .await;
+        // The cache was written, so its absence afterwards means it was removed.
+        assert!(printed[0].contains("built-ok\n"), "{}", printed[0]);
         let caches = run_caches(&project, "tidy-up", &printed_value(&printed[0], "xdg"));
         assert!(!caches.exists(), "a failed run's caches stayed: {caches:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -971,7 +981,8 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
         )
         .unwrap();
         let command = format!(
-            "cat {h}/.kube/config /etc/hostname; timeout 3 cat {h}/.netrc; echo \"pipe=$?\"; \
+            "cat {h}/.kube/config /etc/hostname 2>/dev/null; timeout 3 cat {h}/.netrc 2>/dev/null; \
+             echo \"pipe=$?\"; \
              {d}/tools/python3; echo looked",
             h = home.display(),
             d = dir.display()
@@ -990,4 +1001,225 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
         assert!(printed.contains("program-ran"), "{printed}");
         let _ = std::fs::remove_dir_all(&dir);
     });
+}
+
+/// Credential places named through a directory that is an absolute link, as
+/// `/var/run` links to `/run`, stay denied under both spellings, and every
+/// command still starts: a projected volume reached by a link to its token's
+/// link, the version it rotates in next, an item nested in one of its
+/// directories, and a moved key directory.
+#[test]
+fn credentials_behind_an_absolutely_linked_directory_stay_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-aws-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (real, linked) = (dir.join("real"), dir.join("linked"));
+        std::fs::create_dir_all(real.join("gnupg")).unwrap();
+        std::fs::write(real.join("gnupg/key"), "canary-gnupg\n").unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        for volume in ["sa", "nested"] {
+            for version in [now, next] {
+                let at = real.join(volume).join(version);
+                std::fs::create_dir_all(at.join("aws")).unwrap();
+                std::fs::write(at.join("token"), format!("canary-{volume}{version}\n")).unwrap();
+                std::fs::write(at.join("aws/token"), format!("canary-{volume}-aws\n")).unwrap();
+            }
+            std::os::unix::fs::symlink(now, real.join(volume).join("..data")).unwrap();
+            std::os::unix::fs::symlink("..data/token", real.join(volume).join("token")).unwrap();
+            std::os::unix::fs::symlink("..data/aws", real.join(volume).join("aws")).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::os::unix::fs::symlink(linked.join("sa/token"), dir.join("etc/token")).unwrap();
+        let mut reads = vec![dir.join("etc/token")];
+        for root in [&real, &linked] {
+            reads.push(root.join("gnupg/key"));
+            for volume in ["sa", "nested"] {
+                for item in ["token", "aws/token"] {
+                    reads.push(root.join(volume).join(item));
+                    for version in [now, next] {
+                        reads.push(root.join(volume).join(version).join(item));
+                    }
+                }
+            }
+        }
+        let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
+        let command = format!("cat {} 2>/dev/null; echo looked", reads.join(" "));
+        let gnupg = linked.join("gnupg").display().to_string();
+        let web = dir.join("etc/token").display().to_string();
+        let nested = linked.join("nested/aws/token").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("GNUPGHOME", gnupg.as_str()),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", web.as_str()),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", nested.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            !printed.contains("canary"),
+            "a credential was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// AWS's workload token files stay denied to a turn's commands, whether a
+/// variable in atomic's environment names an ordinary file or a token in a
+/// projected volume, as Kubernetes mounts one: the token there now, the
+/// file behind its link, and the next version of it, which Kubernetes
+/// rotates in, are all out of reach; the rest of the machine is not.
+#[test]
+fn aws_workload_token_files_stay_denied_whether_plain_or_mounted() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-aws-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // An ordinary token file.
+        std::fs::create_dir_all(dir.join("tokens")).unwrap();
+        std::fs::write(dir.join("tokens/web-identity"), "canary-web-identity\n").unwrap();
+        // A projected volume: the token a link through `..data` to the
+        // current version, and the version the next rotation brings.
+        let volume = dir.join("serviceaccount");
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        for (version, canary) in [(now, "canary-pod-identity"), (next, "canary-next-token")] {
+            std::fs::create_dir_all(volume.join(version)).unwrap();
+            std::fs::write(volume.join(version).join("token"), format!("{canary}\n")).unwrap();
+        }
+        std::os::unix::fs::symlink(now, volume.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..data/token", volume.join("token")).unwrap();
+        std::fs::write(dir.join("tokens/readme"), "readable-beside\n").unwrap();
+        let command = format!(
+            "cat {d}/tokens/web-identity {v}/token {v}/{now}/token {v}/{next}/token; \
+             cat {d}/tokens/readme; echo looked",
+            d = dir.display(),
+            v = volume.display()
+        );
+        let web = dir.join("tokens/web-identity").display().to_string();
+        let pod = volume.join("token").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", web.as_str()),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", pod.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            printed.contains("readable-beside"),
+            "a file beside an ordinary token stays readable: {printed}"
+        );
+        for canary in [
+            "canary-web-identity",
+            "canary-pod-identity",
+            "canary-next-token",
+        ] {
+            assert!(!printed.contains(canary), "{canary} was read: {printed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// Codex's file helper, which applies a turn's patches under the turn's
+/// sandbox, keeps that sandbox's registry of mount points where the turn's
+/// commands keep theirs: in the backend's shared directory in atomic's
+/// state, not in the `TMPDIR` atomic was given.
+#[test]
+fn a_turns_patches_keep_their_sandbox_registry_with_its_commands() {
+    support::require_sandbox();
+    on_codex_runtime(patch_keeps_its_registry("registry", false));
+}
+
+/// The same with `ATOMIC_HOME` given relative to the directory atomic
+/// starts in: the file helper, which Codex starts elsewhere, still finds
+/// the shared directory, and the patch lands.
+#[test]
+fn a_relative_atomic_home_keeps_patches_and_their_registry_working() {
+    support::require_sandbox();
+    on_codex_runtime(patch_keeps_its_registry("relative-home", true));
+}
+
+/// Apply a patch in a worktree step through `atomic run`, given another
+/// `TMPDIR`, and with its state under an `ATOMIC_HOME` relative to the
+/// project when `relative`: it lands, and the one registry is in the
+/// backend's shared directory in the state.
+async fn patch_keeps_its_registry(tag: &str, relative: bool) {
+    let dir = std::env::temp_dir().join(format!("atomic-patch-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let project = dir.join("project");
+    write_project(&project);
+    let base = git(&project);
+    let data = json!({"base": base, "text": "the note"}).to_string();
+    let patch = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: patched.txt\n\
+                 +patched\n*** End Patch\nEOF\n";
+    let tmpdir = elsewhere.to_string_lossy().into_owned();
+    let state = if relative {
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-patch-{tag}-{}", std::process::id()))
+    } else {
+        atomic_home_for(&project, "tidy-up")
+    };
+    let _ = std::fs::remove_dir_all(&state);
+    // The state's path from the project's directory, where atomic starts.
+    let up = "../".repeat(project.components().count() - 1);
+    let from_project = format!("{up}{}", state.strip_prefix("/").unwrap().display());
+    let mut env = vec![("TMPDIR", tmpdir.as_str())];
+    if relative {
+        env.push(("ATOMIC_HOME", from_project.as_str()));
+    }
+    let printed = run_once(&home, &project, "tidy-up", &data, patch, &env).await;
+    assert!(
+        printed.contains("Success. Updated the following files") && printed.contains("patched.txt"),
+        "{printed}"
+    );
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&home).unwrap());
+    let registry = format!("codex-bwrap-synthetic-mount-targets-{uid}");
+    assert!(
+        !elsewhere.join(&registry).exists(),
+        "the file helper kept its registry in the TMPDIR atomic was given"
+    );
+    let shared: Vec<PathBuf> = found(&state, &registry)
+        .into_iter()
+        .map(|r| r.parent().unwrap().to_owned())
+        .collect();
+    assert!(
+        shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
+        "registries: {shared:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
+}
+
+/// Every directory named `name` under `dir`.
+fn found(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if entry.file_name() == name {
+                found.push(path);
+            } else {
+                found.extend(self::found(&path, name));
+            }
+        }
+    }
+    found
 }

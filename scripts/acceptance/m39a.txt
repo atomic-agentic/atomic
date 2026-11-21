@@ -1,0 +1,120 @@
+# M39a, the developer loop: each acceptance clause of docs/design/milestones.md
+# § M39a, word for word, the two parts of the sixth as `### ` lines, and the
+# tests that show them, as `<binary> <test path>`.
+# Run by scripts/acceptance.py m39a; see that script for the format.
+
+## From `atomic init` to a passing eval takes a new user under 15 minutes.
+# `init` writes a project with one atom, one workflow and one eval case; that
+# project checks and runs with nothing configured, and an eval of a project
+# with cases records and replays to a passing report. The third test joins the
+# two: it evals a project `atomic init` wrote, hand editing nothing, records
+# that project's own sample case against the fake model, replays it offline to
+# a passing report, and bounds the whole wall clock of `init` and the two evals
+# at 120 s. That bound is the tool's share of the clause's 15 minutes; those 15
+# minutes are a person's clock, and no test measures a person reading a report.
+run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bound
+
+## With only an API key or Ollama on a fresh machine, `init` and `run` need no configuration, and `config --explain` gives each setting's source.
+run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
+run_cli with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why
+run_cli with_only_an_api_key_explain_names_openai_and_never_the_key
+atomic settings::tests::every_setting_has_a_source_and_the_manifest_keys_are_not_settings
+# The API-key case end to end: the key with its base URL, OPENAI_BASE_URL
+# as OpenAI's SDKs read it, pointing at the fake model.
+run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
+
+## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
+# The turn works in a worktree of the fixture's snapshot, never in the
+# checkout: the first compares the checkout that holds the project (its refs,
+# its worktree list, its working tree with every untracked file) before and
+# after, and the second compares the fixture repository the same way when the
+# project sits outside any repository. The third gives its turn a file to
+# write and shows that file committed in the snapshot's worktree, never in the
+# checkout. The last two run a `workspace-write` Codex atom directly and as a
+# step with no `worktree: true`: both are refused `target.unsafe` before the
+# run starts, and the checkout is left as it was.
+fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
+fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
+fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
+fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
+fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
+
+## Changing a `validate` rule re-runs evals from cassettes with no model call.
+# The cassette test edits the atom's own `validate` rule: both recordings
+# replay, the new rule rejects the recorded answer, and the model is called
+# no more than it was when they were recorded. The eval test edits a case's
+# assertion: every call is answered from the recordings (replayed 2, missed 0)
+# and the case fails on replay.
+atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+
+## After kill and resume, the run keeps its ID, its completed results, its budget spent so far and its first gate deadline.
+# Resumed by the id the killed run printed, which its result names again;
+# `runs show` reads the finished steps off attempt one; the budget spent is
+# what the first attempt recorded; the gate a killed run left open is reopened
+# with the `opened_at` and `deadline` it first had; a serve started after the
+# kill finishes that same run under that id; and the ledger charges a resumed
+# run what it spent before the kill plus only real retries.
+run_cli a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished
+run_cli runs_show_says_which_steps_came_from_checkpoints_and_which_attempt_ran_them
+run_cli a_resumed_run_keeps_the_budget_it_already_spent
+run_cli a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time
+run_cli serve_started_after_a_kill_recovers_the_run_and_finishes_it
+budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
+
+## While one resume is running, starting another is refused; an effect whose outcome is unknown remains parked.
+### While one resume is running, starting another is refused
+# The refusal names the process that runs it and the command to wait for; on
+# Postgres, resuming a run another live executor owns is refused until that
+# owner stops.
+run_cli a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time
+run_cli resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped
+### an effect whose outcome is unknown remains parked
+run_cli an_unresolved_effect_stays_parked_across_resumes
+pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
+
+## Run from directories outside the project, the coding example pins the same base commit and leaves the source repository unchanged.
+# The first runs the coding workflow from the project and from an unrelated
+# directory with `--project` and a relative fixture path, and both runs are
+# bound to the same commit of the same fixture, which is then as it was; the
+# others run the turn where the project sits: outside any repository, and in a
+# subdirectory of the developer's checkout. The last runs the coding example
+# itself, from two directories outside the project, to completion: it pins the
+# revision it was given and not the fixture's own tip, and compares the
+# fixture's refs, its worktrees and its working tree, every untracked file
+# included, once its baseline is bound and again after the change is accepted.
+run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
+fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
+fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
+run_cli the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_as_it_was
+
+## A bad path or a missing commit fails before any model call.
+# `fixture.path` for a path that is no repository or is inside one,
+# `fixture.unsupported` for a repository atomic cannot copy whole (submodules,
+# Git LFS), `fixture.revision` for a revision the fixture does not have, and
+# `fixture.input` for an input whose base is a placeholder or a stale commit:
+# typed refusals, each made against an endpoint nothing listens on. The first
+# test also shows that none of these starts a run.
+run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
+run_cli a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refused
+
+## `--project` accepts the manifest file or the directory that holds it, and an input read from a file, from standard input or from `--data` becomes the same run input.
+run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
+
+## A change to validation alone reuses earlier results, labelled as historical, while a change to prepared context, generation schema, tool fixtures or model settings makes the recording unusable.
+# The replay says it is a historical check; the identity is the whole request
+# body less four fields that differ between runs; a replay needs the endpoint
+# it was recorded for; and editing the atom's output schema — one property's
+# description, then a property added — leaves every case without a recording,
+# says to record it again, and calls no model.
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
+atomic_core cassette::tests::the_identity_ignores_what_varies_between_runs_and_nothing_else
+eval_cli a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key
+eval_cli an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again
+pending: tool fixtures and prepared context are still not shown. No tool definition reaches a recording in this version: an atom that declares any tool is refused at load, a lite atom's request carries none, and the kind that runs with tools, a Codex atom, is refused under cassettes; and a case's `prepared` values load and are then refused by the runner, so what these tests edit is the atom's instructions, not prepared context. A test would record an atom that has a declared tool and a case with prepared values, then replay after editing each, expecting the miss that says to record again.
+
+## `atomic run` returns the same result whether the target is named from inside the project or given as a path from elsewhere.
+run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input

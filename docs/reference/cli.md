@@ -164,6 +164,8 @@ authentication](../getting-started/authentication.md).
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
 | `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
 | The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
+| `atomic parks list` | List the runs parked on a budget cap and not yet released | v0.1 local |
+| `atomic parks release <park-id>` | Release a parked run as the local operator, with your enrolled credential; `--tokens`, `--minutes` and `--cost-usd` raise the refusing allowance first (`--scope` names another of the run's own), `--comment` is recorded, `--command-id` makes a repeat safe | v0.1 local, Linux |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
@@ -287,7 +289,9 @@ next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
 as `outcome_unknown`. A step waiting for room on the execution backend gives up
 its wait at the first signal. Besides 130, `atomic run` and `atomic runs resume`
-stop with 75 when a step found no room within `--backend-wait`, and with 78 when
+stop with 75 when a step found no room within `--backend-wait`, on the
+execution backend or on the disk for atomic's own writes (its run's build caches
+and its worktree's directory), and with 78 when
 the sandbox cannot start; either way the run stays unfinished, with nothing
 recorded, for `atomic runs resume`. Each command runs in a process group of its own (under
 `--runner process`, its runner's), and on Linux it is killed if atomic dies.
@@ -327,7 +331,7 @@ Atomic refuses to start when the durable engine's own version variable
 | `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |
 | `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
 | `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
-| `backend_wait`, `ATOMIC_BACKEND_WAIT` (`--backend-wait`) | How many seconds, a whole number of at least 1, a step waits for the execution backend to have room for its workspace. Then `atomic run` and `atomic runs resume` stop, the run unfinished with nothing recorded and exit code 75, for `atomic runs resume`; `atomic serve` sets the step aside, says so, and keeps trying at most 30 seconds apart, saying so each time, and the run goes on once there is room. `atomic eval` waits no longer for each case. Without it a step waits for as long as it takes |
+| `backend_wait`, `ATOMIC_BACKEND_WAIT` (`--backend-wait`) | How many seconds, a whole number of at least 1, a step waits for room: on the execution backend for its workspace, or on the disk for atomic's own writes (its run's build caches and its worktree's directory), each wait with its own clock; a checkout git cannot finish fails the step instead. Then `atomic run` and `atomic runs resume` stop, the run unfinished with nothing recorded and exit code 75, for `atomic runs resume`; `atomic serve` sets the step aside, says so, and keeps trying at most 30 seconds apart, saying so each time, and the run goes on once there is room. `atomic eval` waits no longer for each case. Without it a step waits for as long as it takes |
 
 `atomic --remote <url>` and shared/team service access arrive in **v0.5**, with
 identity and transport controls.

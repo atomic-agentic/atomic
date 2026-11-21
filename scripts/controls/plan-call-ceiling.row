@@ -1,0 +1,1 @@
+plan-call-ceiling|crates/atomic/src/metering.rs|            self.call.input_tokens,|            0,|-p atomic-agentic --test pipeline -- --exact a_pinned_plan_without_ceilings_is_held_to_your_own
