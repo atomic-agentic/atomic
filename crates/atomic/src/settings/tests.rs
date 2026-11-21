@@ -1175,6 +1175,12 @@ fn openai_base_url_points_an_openai_keys_detection_elsewhere() {
         source(&r, "model.base_url"),
         &Source::Detected("OPENAI_API_KEY and OPENAI_BASE_URL are set".into())
     );
+    // The run says where the key goes.
+    let said = r.announcement().expect("announced");
+    assert!(
+        said.contains("; OPENAI_API_KEY is sent to 127.0.0.1:8080;"),
+        "{said}"
+    );
     // Without the key, or with an endpoint set, it is not used, and that
     // is said.
     for vars in [
@@ -1200,33 +1206,33 @@ fn openai_base_url_points_an_openai_keys_detection_elsewhere() {
     }
 }
 
-/// An OPENAI_BASE_URL that is not https, nor http to a loopback address,
-/// or that carries a user, password or query, is refused, so the key goes
-/// nowhere.
+/// An OPENAI_BASE_URL that is not https, nor http to a loopback IP
+/// address, or that carries a user, password, query or fragment, is not
+/// used: nothing is detected, the reason is kept for a command that would
+/// send the key, and said.
 #[test]
 fn an_openai_base_url_unfit_for_the_key_is_refused() {
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let not_loopback = "is http to an address that is not this machine's loopback";
+    let carries = "carries a user, password, query or fragment";
     for (url, why) in [
-        (
-            "http://proxy.example/v1",
-            "is http to an address that is not this machine's loopback",
-        ),
-        (
-            "http://localhost:8080/v1",
-            "is http to an address that is not this machine's loopback",
-        ),
+        ("http://proxy.example/v1", not_loopback),
+        ("http://localhost:8080/v1", not_loopback),
+        ("http://127.0.0.1.nip.io/v1", not_loopback),
+        ("http://[::ffff:127.0.0.1]/v1", not_loopback),
+        ("http://0.0.0.0:8080/v1", not_loopback),
         ("ftp://proxy.example/v1", "is neither https nor http"),
+        ("https://user:pass@proxy.example/v1", carries),
+        ("https://user%40proxy.example@evil.example/v1", carries),
         (
-            "https://user:pass@proxy.example/v1",
-            "carries a user, password or query",
+            "http://127.0.0.1%40evil.example/v1",
+            "does not read as a URL",
         ),
-        (
-            "https://proxy.example/v1?key=k",
-            "carries a user, password or query",
-        ),
+        ("https://proxy.example/v1?key=k", carries),
+        ("https://proxy.example/v1#k", carries),
         ("not a url", "does not read as a URL"),
     ] {
-        let refused = resolved_where(
+        let r = resolved(
             &d,
             &EngineArgs::default(),
             &[
@@ -1234,16 +1240,20 @@ fn an_openai_base_url_unfit_for_the_key_is_refused() {
                 ("OPENAI_BASE_URL", url),
             ],
             &nobody,
-        )
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        );
+        assert_eq!(r.endpoint().map(|e| e.base_url), None, "{url}");
+        let refused = r.refused_endpoint.clone().unwrap_or_default();
         assert!(
-            refused.contains(&format!("OPENAI_BASE_URL {why}, and it decides where")),
+            refused.starts_with(&format!("OPENAI_BASE_URL {why}, and it decides where")),
             "{url}: {refused}"
         );
+        assert!(r.notes.contains(&refused), "{url}: said");
     }
-    for url in ["https://proxy.example/v1", "http://[::1]:8080/v1"] {
+    for url in [
+        "https://proxy.example/v1",
+        "http://[::1]:8080/v1",
+        "http://127.0.0.2/v1",
+    ] {
         let r = resolved(
             &d,
             &EngineArgs::default(),
@@ -1254,6 +1264,7 @@ fn an_openai_base_url_unfit_for_the_key_is_refused() {
             &nobody,
         );
         assert_eq!(r.endpoint().map(|e| e.base_url), Some(url.to_owned()));
+        assert_eq!(r.refused_endpoint, None, "{url}");
     }
 }
 

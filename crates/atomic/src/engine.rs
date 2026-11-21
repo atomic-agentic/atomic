@@ -218,6 +218,16 @@ pub fn endpoint(
     required: bool,
     personal_refused: Option<&str>,
 ) -> anyhow::Result<ModelEndpoint> {
+    // Nor anywhere the person's OPENAI_BASE_URL names that is unfit for it.
+    if required && let Some(why) = &resolved.refused_endpoint {
+        return Err(Failure::new(
+            "config.model",
+            format!("model atoms need a model endpoint, and {why}"),
+            "set OPENAI_BASE_URL to an https URL, or to http on 127.0.0.1 or [::1], or unset \
+             it to use OpenAI's API; `atomic config --explain` shows what was found",
+        )
+        .into());
+    }
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {

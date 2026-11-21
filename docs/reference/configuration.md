@@ -96,11 +96,16 @@ What no layer sets, atomic looks for, and says so as `detected:` in
 
 `OPENAI_BASE_URL` is read as OpenAI's SDKs read it, and only from your
 environment: no file, the project's or your own, sets it, since it decides
-where the key is sent. It must be an `https` URL, or `http` to a loopback
-address written as one (`127.0.0.1` or `[::1]`), with no user, password or
-query in it; anything else stops the command, and no key is sent. It is used
-only with `OPENAI_API_KEY`, when detection runs; otherwise it is said to be
-set and not used. `--explain` names both variables as the source.
+where the key is sent. So whatever sets your environment decides where the
+key goes, a shell profile or a tool that loads variables for a directory,
+such as direnv or a `.env` loader, among them. It must be an `https` URL, or
+`http` to a loopback IP address (`127.0.0.1` or `[::1]`; a name such as
+`localhost` is refused), with no user, password, query or fragment in it.
+Anything else detects no endpoint: a command that would send the key stops
+and says why, and one that sends none, such as `atomic check`, carries on.
+It is used only with `OPENAI_API_KEY`, when detection runs; otherwise it is
+said to be set and not used. `--explain` names both variables as the
+source, and a run says that the key is sent, and to which host.
 
 The key's value is never read for detection. Looking for Ollama is one
 `GET /api/tags` to the loopback address, which must answer within a second, and
