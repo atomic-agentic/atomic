@@ -1,0 +1,1 @@
+lite-loopback-no-proxy|crates/atomic-core/src/lite.rs|        builder = builder.no_proxy();|        let _ = &mut builder;|-p atomic-agentic-core --test model_client the_model_client_keeps_the_key_off_proxies_and_redirects
