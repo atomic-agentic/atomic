@@ -1213,6 +1213,33 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
 }
 
 #[test]
+fn an_exec_atoms_declared_environment_wins_over_its_runs_caches() {
+    let (_, a, _) = exec_project(
+        "exec-env-wins",
+        TOTAL,
+        ", env: { XDG_CACHE_HOME: '/mine', REGION: 'eu' }",
+    );
+    let caches = crate::worktree::Caches::new("/state/cache/run-1-ab".into()).for_exec("total");
+    let (env, writable) = exec_environment(&a, Some(&caches));
+    assert_eq!(env["XDG_CACHE_HOME"], "/mine", "declared wins");
+    assert_eq!(env["REGION"], "eu");
+    for (name, value) in caches.env() {
+        if name != "XDG_CACHE_HOME" {
+            assert_eq!(env[&name], value, "{name}");
+        }
+    }
+    assert_eq!(writable, [std::path::Path::new("/state/cache/run-1-ab")]);
+    // With no caches, as in an eval, only what the atom declares.
+    let (env, writable) = exec_environment(&a, None);
+    assert_eq!(
+        env.keys().collect::<Vec<_>>(),
+        ["REGION", "XDG_CACHE_HOME"],
+        "{env:?}"
+    );
+    assert!(writable.is_empty());
+}
+
+#[test]
 fn exec_declarations_are_checked_at_load() {
     use crate::atom;
     for (config, problem) in [

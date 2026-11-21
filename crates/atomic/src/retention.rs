@@ -64,10 +64,10 @@ pub async fn read_kept(
 }
 
 /// [`read_kept`], calling `between` once the holds are read and before the
-/// runs are, as a step that records its reference and lets its hold go in
-/// that window would: for tests.
-#[doc(hidden)]
-pub async fn read_kept_then(
+/// runs are: [`read_kept`] calls nothing there, and this module's tests let
+/// a hold go there, as a step that records its reference in that window
+/// would.
+async fn read_kept_then(
     store: &LocalStore,
     rt: &Durare,
     keep: &BTreeSet<ArtifactRef>,
@@ -224,4 +224,64 @@ pub async fn sweep(
         tokio::task::spawn_blocking(move || store.sweep(&kept.artifacts, grace, kept.read_at))
             .await??,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::artifact::{ArtifactStore, Provenance};
+
+    /// The holds are read before the runs: a step that records its
+    /// reference and lets its hold go while the sweep reads the runs, after
+    /// the sweep has read past its run, still keeps its content.
+    #[test]
+    fn the_holds_are_read_before_the_runs() {
+        atomic_core::testing::on_codex_runtime(async {
+            let dir = std::env::temp_dir().join(format!(
+                "atomic-retention-holds-first-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            rt.launch().await.expect("launch");
+            let store = LocalStore::open(dir.join("artifacts")).expect("artifacts");
+            let patch = store
+                .put(
+                    &mut &b"let go as the runs are read"[..],
+                    Provenance::default(),
+                )
+                .expect("put")
+                .artifact;
+            for blob in store.stored().expect("stored") {
+                let path = dir
+                    .join("artifacts/blobs/sha256")
+                    .join(&blob.digest()[..2])
+                    .join(&blob.digest()[2..]);
+                std::fs::File::open(&path)
+                    .and_then(|f| {
+                        f.set_modified(
+                            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+                        )
+                    })
+                    .expect("backdate");
+            }
+            let hold = store.hold(&patch).expect("hold");
+            let kept = read_kept_then(&store, &rt, &BTreeSet::new(), || drop(hold))
+                .await
+                .expect("read");
+            let swept = store
+                .sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at)
+                .expect("sweep");
+            assert!(swept.removed.is_empty(), "{swept:?}");
+            assert!(
+                store.contains(&patch).expect("contains"),
+                "removed after its hold was let go"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 }

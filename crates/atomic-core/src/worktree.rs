@@ -204,22 +204,7 @@ impl Worktrees {
                 self.dir.display()
             ))
         })?;
-        let name = match nonce {
-            Some(nonce) if !nonce.is_empty() && nonce.bytes().all(|b| b.is_ascii_hexdigit()) => {
-                format!("{}-{nonce}", component(run))
-            }
-            Some(nonce) => {
-                return Err(WorktreeError::Invalid(format!(
-                    "the run's cache nonce {nonce:?} is not hexadecimal"
-                )));
-            }
-            None => component(run),
-        };
-        Ok(Caches {
-            dir: state.join("cache").join(name),
-            rustup,
-            target: None,
-        })
+        Caches::for_run(&state.join("cache"), run, nonce, rustup)
     }
 
     /// Pin run `run`'s base: resolve `rev` (a commit ID or a ref name such
@@ -436,10 +421,9 @@ impl Worktrees {
     }
 }
 
-/// Build and package caches kept outside every worktree: a run's own, for
-/// its worktree steps ([`Worktrees::caches`]), removed when the run ends, or
-/// the project's, under `<state>/cache`, for exec atoms
-/// ([`Caches::for_state`]).
+/// Build and package caches kept outside every worktree: a run's own, in
+/// `<state>/cache/<run>-<nonce>` ([`Caches::for_run`]), for its worktree and
+/// exec steps, removed when the run ends.
 ///
 /// An atom's commands find them through [`env`](Self::env), and a
 /// `workspace-write` thread is given [`dir`](Self::dir) as a writable root
@@ -454,9 +438,35 @@ pub struct Caches {
 }
 
 impl Caches {
-    /// The caches of the project at `state`.
-    pub fn for_state(state: &ProjectState) -> Self {
-        Self::new(state.dir().join("cache"))
+    /// The build caches of run `run` under `root`, the state directory's
+    /// `cache/`: `<root>/<run>-<nonce>`, named as the run's worktrees are and
+    /// with the nonce its first step recorded, so a run id used again, after
+    /// its store was wiped, say, or names that differ only in case, never
+    /// finds another run's caches. Nothing one run writes there reaches
+    /// another. `rustup` is the person's toolchains, as found when the run
+    /// began.
+    pub fn for_run(
+        root: &Path,
+        run: &str,
+        nonce: Option<&str>,
+        rustup: Option<PathBuf>,
+    ) -> Result<Self> {
+        let name = match nonce {
+            Some(nonce) if !nonce.is_empty() && nonce.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                format!("{}-{nonce}", component(run))
+            }
+            Some(nonce) => {
+                return Err(WorktreeError::Invalid(format!(
+                    "the run's cache nonce {nonce:?} is not hexadecimal"
+                )));
+            }
+            None => component(run),
+        };
+        Ok(Caches {
+            dir: root.join(name),
+            rustup,
+            target: None,
+        })
     }
 
     /// Caches kept under `dir`.
@@ -481,6 +491,18 @@ impl Caches {
         }
     }
 
+    /// These caches for exec step `name`: the same caches, with a Cargo
+    /// target directory of that step's own, so no step runs what another
+    /// built.
+    /// `cargo-target/<name>`, which no worktree's can be: a worktree's is
+    /// named `<run>.<step>`, and a name as a file name holds no `.`.
+    pub fn for_exec(&self, name: &str) -> Self {
+        Self {
+            target: Some(self.dir.join("cargo-target").join(component(name))),
+            ..self.clone()
+        }
+    }
+
     /// The person's rustup toolchains, as found when the caches were made.
     pub fn rustup(&self) -> Option<&Path> {
         self.rustup.as_deref()
@@ -492,8 +514,8 @@ impl Caches {
     }
 
     /// Create the cache directory, readable by its owner only. A link in
-    /// its place is refused: something else made it, since an exec atom's
-    /// command may write the project's caches beside it.
+    /// its place is refused: atomic did not make it, and following it
+    /// would put the run's caches wherever it points.
     pub fn create(&self) -> Result<()> {
         if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(WorktreeError::Invalid(format!(
@@ -780,6 +802,35 @@ mod tests {
             if name != "RUSTUP_HOME" {
                 assert!(Path::new(value).starts_with(caches.dir()), "{name}={value}");
             }
+        }
+        // Each exec step builds into a target of its own, never a
+        // worktree's, and shares the rest of the run's caches.
+        let tree = caches
+            .in_worktree(&Path::new("/state/worktrees").join(worktree_name("run-1", "a")))
+            .env();
+        let targets: Vec<String> = ["a", "b", "a.b", "_a"]
+            .iter()
+            .map(|turn| caches.for_exec(turn).env()["CARGO_TARGET_DIR"].clone())
+            .chain([
+                tree["CARGO_TARGET_DIR"].clone(),
+                env["CARGO_TARGET_DIR"].clone(),
+            ])
+            .collect();
+        let mut distinct = targets.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), targets.len(), "{targets:?}");
+        let exec = caches.for_exec("a").env();
+        assert!(
+            Path::new(&exec["CARGO_TARGET_DIR"]).starts_with(caches.dir().join("cargo-target"))
+        );
+        for name in [
+            "ATOMIC_CACHE_DIR",
+            "XDG_CACHE_HOME",
+            "GOCACHE",
+            "RUSTUP_HOME",
+        ] {
+            assert_eq!(exec[name], env[name], "{name}");
         }
     }
 

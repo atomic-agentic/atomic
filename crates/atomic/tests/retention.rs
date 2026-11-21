@@ -520,33 +520,6 @@ fn a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content() {
     });
 }
 
-/// The holds are read before the runs: a step that records its reference
-/// and lets its hold go while the sweep reads the runs, after the sweep has
-/// read past its run, still keeps its content.
-#[test]
-fn the_holds_are_read_before_the_runs() {
-    on_codex_runtime(async {
-        let dir = scratch("holds-first");
-        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
-        register(&mut rt);
-        rt.launch().await.unwrap();
-        let store = LocalStore::open(dir.join("artifacts")).unwrap();
-        let patch = put(&store, b"let go as the runs are read");
-        backdate(&dir.join("artifacts"));
-        let hold = store.hold(&patch).unwrap();
-        let kept = retention::read_kept_then(&store, &rt, &BTreeSet::new(), || drop(hold))
-            .await
-            .unwrap();
-        let swept = store
-            .sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at)
-            .unwrap();
-        assert!(swept.removed.is_empty(), "{swept:?}");
-        assert!(held(&store, &patch), "removed after its hold was let go");
-        rt.shutdown(Duration::from_secs(5)).await.unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
-    });
-}
-
 #[test]
 fn a_digest_is_found_in_any_case_escaped_or_bare() {
     on_codex_runtime(async {

@@ -514,6 +514,7 @@ async fn engine_built_with(
             store,
             deployment: local(),
             worktrees,
+            caches: None,
             budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
