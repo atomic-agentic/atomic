@@ -379,6 +379,88 @@ async fn engine_built(
     backend: Option<atomic_exec::Backend>,
     store: LocalStore,
 ) -> Durare {
+    engine_built_with(dir, base_url, budgets, model, backend, store, None).await
+}
+
+/// As [`engine_storing`], with exec atoms' commands handing files over to
+/// `store`, as `atomic run` has them.
+async fn engine_handing_over(
+    dir: &Path,
+    base_url: &str,
+    store: LocalStore,
+    backend: Option<atomic_exec::Backend>,
+) -> Durare {
+    let artifacts = Artifacts::store(store.clone(), Default::default());
+    engine_built_with(
+        dir,
+        base_url,
+        BudgetSettings::default(),
+        "synthetic",
+        backend,
+        store,
+        Some(artifacts),
+    )
+    .await
+}
+
+/// The local backend, noting, as each exec step's workspace closes (after
+/// its command's files are stored, before its turn is recorded), the holds
+/// in `held`.
+struct HoldsAtClose {
+    held: PathBuf,
+    seen: Seen,
+    local: atomic_exec::LocalBackend,
+}
+
+/// Each workspace closed, by its label, with the holds seen then.
+type Seen = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+
+/// The names of the holds under `held`, every store's.
+fn holds_in(held: &Path) -> Vec<String> {
+    std::fs::read_dir(held)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|owner| std::fs::read_dir(owner.path()).into_iter().flatten())
+        .flatten()
+        .map(|hold| hold.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+impl atomic_exec::ExecutionBackend for HoldsAtClose {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((workspace.label.clone(), holds_in(&self.held)));
+        self.local.close(workspace)
+    }
+}
+
+async fn engine_built_with(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    backend: Option<atomic_exec::Backend>,
+    store: LocalStore,
+    artifacts: Option<Artifacts>,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -403,6 +485,14 @@ async fn engine_built(
             on.codex.backend = atomic_core::testing::denying_nothing(backend.clone());
             on.lite.backend = backend.clone();
             on.exec = backend;
+            Arc::new(on)
+        }
+        None => runtimes,
+    };
+    let runtimes = match artifacts {
+        Some(artifacts) => {
+            let mut on = (*runtimes).clone();
+            on.codex.artifacts = artifacts;
             Arc::new(on)
         }
         None => runtimes,
@@ -2009,6 +2099,104 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
             rank.contains("Export crashes on ac") && rank.contains('5'),
             "{rank}"
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// The files an exec step's command hands over are held while its turn
+/// runs and let go once the turn has recorded the output that references
+/// them, before the next step runs: a long-running process keeps no hold
+/// for a finished step.
+#[test]
+fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-holds");
+        let project = dir.join("project");
+        std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: patches\n")
+            .expect("manifest");
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/patch.py"),
+            "import json, os, sys\njson.load(sys.stdin)\n\
+             open(os.path.join(os.environ['ATOMIC_OUTPUTS'], 'p.diff'), 'w').write('+x\\n')\n\
+             json.dump({'patch': {'$file': 'p.diff', 'mediaType': 'text/x-diff'}}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("make-patch.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/make-patch';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Make a patch.', kind: 'exec', exec: { command: ['python3', 'tools/patch.py'] } };\n---\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            atoms.join("make-patch.input.schema.json"),
+            object(json!({"text": {"type": "string"}})).to_string(),
+        )
+        .expect("input");
+        std::fs::write(
+            atoms.join("make-patch.output.schema.json"),
+            object(json!({"patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}))
+                .to_string(),
+        )
+        .expect("output");
+        let pipeline = load(
+            &project,
+            "patch.workflow.yaml",
+            "atomic: 1\nname: patch\n\
+             input: { $ref: ../atoms/make-patch.input.schema.json }\n\
+             output: { $ref: ../atoms/make-patch.output.schema.json }\n\
+             steps:\n  make:\n    atom: make-patch\n    with: { text: input.text }\n\
+             \x20 again:\n    after: [make]\n    atom: make-patch\n    with: { text: input.text }\n\
+             returns: steps.again.output\n",
+        );
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = atomic_exec::Backend::connect(HoldsAtClose {
+            held: dir.join("artifacts/artifact-held"),
+            seen: seen.clone(),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects");
+        let rt = engine_handing_over(&dir, &model.base_url(), store.clone(), Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "fix it"}),
+        };
+        rt.start(PIPELINE, "patch-1", run).await.expect("start");
+        let out: Value = rt.result("patch-1").await.expect("finishes");
+        let patch: ArtifactRef = out["patch"]
+            .as_str()
+            .expect("a reference")
+            .parse()
+            .expect("parses");
+        assert!(store.contains(&patch).expect("contains"));
+        // Each step's file was held, once, after it was stored and before
+        // its turn was recorded; the first step's hold was let go before
+        // the second step ran.
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (_, holds) in &seen {
+            assert_eq!(holds.len(), 1, "{seen:?}");
+            assert!(holds[0].starts_with(patch.digest()), "{seen:?}");
+        }
+        // The first step's recorded output names what it held.
+        let steps = rt.steps("patch-1").await.expect("steps");
+        assert!(
+            steps
+                .iter()
+                .filter_map(|s| s.output.as_ref())
+                .any(|o| o.to_string().contains(patch.digest())),
+            "no recorded step names {patch}"
+        );
+        let holds = holds_in(&dir.join("artifacts/artifact-held"));
+        assert!(holds.is_empty(), "held after its turn: {holds:?}");
+        assert_eq!(model.calls(), 0);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
@@ -3750,6 +3938,195 @@ fn trust_is_checked_per_binding() {
     .expect("agent accepted");
 }
 
+/// Start `pipeline` on a fresh engine and return why it was refused, with
+/// the number of model calls made first.
+async fn refused(dir: &Path, pipeline: Pipeline, run: &str) -> (String, usize) {
+    let model = FakeModel::start(vec![
+        Reply::Text(READ.into()),
+        Reply::Text(RANK.into()),
+        Reply::Text(SUMMARY.into()),
+    ])
+    .await
+    .expect("fake model");
+    let rt = engine(dir, &model.base_url()).await;
+    let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+    rt.start(PIPELINE, run, PipelineRun { pipeline, input })
+        .await
+        .expect("start");
+    let error = rt
+        .result::<Value>(run)
+        .await
+        .expect_err("refused")
+        .to_string();
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    (error, model.calls())
+}
+
+/// The atom step `id` of `pipeline`.
+fn atom_step<'p>(pipeline: &'p mut Pipeline, id: &str) -> &'p mut atomic_app::pipeline::AtomStep {
+    pipeline
+        .steps
+        .iter_mut()
+        .find_map(|s| match s {
+            Step::Atom(step) if step.id == id => Some(step),
+            _ => None,
+        })
+        .expect("the step")
+}
+
+#[test]
+fn a_run_is_held_to_its_atoms_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-dispatch");
+        let project = project(&dir);
+        // Prepared as the loader allows, then handed to the engine with the
+        // rank step's atom trusting only team input. The rank step maps the
+        // read step's output, agent data: as a run prepared some other way
+        // would be, it is refused before the read step, or any, runs.
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline
+            .atoms
+            .get_mut("rank-note")
+            .expect("rank-note")
+            .frontmatter["trust"] = json!("team");
+        let (error, calls) = refused(&dir, pipeline, "untrusted").await;
+        assert!(
+            error.contains("step `rank`")
+                && error.contains("is agent data")
+                && error.contains("accepts team input at most"),
+            "{error}"
+        );
+        assert!(
+            error.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+            "the refusal names what to change"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+
+        // A trust a stored run's atom holds that is none of the three, a
+        // string or not, accepts nothing, and the refusal says what to set.
+        for (n, (trust, written)) in [
+            (json!("Team"), "`trust: 'Team'`"),
+            (json!(1), "`trust: 1`"),
+            (json!(["team"]), "`trust: [\"team\"]`"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+            pipeline
+                .atoms
+                .get_mut("rank-note")
+                .expect("rank-note")
+                .frontmatter["trust"] = trust;
+            let (error, calls) = refused(&dir, pipeline, &format!("unknown-trust-{n}")).await;
+            assert!(
+                error.contains(&format!("declares {written}"))
+                    && error.contains("accepts no input"),
+                "{error}"
+            );
+            assert!(
+                error.contains("set atom `rank-note`'s `trust` to external, agent or team"),
+                "the refusal says to set a known trust"
+            );
+            assert_eq!(calls, 0);
+        }
+    });
+}
+
+#[test]
+fn a_bindings_origin_at_run_time_is_the_lower_of_what_was_recorded_and_what_it_reads() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-origins");
+        let project = project(&dir);
+        trusting_atom(&project, "team");
+        // Literals: team data, so the loader takes them.
+        let literals =
+            policy_workflow("'Be brief.'", "").replace("note: input.text", "note: \"'A note.'\"");
+        let prepared = load(&project, "policy.workflow.yaml", &literals);
+        // A field the run recorded no origin for counts as external.
+        let mut pipeline = prepared.clone();
+        atom_step(&mut pipeline, "apply").origins.clear();
+        let (error, calls) = refused(&dir, pipeline, "no-origins").await;
+        assert!(
+            error.contains("step `apply`") && error.contains("is external data"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("`origins` entry"),
+            "the advice names no origins entry the run did not record"
+        );
+        assert_eq!(calls, 0);
+        // A recorded origin above what the binding reads is not believed:
+        // the run's input, marked team, is still external.
+        let mut pipeline = prepared.clone();
+        let step = atom_step(&mut pipeline, "apply");
+        step.with.insert("note".into(), "input.text".into());
+        step.origins.insert("note".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "raised-origin").await;
+        assert!(error.contains("`input.text` is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // A recorded origin below what the binding reads is kept, and the
+        // refusal says the `origins` entry lowered it.
+        let mut pipeline = prepared;
+        atom_step(&mut pipeline, "apply")
+            .origins
+            .insert("policy".into(), "agent".into());
+        let (error, _) = refused(&dir, pipeline, "lowered-origin").await;
+        assert!(
+            error.contains("remove the `origins` entry that marks it agent"),
+            "the refusal names the lowering entry"
+        );
+    });
+}
+
+#[test]
+fn a_refused_binding_says_what_can_take_its_place() {
+    let dir = scratch("trust-advice");
+    let project = project(&dir);
+    trusting_atom(&project, "team");
+    let refusal = |text: &str| {
+        let file = project.join("workflows/advice.workflow.yaml");
+        std::fs::write(&file, text).expect("workflow");
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        let error = workflow::load(&file, &atoms, &mut registry).expect_err("refused");
+        (error.message, error.action.unwrap_or_default())
+    };
+    // A model step's output, agent data, for a team atom, its other field a
+    // literal: what yields team data takes its place.
+    let (message, agent) = refusal(
+        &policy_workflow("steps.read.output.title", "")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(message.contains("is agent data"), "{message}");
+    assert!(
+        agent.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+        "the advice names the team sources"
+    );
+    assert!(
+        !agent.contains("`origins` entry"),
+        "no origins entry to remove"
+    );
+    // A literal that `origins` lowered: the advice names that entry.
+    let (_, lowered) = refusal(
+        &policy_workflow("'Be brief.'", "    origins: { policy: agent }\n")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(
+        lowered.contains("remove the `origins` entry that marks it agent"),
+        "the advice names the lowering entry"
+    );
+}
+
 /// The shape of a serialized value: each object's keys, with the shape of
 /// what each holds, an array's first element, and a scalar's type. The
 /// values under `opaque` keys are data whose keys are not layout, such as a
@@ -4626,6 +5003,126 @@ fn the_candidate_reaches_the_reviewer_as_external_data() {
     let review = read.review.as_ref().expect("a review");
     assert_eq!(review.origins["title"], "external", "{review:?}");
     assert_eq!(review.origins["text"], "external", "{review:?}");
+}
+
+#[test]
+fn a_review_is_held_to_its_reviewers_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("review-trust-dispatch");
+        let project = project(&dir);
+        let prepared = reviewed(&project, 1);
+        // A reviewer that accepts only agent input, handed the candidate,
+        // external data, in a run prepared some other way.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("agent");
+        let (error, calls) = refused(&dir, pipeline, "reviewer-trust").await;
+        assert!(
+            error.contains("step `read`: `review.with.")
+                && error.contains("is external data")
+                && error.contains("accepts agent input at most"),
+            "{error}"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+        // A recorded review origin above what the binding reads is not
+        // believed.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("team");
+        let review = atom_step(&mut pipeline, "read")
+            .review
+            .as_mut()
+            .expect("a review");
+        review.origins.insert("text".into(), "team".into());
+        review.origins.insert("title".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-raised").await;
+        assert!(error.contains("is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // An author that accepts agent input, its own binding a literal, is
+        // not handed the findings on external data in a repair round.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("read-note")
+            .expect("read-note")
+            .frontmatter["trust"] = json!("agent");
+        let step = atom_step(&mut pipeline, "read");
+        step.with.insert("text".into(), "'Exports crash.'".into());
+        step.origins.insert("text".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-findings").await;
+        assert!(
+            error.contains("`review.rounds`") && error.contains("a repair round hands `read-note`"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+        // A reviewer whose trust is none of the three accepts nothing.
+        let mut pipeline = prepared;
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!(true);
+        let (error, calls) = refused(&dir, pipeline, "reviewer-unknown").await;
+        assert!(
+            error.contains("declares `trust: true`")
+                && error.contains("set atom `check-title`'s `trust` to external, agent or team"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+    });
+}
+
+#[test]
+fn a_review_whose_atoms_trust_is_unknown_fails_to_load() {
+    let dir = scratch("review-trust-unknown");
+    let project = project(&dir);
+    reviewed(&project, 1);
+    // Each atom as loaded, then the one named given a `trust` the load of
+    // an atom file refuses, as one built some other way might hold.
+    let load_with = |name: &str| {
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        atoms.get_mut(name).expect("the atom").frontmatter["trust"] = json!(1);
+        workflow::load(
+            &project.join("workflows/reviewed.workflow.yaml"),
+            &atoms,
+            &mut registry,
+        )
+        .expect_err("refused")
+    };
+    let error = load_with("check-title");
+    assert!(
+        error.path.ends_with("/review/reviewer")
+            && error
+                .message
+                .contains("atom `check-title` declares `trust: 1`")
+            && error.message.contains("accepts no input"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.action.as_deref(),
+        Some("set atom `check-title`'s `trust` to external, agent or team")
+    );
+    let error = load_with("read-note");
+    assert!(
+        error
+            .message
+            .contains("atom `read-note` declares `trust: 1`"),
+        "{error:?}"
+    );
 }
 
 #[test]

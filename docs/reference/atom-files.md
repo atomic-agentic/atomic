@@ -207,8 +207,12 @@ are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
 (which holds the well-known `64:ff9b::/96` and the local-use
 `64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
 IPv6-only network that reaches IPv4 through DNS64, a listed host with only
-an IPv4 address therefore cannot be reached: its request fails when the
-proxy dials, with all resolved addresses blocked.
+an IPv4 address therefore cannot be reached: the proxy refuses the address
+DNS64 makes up for it, and the IPv4 one has no route. A NAT64 prefix of the
+network's own, other than `64:ff9b::/32`, is not covered. The machine's
+addresses are read when a proxy starts: one it gains while that proxy runs is
+not refused by it, and a command that starts after the change gets a new
+proxy that refuses it.
 
 Know what a listed host can get:
 
@@ -219,9 +223,19 @@ Know what a listed host can get:
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
-- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
-  a shared-hosting suffix reaches every customer's buckets and sites there, not
-  only yours. List the exact names.
+- **Every name under a wildcard.** atomic checks a wildcard against the
+  Public Suffix List, its ICANN section (`co.uk`) and its private one, where
+  each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
+  is refused when the atom loads if the name under it is on the list, or if
+  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
+  others: name the exact hosts instead. A wildcard above a listed name, such
+  as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
+  it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
+  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  hold, such as `*.example.com`, still reaches whatever is served under it,
+  and a shared host missing from the list is not caught. List exact names
+  where you can.
 
 The rule is enforced on Linux only. On macOS and Windows exec commands run
 unconfined, with whatever network the machine has, and a declaration restricts
@@ -354,7 +368,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default); any other value fails the load. A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts. Before a run's first step, every step is checked again, on what the run recorded and what its bindings read; a resumed or served run is checked on its recorded data. See [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -383,12 +397,24 @@ under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
 variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as the file or
-directory it points at, when that is yours and outside the system's
-directories: a history file linked to `/dev/null`, or a tool linked to the
-system's `python3`, stays usable. A turn does not start when a denial would
-cover its working directory or a directory it may write, or when a linked
-secret lies inside a directory it may write. The model chooses the
+four directory levels inside a denied directory, is denied as what it
+points at, whoever owns it and wherever it is, under `/run`, `/etc` or
+`/opt` too. Never denied, so that commands keep working: anything under
+`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
+and any device, such as `/dev/null`. A credential place that is itself a
+link, such as a `~/.netrc` kept with your dotfiles, is otherwise always
+denied as what it points at, whatever its mode or owner, unless that is the
+root or one of the system's top-level directories. A link found inside a
+credential place is also left alone when it leads to a program (a file with
+any execute bit that starts as a binary or a `#!` script does) or to a
+directory someone else owns, so a virtual environment's `python` linked to
+a toolchain's keeps working; what it leads to stays readable. A key linked
+to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
+credential place is denied like a file. A turn does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place, or a linked secret, lies two or more levels inside a directory
+it may write, where a command could move the directory above it away from
+its denial. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

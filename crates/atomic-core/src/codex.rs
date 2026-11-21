@@ -397,8 +397,10 @@ const LINK_DEPTH: usize = 4;
 /// past this nothing runs.
 const MAX_LINK_TARGETS: usize = 512;
 
-/// Where the system keeps what every command needs: a link into one of
-/// these is never followed to deny its target.
+/// Where the system keeps the programs and libraries every command needs,
+/// and its devices: a link into one of these is never followed to deny its
+/// target. Secrets kept elsewhere by the system, under `/run`, `/etc` or
+/// `/opt`, are denied when a credential place links to them.
 const SYSTEM_PREFIXES: &[&str] = &[
     "/usr",
     "/bin",
@@ -407,14 +409,32 @@ const SYSTEM_PREFIXES: &[&str] = &[
     "/lib32",
     "/lib64",
     "/libx32",
-    "/etc",
-    "/opt",
     "/nix/store",
     "/dev",
     "/proc",
     "/sys",
-    "/run",
 ];
+
+/// Why a deny list could not be made: nothing runs. Not the model's doing.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DenyRefused(pub String);
+
+/// Whether `meta` is a character or block device, such as `/dev/null`:
+/// never denied, since every command may need it.
+fn device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let kind = meta.file_type();
+        kind.is_char_device() || kind.is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
 
 /// The links up to [`LINK_DEPTH`] directory levels inside `dir`. Links to
 /// directories are not walked into.
@@ -434,29 +454,71 @@ fn links_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What a link or a variable resolved to, if it should be denied: only a
-/// regular file or a directory, the person's own, outside the system's
-/// directories. A history file linked to `/dev/null`, or a tool linked to
-/// the system's `python3`, is left alone, since denying it would break
-/// every command.
-fn deniable(target: &Path) -> bool {
+/// Directories a credential place that is a link may point at and still not
+/// be denied, since every command needs them: the root and the system's
+/// top-level directories, each exactly.
+const NEVER_DENIED: &[&str] = &[
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/libx32", "/media",
+    "/mnt", "/nix", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr",
+    "/var",
+];
+
+/// What a link resolved to, if it should be denied.
+///
+/// Never a device, nor anything under the system's program, library and
+/// device directories ([`SYSTEM_PREFIXES`]). A credential place that is
+/// itself a link (`listed`), such as `~/.netrc` kept with a person's
+/// dotfiles, is otherwise denied as what it points at, whoever owns it and
+/// whatever its mode, but for the system's top-level directories
+/// ([`NEVER_DENIED`]). A link found inside a credential place is also left
+/// alone when it leads to a program (a file with an execute bit that starts
+/// as one does) or to a directory someone else owns: a virtual
+/// environment's `python` linked to a toolchain's keeps working. A key
+/// linked to one a secrets manager keeps under `/run`, or a cluster's
+/// credentials under `/etc`, are denied whoever owns them.
+fn deniable(target: &Path, listed: bool) -> bool {
     let Ok(meta) = std::fs::metadata(target) else {
         return false;
     };
-    if !(meta.is_file() || meta.is_dir()) {
+    if device(&meta) || SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
         return false;
     }
-    if SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
-        return false;
+    if listed {
+        return !NEVER_DENIED.iter().any(|p| target == Path::new(p));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != crate::state::effective_uid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && program(target) {
+            return false;
+        }
+        if meta.is_dir() && meta.uid() != crate::state::effective_uid() {
             return false;
         }
     }
     true
+}
+
+/// Whether the file at `path` starts as a program does: an ELF or Mach-O
+/// binary, or a script with `#!`.
+fn program(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0u8; 4];
+    let Ok(read) = std::fs::File::open(path).and_then(|mut f| f.read(&mut start)) else {
+        return false;
+    };
+    let start = &start[..read];
+    start.starts_with(b"#!")
+        || start.starts_with(b"\x7fELF")
+        || [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+        ]
+        .iter()
+        .any(|magic| start == magic)
 }
 
 /// Every path a profile denies under `guard`, for a thread whose Codex home
@@ -489,16 +551,48 @@ fn denied_paths(
     writable: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
-    let mut writable = writable;
+    let mut writable = roots.clone();
     writable.push(real(&private.state_dir));
     let mut needed = writable.clone();
     needed.extend(cwd.map(real));
     needed.push(real(codex_home));
     needed.extend(std::env::current_exe().ok().map(|p| real(&p)));
     let covers = |denied: &Path| needed.iter().find(|n| n.starts_with(denied)).cloned();
+    let refuse = |why: String| anyhow::Error::new(DenyRefused(why));
+    let holds = |path: &Path, needed: &Path| {
+        refuse(format!(
+            "{} holds {}, which atoms' commands need, so atomic cannot deny it; keep the \
+             project and atomic's state outside the places that hold credentials, and point \
+             any variable that names such a place (HISTFILE, CODEX_HOME and the like) elsewhere",
+            path.display(),
+            needed.display()
+        ))
+    };
+    // A denied place two or more levels inside a directory the thread may
+    // write could be moved out from under its denial by a command renaming
+    // a directory above it; one directly inside cannot, since the sandbox's
+    // mount on it is busy.
+    let movable = |path: &Path, real_path: &Path, within: &[PathBuf]| {
+        within
+            .iter()
+            .find(|w| {
+                real_path
+                    .strip_prefix(w)
+                    .is_ok_and(|rest| rest.components().count() >= 2)
+            })
+            .map(|root| {
+                refuse(format!(
+                    "{} is inside {}, which atoms' commands may write, so a command could move \
+                     it out from under its denial; run with a working directory that does not \
+                     hold it",
+                    path.display(),
+                    root.display()
+                ))
+            })
+    };
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
@@ -507,24 +601,38 @@ fn denied_paths(
     // such as a variable naming the root.
     for path in &denied {
         if let Some(needed) = covers(&real(path)).or_else(|| covers(path)) {
-            bail!(
-                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
-                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
-                path.display(),
-                needed.display()
-            );
+            return Err(holds(path, &needed));
         }
     }
+    // The places themselves, resolved, which what is found inside them
+    // needs no denial of its own beside: a place as it is, or what a place
+    // that is a link points at, when that is denied.
+    let base = denied.len();
+    let places: Vec<PathBuf> = denied
+        .iter()
+        .filter_map(|p| {
+            let meta = std::fs::symlink_metadata(p).ok()?;
+            let target = real(p);
+            (!meta.file_type().is_symlink() || deniable(&target, true)).then_some(target)
+        })
+        .collect();
     let mut links = Vec::new();
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
     }
+    // Only the links that lead somewhere a denial is needed count against
+    // the cap.
+    links.retain(|link| {
+        std::fs::canonicalize(link)
+            .is_ok_and(|t| deniable(&t, false) && !places.iter().any(|p| t.starts_with(p)))
+    });
     if links.len() > MAX_LINK_TARGETS {
-        bail!(
-            "the places denied to atoms' commands hold {} links, more than the {MAX_LINK_TARGETS} \
-             atomic follows; remove some, or keep the files they point at inside those places",
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {} links to files elsewhere, more than \
+             the {MAX_LINK_TARGETS} atomic follows; remove some, or keep the files they point at \
+             inside those places",
             links.len()
-        );
+        )));
     }
     denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
@@ -556,55 +664,57 @@ fn denied_paths(
             all.push(entry);
         }
     }
-    for path in denied {
+    for (i, path) in denied.into_iter().enumerate() {
+        let found = i >= base;
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             // Nothing there yet: denied once it is.
             all.push(path);
             continue;
         };
-        let target = std::fs::canonicalize(&path).ok();
-        if meta.file_type().is_symlink() || target.as_ref().is_some_and(|t| *t != path) {
-            // A link, or a path through one: what it resolves to, if that
-            // is a file or directory of the person's, and never what the
-            // thread needs or may write.
-            let Some(target) = target.filter(|t| deniable(t)) else {
+        if meta.file_type().is_symlink() {
+            // A link: the sandbox cannot mount on one, so what it resolves
+            // to, if that should be denied, and never what the thread
+            // needs or may write. A target inside another denied place is
+            // denied with it.
+            let Some(target) = std::fs::canonicalize(&path)
+                .ok()
+                .filter(|t| deniable(t, !found))
+            else {
                 continue;
             };
+            if found && places.iter().any(|p| target.starts_with(p)) {
+                continue;
+            }
             if let Some(needed) = covers(&target) {
-                bail!(
+                return Err(refuse(format!(
                     "{} resolves to {}, which holds {}, which atoms' commands need; atomic \
                      cannot deny it",
                     path.display(),
                     target.display(),
                     needed.display()
-                );
+                )));
             }
-            if let Some(root) = writable.iter().find(|w| target.starts_with(w)) {
-                bail!(
-                    "{} resolves to {}, inside {}, which atoms' commands may write, so a command \
-                     could move it out from under its denial; keep it elsewhere",
-                    path.display(),
-                    target.display(),
-                    root.display()
-                );
+            if let Some(refused) = movable(&path, &target, &writable) {
+                return Err(refused);
             }
-            all.push(target.clone());
-            if !meta.file_type().is_symlink() {
-                all.push(path);
-            }
+            all.push(target);
             continue;
         }
-        if !(meta.is_file() || meta.is_dir()) {
-            // A device or socket, such as a variable naming /dev/null.
+        // A place as it is named, under both spellings when a directory
+        // above it is a link; only a device, such as a variable naming
+        // /dev/null, is left out. A pipe or socket is denied like a file.
+        if device(&meta) {
             continue;
         }
-        if let Some(needed) = covers(&path) {
-            bail!(
-                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
-                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
-                path.display(),
-                needed.display()
-            );
+        let real_path = real(&path);
+        if let Some(needed) = covers(&real_path) {
+            return Err(holds(&path, &needed));
+        }
+        if let Some(refused) = movable(&path, &real_path, &roots) {
+            return Err(refused);
+        }
+        if real_path != path {
+            all.push(real_path);
         }
         all.push(path);
     }
@@ -1139,10 +1249,11 @@ impl ExecSandbox {
         self
     }
 
-    /// The profile for a command that may write `writable`, except the
-    /// directories in `read_only` inside them.
+    /// The profile for a command run in `cwd` that may write `writable`,
+    /// except the directories in `read_only` inside them.
     fn profile(
         &self,
+        cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
@@ -1153,7 +1264,7 @@ impl ExecSandbox {
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
-            None,
+            Some(cwd),
             writable,
         )?;
         let mut policy = base.file_system_sandbox_policy();
@@ -1221,7 +1332,7 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.writable, &command.read_only)
+            .profile(&command.cwd, &command.writable, &command.read_only)
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -1919,7 +2030,8 @@ where
             seen,
             recorded: seen,
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let (turn, progress) = span
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
@@ -2479,6 +2591,11 @@ impl Progress {
     }
 }
 
+/// Where a running turn sends a line it has to say: production gives the
+/// recorder none, and the line goes to the log; a test gives it one and
+/// reads the line back.
+type Said = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Where a running turn's reported usage is recorded as it grows, so that a
 /// turn whose process is stopped or killed before it settles stays charged
 /// at least what it reported (see [`crate::usage::Meter::progress`]).
@@ -2491,8 +2608,12 @@ struct ProgressLog<'a> {
     recorded: (i64, i64),
     /// How many times it recorded.
     records: u32,
-    /// Whether a record failed, and was said to.
-    warned: bool,
+    /// How many times a failed record was said to, which is at most once a
+    /// turn. Counted rather than flagged, so that a second one trying to
+    /// follow the first is visible to a test instead of merely unseen.
+    warnings: u32,
+    /// Where what it says goes (see [`Said`]).
+    said: Option<Said>,
 }
 
 /// How long a turn waits on one record of its progress before it goes on
@@ -2539,29 +2660,51 @@ impl ProgressLog<'_> {
                     ));
                 }
             }
-            failed if !self.warned => {
-                self.warned = true;
+            failed if self.warnings == 0 => {
+                self.warnings += 1;
                 let why = match failed {
                     Ok(Err(e)) => e.to_string(),
                     _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
                 };
-                // The meter's request id is `<run>:<step>:<call>`.
                 let (run, request) = match self.ticket {
-                    Some(t) => (
-                        t.request.rsplitn(3, ':').nth(2).unwrap_or(&t.request),
-                        t.request.as_str(),
-                    ),
+                    Some(t) => (run_of_request(&t.request), t.request.as_str()),
                     None => ("?", "?"),
                 };
-                crate::log_line!(
-                    "run {run}: a Codex turn's usage so far was not recorded for request \
-                     {request} ({why}); until it is, a stop before the turn settles leaves it \
-                     charged at its last record"
-                );
+                let line = progress_warning(run, request, &why, self.records > 0);
+                match &self.said {
+                    Some(said) => said(&line),
+                    None => crate::log_line!("{line}"),
+                }
             }
             _ => {}
         }
     }
+}
+
+/// The run a meter's request id names. The ledger meter in the `atomic`
+/// binary makes each one as `<run>:<step>:<call>`, so the run is what is
+/// left after two fields are cut off the end: a run's id may itself hold
+/// colons. An id of any other shape names no run and is said as it is.
+fn run_of_request(request: &str) -> &str {
+    request.rsplitn(3, ':').nth(2).unwrap_or(request)
+}
+
+/// What a turn says when a record of its progress fails. `recorded` is
+/// whether any record of it was ever written: with none, a stop before the
+/// turn settles leaves it charged what its admission reserved, and only
+/// with one is there a last record to be charged at (see
+/// [`ProgressLog::note`]).
+fn progress_warning(run: &str, request: &str, why: &str, recorded: bool) -> String {
+    let charged = if recorded {
+        "charged at its last record"
+    } else {
+        "charged at the whole bound its request reserved"
+    };
+    format!(
+        "run {run}: a Codex turn's usage so far was not recorded for request \
+         {request} ({why}); until it is, a stop before the turn settles leaves \
+         it {charged}"
+    )
 }
 
 /// Run one turn, cut off after `time` if one is given, recording its
@@ -2855,11 +2998,20 @@ mod tests {
         let project = home.join("project");
         assert!(refused(vec![home.clone()], Some(&project), &[]).contains("need"));
         assert!(refused(vec![dir.clone()], None, &[]).contains("need"));
-        // A secret linked into a directory the thread may write.
-        std::fs::write(work.join("creds"), "x").expect("creds");
-        link(&work.join("creds"), &home.join(".aws/credentials"));
+        // A secret linked two levels into a directory the thread may write,
+        // where a command could rename the directory above it; directly
+        // inside, the sandbox's mount on it cannot be moved.
+        std::fs::create_dir_all(work.join("deep")).expect("deep");
+        std::fs::write(work.join("deep/creds"), "x").expect("creds");
+        link(&work.join("deep/creds"), &home.join(".aws/credentials"));
         let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&work));
         assert!(message.contains("may write"), "{message}");
+        std::fs::write(work.join("creds"), "x").expect("creds");
+        link(&work.join("creds"), &home.join(".aws/credentials"));
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&work)),
+            ""
+        );
         // Too many links to follow.
         std::fs::remove_file(home.join(".aws/credentials")).expect("unlink");
         let many = home.join(".kube");
@@ -2868,9 +3020,132 @@ mod tests {
         for i in 0..=MAX_LINK_TARGETS {
             link(&dir.join("one"), &many.join(format!("l{i}")));
         }
-        assert!(refused(vec![many], None, &[]).contains("links"));
+        assert!(refused(vec![many.clone()], None, &[]).contains("links"));
+        // Links inside the place they are in count for nothing.
+        std::fs::remove_dir_all(&many).expect("unlink");
+        std::fs::create_dir_all(&many).expect("kube");
+        std::fs::write(many.join("one"), "x").expect("one");
+        for i in 0..=MAX_LINK_TARGETS {
+            link(&many.join("one"), &many.join(format!("l{i}")));
+        }
+        assert_eq!(refused(vec![many.clone()], None, &[]), "");
+        // A place inside a directory the thread may write could be moved
+        // away from its denial; a link inside a place, to the place, is
+        // no reason to refuse.
+        link(&home.join(".aws"), &home.join(".aws/current"));
+        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&dir));
+        assert!(message.contains("may write"), "{message}");
+        // With the home itself the working directory a turn may write, as a
+        // project at the home's top is, its places directly inside stay.
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&home)),
+            ""
+        );
+        std::fs::remove_file(home.join(".aws/current")).expect("unlink");
         // And the same places, safely, run.
         assert_eq!(refused(vec![home.join(".aws")], Some(&project), &[]), "");
+        // A refusal is the machine's, not the model's.
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec!["/".into()],
+        };
+        let refusal = denied_paths(&private, &codex, None, &[]).expect_err("refused");
+        assert!(refusal.downcast_ref::<DenyRefused>().is_some(), "{refusal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_denied_and_only_programs_devices_and_others_directories_are_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("pipes");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        let fifo = home.join(".netrc");
+        let _ = std::fs::remove_file(&fifo);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        // A program of the person's, a key and a directory elsewhere.
+        std::fs::create_dir_all(dir.join("tools")).expect("tools");
+        std::fs::write(dir.join("tools/python3"), "#!/bin/sh\n").expect("program");
+        std::fs::set_permissions(
+            dir.join("tools/python3"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("mode");
+        std::fs::write(dir.join("key"), "x").expect("key");
+        link(&dir.join("tools/python3"), &home.join(".ssh/bin/python3"));
+        link(&dir.join("key"), &home.join(".ssh/id"));
+        // Files with an execute bit that are no programs, as on a file
+        // system that marks everything executable: one found by the walk,
+        // and one a credential place itself links to.
+        for name in ["marked-key", "marked-pgpass"] {
+            std::fs::write(dir.join(name), "machine example.com password x\n").expect("file");
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o777))
+                .expect("mode");
+        }
+        link(&dir.join("marked-key"), &home.join(".ssh/marked"));
+        link(&dir.join("marked-pgpass"), &home.join(".pgpass"));
+        // A credential place that links to a program is still denied.
+        link(&dir.join("tools/python3"), &home.join(".vault-token"));
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![
+                fifo.clone(),
+                home.join(".ssh"),
+                home.join(".pgpass"),
+                home.join(".vault-token"),
+            ],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        assert!(denied.contains(&fifo), "{denied:?}");
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        assert!(denied.contains(&real(&dir.join("key"))), "{denied:?}");
+        for marked in ["marked-key", "marked-pgpass"] {
+            assert!(
+                denied.contains(&real(&dir.join(marked))),
+                "{marked}: {denied:?}"
+            );
+        }
+        // Found by the walk, the program is left; linked to by a credential
+        // place, it is denied.
+        assert!(
+            denied.contains(&real(&dir.join("tools/python3"))),
+            "{denied:?}"
+        );
+        assert!(!deniable(&real(&dir.join("tools/python3")), false));
+        // Whoever owns them: what the system keeps outside its program and
+        // device directories, such as a cluster's credentials under /etc.
+        assert!(
+            Path::new("/etc/hostname").is_file(),
+            "a file the system keeps"
+        );
+        assert!(deniable(Path::new("/etc/hostname"), false));
+        assert!(!deniable(Path::new("/usr/bin/env"), false));
+        assert!(!deniable(Path::new("/dev/null"), true));
+        // A directory someone else owns, found by the walk, stays; one a
+        // credential place links to is denied, but for the system's own.
+        if crate::state::effective_uid() != 0 {
+            assert!(
+                !deniable(Path::new("/etc"), false),
+                "root's, found by the walk"
+            );
+        }
+        assert!(!deniable(Path::new("/etc"), true), "the system's own");
+        // A directory under them that a credential place links to, such as
+        // a cluster's, is denied whoever owns it.
+        if Path::new("/etc/ssl").is_dir() {
+            let ssl = std::fs::canonicalize("/etc/ssl").expect("real");
+            if !SYSTEM_PREFIXES.iter().any(|p| ssl.starts_with(p)) {
+                assert!(deniable(&ssl, true), "{ssl:?}");
+            }
+        }
+        assert!(!deniable(Path::new("/"), true), "the root");
     }
 
     #[cfg(unix)]
@@ -3831,6 +4106,18 @@ mod tests {
         }
     }
 
+    /// A sink for a [`ProgressLog`] to say its warnings into, and the lines
+    /// it keeps: a test hands the sink to a recorder as `said` and reads
+    /// back what it wrote, instead of what reached the log.
+    fn warning_sink() -> (Said, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let lines = lines.clone();
+            move |line: &str| lines.lock().expect("said").push(line.to_owned())
+        };
+        (Arc::new(sink), lines)
+    }
+
     #[tokio::test]
     async fn a_progress_record_advances_only_once_written_and_a_failure_is_said_once() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -3840,13 +4127,15 @@ mod tests {
         });
         let metering = Metering::new(meter.clone());
         let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
         let mut log = ProgressLog {
             meter: &metering,
             ticket: Some(&ticket),
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: Some(sink),
         };
         let grown = Progress {
             usage: Some((3, 2, 5)),
@@ -3855,15 +4144,72 @@ mod tests {
         // A failed record does not advance, so the next token event, though
         // it reports nothing new, tries it again; the failure is said once.
         log.note(&grown).await;
-        assert_eq!((log.recorded, log.records, log.warned), ((0, 0), 0, true));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 2);
-        assert_eq!((log.recorded, log.records), ((0, 0), 0));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
+        // What was written, not what was meant: two failures asked for, one
+        // line said. Drop the guard that says it once and this is two.
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "said once, of two failures: {lines:?}");
+        // Nothing was recorded, so a stop would charge the reservation, and
+        // the line names it instead of a record that does not exist.
+        assert!(lines[0].contains("reserved"), "{lines:?}");
+        assert!(!lines[0].contains("last record"), "{lines:?}");
+        // The run it names is the run the request id belongs to.
+        assert!(lines[0].starts_with("run run-1: "), "{lines:?}");
         // Written, it advances; with nothing new, nothing is asked again.
         log.note(&grown).await;
         assert_eq!((log.recorded, log.records), ((3, 2), 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_progress_warning_of_a_turn_that_had_recorded_names_its_last_record() {
+        let meter = Arc::new(Flaky {
+            failing: 1.into(),
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (3, 2),
+            records: 1,
+            warnings: 0,
+            said: Some(sink),
+        };
+        // One record is kept, the turn reports more, and the store refuses
+        // it: what a stop would charge is that last record, not a bound a
+        // record was meant to replace.
+        log.note(&Progress {
+            usage: Some((5, 4, 9)),
+            ..Progress::default()
+        })
+        .await;
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("last record"), "{lines:?}");
+        assert!(!lines[0].contains("reserved"), "{lines:?}");
+        assert_eq!((log.recorded, log.records), ((3, 2), 1));
+    }
+
+    #[test]
+    fn the_run_a_request_id_names_keeps_the_colons_it_has() {
+        // The ledger meter makes every request id `<run>:<step>:<call>`, so
+        // only the last two fields are cut off (see `metering` in the
+        // `atomic` binary).
+        assert_eq!(run_of_request("run-1:2:0"), "run-1");
+        assert_eq!(run_of_request("wf:7:ab:2:0"), "wf:7:ab");
+        // An id of any other shape names no run and is said as it is, as
+        // the ids of a meter that keeps nothing between admit and settle.
+        assert_eq!(run_of_request("r:0"), "r:0");
+        assert_eq!(run_of_request("0"), "0");
+        assert_eq!(run_of_request(""), "");
     }
 
     #[tokio::test]
@@ -3880,7 +4226,8 @@ mod tests {
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let started = std::time::Instant::now();
         log.note(&Progress {
@@ -3893,7 +4240,7 @@ mod tests {
             waited >= PROGRESS_PATIENCE && waited < PROGRESS_PATIENCE * 3,
             "{waited:?}"
         );
-        assert_eq!((log.records, log.warned), (0, true));
+        assert_eq!((log.records, log.warnings), (0, 1));
     }
 
     async fn metered_conversation(
