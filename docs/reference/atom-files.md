@@ -199,7 +199,16 @@ another private suffix, a bare `*`, and anything with a scheme, a port, a path
 or a Unix socket are refused. That list of private names is a courtesy. The
 control is the proxy, which resolves each listed name before it connects and
 refuses one that resolves to an address on this machine or a private network,
-or that does not resolve.
+or that does not resolve. Every address the interfaces of atomic's network
+namespace have counts as this machine's, public ones included; a container's
+or a virtual machine's addresses on another namespace are refused only when
+they are private. Three IPv6 prefixes that carry an IPv4 address inside them
+are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
+(which holds the well-known `64:ff9b::/96` and the local-use
+`64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
+IPv6-only network that reaches IPv4 through DNS64, a listed host with only
+an IPv4 address therefore cannot be reached: its request fails when the
+proxy dials, with all resolved addresses blocked.
 
 Know what a listed host can get:
 
