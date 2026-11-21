@@ -4389,6 +4389,23 @@ mod tests {
         );
     }
 
+    /// A mount table the helper cannot read as one refuses the command,
+    /// whatever else it finds: it cannot tell where what it denies is
+    /// mounted now.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_table_that_cannot_be_read_refuses_the_command() {
+        let dir = Scratch::new("table-unread");
+        let place = dir.0.join("home/.aws");
+        std::fs::create_dir_all(&place).expect("dir");
+        let _table = crate::mounts::with_table(b"not a mount table\n");
+        let only = std::slice::from_ref(&place);
+        assert!(
+            late_link_targets(only, Some(only), &[], &[])
+                .is_err_and(|e| e.downcast_ref::<DenyRefused>().is_some())
+        );
+    }
+
     /// A second mount made since, two or more levels inside a directory the
     /// command may write, refuses it: it could move it out from under its
     /// denial.

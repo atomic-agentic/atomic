@@ -438,6 +438,7 @@ fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
 /// paths with no link in them, and each filesystem mounted inside one.
+#[cfg(test)]
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     aliases_in(&Index::new(mounts), mounts, denied)
 }
