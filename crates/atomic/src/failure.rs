@@ -251,6 +251,22 @@ mod tests {
         assert!(!shown.contains("SAMPLE0123456789"), "the token showed");
         assert!(shown.contains("[REDACTED]"), "{shown}");
         assert!(!shown.contains('\u{1b}'), "an escape reached the terminal");
+        // A control that redaction reads as white space between a secret's
+        // name and its value: escaped first, it would no longer be.
+        let secret = concat!("SEEDED", "q7Lm2Vx9Rk4Tz8");
+        for (case, description) in [
+            format!("the push sent Authorization: Bearer\u{c}{secret}"),
+            format!("the command ran with --password\u{b}{secret}"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let [written, _] = super::shown(&Failure::new("x.y", description, "mend it"));
+            assert!(
+                !written.contains(&secret[6..]),
+                "case {case}: the secret showed"
+            );
+        }
     }
 
     #[test]

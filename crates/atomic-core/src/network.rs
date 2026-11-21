@@ -46,6 +46,21 @@
 //! which inherit it. A command's token
 //! admits no new connection once the command ends, and the proxy stops once
 //! no command needs it.
+//!
+//! Each command that declares hosts is admitted against a budget of file
+//! descriptors ([`Budget`]): it reserves [`DESCRIPTORS_PER_COMMAND`], two for
+//! each of the 128 connections its sandbox's bridge keeps open to the proxy
+//! at once, and together the commands may reserve no more than half of
+//! atomic's limit on open files, which atomic first raises toward its hard
+//! limit. A command that would pass it does not start. The budget holds
+//! while upstreams answer and close as they should; it is not a limit the
+//! proxy enforces. Codex's proxy answers `CONNECT` before it dials, with no
+//! dial timeout of its own (the kernel's connect timeout still applies), may
+//! dial more than once for one connection, keeps a
+//! connection's descriptors for a while after the bridge has dropped it, and
+//! keeps a tunnel open until the upstream closes it, so a command that keeps
+//! opening and abandoning connections to a host that never answers can hold
+//! more than its share.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
@@ -54,7 +69,7 @@ use codex_network_proxy::{
     NetworkProxyState, PreparedManagedNetwork,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -69,6 +84,10 @@ pub const PORT_REFUSED: &str = "port_not_allowed";
 
 /// The reason the proxy gives for a host no atom declared.
 pub const HOST_REFUSED: &str = "not_allowed";
+
+/// The reason the proxy gives for a host under a declared wildcard that
+/// belongs to a public suffix below it: someone else's site.
+pub const SUFFIX_REFUSED: &str = "crosses_public_suffix";
 
 /// The reason the proxy gives for a request on a connection that no
 /// confined command's bridge opened: one without a token the proxy issued.
@@ -181,8 +200,10 @@ fn check_host(host: &str) -> Result<String, String> {
 /// Whether `*.<name>` covers names under which anyone can have a site: when
 /// `name` is a public suffix on the Public Suffix List, from its ICANN
 /// section (`co.uk`) or its private one (`github.io`, `s3.amazonaws.com`),
-/// or when a wildcard rule makes every name just below it one (`*.run.app`,
-/// `*.kawasaki.jp`), which a child that is a suffix shows. A name above a
+/// or when a wildcard rule on the list makes the names just below it
+/// suffixes (`*.run.app`, `*.kawasaki.jp`), which a made-up child that is a
+/// suffix shows; an exception to such a rule (`city.kawasaki.jp`) is one
+/// site, and a wildcard under it passes. A name above a
 /// suffix (`amazonaws.com`, above `s3.amazonaws.com`) passes here; the
 /// proxy keeps such a wildcard from reaching that suffix's names
 /// ([`declared`]).
@@ -195,12 +216,28 @@ fn public_suffix(name: &str) -> bool {
 }
 
 /// Whether `host` is under `parent` without crossing a public suffix: its
-/// own public suffix is shorter than `parent`, so the site it belongs to is
-/// at or below `parent`. Under `*.amazonaws.com`, `foo.amazonaws.com` is,
+/// own public suffix is shorter than `parent`, so the site it belongs to,
+/// its registrable domain, is `parent` or a name above it, and every name
+/// between `host` and `parent` is that one site's. Under `*.amazonaws.com`, `foo.amazonaws.com` is,
 /// and `bucket.s3.amazonaws.com` is not, since `s3.amazonaws.com` is a
 /// suffix of its own, whose sites are other people's.
 fn within_one_site(host: &str, parent: &str) -> bool {
     psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.trim().as_bytes().len() < parent.len())
+}
+
+/// Whether `host`, as a request names it, is under a `*.` name of
+/// `declared` only across a public suffix below it, as
+/// `bucket.s3.amazonaws.com` is under `*.amazonaws.com`.
+fn crosses_public_suffix(declared: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    declared
+        .iter()
+        .filter_map(|p| p.strip_prefix("*."))
+        .any(|parent| {
+            host.strip_suffix(parent)
+                .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.'))
+                && !within_one_site(&host, parent)
+        })
 }
 
 /// Whether `host`, as a request names it, is one of `declared`: the name
@@ -233,7 +270,11 @@ impl NetworkPolicyDecider for DeclaredHosts {
         let decision = if req.execution_id.is_none() {
             NetworkDecision::deny(UNATTRIBUTED_REFUSED)
         } else if !declared(&self.0, &req.host) {
-            NetworkDecision::deny(HOST_REFUSED)
+            NetworkDecision::deny(if crosses_public_suffix(&self.0, &req.host) {
+                SUFFIX_REFUSED
+            } else {
+                HOST_REFUSED
+            })
         } else if !PORTS.contains(&req.port) {
             NetworkDecision::deny(PORT_REFUSED)
         } else {
@@ -297,43 +338,120 @@ fn checked(own: BTreeSet<IpAddr>) -> anyhow::Result<BTreeSet<IpAddr>> {
 /// Every address the interfaces of this process's network namespace have
 /// now: this machine's, as far as the proxy can tell. A container's or a
 /// virtual machine's addresses on another namespace are not among them.
-#[allow(unsafe_code)]
 fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `list` with a list that is freed below with
-    // freeifaddrs, and only read before then.
-    if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("list this machine's network addresses");
-    }
-    let mut own = BTreeSet::new();
-    let mut entry = list;
-    while !entry.is_null() {
-        // SAFETY: `entry` is a node of the list getifaddrs returned, and an
-        // address it points at is a sockaddr of the family it names.
-        unsafe {
-            let addr = (*entry).ifa_addr;
-            if !addr.is_null() {
-                match i32::from((*addr).sa_family) {
-                    libc::AF_INET => {
-                        let sin = &*addr.cast::<libc::sockaddr_in>();
-                        own.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                            sin.sin_addr.s_addr,
-                        ))));
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 = &*addr.cast::<libc::sockaddr_in6>();
-                        own.insert(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
-                    }
-                    _ => {}
-                }
+    let interfaces = nix::ifaddrs::getifaddrs().context("list this machine's network addresses")?;
+    Ok(interfaces
+        .filter_map(|interface| interface.address)
+        .filter_map(|address| {
+            if let Some(v4) = address.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
             }
-            entry = (*entry).ifa_next;
-        }
+        })
+        .collect())
+}
+
+/// The most connections the sandbox helper's bridge opens to a command's
+/// proxy at once (Codex's Linux sandbox caps each route at this).
+const BRIDGE_CONNECTIONS: u64 = 128;
+
+/// The file descriptors atomic reserves for a command's proxy connections:
+/// two for each connection its bridge may have open, the command's and one
+/// upstream, and some to spare. A reservation, not a bound the proxy holds
+/// connections to; see the module documentation.
+pub const DESCRIPTORS_PER_COMMAND: u64 = 2 * BRIDGE_CONNECTIONS + 16;
+
+/// Room in this process's file descriptors for commands' proxy
+/// connections: half of its limit on open files, the rest left to atomic's
+/// own database, model and file work.
+struct Budget(Mutex<u64>);
+
+/// The process's budget, shared by every proxy, since the limit is the
+/// process's.
+#[cfg(not(test))]
+static BUDGET: Budget = Budget(Mutex::new(0));
+
+/// One command's room in a [`Budget`], given back when it ends.
+struct Reservation(&'static Budget);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reserved = reserved.saturating_sub(DESCRIPTORS_PER_COMMAND);
     }
-    // SAFETY: `list` came from getifaddrs and is not used after this.
-    unsafe { libc::freeifaddrs(list) };
-    Ok(own)
+}
+
+impl Budget {
+    /// Room for one more command's connections within half of `limit`, or
+    /// why there is none.
+    fn reserve(&'static self, limit: u64) -> anyhow::Result<Reservation> {
+        let share = limit / 2;
+        let mut reserved = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *reserved + DESCRIPTORS_PER_COMMAND > share {
+            anyhow::bail!(
+                "{} commands that declare hosts are running, and atomic's limit of {limit} open \
+                 files leaves room for {} at once: their proxy connections may take half of it, \
+                 {DESCRIPTORS_PER_COMMAND} for each. atomic raises its own limit only as far as \
+                 its hard limit and at most to {RAISED_LIMIT}; to run more at once, raise its \
+                 hard limit or start it with a higher soft limit",
+                *reserved / DESCRIPTORS_PER_COMMAND,
+                share / DESCRIPTORS_PER_COMMAND,
+            );
+        }
+        *reserved += DESCRIPTORS_PER_COMMAND;
+        Ok(Reservation(self))
+    }
+}
+
+/// The most open files atomic raises its own limit to when its proxies
+/// need room: enough for a couple of hundred commands that declare hosts.
+const RAISED_LIMIT: u64 = 1 << 16;
+
+/// This process's limit on open files: the soft one it is held to, and the
+/// hard one it may raise that to.
+#[allow(unsafe_code)]
+fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into `limit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read the limit on open files");
+    }
+    Ok(limit)
+}
+
+/// Room for one more command's connections in `budget`. Where there is
+/// none under this process's soft limit on open files, the limit is first
+/// raised as far as the hard one allows, up to [`RAISED_LIMIT`]; the
+/// commands atomic starts afterwards inherit it.
+#[allow(unsafe_code, clippy::unnecessary_cast)]
+fn reserve_room(budget: &'static Budget) -> anyhow::Result<Reservation> {
+    let mut limit = descriptor_limits()?;
+    let refused = match budget.reserve(limit.rlim_cur as u64) {
+        Ok(room) => return Ok(room),
+        Err(why) => why,
+    };
+    let raised = (limit.rlim_max as u64).min(RAISED_LIMIT);
+    if raised <= limit.rlim_cur as u64 {
+        return Err(refused);
+    }
+    limit.rlim_cur = raised as libc::rlim_t;
+    // SAFETY: setrlimit reads one rlimit, whose soft limit is within its
+    // hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(refused);
+    }
+    budget.reserve(raised)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
@@ -346,6 +464,8 @@ struct Leased {
     /// dropped first, so the token stops working before the proxy might.
     _scope: NetworkProxy,
     _running: Arc<Running>,
+    /// Its room among the process's file descriptors.
+    _room: Reservation,
 }
 
 /// A token for one command's bridge to open its connections with: 32 random
@@ -358,13 +478,33 @@ fn token() -> anyhow::Result<String> {
 
 /// The proxies a confining backend runs, one for each distinct list of
 /// hosts, each kept while a command that declared it runs.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Proxies {
     running: Arc<Mutex<HashMap<Vec<String>, Weak<Running>>>>,
+    /// The descriptor budget its commands reserve room in: the process's,
+    /// or, in a unit test, one of the test's own.
+    budget: &'static Budget,
     /// This machine's addresses as a test says they are, in place of its
     /// interfaces'.
     #[cfg(test)]
     own_for_tests: Arc<Mutex<Option<BTreeSet<IpAddr>>>>,
+}
+
+impl Default for Proxies {
+    fn default() -> Self {
+        // Each unit test's proxies count against a budget of their own, so
+        // tests running at once do not share one.
+        #[cfg(test)]
+        let budget: &'static Budget = Box::leak(Box::new(Budget(Mutex::new(0))));
+        #[cfg(not(test))]
+        let budget = &BUDGET;
+        Self {
+            running: Arc::default(),
+            budget,
+            #[cfg(test)]
+            own_for_tests: Arc::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Proxies {
@@ -423,6 +563,7 @@ impl Proxies {
         // A proxy started before this machine's addresses changed would
         // reach a new one: start another.
         let own = self.own()?;
+        let room = reserve_room(self.budget)?;
         let running = {
             let mut proxies = self
                 .running
@@ -464,6 +605,7 @@ impl Proxies {
         let lease: Lease = Arc::new(Leased {
             _scope: scope,
             _running: running,
+            _room: room,
         });
         Ok((prepared, lease))
     }
@@ -688,6 +830,36 @@ mod tests {
         ] {
             assert!(!declared(&hosts, no), "{no}");
         }
+        // Each of those but the last, which is under no declared name, is
+        // refused for crossing a suffix rather than as undeclared.
+        for crossing in [
+            "attacker.s3.amazonaws.com",
+            "x.s3.us-east-1.amazonaws.com",
+            "lb.us-east-1.elb.amazonaws.com",
+        ] {
+            assert!(crosses_public_suffix(&hosts, crossing), "{crossing}");
+        }
+        for not in ["other.github.io", "foo.amazonaws.com", "api.example.net"] {
+            assert!(!crosses_public_suffix(&hosts, not), "{not}");
+        }
+        // And the proxy says so.
+        let proxies = Proxies::default();
+        let (prepared, _lease) = proxies
+            .prepare(&["*.amazonaws.com".to_owned()], &[], HashMap::new())
+            .expect("starts");
+        let addr = prepared.env["HTTP_PROXY"]
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_owned();
+        let token = &prepared.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY];
+        assert_eq!(
+            fetch_from(&addr, Some(token), "sts.us-east-1.amazonaws.com"),
+            format!("403 {SUFFIX_REFUSED}")
+        );
+        assert_eq!(
+            fetch_from(&addr, Some(token), "example.org"),
+            format!("403 {HOST_REFUSED}")
+        );
     }
 
     /// The proxy never forwards through another proxy, whatever atomic's
@@ -874,7 +1046,10 @@ mod tests {
     #[test]
     fn this_machines_addresses_come_from_its_interfaces() {
         let own = own_addresses().expect("addresses");
-        assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
+        assert!(
+            own.contains(&IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "{own:?}"
+        );
         let denied = denied_addresses(&own);
         assert!(denied.contains(&"127.0.0.1".to_owned()), "{denied:?}");
         assert!(checked(BTreeSet::new()).is_err());
@@ -967,6 +1142,7 @@ mod tests {
             "*.foo.kawasaki.jp",
             // Parents of wildcard rules: every name below is a suffix.
             "*.run.app",
+            "*.mtls.run.app",
             "*.kawasaki.jp",
             "*.elb.amazonaws.com",
             // On the list, so name the exact hosts instead.
@@ -990,5 +1166,32 @@ mod tests {
         ] {
             assert!(check_hosts(&[accepted.into()]).is_ok(), "{accepted}");
         }
+    }
+
+    /// The commands that declare hosts share half the process's limit on
+    /// open files, room for each command's connections: one that would pass
+    /// it is refused, and a command that ends gives its room back.
+    #[test]
+    fn commands_share_half_the_descriptor_limit() {
+        static OURS: Budget = Budget(Mutex::new(0));
+        let limit = 4 * DESCRIPTORS_PER_COMMAND + 1;
+        let first = OURS.reserve(limit).expect("room for one");
+        let second = OURS.reserve(limit).expect("room for two");
+        let Err(why) = OURS.reserve(limit) else {
+            panic!("room for a third");
+        };
+        assert!(
+            why.to_string()
+                .contains("commands that declare hosts are running"),
+            "{why}"
+        );
+        drop(first);
+        let third = OURS.reserve(limit).expect("room again");
+        drop((second, third));
+        assert_eq!(*OURS.0.lock().expect("budget"), 0);
+        assert!(
+            OURS.reserve(2 * DESCRIPTORS_PER_COMMAND - 1).is_err(),
+            "half, not all"
+        );
     }
 }

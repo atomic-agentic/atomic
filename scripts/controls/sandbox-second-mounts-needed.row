@@ -1,0 +1,1 @@
+sandbox-second-mounts-needed|crates/atomic-core/src/codex.rs|        if let Some(needed) = covers(alias) {|        if let Some(needed) = covers(alias).and(None::<PathBuf>) {|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list

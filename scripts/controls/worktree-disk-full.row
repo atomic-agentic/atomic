@@ -1,0 +1,1 @@
+worktree-disk-full|crates/atomic-core/src/worktree.rs|                Err(e) if e.disk_full() => Err(crate::runtime::NotYet::Room(format!(|                Err(e) if std::hint::black_box(false) && e.disk_full() => Err(crate::runtime::NotYet::Room(format!(|-p atomic-agentic-core --lib --features fake-model -- only_atomics_own_writes_on_a_full_disk_wait
