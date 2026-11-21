@@ -1,1 +1,1 @@
-sandbox-mounts-inside|crates/atomic-core/src/mounts.rs|            aliases_of(mounts, &listed, &inner.at, &mut out)?;|            let _ = inner; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_mount_inside_a_denied_directory_is_followed_to_its_other_mounts
+sandbox-mounts-inside|crates/atomic-core/src/mounts.rs|            aliases_of(index, &inner.at, &mut out)?;|            let _ = inner; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_mount_inside_a_denied_directory_is_followed_to_its_other_mounts
