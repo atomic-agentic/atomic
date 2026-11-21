@@ -10,6 +10,8 @@ use atomic_schema::typescript;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
+mod tags;
+
 /// The kinds of atom this version runs.
 pub const KINDS: &[&str] = &["codex", "lite", "exec"];
 
@@ -596,6 +598,22 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         },
     };
     program.verify_helpers().map_err(|e| fail(1, "body", e))?;
+    // The compiler closes, drops or renames an unbalanced tag silently, and
+    // tags are the prompt's structure: the atom's and each component's
+    // must balance.
+    for (path, text) in &program.sources {
+        if !path.ends_with(".astro") {
+            continue;
+        }
+        if let Some(found) = tags::unbalanced(text) {
+            return Err(AtomError {
+                file: PathBuf::from(path),
+                line: found.line,
+                path: "body".into(),
+                message: found.message,
+            });
+        }
+    }
     let mut schemas = serde_json::Map::new();
     for (key, id) in [("Input", &input), ("Output", &output)] {
         schemas.insert(

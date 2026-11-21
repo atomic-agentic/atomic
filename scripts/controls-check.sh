@@ -85,6 +85,7 @@ CONTROLS=(
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
+    "atom-tags-balance|crates/atomic-core/src/atom.rs|        if !path.ends_with(\".astro\") {|        if !path.ends_with(\".astro/*CONTROL_OFF*/\") {|-p atomic-agentic-core --lib atom::tests::an_unbalanced_section_tag_fails_the_load"
 )
 
 die() {

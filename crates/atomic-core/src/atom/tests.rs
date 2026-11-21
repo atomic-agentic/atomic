@@ -553,3 +553,66 @@ fn a_budget_in_the_frontmatter_is_read_and_a_bad_one_fails_where_it_is_written()
         let _ = std::fs::remove_dir_all(root);
     }
 }
+
+/// An unbalanced tag in the body fails the load where it is: a closing tag
+/// of another name, an element never closed, and a closing tag with nothing
+/// open, which the compiler would rename, close or drop silently.
+#[test]
+fn an_unbalanced_section_tag_fails_the_load() {
+    for (body, line, message) in [
+        (
+            "<section>\n{input.text}\n</notes>",
+            10,
+            "`</notes>` closes <section>, opened on line 8; close it with `</section>`",
+        ),
+        (
+            "Intro\n<section>\n{input.text}\n",
+            9,
+            "<section> is never closed; close it with `</section>`",
+        ),
+        (
+            "{input.text}\n</section>",
+            9,
+            "`</section>` closes no open element; remove it",
+        ),
+    ] {
+        let root = project(body, "{}", None);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err("an unbalanced tag");
+        assert_eq!(
+            (error.line, error.message.as_str(), error.path.as_str()),
+            (line, message, "body"),
+            "{body}"
+        );
+        assert!(
+            error.file.ends_with("test.atom.astro"),
+            "{}",
+            error.file.display()
+        );
+    }
+    // Balanced, the same sections load.
+    let (atom, _) = checked("<section>\n{input.text}\n<notes>a<br>b</notes>\n</section>");
+    assert_eq!(atom.name, "test");
+}
+
+/// A component's tags must balance too, and its own file and line are named.
+#[test]
+fn an_unbalanced_tag_in_a_component_fails_the_load() {
+    let component = "---\n---\n<rules>\n<slot />\n</rule>\n";
+    let root = project(
+        "<Style>Be brief.</Style>\n{input.text}",
+        "{}",
+        Some(component),
+    );
+    let error = load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("unbalanced");
+    assert!(
+        error.file.ends_with("Style.astro"),
+        "{}",
+        error.file.display()
+    );
+    assert_eq!(error.line, 5);
+    assert_eq!(
+        error.message,
+        "`</rule>` closes <rules>, opened on line 3; close it with `</rules>`"
+    );
+}
