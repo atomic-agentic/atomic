@@ -110,6 +110,11 @@ pub struct Workspace {
     /// The environment every command in the workspace gets beside the
     /// platform's core variables.
     pub env: BTreeMap<String, String>,
+    /// Directories of the backend's own that the workspace's commands may
+    /// neither read nor write, `scratch` excepted: the scratch directories of
+    /// every other attempt, live or not, so no turn reads another's `HOME`
+    /// or `TMPDIR`.
+    pub denied: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -304,6 +309,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
+        denied: vec![scratch_root.to_owned()],
     })
 }
 

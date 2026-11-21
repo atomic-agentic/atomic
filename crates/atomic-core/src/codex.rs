@@ -120,6 +120,13 @@ pub struct TurnSpec {
     /// Directories a `workspace-write` thread may write besides its working
     /// directory, such as the project's shared caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
+    /// Directories the thread's commands may neither read nor write, apart
+    /// from those inside them it may write: the backend's scratch
+    /// directories, a `workspace-write` thread's own excepted. Absolute
+    /// paths. Codex's Linux sandbox reopens only writable directories inside
+    /// a denied one, so a `read-only` thread's own scratch directory, which
+    /// it may not write, shows to it empty.
+    pub denied: Vec<PathBuf>,
 }
 
 /// What a thread's commands are kept out of. It has no default: every
@@ -657,6 +664,31 @@ pub(crate) fn permission_profile(
     for pattern in globs {
         policy.entries.push(FileSystemSandboxEntry::new(
             FileSystemPath::GlobPattern { pattern },
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        SANDBOX_NETWORK,
+    ))
+}
+
+/// `profile` with `denied` denied as well: the backend's scratch
+/// directories. What the thread may write inside a denied directory, such as
+/// its own scratch directory, stays writable, as a writable root of its own.
+fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    };
+    if denied.is_empty() {
+        return Ok(profile);
+    }
+    let mut policy = profile.file_system_sandbox_policy();
+    for dir in denied {
+        let dir = AbsolutePathBuf::from_absolute_path(dir)
+            .with_context(|| format!("resolve the sandbox path {}", dir.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(dir),
             FileSystemAccessMode::Deny,
         ));
     }
@@ -1495,19 +1527,22 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(
-            spec.sandbox,
-            guard,
-            codex_home,
-            Some(cwd),
-            &match spec.sandbox {
-                crate::typed::Sandbox::ReadOnly => Vec::new(),
-                crate::typed::Sandbox::WorkspaceWrite => {
-                    let mut roots = spec.writable_roots.clone();
-                    roots.push(cwd.to_owned());
-                    roots
-                }
-            },
+        Constrained::allow_any(deny_also(
+            permission_profile(
+                spec.sandbox,
+                guard,
+                codex_home,
+                Some(cwd),
+                &match spec.sandbox {
+                    crate::typed::Sandbox::ReadOnly => Vec::new(),
+                    crate::typed::Sandbox::WorkspaceWrite => {
+                        let mut roots = spec.writable_roots.clone();
+                        roots.push(cwd.to_owned());
+                        roots
+                    }
+                },
+            )?,
+            &spec.denied,
         )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();

@@ -2230,6 +2230,7 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
         sandbox: WorkspaceWrite,
         writable_roots: vec![dir.join("caches")],
         env: [("RUSTUP_HOME".to_owned(), rustup.display().to_string())].into(),
+        denied: Vec::new(),
     };
     let mut spec = TurnSpec::default();
     turn_in(&workspace(&dir.join("toolchains")), &mut spec).expect("toolchains apart");

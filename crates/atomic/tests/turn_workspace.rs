@@ -486,3 +486,95 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
         );
     });
 }
+
+/// A turn's commands cannot read another live attempt's scratch directory,
+/// its `HOME` or its `TMPDIR`, though a `workspace-write` turn reads and
+/// writes its own: the backend's scratch directories are denied to a turn,
+/// a writing turn's own apart. A `read-only` turn, which may not write its
+/// own, sees it empty too. One turn leaves a secret in both and holds its
+/// attempt open while two others, on the same backend, look for it
+/// everywhere under the backend's scratch root.
+#[test]
+fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("scratch-deny");
+        let root = shared_scratch();
+        let backend = Backend::connect(LocalBackend::in_dir(root.clone())).expect("connects");
+        let turn = |commands: Vec<String>, sandbox: Sandbox| {
+            let (dir, backend) = (dir.clone(), backend.clone());
+            async move {
+                let mut script: Vec<Reply> = commands.iter().map(|c| tool(c)).collect();
+                script.push(Reply::Text("Done.".into()));
+                let model = FakeModel::start(script).await.expect("fake model");
+                let rt = runtime(&dir, &model, backend);
+                let answer = run_turn(
+                    &rt,
+                    &TurnSpec {
+                        prompt: "Do the work.".into(),
+                        sandbox,
+                        ..TurnSpec::default()
+                    },
+                )
+                .await
+                .expect("the turn runs");
+                assert_eq!(answer, "Done.");
+                model
+                    .requests()
+                    .last()
+                    .cloned()
+                    .expect("requests")
+                    .to_string()
+            }
+        };
+        let look = format!(
+            "found=$(grep -rls secret-of-the-first {} 2>/dev/null | grep -c .)",
+            root.display()
+        );
+        let first = tokio::spawn(turn(
+            vec![
+                "echo secret-of-the-first > \"$HOME/secret\" && \
+                 echo secret-of-the-first > \"$TMPDIR/secret\" && echo first-wrote"
+                    .into(),
+                "sleep 10; echo first-held".into(),
+            ],
+            Sandbox::WorkspaceWrite,
+        ));
+        let writer = tokio::spawn(turn(
+            vec![format!(
+                "sleep 5; {look}; echo writer-found=$found; \
+                 echo mine > \"$HOME/m\" && cat \"$HOME/m\" && \
+                 echo also > \"$TMPDIR/m\" && cat \"$TMPDIR/m\" && echo writer-own-ok; \
+                 echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')"
+            )],
+            Sandbox::WorkspaceWrite,
+        ));
+        let reader = tokio::spawn(turn(
+            vec![format!(
+                "sleep 5; {look}; echo reader-found=$found; \
+                 echo reader-home-entries=$(ls -A \"$HOME\" | grep -c .)"
+            )],
+            Sandbox::ReadOnly,
+        ));
+        let (first, writer, reader) = (
+            first.await.expect("first"),
+            writer.await.expect("writer"),
+            reader.await.expect("reader"),
+        );
+        assert!(
+            first.contains("first-wrote") && first.contains("first-held"),
+            "{first}"
+        );
+        // Its own scratch directory holds its TMPDIR and what it wrote.
+        assert!(
+            writer.contains("writer-found=0\\n")
+                && writer.contains("writer-own-ok")
+                && writer.contains("writer-home-own=2\\n"),
+            "the writing turn read the first's scratch, or lost its own: {writer}"
+        );
+        assert!(
+            reader.contains("reader-found=0\\n") && reader.contains("reader-home-entries=0\\n"),
+            "the read-only turn read the first's scratch, or its own: {reader}"
+        );
+    });
+}

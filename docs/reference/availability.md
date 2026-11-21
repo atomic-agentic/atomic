@@ -96,9 +96,12 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn can add, change or remove what a turn keeps in its
-temporary directory. Another turn of the project can still read it, by its path
-under the project's scratch directory: do not rely on it for secrets. (Codex's
+file runs and no other turn can see, add, change or remove what a turn keeps in
+its `HOME` or temporary directory: every scratch directory of the project is
+denied to a turn's commands, apart from a `workspace-write` turn's own. A
+`read-only` turn, which may not write its own, sees it empty. An exec atom's
+command, which has a scratch directory of its own too, is not yet kept from
+the others' in the same way. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,

@@ -683,6 +683,9 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
             .or_insert_with(|| scratch.join(".cargo").display().to_string());
     }
     turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
+    // The backend's scratch directories are no turn's to read; a
+    // `workspace-write` turn's own stays its own, as a writable root.
+    spec.denied = workspace.denied.clone();
     // A cache in the temporary directory every turn of the backend shares
     // would outlive the run and reach the next one.
     if let Some(tmp) = &workspace.tmp {
