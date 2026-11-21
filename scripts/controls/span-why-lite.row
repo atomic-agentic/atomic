@@ -1,0 +1,1 @@
+span-why-lite|crates/atomic-core/src/lite.rs|            crate::usage::note_step_failure(e);|            // CONTROL_OFF: the call says nothing to its step's spans.|-p atomic-agentic-core --lib --features fake-model a_failed_call_says_on_its_step_what_its_span_says

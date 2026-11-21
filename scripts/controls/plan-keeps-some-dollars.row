@@ -1,0 +1,1 @@
+plan-keeps-some-dollars|crates/atomic/src/metering.rs|                    None => return over(what, "cost_usd", "none".into(), usd(limit)),|                    None => {}|-p atomic-agentic --test pipeline -- --exact a_budget_plan_above_its_minutes_or_dollar_ceilings_is_refused

@@ -1,0 +1,1 @@
+no-free-under-cap|crates/atomic/src/settings.rs|        if !theirs(model) && zero("input_usd_per_mtok") && zero("output_usd_per_mtok") {|        if std::hint::black_box(false) && !theirs(model) && zero("input_usd_per_mtok") && zero("output_usd_per_mtok") {|-p atomic-agentic --bins -- --exact settings::tests::under_your_own_dollar_cap_a_project_cannot_make_a_model_free

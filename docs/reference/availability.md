@@ -45,8 +45,9 @@ the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with. An atom step's `review` is built
 for one reviewer atom with a typed verdict: a request for changes gives the
 author repair rounds, and any other verdict but an approval, or a request for
-changes with no rounds left, goes to a person at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
-and calibrated decision atoms are not built yet.
+changes with no rounds left, goes to a person at a gate. Several reviewers,
+`require: majority`, `ai-then-human` gate policy and calibrated decision atoms
+are not built yet.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
 `atomic config --explain` and a local foreground `atomic serve` are built.
@@ -98,7 +99,16 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. With the
+on stderr that it waits, and the run goes on once there is room. atomic's own
+writes for a step that find the disk or a quota full, making its run's build
+caches or the directory its worktree goes in, wait the same way. A checkout git
+cannot finish, for a full disk or anything else, fails the step with what git
+said, and the run ends failed; once space is freed, start it again. Each of
+these waits, and the wait for the backend, keeps its own clock, so a worktree
+step may wait up to three times its limit: for its caches, its worktree's
+directory and its workspace. Without a limit, a step whose own writes find the
+disk full waits for as long as it takes, saying so on stderr every ten minutes.
+With the
 `backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
 waits at most that long: `atomic run` and
 `atomic runs resume` then stop with exit code 75, the run unfinished and nothing
@@ -259,6 +269,8 @@ configured defaults and price table, and the durable usage ledger that reserves
 each model call before it is dispatched, settles it once, and parks a run that
 reaches a cap. A released park admits the call again against the caps as stored;
 the command a person uses to raise a cap and release the park is not built yet.
+The caps and prices in the person's own configuration are ceilings: a project's
+files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
 
 ## Observability stages
