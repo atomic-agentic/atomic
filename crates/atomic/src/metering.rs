@@ -411,7 +411,11 @@ impl LedgerMeter {
                     bounded_by,
                 })
             }
-            Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
+            Admission::Refused { reason, scope } => Err(Exhausted {
+                reason,
+                scope: Some(scope),
+            }
+            .into()),
         }
     }
 }
