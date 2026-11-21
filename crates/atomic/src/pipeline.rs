@@ -1692,7 +1692,7 @@ async fn reviewed<C: WorkflowContext>(
             mapped.insert(field.clone(), value);
         }
         let name = format!("{}.review.{round}", step.id);
-        keep_working(working).await;
+        keep_working(working, ctx.workflow_id()).await;
         let (verdict, told) = turn(
             ctx,
             run,
@@ -1738,7 +1738,7 @@ async fn reviewed<C: WorkflowContext>(
             }
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
-                keep_working(working).await;
+                keep_working(working, ctx.workflow_id()).await;
                 (candidate, _) = turn(
                     ctx,
                     run,
@@ -1804,7 +1804,7 @@ async fn reviewed<C: WorkflowContext>(
     )
     .await?;
     failpoint(&format!("pipeline:after:{id}"));
-    keep_working(working).await;
+    keep_working(working, ctx.workflow_id()).await;
     match resolution {
         Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
             let acceptance = Acceptance {
