@@ -40,6 +40,7 @@ test command_environment
 test entry_point
 test examples
 test exec_private_state
+test second_mounts
 test exec_caches
 test exec_network
 test failpoints

@@ -1,0 +1,1 @@
+sandbox-mounts-alias-unfollowed|crates/atomic-core/src/mounts.rs|        match std::fs::symlink_metadata(alias) {|        match std::fs::metadata(alias) { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there
