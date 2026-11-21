@@ -488,6 +488,38 @@ fn the_keep_set_is_dated_from_before_the_runs_are_read() {
     });
 }
 
+/// A hold let go between a sweep's reading of the runs and its lock still
+/// keeps its content: the step that held it recorded the reference after
+/// the sweep read past it, then let go, and the sweep finds no hold under
+/// its lock. The sweep keeps what was held when it began reading.
+#[test]
+fn a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content() {
+    on_codex_runtime(async {
+        let dir = scratch("let-go");
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        register(&mut rt);
+        rt.launch().await.unwrap();
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let patch = put(&store, b"handed over long ago");
+        backdate(&dir.join("artifacts"));
+        let hold = store.hold(&patch).unwrap();
+        // The sweep reads what to keep: no run names the patch yet...
+        let kept = retention::read_kept(&store, &rt, &BTreeSet::new())
+            .await
+            .unwrap();
+        // ...then the step records it and lets go, before the sweep takes
+        // the store's lock.
+        drop(hold);
+        let swept = store
+            .sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at)
+            .unwrap();
+        assert!(swept.removed.is_empty(), "{swept:?}");
+        assert!(held(&store, &patch), "removed after its hold was let go");
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 #[test]
 fn a_digest_is_found_in_any_case_escaped_or_bare() {
     on_codex_runtime(async {
