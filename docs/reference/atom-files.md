@@ -179,7 +179,9 @@ clients and SDKs read and which come on top of its `env`; a client that ignores
 them reaches nothing. An atom's `env` cannot set any of them. It can open no
 other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
-names one.
+names one. It serves only the sandbox it was started for: each connection
+must open with a token atomic gives that command's sandbox, and the command
+itself never sees, so another process on the machine cannot use the proxy.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
@@ -203,10 +205,6 @@ Know what a listed host can get:
 - **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
   a shared-hosting suffix reaches every customer's buckets and sites there, not
   only yours. List the exact names.
-- **Other local processes, while it runs.** The proxy listens on this machine's
-  loopback interface without authentication for as long as a command that
-  declared hosts runs, and any process on the machine can use it to reach the
-  same hosts.
 
 The rule is enforced on Linux only. On macOS and Windows exec commands run
 unconfined, with whatever network the machine has, and a declaration restricts
