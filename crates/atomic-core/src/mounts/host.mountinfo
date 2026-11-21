@@ -1,0 +1,17 @@
+75 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/vg-root rw,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+48 75 0:24 / /proc rw,nosuid,nodev,noexec,relatime shared:14 - proc proc rw
+41 75 0:25 / /sys rw,nosuid,nodev,noexec,relatime shared:6 - sysfs sysfs rw,seclabel
+38 75 0:6 / /dev rw,nosuid shared:3 - devtmpfs devtmpfs rw,seclabel,size=31466460k,nr_inodes=7866615,mode=755,inode64
+49 75 0:28 / /run rw,nosuid,nodev shared:15 - tmpfs tmpfs rw,seclabel,size=12608424k,nr_inodes=819200,mode=755,inode64
+25 48 0:34 / /proc/sys/fs/binfmt_misc rw,relatime shared:16 - autofs systemd-1 rw,fd=36,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=1785
+50 75 259:2 / /boot rw,relatime shared:76 - xfs /dev/nvme0n1p2 rw,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+53 75 253:2 / /home rw,relatime shared:79 - xfs /dev/mapper/vg-home rw,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+59 75 253:2 /container-storage/containerd /var/lib/containerd rw,relatime shared:79 - xfs /dev/mapper/vg-home rw,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+62 75 253:2 /container-storage/docker /var/lib/docker rw,relatime shared:79 - xfs /dev/mapper/vg-home rw,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+1102 49 0:4 net:[4026531840] /run/docker/netns/default rw shared:956 - nsfs nsfs rw
+987 49 0:4 net:[4026533456] /run/docker/netns/000000000001 rw shared:846 - nsfs nsfs rw
+895 49 0:4 net:[4026533714] /run/docker/netns/000000000002 rw shared:867 - nsfs nsfs rw
+1243 49 0:4 net:[4026533788] /run/netns/cni-fcd51dcf-d6ec-9077-39ca-000000000003 rw shared:1112 - nsfs nsfs rw
+919 30 0:85 / /run/user/1000/gvfs rw,nosuid,nodev,relatime shared:5721 - fuse.gvfsd-fuse gvfsd-fuse rw,user_id=1000,group_id=1000
+1374 30 0:88 / /run/user/1000/doc rw,nosuid,nodev,relatime shared:5748 - fuse.portal portal rw,user_id=1000,group_id=1000
+934 62 0:69 / /var/lib/docker/rootfs/overlayfs/0000000000000000000000000000000000000000000000000000000000000004 rw,relatime shared:817 - overlay overlay rw,seclabel,lowerdir=/var/lib/containerd/l1,upperdir=/var/lib/containerd/u1,workdir=/var/lib/containerd/w1935 53 0:69 / /home/container-storage/docker/rootfs/overlayfs/0000000000000000000000000000000000000000000000000000000000000004 rw,relatime shared:817 - overlay overlay rw,seclabel,lowerdir=/var/lib/containerd/l1,upperdir=/var/lib/containerd/u1,workdir=/var/lib/containerd/w130 49 0:65 / /run/user/1000 rw,nosuid,nodev,relatime shared:720 - tmpfs tmpfs rw,seclabel,size=6304208k,nr_inodes=1576052,mode=700,uid=1000,gid=1000,inode64

@@ -116,10 +116,11 @@ fn run_with_second_mount(dir: &Path, person: &Path, second: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // The harness's summary, whatever the test printed around its own line.
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains(&format!("test {NAME} ... ok")),
-        "it did not run inside its namespace:\n{}",
-        String::from_utf8_lossy(&out.stdout)
+        stdout.contains(NAME) && stdout.contains("test result: ok. 1 passed"),
+        "it did not run inside its namespace:\n{stdout}"
     );
 }
 

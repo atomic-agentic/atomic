@@ -9,39 +9,80 @@
 //! named, so what it names is still readable through each other mount of
 //! the same filesystem that shows it. [`second_mounts`] reads the mount
 //! table, `/proc/self/mountinfo`, and finds every such place, so it is
-//! denied too.
+//! denied too; and so for each filesystem mounted inside a denied
+//! directory, whose files the denial hides there too.
 //!
-//! What it cannot see is a copy, or another filesystem built over one: a
-//! snapshot holds its own copy of what was there when it was taken, and an
-//! overlay or FUSE filesystem that shows a denied directory's files is a
-//! filesystem of its own, not a second mount of the denied one.
+//! It refuses (an error, so nothing runs) when it cannot tell: a table or a
+//! line it cannot read, a denied path it finds no mount for, or a denied
+//! path on a network or FUSE filesystem ([`unknowable`]) that is mounted
+//! more than once, since the table does not say which directory each of its
+//! mounts shows. A mount whose root is not a path, such as a namespace file
+//! (`net:[4026531840]`), shows no directory, and is never a second place.
+//!
+//! What it cannot see:
+//!
+//! - a copy: a snapshot holds its own copy of what was there when it was
+//!   taken;
+//! - another filesystem built over a denied directory: an overlay whose
+//!   upper or lower directory is inside one, or a FUSE filesystem that
+//!   serves its files, shows them at its own mount point as files of its
+//!   own;
+//! - a mount made after the list is built, such as one an automount
+//!   (`autofs`) makes when a path under it is first used, even from inside
+//!   the sandbox, which sees the host's new mounts.
 
-#[cfg(target_os = "linux")]
-use anyhow::Context;
 use anyhow::bail;
 use std::path::{Path, PathBuf};
 
 /// One line of a mount table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Mount {
+    /// Its ID.
+    id: u64,
+    /// The ID of the mount it is mounted on.
+    parent: u64,
     /// The filesystem's device, `major:minor`.
     device: String,
-    /// The directory of the filesystem the mount shows.
-    root: PathBuf,
+    /// The directory of the filesystem the mount shows; `None` when the
+    /// root is not a path, as a namespace file's is not.
+    root: Option<PathBuf>,
     /// Where it is mounted.
     at: PathBuf,
+    /// The filesystem's type, such as `ext4` or `nfs4`.
+    kind: String,
+}
+
+/// Whether a filesystem of type `kind` is one whose mounts may all show `/`
+/// as their root in the table, whatever directory each shows: a network or
+/// FUSE filesystem.
+fn unknowable(kind: &str) -> bool {
+    matches!(
+        kind,
+        "nfs"
+            | "nfs4"
+            | "cifs"
+            | "smb3"
+            | "smbfs"
+            | "9p"
+            | "ceph"
+            | "glusterfs"
+            | "lustre"
+            | "afs"
+            | "fuse"
+            | "fuseblk"
+            | "virtiofs"
+    ) || kind.starts_with("fuse.")
 }
 
 /// A path field of the mount table with its octal escapes (`\040` for a
 /// space, `\011`, `\012`, `\134`) undone; `None` for one that cannot be
 /// read.
-fn unescape(field: &str) -> Option<PathBuf> {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+fn unescape(field: &[u8]) -> Option<PathBuf> {
+    let mut out = Vec::with_capacity(field.len());
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' {
-            let digits = bytes.get(i + 1..i + 4)?;
+    while i < field.len() {
+        if field[i] == b'\\' {
+            let digits = field.get(i + 1..i + 4)?;
             if !digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
                 return None;
             }
@@ -49,7 +90,7 @@ fn unescape(field: &str) -> Option<PathBuf> {
             out.push(u8::try_from(value).ok()?);
             i += 4;
         } else {
-            out.push(bytes[i]);
+            out.push(field[i]);
             i += 1;
         }
     }
@@ -66,29 +107,45 @@ fn unescape(field: &str) -> Option<PathBuf> {
 
 /// The mounts a `mountinfo` table lists, in its order. A line it cannot read
 /// fails it: a mount it left out could be one that shows a denied path.
-fn parse(mountinfo: &str) -> anyhow::Result<Vec<Mount>> {
+fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
     let mut mounts = Vec::new();
-    for (n, line) in mountinfo.lines().enumerate() {
-        if line.trim().is_empty() {
+    for (n, line) in mountinfo.split(|b| *b == b'\n').enumerate() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let fields: Vec<&str> = line.split(' ').collect();
+        let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
         let read = || -> Option<Mount> {
-            let device = (*fields.get(2)?).to_owned();
-            if !device.contains(':') {
+            let number = |f: &[u8]| std::str::from_utf8(f).ok()?.parse::<u64>().ok();
+            let id = number(fields.first()?)?;
+            let parent = number(fields.get(1)?)?;
+            let device = std::str::from_utf8(fields.get(2)?).ok()?;
+            let (major, minor) = device.split_once(':')?;
+            if major.parse::<u32>().is_err() || minor.parse::<u32>().is_err() {
                 return None;
             }
             let root = unescape(fields.get(3)?)?;
             let at = unescape(fields.get(4)?)?;
-            // The optional fields end with a lone `-`.
-            fields.iter().skip(6).position(|f| *f == "-")?;
-            (root.is_absolute() && at.is_absolute()).then_some(Mount { device, root, at })
+            // The optional fields end with a lone `-`, then the type.
+            let dash = 6 + fields.iter().skip(6).position(|f| *f == b"-")?;
+            let kind = std::str::from_utf8(fields.get(dash + 1)?).ok()?;
+            if kind.is_empty() || !at.is_absolute() || root.as_os_str().is_empty() {
+                return None;
+            }
+            Some(Mount {
+                id,
+                parent,
+                device: device.to_owned(),
+                root: root.is_absolute().then_some(root),
+                at,
+                kind: kind.to_owned(),
+            })
         };
         let Some(mount) = read() else {
             bail!(
                 "line {} of the mount table cannot be read, so atomic cannot tell where else \
-                 the places it denies are mounted: {line:?}",
-                n + 1
+                 the places it denies are mounted: {:?}",
+                n + 1,
+                String::from_utf8_lossy(line)
             );
         };
         mounts.push(mount);
@@ -96,47 +153,103 @@ fn parse(mountinfo: &str) -> anyhow::Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// The mount `path` is in: the last listed of those at the longest prefix
-/// of it, since a later mount at a place covers an earlier one.
+/// The mount at the top of the stack `mount` heads at its own mount point:
+/// the one mounted on it there, and on that, and so on.
+fn top<'a>(mounts: &'a [Mount], mut mount: &'a Mount) -> &'a Mount {
+    for _ in 0..mounts.len() {
+        match mounts
+            .iter()
+            .find(|m| m.at == mount.at && m.parent == mount.id && m.id != mount.id)
+        {
+            Some(above) => mount = above,
+            None => break,
+        }
+    }
+    mount
+}
+
+/// The mount `path` is in, as this process sees it: from the root mount,
+/// down the mounts on each directory of the path, each the top of its stack.
 fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-    mounts
+    let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
+    let root = mounts
         .iter()
-        .filter(|m| path.starts_with(&m.at))
-        .fold(None, |best: Option<&Mount>, m| match best {
-            Some(b) if b.at.components().count() > m.at.components().count() => Some(b),
-            _ => Some(m),
-        })
+        .find(|m| m.at == Path::new("/") && !ids.contains(&m.parent))?;
+    let mut here = top(mounts, root);
+    let mut at = PathBuf::from("/");
+    for part in path.components().skip(1) {
+        at.push(part);
+        if let Some(child) = mounts.iter().find(|m| m.at == at && m.parent == here.id) {
+            here = top(mounts, child);
+        }
+    }
+    Some(here)
+}
+
+/// Every other place `mounts` shows `path`, which is absolute with no link
+/// in it: under each other mount of the same filesystem whose directory
+/// holds it, the same file or directory there; and each such mount whose
+/// directory lies inside it, whole.
+fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    let Some(home) = mount_of(mounts, path) else {
+        bail!(
+            "{} is under no mount in the mount table, so atomic cannot tell where else it is \
+             mounted",
+            path.display()
+        );
+    };
+    let same: Vec<&Mount> = mounts
+        .iter()
+        .filter(|m| m.device == home.device && m.id != home.id)
+        .collect();
+    let Some(first) = same.first() else {
+        return Ok(());
+    };
+    if unknowable(&home.kind) {
+        bail!(
+            "{} is on a {} filesystem mounted more than once ({} and {}), and the mount table \
+             does not say which directory each such mount shows, so atomic cannot deny it at \
+             each",
+            path.display(),
+            home.kind,
+            home.at.display(),
+            first.at.display()
+        );
+    }
+    let (Some(root), Ok(rel)) = (&home.root, path.strip_prefix(&home.at)) else {
+        return Ok(());
+    };
+    let inside = root.join(rel);
+    for other in same {
+        let Some(other_root) = &other.root else {
+            continue;
+        };
+        let alias = if let Ok(below) = inside.strip_prefix(other_root) {
+            other.at.join(below)
+        } else if other_root.starts_with(&inside) {
+            other.at.clone()
+        } else {
+            continue;
+        };
+        if alias != path {
+            out.push(alias);
+        }
+    }
+    Ok(())
 }
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
-/// paths with no link in them: under each other mount of the same
-/// filesystem whose directory holds it, the same file or directory there;
-/// and each such mount whose directory lies inside it, whole.
+/// paths with no link in them, and each filesystem mounted inside one.
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for path in denied {
-        let Some(home) = mount_of(mounts, path) else {
-            bail!(
-                "{} is under no mount in the mount table, so atomic cannot tell where else it \
-                 is mounted",
-                path.display()
-            );
-        };
-        let Ok(rel) = path.strip_prefix(&home.at) else {
-            continue;
-        };
-        let inside = home.root.join(rel);
-        for other in mounts.iter().filter(|m| m.device == home.device) {
-            let alias = if let Ok(below) = inside.strip_prefix(&other.root) {
-                other.at.join(below)
-            } else if other.root.starts_with(&inside) {
-                other.at.clone()
-            } else {
-                continue;
-            };
-            if alias != *path {
-                out.push(alias);
-            }
+        aliases_of(mounts, path, &mut out)?;
+        // What is mounted inside a denied directory is hidden there too.
+        for inner in mounts
+            .iter()
+            .filter(|m| m.at != *path && m.at.starts_with(path))
+        {
+            aliases_of(mounts, &inner.at, &mut out)?;
         }
     }
     out.sort();
@@ -163,20 +276,53 @@ fn real(path: &Path) -> PathBuf {
     }
 }
 
-/// Every other place the mount table shows each of `denied`: each must be
-/// denied too. On Linux the table is `/proc/self/mountinfo`, the mounts
-/// this process and the sandbox it starts see; one that cannot be read
-/// fails it rather than leave a place undenied. Elsewhere there is no such
-/// table, and none is found.
+#[cfg(test)]
+thread_local! {
+    /// The mount table [`second_mounts`] reads on this thread, in place of
+    /// this process's.
+    static TABLE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Read `table` as this thread's mount table in [`second_mounts`] until the
+/// guard returned is dropped.
+#[cfg(test)]
+pub(crate) fn with_table(table: &[u8]) -> TableGuard {
+    TABLE.with(|t| *t.borrow_mut() = Some(table.to_vec()));
+    TableGuard
+}
+
+/// Puts this process's own mount table back for [`second_mounts`] when
+/// dropped.
+#[cfg(test)]
+pub(crate) struct TableGuard;
+
+#[cfg(test)]
+impl Drop for TableGuard {
+    fn drop(&mut self) {
+        TABLE.with(|t| *t.borrow_mut() = None);
+    }
+}
+
+/// Every other place the mount table shows each of `denied`, and each
+/// filesystem mounted inside one: each must be denied too. On Linux the
+/// table is `/proc/self/mountinfo`, the mounts this process and the sandbox
+/// it starts see; one that cannot be read, or that leaves a place it cannot
+/// tell about, fails it rather than leave a place undenied. Elsewhere there
+/// is no such table, and none is found.
 pub fn second_mounts(denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    #[cfg(test)]
+    if let Some(table) = TABLE.with(|t| t.borrow().clone()) {
+        let real: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
+        return aliases(&parse(&table)?, &real);
+    }
     #[cfg(target_os = "linux")]
     {
-        let table = std::fs::read_to_string("/proc/self/mountinfo").context(
+        use anyhow::Context;
+        let table = std::fs::read("/proc/self/mountinfo").context(
             "read /proc/self/mountinfo, to find where else the places atomic denies are mounted",
         )?;
-        let mounts = parse(&table)?;
         let real: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
-        aliases(&mounts, &real)
+        aliases(&parse(&table)?, &real)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -186,75 +332,4 @@ pub fn second_mounts(denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const TABLE: &str = "\
-22 1 0:21 /@ / rw,relatime shared:1 - btrfs /dev/sda2 rw,subvol=/@
-23 22 0:21 /@home /home rw,relatime shared:2 - btrfs /dev/sda2 rw,subvol=/@home
-24 22 0:21 / /mnt/top rw,relatime shared:3 - btrfs /dev/sda2 rw,subvol=/
-25 22 0:21 /@home/u /run/host/home/u rw,relatime - btrfs /dev/sda2 rw
-26 22 0:21 /@home/u/.ssh/keys /srv/keys rw,relatime - btrfs /dev/sda2 rw
-27 22 0:30 / /tmp rw shared:4 - tmpfs tmpfs rw
-28 22 0:21 /@home/v\\040w /mnt/v\\040w rw - btrfs /dev/sda2 rw
-";
-
-    fn table() -> Vec<Mount> {
-        parse(TABLE).expect("parses")
-    }
-
-    #[test]
-    fn a_denied_path_is_found_under_every_mount_that_shows_it() {
-        let found = aliases(&table(), &[PathBuf::from("/home/u/.ssh")]).expect("aliases");
-        assert_eq!(
-            found,
-            [
-                "/mnt/top/@home/u/.ssh",
-                "/run/host/home/u/.ssh",
-                "/srv/keys",
-            ]
-            .map(PathBuf::from)
-        );
-    }
-
-    #[test]
-    fn another_filesystem_and_an_unrelated_subtree_are_not_aliases() {
-        assert!(
-            aliases(&table(), &[PathBuf::from("/tmp/x")])
-                .expect("aliases")
-                .is_empty()
-        );
-        // /@ is a sibling of /@home, not a prefix of it.
-        let found = aliases(&table(), &[PathBuf::from("/etc/secret")]).expect("aliases");
-        assert_eq!(found, [PathBuf::from("/mnt/top/@/etc/secret")]);
-    }
-
-    #[test]
-    fn escaped_paths_are_read_as_they_are() {
-        let found = aliases(&table(), &[PathBuf::from("/home/v w/.netrc")]).expect("aliases");
-        assert!(
-            found.contains(&PathBuf::from("/mnt/v w/.netrc")),
-            "{found:?}"
-        );
-    }
-
-    #[test]
-    fn a_table_it_cannot_read_fails_closed() {
-        for bad in [
-            "22 1 0:21 / / rw - ext4 /dev/sda1 rw\n23 x\n",
-            "22 1 nodevice / / rw - ext4 /dev/sda1 rw\n",
-            "22 1 0:21 rel / rw - ext4 /dev/sda1 rw\n",
-            "22 1 0:21 / /a\\09 rw - ext4 /dev/sda1 rw\n",
-            "22 1 0:21 / / rw ext4 /dev/sda1 rw\n",
-        ] {
-            assert!(
-                parse(bad).is_err_and(|e| e.to_string().contains("cannot be read")),
-                "{bad:?}"
-            );
-        }
-        assert!(
-            aliases(&[], &[PathBuf::from("/home/u")])
-                .is_err_and(|e| e.to_string().contains("under no mount")),
-        );
-    }
-}
+mod tests;

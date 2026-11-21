@@ -413,10 +413,18 @@ to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
 credential place is denied like a file. Each is denied too wherever else
 the same directory is mounted, as it is with your home bound at a second
 path, inside toolbox or distrobox (the host's files under `/run/host`), or
-with a btrfs top-level subvolume mounted elsewhere; atomic reads the mount
-table for this, and nothing runs when it cannot. A snapshot holds a copy,
-not the place itself, so a readable snapshot directory is not covered, nor
-is an overlay or FUSE filesystem built over a denied directory. A turn does
+with a btrfs top-level subvolume mounted elsewhere, and so is each
+filesystem mounted inside a denied directory wherever else it is mounted.
+atomic reads the mount table for this when it makes the list, and nothing
+runs when it cannot read it, or when a denied place is on a network or FUSE
+filesystem (NFS, SMB, `fuse.*`) mounted more than once, since the table
+does not say which directory each such mount shows. Not covered: a
+snapshot, which holds a copy, not the place itself; an overlay or FUSE
+filesystem built over a denied directory, such as an overlay whose upper or
+lower directory is inside one, which shows its files as its own; and a
+mount made after the list, such as one an automount makes when a path is
+first used, even from inside the sandbox, which sees the host's new mounts
+until the next turn. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
