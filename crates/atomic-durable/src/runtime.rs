@@ -1129,39 +1129,58 @@ impl Durare {
     /// started under the old layout could not replay under the new one, so
     /// any build of the same layout continues the same runs.
     ///
-    /// It serves `project`, the id of the project's state (see
+    /// It serves `project`, the project's key, `<name>/<state id>` (see
     /// [`DurableRuntime::project`]): on a store several projects share, it
     /// records its parks as the project's and lists and releases no other
-    /// project's.
+    /// project's. A key that is empty or holds a control character is
+    /// refused.
     pub async fn open(
         database: &Database,
         executor: Option<&str>,
         version: &str,
         project: &str,
     ) -> Result<Self> {
-        if project.trim().is_empty() {
-            return Err(DurableError::Engine(
-                "a store is opened for a project, and this one names none".into(),
-            ));
+        if project.trim().is_empty() || project.chars().any(char::is_control) {
+            return Err(DurableError::Engine(format!(
+                "a store is opened for a project, and {project:?} names none"
+            )));
         }
         let mut rt = Self::open_for_none(database, executor, version).await?;
         // A SQLite store is one project's own: a park recorded before parks
-        // had a project is its. Written only when there is one, so opening a
-        // store another process is writing to, as `atomic runs show` does,
-        // takes no write lock.
-        if matches!(database, Database::Sqlite(_)) && rt.has_parks_of_none().await? {
-            let project = project.to_owned();
+        // had a project is its, and so is one recorded under another name
+        // of its own, `<old name>/<state id>`, as before its manifest was
+        // renamed. Written only when there is one, so opening a store another
+        // process is writing to, as `atomic runs show` does, takes no write
+        // lock.
+        let id = project.rfind('/').map(|at| project[at..].to_owned());
+        if matches!(database, Database::Sqlite(_))
+            && rt.has_parks_to_adopt(project, id.as_deref()).await?
+        {
+            let (project, id) = (project.to_owned(), id.clone());
             rt.control_transaction(move |mut tx| {
-                let project = project.clone();
+                let (project, id) = (project.clone(), id.clone());
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO atomic_park_projects (park_id, project) \
                          SELECT p.park_id, ? FROM atomic_parks p WHERE NOT EXISTS \
                          (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id)",
-                        &[Param::Text(project)],
+                        &[Param::Text(project.clone())],
                     )
-                    .await
-                    .map(|_| ())
+                    .await?;
+                    if let Some(id) = id {
+                        tx.execute(
+                            "UPDATE atomic_park_projects SET project = ? \
+                             WHERE project <> ? AND substr(project, -?) = ?",
+                            &[
+                                Param::Text(project.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
                 })
             })
             .await?;
@@ -1170,17 +1189,27 @@ impl Durare {
         Ok(rt)
     }
 
-    /// Whether a park recorded for no project is in the store.
-    async fn has_parks_of_none(&self) -> Result<bool> {
+    /// Whether a park recorded for no project is in the store, or, with
+    /// `id` (`/<state id>`), one recorded for another key than `project`
+    /// ending in it: the same project under an older name.
+    async fn has_parks_to_adopt(&self, project: &str, id: Option<&str>) -> Result<bool> {
+        let (project, id) = (project.to_owned(), id.unwrap_or_default().to_owned());
         self.reads
-            .read(|mut tx| {
+            .read(move |mut tx| {
+                let (project, id) = (project.clone(), id.clone());
                 Box::pin(async move {
                     Ok(tx
                         .query_opt(
-                            "SELECT p.park_id AS park_id FROM atomic_parks p WHERE NOT EXISTS \
-                         (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id) \
-                         LIMIT 1",
-                            &[],
+                            "SELECT p.park_id AS park_id FROM atomic_parks p \
+                             LEFT JOIN atomic_park_projects pp ON pp.park_id = p.park_id \
+                             WHERE pp.project IS NULL OR (? <> '' AND pp.project <> ? \
+                             AND substr(pp.project, -?) = ?) LIMIT 1",
+                            &[
+                                Param::Text(id.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id),
+                            ],
                         )
                         .await?
                         .is_some())

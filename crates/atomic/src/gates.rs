@@ -96,7 +96,7 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
         &database,
         None,
         atomic_app::pipeline::LAYOUT_VERSION,
-        &crate::engine::store_project(state),
+        &crate::engine::store_project(state)?,
     )
     .await
     .with_context(|| {

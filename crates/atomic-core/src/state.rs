@@ -381,8 +381,9 @@ impl ProjectState {
 
     /// The project's id: its root's last component and a hash of its full
     /// path, which names its state directory. A store several projects
-    /// share tells their records apart by it, so the same project checked
-    /// out at another path is another project there.
+    /// share tells their records apart by `<manifest name>/<id>`, so the
+    /// same project checked out at another path, or renamed, is another
+    /// project there.
     pub fn id(&self) -> String {
         self.dir
             .file_name()

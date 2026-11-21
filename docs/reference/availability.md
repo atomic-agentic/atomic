@@ -293,9 +293,12 @@ path. Two projects are the same project only when both match, so a project
 renamed, or checked out at another path, is another project, whose parks the
 old one's commands no longer list or release. Two different projects that
 share both a name and a path, such as the same `/app` in two containers, are
-one project there: give them different names. A local SQLite store is the
-project's own, and a park recorded there before atomic kept parks' projects
-becomes the project's when atomic opens the store. On a shared PostgreSQL store
+one project there: give them different names. A manifest that is there but
+cannot be read or is not valid stops these commands, rather than have them
+use another key. A local SQLite store is the project's own, so a park recorded
+there before atomic kept parks' projects, or under an older name of the
+project's at the same path, becomes the project's when atomic opens the store:
+on one, a rename strands no parked run. On a shared PostgreSQL store
 such a park is no project's: no atomic command lists or releases it, its run
 stays parked with its record kept in the store, and the work goes on only as a
 new run, started again with `atomic run`. Stop every atomic process that uses a

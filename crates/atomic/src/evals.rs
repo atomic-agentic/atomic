@@ -354,7 +354,7 @@ pub async fn run(
             &database,
             executor.as_deref(),
             LAYOUT_VERSION,
-            &crate::engine::store_project(&state),
+            &crate::engine::store_project(&state)?,
         )
         .await
         .map_err(|e| {
