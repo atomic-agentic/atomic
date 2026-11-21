@@ -372,6 +372,16 @@ pub fn needs_model(run: &PipelineRun) -> bool {
         .any(|a| matches!(a.kind.as_str(), "lite" | "codex"))
 }
 
+/// The lite atoms the run calls, which a ChatGPT sign-in does not serve.
+pub fn lite_atoms(run: &PipelineRun) -> Vec<String> {
+    run.pipeline
+        .atoms
+        .values()
+        .filter(|a| a.kind == "lite")
+        .map(|a| a.name.clone())
+        .collect()
+}
+
 /// The run's input: the file `--input` names (`-` for stdin), or `--data`.
 pub fn input(file: Option<&Path>, data: Option<&str>, cwd: &Path) -> anyhow::Result<Value> {
     let (text, from) = match (file, data) {

@@ -93,6 +93,9 @@ enum Command {
     /// cap, with your operator credential.
     #[command(subcommand)]
     Parks(parks::ParksCommand),
+    /// Model access: sign in with ChatGPT so Codex atoms run on your plan.
+    #[command(subcommand)]
+    Model(ModelCommand),
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -179,6 +182,7 @@ impl PromptArgs {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
+            sign_in: None,
         }
     }
 }
@@ -258,22 +262,45 @@ fn real_main() -> anyhow::Result<()> {
             &mut atomic_core::redact::stderr_lines(),
         ));
     }
+    // A command line clap refuses is said now, before anything is touched.
+    let cli = match parsed {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // `atomic model` keeps nothing in a project's state and starts no Codex
+    // thread, so it creates no state and has no Codex home.
+    if let Some(Command::Model(_)) = &cli.command {
+        let json = cli.json;
+        let project = found_project(&cli);
+        let Some(Command::Model(command)) = cli.command else {
+            unreachable!("matched above")
+        };
+        return codex::without_threads(async move {
+            let outcome = match project {
+                Ok(project) => model(command, project.as_deref(), json).await,
+                Err(e) => Err(e),
+            };
+            if let Err(e) = outcome {
+                failure::report(&failure::analyze(&e), json);
+                std::process::exit(1);
+            }
+            Ok(())
+        });
+    }
     // Resolve and create the state directory before Codex starts, so its home
-    // is never the user's own. A failure here is reported once the normal entry
-    // point runs; Codex's helper invocations never need it.
-    let state = if quiet {
-        Err(anyhow::anyhow!("no state directory"))
-    } else {
-        state_root(parsed.as_ref().ok())
-            .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
-            .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from))
+    // is never the user's own. Without one, nothing starts: there is no Codex
+    // home to give it.
+    let state = state_root(Some(&cli))
+        .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
+        .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from));
+    let state = match state {
+        Ok(state) => state,
+        Err(e) => {
+            failure::report(&failure::analyze(&e), cli.json);
+            std::process::exit(1);
+        }
     };
-    let codex_home = match &state {
-        Ok(s) => s.codex_home(),
-        // Never created: Codex finds no home and creates nothing.
-        Err(_) => std::env::temp_dir().join("atomic-no-state-directory"),
-    };
-    codex::dispatch(&codex_home, move |paths| async move {
+    codex::dispatch(&state.codex_home(), move |paths| async move {
         // Only this role, the command itself, exports spans; Codex's helper
         // roles never reach here. Spans go where the standard
         // OTEL_EXPORTER_OTLP_* variables say, if they say, from this runtime;
@@ -281,18 +308,10 @@ fn real_main() -> anyhow::Result<()> {
         if let Err(e) = atomic_app::telemetry::init_from_env() {
             atomic_core::log_line!("warning: telemetry is off: {e:#}");
         }
-        let cli = match parsed {
-            Ok(cli) => cli,
-            Err(_) => Cli::parse(),
-        };
         let json = cli.json;
-        let outcome = match state {
-            Ok(state) => run(cli, paths, state).await,
-            Err(e) => Err(e),
-        };
         // Nothing this process started outlives it, or the execution lock it
         // may hold, however the command ends.
-        if let Err(e) = outcome {
+        if let Err(e) = run(cli, paths, state).await {
             failure::report(&failure::analyze(&e), json);
             flush_spans().await;
             atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
@@ -306,6 +325,25 @@ fn real_main() -> anyhow::Result<()> {
         }
         Ok(())
     })
+}
+
+/// The project a command names or is run in, if there is one: `None` outside
+/// any project.
+fn found_project(cli: &Cli) -> anyhow::Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir().context("read the working directory")?;
+    match target::project_for(cli.project.as_deref(), None, &cwd) {
+        Ok(p) => Ok(Some(p.root().to_owned())),
+        Err(e)
+            if cli.project.is_none()
+                && matches!(
+                    e.downcast_ref::<project::ProjectError>(),
+                    Some(project::ProjectError::NotFound(_))
+                ) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The project root a command's state belongs to: the project it works on,
@@ -367,6 +405,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
         Some(Command::Parks(command)) => parks::run(command, &state).await,
+        Some(Command::Model(_)) => unreachable!("`atomic model` runs without a state directory"),
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
@@ -798,6 +837,115 @@ async fn prompt(
         ..codex::TurnSpec::default()
     };
     Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
+}
+
+/// `atomic model`.
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Sign in with ChatGPT, through Codex's login, so Codex atoms run on
+    /// your plan.
+    Login {
+        /// Sign in with a code on another device, for a machine with no
+        /// browser.
+        #[arg(long)]
+        device_auth: bool,
+    },
+    /// Say who is signed in (the email masked), and where the sign-in is
+    /// kept, never a token.
+    Status,
+    /// Revoke the sign-in where the issuer allows, and forget every copy.
+    Logout,
+}
+
+async fn model(
+    command: ModelCommand,
+    project: Option<&std::path::Path>,
+    json: bool,
+) -> anyhow::Result<()> {
+    use atomic_core::signin::SignIn;
+    // Saying who is signed in creates nothing.
+    let sign_in = match command {
+        ModelCommand::Status => SignIn::located(project)?,
+        _ => SignIn::configured(project)?,
+    };
+    match command {
+        ModelCommand::Status => match sign_in.account()? {
+            // The email is shown masked, built afresh from its first
+            // character and its domain, never as the sign-in holds it.
+            Some(a) if json => {
+                let account = serde_json::json!({
+                    "mode": a.mode,
+                    "email": a.email.as_deref().map(atomic_core::signin::mask_email),
+                    "plan": a.plan,
+                    "store": a.store,
+                });
+                println!(
+                    "{}",
+                    serde_json::json!({"signed_in": true, "account": account})
+                );
+                Ok(())
+            }
+            Some(a) => {
+                let mut said = format!("signed in with {}", a.mode);
+                if let Some(email) = a.email.as_deref().map(atomic_core::signin::mask_email) {
+                    said.push_str(&format!(" as {email}"));
+                }
+                if let Some(plan) = &a.plan {
+                    said.push_str(&format!(" ({plan} plan)"));
+                }
+                println!(
+                    "{said}, kept in {}; Codex atoms use it when no model endpoint is configured",
+                    a.store
+                );
+                Ok(())
+            }
+            None => Err(failure::Failure::new(
+                "model.signed_out",
+                "no one is signed in with ChatGPT",
+                "sign in with `atomic model login` (or `atomic model login --device-auth`)",
+            )
+            .into()),
+        },
+        ModelCommand::Login { device_auth } => {
+            sign_in.login(device_auth).await?;
+            println!("signed in; Codex atoms use it when no model endpoint is configured");
+            Ok(())
+        }
+        ModelCommand::Logout => {
+            let forgot = sign_in.logout().await?;
+            let mut removed = Vec::new();
+            if forgot.file {
+                removed.push("the credential file store");
+            }
+            if forgot.keyring == Ok(true) {
+                removed.push("the OS keyring");
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "signed_out": !removed.is_empty(),
+                        "file": forgot.file,
+                        "keyring": forgot.keyring.as_ref().ok(),
+                        "keyring_error": forgot.keyring.as_ref().err(),
+                    })
+                );
+                return Ok(());
+            }
+            if removed.is_empty() {
+                println!("no one was signed in");
+            } else {
+                println!(
+                    "signed out: forgot the sign-in in {}",
+                    removed.join(" and ")
+                );
+            }
+            if let Err(why) = &forgot.keyring {
+                println!("the OS keyring could not be checked: {why}");
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

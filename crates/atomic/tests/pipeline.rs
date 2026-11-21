@@ -240,6 +240,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
         base_url: base_url.to_owned(),
         model: model.into(),
         api_key_env: None,
+        sign_in: None,
     };
     Arc::new(Runtimes {
         codex: CodexRuntime {
