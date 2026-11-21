@@ -3180,13 +3180,19 @@ mod tests {
             }
             .map(std::ffi::OsString::from)
         };
-        let secrets = home_secrets(&env, None).expect("homes");
-        assert!(secrets.contains(&volume), "the volume: {secrets:?}");
-        assert!(secrets.contains(&volume.join("token")), "{secrets:?}");
-        assert!(secrets.contains(&dir.join("plain-token")), "{secrets:?}");
+        let places = home_secrets(&env, None).expect("homes");
+        assert!(places.contains(&volume), "the volume is denied");
         assert!(
-            !secrets.contains(&dir),
-            "an ordinary token's directory stays readable: {secrets:?}"
+            places.contains(&volume.join("token")),
+            "the token link is denied"
+        );
+        assert!(
+            places.contains(&dir.join("plain-token")),
+            "the ordinary token is denied"
+        );
+        assert!(
+            !places.contains(&dir),
+            "an ordinary token's directory stays readable"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3242,9 +3248,12 @@ mod tests {
             }
             .map(std::ffi::OsString::from)
         };
-        let secrets = home_secrets(&env, None).expect("homes");
+        let places = home_secrets(&env, None).expect("homes");
         let here = std::env::current_dir().expect("cwd");
-        assert!(secrets.contains(&here.join("tokens/web")), "{secrets:?}");
+        assert!(
+            places.contains(&here.join("tokens/web")),
+            "the relative token is denied from the working directory"
+        );
     }
 
     /// A place named through a directory that is an absolute link goes to
