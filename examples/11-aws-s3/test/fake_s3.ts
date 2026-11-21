@@ -115,16 +115,20 @@ export class FakeS3 {
    */
   async close(): Promise<void> {
     const shuttingDown = this.#server.shutdown();
+    let patience: ReturnType<typeof setTimeout> | undefined;
     const ended = await Promise.race([
       shuttingDown.then(() => true),
-      new Promise<boolean>((ready) => setTimeout(() => ready(false), 2_000)),
+      new Promise<boolean>((ready) => {
+        patience = setTimeout(() => ready(false), 2_000);
+      }),
     ]);
+    if (patience !== undefined) clearTimeout(patience);
     if (ended) {
       await shuttingDown;
       return;
     }
-    // Nobody is waiting on this shutdown any more. Its failure is the broken
-    // body of a step that moved on, and there is no test left to hand it to.
+    // Nobody is waiting on this shutdown any more. If it fails, it fails on a
+    // connection no test is watching any more either.
     shuttingDown.catch(() => {});
     this.#server.unref();
   }

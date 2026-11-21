@@ -33,10 +33,11 @@ checks pinned script imports and declarations without contacting S3.
 
 ## Exercise the scripts against a fake service
 
-Nothing in CI runs these tests. CI runs `python3 tools/check_examples.py`, which
-checks the scripts statically — pinned imports against the lockfile, declarations,
-fixtures, the Astro prompt — and does not run Deno code. So run them by hand
-before changing a script or one of its tests.
+Nothing in CI runs these tests. CI checks this example with
+`python3 tools/check_examples.py`, which uses the pinned Deno only as the host
+for the shipped Astro compiler: it checks script imports against the lockfile,
+the atom declarations and the fixtures, and it never runs a script or a test. So
+run these by hand before changing a script or one of its tests.
 
 From this directory, with pinned Deno 2.9.8 on `PATH`:
 
@@ -49,17 +50,18 @@ deno test -A --lock=deno.lock --frozen --cached-only test/
 `DENO_DIR` must be exported for both commands: it names the package cache, and
 `--cached-only` means the test run reads the SDK from that cache instead of
 reaching the registry. Use the same `DENO_DIR` for `deno cache` as for
-`deno test`, or the second command finds nothing cached. In the development
-container (`scripts/dev.sh deno …`) `HOME` is the mounted cache directory, so
-export `DENO_DIR` under it to keep the packages between runs.
+`deno test`, or the second command finds nothing cached. Inside the development
+container `HOME` is the cache directory mounted from the host, so put `DENO_DIR`
+under it to keep the packages between runs; `scripts/dev.sh` does not pass
+`DENO_DIR` through, so set it in the command you give that script.
 
 The harness starts a local fake S3 server. Tests exercise the read and conditional
 write paths, permission denial and checkpoint reuse, and type-check report values.
 [scripts_test.ts](test/scripts_test.ts) runs each script as the child process a
 step is, with only the permissions and variables the atom declares;
 [fetch_report_test.ts](test/fetch_report_test.ts) calls the fetch in the test
-process, which is the only way to see whether a refusal ended its own transfer or
-whether the process simply exited. No AWS account, provider model or live S3
+process, which is what shows whether a refusal ended its own transfer or the
+process simply exited. No AWS account, provider model or live S3
 bucket is involved. The harness simulates checkpoint behavior; it does not
 establish production workflow crash recovery.
 
