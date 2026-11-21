@@ -255,7 +255,9 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        backend: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: atomic_core::testing::denying_nothing(Default::default()),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -521,7 +523,8 @@ async fn engine_built_with(
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();
-            on.backend = backend;
+            // Its turns run without Codex's sandbox helper too.
+            on.backend = atomic_core::testing::denying_nothing(backend);
             Arc::new(on)
         }
         None => runtimes,
@@ -2648,6 +2651,7 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
             &atomic_durable::Database::Sqlite(dir.join("atomic.db")),
             None,
             "atomic.pipeline.other",
+            "the-project",
         )
         .await
         .expect("another layout's engine");

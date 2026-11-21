@@ -79,7 +79,7 @@ pub fn model_client(
 
 /// Whether `base_url` is plain `http` to this machine: see
 /// [`http_loopback_host`].
-fn http_loopback(base_url: &str) -> bool {
+pub(crate) fn http_loopback(base_url: &str) -> bool {
     http_loopback_host(base_url).is_some()
 }
 

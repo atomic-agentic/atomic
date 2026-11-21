@@ -1197,7 +1197,7 @@ pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate:
 /// The [`crate::SecretEnv`] this process was handed, if its environment
 /// names a socket in [`crate::SECRET_ENV_FD`] (see [`read_secret_socket`]);
 /// none if it names none. The variable is gone from its environment after.
-/// Only `atomic runner` calls it, first thing, while it has one thread, and
+/// Only `atomic runner` calls it, before it starts any thread, and
 /// the descriptor the variable names is the one the control plane handed
 /// it: the contract [`read_secret_socket`] asks of its caller holds there,
 /// and nowhere this could be called from outside the crate.

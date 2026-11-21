@@ -88,10 +88,15 @@ that fails removes the directory it made, unless the store then holds a
 sign-in saved since it began: one it forgot first, or, if it failed before
 forgetting, one a save left lock files for. If the store cannot be read, a
 directory holding a lock file stays; if the forgetting itself failed, the
-directory goes regardless. One stopped with Ctrl-C leaves the directory, with
-nothing in the store. A logout removes the directory once both stores are
-checked, so later runs read no store, and removes one it made itself even if
-the keyring cannot be checked. Otherwise, while the keyring cannot be checked,
+directory goes regardless. One stopped with Ctrl-C once it has forgotten
+leaves the directory with nothing in the store; one stopped before that, as at a
+keyring's unlock prompt, can leave an entry that outlived an earlier directory
+readable as a sign-in: run `atomic model logout` to forget it. A logout that
+made the directory and fails before it reaches the stores removes the directory
+again; one stopped with Ctrl-C can leave it, so run `atomic model logout`
+again. A logout removes the directory once both stores are checked, so later
+runs read no store, and removes one it made itself even if the keyring cannot
+be checked. Otherwise, while the keyring cannot be checked,
 the directory stays, and atomic says the sign-in could not be read. A sign-in
 whose directory is there but which cannot be used, because its store cannot be
 read or because it is kept where it is refused, refuses a run that calls a

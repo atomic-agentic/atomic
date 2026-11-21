@@ -1,0 +1,1 @@
+deny-glob-real|crates/atomic-core/src/codex.rs|    let mut globs = vec![format!("{}/*.sqlite*", real_spelling(codex_home).display())];|    let mut globs = vec![format!("{}/*.sqlite*", codex_home.display())];|-p atomic-agentic-core --lib --features fake-model a_place_behind_a_linked_directory_is_denied_by_its_real_path
