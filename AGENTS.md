@@ -195,12 +195,13 @@ first.
    so your own tree is untouched, and keep that worktree between checks so
    its `target/` stays warm: `git worktree add --detach <scratch> HEAD` once;
    then each time `git -C <scratch> checkout --detach <your HEAD>` and
-   `git -C <scratch> merge --no-commit --no-edit origin/main`. If it
-   conflicts, report the files and stop. Build and test there through
-   `scripts/dev.sh` (a linked worktree needs the main checkout's `.git`
-   mounted, as docs/development.md describes), then `git -C <scratch> merge
-   --abort`. A clean textual merge can still break a call whose signature
-   changed.
+   `git -C <scratch> merge --no-commit origin/main`. If it conflicts, report
+   the files, run `git -C <scratch> merge --abort` and stop. Build and test
+   there through `scripts/dev.sh` (a linked worktree needs the main
+   checkout's `.git` mounted, as docs/development.md describes), then run
+   `git -C <scratch> merge --abort` (ignore "no merge to abort"). This checks
+   committed work only; if your change is not committed, say so. A clean
+   textual merge can still break a call whose signature changed.
 7. **Resources and races.** A lock, hold, reservation or temporary directory
    is released on every path, including errors, panics and drops. Anything
    checked before a lock is re-read under it. A step that runs twice is safe.
