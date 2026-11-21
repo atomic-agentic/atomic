@@ -355,7 +355,13 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist.
+        // keys are another atomic's: denied too, where they exist. The entry
+        // from `dirs` is where that other atomic would keep its credentials
+        // (see [`crate::state::credentials_dir`]), which is not always the
+        // directory denied above: that one comes from
+        // [`crate::state::user_config_dir`], the same function
+        // [`crate::state::outside_user_config`] reads, so the directory a
+        // state directory is refused for sitting inside is denied outright.
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1019,9 +1025,11 @@ impl CodexPaths {
 }
 
 /// Harden atomic itself, not one of Codex's helpers: the process that holds
-/// a sign-in's token and the operator credential cannot be dumped, read
-/// through /proc by a same-user process, or leave a core file. It loses its
-/// LD_* variables, and the commands it starts inherit a core-file limit of
+/// a sign-in's token and the operator credential cannot be dumped, or leave
+/// a core file, and no process of the same user may read its memory or the
+/// /proc files that show it, such as `environ` and `mem`, unless it has
+/// `CAP_SYS_PTRACE` over atomic's user namespace; its `cmdline` and `stat`
+/// stay readable. It loses its LD_* variables, and the commands it starts inherit a core-file limit of
 /// zero (on macOS it also refuses a debugger). Both entry points call it.
 fn harden() {
     if !is_helper(std::env::args_os()) {
@@ -1040,6 +1048,35 @@ pub fn harden_runner() {
     codex_process_hardening::pre_main_hardening();
 }
 
+/// Point this process's `TMPDIR` at `tmp`, the shared temporary directory of
+/// the backend its turns run on ([`atomic_exec::LocalBackend::shared_tmp`]).
+///
+/// Codex's sandbox keeps a registry of the mount points it makes in a turn's
+/// writable roots, such as the empty `.git` it mounts read-only where there
+/// is none, in its helper's `TMPDIR`, so that a sandbox never removes one
+/// another sandbox is still using. A turn's commands give their helper the
+/// backend's shared directory. Codex's file helper, which applies a turn's
+/// patches under the same sandbox, takes its `TMPDIR` from this process
+/// instead: pointed here, the two keep one registry. Elsewhere than Linux
+/// Codex keeps no such registry, and this does nothing.
+///
+/// Whatever this process and its helpers keep in their temporary directory
+/// is then kept there, which connecting the backend empties: give it only
+/// for a command that runs turns on that backend, before it connects.
+///
+/// Call it in `main` before [`dispatch`], while the process has one thread.
+pub fn share_sandbox_registry(tmp: &Path) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: called at the start of main, while the process has one thread,
+    // so no other thread can read the environment concurrently.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("TMPDIR", tmp);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tmp;
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -1053,9 +1090,8 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     // Before anything that could re-execute this process: see run_helper.
-    keep_sandbox_off_keyrings();
+    as_any_helper();
     harden();
-    give_the_command_its_own_tmpdir();
     // The person's own Codex home stays denied to atoms' commands.
     let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
     // SAFETY: called at the start of main, while the process has one thread,
@@ -1141,11 +1177,18 @@ pub fn run_helper() -> anyhow::Result<()> {
     // the outer stage non-dumpable and then reads the command's proxy token
     // into its environment, and an exec after that would leave the token in
     // the environment of a process that is dumpable again.
-    keep_sandbox_off_keyrings();
-    give_the_command_its_own_tmpdir();
+    as_any_helper();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// What [`dispatch`] and [`run_helper`] both do first, whichever of Codex's
+/// helpers this process turns out to be: keep the sandbox off keyrings, and
+/// give a sandboxed command its own `TMPDIR`.
+fn as_any_helper() {
+    keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
 }
 
 /// The variable that carries a turn's own temporary directory past Codex's
@@ -2098,10 +2141,10 @@ where
     // Under workspace-write the system temporary directories are not
     // writable (see `permission_profile`): the thread gets its own, removed
     // when the thread ends.
-    // A workspace that names a TMPDIR (the backend's shared one, see
-    // `crate::runtime`) keeps it: Codex's sandbox keeps its registry of
-    // protected mount points there, and turns that share a writable root
-    // must share it.
+    // A workspace that names a TMPDIR keeps it (see `crate::runtime`): on
+    // Linux the backend's shared one, where Codex's sandbox keeps its
+    // registry of protected mount points, which turns that share a writable
+    // root must share; elsewhere the turn's own.
     let temp = match spec.sandbox {
         crate::typed::Sandbox::WorkspaceWrite if !spec.env.contains_key("TMPDIR") => {
             Some(TurnTemp::create(guard)?)

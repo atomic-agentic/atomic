@@ -1,0 +1,1 @@
+own-budget-read|crates/atomic/src/settings.rs|                    own_budget_read(user, written, &lines)?;|                    let _ = own_budget_read;|-p atomic-agentic --bins -- --exact settings::tests::a_cap_of_yours_that_cannot_be_read_is_refused_even_under_a_project_value

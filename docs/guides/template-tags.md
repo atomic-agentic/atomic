@@ -117,16 +117,22 @@ parameter language. A component used without being imported is an error.
 ## Sections and grouping
 
 Lowercase section tags such as `<criteria>` and `<rubric>` organize the prompt;
-the model reads them as prompt structure. Nothing checks that they balance, so
-an unbalanced tag moves text around instead of failing the load. A closing tag
-closes the innermost section that is open, whatever its name:
-`<criteria><rubric>…</criteria>tail` renders
-`<criteria><rubric>…</rubric>tail</criteria>`. A closing tag with no section
-open is dropped. A section still open at the end of the file is closed there,
-so text written after it ends up inside it. Inside a `{…}` expression a section
-left open does fail the load, with a TypeScript syntax error such as
-`':' expected.`, which does not name the tag. A literal section takes no
-attributes.
+the model reads them as prompt structure, so the tags of an atom and of each
+component it uses must balance, inside `{…}` expressions as well as outside
+them. The load fails, naming the file, the line and the tag, when a closing tag
+names another element than the innermost one open
+(`<criteria><rubric>…</criteria>`), when a closing tag has nothing open to
+close, and when an element is still open at the end of the file. A void HTML
+element such as `<br>` or `<input>` and a self-closing tag such as `<Note />`
+open nothing, so `<input>…</input>` is refused. Names match exactly, so the
+component `<Input>` is not the element `<input>`. Which tags there are, and
+where each closes, is read from Astro's own parse, so comments, a
+```` ```mermaid ```` fence and the frontmatter hold none; where a start tag
+ends is read by atomic, its quoted values and braced expressions passed over.
+An element Astro reads as ending somewhere other than where it is written is
+refused too: `<slot>`, `<template>`, `<noscript>`, `<frameset>` and `<head>`
+after leading text or a leading expression, and a closing tag inside a `{…}`
+expression the element did not open in. A literal section takes no attributes.
 `<Fragment>` groups content without adding a section, and takes only a `slot`
 attribute. The `<data-…>` prefix is reserved for atomic's own value wrappers,
 and `<data-…>`, `<script>` and `<style>` are rejected wherever you write them.
