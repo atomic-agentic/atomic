@@ -39,6 +39,11 @@
 //! (`<home>/private/<project>/runtime.lock`) first, so two of them never recover or run the
 //! same work. The operating system releases it when its holder exits,
 //! however it exits.
+//!
+//! The home must not be the person's own configuration directory
+//! ([`user_config_dir`]) or a directory inside it: every atom's commands are
+//! denied that directory whole, so [`ProjectState::create`] refuses a state
+//! directory there before it creates anything.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -93,6 +98,19 @@ pub enum StateError {
         /// Where it would move.
         to: PathBuf,
     },
+    /// The state directory is the person's own configuration directory, or a
+    /// directory inside it, where every atom's commands are denied whole:
+    /// the state there would be denied with it.
+    #[error(
+        "{state} is atomic's state directory, inside {config}, your own configuration \
+         directory, which every atom's commands are denied"
+    )]
+    InsideConfig {
+        /// The state directory, as it really is.
+        state: PathBuf,
+        /// The person's configuration directory, as it really is.
+        config: PathBuf,
+    },
     /// State an older atomic left is there, and so is the current layout's,
     /// as after running an older atomic again: which one holds the project's
     /// runs is the operator's to say.
@@ -107,6 +125,19 @@ pub enum StateError {
         /// The current layout's.
         current: PathBuf,
     },
+}
+
+impl StateError {
+    /// The refusal of a state directory inside the person's own configuration
+    /// directory, both as they really are. atomic's own check makes it, so a
+    /// test that compares the words a command reported compares what this
+    /// process would report.
+    pub fn inside_config(state: &Path, config: &Path) -> Self {
+        StateError::InsideConfig {
+            state: state.to_owned(),
+            config: config.to_owned(),
+        }
+    }
 }
 
 impl ProjectState {
@@ -146,7 +177,12 @@ impl ProjectState {
     /// directory: only while this process holds the state directory's
     /// migration lock, and never while another process has that database
     /// open ([`StateError::InUse`]).
+    ///
+    /// A state directory that is the person's own configuration directory, or
+    /// inside it, is refused here, before anything is created
+    /// ([`outside_user_config`]).
     pub fn create(&self) -> Result<(), StateError> {
+        outside_user_config(&self.dir)?;
         let create = |d: &Path| {
             std::fs::create_dir_all(d).map_err(|source| StateError::Create {
                 path: d.to_owned(),
@@ -487,6 +523,56 @@ pub fn user_config_dir_in(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBu
 /// [`user_config_dir_in`] this process's environment.
 pub fn user_config_dir() -> Option<PathBuf> {
     user_config_dir_in(&|name| std::env::var(name).ok())
+}
+
+/// `path` with the directories that already exist in it resolved: a symbolic
+/// link among them is followed to where it really points, and the components
+/// that do not exist yet, as a state directory before its first run, keep
+/// their place. A path no part of which exists is returned as it was given.
+fn real_path(path: &Path) -> PathBuf {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut existing = path;
+    let resolved = loop {
+        match std::fs::canonicalize(existing) {
+            Ok(real) => break real,
+            Err(_) => match (existing.parent(), existing.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_os_string());
+                    existing = parent;
+                }
+                _ => return path.to_owned(),
+            },
+        }
+    };
+    let mut out = resolved;
+    for name in missing.iter().rev() {
+        out.push(name);
+    }
+    out
+}
+
+/// Refuse a state directory that is [`user_config_dir`], or sits inside it.
+/// Every atom's commands are denied the person's own configuration directory
+/// whole (see [`crate::codex::StateGuard`]), and a denied path inside another
+/// denied path is dropped, so a state directory there is denied with it: its
+/// worktrees and caches fall out of reach of the commands that must use them,
+/// which fail saying nothing of where the cause is. Both sides are resolved
+/// with [`real_path`] first, and compared by path components, so a link into
+/// the configuration directory is caught and a sibling of it, such as
+/// `~/.config/atomic-state`, is not.
+///
+/// `user_config_dir` reads this process's `XDG_CONFIG_HOME` and `HOME`, which
+/// is how the denial itself is made: when neither names an absolute directory
+/// there is no configuration directory to be swallowed by.
+pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
+    let Some(config) = user_config_dir() else {
+        return Ok(());
+    };
+    let (state, config) = (real_path(state_dir), real_path(&config));
+    if state.starts_with(&config) {
+        return Err(StateError::inside_config(&state, &config));
+    }
+    Ok(())
 }
 
 /// This process's effective user id.
