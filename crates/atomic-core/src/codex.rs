@@ -1065,8 +1065,12 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
-    keep_sandbox_off_keyrings();
+    // First, before anything is read into this process or changed in it:
+    // the walk may start the helper again, and what that start inherits must
+    // be only what this one was given. It needs no secret, and an open file
+    // this process was given passes through the new start untouched.
     deny_links_made_since_the_list();
+    keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
@@ -1081,6 +1085,12 @@ pub fn run_helper() -> anyhow::Result<()> {
 /// as `~/.aws/credentials` leading to a file kept elsewhere, would leave
 /// that file readable by its own path. When there is anything to add, the
 /// helper starts again with the larger list, and finds nothing more.
+///
+/// What it cannot see: a link made between this walk and the sandbox's
+/// start, a moment later, which that command may then read through; and a
+/// link made while a long-lived command, such as a turn's unified-exec
+/// session, keeps running, since the walk is made once as each command
+/// starts.
 fn deny_links_made_since_the_list() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
@@ -1132,9 +1142,8 @@ fn deny_links_made_since_the_list() {
 }
 
 /// Set on the sandbox helper started again with more denied, and taken off
-/// before anything else sees it.
-#[cfg(target_os = "linux")]
-const RELISTED: &str = "ATOMIC_SANDBOX_RELISTED";
+/// before anything else sees it. An atom cannot declare it.
+pub(crate) const RELISTED: &str = "ATOMIC_SANDBOX_RELISTED";
 
 /// The helper's arguments `args`, with what links made since its profile's
 /// deny list was built point at denied in it; `None` when there is nothing
@@ -1184,16 +1193,37 @@ fn relisted(args: &[std::ffi::OsString]) -> anyhow::Result<Option<Vec<std::ffi::
     };
     let denied = paths(FileSystemAccessMode::Deny);
     let mut writable = paths(FileSystemAccessMode::Write);
-    // The command's directory may be the workspace, which the profile names
-    // only as such.
-    for flag in ["--command-cwd", "--sandbox-policy-cwd"] {
-        writable.extend(value(flag).map(PathBuf::from));
+    let cwd: Vec<PathBuf> = ["--command-cwd", "--sandbox-policy-cwd"]
+        .iter()
+        .filter_map(|flag| value(flag).map(PathBuf::from))
+        .collect();
+    // The command's directory is writable when the profile lets it write
+    // the workspace, which it names only as such.
+    let workspace_writable = policy.entries.iter().any(|e| {
+        e.access == FileSystemAccessMode::Write
+            && matches!(&e.path, FileSystemPath::Special { value }
+                if matches!(value, codex_protocol::permissions::FileSystemSpecialPath::ProjectRoots { .. }))
+    });
+    if workspace_writable {
+        writable.extend(cwd.iter().cloned());
     }
-    let late = late_link_targets(&denied, &writable)?;
-    if late.is_empty() {
+    // What the command needs: what it may write, where it works, what the
+    // profile lets it read by name (Codex's home), and atomic itself.
+    let mut needed = writable.clone();
+    needed.extend(cwd);
+    needed.extend(paths(FileSystemAccessMode::Read));
+    needed.extend(std::env::current_exe().ok());
+    let late = late_link_targets(&denied, &needed, &writable)?;
+    if late.targets.is_empty() && late.replaced.is_empty() {
         return Ok(None);
     }
-    for target in late {
+    // A place that has become a link is denied as what it points at, as
+    // when the list is built: the sandbox cannot mount on a link.
+    policy.entries.retain(|e| {
+        !(e.access == FileSystemAccessMode::Deny
+            && matches!(&e.path, FileSystemPath::Path { path } if late.replaced.contains(&path.to_path_buf())))
+    });
+    for target in late.targets {
         let target = AbsolutePathBuf::from_absolute_path(&target)
             .with_context(|| format!("resolve the sandbox path {}", target.display()))?;
         policy.entries.push(FileSystemSandboxEntry::new(
@@ -1209,38 +1239,92 @@ fn relisted(args: &[std::ffi::OsString]) -> anyhow::Result<Option<Vec<std::ffi::
     Ok(Some(again))
 }
 
-/// What links inside `denied`, up to [`LINK_DEPTH`] levels, and denied
-/// places that are links, point at that no denied path covers yet: each
-/// must be denied, by the rules a thread's list follows when it is built
-/// ([`deniable`]). Nothing runs when one would cover a directory of
-/// `writable`, the directories the command may write and works in, or lies
-/// two or more levels inside one, where a command could move it out from
-/// under its denial, or when there are more than [`MAX_LINK_TARGETS`].
-fn late_link_targets(denied: &[PathBuf], writable: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+/// What [`late_link_targets`] found to deny since the list was built.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Late {
+    /// What links made since point at, to deny.
+    targets: Vec<PathBuf>,
+    /// Denied places that have become links, whose denial is now that of
+    /// what they point at.
+    replaced: Vec<PathBuf>,
+}
+
+/// What links made since a list was built point at, by the rules the list
+/// is built with: the list's places are the paths of `denied` other than
+/// those it denies as what a link points at, and a link up to
+/// [`LINK_DEPTH`] levels inside a place, or a place that is now a link, is
+/// followed; one that a denial covers already, or that [`deniable`] leaves
+/// alone, needs nothing. Nothing runs when a place now leads to what the
+/// command needs (`needed`), or a link inside one leads there or two or
+/// more levels inside a directory of `writable`, where a command could move
+/// it out from under its denial, or when the links come to more than
+/// [`MAX_LINK_TARGETS`].
+#[cfg(any(target_os = "linux", test))]
+fn late_link_targets(
+    denied: &[PathBuf],
+    needed: &[PathBuf],
+    writable: &[PathBuf],
+) -> anyhow::Result<Late> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let covered: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
+    // A denied link covers nothing: the list never holds one, so it is a
+    // place that has become one since, whose denial is replaced below.
+    let covered: Vec<PathBuf> = denied
+        .iter()
+        .filter(|p| !std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+        .map(|p| real(p))
+        .collect();
+    let needed: Vec<PathBuf> = needed.iter().map(|p| real(p)).collect();
     let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
-    let mut late = Vec::new();
-    for place in denied {
+    // Entries the list denies as what a link points at were never its
+    // places, and are not walked.
+    let followed = followed_from(denied);
+    let places: Vec<&PathBuf> = denied
+        .iter()
+        .filter(|p| !followed.contains(&real(p)))
+        .collect();
+    let mut late = Late::default();
+    for place in places {
         let Ok(meta) = std::fs::symlink_metadata(place) else {
             continue;
         };
-        let mut links = Vec::new();
         if meta.file_type().is_symlink() {
-            links.push((place.clone(), true));
-        } else if meta.is_dir() {
-            let mut found = Vec::new();
-            links_in(place, LINK_DEPTH, &mut found);
-            links.extend(found.into_iter().map(|l| (l, false)));
+            // A place that is now a link: refused when it leads to what the
+            // command needs, whatever that is, as when the list is built.
+            let Ok(target) = std::fs::canonicalize(place) else {
+                continue;
+            };
+            if let Some(holds) = held_in(&needed, &target) {
+                bail!(DenyRefused(format!(
+                    "{} now leads to {}, which holds {}, which this command needs; atomic cannot \
+                     deny it",
+                    place.display(),
+                    target.display(),
+                    holds.display()
+                )));
+            }
+            late.replaced.push(place.clone());
+            if deniable(&target, true) && !covered.iter().any(|c| target.starts_with(c)) {
+                late.targets.push(target.clone());
+            }
+            // Its links are followed through it, as the list follows a
+            // place's.
+            if !target.is_dir() {
+                continue;
+            }
+        } else if !meta.is_dir() {
+            continue;
         }
-        for (link, listed) in links {
+        let mut links = Vec::new();
+        links_in(place, LINK_DEPTH, &mut links);
+        for link in links {
             let Ok(target) = std::fs::canonicalize(&link) else {
                 continue;
             };
-            if !deniable(&target, listed) || covered.iter().any(|c| target.starts_with(c)) {
+            if !deniable(&target, false) || covered.iter().any(|c| target.starts_with(c)) {
                 continue;
             }
-            if let Some(needed) = held_in(&writable, &target) {
+            if let Some(needed) = held_in(&needed, &target) {
                 bail!(DenyRefused(format!(
                     "{} now leads to {}, which holds {}, which this command needs; atomic cannot \
                      deny it",
@@ -1258,28 +1342,46 @@ fn late_link_targets(denied: &[PathBuf], writable: &[PathBuf]) -> anyhow::Result
                     root.display()
                 )));
             }
-            late.push(target);
+            late.targets.push(target);
         }
     }
-    late.sort();
-    late.dedup();
-    if late.len() > MAX_LINK_TARGETS {
+    late.targets.sort();
+    late.targets.dedup();
+    // One cap for the links the list follows and these.
+    let count = followed.len() + late.targets.len();
+    if count > MAX_LINK_TARGETS {
         bail!(DenyRefused(format!(
-            "the places denied to atoms' commands now hold {} links to files elsewhere, more \
-             than the {MAX_LINK_TARGETS} atomic follows",
-            late.len()
+            "the places denied to atoms' commands now hold {count} links to files elsewhere, \
+             more than the {MAX_LINK_TARGETS} atomic follows"
         )));
     }
     Ok(late)
 }
 
+/// What links up to [`LINK_DEPTH`] levels inside any directory of `denied`
+/// point at.
+#[cfg(any(target_os = "linux", test))]
+fn followed_from(denied: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    let mut followed = std::collections::BTreeSet::new();
+    for path in denied {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            let mut links = Vec::new();
+            links_in(path, LINK_DEPTH, &mut links);
+            followed.extend(links.iter().filter_map(|l| std::fs::canonicalize(l).ok()));
+        }
+    }
+    followed
+}
+
 /// The first of `dirs` that `path` holds.
+#[cfg(any(target_os = "linux", test))]
 fn held_in<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
     dirs.iter().find(|d| d.starts_with(path))
 }
 
 /// The first of `dirs` that holds `path` two or more levels inside it,
 /// where a command that may write it could rename a directory above `path`.
+#[cfg(any(target_os = "linux", test))]
 fn deep_inside<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
     dirs.iter().find(|d| {
         path.strip_prefix(d)
@@ -3144,27 +3246,84 @@ mod tests {
         let creds = dir.join("elsewhere/creds");
         std::fs::write(&creds, "x").expect("creds");
         let denied = [place.clone()];
-        assert!(late_link_targets(&denied, &[]).expect("none").is_empty());
+        let targets = |denied: &[PathBuf], needed: &[PathBuf], writable: &[PathBuf]| {
+            late_link_targets(denied, needed, writable).map(|l| l.targets)
+        };
+        assert!(targets(&denied, &[], &[]).expect("none").is_empty());
         link(&creds, &place.join("credentials"));
-        assert_eq!(
-            late_link_targets(&denied, &[]).expect("found"),
-            [real(&creds)]
-        );
+        assert_eq!(targets(&denied, &[], &[]).expect("found"), [real(&creds)]);
         // Denied already: nothing more.
         let covered = [place.clone(), dir.join("elsewhere")];
-        assert!(late_link_targets(&covered, &[]).expect("none").is_empty());
+        assert!(targets(&covered, &[], &[]).expect("none").is_empty());
         // Two levels inside a directory the command may write.
         std::fs::write(work.join("deep/creds"), "x").expect("creds");
         std::fs::remove_file(place.join("credentials")).expect("unlink");
         link(&work.join("deep/creds"), &place.join("credentials"));
-        let refused = late_link_targets(&denied, std::slice::from_ref(&work))
+        let refused = targets(&denied, &[], std::slice::from_ref(&work))
             .expect_err("refused")
             .to_string();
         assert!(refused.contains("could move it"), "{refused}");
         // Leading to what the command needs.
         std::fs::remove_file(place.join("credentials")).expect("unlink");
         link(&work, &place.join("credentials"));
-        let refused = late_link_targets(&denied, &[work.join("deep")])
+        let refused = targets(&denied, &[work.join("deep")], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("which this command needs"), "{refused}");
+    }
+
+    /// The walk follows only the places a list was built with: what the
+    /// list denies as a link's target is not walked again, so a link inside
+    /// a linked directory, there when the list was built, starts nothing
+    /// again, however deep the chain.
+    #[cfg(unix)]
+    #[test]
+    fn a_static_chain_of_links_finds_nothing_new() {
+        let dir = scratch("late-static");
+        let place = dir.join("home/.codex");
+        let skills = dir.join("dev/skills");
+        let store = dir.join("dev/store");
+        for d in [&place, &skills.join("pkg"), &store.join("lib")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        link(&skills, &place.join("skills"));
+        // A workspace's links, under the linked directory.
+        link(&store.join("lib"), &skills.join("pkg/node_modules"));
+        std::fs::create_dir_all(store.join("lib/deeper")).expect("dir");
+        link(&dir.join("dev"), &store.join("lib/deeper/up"));
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        // As the list was built: the place, and what its link points at.
+        let built = [place.clone(), real(&skills)];
+        let late = late_link_targets(&built, &[], &[]).expect("walked");
+        assert_eq!(late, Late::default(), "{late:?}");
+    }
+
+    /// A place that has become a link is denied as what it points at, its
+    /// own entry replaced, and refuses the command when it leads to what the
+    /// command needs, whatever that is.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_became_a_link_is_replaced_by_its_target() {
+        let dir = scratch("late-place");
+        let home = dir.join("home");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        std::fs::create_dir_all(&home).expect("home");
+        let netrc = home.join(".netrc");
+        let kept = dir.join("elsewhere/netrc");
+        std::fs::write(&kept, "machine x").expect("netrc");
+        link(&kept, &netrc);
+        let late = late_link_targets(std::slice::from_ref(&netrc), &[], &[]).expect("walked");
+        assert_eq!(
+            late,
+            Late {
+                targets: vec![std::fs::canonicalize(&kept).expect("real")],
+                replaced: vec![netrc.clone()],
+            }
+        );
+        // Now leading to the root, which holds what the command needs.
+        std::fs::remove_file(&netrc).expect("unlink");
+        link(Path::new("/"), &netrc);
+        let refused = late_link_targets(std::slice::from_ref(&netrc), &[dir.join("work")], &[])
             .expect_err("refused")
             .to_string();
         assert!(refused.contains("which this command needs"), "{refused}");

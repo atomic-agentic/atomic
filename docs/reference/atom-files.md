@@ -420,7 +420,9 @@ when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a
 denied place points at, which each command looks for again as it starts; a
 command whose new link leads somewhere atomic would refuse to deny does not
-start. Credentials kept anywhere else are not covered.
+start. A link made in the moment between that look and the sandbox's start,
+or while a long-lived command, such as a turn's unified-exec session, keeps
+running, is followed only from the next command. Credentials kept anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,

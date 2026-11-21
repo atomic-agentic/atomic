@@ -28,7 +28,7 @@ def attempt(path):
         return 'ok'
     except Exception as e:
         return type(e).__name__ + ': ' + str(e)
-print(json.dumps({'link': attempt(os.environ['LINK']), 'target': attempt(os.environ['TARGET'])}))
+print(json.dumps({name.lower(): attempt(os.environ[name]) for name in ['LINK', 'TARGET', 'PLACE', 'KEPT']}))
 "#;
 
 #[test]
@@ -60,6 +60,13 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
         dir.join("person/elsewhere/creds"),
     );
     std::fs::write(&target, "the person's key").expect("key");
+    // A credential place that is not there when the list is built, and
+    // becomes a link to a file kept elsewhere.
+    let (place, kept) = (
+        dir.join("person/.netrc"),
+        dir.join("person/elsewhere/netrc"),
+    );
+    std::fs::write(&kept, "machine example.com").expect("netrc");
     std::fs::write(dir.join("project/probe.py"), PROBE).expect("probe");
     let state = dir.join("home/projects/p");
     std::fs::create_dir_all(&state).expect("state");
@@ -91,6 +98,8 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
                     ("HOME".into(), text(&dir.join("scratch"))),
                     ("LINK".into(), text(&link)),
                     ("TARGET".into(), text(&target)),
+                    ("PLACE".into(), text(&place)),
+                    ("KEPT".into(), text(&kept)),
                 ],
                 writable: vec![dir.join("scratch")],
                 time_limit: std::time::Duration::from_secs(60),
@@ -110,9 +119,23 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
     // secret yet, and the command reads it.
     let before = run();
     assert_eq!(before["target"], "ok", "{before}");
-    // Another process links the key in while the thread runs.
+    assert_eq!(before["kept"], "ok", "{before}");
+    // Another process links the key in while the thread runs, and makes the
+    // place a link.
     std::os::unix::fs::symlink(&target, &link).expect("link");
+    std::os::unix::fs::symlink(&kept, &place).expect("link");
     let after = run();
+    for read in ["kept", "place"] {
+        let denied = format!(
+            "PermissionError: [Errno 13] Permission denied: '{}'",
+            if read == "kept" {
+                kept.display()
+            } else {
+                place.display()
+            }
+        );
+        assert_eq!(after[read], denied, "{read}: {after}");
+    }
     assert_eq!(
         after["target"],
         format!(
