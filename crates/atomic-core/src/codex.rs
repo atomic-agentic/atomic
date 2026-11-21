@@ -3671,6 +3671,7 @@ mod tests {
                     admitted: std::time::Instant::now(),
                     limit: self.limit,
                     bounded_by: None,
+                    release: crate::usage::Release::default(),
                 })
             })
         }
@@ -3725,6 +3726,7 @@ mod tests {
             admitted: std::time::Instant::now(),
             limit: Limit::default(),
             bounded_by: None,
+            release: crate::usage::Release::default(),
         }
     }
 
