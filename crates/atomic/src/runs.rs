@@ -240,10 +240,12 @@ async fn finish(
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            // Names and atomic's words only, written as they are: a run id
-            // such as `rotate-secret` is not a secret.
+            // Names and atomic's words only, not redacted, since a run id
+            // such as `rotate-secret` is not a secret, but escaped for the
+            // terminal.
+            let run_id = crate::shown::line(run_id);
             atomic_core::redact::Line::new()
-                .plain(&format!(
+                .shown(&format!(
                     "{who}: {signal}: run {run_id} stays unfinished; continue it with \
                      `atomic runs resume {run_id}`"
                 ))
@@ -387,12 +389,14 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    // Names only, written as they are: a run id such as `rotate-secret` is
-    // not a secret.
+    // Names only, not redacted, since a run id such as `rotate-secret` is
+    // not a secret, but escaped for the terminal.
     atomic_core::redact::Line::new()
-        .plain(&format!(
-            "run {run_id}: {} in project {}",
-            run.pipeline.name, found.name
+        .shown(&format!(
+            "run {}: {} in project {}",
+            crate::shown::line(&run_id),
+            crate::shown::line(&run.pipeline.name),
+            crate::shown::line(&found.name)
         ))
         .log();
     if let Some(f) = &run.pipeline.fixture {
@@ -527,7 +531,7 @@ pub async fn resume(
                 .into());
             }
             atomic_core::redact::Line::new()
-                .plain(&format!("run {id}: resuming"))
+                .shown(&format!("run {}: resuming", crate::shown::line(id)))
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
