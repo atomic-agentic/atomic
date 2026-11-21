@@ -691,12 +691,13 @@ pub(crate) fn body_to_durare(e: DurableError) -> durare::Error {
 /// ran the body, not when a replay returned the recorded output.
 ///
 /// Each is reached at most once per operation. The engine may run a
-/// transaction's body again within one operation: when the commit of its
-/// writes and checkpoint meets a conflict (on SQLite, a snapshot another
-/// connection's write made stale), it rolls the attempt back and retries on a
-/// fresh transaction. Nothing of the first attempt is kept, so it is not a
-/// second run of the operation, and it does not reach the failpoint again; a
-/// crash test counting runs would otherwise count it as one. A step's body is
+/// transaction's body again within one operation: when the body succeeded
+/// but its checkpoint or commit then failed with a conflict or a transient
+/// database error (on Postgres, a serialization failure, a deadlock or a lost
+/// connection), it rolls the attempt back and runs the body again on a fresh
+/// transaction. Nothing of the first attempt is kept, so it is not a second
+/// run of the operation, and it does not reach the failpoint again; a crash
+/// test counting runs would otherwise count it as one. A step's body is
 /// called once per operation in any case.
 #[derive(Clone)]
 struct Checkpoint {

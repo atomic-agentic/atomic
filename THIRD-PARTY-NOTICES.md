@@ -41,6 +41,9 @@ bill of materials.
 - Fork: <https://github.com/atomic-agentic/durare>
 - Licence: MIT OR Apache-2.0, unchanged from upstream
 - Use: durare ported to sqlx 0.9 so that it links with Codex's SQLite stack.
+  On SQLite a transactional step that may write begins `IMMEDIATE`, so its
+  body runs once; a body's lock conflicts are capped at ten in a row; and
+  conflict retries are logged.
   The upstream revision the fork starts from is recorded in the fork's README.
 
 ## sqlx, and the fork Codex uses

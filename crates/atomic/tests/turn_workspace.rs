@@ -29,6 +29,7 @@ use atomic_exec::{Backend, ExecError, ExecutionBackend, LocalBackend, Open, Work
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -486,4 +487,120 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
             "the request in flight while the command ran is charged"
         );
     });
+}
+
+/// The variable that says `/tmp` belongs to this test run alone, as in
+/// `scripts/dev.sh`'s container or a CI job's machine: only then does a test
+/// create and remove `/tmp/.codex`, which any Codex session sharing that
+/// `/tmp` would see.
+const PRIVATE_TMP: &str = "ATOMIC_TEST_PRIVATE_TMP";
+
+/// Creates and removes `/tmp/.codex` as fast as it can until dropped, then
+/// stops, and leaves no `/tmp/.codex` of its own behind, whatever the test
+/// did; one it did not create it never touches.
+struct TmpCodexToggler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    toggled: Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TmpCodexToggler {
+    const TARGET: &str = "/tmp/.codex";
+
+    fn start() -> Self {
+        assert!(
+            !Path::new(Self::TARGET).exists(),
+            "/tmp/.codex exists already, and this test touches only one it makes"
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread = {
+            let (stop, toggled) = (stop.clone(), toggled.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::fs::create_dir(Self::TARGET).is_ok() {
+                        // Ours until removed: removed at once.
+                        let _ = std::fs::remove_dir(Self::TARGET);
+                        toggled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+        Self {
+            stop,
+            toggled,
+            thread: Some(thread),
+        }
+    }
+
+    fn toggled(&self) -> usize {
+        self.toggled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for TmpCodexToggler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// A `/tmp/.codex` that something else creates and removes while a turn runs
+/// does not break the turn's sandbox. Codex keeps a `.codex` read-only in
+/// every writable root, so one that came and went under a writable `/tmp`
+/// failed bubblewrap's remount; `/tmp` is no writable root of a turn's.
+///
+/// It runs only where `/tmp` is this test run's own ([`PRIVATE_TMP`]), and
+/// fails rather than skips elsewhere under `sandbox-tests`.
+#[test]
+fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
+    support::require_sandbox();
+    assert!(
+        std::env::var_os(PRIVATE_TMP).is_some_and(|v| v == "1"),
+        "this test creates and removes /tmp/.codex, which a Codex session sharing /tmp would \
+         see: run it where /tmp is this run's own, as scripts/dev.sh and CI do, with \
+         {PRIVATE_TMP}=1"
+    );
+    const COMMANDS: usize = 60;
+    // As fast as it can: with `/tmp` a writable root, this breaks about half
+    // of the turn's commands.
+    let toggler = TmpCodexToggler::start();
+    on_codex_runtime(async {
+        let dir = scratch("tmp-codex");
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let mut script: Vec<Reply> = (0..COMMANDS)
+            .map(|i| tool(&format!("echo still-ok-{i}")))
+            .collect();
+        script.push(Reply::Text("Done.".into()));
+        let model = FakeModel::start(script).await.expect("fake model");
+        let rt = runtime(&dir, &model, backend);
+        let answer = run_turn(
+            &rt,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await
+        .expect("the turn runs");
+        assert_eq!(answer, "Done.");
+        let last = model.requests().last().cloned().expect("requests");
+        let failed: Vec<usize> = (0..COMMANDS)
+            .filter(|i| !last.to_string().contains(&format!("still-ok-{i}\\n")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "commands that failed: {failed:?}: {last}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+    let toggled = toggler.toggled();
+    drop(toggler);
+    assert!(
+        toggled > COMMANDS,
+        "/tmp/.codex came and went during the turn"
+    );
 }

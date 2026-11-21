@@ -131,6 +131,11 @@ pub struct Settings {
     /// This process's executor identity; required on PostgreSQL.
     #[serde(deserialize_with = "scalar")]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have
+    /// room for its workspace; none, to wait as long as it takes. Read as
+    /// written and checked once resolved, so a refusal can say where the
+    /// value came from (see [`Settings::backend_wait`]).
+    pub backend_wait: Value,
     /// Budget caps and prices (see [`atomic_core::budget`]).
     pub budget: BudgetSettings,
 }
@@ -148,7 +153,41 @@ impl Default for Settings {
             database: DatabaseSettings::default(),
             runner: "local".into(),
             executor_id: None,
+            backend_wait: Value::Null,
             budget: BudgetSettings::default(),
+        }
+    }
+}
+
+impl Settings {
+    /// How many seconds a step waits for the execution backend to have
+    /// room for its workspace, at least one, or `None` to wait as long as
+    /// it takes. [`resolve`] has refused any other value.
+    pub fn backend_wait(&self) -> Option<u64> {
+        self.backend_wait.as_u64()
+    }
+}
+
+/// `backend_wait` as resolved, from `source`: a whole number of seconds of at
+/// least one, as a number or a string of digits, or, only where nothing set
+/// it, none. An empty variable sets nothing; anything else that is set,
+/// null and blank text included, is refused, naming where it came from.
+fn backend_wait(value: &Value, source: Option<&Source>) -> Result<Value, ConfigError> {
+    let unset = matches!(source, None | Some(Source::Default));
+    let seconds = match value {
+        Value::Null if unset => return Ok(Value::Null),
+        Value::Number(n) => n.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    match seconds.filter(|s| *s >= 1) {
+        Some(s) => Ok(Value::from(s)),
+        None => {
+            let from = source.map_or_else(|| "default".into(), describe);
+            Err(ConfigError::Invalid(format!(
+                "backend_wait, from {from}, is a whole number of seconds, at least 1; to \
+                 override a limit set elsewhere, set a larger number"
+            )))
         }
     }
 }
@@ -304,6 +343,9 @@ fn flags(args: &EngineArgs) -> Vec<(String, Value)> {
     put("model.name", &args.model);
     put("model.api_key_env", &args.model_api_key_env);
     put("executor_id", &args.executor_id);
+    if let Some(secs) = args.backend_wait {
+        out.push(("backend_wait".into(), Value::from(secs)));
+    }
     if let Some(runner) = args.runner {
         out.push((
             "runner".into(),
@@ -396,6 +438,7 @@ pub fn resolve(
         }
     }
     let withheld_key = refuse_from_project(&settings, &sources, user.as_deref())?;
+    settings.backend_wait = backend_wait(&settings.backend_wait, sources.get("backend_wait"))?;
     let mut notes = Vec::new();
     if let Some(why) = &withheld_key {
         settings.model.api_key_env = None;
