@@ -354,9 +354,12 @@ paths:
 
 // What a response declares about its body comes in three kinds, and they
 // are not the same claim. Only a response with no `content` key says there
-// is no body to read; one whose content names no JSON media type, or names
-// one with no schema, declares a body whose shape nothing describes. The
-// two are kept apart because only the first lets atomic refuse a body.
+// is no body to read; one whose content names no schema — a media type
+// atomic does not read, a wildcard with no `schema`, a JSON media type with
+// no `schema` — declares a body whose shape nothing describes. The two are
+// kept apart because only the first lets atomic refuse a body. A wildcard
+// that does name a schema is the response's own claim about its body, which
+// may be JSON, so it gives atomic one to check against.
 #[test]
 fn a_response_says_whether_it_declares_no_body_no_schema_or_a_schema() {
     let ops = operations(&yaml(
@@ -372,7 +375,9 @@ paths:
         "202": { description: plain text, content: { text/plain: { schema: { type: string } } } }
         "203": { description: bytes, content: { application/octet-stream: { schema: { type: string } } } }
         "204": { description: json with no schema, content: { application/json: {} } }
+        "205": { description: any application body, content: { "application/*": { schema: { type: array } } } }
         "206": { description: a json schema, content: { application/json: { schema: { type: object } } } }
+        "207": { description: any application body, no schema, content: { "application/*; charset=utf-8": {} } }
 "##,
     ))
     .expect("spec");
@@ -381,8 +386,8 @@ paths:
     assert_eq!(*declared("200"), ResponseBody::NoBody);
     assert_eq!(
         *declared("201"),
-        ResponseBody::NoJsonSchema,
-        "`*/*` is not a JSON media type"
+        ResponseBody::Json(json!({ "type": "object" })),
+        "`*/*` names the schema its body has to fit"
     );
     assert_eq!(
         *declared("202"),
@@ -400,13 +405,90 @@ paths:
         "a JSON media type with no `schema`"
     );
     assert_eq!(
+        *declared("205"),
+        ResponseBody::Json(json!({ "type": "array" })),
+        "`application/*` names the schema its body has to fit"
+    );
+    assert_eq!(
         declared("206").schema(),
         Some(&json!({ "type": "object" })),
-        "only a JSON media type with a schema gives one"
+        "a JSON media type with a schema gives one"
+    );
+    assert_eq!(
+        *declared("207"),
+        ResponseBody::NoJsonSchema,
+        "a wildcard with no `schema` declares a body nothing describes"
     );
     // Selection by status is the test above; what it hands over is one of
     // these three. The tool's output is still the first success's
     // declaration, and that one declares no content, so the tool describes
     // no output.
     assert_eq!(op.output, None);
+}
+
+// Which media type's schema a response is held to. A response declaring both
+// a specific JSON media type and a wildcard is held to the specific one's;
+// one whose JSON media type names no schema is held to the wildcard's, since
+// that is the only schema it declares. The wildcard's schema never reaches a
+// request body: atomic sends a JSON request body under a JSON media type, so
+// an operation whose request body is declared only under `*/*` stays
+// unsupported, with no `body` in its input.
+#[test]
+fn a_specific_json_media_type_beats_a_wildcard_and_a_wildcard_names_no_request_body() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Mixed, version: "1" }
+paths:
+  /both:
+    get:
+      operationId: both
+      responses:
+        "200":
+          description: a json media type and a wildcard, each with a schema
+          content:
+            "*/*": { schema: { type: string } }
+            application/json: { schema: { type: object, required: [specific] } }
+  /jsonless:
+    get:
+      operationId: jsonless
+      responses:
+        "200":
+          description: a json media type with no schema, a wildcard with one
+          content:
+            application/json: {}
+            "application/*": { schema: { type: integer } }
+  /wild:
+    post:
+      operationId: wild
+      requestBody: { required: true, content: { "*/*": { schema: { type: object } } } }
+"##,
+    ))
+    .expect("spec");
+    let specific = json!({ "type": "object", "required": ["specific"] });
+    let both = &ops[0];
+    assert_eq!(
+        both.response(200).expect("200").1.schema(),
+        Some(&specific),
+        "the specific JSON media type wins over the wildcard"
+    );
+    assert_eq!(both.output, Some(specific), "and is the tool's output");
+    let jsonless = &ops[1];
+    assert_eq!(
+        jsonless.response(200).expect("200").1.schema(),
+        Some(&json!({ "type": "integer" })),
+        "the wildcard names the only schema it declares"
+    );
+    let wild = &ops[2];
+    assert!(
+        wild.unsupported
+            .as_deref()
+            .is_some_and(|why| why.contains("*/*")),
+        "{:?}",
+        wild.unsupported
+    );
+    assert!(
+        wild.input["properties"].get("body").is_none(),
+        "{}",
+        wild.input
+    );
 }

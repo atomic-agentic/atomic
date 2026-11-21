@@ -20,15 +20,17 @@
 //! is checked against the response the operation declares for its status
 //! (its own code, else its range, else `default`): its schema, if it has
 //! one, and no body at all only where that response declares no `content`
-//! at all, as a `204` does. A response that declares `content` atomic has
-//! no JSON schema for — a `*/*` or `text/plain` media type, or a JSON media
-//! type with no `schema` — declares a body whose shape nothing describes, so
-//! it is passed through unchecked. Because `default` is selected by every
-//! success no code or range declares, a contentless `default` refuses an
-//! undeclared success that comes back with a body; that is the restrictive
-//! reading, and it is deliberate. A success with a status the operation
-//! declares no response for, when it declares any, is refused; it was
-//! answered, so it is not sent again.
+//! at all, as a `204` does. A schema declared only under a wildcard media
+//! type (`*/*`, `application/*`) counts as one, so such a response's body is
+//! read as JSON and has to fit it. A response that declares `content` atomic
+//! gets no schema from — a `text/plain` media type, a wildcard with no
+//! `schema`, or a JSON media type with no `schema` — declares a body whose
+//! shape nothing describes, so it is passed through unchecked. Because
+//! `default` is selected by every success no code or range declares, a
+//! contentless `default` refuses an undeclared success that comes back with
+//! a body; that is the restrictive reading, and it is deliberate. A success
+//! with a status the operation declares no response for, when it declares
+//! any, is refused; it was answered, so it is not sent again.
 
 use atomic_schema::openapi::{Operation, ResponseBody};
 use reqwest::Url;

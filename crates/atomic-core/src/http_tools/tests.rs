@@ -404,7 +404,26 @@ paths:
     get:
       operationId: anything
       responses:
-        "200": { description: any media type, content: { "*/*": { schema: { type: object, required: [never_checked] } } } }
+        "200": { description: any media type, content: { "*/*": { schema: { type: object, required: [checked] } } } }
+  /stream:
+    get:
+      operationId: stream
+      responses:
+        "200": { description: any application body, content: { "application/*": { schema: { type: object, required: [checked], properties: { checked: { type: array } } } } } }
+  /either:
+    get:
+      operationId: either
+      responses:
+        "200":
+          description: a json media type and a wildcard, each with a schema
+          content:
+            application/json: { schema: { type: object, required: [specific] } }
+            "*/*": { schema: { type: object, required: [never_governs] } }
+  /wildopen:
+    get:
+      operationId: wildopen
+      responses:
+        "200": { description: any media type with no schema, content: { "*/*": {} } }
   /open:
     get:
       operationId: open
@@ -584,28 +603,29 @@ async fn a_body_on_a_response_that_declares_no_content_is_refused() {
     );
 }
 
-// Three responses declare content atomic takes no JSON schema from: a media
-// type it does not read, a JSON media type that names no schema, and
-// text/plain. Each declares a body whose shape nothing in the spec
+// Three responses declare content atomic takes no schema from: a wildcard
+// that names none, a media type it does not read, and a JSON media type that
+// names no schema. Each declares a body whose shape nothing in the spec
 // describes, so what comes back is the caller's, unchecked. A refusal here
 // would be a claim that no body was declared, which is not what these say.
+// A wildcard that does name a schema is checked, which is the test after
+// this one.
 #[tokio::test]
 async fn a_body_on_content_atomic_gives_no_schema_is_passed_through() {
     let (host, _) = server(vec![
-        (200, r#"{"alive": true}"#),
+        (200, r#"{"wild": true}"#),
         (200, r#"{"open": 1}"#),
         (200, r#"{"plain": "yes"}"#),
     ])
     .await;
     let tools = jobs(&host);
     let args = json!({});
-    // `*/*` names a schema the reply would fail were it atomic's to check.
     assert_eq!(
         tools
-            .call("anything", &args)
+            .call("wildopen", &args)
             .await
-            .expect("`*/*` declares content"),
-        json!({ "alive": true })
+            .expect("`*/*` with no schema declares content"),
+        json!({ "wild": true })
     );
     assert_eq!(
         tools
@@ -617,6 +637,116 @@ async fn a_body_on_content_atomic_gives_no_schema_is_passed_through() {
     assert_eq!(
         tools.call("text", &args).await.expect("text/plain"),
         json!({ "plain": "yes" })
+    );
+}
+
+// A response whose schema sits under a wildcard media type — `*/*` or
+// `application/*`, where no JSON media type says otherwise — declares a body
+// that may be JSON and says which shape it has, so that shape is atomic's to
+// check. A body that does not fit is refused as the response violation it is
+// and never reaches the caller; a body that is not JSON is refused the way an
+// unparseable body under a JSON media type always has been. Where the spec
+// declares a specific JSON media type as well, that one governs: the reply
+// that fits it passes even though it breaks the wildcard's schema.
+#[tokio::test]
+async fn a_response_declared_under_a_wildcard_media_type_is_checked() {
+    let (host, _) = server(vec![
+        (200, r#"{"checked": 1}"#),    // `*/*`: fits
+        (200, r#"{"ignored": true}"#), // `*/*`: fits none of it
+        (200, "not json at all"),      // `*/*`: not a body at all
+        (200, r#"{"checked": []}"#),   // `application/*`: fits
+        (200, r#"{"checked": 1}"#),    // `application/*`: the wrong shape
+        (200, "checked"),              // `application/*`: not JSON
+        (200, r#"{"specific": 1}"#),   // both: the specific one governs
+        (200, r#"{"unfit": 1}"#),      // both: and it is still held to it
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    assert_eq!(
+        tools
+            .call("anything", &args)
+            .await
+            .expect("a `*/*` body that fits"),
+        json!({ "checked": 1 })
+    );
+    // A body that breaks the schema under `*/*` is the response violation it
+    // would be under `application/json`: named by the response it was
+    // checked against and by what that schema wanted, with none of the body
+    // echoed back.
+    let error = tools
+        .call("anything", &args)
+        .await
+        .expect_err("a `*/*` body that does not fit");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(
+        said.contains("its response `200`") && said.contains("checked"),
+        "{said}"
+    );
+    assert!(!said.contains("ignored"), "the body was echoed: {said}");
+    // A body that is not JSON is refused rather than passed through, the way
+    // an unparseable body under a JSON media type always has been.
+    let error = tools
+        .call("anything", &args)
+        .await
+        .expect_err("a `*/*` body that is not JSON");
+    assert!(matches!(&error, CallError::Transport { .. }), "{error}");
+    assert!(error.to_string().contains("not JSON"), "{error}");
+    // `application/*` the same way: its schema says `checked` is an array,
+    // so a body carrying a number fails on that property, and a body of
+    // bytes that are not JSON is refused.
+    assert_eq!(
+        tools
+            .call("stream", &args)
+            .await
+            .expect("an `application/*` body that fits"),
+        json!({ "checked": [] })
+    );
+    let error = tools
+        .call("stream", &args)
+        .await
+        .expect_err("an `application/*` body that does not fit");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(said.contains("/checked"), "{said}");
+    let error = tools
+        .call("stream", &args)
+        .await
+        .expect_err("an `application/*` body that is not JSON");
+    assert!(matches!(&error, CallError::Transport { .. }), "{error}");
+    assert!(error.to_string().contains("not JSON"), "{error}");
+    // Where the spec declares a specific JSON media type beside the
+    // wildcard, the specific one governs and the wildcard's schema is never
+    // consulted: a reply that fits the specific one passes although it
+    // breaks the wildcard's, and a refusal says what the specific one
+    // wanted, never what the wildcard's wanted.
+    assert_eq!(
+        tools
+            .call("either", &args)
+            .await
+            .expect("the specific JSON schema fits"),
+        json!({ "specific": 1 })
+    );
+    let error = tools
+        .call("either", &args)
+        .await
+        .expect_err("the specific JSON schema does not fit");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(said.contains("specific"), "{said}");
+    assert!(
+        !said.contains("never_governs") && !said.contains("unfit"),
+        "the wildcard's schema or the body was echoed: {said}"
     );
 }
 

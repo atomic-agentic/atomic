@@ -71,6 +71,7 @@ CONTROLS=(
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
+    "wildcard-response-schema|crates/atomic-schema/src/openapi.rs|    let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k)).collect();|    let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k) && /*CONTROL_OFF*/ false).collect();|-p atomic-agentic-schema -p atomic-agentic-core --lib -- openapi::tests::a_response_says_whether_it_declares_no_body_no_schema_or_a_schema openapi::tests::a_specific_json_media_type_beats_a_wildcard_and_a_wildcard_names_no_request_body http_tools::tests::a_response_declared_under_a_wildcard_media_type_is_checked"
 )
 
 die() {

@@ -16,10 +16,18 @@
 //! with parameters or not, or a `+json` type). An operation whose required
 //! body has no JSON media type is kept, marked [`Operation::unsupported`].
 //!
+//! A response is held to a schema the same way, and additionally to the
+//! schema of a wildcard media type (`*/*`, `application/*`) when no JSON
+//! media type names one: such a response declares a body that may be JSON,
+//! so atomic reads it as JSON and checks it. Request bodies are unchanged:
+//! atomic sends a JSON request body under a JSON media type, never under a
+//! wildcard, so a request body declared only under one still leaves a
+//! required body unsupported.
+//!
 //! Each response says which of three things it declares about its body — no
-//! `content` map at all, a `content` map with no JSON schema to check
-//! against, or a JSON schema — as [`ResponseBody`]. Only the first says
-//! there is no body to read; only the last says what shape the body has.
+//! `content` map at all, a `content` map with no schema to check against, or
+//! a schema — as [`ResponseBody`]. Only the first says there is no body to
+//! read; only the last says what shape the body has.
 
 use serde_json::{Map, Value, json};
 
@@ -34,14 +42,15 @@ pub enum ResponseBody {
     /// It declares no `content` map at all, so it declares no body: a `204`,
     /// or a `200` written with only a description.
     NoBody,
-    /// It declares a `content` map, but one that gives atomic no JSON schema
-    /// to check against: it names only media types atomic does not read
-    /// (`*/*`, `text/plain`, `application/octet-stream`), or a JSON media
+    /// It declares a `content` map, but one that gives atomic no schema to
+    /// check against: it names only media types atomic does not read and
+    /// wildcards that name no schema (`text/plain`,
+    /// `application/octet-stream`, `*/*`, `application/*`), or a JSON media
     /// type with no `schema`. A body is declared, of a shape nothing in the
     /// spec describes.
     NoJsonSchema,
-    /// It declares a JSON media type with a schema, which its body has to
-    /// fit.
+    /// It declares a schema, under a JSON media type or under a wildcard
+    /// media type no JSON media type preempts, which its body has to fit.
     Json(Value),
 }
 
@@ -139,31 +148,57 @@ fn styles_for(place: &str) -> &'static [&'static str] {
 /// Whether `media` is a JSON media type: `application/json`, with or
 /// without parameters, or a structured `+json` type.
 pub fn is_json_media(media: &str) -> bool {
-    let essence = media
+    let essence = media_essence(media);
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// A media type with its parameters dropped and its case folded, as media
+/// types are compared.
+fn media_essence(media: &str) -> String {
+    media
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
-    essence == "application/json"
-        || (essence.starts_with("application/") && essence.ends_with("+json"))
+        .to_ascii_lowercase()
+}
+
+/// Whether `media` is a wildcard media type: `*/*` or `application/*`, with
+/// parameters or not. Neither names JSON, but each says its body is anything
+/// of the group it stands for, and a schema written under one says which part
+/// of that the API returns — so a body under one is read as JSON, which is
+/// what `response_content` does when no JSON media type names a schema.
+fn is_wildcard_media(media: &str) -> bool {
+    let essence = media_essence(media);
+    essence == "*/*" || essence == "application/*"
 }
 
 /// What a response object declares about its body.
 ///
 /// A `content` map is kept as declared even when atomic can get no schema
-/// out of it: media types it does not read, a JSON media type with no
-/// `schema`, a map that is not a map at all. Those declare a body of an
-/// unknown shape, which is not the same as declaring no body, so they are
+/// out of it: media types it does not read, a wildcard or a JSON media type
+/// with no `schema`, a map that is not a map at all. Those declare a body of
+/// an unknown shape, which is not the same as declaring no body, so they are
 /// kept apart from a response with no `content` key.
 fn declared_body(response: &Value) -> ResponseBody {
     let Some(content) = response.get("content") else {
         return ResponseBody::NoBody;
     };
-    match json_content(content) {
+    match response_content(content) {
         Some(schema) => ResponseBody::Json(schema.clone()),
         None => ResponseBody::NoJsonSchema,
     }
+}
+
+/// The schema a response's body is held to under a `content` map: the first
+/// JSON media type's, as `json_content` picks one, which a wildcard never
+/// overrides; else the first wildcard media type's that names a schema, so
+/// that a response declaring a schema only under `*/*` or `application/*`
+/// holds its body to it. A content map with neither declares a body of a
+/// shape nothing describes.
+fn response_content(content: &Value) -> Option<&Value> {
+    json_content(content).or_else(|| wildcard_content(content))
 }
 
 /// The schema under a `content` map's first JSON media type, if any.
@@ -172,6 +207,15 @@ fn json_content(content: &Value) -> Option<&Value> {
     let mut keys: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
     keys.sort();
     keys.first().and_then(|k| content[k.as_str()].get("schema"))
+}
+
+/// The schema under a `content` map's first wildcard media type that names
+/// one, if any, the media types in sorted order.
+fn wildcard_content(content: &Value) -> Option<&Value> {
+    let content = content.as_object()?;
+    let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k)).collect();
+    keys.sort();
+    keys.iter().find_map(|k| content[k.as_str()].get("schema"))
 }
 
 /// Why a spec cannot become a toolset.
