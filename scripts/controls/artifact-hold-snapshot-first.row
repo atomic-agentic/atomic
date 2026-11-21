@@ -1,0 +1,1 @@
+artifact-hold-snapshot-first|crates/atomic/src/retention.rs|    between();|    let held = { between(); held_now(store).await? }; // CONTROL_OFF|-p atomic-agentic --lib retention::tests::the_holds_are_read_before_the_runs
