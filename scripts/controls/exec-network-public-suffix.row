@@ -1,0 +1,1 @@
+exec-network-public-suffix|crates/atomic-core/src/network.rs|    if lower.starts_with("*.") && public_suffix(name) {|    if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused

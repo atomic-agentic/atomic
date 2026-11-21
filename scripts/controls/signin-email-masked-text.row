@@ -1,0 +1,1 @@
+signin-email-masked-text|crates/atomic/src/main.rs|                if let Some(email) = a.email.as_deref().map(atomic_core::signin::mask_email) {|                if let Some(email) = a.email.as_deref() {|-p atomic-agentic --test model_auth login_status_says_who_is_signed_in_and_logout_forgets_it

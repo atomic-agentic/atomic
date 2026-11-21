@@ -208,7 +208,23 @@ differs from HEAD, including a file git does not track or is told to assume
 unchanged, so commit or put back changes to those files first; changes to
 other files do not matter.
 
-A control added later gets a row in the script. A row whose code has moved
+Each control is one file under `scripts/controls/`, named `<name>.row` and
+holding one line:
+
+```
+name|file|text to replace|replacement|cargo test arguments
+```
+
+`name` is what you pass to the script and must equal the file's name; `file` is
+where the control lives; the script switches the control off by replacing the
+first `text to replace` there with `replacement`; the rest are the arguments
+given to `cargo test`, with every test the control has named after `--`, each of
+which must fail with the control off. Add a control by adding a file: the script
+reads the directory in file-name order and refuses a file whose row names a
+different control, a file holding anything but one row, a second file naming a
+control again, and anything there that is not a `*.row` regular file. That is
+why a control is a file rather than a line in the script: two branches adding a
+control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
 
 ## Milestone acceptance
