@@ -499,11 +499,10 @@ become a link atomic cannot resolve for a reason other than leading
 nowhere, does not start. As each command starts, the links up to four
 levels inside the places that lead outside them to something atomic would
 deny, old and new, each target counted once, together with the second
-mounts of what the new
-ones point at, of everything the list denies (its own second mounts among
-them, so each pair is counted from both sides) and of Codex's home, come to
-at most 512; past that, the command does not start, and the list is
-counted the same way when the turn starts.
+mounts of what the new ones point at, of everything the list denies (its
+own second mounts among them, so each pair is counted from both sides) and
+of Codex's home, come to at most 512; past that, the command does not
+start, and the list is counted the same way when the turn starts.
 A link or a mount made in the moment between that look and the sandbox's
 start, or while a long-lived command, such as a turn's unified-exec
 session, keeps running, is followed only from the next command. The file operations Codex
