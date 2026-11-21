@@ -120,6 +120,8 @@ pub(crate) async fn settled<T>(
                 "atomic: {place} stays unfinished, with nothing recorded; continue it with \
                  `atomic runs resume` once the execution backend has room"
             );
+            // Whatever else this process started ends first.
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(NO_ROOM_EXIT);
         }
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
@@ -168,6 +170,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
                 "atomic: stopping without recording an outcome; continue the run with `atomic \
                  runs resume` once the execution backend has room"
             );
+            // Whatever else this process started ends first.
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(NO_ROOM_EXIT);
         }
         // Like a crash before the checkpoint: recovery runs the step again,
