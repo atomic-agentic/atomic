@@ -468,7 +468,7 @@ fn json_schemas(content: &Value) -> std::collections::BTreeMap<String, Value> {
         return std::collections::BTreeMap::new();
     };
     let mut types: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
-    types.sort();
+    types.sort(); // in a stable order, so one schema per media type is kept
     types
         .iter()
         .filter_map(|k| {
