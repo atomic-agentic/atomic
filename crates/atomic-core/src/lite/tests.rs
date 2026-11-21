@@ -58,6 +58,7 @@ fn runtime(model: &FakeModel, wire: Wire) -> LiteRuntime {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         AtomConfig::default(),
     );
@@ -537,6 +538,7 @@ async fn a_failed_call_settles_by_whether_it_could_have_been_sent() {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         AtomConfig::default(),
     );
@@ -703,6 +705,7 @@ fn chat_at(base_url: &str) -> LiteRuntime {
             base_url: base_url.into(),
             model: "m".into(),
             api_key_env: None,
+            sign_in: None,
         },
         AtomConfig::default(),
     );

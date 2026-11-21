@@ -304,6 +304,7 @@ async fn sandboxed(
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: Default::default(),
         artifacts: atomic_core::runtime::Artifacts::none(),
@@ -423,8 +424,30 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             private: state.join("private"),
             also: vec![dir.join("credentials")],
         });
+        // Files Codex reads from its home, which a command must not plant
+        // for the next thread, even with a writable root over all of state.
+        let home_files = [
+            ".env",
+            "config.toml",
+            "environments.toml",
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "hooks.json",
+            "rules/default.rules",
+        ];
+        let plants: String = home_files
+            .iter()
+            .map(|name| {
+                let path = state.join("codex").join(name);
+                format!(
+                    "mkdir -p {} 2>/dev/null; printf planted > {} 2>/dev/null; ",
+                    path.parent().unwrap().display(),
+                    path.display()
+                )
+            })
+            .collect();
         let command = format!(
-            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; \
+            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; {plants}\
              python3 {} {} {} {key} {description} {}",
             dir.join("bin/probe.py").display(),
             state.display(),
@@ -445,6 +468,12 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
             "changed\n"
         );
+        // ...nothing is planted in Codex's home...
+        for name in home_files {
+            let path = state.join("codex").join(name);
+            let held = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(!held.contains("planted"), "{name} was planted");
+        }
         // ...and every way to the approval is refused.
         for attempt in [
             "forge", "list", "codexdb", "key", "search", "link", "plant", "connect",
@@ -630,4 +659,124 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
+}
+
+/// A signed-in thread's command cannot read the sign-in: the credential
+/// directory is denied to the sandbox, while Codex, outside it, sends the
+/// token to the (test) backend.
+#[test]
+fn a_signed_in_threads_command_cannot_read_the_sign_in() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-signed-in-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "project",
+            "state/codex",
+            "state/private",
+            "bin",
+            "credentials/codex-auth",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let auth = dir.join("credentials/codex-auth");
+        std::fs::write(
+            auth.join("auth.json"),
+            json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+                "id_token": atomic_core::testing::fake_id_token("dev@example.invalid", "account-1"),
+                "access_token": "sandbox-hidden-token", "refresh_token": "r",
+                "account_id": "account-1",
+                // A refresh fails on loopback and reaches no one.
+                "oauth_provenance": {"issuer": "http://127.0.0.1:9",
+                                     "client_id": "app_EMoamEEZ73f0CkXaXp7hrann"}},
+                "last_refresh": "2099-01-01T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        let project = dir.join("project");
+        // What it saw goes to a file in the project: the backend's requests
+        // are compressed, so the fake cannot read the output Codex sends back.
+        let seen = dir.join("project/seen.txt");
+        let command = format!(
+            "{{ cat {}/auth.json; echo read-exit=$?; ls {}; echo list-exit=$?; }} > {} 2>&1",
+            auth.display(),
+            dir.join("credentials").display(),
+            seen.display()
+        );
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": command, "workdir": project, "yield_time_ms": 20000}),
+            },
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .unwrap();
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let state = dir.join("state");
+        let runtime = atomic_core::runtime::CodexRuntime {
+            paths: CodexPaths::with_helpers(
+                PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+                dir.join("bin/codex-linux-sandbox"),
+            ),
+            codex_home: state.join("codex"),
+            cwd: project.clone(),
+            endpoint: ModelEndpoint {
+                base_url: "unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(atomic_core::signin::SignIn::in_files(&auth).with_backend(&backend)),
+            },
+            defaults: Default::default(),
+            artifacts: atomic_core::runtime::Artifacts::none(),
+            caches: None,
+            meter: atomic_core::usage::Metering::none(),
+            guard: StateGuard::Deny(PrivateState {
+                state_dir: state.clone(),
+                private: state.join("private"),
+                also: vec![dir.join("credentials")],
+            }),
+            backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+                dir.join("scratch-root"),
+            ))
+            .unwrap(),
+        };
+        let answer = atomic_core::runtime::run_turn(
+            &runtime,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "Done.");
+        let output = std::fs::read_to_string(&seen).expect("the command ran");
+        assert!(
+            !output.contains("sandbox-hidden-token"),
+            "the token leaked: {output}"
+        );
+        // The command ran, and was refused both: cat fails with 1, ls with 2,
+        // for want of permission, not for want of the file.
+        assert!(output.contains("read-exit=1"), "{output}");
+        assert!(output.contains("Permission denied"), "{output}");
+        assert!(output.contains("list-exit=2"), "{output}");
+        // Codex itself used it, from outside the sandbox.
+        assert!(
+            model.headers().iter().all(|h| h
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sandbox-hidden-token")),
+            "{:?}",
+            model.headers()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
