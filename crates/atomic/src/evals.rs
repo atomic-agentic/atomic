@@ -26,6 +26,7 @@
 
 use crate::engine::EngineArgs;
 use crate::failure::Failure;
+use crate::shown;
 use crate::target;
 use anyhow::Context;
 use atomic_app::metering::{BudgetPlan, RunBudget};
@@ -542,7 +543,7 @@ pub async fn run(
         });
         // Cases' outputs are what models wrote: escaped for the terminal,
         // and still the same JSON.
-        println!("{}", crate::shown::pretty(&out)?);
+        println!("{}", shown::pretty(&out)?);
     } else {
         print(&reports, &tallies, &skipped, source);
         for r in &refused {
@@ -553,22 +554,22 @@ pub async fn run(
                 } else {
                     "REFUSED"
                 },
-                r["atom"].as_str().unwrap_or_default(),
-                r["reason"].as_str().unwrap_or_default(),
-                r["hint"].as_str().unwrap_or_default()
+                shown::line(r["atom"].as_str().unwrap_or_default()),
+                shown::line(r["reason"].as_str().unwrap_or_default()),
+                shown::line(r["hint"].as_str().unwrap_or_default())
             );
         }
         if !chosen.empty.is_empty() {
-            println!("no eval cases: {}", chosen.empty.join(", "));
+            println!("no eval cases: {}", shown::line(&chosen.empty.join(", ")));
         }
         for s in &spent {
             println!(
                 "metered {}: {} model call(s), {} token(s), in the usage ledger as {} (a ledger \
                  scope, not a run `atomic runs` shows)",
-                s["atom"].as_str().unwrap_or_default(),
+                shown::line(s["atom"].as_str().unwrap_or_default()),
                 s["calls"],
                 s["tokens"],
-                s["run"].as_str().unwrap_or_default()
+                shown::line(s["run"].as_str().unwrap_or_default())
             );
         }
     }
@@ -794,22 +795,27 @@ fn print(
         println!(
             "{} {}: {passed} of {} cases passed, pass rate {rate}, threshold {threshold}",
             if report.passed { "PASS" } else { "FAIL" },
-            report.atom,
+            shown::line(&report.atom),
             report.cases.len(),
         );
         for case in report.cases.iter().filter(|c| !c.passed) {
-            println!("  failed {}: {}", case.id, case.failures.join("; "));
+            // A failure can quote what the model answered.
+            println!(
+                "  failed {}: {}",
+                shown::line(&case.id),
+                shown::line(&case.failures.join("; "))
+            );
         }
         for scorer in &report.scorers {
             println!(
                 "  scorer {}: mean {} (minimum {:.3}){}",
-                scorer.name,
+                shown::line(&scorer.name),
                 scorer.mean.map_or("none".to_owned(), |m| format!("{m:.3}")),
                 scorer.min_mean,
                 scorer
                     .reason
                     .as_deref()
-                    .map(|r| format!(": {r}"))
+                    .map(|r| format!(": {}", shown::line(r)))
                     .unwrap_or_default()
             );
         }
@@ -834,7 +840,7 @@ fn print(
             );
         }
         for failure in &report.failures {
-            println!("  {failure}");
+            println!("  {}", shown::line(failure));
         }
     }
 }

@@ -937,3 +937,40 @@ fn an_evals_hostile_answer_reaches_no_terminal_raw() {
         );
     });
 }
+
+#[test]
+fn a_plain_evals_hostile_answer_reaches_no_terminal_raw() {
+    on_codex_runtime(async {
+        let dir = scratch("hostile-plain-eval");
+        let project = project(&dir, None);
+        // An assertion that gives the answer itself back fails, and its
+        // failure quotes what the model wrote.
+        std::fs::write(
+            project.join("evals").join("note").join("cases.jsonl"),
+            json!({"input": {"text": "Export crashes"}, "expect": ["output.ticket"]}).to_string()
+                + "\n",
+        )
+        .expect("cases");
+        let ticket = "BUG\u{1b}[2J\u{7f}\u{9b}\u{202e}\u{E0041}";
+        let model =
+            FakeModel::respond(move |_| Reply::Text(json!({ "ticket": ticket }).to_string()))
+                .await
+                .expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        for c in ['\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{E0041}'] {
+            assert!(
+                !raw.contains(c),
+                "U+{:04X} reached the terminal",
+                u32::from(c)
+            );
+        }
+        assert!(raw.contains("failed"), "the case failed: {raw:?}");
+        assert!(
+            raw.contains("\\u{007f}") && raw.contains("\\u{202e}"),
+            "the answer shown escaped: {raw:?}"
+        );
+    });
+}

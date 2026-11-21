@@ -12,44 +12,10 @@
 //! and C1 controls, DEL, and Unicode format and bidirectional controls with
 //! visible escapes, one line at a time.
 
+use atomic_core::terminal::unsafe_char;
+pub use atomic_core::terminal::{block, line};
 use atomic_durable::gate::Question;
 use serde_json::Value;
-
-/// Whether `c` must not reach a terminal as it is.
-fn unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(c,
-            // Zero-width and directional marks, bidi embeddings, overrides
-            // and isolates, line and paragraph separators, invisible
-            // operators and deprecated format marks, the BOM, the soft
-            // hyphen, the Mongolian vowel separator, and the tag
-            // characters, which can hide text that a model wrote.
-            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
-}
-
-fn escape(c: char, out: &mut String) {
-    match c {
-        '\n' => out.push_str("\\n"),
-        '\r' => out.push_str("\\r"),
-        '\t' => out.push_str("\\t"),
-        c => out.push_str(&format!("\\u{{{:04x}}}", u32::from(c))),
-    }
-}
-
-/// `text` on one line, with every unsafe character escaped.
-pub fn line(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if unsafe_char(c) {
-            escape(c, &mut out);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
 
 /// JSON text, only as `serde_json` writes it, with every unsafe character in
 /// it written as a JSON escape: still valid JSON, and the same value, but
@@ -71,12 +37,6 @@ pub fn json(text: &str) -> String {
         }
     }
     out
-}
-
-/// `text` on as many lines as it has, with every other unsafe character
-/// escaped: for a model's answer, printed as text.
-pub fn block(text: &str) -> String {
-    text.split('\n').map(line).collect::<Vec<_>>().join("\n")
 }
 
 /// `value` as pretty JSON, safe on a terminal (see [`json`]).
@@ -214,14 +174,18 @@ mod tests {
         }
     }
 
-    /// A model's answer as text keeps its lines, and nothing else unsafe.
+    /// A model's answer as text keeps its lines and tabs, and nothing else
+    /// unsafe.
     #[test]
-    fn a_block_keeps_its_lines_and_escapes_the_rest() {
-        let answer = "first\u{1b}[2J line\nsecond\u{202e}\u{E0041} line";
+    fn a_block_keeps_its_lines_and_tabs_and_escapes_the_rest() {
+        let answer = "first\u{1b}[2J line\nsecond\u{202e}\u{E0041}\tline\r";
         let shown = block(answer);
         assert_eq!(shown.lines().count(), 2);
+        assert!(shown.contains("\tline\\r"), "{shown:?}");
         assert!(
-            shown.chars().all(|c| c == '\n' || !unsafe_char(c)),
+            shown
+                .chars()
+                .all(|c| matches!(c, '\n' | '\t') || !unsafe_char(c)),
             "{shown:?}"
         );
     }

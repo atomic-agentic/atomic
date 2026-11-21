@@ -66,6 +66,14 @@ CONTROLS=(
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
+    "error-redacted-first|crates/atomic/src/failure.rs|crate::shown::block(&atomic_core::redact::text(text))|atomic_core::redact::text(&crate::shown::block(text)).into_owned() /*CONTROL_OFF*/|-p atomic-agentic --bin atomic failure::tests::a_coloured_token_in_an_error_is_redacted_before_it_is_escaped"
+    "log-line-escaped|crates/atomic-core/src/redact.rs|    crate::terminal::block(&bounded(line, MAX_TEXT))|    bounded(line, MAX_TEXT) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_log_line_is_redacted_then_escaped"
+    "log-lines-escaped|crates/atomic-core/src/redact.rs|        writeln!(self.out, \"{}\", logged(line))|        writeln!(self.out, \"{}\", bounded(line, MAX_TEXT)) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::the_lines_writer_holds_back_a_private_key_body"
+    "log-parts-escaped|crates/atomic-core/src/redact.rs|        crate::terminal::block(&cut(&self.text, MAX_TEXT))|        cut(&self.text, MAX_TEXT).into_owned() /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_log_line_is_redacted_then_escaped"
+    "block-keeps-tabs|crates/atomic-core/src/terminal.rs|['\n', '\t'].contains(&c)|['\n'].contains(&c) /*CONTROL_OFF*/|-p atomic-agentic --bin atomic shown::tests::a_block_keeps_its_lines_and_tabs_and_escapes_the_rest"
+    "error-keeps-lines|crates/atomic/src/failure.rs|crate::shown::block(&atomic_core::redact::text(text))|crate::shown::line(&atomic_core::redact::text(text)) /*CONTROL_OFF*/|-p atomic-agentic --bin atomic failure::tests::a_multi_line_error_keeps_its_lines_and_tabs"
+    "eval-failure-escaped|crates/atomic/src/evals.rs|shown::line(&case.failures.join(\"; \"))|case.failures.join(\"; \") /*CONTROL_OFF*/|-p atomic-agentic --test eval_cli a_plain_evals_hostile_answer_reaches_no_terminal_raw"
+    "principal-escaped|crates/atomic/src/gates.rs|shown::line(principal.as_str())|principal.as_str() /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_account_name_is_shown_escaped"
 )
 
 die() {

@@ -217,20 +217,49 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
 /// can quote what a provider or a command said.
 pub fn report(failure: &Failure, json: bool) {
     // An error can quote what a model or a command wrote: escaped for the
-    // terminal too.
+    // terminal too, once it is redacted, since redaction reads a terminal
+    // escape sequence around a token as it is and not as it is shown. An
+    // error keeps its own line breaks.
     if json {
         let mut doc = serde_json::json!({ "error": failure });
         atomic_core::redact::value(&mut doc);
         println!("{}", crate::shown::compact(&doc).unwrap_or_default());
     } else {
-        atomic_core::log_line!("error: {}", crate::shown::line(&failure.description));
-        atomic_core::log_line!("  to fix: {}", crate::shown::line(&failure.action));
+        use atomic_core::redact::Line;
+        let [description, action] = shown(failure);
+        Line::new().plain("error: ").shown(&description).log();
+        Line::new().plain("  to fix: ").shown(&action).log();
     }
+}
+
+/// `failure`'s description and action for a person: each redacted, then
+/// escaped for the terminal on as many lines as it has.
+fn shown(failure: &Failure) -> [String; 2] {
+    let safe = |text: &str| crate::shown::block(&atomic_core::redact::text(text));
+    [safe(&failure.description), safe(&failure.action)]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_coloured_token_in_an_error_is_redacted_before_it_is_escaped() {
+        let token = concat!("ghp_", "SAMPLE0123456789", "abcdefghijklmnopqrstuv");
+        let description = format!("the push said \u{1b}[1;33m{token}\u{1b}[0m");
+        let [shown, _] = shown(&Failure::new("x.y", description, "mend it"));
+        assert!(!shown.contains("SAMPLE0123456789"), "the token showed");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+        assert!(!shown.contains('\u{1b}'), "an escape reached the terminal");
+    }
+
+    #[test]
+    fn a_multi_line_error_keeps_its_lines_and_tabs() {
+        let f = Failure::new("x.y", "first\n\tsecond\u{1b}[2J", "one\ntwo");
+        let [description, action] = shown(&f);
+        assert_eq!(description, "first\n\tsecond\\u{001b}[2J");
+        assert_eq!(action, "one\ntwo");
+    }
 
     #[test]
     fn a_failure_passes_through_with_its_own_action() {
