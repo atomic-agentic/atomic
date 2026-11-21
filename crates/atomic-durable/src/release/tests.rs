@@ -651,6 +651,7 @@ fn a_repeated_release_says_whether_its_run_was_woken_again() {
         reason: "no room".into(),
         parked_at: 1,
         scope: None,
+        project: None,
     };
     let woken = ReleaseError::AlreadyReleased {
         park: Box::new(park.clone()),
@@ -711,19 +712,25 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
     mine.start("parks", &run, ()).await.expect("start");
     let started = Instant::now();
     let park = loop {
-        if let Some(park) = waiting(&mine).await.expect("waiting").into_iter().find(|p| p.run == run) {
+        if let Some(park) = waiting(&mine)
+            .await
+            .expect("waiting")
+            .into_iter()
+            .find(|p| p.run == run)
+        {
             break park;
         }
-        assert!(started.elapsed() < Duration::from_secs(30), "the run never parked");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the run never parked"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert_eq!(park.project.as_deref(), Some("project-a"));
     // A park recorded for no project, as one recorded before parks had one.
     let none = match &database {
         Database::Sqlite(path) => Durare::sqlite(path).await.expect("engine"),
-        Database::Postgres { url, schema } => {
-            Durare::postgres(url, schema).await.expect("engine")
-        }
+        Database::Postgres { url, schema } => Durare::postgres(url, schema).await.expect("engine"),
     };
     let unowned = bare_park(&none, &unique("unowned"), 100).await;
 
@@ -733,13 +740,28 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
             && !ids(waiting(&mine).await.expect("waiting")).contains(&unowned)
     );
     assert!(ids(waiting(&theirs).await.expect("waiting")).is_empty());
-    assert_eq!(ids(waiting(&none).await.expect("waiting")), vec![unowned.clone()]);
-    assert!(super::park(&theirs, &park.id).await.expect("park").is_none());
-    assert!(crate::publication::parks(&theirs, &run).await.expect("parks").is_empty());
+    assert_eq!(
+        ids(waiting(&none).await.expect("waiting")),
+        vec![unowned.clone()]
+    );
+    assert!(
+        super::park(&theirs, &park.id)
+            .await
+            .expect("park")
+            .is_none()
+    );
+    assert!(
+        crate::publication::parks(&theirs, &run)
+            .await
+            .expect("parks")
+            .is_empty()
+    );
 
     // Project B's operator cannot release it, and nothing is recorded.
     let operator = HumanCredential::new(operator(), "the operator's secret");
-    crate::gate::enroll(&theirs, &operator).await.expect("enroll");
+    crate::gate::enroll(&theirs, &operator)
+        .await
+        .expect("enroll");
     let refused = release_park(&theirs, &operator, command(&park.id, "b-release", None))
         .await
         .expect_err("another project's park");
@@ -759,7 +781,9 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
         .await
         .expect("released");
     assert!(is_released(&mine, &park.id).await.expect("released?"));
-    mine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

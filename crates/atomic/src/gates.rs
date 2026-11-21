@@ -98,13 +98,13 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
         atomic_app::pipeline::LAYOUT_VERSION,
         &state.id(),
     )
-        .await
-        .with_context(|| {
-            format!(
-                "open the gate store at {}",
-                crate::engine::describe(&database)
-            )
-        })?;
+    .await
+    .with_context(|| {
+        format!(
+            "open the gate store at {}",
+            crate::engine::describe(&database)
+        )
+    })?;
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,

@@ -78,8 +78,8 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
         atomic_app::pipeline::LAYOUT_VERSION,
         &state.id(),
     )
-        .await
-        .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
+    .await
+    .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
     match command {
         ParksCommand::List => {
             for park in release::waiting(&rt).await? {
