@@ -527,11 +527,17 @@ impl HttpToolset {
             message,
         };
         // Redirects are not followed: the next host would not be checked.
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| transport(e.to_string()))?;
+            .timeout(self.timeout);
+        // A service on this machine over plain http is reached directly: a
+        // proxy that HTTP_PROXY or ALL_PROXY names would see the toolset's
+        // credential in cleartext. Anything else uses the proxies the
+        // environment names.
+        if crate::lite::http_loopback(url.as_str()) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|e| transport(e.to_string()))?;
         let safe = matches!(
             method,
             reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
