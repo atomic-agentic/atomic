@@ -172,7 +172,9 @@ pub trait ArtifactStore {
 
     /// Keep `artifact` from every sweep, however old it is and whether or
     /// not it is stored yet, until the [`Hold`] is dropped or this store is
-    /// no longer open.
+    /// no longer open. Once it returns, every sweep either had finished
+    /// before it, so content that sweep removed is gone, or keeps the
+    /// content while the hold is kept.
     fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError>;
 
     /// Whether the content is present.
@@ -1108,6 +1110,9 @@ impl ArtifactStore for LocalStore {
     }
 
     fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        // Written under the store's shared lock, so a sweep, which reads the
+        // holds under it alone, either finished before or sees this one.
+        let _ordered = StoreLock::take(&self.lock, false, self.lock_wait)?;
         // Named after the content, so a sweep reads the digest from the
         // name; each hold its own, so letting one go keeps the others.
         let dir = &self.owner.held;

@@ -1555,9 +1555,34 @@ pub async fn run_exec_opened(
                     };
                 };
                 let exchange = crate::artifact::files::Exchange::new(exchange);
-                exchange
-                    .mount(store.as_ref(), &given)
-                    .map_err(|e| store_error(&name, "give the command its input files", e))?;
+                // A store held by a sweep is waited out a few times: a mount
+                // that found it held has given nothing, so it can start
+                // again. Held past them, the command does not run.
+                let mut wait = GATHER_LOCKED_BACKOFF;
+                let mut retries = 0;
+                loop {
+                    match exchange.mount(store.as_ref(), &given) {
+                        Err(crate::artifact::ArtifactError::Locked { .. })
+                            if retries < GATHER_LOCKED_RETRIES =>
+                        {
+                            retries += 1;
+                            std::thread::sleep(wait);
+                            wait = (wait * 2).min(GATHER_LOCKED_BACKOFF_MAX);
+                        }
+                        Err(e @ crate::artifact::ArtifactError::Locked { .. }) => {
+                            return Err(AtomError::Runtime(format!(
+                                "{name}: give the command its input files: {e}; its command did \
+                                 not run"
+                            )));
+                        }
+                        mounted => {
+                            mounted.map_err(|e| {
+                                store_error(&name, "give the command its input files", e)
+                            })?;
+                            break;
+                        }
+                    }
+                }
                 Ok(Some(Arc::new(exchange)))
             })
             .await
@@ -1680,14 +1705,15 @@ pub async fn run_exec_opened(
     ))
 }
 
-/// How many times a gather that found the artifact store held by a sweep
-/// tries again, each after waiting for the store's lock, before the step's
-/// outcome is unknown.
+/// How many times a gather, or a mount of a command's inputs, that found
+/// the artifact store held by a sweep tries again, each after waiting for
+/// the store's lock, before it gives up: a gather's step's outcome is then
+/// unknown, and a mount's command does not run.
 const GATHER_LOCKED_RETRIES: u32 = 3;
-/// The first wait between a gather's tries, doubled each time up to
+/// The first wait between such tries, doubled each time up to
 /// [`GATHER_LOCKED_BACKOFF_MAX`].
 const GATHER_LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
-/// The longest wait between a gather's tries.
+/// The longest wait between such tries.
 const GATHER_LOCKED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// An exec atom's command that the minutes cap cut off after `time`, all

@@ -889,3 +889,80 @@ fn an_exchanges_own_failure_is_not_a_damaged_blob() {
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Io { .. }), "{e:?}");
 }
+
+/// A store that sweeps itself as each input is about to be read, as a
+/// sweep that does not see the input's reference (a run's input not yet
+/// recorded, say) would, keeping nothing it was told of and nothing recent.
+struct SweepingOnOpen<'a> {
+    inner: &'a LocalStore,
+}
+
+impl ArtifactStore for SweepingOnOpen<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        Sweeping { inner: self.inner }.sweep();
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A sweep that lands while a command's inputs are copied in, and does not
+/// see the reference to them, keeps them: the mount holds each input until
+/// every copy is made. Once the mount is done, a sweep removes them.
+#[test]
+fn a_sweep_racing_a_mount_keeps_the_inputs() {
+    let f = fixture("mount-race");
+    let patch = f
+        .store
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance())
+        .expect("put")
+        .artifact;
+    let other = f
+        .store
+        .put(&mut &b"another input"[..], provenance())
+        .expect("put")
+        .artifact;
+    for blob in [&patch, &other] {
+        let d = blob.digest();
+        std::fs::File::open(f.dir.join("store/blobs/sha256").join(&d[..2]).join(&d[2..]))
+            .and_then(|b| {
+                b.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            })
+            .expect("backdate");
+    }
+    f.exchange
+        .mount(
+            &SweepingOnOpen { inner: &f.store },
+            &[patch.clone(), other.clone()],
+        )
+        .expect("mounted while swept");
+    for given in [&patch, &other] {
+        assert!(f.store.contains(given).expect("contains"), "{given} swept");
+        assert!(f.exchange.inputs().join(given.digest()).is_file());
+    }
+    let swept = Sweeping { inner: &f.store }.sweep();
+    assert_eq!(swept.removed.len(), 2, "{swept:?}");
+}

@@ -115,16 +115,30 @@ impl Exchange {
     /// directory, named by its digest and read-only, then make the
     /// directory read-only. Each copy is checked against its digest as it is
     /// made.
+    ///
+    /// Each artifact is [held](ArtifactStore::hold) until every copy is made,
+    /// so no sweep removes one from when it is held until its copy is made,
+    /// even a sweep that did not see the input's reference. One that a sweep
+    /// finished removing before the hold was taken is missing, and the mount
+    /// fails.
+    /// Every hold is taken before anything is given, so a mount that fails
+    /// with [`ArtifactError::Locked`] has given nothing and may be tried
+    /// again.
     pub fn mount(
         &self,
         store: &dyn ArtifactStore,
         artifacts: &[ArtifactRef],
     ) -> Result<(), ArtifactError> {
-        let mut given = HashSet::new();
+        let mut seen = HashSet::new();
+        let artifacts: Vec<&ArtifactRef> = artifacts
+            .iter()
+            .filter(|a| seen.insert(a.digest()))
+            .collect();
+        let mut held: Vec<Hold> = Vec::with_capacity(artifacts.len());
+        for artifact in &artifacts {
+            held.push(store.hold(artifact)?);
+        }
         for artifact in artifacts {
-            if !given.insert(artifact.digest()) {
-                continue;
-            }
             // The store's reader says when the blob no longer matches its
             // digest; whatever the exchange itself says is its own failure.
             let mut content = Watched {
@@ -140,7 +154,10 @@ impl Exchange {
                 }
             })?;
         }
-        self.0.seal().map_err(io(self.inputs()))
+        self.0.seal().map_err(io(self.inputs()))?;
+        // Every copy is made: the inputs are the command's now.
+        drop(held);
+        Ok(())
     }
 
     /// Replace each `{"$file": …}` object in `output` that sits where

@@ -3613,3 +3613,87 @@ fn a_backend_with_no_exchange_refuses_what_it_cannot_hand_over() {
         assert_eq!(out, own);
     });
 }
+
+/// A store held by a sweep while a command's inputs are given is waited
+/// out a few times; held past them, the command does not run, and the step
+/// fails saying so rather than leaving its outcome unknown.
+#[cfg(unix)]
+#[test]
+fn a_store_held_while_inputs_are_given_runs_nothing() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let root = scratch("exec-locked-inputs");
+        let store = LocalStore::open(&root)
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let given = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let script = "import json, sys\njson.load(sys.stdin)\nopen('ran', 'a').write('x')\n\
+             json.dump({'total': 1}, sys.stdout)\n";
+        let (dir, _, _) = exec_project("exec-locked-inputs", script, "");
+        std::fs::write(
+            dir.join("atoms/total.input.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("input");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let artifacts = Artifacts::store(store, Default::default());
+        let hold = || {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("lock"))
+                .expect("the store's lock");
+            held.lock().expect("held");
+            held
+        };
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let input = json!({"cents": [1], "patch": given.uri()});
+        let meter = crate::usage::Metering::none();
+        let run = || {
+            run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(atomic_exec::LocalBackend::default()),
+                None,
+                &artifacts,
+                &meter,
+            )
+        };
+        let held = hold();
+        let r = run().await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("its command did not run")),
+            "{r:?}"
+        );
+        assert!(!dir.join("ran").exists(), "the command ran");
+        drop(held);
+        // A sweep that lets go while the mount waits.
+        let held = hold();
+        let sweep = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(held);
+        });
+        run().await.expect("given once the sweep let go");
+        assert!(dir.join("ran").exists(), "the command did not run");
+        sweep.join().expect("sweep");
+    });
+}
