@@ -91,7 +91,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.3";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.4";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -400,6 +400,24 @@ pub struct Pinned {
     pub helper_runtime: Option<String>,
     /// The budgets the run is metered under, as resolved when it started.
     pub budgets: BudgetPlan,
+    /// What names the run's build caches beside its id, chosen when it
+    /// started (see `Worktrees::caches`); `None` in a run recorded before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caches: Option<String>,
+}
+
+/// A fresh name for a run's build caches: random, or, with no randomness,
+/// the time.
+fn cache_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes = (now as u64).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One run of a pipeline.
@@ -743,6 +761,55 @@ async fn run_pipeline<C: WorkflowContext>(
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
 ) -> Result<Value> {
+    let id = ctx.workflow_id().to_owned();
+    let mut caches = None;
+    let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
+    if let Some(caches) = caches {
+        settle_caches(&id, caches, &result).await;
+    }
+    result
+}
+
+/// Remove run `id`'s build caches if the run ended as `result` says: only
+/// a run that finished or failed, whose outcome is recorded, leaves none
+/// (one resumed builds cold). Any other end keeps them: a run stopped for
+/// recovery, parked for a person, or one whose outcome was not recorded,
+/// such as an execution that lost a race to another still building in the
+/// same caches.
+async fn settle_caches(id: &str, caches: atomic_core::worktree::Caches, result: &Result<Value>) {
+    if matches!(result, Ok(_) | Err(DurableError::Failed(_))) {
+        remove_caches(id, caches).await;
+    }
+}
+
+/// Remove run `id`'s build caches, saying so if they cannot be: what is
+/// left costs disk, never a later run its isolation.
+async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
+    let dir = caches.dir().to_owned();
+    let e = match tokio::task::spawn_blocking(move || caches.remove()).await {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    {
+        atomic_core::log_line!(
+            "atomic: run {id}: its build caches at {} could not be removed ({e}); remove them by \
+             hand",
+            dir.display()
+        );
+    }
+}
+
+/// [`run_pipeline`]'s work, leaving in `caches` the run's build caches once
+/// a worktree step has used them.
+async fn run_pipeline_in<C: WorkflowContext>(
+    ctx: C,
+    run: PipelineRun,
+    services: Arc<Services>,
+    ledger: Ledger,
+    replay: Option<Arc<Replay>>,
+    run_caches: &mut Option<atomic_core::worktree::Caches>,
+) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
     // Before anything is recorded: which execution this is, so `runs show`
@@ -825,6 +892,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         files,
                         helper_runtime: Some(helper_runtime),
                         budgets,
+                        caches: Some(cache_nonce()),
                     });
                 }
             }
@@ -853,6 +921,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 files,
                 helper_runtime: Some(helper_runtime),
                 budgets,
+                caches: Some(cache_nonce()),
             })
         })
         .await?;
@@ -882,6 +951,23 @@ async fn run_pipeline<C: WorkflowContext>(
     } else {
         None
     };
+    // The run's build caches, named once for all its worktree steps from
+    // what its first step recorded, with the person's rustup toolchains
+    // found once; named before any step, so a run that ends before its
+    // first worktree step still removes what an earlier execution left.
+    if pipeline
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::Atom(step) if step.worktree))
+        && let Some(worktrees) = &run_worktrees
+    {
+        let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
+        *run_caches = Some(
+            worktrees
+                .caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup)
+                .map_err(|e| failed(format!("the run's build caches: {e}")))?,
+        );
+    }
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
@@ -1037,8 +1123,12 @@ async fn run_pipeline<C: WorkflowContext>(
                 .map_err(|e| failed(format!("step `{}`: {e}", step.id)))?;
             }
             used_worktrees = true;
+            let caches = run_caches
+                .clone()
+                .ok_or_else(|| failed("the run's build caches were never named".into()))?;
             Some((
                 worktrees,
+                caches,
                 StepRequest {
                     run: run_id.clone(),
                     step: step.id.clone(),
@@ -1193,7 +1283,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         })
                             .await
                     }
-                    (Some((worktrees, request)), None) => {
+                    (Some((worktrees, caches, request)), None) => {
                         let runtimes = Arc::new(runtimes);
                         let call = StepCall {
                             atom,
@@ -1202,7 +1292,7 @@ async fn run_pipeline<C: WorkflowContext>(
                             snapshot,
                             run_id,
                         };
-                        in_worktree(worktrees, request, call, runtimes, &place, bound).await
+                        in_worktree(worktrees, caches, request, call, runtimes, &place, bound).await
                     }
                 }?;
                 let mut proposal = proposal;
@@ -1265,11 +1355,16 @@ async fn run_pipeline<C: WorkflowContext>(
     .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
     if used_worktrees && let Some(worktrees) = run_worktrees.clone() {
-        // The run's worktrees go; its accepted commits keep their refs. A
-        // repeat finds less to remove and removes it.
+        // The run's worktrees and build caches go; its accepted commits keep
+        // their refs. A repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
+        let caches = run_caches.clone();
         let _removed: usize = ctx
             .step("cleanup", move |_| async move {
+                if let Some(caches) = caches {
+                    // Never in the way of removing the worktrees.
+                    remove_caches(&run_id, caches).await;
+                }
                 tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
                     .await
                     .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
@@ -1361,6 +1456,7 @@ struct StepCall {
 /// over anything the atom reported.
 async fn in_worktree(
     worktrees: Arc<Worktrees>,
+    caches: atomic_core::worktree::Caches,
     request: StepRequest,
     call: StepCall,
     runtimes: Arc<Runtimes>,
@@ -1384,10 +1480,16 @@ async fn in_worktree(
         } else {
             source_subdirectory(runtimes.codex.cwd.clone()).await?
         };
+        // The run's build caches, with a Cargo target directory of this
+        // worktree's own.
+        caches
+            .create()
+            .map_err(|e| AtomError::Runtime(format!("the build caches: {e}")))?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
+                here.codex.caches = Some(caches.in_worktree(&tree));
                 run_in(
                     &atom,
                     &input,
@@ -1702,6 +1804,35 @@ fn recorded_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a recorded outcome, finished or failed, removes a run's caches:
+    /// an execution that lost a race, or whose outcome went unrecorded,
+    /// leaves them to the one still building there.
+    #[test]
+    fn a_runs_caches_go_only_with_an_outcome_that_was_recorded() {
+        let ends: Vec<(Result<Value>, bool)> = vec![
+            (Ok(json!({})), true),
+            (Err(DurableError::Failed("a step failed".into())), true),
+            (Err(DurableError::Conflict("raced".into())), false),
+            (Err(DurableError::Interrupted("stopping".into())), false),
+            (Err(DurableError::Parked("a cap".into())), false),
+            (Err(DurableError::Engine("the store".into())), false),
+            (Err(DurableError::Nested("a step".into())), false),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (i, (end, removed)) in ends.into_iter().enumerate() {
+            let dir =
+                std::env::temp_dir().join(format!("atomic-settle-{}-{i}", std::process::id()));
+            let caches = atomic_core::worktree::Caches::new(dir.clone());
+            caches.create().expect("create");
+            std::fs::write(dir.join("built"), "x").expect("write");
+            runtime.block_on(settle_caches("run-1", caches, &end));
+            assert_eq!(!dir.exists(), removed, "{end:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     fn run() -> PipelineRun {
         serde_json::from_value(json!({

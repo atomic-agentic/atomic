@@ -776,6 +776,7 @@ async fn prompt(
         meter: atomic_core::usage::Metering::none(),
         guard: codex::StateGuard::for_project(state)?,
         backend,
+        caches: None,
     };
     let spec = codex::TurnSpec {
         prompt: args.prompt.join(" "),

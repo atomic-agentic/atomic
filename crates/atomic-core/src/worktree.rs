@@ -185,6 +185,43 @@ impl Worktrees {
         &self.dir
     }
 
+    /// The build caches of run `run`'s worktree steps, beside the worktrees
+    /// in the state directory: `cache/<run>-<nonce>`, named as the run's
+    /// worktrees are and with the nonce its first step recorded, so a run
+    /// id used again, after its store was wiped, say, or names that differ
+    /// only in case, never finds another run's caches. Nothing one run
+    /// writes there reaches another. `rustup` is the person's toolchains, as
+    /// found when the run began.
+    pub fn caches(
+        &self,
+        run: &str,
+        nonce: Option<&str>,
+        rustup: Option<PathBuf>,
+    ) -> Result<Caches> {
+        let state = self.dir.parent().ok_or_else(|| {
+            WorktreeError::Invalid(format!(
+                "the worktrees directory {} has no parent to keep caches in",
+                self.dir.display()
+            ))
+        })?;
+        let name = match nonce {
+            Some(nonce) if !nonce.is_empty() && nonce.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                format!("{}-{nonce}", component(run))
+            }
+            Some(nonce) => {
+                return Err(WorktreeError::Invalid(format!(
+                    "the run's cache nonce {nonce:?} is not hexadecimal"
+                )));
+            }
+            None => component(run),
+        };
+        Ok(Caches {
+            dir: state.join("cache").join(name),
+            rustup,
+            target: None,
+        })
+    }
+
     /// Pin run `run`'s base: resolve `rev` (a commit ID or a ref name such
     /// as a branch) to a commit and record it under `refs/atomic/<run>/base`.
     /// Once pinned, the pinned commit is returned whatever `rev` now names,
@@ -399,9 +436,10 @@ impl Worktrees {
     }
 }
 
-/// Build and package caches shared by every worktree of a project, kept
-/// outside all of them under `<state>/cache`, so a fresh worktree does not
-/// build cold and resetting a worktree never discards them.
+/// Build and package caches kept outside every worktree: a run's own, for
+/// its worktree steps ([`Worktrees::caches`]), removed when the run ends, or
+/// the project's, under `<state>/cache`, for exec atoms
+/// ([`Caches::for_state`]).
 ///
 /// An atom's commands find them through [`env`](Self::env), and a
 /// `workspace-write` thread is given [`dir`](Self::dir) as a writable root
@@ -409,6 +447,10 @@ impl Worktrees {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caches {
     dir: PathBuf,
+    /// The person's rustup toolchains, which commands may only read.
+    rustup: Option<PathBuf>,
+    /// Cargo's target directory, one worktree's own.
+    target: Option<PathBuf>,
 }
 
 impl Caches {
@@ -419,7 +461,29 @@ impl Caches {
 
     /// Caches kept under `dir`.
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            rustup: None,
+            target: None,
+        }
+    }
+
+    /// These caches for the worktree at `tree`: the same caches, with a
+    /// Cargo target directory of that worktree's own, so no worktree runs
+    /// what another built.
+    pub fn in_worktree(&self, tree: &Path) -> Self {
+        let name = tree
+            .file_name()
+            .map_or_else(|| "worktree".into(), |n| n.to_string_lossy().into_owned());
+        Self {
+            target: Some(self.dir.join("cargo-target").join(name)),
+            ..self.clone()
+        }
+    }
+
+    /// The person's rustup toolchains, as found when the caches were made.
+    pub fn rustup(&self) -> Option<&Path> {
+        self.rustup.as_deref()
     }
 
     /// Where they are.
@@ -427,20 +491,47 @@ impl Caches {
         &self.dir
     }
 
-    /// Create the cache directory.
+    /// Create the cache directory, readable by its owner only. A link in
+    /// its place is refused: something else made it, since an exec atom's
+    /// command may write the project's caches beside it.
     pub fn create(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.dir).map_err(io("create", &self.dir))
+        if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(WorktreeError::Invalid(format!(
+                "{} is a link, not the run's cache directory; atomic did not make it",
+                self.dir.display()
+            )));
+        }
+        crate::state::private_dir(&self.dir).map_err(|e| WorktreeError::Io {
+            what: "create",
+            path: self.dir.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })
+    }
+
+    /// Remove the cache directory and everything in it; a repeat finds
+    /// nothing to remove.
+    /// Directories a tool made read-only, as Go's module cache does, are
+    /// made writable first; a link is removed, never followed.
+    pub fn remove(&self) -> Result<()> {
+        remove_tree(&self.dir)
     }
 
     /// The environment that points common build tools at the caches: the
     /// XDG cache home, Cargo's target directory, and npm's, pip's and Go's
-    /// caches, plus `ATOMIC_CACHE_DIR` for anything else.
+    /// caches, plus `ATOMIC_CACHE_DIR` for anything else, and `RUSTUP_HOME`
+    /// at the person's toolchains when they were found. Cargo's home is the
+    /// command's own `HOME`'s, never shared.
     pub fn env(&self) -> std::collections::BTreeMap<String, String> {
         let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
         [
             ("ATOMIC_CACHE_DIR", self.dir.to_string_lossy().into_owned()),
             ("XDG_CACHE_HOME", at("xdg")),
-            ("CARGO_TARGET_DIR", at("cargo-target")),
+            (
+                "CARGO_TARGET_DIR",
+                self.target
+                    .as_ref()
+                    .map_or_else(|| at("cargo-target"), |t| t.to_string_lossy().into_owned()),
+            ),
             ("npm_config_cache", at("npm")),
             ("PIP_CACHE_DIR", at("pip")),
             ("GOCACHE", at("go-build")),
@@ -448,8 +539,25 @@ impl Caches {
         ]
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
+        .chain(
+            self.rustup
+                .iter()
+                .map(|r| ("RUSTUP_HOME".to_owned(), r.to_string_lossy().into_owned())),
+        )
         .collect()
     }
+}
+
+/// Where rustup keeps its toolchains, as `env` reads the variables: its
+/// `RUSTUP_HOME`, or `.rustup` in the home directory, when that exists. A
+/// command's own `HOME` is not the person's, so without this the rustup
+/// proxies on `PATH` would find no toolchain. Toolchains hold no secrets,
+/// and commands may only read them.
+pub fn rustup_home(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute("RUSTUP_HOME")
+        .or_else(|| absolute("HOME").map(|h| h.join(".rustup")))
+        .filter(|p| p.is_dir())
 }
 
 /// Run blocking git work off the async workers.
@@ -584,5 +692,130 @@ mod tests {
         let mut empty = Value::Null;
         commit.record(&mut empty);
         assert_eq!(empty["commit_ref"], "refs/atomic/r/steps/s/1");
+    }
+
+    #[test]
+    fn rustup_toolchains_are_found_where_the_person_keeps_them() {
+        let dir = std::env::temp_dir().join(format!("atomic-rustup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home/.rustup")).expect("rustup home");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        let home = dir.join("home").display().to_string();
+        let elsewhere = dir.join("elsewhere").display().to_string();
+        let env = |vars: Vec<(&'static str, String)>| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", home.clone())])),
+            Some(dir.join("home/.rustup"))
+        );
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", home), ("RUSTUP_HOME", elsewhere)])),
+            Some(dir.join("elsewhere"))
+        );
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", "/nonexistent".into())])),
+            None,
+            "nothing that is not there"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_run_has_caches_of_its_own_and_each_worktree_a_target_of_its_own() {
+        let git = crate::git::Git::find().expect("git");
+        let worktrees = Worktrees::new(git.repo("/state/repo.git"), "/state/worktrees".into());
+        let caches = worktrees
+            .caches("run-1", Some("ab12"), Some("/toolchains".into()))
+            .expect("caches");
+        assert_eq!(caches.dir(), Path::new("/state/cache/run-1-ab12"));
+        // Another run, the same id started again, and ids that differ in
+        // case only: each its own.
+        let dir = |run: &str, nonce: &str| {
+            worktrees
+                .caches(run, Some(nonce), None)
+                .expect("caches")
+                .dir()
+                .to_owned()
+        };
+        assert_ne!(dir("run-1", "ab12"), dir("run-2", "ab12"));
+        assert_ne!(dir("run-1", "ab12"), dir("run-1", "cd34"));
+        assert_ne!(
+            dir("Run-A", "ab12").to_string_lossy().to_lowercase(),
+            dir("run-a", "cd34").to_string_lossy().to_lowercase()
+        );
+        // Any id a run's worktrees take, named as they are, inside the
+        // state's caches.
+        for run in ["feature/x", "..", "../x", &"r".repeat(300)] {
+            let at = dir(run, "ab12");
+            assert_eq!(at.parent(), Some(Path::new("/state/cache")), "{run:?}");
+            assert!(at.file_name().is_some_and(|n| n.len() < 100), "{run:?}");
+        }
+        assert!(worktrees.caches("run-1", Some("../x"), None).is_err());
+        let orphan = Worktrees::new(git.repo("/state/repo.git"), "/".into());
+        assert!(
+            orphan.caches("run-1", None, None).is_err(),
+            "never in the worktrees"
+        );
+        let env = caches.env();
+        assert!(
+            !env.contains_key("CARGO_HOME"),
+            "the attempt's own: {env:?}"
+        );
+        assert_eq!(env["RUSTUP_HOME"], "/toolchains");
+        let (one, two) = (
+            caches
+                .in_worktree(Path::new("/state/worktrees/run-1-a"))
+                .env(),
+            caches
+                .in_worktree(Path::new("/state/worktrees/run-1-b"))
+                .env(),
+        );
+        assert_ne!(one["CARGO_TARGET_DIR"], two["CARGO_TARGET_DIR"]);
+        for (name, value) in &one {
+            if name != "RUSTUP_HOME" {
+                assert!(Path::new(value).starts_with(caches.dir()), "{name}={value}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_runs_caches_are_private_and_removed_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atomic-run-caches-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let caches = Caches::new(dir.join("cache/run-1"));
+        caches.create().expect("create");
+        let mode = std::fs::metadata(caches.dir())
+            .expect("made")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700);
+        std::fs::write(caches.dir().join("built"), "x").expect("write");
+        // A directory a tool made read-only, as Go's module cache is.
+        let locked = caches.dir().join("go-mod/m@v1");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::fs::write(locked.join("go.mod"), "module m\n").expect("file");
+        for d in [&locked, &caches.dir().join("go-mod")] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o500)).expect("mode");
+        }
+        caches.remove().expect("remove");
+        assert!(!caches.dir().exists());
+        caches.remove().expect("a repeat finds nothing");
+        // A link in its place, which something else made, is refused.
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        std::fs::set_permissions(
+            dir.join("elsewhere"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("mode");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), caches.dir()).expect("link");
+        assert!(caches.create().is_err(), "a link was taken for the caches");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
