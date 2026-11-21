@@ -959,9 +959,11 @@ impl CodexPaths {
 }
 
 /// Harden atomic itself, not one of Codex's helpers: the process that holds
-/// a sign-in's token and the operator credential cannot be dumped, read
-/// through /proc by a same-user process, or leave a core file. It loses its
-/// LD_* variables, and the commands it starts inherit a core-file limit of
+/// a sign-in's token and the operator credential cannot be dumped, or leave
+/// a core file, and no process of the same user may read its memory or the
+/// /proc files that show it, such as `environ` and `mem`, unless it has
+/// `CAP_SYS_PTRACE` over atomic's user namespace; its `cmdline` and `stat`
+/// stay readable. It loses its LD_* variables, and the commands it starts inherit a core-file limit of
 /// zero (on macOS it also refuses a debugger). Both entry points call it.
 fn harden() {
     if !is_helper(std::env::args_os()) {
