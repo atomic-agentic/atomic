@@ -309,6 +309,102 @@ fn a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for() {
     assert!(took > 0, "the last poll took no time at all: {why}");
 }
 
+/// The wait for a gate is bounded by its own limit, and what it says when
+/// that limit runs out is what the last `atomic gates list` answered: a poll
+/// started with no time left on the wait would be killed where it stood, and
+/// what it had printed by then is not the last thing said.
+#[test]
+fn a_wait_for_a_gate_gives_up_at_its_limit_and_quotes_the_last_answer() {
+    let dir = scratch("gate-limit");
+    project(&dir);
+    // A run that outlasts the wait in the project a gate would open in, so
+    // that nothing but the wait's own limit can end it: 400 s, against the
+    // wait's 300. The wait ends the shell it is handed and kills every poll
+    // it started; the sleep is the shell's own child, which the wait does not
+    // reach and which sleeps on after it, so it is named for minutes rather
+    // than for an hour.
+    let run = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg("sleep 400")
+        .current_dir(dir.join("project"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let waited = waited(&dir, run);
+    assert!(
+        waited.why.contains("no gate opened in 300s"),
+        "not the wait's own limit that ended it: {}",
+        waited.why
+    );
+    assert!(
+        waited.when >= GATE_LIMIT,
+        "the wait gave up after {:?}, short of its {GATE_LIMIT:?}",
+        waited.when,
+    );
+    // It polled more than once, and says so.
+    let polls = waited
+        .why
+        .split(" poll(s), ")
+        .next()
+        .and_then(|head| head.rsplit('(').next())
+        .and_then(|polls| polls.parse::<usize>().ok())
+        .expect("the message counts the polls it made");
+    assert!(
+        polls >= 2,
+        "the wait stopped after one poll: {}",
+        waited.why
+    );
+    // What it quotes is a poll that answered: `gates list --json` answers
+    // with a JSON array, and an empty one is what a project holds no gate
+    // for. Half of an answer, which is all a killed poll has, is no array.
+    assert!(
+        waited
+            .why
+            .contains("`atomic gates list` last said: stdout: ["),
+        "the last poll that answered is not quoted: {}",
+        waited.why,
+    );
+    let quoted = waited
+        .why
+        .split("`atomic gates list` last said: stdout: ")
+        .nth(1)
+        .and_then(|rest| rest.split("\nstderr:").next())
+        .expect("the message quotes what the last poll printed");
+    let listed: Vec<Value> = serde_json::from_str(quoted.trim()).unwrap_or_else(|why| {
+        panic!("what the wait quoted is no answer of `gates list`: {why}\nquoted: {quoted}")
+    });
+    assert!(listed.is_empty(), "a gate open for no run: {listed:?}");
+    // The count the message ends with says how long the poll it quoted took,
+    // and, when the wait had to kill a poll, how many, apart from that. The
+    // wait ends at its limit whether or not a poll was killed on the way, so
+    // this is the shape of the count and not a claim that a kill happened.
+    let counted = waited
+        .why
+        .rsplit("poll(s), ")
+        .next()
+        .and_then(|tail| tail.strip_suffix(')'))
+        .expect("the message ends with how its polls went");
+    let parts: Vec<&str> = counted.split(", ").collect();
+    assert!(
+        parts[0].starts_with("the last took ") && parts[0].ends_with(" ms"),
+        "the count does not give the time of the poll it quoted: {}",
+        waited.why,
+    );
+    for part in &parts[1..] {
+        let killed = part
+            .strip_suffix(" killed")
+            .and_then(|killed| killed.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("what the count adds is not a killed count: {part}"));
+        assert!(
+            killed < polls,
+            "it counted more killed polls than polls: {}",
+            waited.why,
+        );
+    }
+}
+
 /// What a run writes as it goes is read line by line as it goes: a test can
 /// wait for one line before the run ends, and a run that has not written it
 /// fails the test with the lines it did write. And a command left running
@@ -347,14 +443,74 @@ fn a_line_is_read_off_a_run_as_it_writes_it() {
     );
     assert!(why.contains("the second line"), "{why}");
     assert!(!why.contains("never\n"), "a line never written: {why}");
-    // The writer is still asleep. Ending the test must not leave it, or an
-    // unreaped process, behind.
+    // The writer is still asleep. Ending the test must not leave that direct
+    // child running, or unreaped. What the shell forked for its `sleep` is
+    // the shell's own child, which this guard does not reach and which ends
+    // in its own time.
     let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+    // And the guard has to end the run rather than wait it out: with the kill
+    // gone the guard would only wait, and wait until the sleep ran out, so
+    // timing the end is what tells a guard that kills from one that waits for
+    // its own good.
+    let began = std::time::Instant::now();
     drop(child);
+    let ended = began.elapsed();
+    assert!(
+        ended < std::time::Duration::from_secs(10),
+        "leaving the run took {ended:?}, which is waiting for a run that \
+         sleeps on rather than killing it",
+    );
     // SAFETY: a signal of 0 only asks whether that process is there.
     #[allow(unsafe_code)]
     let still_there = unsafe { libc::kill(pid, 0) } == 0;
     assert!(!still_there, "the run outlived the guard that ends it");
+}
+
+/// What a run wrote last, with no line end on it, is a line too, and is
+/// handed out clean as every other line: a wait for something else fails the
+/// test with that text and nothing stuck on the end of it.
+#[test]
+fn a_last_line_with_no_end_of_line_is_read_like_the_others() {
+    let dir = scratch("partial-line");
+    project(&dir);
+    // One whole line, then text with no line end on it, and spaces after
+    // each: what the reader hands out is to read the same whether or not the
+    // run ended its line, and to hold neither the line end nor what came
+    // before it.
+    let mut child = Child::new(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf 'whole line  \\npartial at the end  ' >&2")
+            .current_dir(dir.join("project"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut drained = Drained::of(&mut child);
+    // The line with an end of its own is handed out at all.
+    drained.wait_for_stderr("whole line", std::time::Duration::from_secs(30));
+    let why = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drained.wait_for_stderr("no such line", std::time::Duration::from_millis(500))
+    }))
+    .err()
+    .and_then(|payload| payload.downcast_ref::<String>().cloned())
+    .expect("waiting for a line the run never wrote fails the test");
+    // Both lines the run wrote are there, the last one its last word.
+    assert!(why.contains("whole line"), "{why}");
+    assert!(why.contains("partial at the end"), "{why}");
+    // And both clean, with nothing of what the run put after them. What the
+    // wait quotes ends with the run's last line, so the space the run left
+    // after it would still stand out had it come through.
+    assert!(
+        !why.contains("whole line "),
+        "the line with an end of its own kept what came before the end: {why}"
+    );
+    assert!(
+        !why.contains("partial at the end "),
+        "the run's last line kept what came after it: {why}"
+    );
 }
 
 /// A lite provider's error: its excerpt is redacted where it is made, so
@@ -793,12 +949,16 @@ fn a_second_signal_stops_at_once_while_spans_are_sent() {
     );
     let mut drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
-    // The gate's wait is no running step, so the flush starts at once and
-    // the second signal has to find it running. Wait for the run's own word
-    // that it is stopping rather than for a fixed beat, which a loaded
-    // machine can spend before the run has even noticed the first signal;
-    // then a short beat, so that the second signal finds the flush started
-    // and not the run still on its way to it.
+    // Wait for the run's own word that it is stopping rather than for a
+    // fixed beat, which a loaded machine can spend before the run has even
+    // noticed the first signal; then a short beat. What the beat is against
+    // is the second signal arriving before the first wait in `runs::stop`,
+    // just after that word, has been polled: a signal arriving then is
+    // recorded and can be read by that first wait, which logs it as
+    // "stopping now" and takes it, leaving the later wait for the flush to
+    // wait on a third signal that never comes. A signal that arrives once
+    // that wait has been polled is recorded for the flush and stops it,
+    // which is what the run is asked to say.
     drained.wait_for_stderr(STOPPING, SEEN_BY_RUN);
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "TERM");
