@@ -1,0 +1,1 @@
+signin-made-recheck|crates/atomic-core/src/signin.rs|            placed = outside_the_checkout(&auth_home, project);|            placed = Ok(());|-p atomic-agentic-core --lib signin::tests::the_sign_in_is_checked_again_where_its_directory_is_made

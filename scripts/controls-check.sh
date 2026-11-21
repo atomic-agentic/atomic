@@ -117,6 +117,11 @@ for entry in "${entries[@]}"; do
     [ "${#lines[@]}" -eq 1 ] ||
         die "${entry} holds ${#lines[@]} rows, not the one it must"
     row="${lines[0]}"
+    # Five fields, so four separators: a `|` inside a field would move what
+    # follows it into the wrong one.
+    bars="${row//[^|]/}"
+    [ "${#bars}" -eq 4 ] ||
+        die "${entry} has ${#bars} '|' separators, not the 4 between its five fields; a field may not hold a '|'"
     name="${row%%|*}"
     [ -n "${name}" ] || die "${entry} names no control"
     # Before the name's own rule: two files naming one control are refused for

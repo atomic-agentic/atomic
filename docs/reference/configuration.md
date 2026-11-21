@@ -52,9 +52,16 @@ setting by setting.
 
 Layer 2 is the operator's own file: the person who runs the command, not the
 project. No project supplies it, and atomic refuses to read one that lies inside
-the project or inside the checkout that holds it, since the project could have
-supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it. It holds the same
-settings as `atomic.yaml`, and the project's files override it.
+the project or inside any checkout around it (a submodule's superproject, the
+checkout a worktree sits in, or a linked worktree's main checkout), since the
+project could have supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it.
+That includes the default `~/.config/atomic` when your home directory is itself
+a git checkout (a `~/.git`) holding the project. A checkout whose `.git` file or
+`commondir` is not a small regular file, as git writes them, refuses your own
+configuration, and the sign-in, until it is fixed. It holds the same
+settings as `atomic.yaml`, and the project's files override it — except the
+`budget` caps and prices, which are ceilings a project can only tighten, as
+[Budgets](budgets.md#your-own-caps-are-ceilings) describes.
 
 Selecting a configuration profile is planned. The loader reads
 `atomic.<profile>.yaml` when a profile is named and refuses the run when the
@@ -65,10 +72,22 @@ file is missing, but no command names one yet. The `--profile` flag on
 ### How files merge
 
 Files are YAML, read with atomic's restricted loader: no anchors, aliases, tags
-or duplicate keys, and plain `yes`, `no`, `on` and `off` are refused, so quote
-them. Mappings merge key by key; any other value replaces the one below it. A
-setting atomic does not know is an error that names the file and the line, so a
-typo is never silently ignored.
+or duplicate keys, and no plain scalar whose spelling YAML 1.1 and YAML 1.2 do
+not read the same way. Plain `yes`, `no`, `on` and `off` are refused, so quote
+them, and so is every one of these numbers:
+
+- one with a leading zero (`0200`, which YAML 1.1 reads as an octal, 128, and
+  YAML 1.2 as decimal; `007`, which both read as 7, is refused for the same
+  spelling);
+- a sign written on either side of a base prefix (`-0x1F`, which YAML 1.1 reads
+  as -31, and `0x-1F`, which no version reads as a number);
+- one YAML 1.1 reads alone: binary (`0b11`), an underscore in a whole number
+  (`1_000`, `0x_1F`) and the sexagesimal (`12:30`, which 1.1 reads as 750).
+
+Quoting any of them gives the string it is read as elsewhere, and `0o200` and
+`0x1F` are the ways to write an octal and a hexadecimal. Mappings merge key by
+key; any other value replaces the one below it. A setting atomic does not know is
+an error that names the file and the line, so a typo is never silently ignored.
 
 ### How a variable names a setting
 
@@ -81,8 +100,10 @@ variable set to the empty string sets nothing, as if it were unset.
 A value takes the setting's type: `true` or `false` (or `1` and `0`) for
 switches, a number for numbers, JSON for lists and sections. A variable atomic
 cannot read as its setting's type is refused by its own name, before the layers
-are merged. A variable for a string setting is taken as the string it holds, so
-`ATOMIC_EXECUTOR_ID=1` is the identity `1`.
+are merged, and so is a number spelled a way the loader refuses: `0200` names
+its leading zero rather than quietly becoming the text `0200`. A variable for a
+string setting is taken as the string it holds, so `ATOMIC_EXECUTOR_ID=1` is the
+identity `1`.
 
 ## What nothing sets
 
@@ -91,8 +112,21 @@ What no layer sets, atomic looks for, and says so as `detected:` in
 
 | Found | Sets |
 | --- | --- |
-| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
+| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), or to the URL `OPENAI_BASE_URL` names when that is set too, `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
 | Ollama answers on this machine, at `127.0.0.1:11434` | the model endpoint to `http://127.0.0.1:11434/v1`, and `model.name` to the first model it lists unless one is set |
+
+`OPENAI_BASE_URL` is read as OpenAI's SDKs read it, and only from your
+environment: no file, the project's or your own, sets it, since it decides
+where the key is sent. So whatever sets your environment decides where the
+key goes, a shell profile or a tool that loads variables for a directory,
+such as direnv or a `.env` loader, among them. It must be an `https` URL, or
+`http` to a loopback IP address (`127.0.0.1` or `[::1]`; a name such as
+`localhost` is refused), with no user, password, query or fragment in it.
+Anything else detects no endpoint: a command that would send the key stops
+and says why, and one that sends none, such as `atomic check`, carries on.
+It is used only with `OPENAI_API_KEY`, when detection runs; otherwise it is
+said to be set and not used. `--explain` names both variables as the
+source, and a run says that the key is sent, and to which host.
 
 The key's value is never read for detection. Looking for Ollama is one
 `GET /api/tags` to the loopback address, which must answer within a second, and
@@ -141,6 +175,8 @@ waits for as long as it takes.
 The budget settings are the `budget` section: `budget.atom.*`,
 `budget.workflow.*`, `budget.call.*` and the `budget.pricing` table.
 [Budgets](budgets.md) gives the complete section and what each limit covers.
+Written in your own configuration file, a cap or a price there is a ceiling on
+every layer above it; written in a project's file, it is the project's own ask.
 
 ## What limits a setting
 
@@ -149,7 +185,10 @@ Three separate things constrain a setting. Only the first two are built.
 ### Precedence
 
 A higher layer wins over a lower one, layer by layer, as the table above orders
-them. That decides *which value* atomic uses, and nothing else.
+them. That decides *which value* atomic uses, and nothing else. The one exception
+runs the other way: the `budget` caps and prices in your own configuration cap
+what any layer above may ask for, so the number that binds is the smaller of the
+two.
 
 ### Settings only the operator may set
 
@@ -174,11 +213,16 @@ other override.
 
 ### Managed ceilings
 
-Planned. Nothing today limits what a layer may *ask for*: no policy file and no
-managed configuration narrows the choice a layer can express. The committed
-`atomic.policy.lock` is planned for v1.0, as [availability](availability.md)
-records it. Two things are true today and do not depend on it: detection grants
-nothing, and the settings above cannot come from a project.
+Partly built. The `budget` caps and prices in your own configuration narrow what
+every layer above may ask for: a project's file, an `ATOMIC_*` variable and a
+written `budget` block can bring a cap down to yours, never above it, and a price
+you wrote holds where a project's table would replace it
+([Budgets](budgets.md#your-own-caps-are-ceilings)). Nothing else limits what a
+layer may ask for: no policy file and no managed configuration narrows the choice
+a layer can express. The committed `atomic.policy.lock` is planned for v1.0, as
+[availability](availability.md) records it. Two things are true today and do not
+depend on it: detection grants nothing, and the settings above cannot come from a
+project.
 
 ## Models: one endpoint today
 
