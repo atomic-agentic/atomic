@@ -328,11 +328,12 @@ async fn only_the_enrolled_credential_releases_and_raises_on_postgres() {
 // ---------------------------------------------------------------------------
 // Hooks the release transaction calls in tests.
 
-/// Pauses at `before_marking`, by park: the release tells the first notify
-/// it has reached the point, then waits on the second.
+/// Pauses at a point of the release transaction, by point and park: the
+/// release tells the first notify it has reached the point, then waits on
+/// the second.
 type Pause = Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
-static PAUSES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Pause>>> =
-    std::sync::LazyLock::new(Mutex::default);
+type Points = std::collections::HashMap<(&'static str, String), Pause>;
+static PAUSES: std::sync::LazyLock<Mutex<Points>> = std::sync::LazyLock::new(Mutex::default);
 /// How many wake-ups each park's run was sent.
 static WAKES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
     std::sync::LazyLock::new(Mutex::default);
@@ -341,11 +342,16 @@ static WAKES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>
 /// Hold the next release of `park` after it raised its cap, before it marks
 /// the park released, until the returned pause's second notify fires.
 fn pause_before_marking(park: &str) -> Pause {
+    pause_at("before_marking", park)
+}
+
+#[cfg(feature = "postgres-tests")]
+fn pause_at(point: &'static str, park: &str) -> Pause {
     let pause: Pause = Arc::default();
     PAUSES
         .lock()
         .expect("pauses")
-        .insert(park.to_owned(), pause.clone());
+        .insert((point, park.to_owned()), pause.clone());
     pause
 }
 
@@ -360,7 +366,20 @@ async fn reached(pause: &Pause) {
 
 /// Called by the release transaction after its savepoint and raise.
 pub(super) async fn before_marking(park: &str) {
-    let pause = PAUSES.lock().ok().and_then(|mut p| p.remove(park));
+    paused("before_marking", park).await;
+}
+
+/// Called by the release transaction once it found no replay of its
+/// command, before it reads the park.
+pub(super) async fn after_replay_check(park: &str) {
+    paused("after_replay_check", park).await;
+}
+
+async fn paused(point: &'static str, park: &str) {
+    let pause = PAUSES
+        .lock()
+        .ok()
+        .and_then(|mut p| p.remove(&(point, park.to_owned())));
     if let Some(pause) = pause {
         pause.0.notify_one();
         pause.1.notified().await;
@@ -577,6 +596,37 @@ async fn a_release_that_loses_its_command_id_undoes_itself_on_postgres() {
         100,
         "the loser's raise stayed"
     );
+}
+
+/// The same command sent twice at once is one release, however the two
+/// interleave: here the second has found no replay of its command when the
+/// first commits, and then finds the park released. It answers as the
+/// replay it is, not as a release someone else made.
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_release_sent_twice_at_once_is_one_release_on_postgres() {
+    let (rt, _schema) = postgres().await;
+    let rt = Arc::new(rt);
+    let mine = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&*rt, &mine).await.expect("enroll");
+    let run = unique("twice");
+    let park = bare_park(&*rt, &run, 100).await;
+    let pause = pause_at("after_replay_check", &park);
+    let (second_rt, second_cred, second_park) = (rt.clone(), mine.clone(), park.clone());
+    let second = tokio::spawn(async move {
+        release_park(&*second_rt, &second_cred, command(&second_park, "twice", None)).await
+    });
+    reached(&pause).await;
+    let first = release_park(&*rt, &mine, command(&park, "twice", None))
+        .await
+        .expect("the first releases");
+    pause.1.notify_one();
+    let second = second
+        .await
+        .expect("the second release")
+        .expect("the same release");
+    assert_eq!(first.released, second.released);
+    assert_eq!(releases(&*rt).await.expect("releases").len(), 1);
 }
 
 #[cfg(feature = "postgres-tests")]

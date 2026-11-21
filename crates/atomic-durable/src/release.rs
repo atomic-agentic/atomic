@@ -288,6 +288,8 @@ pub async fn release_park<R: DurableRuntime>(
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
                     return Ok(found.map(|r| (r, false)));
                 }
+                #[cfg(test)]
+                tests::after_replay_check(&cmd.park).await;
                 let Some(park) = read_park(&mut tx, &cmd.park).await? else {
                     return Ok(Err(ReleaseError::NoSuchPark(cmd.park.clone())));
                 };
@@ -305,6 +307,15 @@ pub async fn release_park<R: DurableRuntime>(
                     )
                     .await?
                 {
+                    // Released by this same command, committed since the
+                    // replay check above: on PostgreSQL each statement reads
+                    // what has committed by then, so the release and its
+                    // journal entry, committed together, are both seen now.
+                    // A replay, then, not a release someone else made.
+                    let replay = journaled(&mut tx, &cmd.command_id, &request).await?;
+                    if let Some(found) = replay {
+                        return Ok(found.map(|r| (r, false)));
+                    }
                     return Ok(Err(ReleaseError::AlreadyReleased {
                         park: Box::new(park.clone()),
                         by: Principal::stored(row.text("released_by")?),
