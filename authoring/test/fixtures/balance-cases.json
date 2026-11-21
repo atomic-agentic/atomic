@@ -1,0 +1,166 @@
+[
+ [
+  "Note: {input.text}",
+  null
+ ],
+ [
+  "<section>\nx\n</section>",
+  null
+ ],
+ [
+  "<section><notes>a</notes><br><hr/><img src=\"a>b\"></section>",
+  null
+ ],
+ [
+  "<Note title={`a ${'}'} </x>`} />\n<Note>{input.text}</Note>",
+  null
+ ],
+ [
+  "<!-- <section> -->\n<p>a < b and c > d</p>",
+  null
+ ],
+ [
+  "{input.items.map((i) => <li>{i}</li>)}",
+  null
+ ],
+ [
+  "<section>{input.urgent && <note>Don't delay.</note>}</section>",
+  null
+ ],
+ [
+  "<section>{input.urgent && <note>See https://example.com/a and src/**/*.ts, \"quoted` too</note>}</section>",
+  null
+ ],
+ [
+  "{input.urgent ? <note>It's here</note> : <note>It isn't</note>}",
+  null
+ ],
+ [
+  "<section>{input.items.map((i) => <li>{i.name}: don't {i.done ? <b>done</b> : 'open'}</li>)}</section>",
+  null
+ ],
+ [
+  "<pre is:raw><section></pre>",
+  null
+ ],
+ [
+  "<title>a</titles> b</title>",
+  null
+ ],
+ [
+  "<>\n<Section>a</Section>\n</>",
+  null
+ ],
+ [
+  "<Source>a</Source><Input>b</Input><Title><b>c</b></Title><Link>d</Link><Meta>e</Meta><Textarea><f>g</f></Textarea>",
+  null
+ ],
+ [
+  "<règles>Be brief.</règles><éléments>Short.</éléments>",
+  null
+ ],
+ [
+  "<Fragment><a>x</a></Fragment>",
+  null
+ ],
+ [
+  "<Note/>\n<Note />\n<a>x</a>",
+  null
+ ],
+ [
+  "<a title=\"</b>\">x</a>",
+  null
+ ],
+ [
+  "```mermaid\nflowchart TD\n  A[Ticket] --> B{Urgent?}\n  B --> C<page>\n```\n<p>x</p>",
+  null
+ ],
+ [
+  "<section>\nx\n</notes>",
+  "`</notes>` closes <section>, opened on line 5"
+ ],
+ [
+  "a\n<section>\nx\n",
+  "<section> is never closed"
+ ],
+ [
+  "x\n</section>",
+  "`</section>` closes no open element"
+ ],
+ [
+  "<section>\n{input.urgent && <note>Don't\ndelay.</notes>}\n</section>",
+  "closes <note>"
+ ],
+ [
+  "{input.urgent && <note>Don't delay.</note>}\n</section>",
+  "`</section>` closes no open element"
+ ],
+ [
+  "<input>x</input>",
+  "</input>"
+ ],
+ [
+  "<Note>x</note>",
+  "<Note>"
+ ],
+ [
+  "<règles>\nx",
+  "<règles> is never closed"
+ ],
+ [
+  "<Source>\nx",
+  "<Source> is never closed"
+ ],
+ [
+  "<a><b>x</a></b>",
+  "<"
+ ],
+ [
+  "!it's\n</section>\n",
+  "closes no open element"
+ ],
+ [
+  "!say \"hi\"\n<a>x</b>\n",
+  "closes <a>"
+ ],
+ [
+  "!see http://x\n<a>x</b>\n",
+  "closes <a>"
+ ],
+ [
+  "<a>x</a >",
+  null
+ ],
+ [
+  "<a>x</A>",
+  "closes <a>"
+ ],
+ [
+  "<?x y?><a>z</b>",
+  "closes <a>"
+ ],
+ [
+  "<!-- c --!><a>z</b>",
+  "closes <a>"
+ ],
+ [
+  "<!--><a>z</b>",
+  "closes <a>"
+ ],
+ [
+  "!text\n<head><title>t</title></head>\n",
+  null
+ ],
+ [
+  "<Comp>text<slot>fallback</slot></Comp>",
+  null
+ ],
+ [
+  "<p><div>x</div></p>",
+  null
+ ],
+ [
+  "!text\n<slot>fallback</slot>\n",
+  "Astro does not read that `</slot>` as its end"
+ ]
+]

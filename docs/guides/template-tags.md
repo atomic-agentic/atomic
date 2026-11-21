@@ -125,9 +125,11 @@ names another element than the innermost one open
 close, and when an element is still open at the end of the file. A void HTML
 element such as `<br>` or `<input>` and a self-closing tag such as `<Note />`
 open nothing, so `<input>…</input>` is refused. Names match exactly, so the
-component `<Input>` is not the element `<input>`. Comments, a
-```` ```mermaid ```` fence and the frontmatter are not read for tags. A literal
-section takes no attributes.
+component `<Input>` is not the element `<input>`. Tags are read as Astro's own
+parser reads them, so comments, a ```` ```mermaid ```` fence and the
+frontmatter hold none, and an element Astro reads as ending somewhere other
+than where it is written, such as a `<slot>` fallback after leading text, is
+refused too. A literal section takes no attributes.
 `<Fragment>` groups content without adding a section, and takes only a `slot`
 attribute. The `<data-…>` prefix is reserved for atomic's own value wrappers,
 and `<data-…>`, `<script>` and `<style>` are rejected wherever you write them.
