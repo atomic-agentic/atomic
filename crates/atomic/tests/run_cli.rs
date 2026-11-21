@@ -133,33 +133,29 @@ fn project(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(project.join(sub)).expect("project");
     }
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
-    // Each run logs one line. Exec commands run confined, and may write only
-    // their scratch directory and the project's caches: the log is kept in
-    // the caches of the state directory the command runs under, found from
-    // its scratch directory (its HOME, `<state>/scratch/...`). The default
-    // home's is linked from `dir/count.log`; [`count_log`] reads every
-    // home's, for processes given a state directory of their own.
+    // It keeps its own tally of its runs in its run's caches, the only
+    // place besides its scratch directory it may write, and returns it
+    // (see [`TALLY`], [`count_log`]).
+    let _ = dir;
     std::fs::write(
         project.join("tools/count.py"),
-        "import json, os, sys\n\
-         note = json.load(sys.stdin)\n\
-         at = os.environ['HOME']\n\
-         while os.path.basename(at) != 'scratch' and at != '/':\n    at = os.path.dirname(at)\n\
-         open(os.path.join(os.path.dirname(at), 'cache', 'count.log'), 'a').write('ran\\n')\n\
-         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+        format!(
+            "import json, os, sys\n{TALLY}\
+             note = json.load(sys.stdin)\n\
+             json.dump({{'title': note['text'][:25], 'words': len(note['text'].split()), \
+             'ran': tally('count-note')}}, sys.stdout)\n"
+        ),
     )
     .expect("script");
-    let caches = state_dir(dir, &project).join("cache");
-    std::fs::create_dir_all(&caches).expect("caches");
-    let log = caches.join("count.log");
-    std::os::unix::fs::symlink(&log, dir.join("count.log")).expect("log link");
     write_atom(
         &project,
         "count-note",
         "description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] }",
         "",
         object(json!({"text": {"type": "string"}})),
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(
+            json!({"title": {"type": "string"}, "words": {"type": "integer"}, "ran": {"type": "integer"}}),
+        ),
     );
     write_atom(
         &project,
@@ -199,30 +195,240 @@ fn project(dir: &Path) -> PathBuf {
     project
 }
 
-/// One line for each time the exec atom's command ran, under any of the
-/// atomic homes in `dir`.
-fn count_log(dir: &Path) -> Vec<String> {
-    let mut lines = Vec::new();
-    for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let projects = home.path().join("projects");
-        for state in std::fs::read_dir(projects).into_iter().flatten().flatten() {
-            let log = std::fs::read_to_string(state.path().join("cache/count.log"));
-            lines.extend(log.unwrap_or_default().lines().map(str::to_owned));
-        }
-    }
-    lines
+/// A tool's lines that keep its own tally, in its run's caches: each run of
+/// the command appends a line to `<atom>.tally` and returns how many lines
+/// the file has, as `ran` in its output. A command run again in the same
+/// run, by this execution or another, killed or not, is counted, since the
+/// run's caches last until the run ends.
+const TALLY: &str = "def tally(atom):\n\
+    \x20   at = os.path.join(os.environ['ATOMIC_CACHE_DIR'], atom + '.tally')\n\
+    \x20   open(at, 'a').write('ran\\n')\n\
+    \x20   return len(open(at).read().splitlines())\n";
+
+/// How many times the counting atom's command ran, in the store `rt` (see
+/// [`ran_in`]).
+#[cfg(feature = "postgres-tests")]
+async fn counted_in(rt: &Durare) -> usize {
+    ran_in(rt, None, "count-note").await
 }
 
-/// A file named `name` that an exec atom's confined command may write: in
-/// the project's caches, beside `count.log`, and read through `dir/<name>`.
-fn command_log(dir: &Path, name: &str) -> PathBuf {
-    let caches = std::fs::read_link(dir.join("count.log")).expect("the log link");
-    let log = caches.parent().expect("the caches").join(name);
-    let link = dir.join(name);
-    if std::fs::symlink_metadata(&link).is_err() {
-        std::os::unix::fs::symlink(&log, &link).expect("log link");
+/// How many times exec atom `atom`'s command ran, by the tally it keeps
+/// ([`TALLY`]), summed over the runs in the store `rt` whose workflow has a
+/// step of `atom`: for a run that still has its caches (in `state`), the
+/// tally there, which counts every run of the command so far; for one that
+/// has ended, the largest tally its step's recorded output gives, which
+/// counts every run up to the one whose result the run kept, or, where the
+/// run kept no result of it, how many of its executions began the step.
+async fn ran_in(rt: &Durare, state: Option<&Path>, atom: &str) -> usize {
+    let mut ran = 0;
+    let runs = rt.runs_after(None, 100_000).await.expect("runs");
+    for (key, _) in runs {
+        let Some(record) = rt.run_record(&key.id).await.expect("record") else {
+            continue;
+        };
+        if record.workflow != atomic_app::pipeline::PIPELINE {
+            continue;
+        }
+        let counting: Vec<String> = record.input["pipeline"]["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|s| s["atom"] == atom)
+            .filter_map(|s| s["id"].as_str().map(str::to_owned))
+            .collect();
+        if counting.is_empty() {
+            continue;
+        }
+        if let Some(tally) = state.and_then(|state| live_tally(state, &key.id, atom)) {
+            ran += tally;
+            continue;
+        }
+        let steps = rt.steps(&key.id).await.expect("steps");
+        let recorded = steps
+            .iter()
+            .filter(|s| {
+                counting
+                    .iter()
+                    .any(|id| s.name == *id || s.name.starts_with(&format!("{id}.")))
+            })
+            .filter_map(|s| s.output.as_ref().and_then(tally_in))
+            .max();
+        ran += match recorded {
+            Some(tally) => tally,
+            None => began(rt, &key.id, &steps, &counting).await,
+        };
     }
-    log
+    ran
+}
+
+/// How many executions of run `run` began one of the steps `counting`, by
+/// the store: an execution that ran a command records its attempt, or its
+/// turn when the step has none.
+async fn began(
+    rt: &Durare,
+    run: &str,
+    steps: &[atomic_durable::StepRecord],
+    counting: &[String],
+) -> usize {
+    let ran_it: Vec<_> = steps
+        .iter()
+        .filter(|s| {
+            counting.iter().any(|id| {
+                s.name == format!("{id}.attempt")
+                    || (s.name == format!("{id}.turn") && s.error.is_none())
+            })
+        })
+        .collect();
+    let executions = atomic_durable::history::executions(rt, run)
+        .await
+        .unwrap_or_default();
+    let mut by: Vec<i64> = ran_it
+        .iter()
+        .filter_map(|s| atomic_durable::history::recorded_by(s, &executions))
+        .collect();
+    by.sort_unstable();
+    by.dedup();
+    if by.is_empty() {
+        usize::from(!ran_it.is_empty())
+    } else {
+        by.len()
+    }
+}
+
+/// The lines of `atom`'s tally in run `run`'s caches under `state`, if the
+/// run still has them.
+fn live_tally(state: &Path, run: &str, atom: &str) -> Option<usize> {
+    let prefix = format!("{run}-");
+    std::fs::read_dir(state.join("cache"))
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .find_map(|e| std::fs::read_to_string(e.path().join(format!("{atom}.tally"))).ok())
+        .map(|text| text.lines().count())
+}
+
+/// The largest `ran` in a recorded value, wherever the record nests it.
+fn tally_in(value: &Value) -> Option<usize> {
+    match value {
+        Value::Object(map) => map
+            .get("ran")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .into_iter()
+            .chain(map.values().filter_map(tally_in))
+            .max(),
+        Value::Array(items) => items.iter().filter_map(tally_in).max(),
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|v| v.is_object() || v.is_array())
+            .as_ref()
+            .and_then(tally_in),
+        _ => None,
+    }
+}
+
+/// [`ran`] for the counting atom.
+fn count_log(dir: &Path) -> usize {
+    ran(dir, "count-note")
+}
+
+/// The stores of every atomic home in `dir`, with each project's state
+/// directory.
+fn stores(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    let mut stores = Vec::new();
+    for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        for project in std::fs::read_dir(home.path().join("private"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let db = project.path().join("atomic.db");
+            if db.is_file() {
+                stores.push((db, home.path().join("projects").join(project.file_name())));
+            }
+        }
+    }
+    stores
+}
+
+/// What run `id` returned, once it has finished, in any store in `dir`.
+fn finished_output(dir: &Path, id: &str) -> Option<Value> {
+    let (stores, id) = (stores(dir), id.to_owned());
+    // A runtime of its own, so it may be asked from inside the tests' own.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async move {
+                for (db, _) in stores {
+                    let rt = Durare::sqlite(&db).await.expect("store");
+                    if rt.status(&id).await.expect("status") == Some(RunStatus::Succeeded) {
+                        return rt.result::<Value>(&id).await.ok();
+                    }
+                }
+                None
+            })
+    })
+    .join()
+    .expect("result")
+}
+
+/// [`ran_in`] summed over the stores of every atomic home in `dir`.
+fn ran(dir: &Path, atom: &str) -> usize {
+    let (atom, stores) = (atom.to_owned(), stores(dir));
+    // A runtime of its own, so it may be asked from inside the tests' own.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async move {
+                let mut ran = 0;
+                for (db, state) in stores {
+                    let rt = Durare::sqlite(&db).await.expect("store");
+                    ran += ran_in(&rt, Some(&state), &atom).await;
+                }
+                ran
+            })
+    })
+    .join()
+    .expect("count")
+}
+
+/// The file named `name` that an exec atom's confined command wrote into
+/// its run's caches, `<state>/cache/<run>/<name>`, under any of the atomic
+/// homes in `dir`, while the run has them: a command may write only those
+/// and its scratch directory, and the caches go when the run ends. A path
+/// that does not exist when none has.
+fn run_file(dir: &Path, name: &str) -> PathBuf {
+    for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        for state in std::fs::read_dir(home.path().join("projects"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            for run in std::fs::read_dir(state.path().join("cache"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let file = run.path().join(name);
+                if file.exists() {
+                    return file;
+                }
+            }
+        }
+    }
+    dir.join("no-run-has").join(name)
+}
+
+/// What an exec atom's command names on its command line for a file of its
+/// run's caches it writes (see [`run_file`]): `dir/<name>`, unique to the
+/// test, which [`pids_with`] finds its processes by; the command writes the
+/// file of that name in `$ATOMIC_CACHE_DIR`.
+fn command_log(dir: &Path, name: &str) -> PathBuf {
+    dir.join(name)
 }
 
 /// The processes, as this process numbers them, whose command line has
@@ -275,30 +481,50 @@ fn runner_of(marker: &str) -> Option<String> {
 }
 
 /// Acts, from outside the sandbox, for exec commands that ask: a command
-/// writes `<log>.ask`, `<log>` being one of `logs` and in its own command
-/// line, and this finds the `atomic runner` that started it, calls `act` on
-/// it and writes `<log>.done`. A confined command cannot reach its runner
-/// itself. Stops when dropped.
+/// with `<log>` on its command line, `<log>` being one of `logs` (see
+/// [`command_log`]), writes the file of `<log>`'s name with `.ask` into its
+/// run's caches, and this finds the `atomic runner` that started it, calls
+/// `act` on it and writes `.done` beside the `.ask`. A confined command
+/// cannot reach its runner itself. It counts how often each asked
+/// ([`acted`](Self::acted)), and the most lines `<log>` had in the run's
+/// caches when it did ([`ran`](Self::ran)), the command's own tally of its
+/// runs. Stops when dropped.
 struct RunnerWatch {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    acted: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, (usize, usize)>>>,
 }
 
 impl RunnerWatch {
     fn new(logs: Vec<PathBuf>, act: impl Fn(&str) + Send + 'static) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopping = stop.clone();
+        let acted = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let counts = acted.clone();
         let thread = std::thread::spawn(move || {
             while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 for log in &logs {
-                    let ask = log.with_extension("ask");
+                    let (Some(dir), Some(name)) = (log.parent(), log.file_name()) else {
+                        continue;
+                    };
+                    let name = Path::new(name).with_extension("ask");
+                    let ask = run_file(dir, &name.display().to_string());
                     if !ask.exists() {
                         continue;
                     }
                     if let Some(runner) = runner_of(&log.display().to_string()) {
                         let _ = std::fs::remove_file(&ask);
+                        let tally = std::fs::read_to_string(ask.with_extension("log"))
+                            .unwrap_or_default()
+                            .lines()
+                            .count();
                         act(&runner);
-                        std::fs::write(log.with_extension("done"), "").expect("done");
+                        let mut counts = counts.lock().expect("counts");
+                        let count = counts.entry(log.clone()).or_insert((0, 0));
+                        count.0 += 1;
+                        count.1 = count.1.max(tally);
+                        drop(counts);
+                        std::fs::write(ask.with_extension("done"), "").expect("done");
                     }
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -307,7 +533,28 @@ impl RunnerWatch {
         Self {
             stop,
             thread: Some(thread),
+            acted,
         }
+    }
+
+    /// How many times the command with `log` on its command line asked.
+    fn acted(&self, log: &Path) -> usize {
+        self.counts(log).0
+    }
+
+    /// How many times, by its own tally, the command with `log` on its
+    /// command line had run when it last asked.
+    fn ran(&self, log: &Path) -> usize {
+        self.counts(log).1
+    }
+
+    fn counts(&self, log: &Path) -> (usize, usize) {
+        self.acted
+            .lock()
+            .expect("counts")
+            .get(log)
+            .copied()
+            .unwrap_or((0, 0))
     }
 
     /// Kill the asking command's runner.
@@ -609,7 +856,8 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
         ),
         (&project, vec!["run", "count-note", "--input", "-"], NOTE),
     ];
-    let expected = json!({"title": "Exporting a file named ca", "words": 8});
+    // Each run's command ran once, by the tally it keeps in its run's caches.
+    let expected = json!({"title": "Exporting a file named ca", "words": 8, "ran": 1});
     for (cwd, args, stdin) in &runs {
         let out = atomic(&dir, cwd, args, &[], stdin);
         assert!(out.status.success(), "{args:?}: {}", text(&out));
@@ -617,7 +865,7 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
         // The durable run id comes first, on stderr.
         assert!(run_id(&String::from_utf8_lossy(&out.stderr)).starts_with("run-"));
     }
-    assert_eq!(count_log(&dir).len(), runs.len(), "one run each");
+    assert_eq!(count_log(&dir), runs.len(), "one run each");
 
     // With --json the result names the durable run, which the store keeps.
     let out = atomic(
@@ -646,7 +894,7 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
         json!({"run": id, "status": "succeeded", "output": expected})
     );
     assert_eq!(
-        count_log(&dir).len(),
+        count_log(&dir),
         runs.len() + 1,
         "a finished run is not run again"
     );
@@ -1213,7 +1461,7 @@ fn a_workflow_runs_by_name_and_by_file() {
     assert_eq!(stdout_json(&by_name), stdout_json(&by_file));
     assert_eq!(
         stdout_json(&by_name),
-        json!({"title": "Exporting a file named ca", "words": 8})
+        json!({"title": "Exporting a file named ca", "words": 8, "ran": 1})
     );
     // The run's artifact store took its lock where no atom can open it.
     let state = state_dir(&dir, &project);
@@ -1297,7 +1545,7 @@ fn errors_say_what_to_do_and_json_carries_the_action_apart() {
     let error = &stdout_json(&out)["error"];
     assert_eq!(error["kind"], "input.invalid", "{error}");
     assert!(!String::from_utf8_lossy(&out.stderr).contains("run run-"));
-    assert!(count_log(&dir).is_empty());
+    assert!(count_log(&dir) == 0);
 }
 
 // needs_sandbox
@@ -1332,7 +1580,26 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
         );
         let id = run_id(&String::from_utf8_lossy(&out.stderr));
         assert_eq!(model.calls(), 1, "rank ran");
-        assert_eq!(count_log(&dir).len(), 1, "count ran");
+        assert_eq!(count_log(&dir), 1, "count ran");
+
+        // Resumed, and killed again before the run ends, so its caches,
+        // and the tally count keeps there, are still there to read: a
+        // later execution that ran count again would show.
+        let (d, p, e, i) = (dir.clone(), project.clone(), env.clone(), id.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["runs", "resume", &i],
+                &with(&e, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "killed again: {}", text(&out));
+        assert_eq!(model.calls(), 2, "only summarize ran again");
+        assert_eq!(count_log(&dir), 1, "count did not run again");
 
         let (d, p, e, i) = (dir.clone(), project.clone(), env.clone(), id.clone());
         let out = tokio::task::spawn_blocking(move || {
@@ -1351,8 +1618,8 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
             stdout_json(&out),
             json!({"run": id, "status": "succeeded", "output": {"line": "P1: Export crashes on accents"}})
         );
-        assert_eq!(model.calls(), 2, "only summarize ran again");
-        assert_eq!(count_log(&dir).len(), 1, "count did not run again");
+        assert_eq!(model.calls(), 2, "nothing ran again");
+        assert_eq!(count_log(&dir), 1, "count did not run again");
     });
 }
 
@@ -1492,7 +1759,7 @@ fn an_unresolved_effect_stays_parked_across_resumes() {
         "",
     );
     assert!(!out.status.success(), "killed: {}", text(&out));
-    assert_eq!(count_log(&dir).len(), 1);
+    assert_eq!(count_log(&dir), 1);
     // The command declares no effects, so resuming parks it instead of
     // running it again, and later resumes leave it parked.
     for expected in ["run.failed", "run.failed"] {
@@ -1512,7 +1779,7 @@ fn an_unresolved_effect_stays_parked_across_resumes() {
                 .is_some_and(|d| d.contains("outcome_unknown")),
             "{error}"
         );
-        assert_eq!(count_log(&dir).len(), 1, "the command did not run again");
+        assert_eq!(count_log(&dir), 1, "the command did not run again");
     }
 }
 
@@ -1597,7 +1864,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             Some(RunStatus::Succeeded)
         );
         assert_eq!(model.calls(), 2, "rank once, summarize once");
-        assert_eq!(count_log(&dir).len(), 1);
+        assert_eq!(count_log(&dir), 1);
     });
 }
 
@@ -1831,7 +2098,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         let out: Value = rt.result("served-1").await.expect("result");
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
         assert_eq!(model.calls(), 2, "rank once, summarize once");
-        assert_eq!(count_log(&dir).len(), 1);
+        assert_eq!(count_log(&dir), 1);
         let log = std::fs::read_to_string(dir.join("serve.log")).expect("log");
         assert!(log.contains("recovered 1 unfinished run(s)"), "{log}");
 
@@ -1959,7 +2226,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(model.calls(), 4);
-        assert_eq!(count_log(&dir).len(), 2, "each run counted once");
+        assert_eq!(count_log(&dir), 2, "each run counted once");
         terminate(&serve);
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
@@ -2042,7 +2309,7 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
             .expect("child");
         assert!(status.success());
         assert_eq!(model.calls(), 1, "nothing ran again");
-        assert_eq!(count_log(&dir).len(), 1);
+        assert_eq!(count_log(&dir), 1);
     });
 }
 
@@ -2142,7 +2409,7 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         }
         assert_eq!(model.calls(), 4);
         assert_eq!(
-            count_log(&dir).len(),
+            count_log(&dir),
             3,
             "each triage's count once, count-note once"
         );
@@ -2200,7 +2467,7 @@ fn a_run_id_that_already_exists_is_refused() {
                 "{error}"
             );
         }
-        assert_eq!(count_log(&dir).len(), 1, "nothing ran again");
+        assert_eq!(count_log(&dir), 1, "nothing ran again");
 
         // An unfinished one's: refused, not waited on.
         let (d, p, e) = (dir.clone(), project.clone(), env.clone());
@@ -2228,7 +2495,7 @@ fn a_run_id_that_already_exists_is_refused() {
             "{error}"
         );
         assert_eq!(model.calls(), 1, "nothing ran again");
-        assert_eq!(count_log(&dir).len(), 2);
+        assert_eq!(count_log(&dir), 2);
     });
 }
 
@@ -2714,7 +2981,7 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(count_log(&dir).len(), 1);
+    assert_eq!(count_log(&dir), 1);
 
     let full = dir.join("bwrap-full");
     std::fs::write(&full, "").expect("the disk fills");
@@ -2738,14 +3005,14 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
         run.try_wait().expect("wait").is_none(),
         "it waits rather than stopping: {waiting}"
     );
-    assert_eq!(count_log(&dir).len(), 1, "nothing ran meanwhile");
+    assert_eq!(count_log(&dir), 1, "nothing ran meanwhile");
 
     std::fs::remove_file(&full).expect("room again");
     let status = wait_child(&mut run, "the waiting run");
     let text = std::fs::read_to_string(&log).expect("log");
     assert!(status.success(), "{text}");
     assert!(text.contains("can open its workspace again"), "{text}");
-    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    assert_eq!(count_log(&dir), 2, "its command ran once");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2771,7 +3038,7 @@ fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(count_log(&dir).len(), 1);
+    assert_eq!(count_log(&dir), 1);
 
     let full = dir.join("bwrap-full");
     std::fs::write(&full, "").expect("the disk fills");
@@ -2814,7 +3081,7 @@ fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
         "{text_log}"
     );
     assert!(text_log.contains("atomic runs resume"), "{text_log}");
-    assert_eq!(count_log(&dir).len(), 1, "nothing ran");
+    assert_eq!(count_log(&dir), 1, "nothing ran");
 
     std::fs::remove_file(&full).expect("room again");
     let out = atomic(
@@ -2825,7 +3092,7 @@ fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    assert_eq!(count_log(&dir), 2, "its command ran once");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2877,7 +3144,7 @@ fn a_signal_ends_a_wait_for_room_at_once() {
         "it stopped in {took:?}: {text_log}"
     );
     assert!(!status.success(), "{text_log}");
-    assert_eq!(count_log(&dir).len(), 1, "nothing ran");
+    assert_eq!(count_log(&dir), 1, "nothing ran");
 
     std::fs::remove_file(&full).expect("room again");
     let out = atomic(
@@ -2888,7 +3155,7 @@ fn a_signal_ends_a_wait_for_room_at_once() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    assert_eq!(count_log(&dir), 2, "its command ran once");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2943,7 +3210,8 @@ fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
     );
 
     // Started again, serve sets the step aside again, keeps trying, and
-    // runs it, once, when there is room.
+    // runs it, once, when there is room: the run's output carries the log
+    // its caches kept, which go with it.
     let log = dir.join("serve-again.log");
     let mut serve = spawn(&dir, &project, &["serve"], &env, &log);
     wait_until("serve to try again", || {
@@ -2952,14 +3220,17 @@ fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
     });
     assert!(serve.try_wait().expect("wait").is_none(), "serve goes on");
     std::fs::remove_file(&full).expect("room again");
-    wait_until("serve to run the step", || {
-        steps_log(&dir).contains(&"second".to_owned())
+    wait_until("serve to finish the run", || {
+        finished_output(&dir, "two-1").is_some()
     });
     terminate(&serve);
     let status = wait_child(&mut serve, "serve");
     let text_log = std::fs::read_to_string(&log).unwrap_or_default();
     assert!(status.success(), "{text_log}");
-    assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+    assert_eq!(
+        finished_output(&dir, "two-1").expect("finished")["steps"],
+        json!(["first start", "first end", "second"])
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3176,12 +3447,16 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
         let out = tokio::task::spawn_blocking(move || {
             let mut env = UNUSED_MODEL.to_vec();
             env.push(("PATH", e.as_str()));
-            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+            atomic(&d, &p, &["--json", "runs", "resume", "two-1"], &env, "")
         })
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+        // Each step's command ran once, in order, by the log the run kept.
+        assert_eq!(
+            stdout_json(&out)["output"]["steps"],
+            json!(["first start", "first end", "second"])
+        );
     });
 }
 
@@ -3209,7 +3484,7 @@ fn state_under_the_temporary_directory_is_refused() {
         "{}",
         text(&out)
     );
-    assert!(count_log(&dir).is_empty(), "nothing ran");
+    assert!(count_log(&dir) == 0, "nothing ran");
 }
 
 // needs_sandbox
@@ -3238,7 +3513,7 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         assert!(out.status.success(), "{}", text(out));
     }
     assert_eq!(stdout_json(&local), stdout_json(&split));
-    assert_eq!(count_log(&dir).len(), 2);
+    assert_eq!(count_log(&dir), 2);
 
     // A runner process starts the command, and has only PATH from atomic's
     // environment, which has HOME, USER and ATOMIC_HOME too. The command
@@ -3248,7 +3523,7 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         project.join("tools/parent-env.py"),
         "import json, os, sys, time\n\
          json.load(sys.stdin)\n\
-         log = sys.argv[1]\n\
+         log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
          open(log.removesuffix('.log') + '.ask', 'w').close()\n\
          done = log.removesuffix('.log') + '.done'\n\
          for _ in range(500):\n\
@@ -3315,14 +3590,15 @@ fn write_runner_killer(
         project.join("tools/kill-runner.py"),
         "import json, os, sys, time\n\
          note = json.load(sys.stdin)\n\
-         log = sys.argv[1]\n\
+         log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
          open(log, 'a').write('ran\\n')\n\
          if os.environ.get('KILL_ALWAYS') or not os.path.exists(log + '.killed'):\n\
          \x20   open(log + '.killed', 'w').close()\n\
          \x20   open(log.removesuffix('.log') + '.ask', 'w').close()\n\
          \x20   time.sleep(30)\n\
          \x20   sys.exit(1)\n\
-         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+         json.dump({'title': note['text'][:25], 'words': len(note['text'].split()), \
+         'ran': len(open(log).read().splitlines())}, sys.stdout)\n",
     )
     .expect("script");
     write_atom(
@@ -3339,15 +3615,11 @@ fn write_runner_killer(
         ),
         "",
         object(json!({"text": {"type": "string"}})),
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(
+            json!({"title": {"type": "string"}, "words": {"type": "integer"}, "ran": {"type": "integer"}}),
+        ),
     );
     log
-}
-
-fn lines(file: &Path) -> usize {
-    std::fs::read_to_string(file)
-        .map(|s| s.lines().count())
-        .unwrap_or(0)
 }
 
 // needs_sandbox
@@ -3358,16 +3630,15 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
     support::require_sandbox();
     let dir = scratch("runner-killed");
     let project = project(&dir);
-    let _watch = RunnerWatch::killing(vec![
-        write_runner_killer(&project, &dir, "undeclared", "", false),
-        write_runner_killer(
-            &project,
-            &dir,
-            "idempotent",
-            ", effects: { external: 'idempotent' }",
-            false,
-        ),
-    ]);
+    let undeclared = write_runner_killer(&project, &dir, "undeclared", "", false);
+    let idempotent = write_runner_killer(
+        &project,
+        &dir,
+        "idempotent",
+        ", effects: { external: 'idempotent' }",
+        false,
+    );
+    let watch = RunnerWatch::killing(vec![undeclared.clone(), idempotent.clone()]);
     // Undeclared: it may have done what it does, so it parks after one run.
     let out = atomic(
         &dir,
@@ -3393,7 +3664,10 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
             .is_some_and(|d| d.contains("outcome_unknown")),
         "{error}"
     );
-    assert_eq!(lines(&dir.join("undeclared.log")), 1, "it ran once");
+    // Its runner was killed under it once, and it never ran again: run
+    // again, it would have finished, since it kills only the first time.
+    assert_eq!(watch.acted(&undeclared), 1, "killed once");
+    assert_eq!(watch.ran(&undeclared), 1, "it ran once");
 
     // Declared idempotent: the step is retried, and the second run finishes.
     let out = atomic(
@@ -3404,15 +3678,13 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
+    // Killed once, then run once more to its end, as declared: its own
+    // tally says it ran twice.
     assert_eq!(
         stdout_json(&out),
-        json!({"title": "Exporting a file named ca", "words": 8})
+        json!({"title": "Exporting a file named ca", "words": 8, "ran": 2})
     );
-    assert_eq!(
-        lines(&dir.join("idempotent.log")),
-        2,
-        "once more, as declared"
-    );
+    assert_eq!(watch.acted(&idempotent), 1, "killed once");
 }
 
 /// An idempotent exec atom whose command starts a child that sleeps, logs
@@ -3424,8 +3696,8 @@ fn write_slow(project: &Path, dir: &Path) {
         project.join("tools/slow.py"),
         "import json, os, subprocess, sys, time\n\
          note = json.load(sys.stdin)\n\
-         log = sys.argv[1]\n\
-         child = subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)', log])\n\
+         log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
+         child = subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)', sys.argv[1]])\n\
          open(log, 'a').write('start\\n')\n\
          time.sleep(60)\n\
          open(log, 'a').write('end\\n')\n\
@@ -3452,7 +3724,7 @@ const UNUSED_MODEL: [(&str, &str); 2] = [
 
 /// How many times the slow command has started.
 fn slow_starts(dir: &Path) -> usize {
-    std::fs::read_to_string(dir.join("slow.log"))
+    std::fs::read_to_string(run_file(dir, "slow.log"))
         .unwrap_or_default()
         .lines()
         .filter(|l| *l == "start")
@@ -3462,8 +3734,7 @@ fn slow_starts(dir: &Path) -> usize {
 /// The processes of the slow command that run now, with everything that
 /// started it inside its sandbox, and its child.
 fn slow_pids(dir: &Path) -> Vec<String> {
-    let log = std::fs::read_link(dir.join("slow.log")).expect("the log link");
-    pids_with(&log.display().to_string())
+    pids_with(&command_log(dir, "slow.log").display().to_string())
 }
 
 /// Whether serve has said it stopped or failed.
@@ -3666,7 +3937,7 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
     assert!(log.contains("stopped 1 command(s)"), "{log}");
     all_gone(&pids, "the stopped command and its child");
     assert!(!lock_held(&state), "the lock went with the process");
-    let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+    let ends = std::fs::read_to_string(run_file(&dir, "slow.log")).expect("log");
     assert!(!ends.contains("end"), "no command ran to its end: {ends}");
     assert_eq!(slow_starts(&dir), 2, "started twice, never at once");
 }
@@ -3678,8 +3949,8 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
 const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
     signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
     note = json.load(sys.stdin)\n\
-    log = sys.argv[1]\n\
-    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', log], start_new_session=True)\n\
+    log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
+    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', sys.argv[1]], start_new_session=True)\n\
     open(log, 'a').write('start\\n')\n\
     time.sleep(60)\n\
     open(log, 'a').write('end\\n')\n\
@@ -3765,7 +4036,7 @@ fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
             "{runner}: every process ended at its kill: {}",
             text()
         );
-        let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+        let ends = std::fs::read_to_string(run_file(&dir, "slow.log")).expect("log");
         assert!(
             !ends.contains("end"),
             "{runner}: no command ran to its end: {ends}"
@@ -3803,7 +4074,7 @@ fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
         );
         let pids = slow_pids(&dir);
         if runner == "process" && cfg!(target_os = "linux") {
-            let log = std::fs::read_link(dir.join("slow.log")).expect("the log link");
+            let log = command_log(&dir, "slow.log");
             let started_by = runner_of(&log.display().to_string()).expect("a runner started it");
             assert_eq!(
                 parent_of(&started_by),
@@ -3922,7 +4193,7 @@ fn atomic_run_reading_its_input_stops_on_a_signal() {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(!status.success(), "{sig}");
-        assert!(count_log(&dir).is_empty(), "{sig}: nothing ran");
+        assert!(count_log(&dir) == 0, "{sig}: nothing ran");
     }
 }
 
@@ -3936,13 +4207,14 @@ fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
     let project = project(&dir);
     // Idempotent, so each recovery may run it again, and its runner always
     // dies under it.
-    let _watch = RunnerWatch::killing(vec![write_runner_killer(
+    let doomed = write_runner_killer(
         &project,
         &dir,
         "doomed",
         ", effects: { external: 'idempotent' }",
         true,
-    )]);
+    );
+    let watch = RunnerWatch::killing(vec![doomed.clone()]);
     let out = atomic(
         &dir,
         &project,
@@ -3957,16 +4229,17 @@ fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
     assert_eq!(error["kind"], "run.dead_lettered", "{error}");
     let action = error["action"].as_str().unwrap_or_default();
     assert!(!action.contains("runs resume"), "{error}");
-    let ran = lines(&dir.join("doomed.log"));
-    assert_eq!(
-        ran,
-        1 + atomic_app::pipeline::RECOVERY_LIMIT as usize,
-        "once, then once per recovery"
-    );
+    // Each try's runner was killed under it, and by its own tally it ran
+    // once, then once per recovery.
+    let tries = 1 + atomic_app::pipeline::RECOVERY_LIMIT as usize;
+    assert_eq!(watch.acted(&doomed), tries, "killed each try");
+    assert_eq!(watch.ran(&doomed), tries, "once, then once per recovery");
 }
 
 /// A workflow of two undeclared exec steps: `first` logs `first start`,
-/// takes three seconds and logs `first end`; `second` logs `second`.
+/// takes three seconds and logs `first end`; `second` logs `second`. The
+/// log is in the run's caches, and each returns it as `steps`, so the
+/// workflow's output says what ran in the run, and in what order.
 fn write_two_steps(project: &Path, dir: &Path) {
     let log = command_log(dir, "steps.log");
     for (name, body) in [
@@ -3980,10 +4253,11 @@ fn write_two_steps(project: &Path, dir: &Path) {
             project.join(format!("tools/{name}.py")),
             format!(
                 "import json, os, sys, time\n\
-                 def log(line): open(os.environ['STEPS_LOG'], 'a').write(line + '\\n')\n\
+                 def log(line): open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['STEPS_LOG'])), 'a').write(line + '\\n')\n\
                  note = json.load(sys.stdin)\n\
                  {body}\
-                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+                 steps = open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['STEPS_LOG']))).read().splitlines()\n\
+                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split()), 'steps': steps}}, sys.stdout)\n"
             ),
         )
         .expect("script");
@@ -3996,7 +4270,9 @@ fn write_two_steps(project: &Path, dir: &Path) {
             ),
             "",
             object(json!({"text": {"type": "string"}})),
-            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+            object(
+                json!({"title": {"type": "string"}, "words": {"type": "integer"}, "steps": {"type": "array", "items": {"type": "string"}}}),
+            ),
         );
     }
     std::fs::write(
@@ -4012,7 +4288,7 @@ fn write_two_steps(project: &Path, dir: &Path) {
 }
 
 fn steps_log(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("steps.log"))
+    std::fs::read_to_string(run_file(dir, "steps.log"))
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
@@ -4051,12 +4327,16 @@ fn no_step_starts_after_the_first_signal() {
     let out = atomic(
         &dir,
         &project,
-        &["runs", "resume", "two-1"],
+        &["--json", "runs", "resume", "two-1"],
         &UNUSED_MODEL,
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+    // Each step's command ran once, in order, by the log the run kept.
+    assert_eq!(
+        stdout_json(&out)["output"]["steps"],
+        json!(["first start", "first end", "second"])
+    );
 }
 
 // needs_sandbox
@@ -4166,14 +4446,17 @@ fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
 }
 
 /// A workflow of two exec steps: `mark`, and then `tally`, idempotent,
-/// which logs the run it ran for.
+/// which logs the run it ran for in the run's caches and returns the log as
+/// `tallied`.
 fn write_tally(project: &Path, dir: &Path) {
     let log = command_log(dir, "tally.log");
     for (name, body, effects) in [
-        ("mark", "", ""),
+        ("mark", "out['tallied'] = []\n", ""),
         (
             "tally",
-            "open(os.environ['TALLY_LOG'], 'a').write(os.environ['ATOMIC_RUN_ID'] + '\\n')\n",
+            "at = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(os.environ['TALLY_LOG']))\n\
+             open(at, 'a').write(os.environ['ATOMIC_RUN_ID'] + '\\n')\n\
+             out['tallied'] = open(at).read().splitlines()\n",
             ", effects: { external: 'idempotent' }",
         ),
     ] {
@@ -4182,8 +4465,9 @@ fn write_tally(project: &Path, dir: &Path) {
             format!(
                 "import json, os, sys\n\
                  note = json.load(sys.stdin)\n\
+                 out = {{'title': note['text'][:25], 'words': len(note['text'].split())}}\n\
                  {body}\
-                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+                 json.dump(out, sys.stdout)\n"
             ),
         )
         .expect("script");
@@ -4196,7 +4480,9 @@ fn write_tally(project: &Path, dir: &Path) {
             ),
             "",
             object(json!({"text": {"type": "string"}})),
-            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+            object(
+                json!({"title": {"type": "string"}, "words": {"type": "integer"}, "tallied": {"type": "array", "items": {"type": "string"}}}),
+            ),
         );
     }
     std::fs::write(
@@ -4272,15 +4558,12 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
             .await
             .expect("child");
         assert!(status.success());
-        let mut tallied: Vec<String> = std::fs::read_to_string(dir.join("tally.log"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        tallied.sort();
-        let mut expected = ids.clone();
-        expected.sort();
-        assert_eq!(tallied, expected, "each run's command ran once");
+        // Each run's command ran once, for that run, by the log the run
+        // kept.
+        for id in &ids {
+            let out: Value = rt.result(id).await.expect("result");
+            assert_eq!(out["tallied"], json!([id]), "{id}'s command ran once");
+        }
     });
 }
 
@@ -4411,7 +4694,7 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     }
     workflow.push_str(&format!("returns: steps.s{}.output\n", n - 1));
     std::fs::write(project.join("workflows/bumpy.workflow.yaml"), workflow).expect("workflow");
-    let _watch = RunnerWatch::killing(logs);
+    let watch = RunnerWatch::killing(logs.clone());
     let out = atomic(
         &dir,
         &project,
@@ -4420,8 +4703,11 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    for i in 0..n {
-        assert_eq!(lines(&dir.join(format!("bump-{i}.log"))), 2, "step {i}");
+    for (i, log) in logs.iter().enumerate() {
+        // Killed once, then run again to its end: its recorded output keeps
+        // the tally it ran with.
+        assert_eq!(watch.acted(log), 1, "step {i}");
+        assert_eq!(ran(&dir, &format!("bump-{i}")), 2, "step {i}");
     }
 }
 
@@ -5039,7 +5325,7 @@ fn a_run_whose_execution_cannot_be_recorded_still_runs() {
         "{}",
         text(&out)
     );
-    assert_eq!(count_log(&dir).len(), 2);
+    assert_eq!(count_log(&dir), 2);
 }
 
 // needs_sandbox
@@ -5419,7 +5705,7 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
             std::fs::read_to_string(dir.join("b.log")).unwrap_or_default()
         );
         assert_eq!(model.calls(), 2, "rank once, summarize once");
-        assert_eq!(count_log(&dir).len(), 1, "count once");
+        assert_eq!(counted_in(&rt).await, 1, "count once");
     });
 }
 
@@ -5489,7 +5775,7 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             json!({"line": "P1: Export crashes on accents"})
         );
         assert_eq!(model.calls(), 2, "summarize ran once: {}", text(&out));
-        assert_eq!(count_log(&dir).len(), 2);
+        assert_eq!(counted_in(&rt).await, 2);
     });
 }
 
@@ -5661,7 +5947,7 @@ async fn a_run_whose_workflow_code_panics() {
             Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))
         );
     }
-    assert_eq!(count_log(&dir).len(), 1, "the count ran once");
+    assert_eq!(count_log(&dir), 1, "the count ran once");
     // Kept where a later process, or the run's inspection, finds it.
     let private = state
         .parent()
@@ -5967,7 +6253,17 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
         ranking_atom(&project, "rank-for-team", Some("team"));
         ranking_atom(&project, "rank-for-agents", Some("agent"));
         let env = model_env(&model.base_url());
-        for atom in ["rank-for-team", "rank-for-agents"] {
+        for (atom, sources) in [
+            (
+                "rank-for-team",
+                "a gate a person decides, or a literal in the workflow file",
+            ),
+            (
+                "rank-for-agents",
+                "a model step's output, a gate a person decides, or a literal in the workflow \
+                 file",
+            ),
+        ] {
             let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
             let out = tokio::task::spawn_blocking(move || {
                 atomic(
@@ -5989,10 +6285,21 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
                 message.contains(&format!("atom `{atom}`")),
                 "{atom}: {message}"
             );
+            // The action names what the atom takes instead.
+            let action = error["action"].as_str().unwrap_or_default();
+            assert!(
+                action.contains(&format!(
+                    "run it from a workflow that binds the field to {sources}"
+                )) && action.contains("declare a lower `trust` on the atom"),
+                "{atom}: the action names what can take the field's place"
+            );
             // Refused as the run was loaded: no durable run was started,
             // which would name itself first on stderr.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+            assert!(
+                !stderr.contains("run run-"),
+                "{atom}: a run started: {stderr}"
+            );
         }
         assert_eq!(model.calls(), 0, "a model was called");
     });
