@@ -2028,7 +2028,9 @@ async fn in_worktree(
             .await
             .map_err(|e| match e {
                 StepError::Body(e) => e,
-                StepError::Worktree(e) => AtomError::Runtime(format!("the step's worktree: {e}")),
+                StepError::Worktree(e) => {
+                    AtomError::Runtime(format!("the step's worktree: {}", e.described()))
+                }
                 StepError::Waited(e) => e,
             })
     })

@@ -858,27 +858,6 @@ impl Repo {
             .collect()
     }
 
-    /// What checking out commit `sha` writes: the bytes of its files and how
-    /// many files and directories it makes.
-    pub fn checkout_size(&self, sha: &str) -> Result<(u64, u64), GitError> {
-        check_sha(sha)?;
-        let out = self.run(
-            &["ls-tree", "-r", "-t", "-l", "-z", "--full-tree", sha],
-            None,
-        )?;
-        let (mut bytes, mut entries) = (0u64, 0u64);
-        for entry in out.split(|b| *b == 0).filter(|e| !e.is_empty()) {
-            let text = std::str::from_utf8(entry).map_err(|_| GitError::Unreadable)?;
-            let (head, _) = text.split_once('\t').ok_or(GitError::Unreadable)?;
-            let size = head.split_whitespace().nth(3).ok_or(GitError::Unreadable)?;
-            entries += 1;
-            if size != "-" {
-                bytes = bytes.saturating_add(size.parse().map_err(|_| GitError::Unreadable)?);
-            }
-        }
-        Ok((bytes, entries))
-    }
-
     /// The contents of blob `id`, read by its object ID, so any path it has
     /// in a tree is read the same.
     pub fn blob_by_id(&self, id: &str) -> Result<Vec<u8>, GitError> {

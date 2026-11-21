@@ -67,11 +67,12 @@ pub struct EngineArgs {
     #[arg(long)]
     pub executor_id: Option<String>,
     /// How many seconds a step waits for room, on the execution backend for
-    /// its workspace or on the disk for its worktree or its run's build
-    /// caches, before the run stops, unfinished and with nothing recorded,
-    /// for `atomic runs resume`. Each of those waits has its own clock.
-    /// Without it, a step waits for as long as it takes (`backend_wait`,
-    /// `ATOMIC_BACKEND_WAIT`).
+    /// its workspace or on the disk for atomic's own writes (its run's build
+    /// caches and its worktree's directory), before the run stops,
+    /// unfinished and with nothing recorded, for `atomic runs resume`. Each
+    /// of those waits has its own clock. A checkout git cannot finish fails
+    /// the step instead. Without it, a step waits for as long as it takes
+    /// (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     pub backend_wait: Option<u64>,
 }

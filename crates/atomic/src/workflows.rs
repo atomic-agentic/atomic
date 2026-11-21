@@ -119,7 +119,7 @@ pub(crate) async fn settled<T>(
             atomic_core::log_line!(
                 "atomic: {place} stays unfinished, with nothing recorded; continue it with \
                  `atomic runs resume` once there is room: on the execution backend, or on \
-                 the disk for the step's worktree or its run's build caches"
+                 the disk for the run's build caches or the step's worktree directory"
             );
             // Whatever else this process started ends first.
             atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
@@ -170,7 +170,7 @@ pub fn atom_failure(e: AtomError) -> DurableError {
             atomic_core::log_line!(
                 "atomic: stopping without recording an outcome; continue the run with `atomic \
                  runs resume` once there is room: on the execution backend, or on the disk for \
-                 the step's worktree or its run's build caches"
+                 the run's build caches or the step's worktree directory"
             );
             // Whatever else this process started ends first.
             atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
