@@ -110,14 +110,17 @@ atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn can see, add, change or remove what a turn keeps in
-its `HOME` or temporary directory: every scratch directory of the project is
-denied to a turn's commands, apart from a `workspace-write` turn's own. A
-`read-only` turn, which may not write its own, sees it empty. On Linux only
-Codex's sandbox helper, which the `atomic` binary provides, can deny them, so
-a process without it refuses the turn instead of running it. An exec atom's
+its `HOME` or temporary directory: every scratch directory of the project,
+those of `atomic run`, `atomic serve` and `atomic eval` and those of
+`atomic debug prompt`,
+is denied to a turn's commands, apart from a `workspace-write` turn's own. A
+`read-only` turn, which may not write its own, cannot reach it at all, not
+even to list it. Apart from macOS, whose own sandbox denies them, only
+Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
+them, so a process without it refuses the turn instead of running it. An exec atom's
 command, which has a scratch directory of its own too, is kept out of every
-other attempt's in the same way, its own apart, wherever its command is
-confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
+other one in the same way, its own apart, wherever its command is confined,
+on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -177,9 +180,10 @@ terminal's path in `/dev/pts` or another process's descriptors. A step that runs
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
-when resumed where the sandbox can start. `atomic serve` instead leaves that run
-unfinished, says so, and goes on serving the others; the run continues when a
-later process recovers it. A sandbox that fails in a way that may pass, such as
+when resumed where the sandbox can start. `atomic serve` instead sets that run
+aside, unfinished, says so, and goes on serving the others; it tries the
+sandbox again, first after a few seconds and then at most a minute apart, and
+the run goes on once the sandbox starts. A sandbox that fails in a way that may pass, such as
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's

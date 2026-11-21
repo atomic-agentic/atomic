@@ -67,7 +67,7 @@ fn shared_scratch() -> PathBuf {
     .clone()
 }
 
-fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
+fn runtime(dir: &Path, model: &FakeModel) -> CodexRuntime {
     CodexRuntime {
         paths: CodexPaths::with_helpers(
             PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
@@ -85,7 +85,6 @@ fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
         artifacts: Artifacts::none(),
         meter: Metering::none(),
         guard: atomic_core::codex::StateGuard::NoProjectState,
-        backend,
         caches: None,
     }
 }
@@ -136,6 +135,13 @@ impl ExecutionBackend for Relocating {
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         self.local.close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, ExecError> {
+        self.local.exchange(workspace)
+    }
 }
 
 /// A read-only codex atom that reports whether its work is done.
@@ -173,8 +179,8 @@ fn a_turn_runs_where_its_workspace_says() {
             root: dir.join("elsewhere"),
         })
         .expect("connects");
-        let rt = runtime(&dir, &model, backend);
-        let (out, _) = run_codex_atom(&Report, &json!({}), &rt)
+        let rt = runtime(&dir, &model);
+        let (out, _) = run_codex_atom(&Report, &json!({}), &rt, &backend)
             .await
             .expect("runs");
         assert_eq!(out, json!({"done": true}));
@@ -219,13 +225,11 @@ async fn plant_in_live_exec_scratch(dir: &Path, scratch_root: PathBuf) -> (bool,
     ])
     .await
     .expect("fake model");
-    let rt = runtime(
-        dir,
-        &model,
-        Backend::connect(LocalBackend::in_dir(scratch_root)).expect("connects"),
-    );
+    let backend = Backend::connect(LocalBackend::in_dir(scratch_root)).expect("connects");
+    let rt = runtime(dir, &model);
     let answer = run_turn(
         &rt,
+        &backend,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
@@ -297,9 +301,10 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                 )));
                 script.push(Reply::Text("Done.".into()));
                 let model = FakeModel::start(script).await.expect("fake model");
-                let rt = runtime(&dir, &model, backend);
+                let rt = runtime(&dir, &model);
                 let answer = run_turn(
                     &rt,
+                    &backend,
                     &TurnSpec {
                         prompt: "Do the work.".into(),
                         sandbox: Sandbox::WorkspaceWrite,
@@ -372,9 +377,10 @@ fn a_command_naming_the_inner_stage_leaves_the_registry_shared() {
         ])
         .await
         .expect("fake model");
-        let rt = runtime(&dir, &model, backend);
+        let rt = runtime(&dir, &model);
         let answer = run_turn(
             &rt,
+            &backend,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,
@@ -417,6 +423,7 @@ impl atomic_core::usage::Meter for Recorder {
                 admitted: std::time::Instant::now(),
                 limit: self.limit,
                 bounded_by: None,
+                release: atomic_core::usage::Release::default(),
             })
         })
     }
@@ -460,17 +467,14 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
             },
             settled: std::sync::Mutex::new(Vec::new()),
         });
-        let mut rt = runtime(
-            &dir,
-            &model,
-            Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects"),
-        );
+        let mut rt = runtime(&dir, &model);
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
         rt.meter = Metering::new(recorder.clone());
         let spec = TurnSpec {
             prompt: "build it".into(),
             ..TurnSpec::default()
         };
-        let ended = run_turn(&rt, &spec).await;
+        let ended = run_turn(&rt, &backend, &spec).await;
         let e = ended.expect_err("cut off");
         assert!(format!("{e}").contains("cut off"), "{e}");
         assert_eq!(model.calls(), 2, "the request after the command was made");
@@ -490,28 +494,39 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
 }
 
 /// A turn's commands cannot read another live attempt's scratch directory,
-/// its `HOME` or its `TMPDIR`, though a `workspace-write` turn reads and
-/// writes its own: the backend's scratch directories are denied to a turn,
-/// a writing turn's own apart. A `read-only` turn, which may not write its
-/// own, sees it empty too. One turn leaves a secret in both and holds its
-/// attempt open while two others, on the same backend, look for it
-/// everywhere under the backend's scratch root.
+/// its `HOME` or its `TMPDIR`, on its own backend or on another backend of
+/// the project, though a `workspace-write` turn reads and writes its own: a
+/// backend denies a turn every scratch root it names, a writing turn's own
+/// directory apart. A `read-only` turn, which may not write its own, cannot
+/// reach it at all. One turn leaves a secret in both and holds its attempt
+/// open, as does a neighbour on a backend with a scratch root of its own,
+/// while the others look for the secrets everywhere under both roots once
+/// the markers the two leave say they are there.
 #[test]
 fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("scratch-deny");
         let root = shared_scratch();
-        let backend = Backend::connect(LocalBackend::in_dir(root.clone())).expect("connects");
-        let turn = |commands: Vec<String>, sandbox: Sandbox| {
+        let sibling = root.with_file_name("scratch-debug");
+        // Two backends of one project, as `atomic run` and `atomic debug
+        // prompt` have, each told to deny the other's scratch root.
+        let backend =
+            Backend::connect(LocalBackend::in_dir(root.clone()).denying([sibling.clone()]))
+                .expect("connects");
+        let neighbours =
+            Backend::connect(LocalBackend::in_dir(sibling.clone()).denying([root.clone()]))
+                .expect("connects");
+        let turn = |commands: Vec<String>, sandbox: Sandbox, backend: &Backend| {
             let (dir, backend) = (dir.clone(), backend.clone());
             async move {
                 let mut script: Vec<Reply> = commands.iter().map(|c| tool(c)).collect();
                 script.push(Reply::Text("Done.".into()));
                 let model = FakeModel::start(script).await.expect("fake model");
-                let rt = runtime(&dir, &model, backend);
+                let rt = runtime(&dir, &model);
                 let answer = run_turn(
                     &rt,
+                    &backend,
                     &TurnSpec {
                         prompt: "Do the work.".into(),
                         sandbox,
@@ -529,37 +544,68 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                     .to_string()
             }
         };
-        let look = format!(
-            "found=$(grep -rls secret-of-the-first {} 2>/dev/null | grep -c .)",
-            root.display()
-        );
+        // The markers are in the shared working directory, outside every
+        // scratch root; a look starts once they are there, and gives up
+        // after 30 s.
+        let wait = |marker: &str| {
+            format!("for i in $(seq 300); do [ -e {marker} ] && break; sleep 0.1; done")
+        };
+        let look = |name: &str, under: &Path, secret: &str| {
+            format!(
+                "echo {name}=$(grep -rls {secret} {} 2>/dev/null | grep -c .)",
+                under.display()
+            )
+        };
         let first = tokio::spawn(turn(
             vec![
                 "echo secret-of-the-first > \"$HOME/secret\" && \
-                 echo secret-of-the-first > \"$TMPDIR/secret\" && echo first-wrote"
+                 echo secret-of-the-first > \"$TMPDIR/secret\" && touch first-wrote && \
+                 echo first-wrote"
                     .into(),
-                "sleep 10; echo first-held".into(),
+                "sleep 8; echo first-held".into(),
             ],
             Sandbox::WorkspaceWrite,
+            &backend,
+        ));
+        let neighbour = tokio::spawn(turn(
+            vec![format!(
+                "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
+                 {}; {}; sleep 6; echo neighbour-held",
+                wait("first-wrote"),
+                look("neighbour-found", &root, "secret-of-the-first"),
+            )],
+            Sandbox::WorkspaceWrite,
+            &neighbours,
         ));
         let writer = tokio::spawn(turn(
             vec![format!(
-                "sleep 5; {look}; echo writer-found=$found; \
+                "{}; {}; {}; {}; \
                  echo mine > \"$HOME/m\" && cat \"$HOME/m\" && \
                  echo also > \"$TMPDIR/m\" && cat \"$TMPDIR/m\" && echo writer-own-ok; \
-                 echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')"
+                 echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')",
+                wait("first-wrote"),
+                wait("neighbour-wrote"),
+                look("writer-found", &root, "secret-of-the-first"),
+                look("writer-sibling-found", &sibling, "secret-of-the-neighbour"),
             )],
             Sandbox::WorkspaceWrite,
+            &backend,
         ));
         let reader = tokio::spawn(turn(
             vec![format!(
-                "sleep 5; {look}; echo reader-found=$found; \
-                 echo reader-home-entries=$(ls -A \"$HOME\" | grep -c .)"
+                "{}; {}; \
+                 if ls -A \"$HOME\" >/dev/null 2>&1; then echo reader-home=listed; \
+                 else echo reader-home=unreachable; fi; \
+                 echo reader-home-says=$(ls -A \"$HOME\" 2>&1 | head -1)",
+                wait("first-wrote"),
+                look("reader-found", &root, "secret-of-the-first"),
             )],
             Sandbox::ReadOnly,
+            &backend,
         ));
-        let (first, writer, reader) = (
+        let (first, neighbour, writer, reader) = (
             first.await.expect("first"),
+            neighbour.await.expect("neighbour"),
             writer.await.expect("writer"),
             reader.await.expect("reader"),
         );
@@ -567,16 +613,24 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             first.contains("first-wrote") && first.contains("first-held"),
             "{first}"
         );
+        assert!(
+            neighbour.contains("neighbour-found=0\\n") && neighbour.contains("neighbour-held"),
+            "the neighbour read the first's scratch: {neighbour}"
+        );
         // Its own scratch directory holds its TMPDIR and what it wrote.
         assert!(
             writer.contains("writer-found=0\\n")
+                && writer.contains("writer-sibling-found=0\\n")
                 && writer.contains("writer-own-ok")
                 && writer.contains("writer-home-own=2\\n"),
-            "the writing turn read the first's scratch, or lost its own: {writer}"
+            "the writing turn read another's scratch, or lost its own: {writer}"
         );
+        // Not an empty directory: one it may not open at all.
         assert!(
-            reader.contains("reader-found=0\\n") && reader.contains("reader-home-entries=0\\n"),
-            "the read-only turn read the first's scratch, or its own: {reader}"
+            reader.contains("reader-found=0\\n")
+                && reader.contains("reader-home=unreachable")
+                && reader.contains("Permission denied"),
+            "the read-only turn read the first's scratch, or reached its own: {reader}"
         );
     });
 }
@@ -667,9 +721,10 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
             .collect();
         script.push(Reply::Text("Done.".into()));
         let model = FakeModel::start(script).await.expect("fake model");
-        let rt = runtime(&dir, &model, backend);
+        let rt = runtime(&dir, &model);
         let answer = run_turn(
             &rt,
+            &backend,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,

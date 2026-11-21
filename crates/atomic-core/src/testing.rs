@@ -440,7 +440,8 @@ pub fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f:
     }
 }
 
-/// `backend` with nothing denied to its workspaces' commands, for tests whose
+/// `backend` with nothing denied to its workspaces' commands, and in every
+/// other way the same backend, for tests whose
 /// Codex turns run without Codex's Linux sandbox helper
 /// ([`crate::codex::CodexPaths::without_helpers`]). Atomic refuses such a
 /// turn on Linux when its workspace has paths to deny, the backend's scratch
@@ -481,6 +482,13 @@ impl atomic_exec::ExecutionBackend for DenyingNothing {
 
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.0.shared().close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.0.shared().exchange(workspace)
     }
 }
 

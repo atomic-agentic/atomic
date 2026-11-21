@@ -21,7 +21,8 @@ use atomic_core::budget::{
     Budget, BudgetError, BudgetSettings, CallBound, Level, Price, Resolved, resolve,
 };
 use atomic_core::usage::{
-    Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket, Usage,
+    Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Release, Ticket,
+    Usage,
 };
 use atomic_durable::StepInfo;
 use atomic_durable::usage::{
@@ -395,15 +396,17 @@ impl LedgerMeter {
                 millis,
                 bounded_by,
             } => {
-                beat(&self.ledger, &request, attempt, millis);
+                let admitted = Instant::now();
+                beat(&self.ledger, &request, attempt, millis, admitted);
                 if atomic_durable::failpoints::armed() {
                     atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
                 }
                 Ok(Ticket {
+                    release: released(&request, attempt),
                     request,
                     attempt,
                     model: call.model,
-                    admitted: Instant::now(),
+                    admitted,
                     limit: Limit {
                         output_tokens: None,
                         time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
@@ -521,16 +524,18 @@ impl Meter for LedgerMeter {
                 } => {
                     // While the call runs, it says so, so a call whose process
                     // dies is charged no time past its last word.
-                    beat(&self.ledger, &request, attempt, millis);
+                    let admitted = Instant::now();
+                    beat(&self.ledger, &request, attempt, millis, admitted);
                     // Admitted and reserved, and not yet dispatched.
                     if atomic_durable::failpoints::armed() {
                         atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
                     }
                     Ok(Ticket {
+                        release: released(&request, attempt),
                         request,
                         attempt,
                         model: call.model,
-                        admitted: Instant::now(),
+                        admitted,
                         limit: Limit {
                             output_tokens: Some(bound.output_tokens),
                             // A request's own bound; for a turn, the active
@@ -582,8 +587,15 @@ impl Meter for LedgerMeter {
                 Outcome::Partial { reported, last } => self.partial(&ticket.model, reported, last),
                 Outcome::NotDispatched => Settlement::NotDispatched,
             };
+            // The active time it took, as this process measured it: a
+            // machine that slept meanwhile is not charged the sleep.
             self.ledger
-                .settle(&ticket.request, ticket.attempt, how)
+                .settle_measured(
+                    &ticket.request,
+                    ticket.attempt,
+                    how,
+                    active(ticket.admitted),
+                )
                 .await
                 .map_err(store)?;
             // Mid-atom: the call is made and settled, and the atom's turn
@@ -597,17 +609,24 @@ impl Meter for LedgerMeter {
 }
 
 /// The calls this process has admitted and not yet settled, by request and
-/// attempt: the ledger each is journaled in, and its heartbeat.
-type InFlight = HashMap<(String, i64), (Ledger, tokio::task::AbortHandle)>;
+/// attempt: the ledger each is journaled in, its heartbeat, and when it was
+/// admitted.
+type InFlight = HashMap<(String, i64), (Ledger, tokio::task::AbortHandle, Instant)>;
 
 static IN_FLIGHT: LazyLock<Mutex<InFlight>> = LazyLock::new(Mutex::default);
 
-/// Start the heartbeat of attempt `attempt` at `request`, which reserved
-/// `millis`: every [`heartbeat_every`] of it until it settles, and never
-/// past its reservation.
-fn beat(ledger: &Ledger, request: &str, attempt: i64, millis: i64) {
+/// The active milliseconds since `admitted`, on the monotonic clock, which
+/// on Linux and macOS does not run while the machine sleeps.
+fn active(admitted: Instant) -> i64 {
+    i64::try_from(admitted.elapsed().as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Start the heartbeat of attempt `attempt` at `request`, admitted at
+/// `admitted` and reserving `millis`: every [`heartbeat_every`] of it until
+/// it settles or its ticket is dropped, and never past its reservation.
+fn beat(ledger: &Ledger, request: &str, attempt: i64, millis: i64, admitted: Instant) {
     let every = Duration::from_millis(u64::try_from(heartbeat_every(millis)).unwrap_or(5_000));
-    let until = Instant::now() + Duration::from_millis(u64::try_from(millis).unwrap_or(0)) + every;
+    let until = admitted + Duration::from_millis(u64::try_from(millis).unwrap_or(0)) + every;
     let (beating, id) = (ledger.clone(), request.to_owned());
     let task = tokio::spawn(async move {
         loop {
@@ -615,16 +634,28 @@ fn beat(ledger: &Ledger, request: &str, attempt: i64, millis: i64) {
             if Instant::now() > until {
                 return;
             }
-            // A missed heartbeat only charges more time, never less.
-            let _ = beating.heartbeat(&id, attempt).await;
+            // A missed heartbeat is not tried again: if the process then
+            // dies, the call is charged only until a beat after the last
+            // one recorded, less than it ran.
+            let _ = beating.heartbeat(&id, attempt, active(admitted)).await;
         }
     });
     if let Ok(mut calls) = IN_FLIGHT.lock() {
         calls.insert(
             (request.to_owned(), attempt),
-            (ledger.clone(), task.abort_handle()),
+            (ledger.clone(), task.abort_handle(), admitted),
         );
     }
+}
+
+/// What a ticket for attempt `attempt` at `request` does if it is dropped
+/// unsettled, as when the task holding it panics: its call has ended, so
+/// its heartbeat stops and it is no longer in flight. Its attempt stays
+/// reserved, and is charged until a beat after its last heartbeat when it
+/// is found.
+fn released(request: &str, attempt: i64) -> Release {
+    let request = request.to_owned();
+    Release::new(move || ended(&request, attempt))
 }
 
 /// The call of attempt `attempt` at `request` ended: stop its heartbeat.
@@ -633,7 +664,7 @@ fn ended(request: &str, attempt: i64) {
         .lock()
         .ok()
         .and_then(|mut calls| calls.remove(&(request.to_owned(), attempt)));
-    if let Some((_, heartbeat)) = call {
+    if let Some((_, heartbeat, _)) = call {
         heartbeat.abort();
     }
 }
@@ -649,9 +680,9 @@ pub async fn interrupt_in_flight() -> usize {
         .map(|mut calls| calls.drain().collect())
         .unwrap_or_default();
     let n = calls.len();
-    for ((request, attempt), (ledger, heartbeat)) in calls {
+    for ((request, attempt), (ledger, heartbeat, admitted)) in calls {
         heartbeat.abort();
-        let _ = ledger.interrupt(&request, attempt).await;
+        let _ = ledger.interrupt(&request, attempt, active(admitted)).await;
     }
     n
 }

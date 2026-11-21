@@ -112,13 +112,12 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: Metering::none(),
-            // Its turns run without Codex's sandbox helper, so nothing may be
-            // denied to them: see `denying_nothing`.
-            backend: atomic_core::testing::denying_nothing(Default::default()),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: atomic_core::testing::denying_nothing(Default::default()),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -831,11 +830,11 @@ fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
 #[test]
 fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
     on_codex_runtime(async {
-        // Scaled down: the review's turn reserves its atom's 3 s and beats
-        // every 300 ms. Killed at its first heartbeat, about 0.3 s in, and
-        // recovered after the 3 s have passed, the dead turn is charged the
+        // Scaled down: the review's turn reserves its atom's 6 s and beats
+        // every 600 ms. Killed at its first heartbeat, about 0.6 s in, and
+        // recovered after the 6 s have passed, the dead turn is charged the
         // time it ran, up to a beat after its last heartbeat, and the review
-        // has the rest of its time to run again.
+        // has the rest of its time, most of it, to run again.
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
             Reply::Delayed {
@@ -849,7 +848,7 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let dir = scratch("lapsed");
         let url = model.base_url();
         let caps = "10000,100000";
-        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.05");
+        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.1");
         let until = Instant::now() + Duration::from_secs(60);
         while model.calls() < 2 {
             assert!(
@@ -861,7 +860,7 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         // Killed once its turn has recorded a heartbeat a beat or more after
         // admission, however slowly a loaded machine runs it: recovery
         // charges it until a beat after that, at least two beats.
-        let every = heartbeat_every(3_000);
+        let every = heartbeat_every(6_000);
         let beaten = Instant::now() + Duration::from_secs(60);
         while beat_after_admission(&dir)
             .await
@@ -880,8 +879,8 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         process.kill().expect("kill the child");
         let _ = process.wait();
         // Down past the whole reservation.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.05")
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.1")
             .await
             .expect("the recovered run");
         assert_eq!(seen, "finished");
@@ -889,9 +888,9 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let review = attempts(&rt, "lapsed").await;
         let dead = &review[1];
         assert_eq!(dead.state, "reserved");
-        assert_eq!(dead.reserved.millis, 3_000, "{dead:?}");
+        assert_eq!(dead.reserved.millis, 6_000, "{dead:?}");
         assert!(
-            dead.charged.millis < 2_000,
+            dead.charged.millis < 4_000,
             "the downtime was not charged: {dead:?}"
         );
         // Its heartbeats carried it past the first beat: it is charged the
@@ -1083,7 +1082,10 @@ fn parallel_children_cannot_both_take_the_last_reservation() {
                             let request = ChangeRequest {
                                 request: name.clone(),
                             };
-                            propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                            propose(async move {
+                                run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                                    .await
+                            })
                         },
                         Vec::new(),
                     )
@@ -1167,9 +1169,13 @@ fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
         .expect("fake model");
         let mut lite = runtimes(&dir, &model.base_url()).lite.clone();
         lite.meter = budget.meter(&step("sent"), &caps);
-        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        assert!(
+            run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                .await
+                .is_err()
+        );
         lite.meter = budget.meter(&step("silent"), &caps);
-        run_lite_atom(&DraftTask, &request, &lite)
+        run_lite_atom(&DraftTask, &request, &lite, &Default::default())
             .await
             .expect("an answer without usage");
         for run in ["sent", "silent"] {
@@ -1188,7 +1194,11 @@ fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
             .lite
             .clone();
         lite.meter = budget.meter(&step("unsent"), &caps);
-        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        assert!(
+            run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             requests("unsent", &attempts(&rt, "unsent").await),
             [("0:0".to_owned(), 1, "released".to_owned())]
@@ -1396,6 +1406,84 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
     });
 }
 
+/// The heartbeat attempt 1 at `request` last recorded in the run database
+/// under `dir`, if it has one.
+async fn seen(dir: &Path, request: &str) -> Option<i64> {
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display()))
+        .await
+        .expect("open the database");
+    let seen: Option<i64> = sqlx::query_scalar(
+        "SELECT seen_at FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = 1",
+    )
+    .bind(request)
+    .fetch_optional(&db)
+    .await
+    .expect("read the heartbeat");
+    db.close().await;
+    seen
+}
+
+#[test]
+fn a_call_whose_task_panics_stops_its_heartbeat() {
+    on_codex_runtime(async {
+        let dir = scratch("panicked");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // A command that may take two seconds beats every 200 ms.
+        let two_seconds = Budget {
+            millis: Some(2_000),
+            ..Budget::default()
+        };
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &two_seconds)],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "panicked".into(),
+                step_id: 1,
+            },
+            &plan.exec["nap"],
+        );
+        let (ticket, _) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: atomic_core::usage::WORK_MODEL.into(),
+                input_bound: None,
+                turn: false,
+                work: true,
+            })
+            .await
+            .expect("admitted");
+        // The task holding the ticket panics half a second in, before it
+        // settles.
+        let held = tokio::spawn(async move {
+            let _ticket = ticket;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            panic!("the call's task panics");
+        });
+        assert!(
+            held.await.expect_err("the task panicked").is_panic(),
+            "the task panicked"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = seen(&dir, "panicked:1:0").await;
+        assert!(before.is_some(), "it beat while it ran");
+        // Its heartbeat stopped with it: nothing more is recorded, though
+        // its reservation runs on to two seconds.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(seen(&dir, "panicked:1:0").await, before, "it beat on");
+        let attempt = &rt.ledger().attempts("panicked").await.expect("attempts")[0];
+        assert_eq!(attempt.state, "reserved", "{attempt:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 #[test]
 fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() {
     on_codex_runtime(async {
@@ -1438,7 +1526,7 @@ fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() 
         let request = ChangeRequest {
             request: "Two units at 1.25 should cost 2.50.".into(),
         };
-        let refused = run_lite_atom(&DraftTask, &request, &lite)
+        let refused = run_lite_atom(&DraftTask, &request, &lite, &Default::default())
             .await
             .expect_err("refused");
         assert!(refused.to_string().contains("has no price"), "{refused}");
@@ -1550,7 +1638,7 @@ fn a_dead_commands_reservation_is_settled_when_it_is_found() {
         // the step runs again an hour later.
         now.store(start + 20_000, Ordering::SeqCst);
         ledger
-            .heartbeat(&request, attempt)
+            .heartbeat(&request, attempt, 20_000)
             .await
             .expect("heartbeat");
         now.store(start + 3_600_000, Ordering::SeqCst);

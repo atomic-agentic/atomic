@@ -124,7 +124,7 @@ pub fn exec_backend(
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    let local = state.run_backend();
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
@@ -424,14 +424,10 @@ pub async fn open(
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
-            backend: exec.clone(),
             caches: None,
         },
-        lite: LiteRuntime {
-            backend: exec.clone(),
-            ..LiteRuntime::new(endpoint, AtomConfig::default())
-        },
-        exec,
+        lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        backend: exec,
         exec_meter: Default::default(),
         clock: None,
     });

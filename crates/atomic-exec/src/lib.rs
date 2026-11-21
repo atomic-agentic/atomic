@@ -36,6 +36,7 @@
 //! [`quiescence`] is the runner's side of a sandbox backend that suspends:
 //! whether its sandbox is safe to suspend.
 
+pub mod exchange;
 pub mod process;
 pub mod quiescence;
 pub mod runner;
@@ -335,6 +336,20 @@ pub trait ExecutionBackend: Send + Sync {
 
     /// Release `workspace`. Closing one that is closed already succeeds.
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError>;
+
+    /// The exchange of `workspace`, which this backend opened: the
+    /// directories an exec atom's command is given artifacts in and hands
+    /// files over in (see [`exchange`]), made new before the command runs.
+    /// The control plane moves those files only through it. A backend that
+    /// hands no files over gives none, the default: its commands are given
+    /// no artifacts, and an output that names a file is refused.
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        let _ = workspace;
+        Ok(None)
+    }
 }
 
 /// A connected backend, shared by everything that runs atoms, such as the
@@ -406,6 +421,13 @@ impl ExecutionBackend for Backend {
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         self.inner.close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        self.inner.exchange(workspace)
+    }
 }
 
 /// The backend on this machine, in the control plane's process: a
@@ -421,6 +443,10 @@ pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
+    /// Directories its workspaces' commands are kept out of besides its own
+    /// scratch root, such as another backend's scratch root in the same
+    /// project.
+    denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
     checked: Arc<std::sync::OnceLock<()>>,
@@ -432,6 +458,7 @@ impl std::fmt::Debug for LocalBackend {
             .field("scratch_root", &self.scratch_root)
             .field("tmp", &self.tmp)
             .field("confined", &self.confine.is_some())
+            .field("denying", &self.denying)
             .finish()
     }
 }
@@ -464,8 +491,19 @@ impl LocalBackend {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
+    }
+
+    /// The same backend, keeping its workspaces' commands out of `dirs` as
+    /// well as its own scratch root: the scratch roots of the project's other
+    /// backends, so no command of one reads another's attempts. Each is
+    /// created, if missing, when a workspace opens, so it cannot appear
+    /// undenied while a command runs.
+    pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.denying.extend(dirs);
+        self
     }
 
     /// The same backend, running every command under `confine`.
@@ -516,6 +554,7 @@ impl Default for LocalBackend {
             )),
             tmp: base.join(".tmp"),
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
     }
@@ -570,11 +609,31 @@ impl ExecutionBackend for LocalBackend {
             confine.check(&self.tmp)?;
             let _ = self.checked.set(());
         }
-        workspace::open_local(&self.scratch_root, &self.tmp, request)
+        workspace::open_local(&self.scratch_root, &self.tmp, &self.denying, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         workspace::close_local(workspace)
+    }
+
+    /// The exchange in the workspace's scratch directory, on Unix
+    /// ([`exchange::LocalExchange`]); none for a workspace with no scratch
+    /// directory, or elsewhere.
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        #[cfg(unix)]
+        if let Some(scratch) = &workspace.scratch {
+            let made =
+                exchange::LocalExchange::create(scratch).map_err(|e| ExecError::Workspace {
+                    label: workspace.label.clone(),
+                    message: format!("make its exchange in {}: {e}", scratch.display()),
+                })?;
+            return Ok(Some(Box::new(made)));
+        }
+        let _ = workspace;
+        Ok(None)
     }
 
     /// Runs `command` under this backend's confinement, if it has one, in a

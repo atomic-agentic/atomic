@@ -810,10 +810,8 @@ async fn prompt(
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a
     // backend's shared temporary directory, which their turns may be using.
-    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-        state.dir().join("scratch-debug"),
-    ))
-    .context("connect to the execution backend")?;
+    let backend = atomic_exec::Backend::connect(state.debug_backend())
+        .context("connect to the execution backend")?;
     let runtime = atomic_core::runtime::CodexRuntime {
         paths: paths.clone(),
         codex_home: state.codex_home(),
@@ -823,14 +821,13 @@ async fn prompt(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: codex::StateGuard::for_project(state)?,
-        backend,
         caches: None,
     };
     let spec = codex::TurnSpec {
         prompt: args.prompt.join(" "),
         ..codex::TurnSpec::default()
     };
-    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
+    Ok(atomic_core::runtime::run_turn(&runtime, &backend, &spec).await?)
 }
 
 /// `atomic model`.

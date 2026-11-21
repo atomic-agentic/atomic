@@ -222,13 +222,12 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
-            // Its turns run without Codex's sandbox helper, so nothing may be
-            // denied to them: see `denying_nothing`.
-            backend: atomic_core::testing::denying_nothing(Default::default()),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: atomic_core::testing::denying_nothing(Default::default()),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -318,6 +317,13 @@ impl atomic_exec::ExecutionBackend for Logging {
     }
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.local.close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
     }
 }
 
@@ -450,6 +456,12 @@ impl atomic_exec::ExecutionBackend for HoldsAtClose {
             .push((workspace.label.clone(), holds_in(&self.held)));
         self.local.close(workspace)
     }
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
+    }
 }
 
 async fn engine_built_with(
@@ -482,9 +494,7 @@ async fn engine_built_with(
         Some(backend) => {
             let mut on = (*runtimes).clone();
             // Its turns run without Codex's sandbox helper too.
-            on.codex.backend = atomic_core::testing::denying_nothing(backend.clone());
-            on.lite.backend = backend.clone();
-            on.exec = backend;
+            on.backend = atomic_core::testing::denying_nothing(backend);
             Arc::new(on)
         }
         None => runtimes,
@@ -1397,6 +1407,13 @@ impl atomic_exec::ExecutionBackend for Stating {
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         atomic_exec::LocalBackend::default().close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().exchange(workspace)
+    }
 }
 
 /// The run plans from what the backend states, not from which backend it
@@ -1509,6 +1526,13 @@ impl atomic_exec::ExecutionBackend for Busy {
     }
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.local.close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
     }
 }
 
@@ -2185,7 +2209,7 @@ fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
             assert_eq!(holds.len(), 1, "{seen:?}");
             assert!(holds[0].starts_with(patch.digest()), "{seen:?}");
         }
-        // The first step's recorded output names what it held.
+        // A recorded step output names what was held.
         let steps = rt.steps("patch-1").await.expect("steps");
         assert!(
             steps
@@ -5883,6 +5907,60 @@ fn a_run_with_no_minutes_left_parks_before_the_next_command() {
         let out: Value = rt.result("naps-3").await.expect("finishes");
         assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
         let ran = commands(&rt, "naps-3").await;
+        assert_eq!(ran.len(), 2, "each command ran once: {ran:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// The same park released in the process that parked it: the second step's
+/// body runs again after the workspace its attempt opened was taken, and its
+/// command, which the cap refused, runs once. Each command runs once.
+#[test]
+fn a_run_parked_before_its_next_command_finishes_in_the_same_process() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-park-here");
+        let project = napping_project(&dir, "");
+        let pipeline = load(
+            &project,
+            "naps.workflow.yaml",
+            &naps(true, "budget:\n  minutes: 1\n"),
+        );
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-4",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 0}),
+            },
+        )
+        .await
+        .expect("start");
+        let g = open_gate(&rt, "naps-4").await;
+        spend_all_but(&rt, "naps-4", 100).await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let park = nth_park(&rt, "naps-4", 1).await;
+        assert!(park.step.starts_with("second"), "{}", park.step);
+        assert_eq!(commands(&rt, "naps-4").await.len(), 1, "only the first ran");
+        rt.ledger()
+            .raise(
+                "run:naps-4",
+                Caps {
+                    tokens: 0,
+                    millis: 600_000,
+                    micro_usd: None,
+                },
+            )
+            .await
+            .expect("raise")
+            .expect("exists");
+        atomic_durable::release(&rt, &park).await.expect("release");
+        let out: Value = rt.result("naps-4").await.expect("finishes");
+        assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
+        let ran = commands(&rt, "naps-4").await;
         assert_eq!(ran.len(), 2, "each command ran once: {ran:?}");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await

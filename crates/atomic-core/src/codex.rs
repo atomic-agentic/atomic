@@ -125,11 +125,12 @@ pub struct TurnSpec {
     /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
     /// Directories the thread's commands may neither read nor write, apart
-    /// from those inside them it may write: the backend's scratch
-    /// directories, a `workspace-write` thread's own excepted. Absolute
-    /// paths. Codex's Linux sandbox reopens only writable directories inside
-    /// a denied one, so a `read-only` thread's own scratch directory, which
-    /// it may not write, shows to it empty.
+    /// from those inside them it may write: the scratch roots of the
+    /// project's backends, a `workspace-write` thread's own directory
+    /// excepted. Absolute paths. Codex's Linux sandbox reopens only writable
+    /// directories inside a denied one, so a `read-only` thread's own scratch
+    /// directory, which it may not write, is out of its reach too: it cannot
+    /// even list it.
     pub denied: Vec<PathBuf>,
 }
 
@@ -854,23 +855,24 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
     ))
 }
 
-/// Refuse, on Linux (`linux`), a thread whose commands must be kept out of
-/// `denied` when `paths` has no Linux sandbox helper. Codex's Linux sandbox
-/// reads a profile that denies paths only through that helper, so without
-/// one the thread could not keep its commands out of other attempts' scratch
-/// directories; atomic refuses it before the thread starts rather than run it
-/// with less denied.
+/// Refuse a thread whose commands must be kept out of `denied` when `paths`
+/// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
+/// denies paths itself. On Linux, Codex's sandbox reads a profile that
+/// denies paths only through that helper, and nowhere else has atomic seen a
+/// denial hold, so without one the thread could not be kept out of other
+/// attempts' scratch directories; atomic refuses it before the thread starts
+/// rather than run it with less denied.
 fn refuse_denied_without_helper(
     paths: &CodexPaths,
     denied: &[PathBuf],
-    linux: bool,
+    macos: bool,
 ) -> anyhow::Result<()> {
-    if linux && !denied.is_empty() && paths.linux_sandbox().is_none() {
+    if !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {
         let denied: Vec<_> = denied.iter().map(|d| d.display().to_string()).collect();
         bail!(
-            "this turn's commands must be kept out of {}, and on Linux only Codex's \
-             sandbox helper can do that, which this process does not have; run atomic \
-             itself, which provides one",
+            "this turn's commands must be kept out of {}, and apart from macOS only \
+             Codex's Linux sandbox helper can do that, which this process does not have; \
+             run atomic itself, which provides one",
             denied.join(", ")
         );
     }
@@ -1866,7 +1868,7 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
-    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "linux"))?;
+    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -3395,27 +3397,27 @@ mod tests {
     }
 
     /// Only Codex's Linux sandbox helper keeps a thread's commands out of
-    /// the paths its profile denies, so on Linux a thread with something to
-    /// deny and no helper is refused before any model call, and is never
-    /// run with less denied.
+    /// the paths its profile denies, apart from macOS's own sandbox, so
+    /// anywhere but macOS a thread with something to deny and no helper is
+    /// refused before any model call, and is never run with less denied.
     #[test]
-    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_on_linux() {
+    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_except_on_macos() {
         let denied = [PathBuf::from("/scratch/root")];
         let helperless = CodexPaths::without_helpers();
-        let why = refuse_denied_without_helper(&helperless, &denied, true)
+        let why = refuse_denied_without_helper(&helperless, &denied, false)
             .expect_err("no helper to deny with")
             .to_string();
         assert!(
             why.contains("/scratch/root") && why.contains("sandbox helper"),
             "{why}"
         );
-        refuse_denied_without_helper(&helperless, &[], true).expect("nothing to deny");
-        refuse_denied_without_helper(&helperless, &denied, false).expect("not on Linux");
+        refuse_denied_without_helper(&helperless, &[], false).expect("nothing to deny");
+        refuse_denied_without_helper(&helperless, &denied, true).expect("macOS denies itself");
         let with =
             CodexPaths::with_helpers("/bin/atomic".into(), "/bin/codex-linux-sandbox".into());
-        refuse_denied_without_helper(&with, &denied, true).expect("a helper denies");
+        refuse_denied_without_helper(&with, &denied, false).expect("a helper denies");
 
-        if !cfg!(target_os = "linux") {
+        if cfg!(target_os = "macos") {
             return;
         }
         on_codex_runtime(async move {
@@ -4069,6 +4071,7 @@ mod tests {
                     admitted: std::time::Instant::now(),
                     limit: self.limit,
                     bounded_by: None,
+                    release: crate::usage::Release::default(),
                 })
             })
         }
@@ -4123,6 +4126,7 @@ mod tests {
             admitted: std::time::Instant::now(),
             limit: Limit::default(),
             bounded_by: None,
+            release: crate::usage::Release::default(),
         }
     }
 
