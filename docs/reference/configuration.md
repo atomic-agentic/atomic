@@ -220,7 +220,9 @@ atom's turn is refused before anything is sent, naming the variable. Add the
 host to `NO_PROXY` (for example `NO_PROXY=127.0.0.1`) or use an `https`
 endpoint. The entry must name the host as the URL does: `localhost` does not
 exempt `127.0.0.1`, `*` exempts names but not addresses, and `NO_PROXY`, when it
-is set at all, hides `no_proxy`. Redirects stay open: Codex's client follows
+is set at all, hides `no_proxy`. This machine is recognised as for a lite atom:
+a host name that only resolves here is not refused and goes through the proxy,
+so put it in `NO_PROXY` yourself. Redirects stay open: Codex's client follows
 one, so an `https` endpoint that redirects to `http` on the same host and port
 receives the key again in cleartext. Point a Codex atom only at an endpoint you
 trust not to redirect.
