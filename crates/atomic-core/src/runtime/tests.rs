@@ -90,6 +90,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -1104,6 +1105,7 @@ fn exec_validators_follow_the_steps_clock() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1117,6 +1119,7 @@ fn exec_validators_follow_the_steps_clock() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -1210,6 +1213,33 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
 }
 
 #[test]
+fn an_exec_atoms_declared_environment_wins_over_its_runs_caches() {
+    let (_, a, _) = exec_project(
+        "exec-env-wins",
+        TOTAL,
+        ", env: { XDG_CACHE_HOME: '/mine', REGION: 'eu' }",
+    );
+    let caches = crate::worktree::Caches::new("/state/cache/run-1-ab".into()).for_exec("total");
+    let (env, writable) = exec_environment(&a, Some(&caches));
+    assert_eq!(env["XDG_CACHE_HOME"], "/mine", "declared wins");
+    assert_eq!(env["REGION"], "eu");
+    for (name, value) in caches.env() {
+        if name != "XDG_CACHE_HOME" {
+            assert_eq!(env[&name], value, "{name}");
+        }
+    }
+    assert_eq!(writable, [std::path::Path::new("/state/cache/run-1-ab")]);
+    // With no caches, as in an eval, only what the atom declares.
+    let (env, writable) = exec_environment(&a, None);
+    assert_eq!(
+        env.keys().collect::<Vec<_>>(),
+        ["REGION", "XDG_CACHE_HOME"],
+        "{env:?}"
+    );
+    assert!(writable.is_empty());
+}
+
+#[test]
 fn exec_declarations_are_checked_at_load() {
     use crate::atom;
     for (config, problem) in [
@@ -1283,6 +1313,85 @@ fn exec_declarations_are_checked_at_load() {
             "kind: 'lite', effects: { external: 'read-only' }",
             "for `kind: 'exec'`",
         ),
+        // Network: only an exec atom's command, only public DNS names.
+        (
+            "kind: 'codex', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'lite', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['localhost'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['127.0.0.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['169.254.169.254'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['metadata.google.internal'] }",
+            "private network",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['*'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['unix:/var/run/docker.sock'] }",
+            "Unix socket",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['api.example.com:443'] }",
+            "no scheme, port",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: 'api.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['a.example.com'], unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: true",
+            "is `false` or",
+        ),
+        ("kind: 'codex', network: true", "is `false` or"),
+        (
+            "kind: 'lite', network: { allow: 'x.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'codex', network: { unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['0x7f.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['8.8.8.0x8'] }",
+            "an IP address",
+        ),
+        // Proxy variables are atomic's to set, in any case.
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { https_proxy: 'http://evil.example.com' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { NO_PROXY: '*' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'codex', env: { All_Proxy: 'socks5://x' }",
+            "names a proxy",
+        ),
     ] {
         let dir = scratch("exec-load");
         std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
@@ -1307,6 +1416,25 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+/// An exec atom may declare public hosts for its command, in any case and
+/// order, and they reach the command as one canonical list.
+#[test]
+fn an_exec_atom_declares_the_public_hosts_its_command_reaches() {
+    let (_, a, _) = exec_project(
+        "network-load",
+        TOTAL,
+        ", network: { allow: ['API.example.com', '*.cdn.example.net'] }",
+    );
+    assert_eq!(
+        declared_network(&a),
+        ["*.cdn.example.net", "api.example.com"]
+    );
+    let (_, none, _) = exec_project("network-none", TOTAL, ", network: false");
+    assert!(declared_network(&none).is_empty());
+    let (_, plain, _) = exec_project("network-plain", TOTAL, "");
+    assert!(declared_network(&plain).is_empty());
 }
 
 /// A lite atom with [`Classify`]'s contract.
@@ -2051,6 +2179,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
+                &crate::usage::Metering::none(),
             )
             .await;
             match want {
@@ -2145,6 +2274,7 @@ fn an_exec_output_cel_cannot_read_fails() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(
@@ -2725,6 +2855,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
                     backend,
                     None,
                     &artifacts,
+                    &crate::usage::Metering::none(),
                 )
                 .await
             });
@@ -2809,6 +2940,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
             step_id: "total".into(),
         };
         let input = json!({"cents": [1]});
+        let meter = crate::usage::Metering::none();
         let run = || {
             run_exec(
                 &a,
@@ -2818,6 +2950,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &artifacts,
+                &meter,
             )
         };
         let held = hold();
@@ -3056,6 +3189,7 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
                 backend,
                 None,
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await;
         });

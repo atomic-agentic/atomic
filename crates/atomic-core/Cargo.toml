@@ -39,6 +39,7 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 getrandom = { workspace = true }
 libc = { workspace = true }
+psl = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync"] }
@@ -48,6 +49,7 @@ codex-app-server = { workspace = true }
 codex-core-api = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
+codex-network-proxy = { workspace = true }
 deno_core = { workspace = true }
 codex-keyring-store = { workspace = true }
 codex-login = { workspace = true }

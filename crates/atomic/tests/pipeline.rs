@@ -227,6 +227,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -410,6 +411,7 @@ async fn engine_built(
             store,
             deployment: local(),
             worktrees,
+            caches: None,
             budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
@@ -2736,6 +2738,35 @@ fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     assert_eq!(read, plan);
 }
 
+/// A plan pinned before exec atoms were metered, under a layout before
+/// this one, has no exec caps. It still reads, as a plan with none: a run of
+/// that layout is not recovered by this build, which says so when asked to
+/// replay it, but its stored plan is still read back.
+#[test]
+fn a_budget_plan_pinned_before_exec_atoms_were_metered_still_reads() {
+    let dir = scratch("plan-earlier");
+    let project = project(&dir);
+    let mut pipeline = load(&project, "earlier.workflow.yaml", TRIAGE);
+    pin_budgets(
+        &mut pipeline,
+        &runtimes(&dir, "http://127.0.0.1:9/v1"),
+        &small_calls(),
+    )
+    .expect("pinned");
+    let mut plan = pipeline.budgets.expect("a plan");
+    let mut stored = serde_json::to_value(&plan).expect("encode");
+    stored
+        .as_object_mut()
+        .expect("an object")
+        .remove("exec")
+        .expect("this version pins exec caps");
+    let read: atomic_app::metering::BudgetPlan =
+        serde_json::from_value(stored).expect("an earlier plan still reads");
+    assert!(read.exec.is_empty(), "{read:?}");
+    plan.exec.clear();
+    assert_eq!(read, plan);
+}
+
 #[test]
 fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
     on_codex_runtime(async {
@@ -3716,6 +3747,195 @@ fn trust_is_checked_per_binding() {
     .expect("agent accepted");
 }
 
+/// Start `pipeline` on a fresh engine and return why it was refused, with
+/// the number of model calls made first.
+async fn refused(dir: &Path, pipeline: Pipeline, run: &str) -> (String, usize) {
+    let model = FakeModel::start(vec![
+        Reply::Text(READ.into()),
+        Reply::Text(RANK.into()),
+        Reply::Text(SUMMARY.into()),
+    ])
+    .await
+    .expect("fake model");
+    let rt = engine(dir, &model.base_url()).await;
+    let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+    rt.start(PIPELINE, run, PipelineRun { pipeline, input })
+        .await
+        .expect("start");
+    let error = rt
+        .result::<Value>(run)
+        .await
+        .expect_err("refused")
+        .to_string();
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    (error, model.calls())
+}
+
+/// The atom step `id` of `pipeline`.
+fn atom_step<'p>(pipeline: &'p mut Pipeline, id: &str) -> &'p mut atomic_app::pipeline::AtomStep {
+    pipeline
+        .steps
+        .iter_mut()
+        .find_map(|s| match s {
+            Step::Atom(step) if step.id == id => Some(step),
+            _ => None,
+        })
+        .expect("the step")
+}
+
+#[test]
+fn a_run_is_held_to_its_atoms_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-dispatch");
+        let project = project(&dir);
+        // Prepared as the loader allows, then handed to the engine with the
+        // rank step's atom trusting only team input. The rank step maps the
+        // read step's output, agent data: as a run prepared some other way
+        // would be, it is refused before the read step, or any, runs.
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline
+            .atoms
+            .get_mut("rank-note")
+            .expect("rank-note")
+            .frontmatter["trust"] = json!("team");
+        let (error, calls) = refused(&dir, pipeline, "untrusted").await;
+        assert!(
+            error.contains("step `rank`")
+                && error.contains("is agent data")
+                && error.contains("accepts team input at most"),
+            "{error}"
+        );
+        assert!(
+            error.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+            "the refusal names what to change"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+
+        // A trust a stored run's atom holds that is none of the three, a
+        // string or not, accepts nothing, and the refusal says what to set.
+        for (n, (trust, written)) in [
+            (json!("Team"), "`trust: 'Team'`"),
+            (json!(1), "`trust: 1`"),
+            (json!(["team"]), "`trust: [\"team\"]`"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+            pipeline
+                .atoms
+                .get_mut("rank-note")
+                .expect("rank-note")
+                .frontmatter["trust"] = trust;
+            let (error, calls) = refused(&dir, pipeline, &format!("unknown-trust-{n}")).await;
+            assert!(
+                error.contains(&format!("declares {written}"))
+                    && error.contains("accepts no input"),
+                "{error}"
+            );
+            assert!(
+                error.contains("set atom `rank-note`'s `trust` to external, agent or team"),
+                "the refusal says to set a known trust"
+            );
+            assert_eq!(calls, 0);
+        }
+    });
+}
+
+#[test]
+fn a_bindings_origin_at_run_time_is_the_lower_of_what_was_recorded_and_what_it_reads() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-origins");
+        let project = project(&dir);
+        trusting_atom(&project, "team");
+        // Literals: team data, so the loader takes them.
+        let literals =
+            policy_workflow("'Be brief.'", "").replace("note: input.text", "note: \"'A note.'\"");
+        let prepared = load(&project, "policy.workflow.yaml", &literals);
+        // A field the run recorded no origin for counts as external.
+        let mut pipeline = prepared.clone();
+        atom_step(&mut pipeline, "apply").origins.clear();
+        let (error, calls) = refused(&dir, pipeline, "no-origins").await;
+        assert!(
+            error.contains("step `apply`") && error.contains("is external data"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("`origins` entry"),
+            "the advice names no origins entry the run did not record"
+        );
+        assert_eq!(calls, 0);
+        // A recorded origin above what the binding reads is not believed:
+        // the run's input, marked team, is still external.
+        let mut pipeline = prepared.clone();
+        let step = atom_step(&mut pipeline, "apply");
+        step.with.insert("note".into(), "input.text".into());
+        step.origins.insert("note".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "raised-origin").await;
+        assert!(error.contains("`input.text` is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // A recorded origin below what the binding reads is kept, and the
+        // refusal says the `origins` entry lowered it.
+        let mut pipeline = prepared;
+        atom_step(&mut pipeline, "apply")
+            .origins
+            .insert("policy".into(), "agent".into());
+        let (error, _) = refused(&dir, pipeline, "lowered-origin").await;
+        assert!(
+            error.contains("remove the `origins` entry that marks it agent"),
+            "the refusal names the lowering entry"
+        );
+    });
+}
+
+#[test]
+fn a_refused_binding_says_what_can_take_its_place() {
+    let dir = scratch("trust-advice");
+    let project = project(&dir);
+    trusting_atom(&project, "team");
+    let refusal = |text: &str| {
+        let file = project.join("workflows/advice.workflow.yaml");
+        std::fs::write(&file, text).expect("workflow");
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        let error = workflow::load(&file, &atoms, &mut registry).expect_err("refused");
+        (error.message, error.action.unwrap_or_default())
+    };
+    // A model step's output, agent data, for a team atom, its other field a
+    // literal: what yields team data takes its place.
+    let (message, agent) = refusal(
+        &policy_workflow("steps.read.output.title", "")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(message.contains("is agent data"), "{message}");
+    assert!(
+        agent.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+        "the advice names the team sources"
+    );
+    assert!(
+        !agent.contains("`origins` entry"),
+        "no origins entry to remove"
+    );
+    // A literal that `origins` lowered: the advice names that entry.
+    let (_, lowered) = refusal(
+        &policy_workflow("'Be brief.'", "    origins: { policy: agent }\n")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(
+        lowered.contains("remove the `origins` entry that marks it agent"),
+        "the advice names the lowering entry"
+    );
+}
+
 /// The shape of a serialized value: each object's keys, with the shape of
 /// what each holds, an array's first element, and a scalar's type. The
 /// values under `opaque` keys are data whose keys are not layout, such as a
@@ -4595,6 +4815,126 @@ fn the_candidate_reaches_the_reviewer_as_external_data() {
 }
 
 #[test]
+fn a_review_is_held_to_its_reviewers_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("review-trust-dispatch");
+        let project = project(&dir);
+        let prepared = reviewed(&project, 1);
+        // A reviewer that accepts only agent input, handed the candidate,
+        // external data, in a run prepared some other way.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("agent");
+        let (error, calls) = refused(&dir, pipeline, "reviewer-trust").await;
+        assert!(
+            error.contains("step `read`: `review.with.")
+                && error.contains("is external data")
+                && error.contains("accepts agent input at most"),
+            "{error}"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+        // A recorded review origin above what the binding reads is not
+        // believed.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("team");
+        let review = atom_step(&mut pipeline, "read")
+            .review
+            .as_mut()
+            .expect("a review");
+        review.origins.insert("text".into(), "team".into());
+        review.origins.insert("title".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-raised").await;
+        assert!(error.contains("is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // An author that accepts agent input, its own binding a literal, is
+        // not handed the findings on external data in a repair round.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("read-note")
+            .expect("read-note")
+            .frontmatter["trust"] = json!("agent");
+        let step = atom_step(&mut pipeline, "read");
+        step.with.insert("text".into(), "'Exports crash.'".into());
+        step.origins.insert("text".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-findings").await;
+        assert!(
+            error.contains("`review.rounds`") && error.contains("a repair round hands `read-note`"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+        // A reviewer whose trust is none of the three accepts nothing.
+        let mut pipeline = prepared;
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!(true);
+        let (error, calls) = refused(&dir, pipeline, "reviewer-unknown").await;
+        assert!(
+            error.contains("declares `trust: true`")
+                && error.contains("set atom `check-title`'s `trust` to external, agent or team"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+    });
+}
+
+#[test]
+fn a_review_whose_atoms_trust_is_unknown_fails_to_load() {
+    let dir = scratch("review-trust-unknown");
+    let project = project(&dir);
+    reviewed(&project, 1);
+    // Each atom as loaded, then the one named given a `trust` the load of
+    // an atom file refuses, as one built some other way might hold.
+    let load_with = |name: &str| {
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        atoms.get_mut(name).expect("the atom").frontmatter["trust"] = json!(1);
+        workflow::load(
+            &project.join("workflows/reviewed.workflow.yaml"),
+            &atoms,
+            &mut registry,
+        )
+        .expect_err("refused")
+    };
+    let error = load_with("check-title");
+    assert!(
+        error.path.ends_with("/review/reviewer")
+            && error
+                .message
+                .contains("atom `check-title` declares `trust: 1`")
+            && error.message.contains("accepts no input"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.action.as_deref(),
+        Some("set atom `check-title`'s `trust` to external, agent or team")
+    );
+    let error = load_with("read-note");
+    assert!(
+        error
+            .message
+            .contains("atom `read-note` declares `trust: 1`"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_replay_of_a_reviewed_run_reviews_nothing_again() {
     on_codex_runtime(async {
         let dir = scratch("review-replay");
@@ -5037,6 +5377,363 @@ fn a_worktree_steps_reviewer_sees_its_commit_and_the_gate_shows_the_one_publishe
             plain_git(&project, &["rev-parse", &format!("{commit}^")]),
             base
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A project with `nap`, an exec atom whose command sleeps for the seconds
+/// its input names, with `budget` its own budget block (or none).
+fn napping_project(dir: &Path, budget: &str) -> PathBuf {
+    let project = project(dir);
+    std::fs::create_dir_all(project.join("tools")).expect("tools");
+    std::fs::write(
+        project.join("tools/nap.py"),
+        "import json, sys, time\nseconds = json.load(sys.stdin)['seconds']\ntime.sleep(seconds)\njson.dump({'slept': seconds}, sys.stdout)\n",
+    )
+    .expect("script");
+    let atoms = project.join("atoms");
+    std::fs::write(
+        atoms.join("nap.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/nap';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Nap.', kind: 'exec', exec: {{ command: ['python3', 'tools/nap.py'] }}{budget} }};\n---\n"
+        ),
+    )
+    .expect("atom");
+    for (role, schema) in [
+        ("input", object(json!({"seconds": {"type": "number"}}))),
+        ("output", object(json!({"slept": {"type": "number"}}))),
+    ] {
+        std::fs::write(
+            atoms.join(format!("nap.{role}.schema.json")),
+            schema.to_string(),
+        )
+        .expect("schema");
+    }
+    project
+}
+
+/// Two naps, with a gate between them when `gated`, under `budget`.
+fn naps(gated: bool, budget: &str) -> String {
+    let gate = if gated {
+        "  check:\n    after: [first]\n    gate:\n      title: \"'Check the nap'\"\n      show: steps.first.output\n      timeout: 24h\n"
+    } else {
+        ""
+    };
+    format!(
+        "atomic: 1\nname: naps\n\
+         input: {{ $ref: ../atoms/nap.input.schema.json }}\n\
+         output: {{ $ref: ../atoms/nap.output.schema.json }}\n\
+         steps:\n\
+         \x20 first:\n    atom: nap\n    with: {{ seconds: input.seconds }}\n\
+         {gate}\
+         \x20 second:\n    after: [{}]\n    atom: nap\n    with: {{ seconds: input.seconds }}\n\
+         returns: steps.second.output\n{budget}",
+        if gated { "check" } else { "first" }
+    )
+}
+
+/// The active time charged to run `run`'s allowance, in milliseconds.
+async fn charged_millis(rt: &Durare, run: &str) -> i64 {
+    rt.ledger()
+        .allowance(&format!("run:{run}"))
+        .await
+        .expect("ledger")
+        .expect("the run's allowance")
+        .charged
+        .millis
+}
+
+/// Charge run `run`'s allowance all but `left` milliseconds of its active
+/// time through the ledger, as earlier work would have, so a test need not
+/// race a command's start to use it up.
+async fn spend_all_but(rt: &Durare, run: &str, left: i64) {
+    use atomic_durable::usage::{Admission, Charge, Request, Scope, Settlement};
+    let ledger = rt.ledger();
+    let allowance = ledger
+        .allowance(&format!("run:{run}"))
+        .await
+        .expect("ledger")
+        .expect("the run's allowance");
+    let spend = allowance.caps.millis - allowance.charged.millis - left;
+    assert!(spend > 0, "{allowance:?}");
+    let charge = Charge {
+        tokens: 0,
+        millis: spend,
+        micro_usd: 0,
+    };
+    let admitted = ledger
+        .admit(Request {
+            id: format!("{run}:seeded:0"),
+            run: run.to_owned(),
+            model: "seeded".into(),
+            chain: vec![Scope::run(run, allowance.caps)],
+            reserve: charge,
+            maximum: charge,
+            turn: false,
+        })
+        .await
+        .expect("admit");
+    let Admission::Admitted {
+        request, attempt, ..
+    } = admitted
+    else {
+        panic!("refused: {admitted:?}");
+    };
+    ledger
+        .settle(
+            &request,
+            attempt,
+            Settlement::Reported {
+                input_tokens: 0,
+                output_tokens: 0,
+                millis: spend,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+}
+
+/// The work attempts the ledger holds for run `run`: one for each command
+/// admitted, with its state.
+async fn commands(rt: &Durare, run: &str) -> Vec<(String, String)> {
+    rt.ledger()
+        .attempts(run)
+        .await
+        .expect("attempts")
+        .into_iter()
+        .filter(|a| a.model == atomic_core::usage::WORK_MODEL)
+        .map(|a| (a.request, a.state))
+        .collect()
+}
+
+/// An exec atom's command is held to its minutes cap: cut off when its
+/// step's active time runs out, and charged the time it ran. With effects
+/// that may not repeat, the step fails saying so; declared idempotent, the
+/// run parks.
+#[test]
+fn an_exec_atoms_command_is_cut_off_at_its_minutes_cap() {
+    on_codex_runtime(async {
+        for (tag, effects) in [
+            ("plain", ""),
+            ("idempotent", ", effects: { external: 'idempotent' }"),
+        ] {
+            let dir = scratch(&format!("exec-minutes-{tag}"));
+            // Three seconds of active time for the atom.
+            let project = napping_project(&dir, &format!("{effects}, budget: {{ minutes: 0.05 }}"));
+            let pipeline = load(&project, "naps.workflow.yaml", &naps(false, ""));
+            let model = FakeModel::start(Vec::new()).await.expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            let run = format!("naps-{tag}");
+            let began = std::time::Instant::now();
+            rt.start(
+                PIPELINE,
+                &run,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"seconds": 20}),
+                },
+            )
+            .await
+            .expect("start");
+            let why = if effects.is_empty() {
+                let error = rt
+                    .result::<Value>(&run)
+                    .await
+                    .expect_err("the nap was cut off");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("whether its effects happened is unknown"),
+                    "{error}"
+                );
+                error.to_string()
+            } else {
+                nth_park(&rt, &run, 1).await.reason
+            };
+            assert!(why.contains("time limit of"), "{why}");
+            assert!(why.contains("allowance"), "{why}");
+            assert!(
+                began.elapsed() < std::time::Duration::from_secs(15),
+                "the command ran past its cap: {:?}",
+                began.elapsed()
+            );
+            // Settled at the time it ran, not left reserved.
+            let ran = commands(&rt, &run).await;
+            assert_eq!(ran.len(), 1, "{ran:?}");
+            assert_eq!(ran[0].1, "settled", "{ran:?}");
+            let charged = charged_millis(&rt, &run).await;
+            assert!(
+                (2_500..=6_000).contains(&charged),
+                "charged {charged} ms for a command cut off at 3 s"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+/// Commands' active time counts toward the run's minutes, and time waiting
+/// at a gate does not: two one-second naps fit under twelve seconds however
+/// long the gate between them waits.
+#[test]
+fn exec_time_counts_toward_the_runs_minutes_and_gate_waits_do_not() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-gate-minutes");
+        let project = napping_project(&dir, "");
+        let pipeline = load(
+            &project,
+            "naps.workflow.yaml",
+            &naps(true, "budget:\n  minutes: 0.2\n"),
+        );
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-2",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 1}),
+            },
+        )
+        .await
+        .expect("start");
+        let g = open_gate(&rt, "naps-2").await;
+        let after_first = charged_millis(&rt, "naps-2").await;
+        assert!(
+            (900..=6_000).contains(&after_first),
+            "the first nap charged {after_first} ms"
+        );
+        // Longer at the gate than the whole cap.
+        tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let out: Value = rt.result("naps-2").await.expect("finishes");
+        assert_eq!(out["slept"].as_f64(), Some(1.0), "{out}");
+        let total = charged_millis(&rt, "naps-2").await;
+        assert!(
+            (1_800..=12_000).contains(&total),
+            "charged {total} ms for two one-second naps and a thirteen-second gate"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// With less active time left than a command is worth starting with, the
+/// next exec step parks the run before its command runs. In a new process,
+/// raised and released, the command runs once: the park was no interrupted
+/// command.
+#[test]
+fn a_run_with_no_minutes_left_parks_before_the_next_command() {
+    let dir = scratch("exec-park");
+    let project = napping_project(&dir, "");
+    // The first process parks the run at its second step. Its runtime, and
+    // every task on it, ends with it.
+    let parked = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (dir, project, parked) = (dir.clone(), project.clone(), parked.clone());
+        on_codex_runtime(async move {
+            let pipeline = load(
+                &project,
+                "naps.workflow.yaml",
+                &naps(true, "budget:\n  minutes: 1\n"),
+            );
+            let model = FakeModel::start(Vec::new()).await.expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                "naps-3",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"seconds": 0}),
+                },
+            )
+            .await
+            .expect("start");
+            // At the gate, after the first nap: all but a tenth of a second
+            // spent.
+            let g = open_gate(&rt, "naps-3").await;
+            spend_all_but(&rt, "naps-3", 100).await;
+            decide(&rt, &g, Verdict::Approve, "fine").await;
+            let park = nth_park(&rt, "naps-3", 1).await;
+            assert!(park.reason.contains("run:naps-3"), "{}", park.reason);
+            assert!(park.step.starts_with("second"), "{}", park.step);
+            assert_eq!(commands(&rt, "naps-3").await.len(), 1, "only the first ran");
+            *parked.lock().expect("park") = Some(park);
+        });
+    }
+    let park = parked.lock().expect("park").take().expect("parked");
+    // A new process: the second step's attempt replays as one an earlier
+    // execution recorded, and its command never started.
+    on_codex_runtime(async move {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        assert_eq!(rt.recover().await.expect("recover"), 1, "the parked run");
+        rt.ledger()
+            .raise(
+                "run:naps-3",
+                Caps {
+                    tokens: 0,
+                    millis: 600_000,
+                    micro_usd: None,
+                },
+            )
+            .await
+            .expect("raise")
+            .expect("exists");
+        atomic_durable::release(&rt, &park).await.expect("release");
+        let out: Value = rt.result("naps-3").await.expect("finishes");
+        assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
+        let ran = commands(&rt, "naps-3").await;
+        assert_eq!(ran.len(), 2, "each command ran once: {ran:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A plan pinned in the run's input with no caps for an exec atom the run
+/// has is refused before anything runs: no command runs unmetered.
+#[test]
+fn a_pinned_plan_without_an_exec_atoms_caps_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-pinned-uncapped");
+        let project = napping_project(&dir, "");
+        let mut pipeline = load(&project, "naps.workflow.yaml", &naps(false, ""));
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        pin_budgets(
+            &mut pipeline,
+            &runtimes(&dir, &model.base_url()),
+            &small_calls(),
+        )
+        .expect("pinned");
+        pipeline.budgets.as_mut().expect("a plan").exec.clear();
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "uncapped",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 0}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt.result::<Value>("uncapped").await.expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("runs a command, and the plan has no caps"),
+            "{error}"
+        );
+        assert!(commands(&rt, "uncapped").await.is_empty(), "a command ran");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

@@ -59,17 +59,20 @@ beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
 accepted commits keep their refs. A run that fails keeps its worktrees and
 their refs, so it can be inspected and resumed.
 
-No build cache an atom writes outlives its run. A worktree step's commands
-get build caches of the run's own, which they may write and which are
-removed when the run ends, whether it finishes or fails. A run stopped to
-be resumed, parked, or taken over by another process keeps them; one
-resumed after they went builds cold:
+No build cache an atom writes outlives its run. A worktree step's commands,
+and an exec step's command, get build caches of the run's own, which they may
+write and which are removed when the run ends, whether it finishes or fails.
+A run stopped to be resumed, parked, or taken over by another process keeps
+them; one resumed after they went builds cold:
 `XDG_CACHE_HOME`, npm's, pip's and Go's caches
 (`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
-directory in the state directory, shared by the run's worktree steps.
-`CARGO_TARGET_DIR` is each worktree's own, so no worktree runs what another
-built. Their `HOME` is the attempt's own, empty, directory, which they may
-write, and `CARGO_HOME` is `.cargo` inside it, never shared and never yours.
+directory in the state directory, shared by the run's worktree and exec steps,
+repair rounds included. No other run's command may write it, though one can
+still read it by its path, so keep nothing secret there.
+`CARGO_TARGET_DIR` is each worktree's own, and each exec step's, so no step
+runs what another built. A worktree step's `HOME` is the attempt's own, empty,
+directory, which its commands may write, and `CARGO_HOME` is `.cargo` inside
+it, never shared and never yours.
 `RUSTUP_HOME` points at the toolchains installed for you (your `RUSTUP_HOME`,
 or `~/.rustup`), which the commands may only read: a step does not start if
 it is inside, or holds, a directory the turn may write. A read-only step finds

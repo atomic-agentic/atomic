@@ -133,6 +133,27 @@ fn a_3_0_and_a_3_1_spec_of_one_api_give_the_same_tools() {
 }
 
 #[test]
+fn unquoted_status_codes_import_the_same_as_quoted_ones() {
+    // Specs commonly write the responses map with the status codes unquoted.
+    let unquoted = V31.replace("\"200\":", "200:").replace("\"201\":", "201:");
+    assert_ne!(unquoted, V31, "the fixture holds no status code to unquote");
+    let quoted = operations(&yaml(V31)).expect("quoted codes");
+    let same = operations(&yaml(&unquoted)).expect("unquoted codes");
+    assert_eq!(same, quoted);
+    // The code is still the string a caller looks a status up by.
+    assert_eq!(
+        same[0]
+            .responses
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["200"]
+    );
+    assert_eq!(same[0].response(200).map(|(k, _)| k), Some("200"));
+    assert_eq!(same[1].response(201).map(|(k, _)| k), Some("201"));
+}
+
+#[test]
 fn an_operation_becomes_one_input_object_with_its_parameters_and_body() {
     let ops = operations(&yaml(V30)).expect("spec");
     let forecast = &ops[0];

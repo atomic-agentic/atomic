@@ -108,9 +108,13 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
         _ => None,
     };
     let calls = rt.ledger().attempts(id).await?;
-    // Every call that reported usage: settled, known in part, or a turn
-    // still running, or whose process died, by what it last recorded.
-    let settled: Vec<_> = calls.iter().filter(|a| a.usage.is_some()).collect();
+    // Every model call that reported usage: settled, known in part, or a
+    // turn still running, or whose process died, by what it last recorded.
+    // An exec command's time is metered too, as work, but it is no call.
+    let settled: Vec<_> = calls
+        .iter()
+        .filter(|a| a.usage.is_some() && a.model != atomic_core::usage::WORK_MODEL)
+        .collect();
     let usage = json!({
         "calls": settled.len(),
         "input_tokens": settled.iter().filter_map(|a| a.usage).map(|u| u.0).sum::<i64>(),

@@ -14,6 +14,7 @@ fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {
         output_limit: 1024,
         writable: Vec::new(),
         read_only: Vec::new(),
+        network: Vec::new(),
     }
 }
 
