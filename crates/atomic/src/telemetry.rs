@@ -23,8 +23,9 @@
 //!
 //! A step or run that fails ends its span with the failure's class and a short
 //! reason, not the failure whole: what a model call that failed in that step
-//! said of its own cause (a provider's status and the type of error it named,
-//! none of its body), or, when nothing so near a model call failed, the
+//! said of its own cause (for a lite atom, a provider's status and the type of
+//! error it named, none of its body; for a Codex atom, its redacted and bounded
+//! error line, which can quote the provider), or, when nothing so near a model call failed, the
 //! failure's message cut short (see [`mark_failed`]). A step notes on a handle
 //! of its own, which the run takes up only when that step failed. The whole
 //! failure stays in the run's stored error, where a person reads it.
@@ -113,9 +114,11 @@ fn error_type(e: &DurableError) -> Option<&'static str> {
 /// Mark `span`, which `why` speaks for, failed with `e`: ERROR status with why
 /// it failed and its class (redacted on export).
 ///
-/// What the span says of why is what the calls it covers noted — for a
-/// provider's answer, its status and the type of error it named, none of the
-/// provider's own text (see [`atomic_core::usage::Why`]) — or, when nothing
+/// What the span says of why is what the calls it covers noted — for a lite
+/// atom's call the provider answered with an error status, that status and the
+/// type of error it named, none of the provider's own text; for a Codex atom,
+/// its redacted and bounded error line, which can quote the provider (see
+/// [`atomic_core::usage::Why`]) — or, when nothing
 /// noted anything, `e` itself, redacted and cut to
 /// [`atomic_core::usage::MAX_SPAN_ERROR`] characters, which is how a model
 /// call's own span cuts it. A span never carries the whole failure: that
@@ -178,8 +181,8 @@ where
 /// Run `future` as one step of the run `run_why` notes for, inside the step's
 /// `span`, which `why` speaks for: `why` is what the step's model calls note
 /// on, its span says the same, and when the step fails the run's spans say it
-/// too (see [`mark_failed`] and [`atomic_core::usage::Why`]). A step that is
-/// retried, or whose failure the run goes on past, leaves nothing on them.
+/// too (see [`mark_failed`] and [`atomic_core::usage::Why`]). A step that
+/// succeeds or parks leaves nothing on them.
 pub fn traced_step<F, T>(
     span: tracing::Span,
     why: atomic_core::usage::Why,

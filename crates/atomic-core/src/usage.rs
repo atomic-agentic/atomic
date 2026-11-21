@@ -411,8 +411,7 @@ impl Why {
 
     /// Note on this what one of its steps noted on a handle of its own, so
     /// that the run's span says what that step's said. Call it when that step
-    /// itself failed: a step that was retried, or whose failure the run went
-    /// on past, is then left to say nothing.
+    /// itself failed; a step that succeeded or parked is left to say nothing.
     pub fn note_step(&self, step: &Why) {
         if let Some(message) = step.noted() {
             self.note(message);

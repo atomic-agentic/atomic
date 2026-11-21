@@ -64,8 +64,8 @@ and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a model call
 `atomic.model_call` or `atomic.meter`). No span carries the whole failure: what
 one says of it is redacted and at most 200 characters, with a `…` on one that
 was cut. A model call says it in `error.message`. When the provider answered
-with an error status, `error.message` holds only that status and the type of
-error the provider named, such as `401 Unauthorized: invalid_request_error`,
+a lite atom's call with an error status, `error.message` holds only that
+status and the type of error the provider named, such as `401 Unauthorized: invalid_request_error`,
 and `http.response.status_code` holds the code. A type that does not read as
 one, such as `BadRequestError`, `DeploymentNotFound` or `"429"`, gives the
 status alone. Any other failure is what failed and its innermost cause, which
@@ -77,9 +77,9 @@ its run — `401 Unauthorized: invalid_request_error` for a provider's answer,
 and otherwise the same bounded line the call's own span carries, which can
 quote the provider as the call's does. A step that failed nowhere near a model
 call — an output that misfits its schema, a command that stopped — says its own
-error, cut to the same length. Each step keeps a note of its own, so a call
-that failed in a step whose output was taken anyway labels neither a later step
-nor its run. Nothing a step noted crosses a restart: a run that resumes and
+error, cut to the same length. Each step keeps a note of its own, which its
+run takes up only when that step fails, so a step that parked and ran again
+starts with a fresh one. Nothing a step noted crosses a restart: a run that resumes and
 then fails on a failure its engine had recorded has nothing noted near a model
 call, so its span says that failure, cut to the same length.
 The run's stored error keeps the whole, redacted, which is where a person reads
