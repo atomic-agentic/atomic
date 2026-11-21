@@ -2027,6 +2027,16 @@ fn small_calls() -> BudgetSettings {
     s
 }
 
+/// The caps of the person who runs atomic, as their own configuration hands
+/// them to a run through `BudgetSettings::ceilings`: one on the run and one on
+/// an atom, and nothing on the most one call may use.
+fn their_caps() -> BudgetSettings {
+    let mut budgets = small_calls();
+    budgets.ceilings.workflow.tokens = Some(20_000);
+    budgets.ceilings.atom.tokens = Some(6_000);
+    budgets
+}
+
 /// A git worktree somewhere under `root`.
 fn find_worktree(root: &Path) -> Option<PathBuf> {
     let mut queue = vec![(root.to_owned(), 0)];
@@ -2711,6 +2721,164 @@ fn an_atom_that_calls_another_model_than_its_budget_was_resolved_for_fails() {
             "{failed:?}"
         );
         assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// Give one of the project's atoms a `budget` block of its own.
+fn atom_asks(project: &Path, name: &str, tokens: u64) {
+    let file = project.join(format!("atoms/{name}.atom.astro"));
+    let text = std::fs::read_to_string(&file).expect("atom");
+    std::fs::write(
+        &file,
+        text.replace(
+            &format!("description: '{name}'"),
+            &format!("description: '{name}', budget: {{ tokens: {tokens} }}"),
+        ),
+    )
+    .expect("atom");
+}
+
+#[test]
+fn a_run_holds_a_workflows_and_an_atoms_own_budget_block_to_their_own_caps() {
+    on_codex_runtime(async {
+        let dir = scratch("person-ceilings");
+        let project = project(&dir);
+        // One atom asks for far more than they allow, and one for less.
+        atom_asks(&project, "read-note", 100_000);
+        atom_asks(&project, "rank-note", 3_000);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let rt = engine_with(&dir, &url, their_caps()).await;
+        let pipeline = load(
+            &project,
+            "held.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 400000\n"),
+        );
+        rt.start(
+            PIPELINE,
+            "held",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            },
+        )
+        .await
+        .expect("start");
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("held"),
+        )
+        .await
+        .expect("the run ended");
+        assert!(
+            finished.is_ok(),
+            "held to their caps, the run finishes: {finished:?}"
+        );
+        assert_eq!(model.calls(), 3);
+
+        // The caps the run recorded for itself and for each atom are the
+        // smaller of what was written and what they allowed.
+        let pin = rt
+            .steps("held")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output)
+            .expect("a pin step");
+        let plan = serde_json::from_value::<Pinned>(pin)
+            .expect("pinned")
+            .budgets;
+        assert_eq!(plan.run.tokens, 20_000, "the workflow's 400000 is held");
+        assert_eq!(
+            plan.atoms["read-note"].tokens, 6_000,
+            "the atom's own 100000 is held"
+        );
+        assert_eq!(
+            plan.atoms["rank-note"].tokens, 3_000,
+            "a block under their cap tightens it, as any project's may"
+        );
+        assert_eq!(
+            plan.atoms["summarize-note"].tokens, 6_000,
+            "an atom writing nothing is held too"
+        );
+        // They are recorded with the plan, so a resumed run keeps them and a
+        // plan changed elsewhere is held to them.
+        assert_eq!(plan.ceilings.workflow.tokens, Some(20_000));
+        assert_eq!(plan.ceilings.atom.tokens, Some(6_000));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_budget_plan_above_the_caps_it_was_resolved_under_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-ceilinged");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let budgets = their_caps();
+        let rt = engine_with(&dir, &url, budgets.clone()).await;
+        let pinned = || {
+            let mut pipeline = load(&project, "ceilinged.workflow.yaml", TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), &budgets).expect("pinned");
+            pipeline
+        };
+        // A plan recorded elsewhere, or changed since, is held to the ceilings
+        // it says it was resolved under, at every level.
+        let mut over_run = pinned();
+        if let Some(plan) = over_run.budgets.as_mut() {
+            plan.run.tokens = 40_000_000;
+        }
+        let mut over_atom = pinned();
+        if let Some(plan) = over_atom.budgets.as_mut() {
+            plan.atoms.get_mut("read-note").expect("an atom").tokens = 60_000;
+        }
+        for (run, pipeline, says) in [
+            (
+                "over-run",
+                over_run,
+                "the run: its tokens cap (40000000) is above the cap of 20000 tokens",
+            ),
+            (
+                "over-atom",
+                over_atom,
+                "atom read-note: its tokens cap (60000) is above the cap of 6000 tokens",
+            ),
+        ] {
+            rt.start(
+                PIPELINE,
+                run,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
+            )
+            .await
+            .expect("start");
+            let failed =
+                tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(run))
+                    .await
+                    .expect("the run ended");
+            assert!(
+                matches!(&failed, Err(atomic_durable::DurableError::Failed(m)) if m.contains(says)),
+                "{run}: {failed:?}"
+            );
+        }
+        assert_eq!(model.calls(), 0, "both plans were refused before any call");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

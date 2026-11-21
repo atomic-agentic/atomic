@@ -22,12 +22,13 @@
 //! belongs to the application, is never read.
 
 use crate::engine::{EngineArgs, RunnerKind};
-use atomic_core::budget::BudgetSettings;
+use atomic_core::budget::{BudgetSettings, CallCaps, Caps, Ceilings};
 use atomic_core::codex::ModelEndpoint;
 use atomic_core::config::{self, ConfigError, Layers, Source};
 use atomic_core::signin::SignIn;
+use atomic_schema::yaml;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -443,6 +444,11 @@ pub fn resolve(
         );
         notes.push(why.clone());
     }
+    // The person's own caps bind every layer above their file, and their
+    // prices hold over a project's: a project can only tighten what they
+    // allowed. What bound is said, so a number that is not the highest
+    // layer's is never shown without its reason.
+    notes.extend(person_budget(&mut settings, user.as_deref(), &mut sources)?);
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     let unset = |sources: &BTreeMap<String, Source>, path: &str| {
         matches!(sources.get(path), None | Some(Source::Default))
@@ -720,6 +726,380 @@ fn refuse_from_project(
         )));
     }
     Ok(withheld)
+}
+
+/// The `budget` groups the person's own configuration can cap, and the only
+/// ones it can.
+const GROUPS: [&str; 3] = ["atom", "workflow", "call"];
+
+/// Where in a parsed document each dotted setting path sits, so a setting
+/// taken from it can be named with the line it is on. A mapping is recorded
+/// too, so a path the loader has no line for falls back to the section above
+/// it instead of to no line at all.
+fn lines_of(doc: &yaml::Document) -> BTreeMap<String, usize> {
+    fn walk(
+        doc: &yaml::Document,
+        value: &Value,
+        pointer: &str,
+        dotted: &str,
+        out: &mut BTreeMap<String, usize>,
+    ) {
+        out.insert(
+            dotted.to_owned(),
+            doc.position(pointer).map_or(1, |p| p.line),
+        );
+        if let Value::Object(map) = value {
+            for (key, child) in map {
+                // The loader records positions by JSON Pointer, whose tokens
+                // escape `~` and `/`.
+                let token = key.replace('~', "~0").replace('/', "~1");
+                let child_dotted = if dotted.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{dotted}.{key}")
+                };
+                walk(
+                    doc,
+                    child,
+                    &format!("{pointer}/{token}"),
+                    &child_dotted,
+                    out,
+                );
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(doc, &doc.value, "", "", &mut out);
+    out
+}
+
+/// The line `dotted` is on, or, when nothing records one for it, the line of
+/// the deepest part of it that has one.
+fn line_of(at: &BTreeMap<String, usize>, dotted: &str) -> usize {
+    let mut path = dotted;
+    loop {
+        if let Some(line) = at.get(path) {
+            return *line;
+        }
+        match path.rfind('.') {
+            Some(below) => path = &path[..below],
+            None => return 1,
+        }
+    }
+}
+
+/// The value at `dotted` in `v`, or `None` when nothing is there.
+fn at<'v>(v: &'v Value, dotted: &str) -> Option<&'v Value> {
+    dotted.split('.').try_fold(v, |v, key| v.get(key))
+}
+
+/// The value at `dotted` in `v`, as a slot to write through, or `None` when
+/// nothing is there.
+fn slot<'v>(v: &'v mut Value, dotted: &str) -> Option<&'v mut Value> {
+    let mut cur = v;
+    for key in dotted.split('.') {
+        cur = cur.as_object_mut()?.get_mut(key)?;
+    }
+    Some(cur)
+}
+
+/// The person's own configuration's `budget` section, held over the merged
+/// settings, and the remarks naming what it bound. With it, their
+/// [`Ceilings`], which travel with the settings so that a run holds an atom's
+/// or workflow's own `budget` block to them too (see
+/// [`atomic_core::budget::resolve`]).
+///
+/// [`config::resolve`] read this file already, and refused every key of it
+/// that is not a setting; the section is read again here as a whole for one
+/// reason: a ceiling needs to know what each layer set, not only what the
+/// last of them set.
+fn person_budget(
+    settings: &mut Settings,
+    user: Option<&Path>,
+    sources: &mut BTreeMap<String, Source>,
+) -> Result<Vec<String>, ConfigError> {
+    let mut budget = serde_json::to_value(&settings.budget)
+        .map_err(|e| ConfigError::Invalid(format!("the budget settings cannot be held: {e}")))?;
+    let mut ceilings = Ceilings::default();
+    let mut notes = Vec::new();
+    if let Some(user) = user {
+        match std::fs::read_to_string(user) {
+            Ok(text) => {
+                let doc = yaml::load(user, &text)?;
+                // A `budget` that is not a mapping was refused with its file
+                // and line while the layers merged, so nothing caps from it.
+                if let Some(Value::Object(written)) = doc.value.pointer("/budget") {
+                    let (held, said) =
+                        hold_budget(user, written, &lines_of(&doc), &mut budget, sources);
+                    ceilings = held;
+                    notes = said;
+                }
+            }
+            // No file of their own: nothing caps, as [`config::resolve`] read
+            // nothing from it either.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: user.to_owned(),
+                    source,
+                });
+            }
+        }
+    }
+    settings.budget = serde_json::from_value(budget).map_err(|e| {
+        ConfigError::Invalid(format!(
+            "the budget settings cannot be read back: {}",
+            config::without_values(&e.to_string())
+        ))
+    })?;
+    settings.budget.ceilings = ceilings;
+    Ok(notes)
+}
+
+/// The `written` `budget` section of the person's own configuration file
+/// `user`, held over the merged `budget` section, which is changed in place:
+///
+/// - every cap they wrote caps the merged one, so the effective limit is the
+///   smaller of the two and a higher layer can only bring a cap down to
+///   theirs, never above it. A measure they leave unset caps nothing, and a
+///   cap nothing set stays unset: their cap never makes a cap where there was
+///   none;
+/// - every price they wrote holds for the model it names, so a project's
+///   `budget.pricing` cannot make a model they priced look cheaper than they
+///   priced it, and cannot give any model a per-call maximum above their own
+///   `budget.call` cap;
+/// - what binds is recorded in `sources` as theirs, at the line `at_line`
+///   gives, so `atomic config --explain` names the file the effective number
+///   came from, and is said in a remark, so a number that is not the highest
+///   layer's is never shown without its reason.
+///
+/// Nothing here fails: `config::resolve` read this section as a
+/// `BudgetSettings` already and refused what it could not read, with the file
+/// and line of every key it refused.
+fn hold_budget(
+    user: &Path,
+    written: &Map<String, Value>,
+    at_line: &BTreeMap<String, usize>,
+    budget: &mut Value,
+    sources: &mut BTreeMap<String, Source>,
+) -> (Ceilings, Vec<String>) {
+    let yours = user.display().to_string();
+    let theirs = |dotted: &str| Source::File {
+        path: user.to_owned(),
+        line: line_of(at_line, dotted),
+    };
+    // `budget` is the merged `budget` section on its own, so a lookup drops
+    // the section's own name from the setting path.
+    fn inside(dotted: &str) -> &str {
+        dotted.strip_prefix("budget.").unwrap_or(dotted)
+    }
+    let mut notes = Vec::new();
+    // 1. Their caps, held over the merged ones, and gathered as the ceilings
+    //    that travel with the settings to hold a run's own budget block.
+    //
+    // Every key of a group is one of its settings, and `config::resolve` read
+    // this section as `BudgetSettings` before this ran: what is here is a
+    // number for the limit it names, or nothing at all, which is how every
+    // layer says it sets no cap. What is in range from there, and what is too
+    // large to account for, `BudgetSettings::validate` says by its setting.
+    let mut ceilings = Ceilings::default();
+    for group in GROUPS {
+        let Some(wrote) = written.get(group).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut bound = Vec::new();
+        for (field, cap) in wrote {
+            let dotted = format!("budget.{group}.{field}");
+            let Some(want) = cap.as_f64() else {
+                continue;
+            };
+            // A cap is held only by a cap smaller than it, which leaves a
+            // project's smaller cap tightening what they allow, and their own
+            // number standing where nothing above it raised it.
+            if at(budget, inside(&dotted))
+                .and_then(Value::as_f64)
+                .is_none_or(|have| want >= have)
+            {
+                continue;
+            }
+            bound.push(format!("{dotted} at {}", show(cap)));
+            *slot(budget, inside(&dotted)).expect("a setting, read as one") = cap.clone();
+            sources.insert(dotted.clone(), theirs(&dotted));
+        }
+        if !bound.is_empty() {
+            notes.push(format!(
+                "budget.{group}: your own configuration ({yours}) caps {}, which no project or \
+                 variable can raise",
+                bound.join(", ")
+            ));
+        }
+        let count = |what: &str| wrote.get(what).and_then(Value::as_u64);
+        let number = |what: &str| wrote.get(what).and_then(Value::as_f64);
+        match group {
+            "atom" | "workflow" => {
+                let caps = Caps {
+                    tokens: count("tokens"),
+                    minutes: number("minutes"),
+                    cost_usd: number("cost_usd"),
+                };
+                if group == "atom" {
+                    ceilings.atom = caps;
+                } else {
+                    ceilings.workflow = caps;
+                }
+            }
+            _ => {
+                ceilings.call = CallCaps {
+                    input_tokens: count("input_tokens"),
+                    output_tokens: count("output_tokens"),
+                    minutes: number("minutes"),
+                };
+            }
+        }
+    }
+    // 2. Their prices, over a project's, and their call cap over a project's
+    //    per-call maxima. A price of the wrong shape was refused with its file
+    //    and line while the layers merged, as any other setting is.
+    let mut their_prices: BTreeMap<&str, &Map<String, Value>> = BTreeMap::new();
+    if let Some(Value::Object(pricing)) = written.get("pricing") {
+        for (model, price) in pricing {
+            if let Value::Object(price) = price {
+                their_prices.insert(model, price);
+            }
+        }
+    }
+    let mut bound = Vec::new();
+    let mut clamped = Vec::new();
+    if let Some(Value::Object(table)) = slot(budget, inside("budget.pricing")) {
+        // A model they priced and a project named too: their fields, and the
+        // project's only where they wrote none. A model they never named is
+        // held to their call cap below, so it needs no fields of its own.
+        let none = Map::new();
+        for (model, entry) in table.iter_mut() {
+            let Value::Object(entry) = entry else {
+                continue;
+            };
+            let their = their_prices.get(model.as_str()).copied().unwrap_or(&none);
+            let mut held = Vec::new();
+            let mut capped = Vec::new();
+            for field in [
+                "input_usd_per_mtok",
+                "output_usd_per_mtok",
+                "max_input_tokens",
+                "max_output_tokens",
+            ] {
+                let dotted = format!("budget.pricing.{model}.{field}");
+                // A field they wrote is theirs, at their line. A maximum held
+                // down is cited from the cap that holds it, so the number is
+                // never shown against a file that says a larger one.
+                let mut held_by: Option<&str> = None;
+                let keep = match their.get(field) {
+                    // Their price for a model holds: a project cannot make a
+                    // model they priced look cheaper, nor give a call to it a
+                    // larger bound than they gave it.
+                    Some(written) => {
+                        if same(Some(written), entry.get(field)) {
+                            None
+                        } else {
+                            Some(written.clone())
+                        }
+                    }
+                    // A maximum a project gave a model cannot pass their cap
+                    // on the most one call may use, whether or not they priced
+                    // the model at all.
+                    None => {
+                        let (cap, cap_of) = match field {
+                            "max_input_tokens" => {
+                                (ceilings.call.input_tokens, "budget.call.input_tokens")
+                            }
+                            "max_output_tokens" => {
+                                (ceilings.call.output_tokens, "budget.call.output_tokens")
+                            }
+                            // A price is no cap on what one call may use.
+                            _ => (None, ""),
+                        };
+                        match (cap, entry.get(field).and_then(Value::as_f64)) {
+                            (Some(cap), Some(have)) if (cap as f64) < have => {
+                                held_by = Some(cap_of);
+                                Some(Value::from(cap))
+                            }
+                            _ => None,
+                        }
+                    }
+                };
+                if let Some(keep) = keep {
+                    entry.insert(field.to_owned(), keep);
+                    match held_by {
+                        Some(cap_of) => {
+                            capped.push(field.to_string());
+                            sources.insert(dotted.clone(), theirs(cap_of));
+                        }
+                        None => {
+                            held.push(field.to_string());
+                            sources.insert(dotted.clone(), theirs(&dotted));
+                        }
+                    }
+                }
+            }
+            if !held.is_empty() {
+                bound.push(format!("{model}: {}", held.join(", ")));
+            }
+            if !capped.is_empty() {
+                clamped.push(format!("{model}: {}", capped.join(", ")));
+            }
+        }
+        // A model only they priced: a layer that writes `budget.pricing`
+        // replaces the whole table below it, so their price for it would be
+        // lost without this, and a project could leave it out to the same end.
+        for (model, price) in &their_prices {
+            if table.contains_key(*model) {
+                continue;
+            }
+            let mut fields = Vec::new();
+            for field in price.keys() {
+                let dotted = format!("budget.pricing.{model}.{field}");
+                sources.insert(dotted.clone(), theirs(&dotted));
+                fields.push(field.as_str());
+            }
+            table.insert((*model).to_owned(), Value::Object((*price).clone()));
+            bound.push(format!("{model}: {}", fields.join(", ")));
+        }
+    }
+    if !bound.is_empty() {
+        notes.push(format!(
+            "budget.pricing: priced by your own configuration ({yours}), which a project's \
+             budget.pricing cannot change: {}",
+            bound.join("; ")
+        ));
+    }
+    if !clamped.is_empty() {
+        notes.push(format!(
+            "budget.pricing: your own configuration ({yours}) caps the most one call may use, \
+             which a project's budget.pricing cannot raise: {}",
+            clamped.join("; ")
+        ));
+    }
+    (ceilings, notes)
+}
+
+/// `v` as `atomic config` shows it, for a remark that names a cap.
+fn show(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Whether a price written in two files is the same: `2` and `2.0` are the
+/// same price, and holding one over the other would say so for nothing.
+fn same(written: Option<&Value>, merged: Option<&Value>) -> bool {
+    match (written, merged) {
+        (Some(a), Some(b)) => {
+            a == b || matches!((a.as_f64(), b.as_f64()), (Some(x), Some(y)) if x == y)
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Read the settings of the project configured in `dir` as `atomic run`

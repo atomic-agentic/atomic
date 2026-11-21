@@ -96,6 +96,34 @@ them: a run resumed after the configuration changed is metered as it began.
 `atomic config --explain` shows each budget setting with the layer it came
 from.
 
+## Your own caps are ceilings
+
+The caps you set in your own configuration are ceilings, not defaults. For each
+measure you set — an atom's or a run's `tokens`, `minutes` or `cost_usd`, and the
+most one call may use — the cap that binds is the smaller of yours and what
+`atomic.yaml`, `atomic.local.yaml`, an `ATOMIC_BUDGET_*` variable or a written
+`budget` block asks for. A project may bring a cap down to what you allowed, never
+above it. A measure you leave unset caps nothing, and a cap nothing sets stays
+unset: your ceiling never makes a dollar cap where there was none.
+
+Your prices are ceilings too. A project's `budget.pricing` cannot make a model you
+priced look cheaper than you priced it, and cannot give a model a per-call
+maximum above your `budget.call` cap — which is how a model is made to look free
+under a dollar cap. A model only you priced stays priced when another layer
+replaces the table below it.
+
+What holds is never shown without its reason: `atomic config --explain` shows the
+effective number with your file and line as its source, and says in a remark that
+your own configuration caps it. A cap that leaves no room for one call fails
+configuration and names your cap as the limit, in words such as `capped by your
+own budget.atom.tokens`.
+
+Ceilings come only from your own configuration file, which no project supplies:
+`budget.ceilings` is no setting, and a file that writes it is refused as an
+unknown setting. A run resolves them with its caps and records them with its plan,
+so a resumed run keeps the ceilings it began under, and a plan carrying caps above
+them is refused before its first call.
+
 Every model call a run makes is metered: a step whose atom calls a model and
 that the run has no caps for is refused, never run without a meter. A live
 `atomic eval` is metered as a step is (see [eval cases](eval-cases.md)). The
