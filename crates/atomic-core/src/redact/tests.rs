@@ -1279,7 +1279,10 @@ fn the_address_to_sign_in_at_is_written_whole_and_nothing_else_is() {
     // after the address is shown, not run.
     let escaped = format!("{address}\u{1b}]0;title\u{7}");
     let line = sign_in_line(&escaped);
-    assert!(!line.contains('\u{1b}') && !line.contains('\u{7}'), "{line:?}");
+    assert!(
+        !line.contains('\u{1b}') && !line.contains('\u{7}'),
+        "{line:?}"
+    );
     // Anything else is redacted as any line is.
     for other in [
         format!("https://example.com/other?state={state}"),
