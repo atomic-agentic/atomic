@@ -1,0 +1,1 @@
+sandbox-late-links-cap|crates/atomic-core/src/codex.rs|    } else if held.len() > MAX_LINK_TARGETS {|    } else if std::hint::black_box(false) && held.len() > MAX_LINK_TARGETS {|-p atomic-agentic-core --lib --features fake-model the_late_cap_counts_only_links_that_lead_out
