@@ -1025,9 +1025,11 @@ impl CodexPaths {
 }
 
 /// Harden atomic itself, not one of Codex's helpers: the process that holds
-/// a sign-in's token and the operator credential cannot be dumped, read
-/// through /proc by a same-user process, or leave a core file. It loses its
-/// LD_* variables, and the commands it starts inherit a core-file limit of
+/// a sign-in's token and the operator credential cannot be dumped, or leave
+/// a core file, and no process of the same user may read its memory or the
+/// /proc files that show it, such as `environ` and `mem`, unless it has
+/// `CAP_SYS_PTRACE` over atomic's user namespace; its `cmdline` and `stat`
+/// stay readable. It loses its LD_* variables, and the commands it starts inherit a core-file limit of
 /// zero (on macOS it also refuses a debugger). Both entry points call it.
 fn harden() {
     if !is_helper(std::env::args_os()) {
@@ -1087,9 +1089,8 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    keep_sandbox_off_keyrings();
+    as_any_helper();
     harden();
-    give_the_command_its_own_tmpdir();
     // The person's own Codex home stays denied to atoms' commands.
     let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
     // SAFETY: called at the start of main, while the process has one thread,
@@ -1171,11 +1172,18 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
-    keep_sandbox_off_keyrings();
-    give_the_command_its_own_tmpdir();
+    as_any_helper();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// What [`dispatch`] and [`run_helper`] both do first, whichever of Codex's
+/// helpers this process turns out to be: keep the sandbox off keyrings, and
+/// give a sandboxed command its own `TMPDIR`.
+fn as_any_helper() {
+    keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
 }
 
 /// The variable that carries a turn's own temporary directory past Codex's
@@ -2038,10 +2046,10 @@ where
     // Under workspace-write the system temporary directories are not
     // writable (see `permission_profile`): the thread gets its own, removed
     // when the thread ends.
-    // A workspace that names a TMPDIR (the backend's shared one, see
-    // `crate::runtime`) keeps it: Codex's sandbox keeps its registry of
-    // protected mount points there, and turns that share a writable root
-    // must share it.
+    // A workspace that names a TMPDIR keeps it (see `crate::runtime`): on
+    // Linux the backend's shared one, where Codex's sandbox keeps its
+    // registry of protected mount points, which turns that share a writable
+    // root must share; elsewhere the turn's own.
     let temp = match spec.sandbox {
         crate::typed::Sandbox::WorkspaceWrite if !spec.env.contains_key("TMPDIR") => {
             Some(TurnTemp::create(guard)?)
