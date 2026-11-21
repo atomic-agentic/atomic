@@ -1,0 +1,1 @@
+signin-logout-own-locks|crates/atomic-core/src/signin.rs|                Err(_) => locked && !made,|                Err(_) => locked, /*CONTROL_OFF*/|-p atomic-agentic --test model_auth a_login_that_fails_and_a_logout_leave_no_sign_in_directory
