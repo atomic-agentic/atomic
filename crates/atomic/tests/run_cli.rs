@@ -757,6 +757,19 @@ async fn project_store(state: &Path) -> Durare {
     project_store_at(&database(state)).await
 }
 
+/// [`project_store`] for a project whose manifest names it `name`.
+async fn named_project_store(state: &Path, name: &str) -> Durare {
+    let id = state.file_name().expect("a project id").to_string_lossy();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(database(state)),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("{name}/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
 /// [`project_store`] by the database's path, `<home>/private/<id>/atomic.db`.
 async fn project_store_at(db: &Path) -> Durare {
     let id = db
@@ -2736,7 +2749,7 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "served-gate").await;
         assert!(opened.deadline.is_some(), "the gate has a deadline");
         first.kill().expect("SIGKILL the run");
@@ -2831,6 +2844,10 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
 /// command that reads the project's runs and gates refuses, saying so,
 /// rather than read them under another key and find none. Mended, the
 /// manifest finds them all again, the gate still open: nothing was stranded.
+/// atomic refuses the manifest as it finds the project, before any command
+/// runs, and the store's key refuses it again (the engine's
+/// `the_store_key_falls_back_only_when_no_manifest_is_there`), so no one
+/// controls row switches this test's refusals off.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -6179,7 +6196,7 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
         let checked = atomic(&dir, &outside, &["check", &project_arg], &[], "");
         assert!(checked.status.success(), "{}", text(&checked));
         let state = state_dir(&dir, &project);
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = named_project_store(&state, "reviewed-change").await;
         // The example's own input, with the fixture's real baseline for the
         // placeholder, and the answers each step is scripted to give.
         let mut task =

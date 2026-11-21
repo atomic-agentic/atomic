@@ -1,1 +1,0 @@
-gate-run-broken-manifest|crates/atomic/src/engine.rs|        Err(atomic_core::project::ProjectError::NotFound(_)) => state|        Err(_) => state|-p atomic-agentic --features atomic-agentic/sandbox-tests --test run_cli a_broken_manifest_refuses_the_gate_and_run_commands_and_strands_nothing
