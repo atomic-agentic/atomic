@@ -237,7 +237,8 @@ fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
     )
     .expect("resolves");
     assert_eq!(r.endpoint().expect("an endpoint").base_url, OPENAI_BASE_URL);
-    // A sign-in that cannot be read is said, and detection goes on.
+    // A sign-in that cannot be read is said, and resolution still detects;
+    // a run that calls a model is refused (see `engine::endpoint`).
     let r = resolved_signed_in(
         &d,
         &EngineArgs::default(),

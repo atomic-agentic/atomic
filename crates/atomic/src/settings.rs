@@ -297,7 +297,13 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
     match SignIn::located(project) {
         Ok(sign_in) => found(sign_in),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        // Refused where it is kept: with no directory there no one ever
+        // signed in, and nothing is refused; with one, it may hold a
+        // sign-in, and that it cannot be used is said.
+        Err(e) => match atomic_core::signin::location() {
+            Some(dir) if std::fs::symlink_metadata(&dir).is_err() => Ok(None),
+            _ => Err(e.to_string()),
+        },
     }
 }
 
