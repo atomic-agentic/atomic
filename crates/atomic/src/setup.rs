@@ -574,9 +574,12 @@ impl<'a> OwnedDir<'a> {
         } else if is_link(&self.path) {
             // The whole directory atomic owns is an alias for elsewhere.
             report.links.push(link_named(&self.shown("")));
-        } else if self.path.exists() {
-            let manifest = self.read_manifest()?;
-            self.inspect("", manifest.as_ref(), &mut report)?;
+        } else if let Some(dir) = at::open_dirs(self.root, &self.at)? {
+            // Held open from here: the walk lists and reads through it, so
+            // a directory swapped for a link since the chain was weighed is
+            // refused, never followed.
+            let manifest = self.read_manifest(&dir)?;
+            self.inspect(&dir, "", manifest.as_ref(), &mut report)?;
             if report.is_empty() {
                 return Ok(self.leftovers(&manifest, &report));
             }
@@ -630,13 +633,13 @@ impl<'a> OwnedDir<'a> {
     /// wrote here. A file that is not a manifest atomic wrote is refused here,
     /// rather than read as no manifest at all, because that would let whatever
     /// is in the directory through on the strength of a file someone else left.
-    fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
+    fn read_manifest(&self, dir: &at::Dir) -> anyhow::Result<Option<Manifest>> {
         let shown = self.shown(MANIFEST);
-        let at = self.path.join(MANIFEST);
+        let name = std::ffi::OsStr::new(MANIFEST);
         // Plain file or nothing, before it is opened: what is asked of this
         // path is one small read, and a fifo or a device would wait or stream.
-        let meta = match std::fs::symlink_metadata(&at) {
-            Ok(meta) if meta.is_file() => meta,
+        let meta = match at::entry(dir, name) {
+            Ok(meta) if meta.kind == at::Kind::File => meta,
             Ok(_) => {
                 bail!("{shown} is not a plain file, and atomic writes a plain file there")
             }
@@ -649,10 +652,10 @@ impl<'a> OwnedDir<'a> {
                  replace it and run `atomic setup` again"
             )
         };
-        if meta.len() > MANIFEST_BYTES_MAX {
-            return Err(too_large(meta.len()));
+        if meta.len > MANIFEST_BYTES_MAX {
+            return Err(too_large(meta.len));
         }
-        let text = read_at_most(&at, MANIFEST_BYTES_MAX)
+        let text = at::read_in(dir, name, MANIFEST_BYTES_MAX)
             .with_context(|| format!("cannot read {shown}"))?
             .ok_or_else(|| too_large(MANIFEST_BYTES_MAX + 1))
             .and_then(|bytes| {
@@ -763,36 +766,27 @@ impl<'a> OwnedDir<'a> {
     /// possible lossily, and two entries whose names differ only in bytes that
     /// are not text have the same lossy name: judging an entry by a name another
     /// entry shares would let one hide the other, so no entry is judged by a name
-    /// it does not have. Every filesystem call is made with the entry's own path.
-    ///
-    /// Not covered: the walk reads by path, so a directory above the skill's
-    /// swapped for a link after [`OwnedDir::chain_link`] weighed the chain
-    /// would have it list and read what the link leads to. Nothing is written
-    /// or removed by path, so what it could do is name what it found there in
-    /// a refusal, or match its bytes.
+    /// it does not have. Every filesystem call is made by the entry's name in
+    /// `dir`, the directory held open: a directory on the way swapped for a
+    /// link after [`OwnedDir::chain_link`] weighed the chain is refused where
+    /// it is opened, never listed or read through.
     fn inspect(
         &self,
+        dir: &at::Dir,
         at: &str,
         manifest: Option<&Manifest>,
         report: &mut Report,
     ) -> anyhow::Result<()> {
         let shown_at = self.shown(at);
-        let read = std::fs::read_dir(self.path.join(at))
-            .with_context(|| format!("cannot inspect {shown_at}"))?;
-        let mut names: Vec<std::ffi::OsString> = read
-            .map(|entry| {
-                entry.map(|entry| entry.file_name()).map_err(|e| {
-                    anyhow::Error::new(e).context(format!("cannot inspect {shown_at}"))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut names = at::list(dir).with_context(|| format!("cannot inspect {shown_at}"))?;
         names.sort();
-        for name in names {
-            // The entry's own path, which is what every call below makes. The
-            // name is taken lossily only to refuse it: names that differ only in
-            // bytes which are not text have the same lossy name, so an entry
-            // judged by a name another entry shares could hide that other entry.
-            let entry = self.path.join(at).join(&name);
+        for entry in names {
+            // The entry's own name in the directory held open, which is what
+            // every call below makes. The name is taken lossily only to refuse
+            // it: names that differ only in bytes which are not text have the
+            // same lossy name, so an entry judged by a name another entry
+            // shares could hide that other entry.
+            let name = entry.as_os_str();
             let Some(name) = name.to_str() else {
                 let below = if at.is_empty() {
                     name.to_string_lossy().into_owned()
@@ -813,10 +807,8 @@ impl<'a> OwnedDir<'a> {
             let shown = self.shown(&relative);
             // What an entry is, not what it points at: a symbolic link is
             // named as one and never followed, read from or written through.
-            let meta = std::fs::symlink_metadata(&entry)
-                .with_context(|| format!("cannot inspect {shown}"))?;
-            let kind = meta.file_type();
-            if kind.is_symlink() {
+            let meta = at::entry(dir, &entry).with_context(|| format!("cannot inspect {shown}"))?;
+            if meta.kind == at::Kind::Link {
                 report.links.push(link_named(&shown));
                 continue;
             }
@@ -826,14 +818,16 @@ impl<'a> OwnedDir<'a> {
                 continue;
             }
             let listed = manifest.is_some_and(|m| m.files.contains_key(relative.as_str()));
-            if kind.is_dir() {
+            if meta.kind == at::Kind::Dir {
+                let sub =
+                    at::subdir(dir, &entry).with_context(|| format!("cannot inspect {shown}"))?;
                 // What keeps a directory that is not one of the pack's is what
                 // stands in it, not what a manifest once listed there: a
                 // directory whose listed files are no longer on disk is the
                 // shell an earlier pack left, which is exactly what atomic has
                 // no reason to write in.
                 if !self.dirs.contains(relative.as_str())
-                    && !self.holds_own(&entry, &relative, manifest)?
+                    && !self.holds_own(&sub, &relative, manifest)?
                 {
                     report
                         .extra
@@ -844,14 +838,13 @@ impl<'a> OwnedDir<'a> {
                     // nothing in it for a person to go and remove. An empty one
                     // atomic cannot account for, such as one a person made, and
                     // anything that holds something, are left as they are.
-                    let empty =
-                        std::fs::read_dir(&entry).is_ok_and(|mut entries| entries.next().is_none());
+                    let empty = at::list(&sub).is_ok_and(|entries| entries.is_empty());
                     if empty && lists_under(manifest, &relative) {
                         self.empty.borrow_mut().insert(relative);
                     }
                     continue;
                 }
-                self.inspect(&relative, manifest, report)?;
+                self.inspect(&sub, &relative, manifest, report)?;
                 continue;
             }
             if !listed && !self.files.contains(relative.as_str()) {
@@ -863,7 +856,7 @@ impl<'a> OwnedDir<'a> {
             // Past this point the path is atomic's to write, so only a plain
             // file may stand at it: a device, a fifo or a socket is refused,
             // not read from.
-            if !meta.is_file() {
+            if meta.kind != at::Kind::File {
                 report.changed.push(format!(
                     "{shown} is not a plain file, and atomic writes a plain file there"
                 ));
@@ -876,7 +869,7 @@ impl<'a> OwnedDir<'a> {
                 // stopped after the files and before its manifest leaves.
                 // Anything else was edited since, and is not atomic's to throw
                 // away.
-                let bytes = self.bytes(&entry, &shown, meta.len())?;
+                let bytes = self.bytes(dir, &entry, &shown, meta.len)?;
                 let holds = manifest_vouches_for(manifest, &relative, &bytes);
                 let holds =
                     holds || pack_holds(self.pack_bytes, &self.pack_path(&relative), &bytes);
@@ -899,8 +892,8 @@ impl<'a> OwnedDir<'a> {
                 .find(|f| f.path == path)
                 .expect("the pack has its own path");
             // Sizes first, so a large leftover costs no reading.
-            let other = meta.len() != file.contents.len() as u64 || {
-                let bytes = self.bytes(&entry, &shown, meta.len())?;
+            let other = meta.len != file.contents.len() as u64 || {
+                let bytes = self.bytes(dir, &entry, &shown, meta.len)?;
                 !pack_holds(self.pack_bytes, &path, &bytes)
             };
             if other {
@@ -922,7 +915,7 @@ impl<'a> OwnedDir<'a> {
     /// out of this: a manifest is text, so it can name no such entry.
     fn holds_own(
         &self,
-        entry: &Path,
+        dir: &at::Dir,
         relative: &str,
         manifest: Option<&Manifest>,
     ) -> anyhow::Result<bool> {
@@ -930,11 +923,8 @@ impl<'a> OwnedDir<'a> {
             return Ok(false);
         };
         let shown = self.shown(relative);
-        let read = std::fs::read_dir(entry).with_context(|| format!("cannot inspect {shown}"))?;
-        for seen in read {
-            let name = seen
-                .map(|seen| seen.file_name())
-                .with_context(|| format!("cannot inspect {shown}"))?;
+        let names = at::list(dir).with_context(|| format!("cannot inspect {shown}"))?;
+        for name in names {
             let Some(name) = name.to_str() else {
                 continue;
             };
@@ -955,7 +945,13 @@ impl<'a> OwnedDir<'a> {
     /// The bytes of a plain file the walk has seen to be one, read from `entry`,
     /// which is where the walk saw it. `size` is what its own directory entry
     /// said, and `READ_BYTES_MAX` is the most that will be read for a hash.
-    fn bytes(&self, entry: &Path, shown: &str, size: u64) -> anyhow::Result<Vec<u8>> {
+    fn bytes(
+        &self,
+        dir: &at::Dir,
+        entry: &std::ffi::OsStr,
+        shown: &str,
+        size: u64,
+    ) -> anyhow::Result<Vec<u8>> {
         let too_large = |size: u64| {
             anyhow::anyhow!(
                 "{shown} is {size} bytes, more than the {READ_BYTES_MAX} bytes any file atomic \
@@ -965,7 +961,7 @@ impl<'a> OwnedDir<'a> {
         if size > READ_BYTES_MAX {
             return Err(too_large(size));
         }
-        read_at_most(entry, READ_BYTES_MAX)
+        at::read_in(dir, entry, READ_BYTES_MAX)
             .with_context(|| format!("cannot read {shown}"))?
             .ok_or_else(|| too_large(READ_BYTES_MAX + 1))
     }
@@ -986,12 +982,12 @@ impl<'a> OwnedDir<'a> {
 /// and never waiting, as opening a fifo would, or `None` when it holds more
 /// than `max`: a file that grew since its size was seen is read no further
 /// than that, and one that is no longer a plain file is refused.
+#[cfg(not(unix))]
 fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, at::READ_FLAGS);
     let file = open.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a plain file"));
@@ -1263,12 +1259,35 @@ mod at {
     }
 
     fn walk(root: &Path, relative: &Path, make: bool) -> anyhow::Result<Option<OwnedFd>> {
+        walk_through(
+            root,
+            relative.parent().unwrap_or(Path::new("")),
+            relative,
+            make,
+        )
+    }
+
+    /// The directory `relative` below `root` itself, held open, reached one
+    /// name at a time and never through a link: `None` when a directory on
+    /// the way is not there.
+    pub(super) fn open_dirs(root: &Path, relative: &Path) -> anyhow::Result<Option<OwnedFd>> {
+        walk_through(root, relative, relative, false)
+    }
+
+    /// Open `root`, then each directory `dirs` names, as [`walk`] does,
+    /// naming `relative` in a refusal.
+    fn walk_through(
+        root: &Path,
+        dirs: &Path,
+        relative: &Path,
+        make: bool,
+    ) -> anyhow::Result<Option<OwnedFd>> {
         let mut dir: OwnedFd = std::fs::File::open(root)
             .with_context(|| format!("open {}", line(&root.to_string_lossy())))?
             .into();
         let mut below = PathBuf::new();
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | DIR_NOT_THROUGH_A_LINK;
-        for part in relative.parent().into_iter().flat_map(Path::components) {
+        for part in dirs.components() {
             anyhow::ensure!(
                 matches!(part, std::path::Component::Normal(_)),
                 "{} is not a plain relative path",
@@ -1372,6 +1391,152 @@ mod at {
             "{shown} is more than {max} bytes, larger than atomic reads there"
         );
         Ok(Some(Read { bytes, id }))
+    }
+
+    /// A directory held open, which the check walks through.
+    pub(super) type Dir = OwnedFd;
+
+    /// What an entry of a directory is, as [`entry`] sees it, never through
+    /// a link.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kind {
+        File,
+        Dir,
+        Link,
+        Other,
+    }
+
+    /// An entry's kind and size.
+    pub(super) struct Entry {
+        pub(super) kind: Kind,
+        pub(super) len: u64,
+    }
+
+    /// What `name` in the directory held open as `dir` is, not following a
+    /// link.
+    pub(super) fn entry(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Entry> {
+        let name = CString::new(name.as_bytes()).map_err(std::io::Error::other)?;
+        let st = stat_at(dir.as_fd(), &name)?;
+        let kind = match st.st_mode & libc::S_IFMT {
+            libc::S_IFREG => Kind::File,
+            libc::S_IFDIR => Kind::Dir,
+            libc::S_IFLNK => Kind::Link,
+            _ => Kind::Other,
+        };
+        // The field's type differs between systems.
+        #[allow(clippy::unnecessary_cast)]
+        let len = st.st_size as u64;
+        Ok(Entry { kind, len })
+    }
+
+    /// The directory `name` in the one held open as `dir`, held open in its
+    /// turn, never through a link: a link put there since it was seen to be
+    /// a directory is refused, not followed.
+    pub(super) fn subdir(dir: &OwnedFd, name: &OsStr) -> anyhow::Result<OwnedFd> {
+        let flags =
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | SUBDIR_NOT_THROUGH_A_LINK;
+        Ok(openat(dir.as_fd(), &c_name(name)?, flags, 0)?)
+    }
+
+    /// How a directory the walk goes into is opened besides: never through
+    /// a link standing at its name.
+    /// `scripts/controls/skill-dir-check-at.row` switches this off.
+    const SUBDIR_NOT_THROUGH_A_LINK: libc::c_int = libc::O_NOFOLLOW;
+
+    /// The names in the directory held open as `dir`, but `.` and `..`.
+    pub(super) fn list(dir: &OwnedFd) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        use std::os::unix::ffi::OsStringExt;
+        // fdopendir takes the descriptor it is given, so it is given a copy.
+        // SAFETY: dup takes an open descriptor and touches no memory.
+        #[allow(unsafe_code)]
+        let copy = unsafe { libc::dup(dir.as_raw_fd()) };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: `copy` is an open descriptor this call owns; on success the
+        // stream owns it, and it is closed with the stream below.
+        #[allow(unsafe_code)]
+        let stream = unsafe { libc::fdopendir(copy) };
+        if stream.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: on failure `copy` is still this call's to close.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::close(copy);
+            }
+            return Err(e.into());
+        }
+        // From the start, as the copy shares its offset with `dir`.
+        // SAFETY: `stream` is the open stream made above.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::rewinddir(stream);
+        }
+        let mut names = Vec::new();
+        let failed = loop {
+            set_errno(0);
+            // SAFETY: `stream` is open, and the entry it returns is read
+            // before the next call.
+            #[allow(unsafe_code)]
+            let next = unsafe { libc::readdir(stream) };
+            if next.is_null() {
+                let e = std::io::Error::last_os_error();
+                break (e.raw_os_error() != Some(0)).then_some(e);
+            }
+            // SAFETY: `d_name` is a NUL-terminated name inside the entry.
+            #[allow(unsafe_code)]
+            let name = unsafe { std::ffi::CStr::from_ptr((*next).d_name.as_ptr()) };
+            let name = name.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(std::ffi::OsString::from_vec(name.to_vec()));
+            }
+        };
+        // SAFETY: `stream` is open, and closing it closes `copy`.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::closedir(stream);
+        }
+        match failed {
+            Some(e) => Err(e.into()),
+            None => Ok(names),
+        }
+    }
+
+    /// Set this thread's `errno`, which `readdir` leaves as it was at its end.
+    fn set_errno(value: libc::c_int) {
+        // SAFETY: the location is this thread's own errno.
+        #[allow(unsafe_code)]
+        unsafe {
+            #[cfg(target_os = "linux")]
+            {
+                *libc::__errno_location() = value;
+            }
+            #[cfg(target_os = "macos")]
+            {
+                *libc::__error() = value;
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                let _ = value;
+            }
+        }
+    }
+
+    /// The bytes of the plain file `name` in the directory held open as
+    /// `dir`, opened never through a link and never waiting, or `None` when
+    /// it holds more than `max`.
+    pub(super) fn read_in(
+        dir: &OwnedFd,
+        name: &OsStr,
+        max: u64,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | READ_FLAGS;
+        let file = std::fs::File::from(openat(dir.as_fd(), &c_name(name)?, flags, 0)?);
+        anyhow::ensure!(file.metadata()?.is_file(), "not a plain file");
+        let mut bytes = Vec::new();
+        file.take(max + 1).read_to_end(&mut bytes)?;
+        Ok((bytes.len() as u64 <= max).then_some(bytes))
     }
 
     /// Remove the file, or with `dir` the empty directory, at `relative`
@@ -1586,6 +1751,57 @@ mod at {
             }
         }
         Ok(dir)
+    }
+
+    pub(super) type Dir = PathBuf;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Kind {
+        File,
+        Dir,
+        Link,
+        Other,
+    }
+
+    pub(super) struct Entry {
+        pub(super) kind: Kind,
+        pub(super) len: u64,
+    }
+
+    pub(super) fn open_dirs(root: &Path, relative: &Path) -> anyhow::Result<Option<PathBuf>> {
+        let dir = root.join(relative);
+        Ok(dir.is_dir().then_some(dir))
+    }
+
+    pub(super) fn entry(dir: &Path, name: &OsStr) -> std::io::Result<Entry> {
+        let meta = std::fs::symlink_metadata(dir.join(name))?;
+        let kind = if meta.file_type().is_symlink() {
+            Kind::Link
+        } else if meta.is_dir() {
+            Kind::Dir
+        } else if meta.is_file() {
+            Kind::File
+        } else {
+            Kind::Other
+        };
+        Ok(Entry {
+            kind,
+            len: meta.len(),
+        })
+    }
+
+    pub(super) fn subdir(dir: &Path, name: &OsStr) -> anyhow::Result<PathBuf> {
+        Ok(dir.join(name))
+    }
+
+    pub(super) fn list(dir: &Path) -> anyhow::Result<Vec<std::ffi::OsString>> {
+        Ok(std::fs::read_dir(dir)?
+            .map(|e| e.map(|e| e.file_name()))
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub(super) fn read_in(dir: &Path, name: &OsStr, max: u64) -> anyhow::Result<Option<Vec<u8>>> {
+        Ok(super::read_at_most(&dir.join(name), max)?)
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -3193,6 +3409,52 @@ mod tests {
         );
     }
 
+    /// The check walks the skill directory through directories it holds
+    /// open: one swapped for a link elsewhere after it was opened is still
+    /// the one listed, a directory reached through a link is refused when it
+    /// is opened, and so is a link standing where a directory was seen.
+    #[cfg(unix)]
+    #[test]
+    fn the_check_walks_through_held_directories_and_never_a_link() {
+        let root = std::fs::canonicalize(scratch("check-held")).expect("canonical root");
+        let skill = root.join(".agents/skills/atomic-create-atom");
+        std::fs::create_dir_all(skill.join("references")).expect("skill");
+        std::fs::write(skill.join("SKILL.md"), "ours\n").expect("ours");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join("skills/atomic-create-atom")).expect("elsewhere");
+        std::fs::write(elsewhere.join("skills/atomic-create-atom/theirs.md"), "x").expect("theirs");
+        let held = at::open_dirs(&root, Path::new(".agents/skills/atomic-create-atom"))
+            .expect("opened")
+            .expect("there");
+        // `.agents` swapped for a link to elsewhere while the check runs.
+        std::fs::rename(root.join(".agents"), root.join(".agents-before")).expect("moved");
+        std::os::unix::fs::symlink("elsewhere", root.join(".agents")).expect("link");
+        let mut names = at::list(&held).expect("listed");
+        names.sort();
+        assert_eq!(names, vec!["SKILL.md", "references"]);
+        let refused = at::open_dirs(&root, Path::new(".agents/skills/atomic-create-atom"))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert_eq!(
+            refused,
+            ".agents/skills/atomic-create-atom is reached through .agents, which is a symbolic \
+             link"
+        );
+        // A link where the walk saw a directory is not gone into.
+        std::fs::remove_dir(root.join(".agents-before/skills/atomic-create-atom/references"))
+            .expect("emptied");
+        std::os::unix::fs::symlink(
+            elsewhere.join("skills"),
+            root.join(".agents-before/skills/atomic-create-atom/references"),
+        )
+        .expect("link");
+        assert!(
+            at::subdir(&held, std::ffi::OsStr::new("references")).is_err(),
+            "a link was gone into as a directory"
+        );
+    }
+
     /// The instructions file's read does not wait on a fifo standing there.
     #[cfg(unix)]
     #[test]
@@ -3210,7 +3472,11 @@ mod tests {
     #[test]
     fn a_fifo_for_a_skill_file_is_refused_without_waiting() {
         read_of_a_fifo_comes_back(|fifo| {
-            read_at_most(fifo, 1024).is_err_and(|e| e.to_string() == "not a plain file")
+            let dir: std::os::fd::OwnedFd = std::fs::File::open(fifo.parent().expect("dir"))
+                .expect("open")
+                .into();
+            at::read_in(&dir, std::ffi::OsStr::new("AGENTS.md"), 1024)
+                .is_err_and(|e| format!("{e:#}") == "not a plain file")
         });
     }
 
