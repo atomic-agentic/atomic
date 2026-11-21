@@ -1110,7 +1110,8 @@ where
 const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A lock on making Codex's links to atomic under its helpers' names, in a
-/// file of `codex_home` that atoms' commands are denied, held from just
+/// file of `codex_home` that atoms' commands are denied under
+/// [`StateGuard::Deny`], held from just
 /// before Codex's dispatch until the command itself starts: or none, when
 /// it cannot be taken within [`HELPER_LINKS_WAIT`] or made at all.
 ///
@@ -1225,11 +1226,35 @@ pub fn run_helper() -> anyhow::Result<()> {
     if !invoked_as_linux_sandbox() && linux_sandbox_args() {
         return Err(run_as_linux_sandbox());
     }
+    // A helper of another system's, which Codex's dispatch here would not
+    // take, goes no further: nothing of a command's start is made for it.
+    if let Some(first) = std::env::args_os().nth(1)
+        && OTHER_SYSTEMS_HELPERS.iter().any(|h| first == *h)
+    {
+        bail!(
+            "{} names a Codex helper of another operating system",
+            first.to_string_lossy()
+        );
+    }
     as_any_helper();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
 }
+
+/// The first arguments [`is_helper`] knows that name a helper Codex's dispatch
+/// runs only on another operating system than this one.
+const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
+    &["--codex-run-as-process-setup"]
+} else if cfg!(target_os = "linux") {
+    &["--__codex-windows-mxc", "--run-as-windows-sandbox"]
+} else {
+    &[
+        "--__codex-windows-mxc",
+        "--run-as-windows-sandbox",
+        "--codex-run-as-process-setup",
+    ]
+};
 
 /// What [`dispatch`] and [`run_helper`] both do first, whichever of Codex's
 /// helpers this process turns out to be: keep the sandbox off keyrings, and
@@ -1674,11 +1699,28 @@ impl atomic_exec::Confine for ExecSandbox {
 /// by its name, as one without `--argv0` tries to. Waiting would not change
 /// either.
 pub(crate) fn not_the_helper(stderr: &str) -> bool {
-    stderr.lines().any(|line| {
-        line.contains("unexpected argument '--sandbox-policy-cwd'")
-            || (line.trim_start().starts_with("bwrap:")
-                && line.contains("execvp codex-linux-sandbox"))
-    })
+    stderr
+        .lines()
+        .any(|line| refused_helper_arguments(line) || ran_by_helper_name(line))
+}
+
+/// Whether `line` is atomic's own command line refusing the helper's first
+/// argument. `scripts/controls/sandbox-helper-not-atomic.row` switches this
+/// off.
+fn refused_helper_arguments(line: &str) -> bool {
+    line.contains("unexpected argument '--sandbox-policy-cwd'")
+}
+
+/// Whether `line` is bubblewrap failing to run the helper by its name, the
+/// bare one or a path that ends in it.
+/// `scripts/controls/sandbox-helper-not-by-name.row` switches this off.
+fn ran_by_helper_name(line: &str) -> bool {
+    let Some((said, rest)) = line.split_once("execvp ") else {
+        return false;
+    };
+    let run = rest.split(':').next().unwrap_or_default();
+    let named = run == "codex-linux-sandbox" || run.ends_with("/codex-linux-sandbox");
+    said.trim_start().starts_with("bwrap:") && named
 }
 
 /// Whether a sandbox trial that failed with `stderr` failed because this
@@ -1862,8 +1904,9 @@ fn scrub(mut remove: impl FnMut(&str)) {
 }
 
 /// The first argument Codex passes its Linux sandbox helper at the pinned
-/// revision, to its outer stage and to its inner one alike. No command line
-/// of atomic's own starts with it.
+/// revision, to its outer stage and to its inner one alike, whenever it
+/// does not first pass `--inherit-pid-namespace`, as it does only for a
+/// command of its own. No command line of atomic's own starts with it.
 #[cfg(target_os = "linux")]
 const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
 
@@ -1880,6 +1923,17 @@ fn linux_sandbox_args() -> bool {
         .is_some_and(|name| name == "apply_patch" || name == "applypatch");
     !patch && args.next().as_deref() == Some(LINUX_SANDBOX_ARG1.as_ref())
 }
+
+/// The name this executable runs again under as Codex's Linux sandbox
+/// helper: its file name is the helper's, which Codex's dispatch and
+/// atomic's own know it by, but as a path it can never exist, since
+/// `/dev/null` is no directory. A bubblewrap without `--argv0` runs the
+/// inner stage by this name: an absolute one, which it cannot find, so it
+/// fails, rather than the bare name, which it would look for along `PATH`,
+/// where a command could have put a program by that name.
+/// `scripts/controls/sandbox-helper-unfindable.row` switches it off.
+#[cfg(target_os = "linux")]
+const HELPER_BY_NAME_ONLY: &str = "/dev/null/codex-linux-sandbox";
 
 /// Run this executable again, with the same arguments, under the Linux
 /// sandbox helper's name, which Codex's dispatch and atomic's own helper
@@ -1901,7 +1955,7 @@ fn run_as_linux_sandbox() -> anyhow::Error {
         Err(e) => return anyhow::Error::new(e).context("find atomic's own executable"),
     };
     let error = std::process::Command::new(&exe)
-        .arg0("codex-linux-sandbox")
+        .arg0(HELPER_BY_NAME_ONLY)
         .args(std::env::args_os().skip(1))
         .exec();
     anyhow::Error::new(error).context(format!(
@@ -4654,13 +4708,18 @@ mod tests {
             "error: unexpected argument '--sandbox-policy-cwd' found\n\n\
              Usage: atomic-x86_64 [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
         ));
-        assert!(not_the_helper(
-            "bwrap: execvp codex-linux-sandbox: No such file or directory"
-        ));
+        for by_name in [
+            "bwrap: execvp codex-linux-sandbox: No such file or directory",
+            "bwrap: execvp /dev/null/codex-linux-sandbox: Not a directory",
+        ] {
+            assert!(not_the_helper(by_name), "{by_name}");
+        }
         for other in [
             "",
             "bwrap: Can't make directory /tmp/x: No space left on device",
             "error: unexpected argument '--other' found",
+            "bwrap: execvp /usr/bin/true: No such file or directory",
+            "bwrap: execvp /opt/codex-linux-sandbox-x: No such file or directory",
         ] {
             assert!(!not_the_helper(other), "{other}");
         }

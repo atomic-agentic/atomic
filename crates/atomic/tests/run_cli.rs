@@ -2850,6 +2850,73 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
     assert_eq!(count_log(&dir), 1, "the command ran once");
 }
 
+/// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
+/// the helper's inner stage by the name it was started under, a program a
+/// command put on `PATH` under the helper's name is never run in its place:
+/// the name is a path that cannot exist, so the run fails at once instead,
+/// saying the helper could not be set up.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn a_helper_run_by_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    support::require_sandbox();
+    let dir = scratch("helper-by-name");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it
+    // is named, looking a bare name up along PATH.
+    script(
+        &dir.join("bwrap/bwrap"),
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(
+            "Codex's Linux sandbox helper could not be set up: what ran in its place was not \
+             the helper (a trial command exited with code 1: bwrap: execvp \
+             /dev/null/codex-linux-sandbox: Not a directory)"
+        ),
+        "{said}"
+    );
+}
+
 /// `atomic run` confines an exec atom's command: through the engine as it
 /// is wired, the command cannot read the project's database or the
 /// credential store, write a gate decision, or open a socket, and can still
