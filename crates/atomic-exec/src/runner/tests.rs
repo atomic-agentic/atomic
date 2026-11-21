@@ -420,7 +420,10 @@ fn a_runner_refuses_a_request_its_secret_was_not_sent_with() {
     for (case, handed) in [
         (
             "the real request's digest",
-            secret(&[("K", value.clone()), (REQUEST_DIGEST, request_digest(&real))]),
+            secret(&[
+                ("K", value.clone()),
+                (REQUEST_DIGEST, request_digest(&real)),
+            ]),
         ),
         ("no digest", secret(&[("K", value.clone())])),
         (
@@ -440,7 +443,12 @@ fn a_runner_refuses_a_request_its_secret_was_not_sent_with() {
             &LocalBackend::default(),
             handed,
         );
-        assert_eq!(code, code::USAGE, "{case}: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            code,
+            code::USAGE,
+            "{case}: {}",
+            String::from_utf8_lossy(&err)
+        );
         assert!(
             String::from_utf8_lossy(&err).contains("refused"),
             "{case}: {}",
@@ -456,7 +464,10 @@ fn a_runner_refuses_a_request_its_secret_was_not_sent_with() {
         &mut out,
         &mut err,
         &LocalBackend::default(),
-        secret(&[("K", value.clone()), (REQUEST_DIGEST, request_digest(&forged))]),
+        secret(&[
+            ("K", value.clone()),
+            (REQUEST_DIGEST, request_digest(&forged)),
+        ]),
     );
     assert_eq!(code, code::CLEAN, "{}", String::from_utf8_lossy(&err));
     assert!(marker.exists(), "the request it was sent with ran");

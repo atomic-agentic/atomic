@@ -72,7 +72,9 @@ fn bound_secret(secret: crate::SecretEnv, request: &[u8]) -> Result<crate::Secre
         return Err("its secret variables came with no single digest of their request".into());
     };
     if *digest != request_digest(request) {
-        return Err("the request on its stdin is not the one its secret variables were sent with".into());
+        return Err(
+            "the request on its stdin is not the one its secret variables were sent with".into(),
+        );
     }
     if rest.is_empty() {
         return Err("its secret variables came with a digest and nothing else".into());

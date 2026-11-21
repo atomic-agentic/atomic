@@ -1101,6 +1101,12 @@ fn still_dumpable() -> bool {
     }
 }
 
+/// Whether `mode`, as fstat gives it, is a socket's.
+#[cfg(unix)]
+fn is_socket_mode(mode: libc::mode_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFSOCK
+}
+
 /// Whether `fd` is past the standard three, as a handed socket must be.
 #[cfg(unix)]
 fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
@@ -1117,7 +1123,6 @@ fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
 pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
-    use std::os::unix::fs::FileTypeExt;
     let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
     if still_dumpable() {
         return Err(invalid(
@@ -1130,13 +1135,24 @@ pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::Secret
         .and_then(|fd| fd.parse().ok())
         .filter(above_stdio)
         .ok_or_else(|| invalid("its descriptor is not a number above 2".to_owned()))?;
-    // SAFETY: the descriptor was handed to this process for this alone; it
-    // is read and closed here, once.
+    // Looked at before it is taken as this process's own: a descriptor that
+    // is not open must not be owned, or closing it would close another's.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes one stat into `stat`, and only reads `fd`.
     #[allow(unsafe_code)]
-    let mut socket = unsafe { std::fs::File::from_raw_fd(fd) };
-    if !socket.metadata()?.file_type().is_socket() {
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so it wrote the whole stat.
+    #[allow(unsafe_code)]
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    if !is_socket_mode(mode) {
         return Err(invalid("its descriptor is not a socket".to_owned()));
     }
+    // SAFETY: the descriptor is open, and was handed to this process for
+    // this alone; it is read and closed here, once.
+    #[allow(unsafe_code)]
+    let mut socket = unsafe { std::fs::File::from_raw_fd(fd) };
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes)?;
     drop(socket);
