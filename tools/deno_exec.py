@@ -18,8 +18,6 @@ from __future__ import annotations
 import json
 import re
 
-import yaml
-
 CHECKED = []
 CODE = "(code)"  # reserved; declarative Astro atoms never contain executable code
 
@@ -121,14 +119,21 @@ def _declaration(path, fm, project, specifiers):
     deno = (fm.get("runtime") or {}).get("deno", {})
     _require(isinstance(deno, dict) and deno.keys() <= DENO_KEYS, f"{path}: runtime.deno takes only {sorted(DENO_KEYS)}")
     _require(set(deno.get("sys", [])) <= HARMLESS_SYS, f"{path}: runtime.deno.sys may hold only {sorted(HARMLESS_SYS)}")
-    # The lockfile beside the manifest is the default; an atom may name another.
+    # The lockfile beside the manifest is the default; the manifest may name
+    # another and an atom a third. Whichever is chosen, its real path is settled
+    # before it is checked or read: a relative path or a symlink must not lead
+    # the checker out of the project, where a lockfile written elsewhere would
+    # vouch for specifiers the project never recorded.
     settings = SETTINGS.get(project, {})
-    lock_path = (path.parent / deno["lock"]).resolve() if "lock" in deno else project / settings.get("lock", "deno.lock")
+    declared = deno.get("lock", settings.get("lock", "deno.lock"))
+    lock_path = ((path.parent if "lock" in deno else project) / declared).resolve()
+    _require(lock_path.is_relative_to(project),
+             f"{path}: lockfile {declared} is {lock_path}, which is outside the project")
     for source, target in sorted(specifiers):
         _require(PINNED.fullmatch(target), f"{source}: import {target!r} must be an npm: or jsr: package pinned to an exact version")
         _require("allow_packages" not in settings or _allowed(target, settings["allow_packages"]),
                  f"{source}: {target} is not in the manifest's runtime.deno.allow_packages")
-        _require(lock_path.is_file() and lock_path.is_relative_to(project), f"{path}: lockfile {lock_path.name} is missing")
+        _require(lock_path.is_file(), f"{path}: lockfile {lock_path.name} is missing")
         _require(target in json.loads(lock_path.read_text()).get("specifiers", {}), f"{source}: {target} is not recorded in {lock_path.name}")
 
     hosts = []
