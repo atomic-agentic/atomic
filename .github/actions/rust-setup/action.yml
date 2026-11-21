@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# What every Linux Rust job in CI needs before cargo runs: system packages,
+# the pinned toolchain and Astro compiler host, the build caches and the
+# verified V8 archive, and for the test jobs the test Postgres and the user
+# namespaces Codex's sandbox needs. Actions are pinned by commit SHA.
+#
+# Two caches are restored. cargo's downloads (the registry and the git
+# sources, rusty_v8's Chromium submodules among them) are keyed on the
+# toolchain and Cargo.lock. target/ is keyed on those and the manifests, one
+# cache per kind of build ("test" for the test features' build, "check" for
+# clippy's), and holds only the dependencies' artifacts (scripts/cache-trim.py),
+# since a checkout makes the workspace's own crates rebuild in any case. Only
+# pushes to main save them (.github/actions/rust-cache-save), from the job
+# that builds the most; pull requests restore main's, so pull requests never
+# crowd the cache out. A miss falls back to the newest cache of the same kind,
+# or builds from scratch.
+
+name: Rust setup
+description: Packages, toolchain, build caches and test backends for a Linux Rust job
+
+inputs:
+  target-cache:
+    description: Which build cache to restore into target/, "test" or "check"
+    required: true
+  backends:
+    description: '"true" to start the test Postgres and allow the user namespaces the sandbox tests need'
+    default: "false"
+  warm:
+    description: >-
+      "true" for a job that saves its build cache on main. On main it restores
+      target/ only from an exact match, so that a cache it saves holds nothing
+      stale.
+    default: "false"
+  warm-downloads:
+    description: >-
+      "true" for the one job that saves cargo's downloads on main, which then
+      restores them only from an exact match, for the same reason. Other jobs
+      fall back to the newest downloads after a lockfile change.
+    default: "false"
+
+outputs:
+  cargo-home-key:
+    description: The key cargo's downloads are cached under
+    value: ${{ steps.cargo-home.outputs.cache-primary-key }}
+  cargo-home-hit:
+    description: '"true" when cargo''s downloads were restored from that exact key'
+    value: ${{ steps.cargo-home.outputs.cache-hit }}
+  target-key:
+    description: The key target/ is cached under
+    value: ${{ steps.target.outputs.cache-primary-key }}
+  target-hit:
+    description: '"true" when target/ was restored from that exact key'
+    value: ${{ steps.target.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    # The test jobs' target directory once outgrew the runner's free disk.
+    # Runners now have room to spare, so this frees space only when they do
+    # not, by dropping toolchains these jobs never use.
+    - name: Disk space
+      shell: bash
+      run: |
+        df -h /
+        if [ "$(df --output=avail -BG / | tail -1 | tr -dc 0-9)" -lt 40 ]; then
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+        fi
+
+    - name: System packages
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev bubblewrap
+
+    # Codex's Linux sandbox runs commands under bubblewrap, which needs
+    # unprivileged user namespaces; Ubuntu restricts them through AppArmor by
+    # default.
+    - name: User namespaces for the sandbox tests
+      if: inputs.backends == 'true'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+    # Postgres-backed suites read ATOMIC_TEST_DATABASE_URL and fail without it.
+    - name: Test Postgres
+      if: inputs.backends == 'true'
+      shell: bash
+      run: |
+        docker run -d --name atomic-test-postgres -p 127.0.0.1:5432:5432 \
+          -e POSTGRES_USER=atomic -e POSTGRES_PASSWORD=atomic -e POSTGRES_DB=atomic \
+          postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+        ready=""
+        for _ in $(seq 1 60); do
+          if docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic; then
+            ready=yes
+            break
+          fi
+          sleep 1
+        done
+        if [ -z "${ready}" ]; then
+          echo "::error::the test Postgres did not accept connections within 60 seconds"
+          docker logs atomic-test-postgres
+          exit 1
+        fi
+        echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
+
+    - name: Pinned Astro compiler host
+      shell: bash
+      run: |
+        python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
+        echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
+
+    # rustup installs the toolchain and components rust-toolchain.toml names.
+    - name: Toolchain
+      shell: bash
+      run: rustup show active-toolchain || rustup toolchain install
+
+    # The paths and keys here and in rust-cache-save must match exactly.
+    - name: Restore cargo's downloads
+      id: cargo-home
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: cargo-home-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+        restore-keys: ${{ !(inputs.warm-downloads == 'true' && github.ref == 'refs/heads/main') && format('cargo-home-{0}-', runner.os) || '' }}
+
+    - name: Restore the build cache
+      id: target
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: target
+        key: target-${{ inputs.target-cache }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml') }}
+        restore-keys: ${{ !(inputs.warm == 'true' && github.ref == 'refs/heads/main') && format('target-{0}-{1}-', inputs.target-cache, runner.os) || '' }}
+
+    # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
+    # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
+    - name: V8 archive
+      shell: bash
+      run: scripts/v8-archive.sh

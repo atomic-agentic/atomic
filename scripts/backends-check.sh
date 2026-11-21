@@ -13,7 +13,7 @@
 # that is the default (ATOMIC_DEV_SANDBOX unset), and CI turns user namespaces
 # off for the step. It refuses to run where the sandbox works, since it could
 # then show nothing. The sandbox half and the Postgres half's workspace pass
-# use CI's test step's cargo flags, so nothing rebuilds for them; the
+# use CI's test build's cargo flags, so nothing rebuilds for them; the
 # Postgres half's pass over atomic-agentic-durable alone rebuilds that
 # package with its own features.
 set -uo pipefail

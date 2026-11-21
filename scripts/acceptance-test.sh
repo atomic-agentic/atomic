@@ -218,10 +218,11 @@ for list in "${ROOT}"/scripts/acceptance/*.txt; do
     out="$(python3 "${CHECK}" "${milestone}" --check 2>&1)" || fail "${list}: ${out}"
 done
 
-# The features it runs with are CI's test step's, so nothing rebuilds.
+# The features it runs with are those CI builds the tests with, so nothing
+# rebuilds.
 ci="$(grep -o 'cargo test --workspace --locked --no-fail-fast --features [^ ]*' "${ROOT}/.github/workflows/ci.yml" | head -1 | awk '{print $NF}')"
 ours="$(python3 -c "import sys; sys.path.insert(0, '${ROOT}/scripts'); import acceptance; print(acceptance.FEATURES)")"
-[ -n "${ci}" ] && [ "${ci}" = "${ours}" ] || fail "acceptance.py's features (${ours}) are not CI's test step's (${ci})"
+[ -n "${ci}" ] && [ "${ci}" = "${ours}" ] || fail "acceptance.py's features (${ours}) are not CI's test build's (${ci})"
 
 # A job summary goes where GITHUB_STEP_SUMMARY says, and holds the report.
 GITHUB_STEP_SUMMARY="${WORK}/summary.md" check 0 "passed" --log "${WORK}/ok.log"
