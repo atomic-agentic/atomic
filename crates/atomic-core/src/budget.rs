@@ -20,6 +20,11 @@
 //! prices: [`resolve`] rejects it otherwise rather than claim a bound it
 //! cannot keep.
 //!
+//! Caps the person who runs atomic set in their own configuration are the
+//! exception to that layering, and [`Ceilings`] carries them: a project's
+//! file, a variable and a written limit may only bring a cap down to one of
+//! them, never above it.
+//!
 //! Caps are held as integers: tokens, milliseconds and micro-dollars
 //! (millionths of a US dollar). A price in US dollars per million tokens is
 //! therefore exactly a price in micro-dollars per token. Every amount is at
@@ -167,6 +172,84 @@ pub struct Price {
     pub max_output_tokens: Option<u64>,
 }
 
+/// A cap the person's own configuration wrote, in the units the `budget`
+/// section is written in. `None` caps nothing: a measure they leave unset
+/// keeps whatever a project's file or a written `budget` block says.
+// Not `deny_unknown_fields`, as the person's own file is read field by
+// field and these are only ever read back from a budget plan, which reads
+// past the fields a later version adds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Caps {
+    /// Cumulative tokens.
+    pub tokens: Option<u64>,
+    /// Cumulative active minutes.
+    pub minutes: Option<f64>,
+    /// A dollar cap, or `None` for none.
+    pub cost_usd: Option<f64>,
+}
+
+/// The most one model call the person's own configuration allows, as written.
+// Read past later fields, as [`Caps`] is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CallCaps {
+    /// The most input tokens one call takes.
+    pub input_tokens: Option<u64>,
+    /// The most output tokens one call returns.
+    pub output_tokens: Option<u64>,
+    /// The most active minutes one call takes.
+    pub minutes: Option<f64>,
+}
+
+/// The caps the person who runs atomic set in their own configuration, which
+/// nothing above it may raise.
+///
+/// A ceiling is a cap on the cap: for each measure it sets, the effective cap
+/// is the smaller of it and what the project's files, an `ATOMIC_*` variable
+/// or the atom's or workflow's own `budget` block says. A measure it leaves
+/// unset caps nothing. Its dollar ceiling binds even where nothing else sets
+/// a dollar cap. Where a ceiling binds, the cap's origin is
+/// [`Origin::Ceiled`], so a refusal says whose cap held.
+///
+/// Ceilings are not a setting: no file may write `budget.ceilings`, and they
+/// come only from the person's own configuration file, which the configuration
+/// layer of the command reads into [`BudgetSettings::ceilings`]. The command
+/// also holds [`BudgetSettings::atom`], [`BudgetSettings::workflow`] and
+/// [`BudgetSettings::call`] to them, so what `atomic config` shows is what a
+/// run is held to.
+// Read past later fields, as [`Caps`] is: it is `serde(skip)` in
+// [`BudgetSettings`], so no configuration file is read through it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Ceilings {
+    /// Ceilings on what an atom invocation may spend.
+    pub atom: Caps,
+    /// Ceilings on what a workflow run, children included, may spend.
+    pub workflow: Caps,
+    /// Ceilings on the most one model call may use.
+    pub call: CallCaps,
+}
+
+impl Ceilings {
+    /// The ceilings on `level`'s caps, as a `budget` block writes them:
+    /// tokens, milliseconds and micro-dollars. In range:
+    /// [`BudgetSettings::validate`] refuses a ceiling that is not, before
+    /// anything is resolved, and a ceiling too large to hold is no ceiling on
+    /// a cap that is at most [`LIMIT`] anyway.
+    pub fn held_by(&self, level: Level) -> Budget {
+        let caps = match level {
+            Level::Atom => &self.atom,
+            Level::Workflow => &self.workflow,
+        };
+        Budget {
+            tokens: caps.tokens,
+            millis: caps.minutes.and_then(|m| amount(m, 60_000.0)),
+            micro_usd: caps.cost_usd.and_then(|u| amount(u, 1_000_000.0)),
+        }
+    }
+}
+
 /// The `budget` configuration section.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -180,6 +263,17 @@ pub struct BudgetSettings {
     /// The price table, by model name. A model it does not name is unpriced:
     /// a dollar cap on it fails configuration.
     pub pricing: BTreeMap<String, Price>,
+    /// The person's own caps, which hold over every other layer and over a
+    /// written `budget` block (see [`Ceilings`]). Not a setting: it is read
+    /// from the person's own configuration file, never from a project's, and
+    /// a file that writes `budget.ceilings` is refused as an unknown setting.
+    #[serde(skip, default)]
+    pub ceilings: Ceilings,
+    /// Under a dollar cap of the person's own, the models only a project's
+    /// configuration prices, which a run calling them says at its start.
+    /// Not a setting, as [`ceilings`](Self::ceilings) is not.
+    #[serde(skip, default)]
+    pub priced_by_project: std::collections::BTreeSet<String>,
 }
 
 /// The built-in defaults. Finite for tokens and time; no dollar cap, since
@@ -203,6 +297,8 @@ impl Default for BudgetSettings {
                 minutes: 10.0,
             },
             pricing: BTreeMap::new(),
+            ceilings: Ceilings::default(),
+            priced_by_project: Default::default(),
         }
     }
 }
@@ -215,6 +311,9 @@ pub enum Origin {
     /// A default, by its setting path, such as `budget.atom.tokens`; the
     /// configuration's sources say which layer set it.
     Default(String),
+    /// The person's own cap, by its setting path: it was the smaller of it
+    /// and what the block wrote or the default said, so it holds.
+    Ceiled(String),
 }
 
 /// A budget after defaults: every cap that applies, and where each came from.
@@ -293,8 +392,8 @@ pub struct BelowCall {
     pub need: String,
     /// The unit, such as ` tokens`.
     pub unit: String,
-    /// Where the cap came from: written in the budget block, or the
-    /// default's setting.
+    /// Where the cap came from: written in the budget block, the default's
+    /// setting, or the person's own cap that bounds it.
     pub from: String,
     /// The model.
     pub model: String,
@@ -313,7 +412,7 @@ fn out_of_range(setting: String, message: &str) -> BudgetError {
 impl BudgetSettings {
     /// Check every setting is in range: caps, the call bound and prices
     /// finite, positive (a price may be zero) and at most [`LIMIT`] in their
-    /// integer units.
+    /// integer units, the person's own caps with them.
     pub fn validate(&self) -> Result<(), BudgetError> {
         let count = |setting: String, n: u64| {
             if n == 0 || n > LIMIT {
@@ -340,6 +439,31 @@ impl BudgetSettings {
         count("budget.call.input_tokens".into(), self.call.input_tokens)?;
         count("budget.call.output_tokens".into(), self.call.output_tokens)?;
         scaled("budget.call.minutes".into(), self.call.minutes, 60_000.0)?;
+        // A person's own cap is held to the same rule as the limit it caps,
+        // under the same setting name: it is that setting, in their file.
+        for (level, caps) in [
+            ("atom", &self.ceilings.atom),
+            ("workflow", &self.ceilings.workflow),
+        ] {
+            if let Some(n) = caps.tokens {
+                count(format!("budget.{level}.tokens"), n)?;
+            }
+            if let Some(minutes) = caps.minutes {
+                scaled(format!("budget.{level}.minutes"), minutes, 60_000.0)?;
+            }
+            if let Some(usd) = caps.cost_usd {
+                scaled(format!("budget.{level}.cost_usd"), usd, 1_000_000.0)?;
+            }
+        }
+        if let Some(n) = self.ceilings.call.input_tokens {
+            count("budget.call.input_tokens".into(), n)?;
+        }
+        if let Some(n) = self.ceilings.call.output_tokens {
+            count("budget.call.output_tokens".into(), n)?;
+        }
+        if let Some(minutes) = self.ceilings.call.minutes {
+            scaled("budget.call.minutes".into(), minutes, 60_000.0)?;
+        }
         for (model, price) in &self.pricing {
             let at = |field: &str| format!("budget.pricing.{model}.{field}");
             for (field, usd) in [
@@ -366,10 +490,29 @@ impl BudgetSettings {
     }
 }
 
+/// The cap one measure ends with: what its `budget` block wrote (`declared`),
+/// or `default` when it wrote nothing, held to `ceiling` when the person's own
+/// cap for the measure is smaller. With it, where that cap came from: the
+/// block, the default, or the ceiling that bound it, by its setting `path`.
+fn hold(declared: Option<u64>, default: u64, ceiling: Option<u64>, path: &str) -> (u64, Origin) {
+    let (want, from) = match declared {
+        Some(w) => (w, Origin::Declared),
+        None => (default, Origin::Default(path.to_owned())),
+    };
+    match ceiling {
+        Some(c) if c < want => (c, Origin::Ceiled(path.to_owned())),
+        _ => (want, from),
+    }
+}
+
 /// Resolve `declared` for `level` against `settings`, for calls to `models`
 /// (every model the atom or workflow may call). A dollar cap, written or
 /// inherited, needs every one of them priced, and every cap must leave room
 /// for one call to each of them.
+///
+/// Every cap is the smaller of what the block or the configured default says
+/// and what `settings`' [`Ceilings`] cap it to: a written `budget` block can
+/// only bring a cap down to a person's own cap, never above it.
 pub fn resolve(
     declared: &Budget,
     level: Level,
@@ -385,18 +528,32 @@ pub fn resolve(
     // In range: validated above.
     let millis_of = |minutes: f64| amount(minutes, 60_000.0).unwrap_or(LIMIT);
     let micro_of = |usd: f64| amount(usd, 1_000_000.0).unwrap_or(LIMIT);
-    let (tokens, tokens_from) = match declared.tokens {
-        Some(t) => (t, Origin::Declared),
-        None => (limits.tokens, Origin::Default(path("tokens"))),
-    };
-    let (millis, millis_from) = match declared.millis {
-        Some(m) => (m, Origin::Declared),
-        None => (millis_of(limits.minutes), Origin::Default(path("minutes"))),
-    };
+    // What the person who runs atomic caps this level at, in these units.
+    let capped = settings.ceilings.held_by(level);
+    let (tokens, tokens_from) = hold(
+        declared.tokens,
+        limits.tokens,
+        capped.tokens,
+        &path("tokens"),
+    );
+    let (millis, millis_from) = hold(
+        declared.millis,
+        millis_of(limits.minutes),
+        capped.millis,
+        &path("minutes"),
+    );
     let (micro_usd, cost_from) = match (declared.micro_usd, limits.cost_usd) {
         (Some(c), _) => (Some(c), Origin::Declared),
         (None, Some(usd)) => (Some(micro_of(usd)), Origin::Default(path("cost_usd"))),
         (None, None) => (None, Origin::Default(path("cost_usd"))),
+    };
+    // The person's dollar cap holds a larger one down, and stands where
+    // nothing else set one: whatever a block or a layer above them leaves
+    // out, their cap still binds.
+    let (micro_usd, cost_from) = match (micro_usd, capped.micro_usd) {
+        (Some(c), Some(k)) if k < c => (Some(k), Origin::Ceiled(path("cost_usd"))),
+        (None, Some(k)) => (Some(k), Origin::Ceiled(path("cost_usd"))),
+        _ => (micro_usd, cost_from),
     };
     if micro_usd.is_some()
         && let Some(model) = models.iter().find(|m| !settings.pricing.contains_key(**m))
@@ -497,6 +654,7 @@ impl BudgetSettings {
                 from: match origin {
                     Origin::Declared => "written in its budget block".to_owned(),
                     Origin::Default(setting) => format!("the default {setting}"),
+                    Origin::Ceiled(setting) => format!("capped by your own {setting}"),
                 },
                 model: model.to_owned(),
                 bound,

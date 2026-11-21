@@ -1032,6 +1032,134 @@ fn address_of(model: &FakeModel) -> String {
         .to_owned()
 }
 
+/// The person's own configuration, at `~/.config/atomic/config.yaml`, caps a
+/// run made with `atomic run`: the project's larger cap, and its `null` for
+/// their dollar cap, leave their caps the ones the run's plan records, with
+/// their ceilings beside them.
+#[test]
+fn your_own_configuration_caps_what_atomic_run_records() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("person-caps");
+        let project = project(&dir);
+        // Their home outside the checkout that holds the project, as a
+        // configuration inside it could have come with the project.
+        let home = std::env::temp_dir().join(format!("atomic-person-caps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.yaml"),
+            "budget:\n  atom:\n    tokens: 150000\n    cost_usd: 1\n  workflow:\n    \
+             tokens: 300000\n  pricing:\n    synthetic:\n      input_usd_per_mtok: 1\n      \
+             output_usd_per_mtok: 1\n",
+        )
+        .expect("their configuration");
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  workflow:\n    tokens: 900000\n  atom:\n    \
+             cost_usd: null\n",
+        )
+        .expect("manifest");
+        let env = model_env(&model.base_url());
+        let (d, p, h) = (dir.clone(), project.clone(), home.display().to_string());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--run-id",
+                    "capped-1",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &with(&env, &[("HOME", h.as_str())]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let state = state_dir(&dir, &project);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        // The plan is what the run's first step, `pin`, recorded.
+        let steps = rt.steps("capped-1").await.expect("steps");
+        let pin = steps
+            .iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output.clone())
+            .expect("the run pinned its plan");
+        let plan = &pin["budgets"];
+        assert_eq!(plan["run"]["tokens"], 300_000, "{plan}");
+        assert_eq!(plan["atoms"]["rank-note"]["tokens"], 150_000, "{plan}");
+        assert_eq!(plan["atoms"]["rank-note"]["micro_usd"], 1_000_000, "{plan}");
+        assert_eq!(plan["ceilings"]["workflow"]["tokens"], 300_000, "{plan}");
+        assert_eq!(plan["ceilings"]["atom"]["cost_usd"], 1.0, "{plan}");
+        let _ = std::fs::remove_dir_all(&home);
+    });
+}
+
+/// Under the person's own dollar cap, a run that calls a model only the
+/// project prices says so on stderr at its start.
+#[test]
+fn a_run_says_which_models_only_the_project_prices_under_your_dollar_cap() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("project-priced");
+        let project = project(&dir);
+        let home =
+            std::env::temp_dir().join(format!("atomic-project-priced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.yaml"),
+            "budget:\n  atom:\n    cost_usd: 1\n",
+        )
+        .expect("their configuration");
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  pricing:\n    synthetic:\n      \
+             input_usd_per_mtok: 0.000001\n      output_usd_per_mtok: 0.000001\n",
+        )
+        .expect("manifest");
+        let env = model_env(&model.base_url());
+        let (d, p, h) = (dir.clone(), project.clone(), home.display().to_string());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &with(&env, &[("HOME", h.as_str())]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "under your own dollar cap, the run calls synthetic at prices only a layer \
+                 above your own configuration sets"
+            ),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    });
+}
+
 #[test]
 fn with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why() {
     on_codex_runtime(async {

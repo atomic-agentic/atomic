@@ -358,7 +358,11 @@ fn kind(v: &Value) -> &'static str {
 /// replaced by `"…"` or `` `…` ``: double quotes, inside which a quote
 /// escaped with a backslash is part of the value, and backticks, in which
 /// serde quotes a variant or a field. An unclosed quote hides the rest.
-fn without_values(message: &str) -> String {
+///
+/// Every error this crate's layers raise is scrubbed with it, and so is any
+/// other error the command raises about a configured value, so a value put in
+/// the wrong place is never repeated where the configuration is read.
+pub fn without_values(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.chars();
     while let Some(c) = chars.next() {
