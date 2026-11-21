@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Metering atoms' model calls against the durable usage ledger.
+//! Metering atoms' model calls, and exec atoms' commands, against the
+//! durable usage ledger.
 //!
 //! A [`RunBudget`] holds a workflow run's resolved caps and the ledger. For
 //! each atom step it makes a [`Metering`] that admits every model call
@@ -13,6 +14,19 @@
 //! limit and cut off when the bound's time runs out. Each settlement records
 //! what the provider reported, priced the same way.
 //!
+//! An exec atom's command is admitted the same way, as work under the model
+//! name [`atomic_core::usage::WORK_MODEL`]: no tokens and no cost, so only
+//! its time is checked, and all the active time its allowances have left,
+//! at most its own limit, as a turn takes. It is cut off when that runs out.
+//! Its charge runs from its admission to its settlement, so it also takes in
+//! starting its runner, trying again while another runner held its
+//! workspace, and storing its output files: those are charged but not cut
+//! off. A command the cap bounds can so take its run past the cap by up to
+//! its runner's grace ([`atomic_exec::runner::RUNNER_GRACE`], 30 s), two
+//! retries a second apart, and about 1.4 s of backoff while a sweep holds
+//! the artifact store: about 35 s, plus the time its output files take to
+//! store. Each exec step running at once can go past by that much.
+//!
 //! A run's caps, prices and call bounds are resolved once, before it starts,
 //! into a [`BudgetPlan`] the run keeps: a resumed run is metered as it began,
 //! whatever the settings say by then. The caps the person who runs atomic set
@@ -20,7 +34,8 @@
 //! records sits above them, and the plan keeps them beside its caps.
 
 use atomic_core::budget::{
-    Budget, BudgetError, BudgetSettings, CallBound, Ceilings, Level, Price, Resolved, resolve,
+    Budget, BudgetError, BudgetSettings, CallBound, Ceilings, LEAST_WORK, Level, Price, Resolved,
+    check_work_room, resolve,
 };
 use atomic_core::usage::{
     Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Release, Ticket,
@@ -122,12 +137,17 @@ impl BudgetPlan {
             resolved.insert((*name).to_owned(), caps);
         }
         // An exec atom calls no model: its caps need no price, and its
-        // tokens and cost stay at nothing.
+        // tokens and cost stay at nothing. Its minutes, and the run's, must
+        // leave room to start its command.
         let mut exec_caps = BTreeMap::new();
         for (name, budget) in exec {
             let caps = resolve(budget, Level::Atom, settings, &[])
+                .and_then(|caps| check_work_room(&caps, Level::Atom).map(|()| caps))
                 .map_err(|e| (Some((*name).to_owned()), e))?;
             exec_caps.insert((*name).to_owned(), caps);
+        }
+        if !exec.is_empty() {
+            check_work_room(&run, Level::Workflow).map_err(|e| (None, e))?;
         }
         Ok(Self {
             run,
@@ -354,8 +374,9 @@ impl BudgetPlan {
 
     /// Check a plan that came from outside, such as one pinned in a run's
     /// input: its settings in range, every cap leaving room for one call to
-    /// its models, a dollar cap only over priced models, and nothing above
-    /// the ceilings recorded with the plan ([`held_to`](Self::held_to)).
+    /// its models and for one exec atom's command to start, a dollar cap
+    /// only over priced models, and nothing above the ceilings recorded with
+    /// the plan ([`held_to`](Self::held_to)).
     pub fn validate(&self) -> Result<(), String> {
         let settings = self.settings();
         settings.validate().map_err(|e| e.to_string())?;
@@ -385,6 +406,10 @@ impl BudgetPlan {
                 .map_err(|e| format!("the run: {e}"))?;
             priced(model, caps, &format!("atom {atom}"))?;
             priced(model, &self.run, "the run")?;
+        }
+        for (atom, caps) in &self.exec {
+            check_work_room(caps, Level::Atom).map_err(|e| format!("atom {atom}: {e}"))?;
+            check_work_room(&self.run, Level::Workflow).map_err(|e| format!("the run: {e}"))?;
         }
         Ok(())
     }
@@ -533,59 +558,6 @@ impl RunBudget {
     }
 }
 
-/// The least active time worth starting a command with: less left than
-/// this refuses it, and the run parks.
-const LEAST_WORK: Duration = Duration::from_millis(500);
-
-impl LedgerMeter {
-    /// Admit active work that is not a model call, such as an exec atom's
-    /// command: no tokens and no cost, and all the active time the chain has
-    /// left, as a turn takes; it is cut off when that runs out.
-    async fn admit_work(&self, call: Call) -> Result<Ticket, MeterError> {
-        let least = Charge {
-            tokens: 0,
-            millis: int(u64::try_from(LEAST_WORK.as_millis()).unwrap_or(500)),
-            micro_usd: 0,
-        };
-        let request = Request {
-            id: format!("{}:{}:{}", self.run, self.step, call.index),
-            run: self.run.clone(),
-            model: call.model.clone(),
-            chain: self.chain.clone(),
-            reserve: least,
-            maximum: least,
-            turn: true,
-        };
-        match self.ledger.admit(request).await.map_err(store)? {
-            Admission::Admitted {
-                request,
-                attempt,
-                millis,
-                bounded_by,
-            } => {
-                let admitted = Instant::now();
-                beat(&self.ledger, &request, attempt, millis, admitted);
-                if atomic_durable::failpoints::armed() {
-                    atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
-                }
-                Ok(Ticket {
-                    release: released(&request, attempt),
-                    request,
-                    attempt,
-                    model: call.model,
-                    admitted,
-                    limit: Limit {
-                        output_tokens: None,
-                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
-                    },
-                    bounded_by,
-                })
-            }
-            Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
-        }
-    }
-}
-
 /// One atom step's meter.
 struct LedgerMeter {
     ledger: Ledger,
@@ -633,11 +605,78 @@ impl LedgerMeter {
     }
 }
 
+impl LedgerMeter {
+    /// Admit `call`, reserving `reserve` with the declared `maximum`, and
+    /// hold it to what was reserved: `output_tokens` as its output limit,
+    /// and its reserved time.
+    async fn admit_reserving(
+        &self,
+        call: Call,
+        reserve: Charge,
+        maximum: Charge,
+        turn: bool,
+        output_tokens: Option<u64>,
+    ) -> Result<Ticket, MeterError> {
+        let request = Request {
+            id: format!("{}:{}:{}", self.run, self.step, call.index),
+            run: self.run.clone(),
+            model: call.model.clone(),
+            chain: self.chain.clone(),
+            reserve,
+            maximum,
+            turn,
+            longest: call
+                .longest
+                .map(|d| int(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
+        };
+        match self.ledger.admit(request).await.map_err(store)? {
+            Admission::Admitted {
+                request,
+                attempt,
+                millis,
+                bounded_by,
+            } => {
+                // While the call runs, it says so, so a call whose process
+                // dies is charged no time past its last word.
+                let admitted = Instant::now();
+                beat(&self.ledger, &request, attempt, millis, admitted);
+                // Admitted and reserved, and not yet dispatched.
+                if atomic_durable::failpoints::armed() {
+                    atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
+                }
+                Ok(Ticket {
+                    release: released(&request, attempt),
+                    request,
+                    attempt,
+                    model: call.model,
+                    admitted,
+                    limit: Limit {
+                        output_tokens,
+                        // A request's own bound; for a turn or work, the
+                        // active time it has left.
+                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
+                    },
+                    bounded_by,
+                })
+            }
+            Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
+        }
+    }
+}
+
 impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
+            // Active work that is not a model call, such as an exec atom's
+            // command: no tokens and no cost, and the active time the chain
+            // has left, at least LEAST_WORK, as a turn takes.
             if call.work {
-                return self.admit_work(call).await;
+                let least = Charge {
+                    tokens: 0,
+                    millis: int(u64::try_from(LEAST_WORK.as_millis()).unwrap_or(500)),
+                    micro_usd: 0,
+                };
+                return self.admit_reserving(call, least, least, true, None).await;
             }
             // A dollar cap can hold only over priced calls: a call to a model
             // the plan does not price, as when the model changed since the
@@ -668,52 +707,9 @@ impl Meter for LedgerMeter {
                 millis: whole.millis,
                 micro_usd: int(self.settings.cost(&call.model, input, bound.output_tokens)),
             };
-            let request = Request {
-                // The shape `<run>:<step>:<call>`. A turn whose progress
-                // record fails reads the run back off its request id (see
-                // `run_of_request` in atomic-core's `codex`), so the run
-                // keeps whatever colons it has and the step and the call
-                // are the last two fields.
-                id: format!("{}:{}:{}", self.run, self.step, call.index),
-                run: self.run.clone(),
-                model: call.model.clone(),
-                chain: self.chain.clone(),
-                reserve: whole,
-                maximum,
-                turn: call.turn,
-            };
-            match self.ledger.admit(request).await.map_err(store)? {
-                Admission::Admitted {
-                    request,
-                    attempt,
-                    millis,
-                    bounded_by,
-                } => {
-                    // While the call runs, it says so, so a call whose process
-                    // dies is charged no time past its last word.
-                    let admitted = Instant::now();
-                    beat(&self.ledger, &request, attempt, millis, admitted);
-                    // Admitted and reserved, and not yet dispatched.
-                    if atomic_durable::failpoints::armed() {
-                        atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
-                    }
-                    Ok(Ticket {
-                        release: released(&request, attempt),
-                        request,
-                        attempt,
-                        model: call.model,
-                        admitted,
-                        limit: Limit {
-                            output_tokens: Some(bound.output_tokens),
-                            // A request's own bound; for a turn, the active
-                            // time its atom has left.
-                            time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
-                        },
-                        bounded_by,
-                    })
-                }
-                Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
-            }
+            let turn = call.turn;
+            self.admit_reserving(call, whole, maximum, turn, Some(bound.output_tokens))
+                .await
         })
     }
 

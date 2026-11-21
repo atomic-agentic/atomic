@@ -283,6 +283,7 @@ where
                 input_bound,
                 turn: false,
                 work: false,
+                longest: None,
             })
             .await
             .map_err(meter_error)?;

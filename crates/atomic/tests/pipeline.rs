@@ -6405,6 +6405,7 @@ async fn spend_all_but(rt: &Durare, run: &str, left: i64) {
             reserve: charge,
             maximum: charge,
             turn: false,
+            longest: None,
         })
         .await
         .expect("admit");
@@ -6440,6 +6441,51 @@ async fn commands(rt: &Durare, run: &str) -> Vec<(String, String)> {
         .filter(|a| a.model == atomic_core::usage::WORK_MODEL)
         .map(|a| (a.request, a.state))
         .collect()
+}
+
+/// An exec atom's command reserves no more of its allowances than it can
+/// take: its own five minutes and its runner's thirty seconds of grace, not
+/// the half hour its atom has by default.
+#[test]
+fn an_exec_atoms_command_reserves_only_its_own_limit_and_its_runners_grace() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-longest");
+        let project = napping_project(&dir, "");
+        let pipeline = load(&project, "naps.workflow.yaml", &naps(false, ""));
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-longest",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 0}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt.result("naps-longest").await.expect("the naps finish");
+        let reserved: Vec<(i64, String)> = rt
+            .ledger()
+            .attempts("naps-longest")
+            .await
+            .expect("attempts")
+            .into_iter()
+            .filter(|a| a.model == atomic_core::usage::WORK_MODEL)
+            .map(|a| (a.reserved.millis, a.state))
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![
+                (330_000, "settled".to_owned()),
+                (330_000, "settled".to_owned())
+            ]
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 /// An exec atom's command is held to its minutes cap: cut off when its
