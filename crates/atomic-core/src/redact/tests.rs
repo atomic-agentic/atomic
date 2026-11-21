@@ -2301,6 +2301,33 @@ fn json_that_text_redaction_breaks_is_hidden_whole() {
     }
 }
 
+/// JSON that text redaction breaks deeper in, in a string the JSON it
+/// changed holds, is hidden whole too: by the time redaction reaches that
+/// string it no longer reads as JSON, and what the rules that read names
+/// and pairs would hide there must not show.
+#[test]
+fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
+    let doc = held(&held(&inner));
+    // Under an ordinary name and under a hint, where held JSON is opened.
+    for parent in ["body", "key"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "under {parent}: the header's value showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "under {parent}: a second pass changed it");
+    }
+}
+
 /// Text still changing when the readings run out is hidden whole.
 #[test]
 fn text_still_changing_at_the_bound_is_hidden_whole() {

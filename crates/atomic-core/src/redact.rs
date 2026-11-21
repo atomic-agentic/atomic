@@ -1428,11 +1428,12 @@ fn redact_string(string: &mut String, nested: usize) {
             && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
     };
     let mut opened = false;
+    let mut written = String::new();
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
         opened = redacted != *string && was_json(string);
-        *string = redacted;
+        written = std::mem::replace(string, redacted);
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
     // can hide where a secret starts, and a secret-named field is only clear
@@ -1441,6 +1442,12 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // JSON that text redaction broke deeper in, in a string it holds:
+        // hidden whole for the same reason.
+        if opened && broke_json_within(&written, &inner, nested) {
+            *string = REDACTED.to_owned();
+            return;
+        }
         let before = inner.clone();
         redact_nested(&mut inner, nested + 1);
         if inner != before {
@@ -1451,6 +1458,35 @@ fn redact_string(string: &mut String, nested: usize) {
         // and pairs cannot read it, and text redaction alone may leave
         // their secrets, so it is hidden whole.
         *string = REDACTED.to_owned();
+    }
+}
+
+/// Whether text redaction, which made `texted` of the JSON `written`, broke
+/// JSON held in a string inside it: fewer of its strings read as JSON, at
+/// any depth that [`redact_string`] opens, so the rules that read names and
+/// pairs there no longer can. `nested` is the depth `written` is read at.
+fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
+    serde_json::from_str::<Value>(written).is_ok_and(|written| {
+        json_in_strings(&written, nested + 1) > json_in_strings(texted, nested + 1)
+    })
+}
+
+/// How many strings in `value`, read at depth `nested`, read as JSON that
+/// [`redact_string`] opens, counting those inside them in turn.
+fn json_in_strings(value: &Value, nested: usize) -> usize {
+    match value {
+        Value::String(string)
+            if nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) =>
+        {
+            serde_json::from_str::<Value>(string)
+                .map_or(0, |inner| 1 + json_in_strings(&inner, nested + 1))
+        }
+        Value::Array(items) => items.iter().map(|item| json_in_strings(item, nested)).sum(),
+        Value::Object(fields) => fields
+            .values()
+            .map(|field| json_in_strings(field, nested))
+            .sum(),
+        _ => 0,
     }
 }
 
@@ -1564,6 +1600,12 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return false;
     };
+    // JSON in a string it holds that text redaction broke: hidden whole,
+    // as [`redact_string`] hides it.
+    if texted != *string && broke_json_within(string, &inner, nested) {
+        *string = REDACTED.to_owned();
+        return true;
+    }
     // Grown past the bound, a second pass would cut it: hidden whole now.
     if texted.len() > MAX_TEXT {
         *string = REDACTED.to_owned();
