@@ -941,7 +941,7 @@ mod tests {
 
     /// The test keyring's probe for `dir`, if it is listed there.
     pub(super) fn probe(dir: &Path) -> Option<Result<(), CredentialError>> {
-        keyring_holds(dir)?;
+        let _listed = keyring_holds(dir)?;
         if PROBE_FAILS.lock().expect("probe").iter().any(|d| d == dir) {
             return Some(Err(CredentialError::Keyring(
                 "the test keyring refuses".into(),
