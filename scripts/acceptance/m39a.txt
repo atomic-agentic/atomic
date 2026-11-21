@@ -72,11 +72,15 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 # directory with `--project` and a relative fixture path, and both runs are
 # bound to the same commit of the same fixture, which is then as it was; the
 # others run the turn where the project sits: outside any repository, and in a
-# subdirectory of the developer's checkout.
+# subdirectory of the developer's checkout. The last runs the coding example
+# itself, from two directories outside the project, to completion: it pins the
+# revision it was given and not the fixture's own tip, and compares the
+# fixture's refs, its worktrees and its working tree, every untracked file
+# included, once its baseline is bound and again after the change is accepted.
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
-pending: no test runs the coding example itself (`examples/02-change-request`) from outside the project: these use a one-step coding workflow a test writes, the run started from an unrelated directory stops at its gate before the coding turn, and its comparison of the fixture leaves out `git status`. A test would run the example with `--project` from an unrelated directory, with `--fixture` and `--fixture-rev`, to completion, and compare the fixture's full state.
+run_cli the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_being
 
 ## A bad path or a missing commit fails before any model call.
 # `fixture.path` for a path that is no repository or is inside one,
