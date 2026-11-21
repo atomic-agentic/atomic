@@ -1807,3 +1807,302 @@ fn a_held_key_with_no_marker_is_judged_whole() {
         .collect();
     assert_eq!(keys, [REDACTED], "{out}");
 }
+
+/// JSON in a string under a hint is redacted as held: a value inside that
+/// looks like a credential is hidden as it would be in a real object.
+#[test]
+fn json_held_in_a_string_under_a_hint_is_redacted_as_held() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    // Pretty, as a model or a tool writes it: compact, the whole string
+    // already reads as a credential and is hidden.
+    let inner =
+        serde_json::to_string_pretty(&json!({"note": credential, "size": 3})).expect("JSON");
+    let mut out = json!({"key": inner});
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&credential[4..]),
+        "the credential showed"
+    );
+    let held: Value =
+        serde_json::from_str(out["key"].as_str().expect("a string")).expect("still JSON");
+    assert_eq!(held["size"], 3, "{held}");
+    let mut again = out.clone();
+    value(&mut again);
+    assert_eq!(again, out, "a second pass changed it");
+}
+
+/// Held JSON written compactly but spaced, which does not read as a
+/// credential whole, settles in one pass: written back compact it would,
+/// so it is hidden whole at once.
+#[test]
+fn spaced_compact_held_json_settles_in_one_pass() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let mut out = json!({"key": format!("{{\"note\": \"{credential}\", \"size\": 3}}")});
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&credential[4..]),
+        "the credential showed"
+    );
+    let mut again = out.clone();
+    value(&mut again);
+    assert_eq!(again, out, "a second pass changed it");
+}
+
+/// A string under a hint that holds JSON with nothing to hide is left as it
+/// was written, so nothing reads it as changed.
+#[test]
+fn json_held_with_nothing_to_hide_stays_as_written() {
+    for written in [
+        "{\n    \"size\": 3,\n    \"note\": \"ship it\"\n}",
+        "{\"size\": 3, \"note\": \"ship it\"}",
+    ] {
+        let mut out = json!({"key": written});
+        value(&mut out);
+        assert_eq!(out["key"], written);
+    }
+}
+
+/// A header named by its last dotted segment is a header, in a real object
+/// and in JSON held in a string under a hint.
+#[test]
+fn a_dotted_header_name_holds_its_header_secret() {
+    // Values that do not look like credentials by themselves: only the
+    // header rule hides them.
+    let session = concat!("sid=", "SEEDED", "; path=/");
+    let bearer = concat!("Bearer ", "SEEDED");
+    for (case, doc) in [
+        json!({"http.cookie": session}),
+        json!({"http.request.header.authorization": bearer}),
+        json!({"key": {"cookie": session}}),
+        json!({"key": {"http.cookie": session}}),
+        json!({"key": serde_json::to_string_pretty(&json!({"http.cookie": session})).expect("JSON")}),
+        json!({"key": serde_json::to_string_pretty(&json!({"http.request.header.authorization": bearer})).expect("JSON")}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("SEEDED"),
+            "case {case}: a header secret showed"
+        );
+    }
+}
+
+/// Held JSON that redaction would grow past the text bound is hidden whole,
+/// so a second pass does not cut it.
+#[test]
+fn held_json_that_would_grow_past_the_bound_is_hidden_whole() {
+    // Pretty, so it never reads whole as a credential: each
+    // `"password": "x"` grows by the marker's length less one.
+    let items: Vec<Value> = (0..1800).map(|_| json!({"password": "x"})).collect();
+    let inner = serde_json::to_string_pretty(&Value::Array(items)).expect("JSON");
+    assert!(
+        inner.len() <= MAX_TEXT && inner.len() + 1800 * 9 > MAX_TEXT,
+        "{}",
+        inner.len()
+    );
+    let mut out = json!({"key": inner});
+    value(&mut out);
+    assert_eq!(out["key"], REDACTED);
+    let mut again = out.clone();
+    value(&mut again);
+    assert_eq!(again, out);
+}
+
+/// Opening held JSON and reading dotted header names never shows what
+/// redaction before them hid: over many generated documents, every planted
+/// secret hidden as before is hidden now.
+#[test]
+fn opening_held_json_never_shows_what_redaction_hid_before() {
+    let mut seed: u64 = 0x5eed_0fa7_0c1c_u64;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    const KEYS: &[&str] = &[
+        "key",
+        "cache_key",
+        "note",
+        "value",
+        "name",
+        "http.cookie",
+        "authorization",
+        "http.request.header.authorization",
+        "items",
+        "--password",
+        "password",
+        "token",
+        "data",
+        "header",
+        "x-api-key",
+        "args",
+    ];
+    let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
+    for _ in 0..3000 {
+        let mut planted: Vec<String> = Vec::new();
+        let doc = generate(&mut next, &mut planted, 0);
+        let doc = json!({ KEYS[next(KEYS.len() as u64) as usize]: doc });
+        let mut now = doc.clone();
+        value(&mut now);
+        let mut before = doc.clone();
+        AS_MAIN.with(|m| m.set(true));
+        value(&mut before);
+        AS_MAIN.with(|m| m.set(false));
+        // As stable as before: where a second pass changed nothing before,
+        // it changes nothing now.
+        let mut now_again = now.clone();
+        value(&mut now_again);
+        let mut before_again = before.clone();
+        AS_MAIN.with(|m| m.set(true));
+        value(&mut before_again);
+        AS_MAIN.with(|m| m.set(false));
+        if before_again == before && now_again != now {
+            unstable += 1;
+        }
+        let (now, before) = (now.to_string(), before.to_string());
+        shown_more += planted
+            .iter()
+            .filter(|p| now.contains(p.as_str()) && !before.contains(p.as_str()))
+            .count();
+        hidden_more += planted
+            .iter()
+            .filter(|p| before.contains(p.as_str()) && !now.contains(p.as_str()))
+            .count();
+    }
+    assert_eq!(shown_more, 0, "a secret hidden before is shown now");
+    assert_eq!(
+        unstable, 0,
+        "a second pass changes what it did not change before"
+    );
+    // The comparison compares something: some are hidden only now.
+    assert!(hidden_more > 0, "nothing is hidden that was shown before");
+
+    fn generate(
+        next: &mut impl FnMut(u64) -> u64,
+        planted: &mut Vec<String>,
+        depth: usize,
+    ) -> Value {
+        let secret = |next: &mut dyn FnMut(u64) -> u64, planted: &mut Vec<String>| {
+            let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+            let mut s = String::from("Q");
+            for _ in 0..15 {
+                s.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+            }
+            planted.push(s.clone());
+            s
+        };
+        match if depth >= 3 { next(5) } else { next(9) } {
+            0 => json!(secret(next, planted)),
+            1 => json!(format!("session={}", secret(next, planted))),
+            2 => json!(format!("Bearer {}", secret(next, planted))),
+            3 => json!(format!("password={}", secret(next, planted))),
+            4 if next(2) == 0 => {
+                json!([{"name": "DB_PASSWORD", "value": format!("{} x", secret(next, planted))}])
+            }
+            4 if next(2) == 0 => json!([
+                "run",
+                "--DB_PASSWORD",
+                format!("{} x", secret(next, planted))
+            ]),
+            4 => json!("ship it"),
+            5 | 6 => {
+                let mut fields = serde_json::Map::new();
+                for _ in 0..=next(3) {
+                    let key = KEYS[next(KEYS.len() as u64) as usize];
+                    fields.insert(key.to_owned(), generate(next, planted, depth + 1));
+                }
+                Value::Object(fields)
+            }
+            7 => Value::Array(
+                (0..=next(3))
+                    .map(|_| generate(next, planted, depth + 1))
+                    .collect(),
+            ),
+            _ => {
+                let inner = generate(next, planted, depth + 1);
+                if next(2) == 0 {
+                    json!(inner.to_string())
+                } else {
+                    json!(serde_json::to_string_pretty(&inner).expect("JSON"))
+                }
+            }
+        }
+    }
+}
+
+/// What redacts in JSON held in a string as written, a secret's name and
+/// value pair or flag, or a token after an escaped `/`, still redacts once
+/// the string is opened, as it does unopened.
+#[test]
+fn held_json_hides_what_unopened_json_hides() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let pretty = |v: Value| serde_json::to_string_pretty(&v).expect("JSON");
+    for (case, doc) in [
+        json!({"credentials": pretty(json!([{"name": "DB_PASSWORD", "value": "correct horse"}]))}),
+        json!({"key": pretty(json!(["run", "--DB_PASSWORD", "correct horse"]))}),
+        json!({"credentials": {"env": [{"name": "DB_PASSWORD", "value": "correct horse"}]}}),
+        json!({"key": format!("{{\"a\": \"{credential}\", \"url\": \"see https:\\/\\/h\\/t\\/{SAMPLE} ok\"}}")}),
+        json!({"key": format!("{{\"a\": \"{credential}\", \"url\": \"see x\\u002b{SAMPLE} ok\"}}")}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        let shown = out.to_string();
+        assert!(!shown.contains("correct horse"), "case {case}: a secret showed");
+        assert!(!shown.contains(&SAMPLE[4..]), "case {case}: a token showed");
+        assert!(!shown.contains(&credential[4..]), "case {case}: a credential showed");
+    }
+}
+
+/// A header named by its last dotted segment in a name and value pair is
+/// read by its name too, as it was before dotted names were headers.
+#[test]
+fn a_dotted_header_in_a_pair_is_read_by_its_name_too() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, doc) in [
+        json!([["http.cookie", credential]]),
+        json!({"name": "http.response.header.set-cookie", "value": "opaque session"}),
+        json!({"key": "http.request.header.proxy-authorization", "value": "hunter2"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        let shown = out.to_string();
+        for secret in [&credential[4..], "opaque session", "hunter2"] {
+            assert!(!shown.contains(secret), "case {case}: a secret showed");
+        }
+    }
+}
+
+/// Held JSON that is rewritten settles in one pass, under a header's name
+/// and where text redaction reads the rewritten form.
+#[test]
+fn rewritten_held_json_settles_in_one_pass() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, doc) in [
+        json!({"authorization": format!("{{\"id\": \"a b\", \"k\": \"{credential}\"}}")}),
+        json!({"key": format!("{{\"x/MAX_TOKEN\": \"a b\", \"k\": \"{credential}\"}}")}),
+        json!({"cookie": format!("{{\"note\": \"a b\", \"k\": \"{credential}\"}}")}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut once = doc;
+        value(&mut once);
+        assert!(
+            !once.to_string().contains(&credential[4..]),
+            "case {case}: a credential showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(twice, once, "case {case}: a second pass changed it");
+    }
+}
