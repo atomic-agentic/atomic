@@ -1483,11 +1483,13 @@ struct Late {
 /// up to [`LINK_DEPTH`] levels inside a place, or a place that is now a
 /// link, is followed; one that a denial covers already, or that
 /// [`deniable`] leaves alone, needs nothing, and what is found is denied at
-/// its second mounts too. Nothing runs when a place now leads to what the
-/// command needs (`needed`), or two or more levels inside a directory of
+/// its second mounts too, as is each second mount of what `denied` holds
+/// made since the list was built, from one read of the mount table. Nothing
+/// runs when a place, or a new second mount, now leads to what the command
+/// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold come
-/// to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; or when the links the places hold and
+/// those second mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_link_targets(
     denied: &[PathBuf],
@@ -1610,32 +1612,36 @@ fn late_link_targets(
         }
     }
     collapse(&mut late.targets);
-    // Their second mounts too, held to the same rules.
-    if !late.targets.is_empty() {
-        let mut found = crate::mounts::second_mounts(&[&late.targets])
-            .map_err(|e| DenyRefused(format!("{e:#}")))?;
-        for alias in &found[0] {
-            refuse(alias, alias)?;
-        }
-        let aliases = found[0].len();
-        // A second mount a denial covers already needs none of its own.
-        let uncovered = |a: &PathBuf| !covered.iter().any(|c| real(a).starts_with(c));
-        found[0].retain(uncovered);
-        late.targets.extend(found.into_iter().flatten());
-        collapse(&mut late.targets);
-        let count = held.len() + aliases;
-        if count > MAX_LINK_TARGETS {
-            bail!(DenyRefused(format!(
-                "the places denied to atoms' commands now hold {} links to files elsewhere, with \
-                 {aliases} second mounts of what the new ones point at, more than the \
-                 {MAX_LINK_TARGETS} atomic follows",
-                held.len()
-            )));
-        }
-    } else if held.len() > MAX_LINK_TARGETS {
+    // One read of the mount table as the command starts: the second mounts
+    // of what is new, and those of what the list denies already, which a
+    // mount made since the list was built may have added to. Each is held
+    // to the same rules.
+    let found = crate::mounts::second_mounts(&[&late.targets, &covered])
+        .map_err(|e| DenyRefused(format!("{e:#}")))?;
+    for alias in &found[0] {
+        refuse(alias, alias)?;
+    }
+    let aliases = found[0].len();
+    // A second mount a denial covers already needs none of its own.
+    let uncovered = |a: &PathBuf| !covered.iter().any(|c| real(a).starts_with(c));
+    let mut found = found.into_iter();
+    let mut of_new: Vec<PathBuf> = found.next().unwrap_or_default();
+    of_new.retain(uncovered);
+    let mut since: Vec<PathBuf> = found.next().unwrap_or_default();
+    since.retain(uncovered);
+    for alias in &since {
+        refuse(alias, alias)?;
+    }
+    let mounted = since.len();
+    late.targets.extend(of_new);
+    late.targets.extend(since);
+    collapse(&mut late.targets);
+    let count = held.len() + aliases + mounted;
+    if count > MAX_LINK_TARGETS {
         bail!(DenyRefused(format!(
-            "the places denied to atoms' commands now hold {} links to files elsewhere, more \
-             than the {MAX_LINK_TARGETS} atomic follows",
+            "the places denied to atoms' commands now hold {} links to files elsewhere, with \
+             {aliases} second mounts of what the new ones point at and {mounted} of what they \
+             deny made since the list was built, more than the {MAX_LINK_TARGETS} atomic follows",
             held.len()
         )));
     }
@@ -3920,7 +3926,7 @@ mod tests {
             .to_string();
         assert!(
             refused
-                .contains("with 0 second mounts of what the new ones point at, more than the 512"),
+                .contains("with 0 second mounts of what the new ones point at and 0 of what they deny made since the list was built, more than the 512"),
             "{refused}"
         );
     }
@@ -3970,7 +3976,9 @@ mod tests {
         assert!(late.targets.contains(&creds), "{late:?}");
         assert!(late.targets.contains(&again), "{late:?}");
         // A second mount a denial covers already needs none of its own.
-        let built = [place.clone(), PathBuf::from("/again")];
+        // As the builder would: the place at its own second mount too.
+        let again_place = Path::new("/again").join(place.strip_prefix("/").expect("absolute"));
+        let built = [place.clone(), again_place, again.clone()];
         let late = late_link_targets(&built, Some(only), &[], &[]).expect("walked");
         assert_eq!(late.targets, [creds], "{late:?}");
     }
@@ -4074,6 +4082,93 @@ mod tests {
                 targets: Vec::new(),
                 replaced: vec![netrc.clone()],
             }
+        );
+    }
+
+    /// A second mount of what the list denies, made after it was built, is
+    /// denied at its new place for the next command, held to the same rules
+    /// as the rest.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_made_since_the_list_is_denied_for_the_next_command() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+        let dir = Scratch::new("mounted-since");
+        let home = dir.0.join("home");
+        let place = home.join(".aws");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        for d in [&place, &work, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        });
+        // The list, built while the home is mounted once.
+        let built = crate::mounts::with_table(ONE_MOUNT);
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let args: Vec<std::ffi::OsString> = [
+            "codex-linux-sandbox".to_owned(),
+            "--command-cwd".to_owned(),
+            work.display().to_string(),
+            "--permission-profile".to_owned(),
+            serde_json::to_string(&profile).expect("json"),
+            "--".to_owned(),
+            "true".to_owned(),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let places = [place.clone()];
+        assert_eq!(relisted(&args, Some(&places)).expect("nothing new"), None);
+        drop(built);
+        // The home bound at a second path since.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again rw - ext4 /dev/sda1 rw\n",
+            home.display()
+        );
+        let _since = crate::mounts::with_table(table.as_bytes());
+        let again = relisted(&args, Some(&places))
+            .expect("relisted")
+            .expect("more denied");
+        let at = again
+            .iter()
+            .position(|a| a == "--permission-profile")
+            .expect("flag");
+        let profile: PermissionProfile =
+            serde_json::from_str(again[at + 1].to_str().expect("text")).expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let denied: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        assert!(denied.contains(&PathBuf::from("/again/.aws")), "{denied:?}");
+        // Where the new mount of it holds what the command needs: refused.
+        let refused = late_link_targets(
+            &places,
+            Some(&places),
+            &[PathBuf::from("/again/.aws/needed")],
+            &[],
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            refused.contains("/again/.aws now leads to /again/.aws, which holds")
+                && refused.contains("which this command needs"),
+            "{refused}"
         );
     }
 
@@ -4295,6 +4390,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_helper_relists_a_turns_profile() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("relisted");
         let place = dir.join("home/.aws");
         let work = dir.join("work");
