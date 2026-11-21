@@ -63,6 +63,10 @@ pub const PORT_REFUSED: &str = "port_not_allowed";
 /// The reason the proxy gives for a host no atom declared.
 pub const HOST_REFUSED: &str = "not_allowed";
 
+/// The reason the proxy gives for a host under a declared wildcard that
+/// belongs to a public suffix below it: someone else's site.
+pub const SUFFIX_REFUSED: &str = "crosses_public_suffix";
+
 /// The reason the proxy gives for a request on a connection that no
 /// confined command's bridge opened: one without a token the proxy issued.
 pub const UNATTRIBUTED_REFUSED: &str = "not_from_a_command";
@@ -174,8 +178,10 @@ fn check_host(host: &str) -> Result<String, String> {
 /// Whether `*.<name>` covers names under which anyone can have a site: when
 /// `name` is a public suffix on the Public Suffix List, from its ICANN
 /// section (`co.uk`) or its private one (`github.io`, `s3.amazonaws.com`),
-/// or when a wildcard rule makes every name just below it one (`*.run.app`,
-/// `*.kawasaki.jp`), which a child that is a suffix shows. A name above a
+/// or when a wildcard rule on the list makes the names just below it
+/// suffixes (`*.run.app`, `*.kawasaki.jp`), which a made-up child that is a
+/// suffix shows; an exception to such a rule (`city.kawasaki.jp`) is one
+/// site, and a wildcard under it passes. A name above a
 /// suffix (`amazonaws.com`, above `s3.amazonaws.com`) passes here; the
 /// proxy keeps such a wildcard from reaching that suffix's names
 /// ([`declared`]).
@@ -188,12 +194,28 @@ fn public_suffix(name: &str) -> bool {
 }
 
 /// Whether `host` is under `parent` without crossing a public suffix: its
-/// own public suffix is shorter than `parent`, so the site it belongs to is
-/// at or below `parent`. Under `*.amazonaws.com`, `foo.amazonaws.com` is,
+/// own public suffix is shorter than `parent`, so the site it belongs to,
+/// its registrable domain, is `parent` or a name above it, and every name
+/// between `host` and `parent` is that one site's. Under `*.amazonaws.com`, `foo.amazonaws.com` is,
 /// and `bucket.s3.amazonaws.com` is not, since `s3.amazonaws.com` is a
 /// suffix of its own, whose sites are other people's.
 fn within_one_site(host: &str, parent: &str) -> bool {
     psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.trim().as_bytes().len() < parent.len())
+}
+
+/// Whether `host`, as a request names it, is under a `*.` name of
+/// `declared` only across a public suffix below it, as
+/// `bucket.s3.amazonaws.com` is under `*.amazonaws.com`.
+fn crosses_public_suffix(declared: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    declared
+        .iter()
+        .filter_map(|p| p.strip_prefix("*."))
+        .any(|parent| {
+            host.strip_suffix(parent)
+                .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.'))
+                && !within_one_site(&host, parent)
+        })
 }
 
 /// Whether `host`, as a request names it, is one of `declared`: the name
@@ -226,7 +248,11 @@ impl NetworkPolicyDecider for DeclaredHosts {
         let decision = if req.execution_id.is_none() {
             NetworkDecision::deny(UNATTRIBUTED_REFUSED)
         } else if !declared(&self.0, &req.host) {
-            NetworkDecision::deny(HOST_REFUSED)
+            NetworkDecision::deny(if crosses_public_suffix(&self.0, &req.host) {
+                SUFFIX_REFUSED
+            } else {
+                HOST_REFUSED
+            })
         } else if !PORTS.contains(&req.port) {
             NetworkDecision::deny(PORT_REFUSED)
         } else {
@@ -759,6 +785,36 @@ mod tests {
         ] {
             assert!(!declared(&hosts, no), "{no}");
         }
+        // Each of those but the last, which is under no declared name, is
+        // refused for crossing a suffix rather than as undeclared.
+        for crossing in [
+            "attacker.s3.amazonaws.com",
+            "x.s3.us-east-1.amazonaws.com",
+            "lb.us-east-1.elb.amazonaws.com",
+        ] {
+            assert!(crosses_public_suffix(&hosts, crossing), "{crossing}");
+        }
+        for not in ["other.github.io", "foo.amazonaws.com", "api.example.net"] {
+            assert!(!crosses_public_suffix(&hosts, not), "{not}");
+        }
+        // And the proxy says so.
+        let proxies = Proxies::default();
+        let (prepared, _lease) = proxies
+            .prepare(&["*.amazonaws.com".to_owned()], &[], HashMap::new())
+            .expect("starts");
+        let addr = prepared.env["HTTP_PROXY"]
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_owned();
+        let token = &prepared.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY];
+        assert_eq!(
+            fetch_from(&addr, Some(token), "sts.us-east-1.amazonaws.com"),
+            format!("403 {SUFFIX_REFUSED}")
+        );
+        assert_eq!(
+            fetch_from(&addr, Some(token), "example.org"),
+            format!("403 {HOST_REFUSED}")
+        );
     }
 
     /// The proxy never forwards through another proxy, whatever atomic's
@@ -1037,6 +1093,7 @@ mod tests {
             "*.foo.kawasaki.jp",
             // Parents of wildcard rules: every name below is a suffix.
             "*.run.app",
+            "*.mtls.run.app",
             "*.kawasaki.jp",
             "*.elb.amazonaws.com",
             // On the list, so name the exact hosts instead.

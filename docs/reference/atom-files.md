@@ -168,7 +168,8 @@ export const config = {
 ```
 
 `network.allow` lists DNS names, each a name with at least two labels or `*.`
-and such a name for its subdomains, up to 32 of them. `network: false`, or no
+and such a name for its subdomains, as far as the Public Suffix List allows
+(see below), up to 32 of them. `network: false`, or no
 `network` at all, means none. On Linux the command then gets a network of its
 own whose only way out is a proxy atomic runs for it, which forwards a request
 only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
@@ -228,12 +229,17 @@ Know what a listed host can get:
   Public Suffix List, its ICANN section (`co.uk`) and its private one, where
   each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
   is refused when the atom loads if the name under it is on the list, or if
-  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  a wildcard rule on the list makes the names just below it suffixes
+  (`*.run.app`, `*.kawasaki.jp`); an exception to such a rule is one site, so
+  `*.city.kawasaki.jp` loads. That refuses
   `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
   others: name the exact hosts instead. A wildcard above a listed name, such
   as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
   it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
-  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  someone else's site under `s3.amazonaws.com`. The proxy refuses such a
+  request with the reason `crosses_public_suffix`, not `not_allowed`, so
+  `sts.us-east-1.amazonaws.com` under `*.amazonaws.com` says why; list it
+  exactly to reach it. A wildcard under a name you
   hold, such as `*.example.com`, still reaches whatever is served under it,
   and a shared host missing from the list is not caught. List exact names
   where you can.
