@@ -41,6 +41,7 @@ test entry_point
 test examples
 test exec_private_state
 test second_mounts
+test stale_roots
 test exec_caches
 test exec_network
 test exec_network_fds
@@ -76,6 +77,7 @@ test test_database
 test model_auth
 test model_auth_sandbox
 test stop_all
+test secret_socket
 test stop_bomb
 
 [crash]

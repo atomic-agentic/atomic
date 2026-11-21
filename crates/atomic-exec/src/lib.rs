@@ -153,7 +153,9 @@ pub struct Command {
     /// `/proc/<pid>/fd`, so in that window another process can take them
     /// only by attaching to the program (ptrace, `pidfd_getfd`), which Yama's
     /// `ptrace_scope` of 1 or more refuses to a process that is not its
-    /// ancestor; at `ptrace_scope` 0 the window is narrowed, not closed.
+    /// ancestor; at `ptrace_scope` 0 one can attach in that window and keep
+    /// its access after, so the window is narrowed, not closed. A process
+    /// runner forwards them to its runner the same way.
     pub secret_env: SecretEnv,
 }
 
@@ -165,8 +167,7 @@ pub const SECRET_ENV_FD: &str = "ATOMIC_SECRET_ENV_FD";
 /// environment: the command finds the socket's descriptor in
 /// [`SECRET_ENV_FD`] and reads `KEY=VALUE` entries, each ended by a NUL
 /// byte, until the other end closes. Its `Debug` form shows the names only.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretEnv(pub Vec<(String, String)>);
 
 impl std::fmt::Debug for SecretEnv {
