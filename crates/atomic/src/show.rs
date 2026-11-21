@@ -162,17 +162,35 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
     })))
 }
 
-/// The kind of the atom whose checkpoint `checkpoint` (`<step>.<part>`, as
-/// `assess.publish`) is, from the pipeline the run pinned in its `input`:
-/// `codex`, `lite` and so on. None when the run pinned no such step or atom.
+/// The kind of the atom whose checkpoint `checkpoint` is, from the pipeline
+/// the run pinned in its `input`: `codex`, `lite` and so on. A checkpoint is
+/// `<turn>.<part>`, as `assess.publish`, and a turn is a step's author
+/// (`<id>`), one of its reviewers' verdicts (`<id>.review.<n>`, the step's
+/// reviewer) or a repair round of its author (`<id>.repair.<n>`). None when
+/// the run pinned no such step or atom.
 fn atom_kind(input: &Value, checkpoint: &str) -> Option<String> {
-    let step = checkpoint.rsplit_once('.').map_or(checkpoint, |(id, _)| id);
+    let turn = checkpoint
+        .rsplit_once('.')
+        .map_or(checkpoint, |(turn, _)| turn);
     let pipeline = &input["pipeline"];
-    let atom = pipeline["steps"]
-        .as_array()?
-        .iter()
-        .find(|s| s["id"] == step)?["atom"]
-        .as_str()?;
+    let steps = pipeline["steps"].as_array()?;
+    let step = |id: &str| steps.iter().find(|s| s["id"] == id);
+    let atom = match step(turn) {
+        Some(found) => found["atom"].as_str()?,
+        None => {
+            let mut parts = turn.rsplitn(3, '.');
+            let (round, role, id) = (parts.next()?, parts.next()?, parts.next()?);
+            if round.is_empty() || !round.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let found = step(id)?;
+            match role {
+                "review" => found["review"]["reviewer"].as_str()?,
+                "repair" => found["atom"].as_str()?,
+                _ => return None,
+            }
+        }
+    };
     pipeline["atoms"][atom]["kind"].as_str().map(str::to_owned)
 }
 
@@ -362,14 +380,25 @@ mod tests {
         let input = json!({"pipeline": {
             "steps": [
                 {"kind": "atom", "id": "assess", "atom": "assess-order"},
-                {"kind": "atom", "id": "fix", "atom": "fix-bug"},
+                {"kind": "atom", "id": "fix", "atom": "fix-bug",
+                 "review": {"reviewer": "check-fix", "rounds": 2}},
                 {"kind": "gate", "id": "accept"},
             ],
-            "atoms": {"assess-order": {"kind": "lite"}, "fix-bug": {"kind": "codex"}},
+            "atoms": {
+                "assess-order": {"kind": "lite"},
+                "fix-bug": {"kind": "codex"},
+                "check-fix": {"kind": "lite"},
+            },
         }});
         let kind = |step| super::atom_kind(&input, step);
         assert_eq!(kind("assess.publish").as_deref(), Some("lite"));
         assert_eq!(kind("fix.publish").as_deref(), Some("codex"));
+        // A reviewer's verdict is the reviewer's; a repair round, the author's.
+        assert_eq!(kind("fix.review.1.publish").as_deref(), Some("lite"));
+        assert_eq!(kind("fix.repair.1.publish").as_deref(), Some("codex"));
+        assert_eq!(kind("assess.review.1.publish"), None, "no reviewer");
+        assert_eq!(kind("fix.review.x.publish"), None);
+        assert_eq!(kind("fix.other.1.publish"), None);
         assert_eq!(kind("accept.gate"), None);
         assert_eq!(kind("gone.publish"), None);
         assert_eq!(

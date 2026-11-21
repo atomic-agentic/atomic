@@ -38,13 +38,15 @@ executed, from its start or from its checkpoints; each recorded step with the
 attempt that ran it, so after a kill and a resume it shows which steps the
 resume found checkpointed and which it ran again; its model calls and tokens,
 counting what a Codex turn still running, or stopped before it settled, last
-recorded having reported;
-its gates; and, for each atom step, what its turn recorded: the Codex thread
-that holds a Codex atom's transcript, or the provider's id for a lite atom's
-last response, since a lite atom keeps no transcript. `--json` gives the same
-as one document, with each step's output and each recorded turn's atom kind. It reads the store alone, and
-runs nothing: it needs no model, does not take the project's execution lock,
-and answers while a run holds it.
+recorded having reported; its gates; and what each turn recorded, the
+author's, each reviewer's and each repair round's: the Codex thread that holds
+a Codex atom's transcript, or the provider's id for a lite atom's last
+response, since a lite atom keeps no transcript. A turn whose atom's kind the
+run did not pin, as a workflow written in Rust pins none, is shown only as a
+recorded turn. `--json` gives the same as one document, with each step's output
+and each recorded turn's atom kind. It reads the store alone, and runs
+nothing: it needs no model, does not take the project's execution lock, and
+answers while a run holds it.
 
 ## Choose what to run and what to send
 
