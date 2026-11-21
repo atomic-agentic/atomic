@@ -1,0 +1,1 @@
+persons-dollar-cap-stands|crates/atomic-core/src/budget.rs|        (None, Some(k)) => (Some(k), Origin::Ceiled(path("cost_usd"))),|        (None, Some(k)) if std::hint::black_box(false) => (Some(k), Origin::Ceiled(path("cost_usd"))),|-p atomic-agentic-core --lib --features fake-model -- a_persons_dollar_cap_binds_where_nothing_else_set_one

@@ -115,6 +115,22 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The backend on this machine that `atomic run`, `atomic serve` and the
+/// evals run turns and exec atoms' commands on, unconfined and unconnected:
+/// scratch in the project's state, outside every directory a sandboxed
+/// turn may write.
+pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"))
+}
+
+/// The backend `atomic debug codex-prompt` and `atomic debug probe` run
+/// their turn on: one of its own beside [`local_backend`], since these
+/// commands take no execution lock, and connecting empties a backend's
+/// shared temporary directory, which a run's turns may be using.
+pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch-debug"))
+}
+
 /// The backend exec atoms' commands run on with `runner`: scratch in the
 /// project's state, confined like turns' commands where that is verified,
 /// connected once.
@@ -127,7 +143,7 @@ pub fn exec_backend(
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    let local = local_backend(state);
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
@@ -350,14 +366,16 @@ pub fn deployment() -> Deployment {
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
-    /// Where its store is, for messages.
-    pub store: String,
+    /// Where its durable store is, for messages.
+    pub store_description: String,
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// The project's artifact store, which its runs read and write.
+    pub artifacts: LocalStore,
 }
 
 impl Engine {
@@ -470,7 +488,7 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
-            store,
+            store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
@@ -494,9 +512,10 @@ pub async fn open(
     }
     Ok(Engine {
         rt,
-        store: describe(&database),
+        store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        artifacts: store,
     })
 }
 

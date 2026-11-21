@@ -32,6 +32,12 @@ if grep -qa "ATOMIC_FAILPOINT" "${BIN}"; then
     echo "scripts/release-package.sh: ${BIN} has crash-test failpoints compiled in; build it on its own, as above" >&2
     exit 1
 fi
+# Nor one built with the fake-model test feature, whose login an environment
+# variable could send to an issuer of its own.
+if grep -qa "ATOMIC_TEST_LOGIN_ISSUER" "${BIN}"; then
+    echo "scripts/release-package.sh: ${BIN} has the fake-model test feature compiled in; build it on its own, as above" >&2
+    exit 1
+fi
 
 VERSION="$(cd "${ROOT}" && cargo pkgid -p atomic-agentic)"
 VERSION="${VERSION##*@}"

@@ -38,8 +38,9 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The version of the request and response format.
-pub const PROTOCOL: u32 = 1;
+/// The version of the request and response format: 2 since a request
+/// carries secret variables, which a runner that knows only 1 would drop.
+pub const PROTOCOL: u32 = 2;
 
 /// The exit codes `atomic runner` uses.
 pub mod code {
@@ -151,6 +152,13 @@ pub struct Request {
     pub time_limit_ms: u64,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// Its [`crate::SecretEnv`], which the runner hands it on a socket. The
+    /// runner reads this request only after it has made itself non-dumpable,
+    /// but the request waits in the runner's stdin, a pipe, from its start:
+    /// until then another process of the same user can reopen that pipe
+    /// through `/proc/<pid>/fd/0` and read it.
+    #[serde(default, skip_serializing_if = "crate::SecretEnv::is_empty")]
+    pub secret_env: crate::SecretEnv,
 }
 
 impl Request {
@@ -165,6 +173,7 @@ impl Request {
             stdin: hex(&command.stdin),
             time_limit_ms: u64::try_from(command.time_limit.as_millis()).unwrap_or(u64::MAX),
             output_limit: command.output_limit,
+            secret_env: command.secret_env.clone(),
         }
     }
 
@@ -182,6 +191,7 @@ impl Request {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: self.secret_env.clone(),
         })
     }
 }
@@ -320,7 +330,7 @@ pub struct ProcessRunner {
 }
 
 /// How much longer than its command a runner may take before it is stopped.
-const RUNNER_GRACE: Duration = Duration::from_secs(30);
+pub const RUNNER_GRACE: Duration = Duration::from_secs(30);
 
 impl ProcessRunner {
     /// Runners started as `program runner`, with only `PATH` from this

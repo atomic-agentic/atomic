@@ -64,9 +64,29 @@ ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
 nothing else, and an atom's tools are the ones its file declares. As with the
 operator credential, this has been verified on Linux only, so `atomic model
 login` is refused on macOS and Windows for now. atomic does not reuse an
-existing `codex login`. A sign-in kept inside the checkout that holds the
-project (`ATOMIC_HOME` pointed there) is refused, since the repository could
-have supplied it.
+existing `codex login`. A sign-in kept inside a checkout that holds the
+project (`ATOMIC_HOME` pointed there, directly or through a link), the
+project's own or one around it such as a submodule's superproject or the main
+checkout of a linked worktree, is refused, since a repository could have
+supplied it. That includes the default location when your home directory is
+itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
+directory outside it. A link on the way that leads nowhere is refused too, and
+so is a checkout whose `.git` file or `commondir` is not a small regular file,
+as git writes them: that refuses your own configuration as well. A login that
+makes the sign-in directory first forgets whatever the store still holds for
+it, which outlived an earlier directory and is no sign-in. It is forgotten, not
+revoked, and a later logout can no longer revoke it. Under
+`ATOMIC_CREDENTIAL_STORE=file` only the file store is forgotten: a keyring
+entry stays, and is read again if you go back to the keyring store. A login
+that fails removes the directory it made, unless the store then holds a
+sign-in saved since it began: one it forgot first, or, if it failed before
+forgetting, one a save left lock files for. If the store cannot be read, a
+directory holding a lock file stays; if the forgetting itself failed, the
+directory goes regardless. One stopped with Ctrl-C leaves the directory, with
+nothing in the store. A logout removes the directory once both stores are
+checked, so later runs read no store, and removes one it made itself even if
+the keyring cannot be checked. Otherwise, while the keyring cannot be checked,
+the directory stays, and atomic says the sign-in could not be read.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:
