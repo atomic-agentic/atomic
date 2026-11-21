@@ -47,6 +47,25 @@ pub fn line(text: &str) -> String {
     out
 }
 
+/// JSON text, such as `serde_json` writes, with every unsafe character in
+/// it written as a JSON escape: still valid JSON, and the same value, but
+/// safe on a terminal. `serde_json` escapes C0 controls itself; DEL, C1
+/// controls and the Unicode format and bidirectional controls it writes as
+/// they are. A pretty form's own line breaks stay.
+pub fn json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c != '\n' && unsafe_char(c) {
+            // Every unsafe character is in the Basic Multilingual Plane, so
+            // one `\uXXXX` escape writes it.
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// A JSON value for a person: a string as its text, anything else as JSON,
 /// on one line, safe.
 pub fn value(v: &Value) -> String {
@@ -116,6 +135,32 @@ mod tests {
             "café · 日本",
             "ordinary text is untouched"
         );
+    }
+
+    /// JSON for a program, shown on a terminal: no unsafe character reaches
+    /// it as it is, and it still reads as the same value.
+    #[test]
+    fn json_reaches_no_terminal_with_a_control_in_it() {
+        let hostile = json!({
+            "title": "Ship\u{1b}[2J\u{7f}\u{9b}31m\u{85}\u{202e}gpj.exe\u{2066}\u{feff}",
+            "show": {"line\u{202e}": ["\u{200b}", 1]},
+        });
+        let written = json(&serde_json::to_string_pretty(&hostile).expect("JSON"));
+        assert!(
+            written.chars().all(|c| c == '\n' || !unsafe_char(c)),
+            "{written:?}"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&written).expect("still JSON"),
+            hostile
+        );
+        assert!(
+            written.contains("\\u007f\\u009b31m\\u0085\\u202egpj.exe"),
+            "{written}"
+        );
+        // Ordinary text, and the pretty form's line breaks, stay.
+        let plain = serde_json::to_string_pretty(&json!({"a": "café · 日本"})).expect("JSON");
+        assert_eq!(json(&plain), plain);
     }
 
     #[test]
