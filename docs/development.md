@@ -172,10 +172,11 @@ message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
 commands, and stops before such a step without it, so the tests in
-`crates/atomic/tests/run_cli.rs` that run commands are behind the same feature
-there, each marked `// needs_sandbox`; the rest of that file runs in a plain
-`cargo test`. The sandbox check runs each marked test, as it runs every test
-of a file that is behind the feature as a whole.
+`crates/atomic/tests/run_cli.rs` and `crates/atomic/tests/telemetry.rs` that
+run commands are behind the same feature there, each marked
+`// needs_sandbox`; the rest of those files runs in a plain `cargo test`. The
+sandbox check runs each marked test, as it runs every test of a file that is
+behind the feature as a whole.
 
 ## Controls are tested by removing them
 
@@ -185,7 +186,10 @@ command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
 directory and a worktree's git directory out of a turn's reach, its exclusion
 of `/tmp`, and its denial of atomic's private state, to turns and to exec
-atoms' commands; and the confinement of exec atoms' commands itself), it
+atoms' commands; the confinement of exec atoms' commands itself; and their
+network: none unless declared, and through the proxy only the declared hosts,
+on ports 80 and 443, never through another proxy, with the declaration checked
+when the atom loads and again before the command runs), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:

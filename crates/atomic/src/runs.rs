@@ -671,7 +671,9 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     .await
     .unwrap_or(0);
     if interrupted > 0 {
-        atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
+        atomic_core::log_line!(
+            "{who}: settled {interrupted} model call(s) or command(s) that had not finished"
+        );
     }
     // Spans still open end and are sent; a collector that does not answer
     // holds this up until another signal or the flush's deadline, whichever

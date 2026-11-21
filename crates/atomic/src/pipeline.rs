@@ -99,7 +99,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.5";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.6";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -837,7 +837,13 @@ fn plan_budgets(
         .iter()
         .map(|(name, budget, model)| (*name, *budget, model.as_str()))
         .collect();
-    BudgetPlan::resolve(settings, &pipeline.budget, &atoms).map_err(|(atom, e)| match atom {
+    let exec: Vec<(&str, &Budget)> = pipeline
+        .atoms
+        .iter()
+        .filter(|(_, atom)| atom.kind == "exec")
+        .map(|(name, atom)| (name.as_str(), &atom.budget))
+        .collect();
+    BudgetPlan::resolve(settings, &pipeline.budget, &atoms, &exec).map_err(|(atom, e)| match atom {
         None => format!("workflow {}: budget: {e}", pipeline.name),
         Some(name) => format!("atom {name}: budget: {e}"),
     })
@@ -938,8 +944,15 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| model_of(atom, &services.runtimes).is_some())
                 .map(|(name, _)| name.as_str())
                 .collect();
+            // And every exec atom its caps, which its command is held to.
+            let exec_atoms: Vec<&str> = pipeline
+                .atoms
+                .iter()
+                .filter(|(_, atom)| atom.kind == "exec")
+                .map(|(name, _)| name.as_str())
+                .collect();
             plan.validate()
-                .and_then(|()| plan.covers(&model_atoms))
+                .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
                 .map(|()| plan.clone())
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
@@ -1019,7 +1032,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         .await?;
     let plan = pinned.budgets.clone();
     let budget = RunBudget::pinned(ledger, &plan);
-    let (caps, models) = (plan.atoms, plan.models);
+    let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();
     // What each finished step's output is typed by, for CEL.
     let mut shapes = BTreeMap::new();
@@ -1109,6 +1122,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             services: &services,
             budget: &budget,
             caps: &caps,
+            exec_caps: &exec_caps,
             models: &models,
             replay: &replay,
             pinned: &pinned,
@@ -1248,6 +1262,8 @@ struct RunScope<'a> {
     services: &'a Arc<Services>,
     budget: &'a RunBudget,
     caps: &'a BTreeMap<String, atomic_core::budget::Resolved>,
+    /// Each exec atom's caps, which its command's active time is charged to.
+    exec_caps: &'a BTreeMap<String, atomic_core::budget::Resolved>,
     models: &'a BTreeMap<String, String>,
     replay: &'a Option<Arc<Replay>>,
     pinned: &'a Pinned,
@@ -1361,7 +1377,14 @@ async fn turn<C: WorkflowContext>(
         &serde_json::to_vec(&atom_input)
             .map_err(|e| failed(format!("step `{}`: encode its input: {e}", t.name)))?,
     );
-    let (budget, atom_caps) = (budget.clone(), caps.get(&t.atom).cloned());
+    // A model atom's caps, or an exec atom's, which its command's active
+    // time is charged to.
+    let (budget, atom_caps) = (
+        budget.clone(),
+        caps.get(&t.atom)
+            .or_else(|| run.exec_caps.get(&t.atom))
+            .cloned(),
+    );
     // A model atom runs on the model its budget was resolved for, and
     // only with caps: never unmetered, never at another model's price.
     if let Some(model) = model_of(&atom, &runtimes) {
@@ -1385,6 +1408,13 @@ async fn turn<C: WorkflowContext>(
                 t.name, atom.name
             )));
         }
+    }
+    // An exec atom's command runs only with caps, never unmetered.
+    if atom.kind == "exec" && atom_caps.is_none() {
+        return Err(failed(format!(
+            "step `{}`: `{}` runs a command, and the run's budget has no caps for it",
+            t.name, atom.name
+        )));
     }
     let tree = if t.worktree {
         let worktrees = run.worktrees.cloned().ok_or_else(|| {
@@ -1486,19 +1516,21 @@ async fn turn<C: WorkflowContext>(
         // live.
         let served = serving.as_ref().map(|r| r.serve(&id, &input_sha256));
         let input_sha256 = input_sha256.clone();
-        // An exec atom calls no model and has no caps to meter.
+        // A model atom's calls, or an exec atom's command.
         if let Some(atom_caps) = &atom_caps {
             let meter = match charge {
                 Some(allowance) => budget.meter_charged(&position, allowance, atom_caps),
                 None => budget.meter(&position, atom_caps),
             };
             runtimes.codex.meter = meter.clone();
-            runtimes.lite.meter = meter;
+            runtimes.lite.meter = meter.clone();
+            runtimes.exec_meter = meter;
         }
         // Made here, in the step's body, so a step that replays from
         // its checkpoint makes none.
         let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
         let caller = (run_id.clone(), id.clone());
+        let (ledgered, metered, at) = (budget.clone(), atom_caps.is_some(), position.clone());
         let work = async move {
             if let Some(served) = served {
                 return served;
@@ -1521,11 +1553,23 @@ async fn turn<C: WorkflowContext>(
                     )));
                 }
             }
-            if let Some((begun, declared, opened, _)) = &guard
-                && !declared
+            // An earlier execution's attempt replays as interrupted, but
+            // its command may never have started: a cap refused it and the
+            // step parked. The ledger says which: only a command admitted
+            // may have run.
+            let interrupted = match &guard {
+                Some((begun, false, _, _)) if begun.interrupted() => {
+                    !metered
+                        || ledgered.command_admitted(&at).await.map_err(|e| {
+                            failed(format!("step `{id}`: read its command's attempts: {e}"))
+                        })?
+                }
+                _ => false,
+            };
+            if let Some((_, false, opened, _)) = &guard
                 && let Some(why) = ran_before(
                     &atom.name,
-                    begun.interrupted(),
+                    interrupted,
                     opened.lock().map_or(true, |o| o.is_none()),
                 )
             {
@@ -1542,6 +1586,7 @@ async fn turn<C: WorkflowContext>(
                     let backend = runtimes.backend.shared();
                     // The store the model runtimes check references against.
                     let artifacts = runtimes.codex.artifacts.clone();
+                    let meter = runtimes.exec_meter.clone();
                     propose_at(&place, true, async move {
                         let compiled = compile::compile(&atom, &Registry::new())
                             .map_err(|e| AtomError::Runtime(e.to_string()))?;
@@ -1563,6 +1608,7 @@ async fn turn<C: WorkflowContext>(
                             opened,
                             clock.as_ref(),
                             &artifacts,
+                            &meter,
                         )
                         .await
                     })

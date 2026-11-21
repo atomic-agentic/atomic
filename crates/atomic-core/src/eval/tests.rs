@@ -92,6 +92,7 @@ fn runtimes(model: &FakeModel, root: &Path) -> Runtimes {
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         backend: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -183,6 +184,113 @@ async fn cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file() {
         reports[0].passed && reports[1].passed,
         "above a 0.5 threshold"
     );
+}
+
+#[tokio::test]
+async fn a_cases_origin_is_held_to_the_atoms_trust_and_labels_its_prompt() {
+    let case_file = |origin: Option<&str>| {
+        let label = origin.map(|o| format!("origin: {o}\n")).unwrap_or_default();
+        format!(
+            "{label}input:\n  text: Export crashes\nexpect:\n  - \"output.ticket == 'BUG-1'\"\n"
+        )
+    };
+    // A team atom refuses a case of the default origin, external, as it
+    // loads: before any call, naming the case, the atom, its trust and the
+    // case's origin.
+    let (root, team) = atom_with("{trust:'team'}");
+    write(&root.join("default/a.yaml"), &case_file(None));
+    let refused = load_cases(&team, &at(&root, "default", 1.0))
+        .expect_err("an external case for a team atom")
+        .to_string();
+    for said in [
+        "a.yaml",
+        "case a.yaml's input",
+        "is external data",
+        "atom `test` accepts team input at most",
+        "trust: 'team'",
+    ] {
+        assert!(refused.contains(said), "{said}: {refused}");
+    }
+    // A case its own file labels team is taken, and its input is labelled
+    // team in the prompt.
+    write(&root.join("reviewed/a.yaml"), &case_file(Some("team")));
+    let settings = at(&root, "reviewed", 1.0);
+    let cases = load_cases(&team, &settings).expect("a team case");
+    assert_eq!(cases[0].origin, "team");
+    let model = FakeModel::start(answers()).await.expect("fake model");
+    let rt = runtimes(&model, &root.join("rt-team"));
+    let subject = AtomSubject {
+        atom: &team,
+        runtimes: &rt,
+    };
+    let report = run(&team, cases, &settings, &subject, Options::default()).await;
+    assert!(report.passed, "{report:?}");
+    let sent: String = model.requests().iter().map(Value::to_string).collect();
+    assert!(sent.contains(r#"origin=\"team\">Export crashes"#), "{sent}");
+    assert!(!sent.contains(r#"origin=\"external\""#), "{sent}");
+
+    // Trust is a minimum: an agent atom takes agent and team cases, and
+    // refuses an external one, labelled or not.
+    let (root, agent) = atom_with("{trust:'agent'}");
+    for (origin, taken) in [
+        (Some("agent"), true),
+        (Some("team"), true),
+        (Some("external"), false),
+        (None, false),
+    ] {
+        let dir = format!("agent-{}", origin.unwrap_or("default"));
+        write(&root.join(format!("{dir}/a.yaml")), &case_file(origin));
+        let loaded = load_cases(&agent, &at(&root, &dir, 1.0));
+        assert_eq!(loaded.is_ok(), taken, "{origin:?}: {loaded:?}");
+    }
+    // A case captured from a run, appended to a JSONL file with the origin
+    // its input was recorded with, keeps it.
+    write(
+        &root.join("captured/cases.jsonl"),
+        &(json!({"origin": "agent", "input": {"text": "Export crashes"}, "expect": ["true"]})
+            .to_string()
+            + "\n"),
+    );
+    let captured = load_cases(&agent, &at(&root, "captured", 1.0)).expect("a captured case");
+    assert_eq!(captured[0].origin, "agent");
+    // The hint fits the atom: an agent atom's case may say it came from a
+    // model step, or from a person on the team.
+    write(&root.join("hint/a.yaml"), &case_file(None));
+    let hint = load_cases(&agent, &at(&root, "hint", 1.0))
+        .expect_err("an external case for an agent atom")
+        .to_string();
+    assert!(
+        hint.contains("`origin: agent` if its input came from a model step")
+            && hint.contains("`origin: team` if a person on the team wrote or reviewed it"),
+        "{hint}"
+    );
+    // A case built outside the load is checked before it runs too.
+    let unchecked = Case {
+        id: "built.yaml".into(),
+        input: json!({"text": "Export crashes"}),
+        expect: vec!["true".into()],
+        case: Value::Null,
+        prepared: None,
+        origin: "external".into(),
+    };
+    let model = FakeModel::start(answers()).await.expect("fake model");
+    let rt = runtimes(&model, &root.join("rt-built"));
+    let subject = AtomSubject {
+        atom: &agent,
+        runtimes: &rt,
+    };
+    let refused = subject
+        .run(&unchecked)
+        .await
+        .expect_err("an unchecked case");
+    assert!(refused.contains("accepts agent input at most"), "{refused}");
+    assert_eq!(model.calls(), 0);
+    // An origin that is not one of the three is refused where it is written.
+    write(&root.join("odd/a.yaml"), &case_file(Some("Team")));
+    let odd = load_cases(&agent, &at(&root, "odd", 1.0))
+        .expect_err("an unknown origin")
+        .to_string();
+    assert!(odd.contains("`origin` is external, agent, team"), "{odd}");
 }
 
 #[test]
@@ -283,6 +391,7 @@ fn case(id: &str, assertion: &str) -> Case {
         expect: vec![assertion.into()],
         case: json!({"ok": true}),
         prepared: None,
+        origin: "external".into(),
     }
 }
 
@@ -859,6 +968,7 @@ fn an_assertion_reads_numbers_as_the_contracts_type_them() {
         expect: vec!["input.n / 2 == 0".into(), "output.half / 4.0 == 0.5".into()],
         case: Value::Null,
         prepared: None,
+        origin: "external".into(),
     };
     let failures = check(&case, &json!({"half": 2}), &contracts);
     assert!(failures.is_empty(), "{failures:?}");

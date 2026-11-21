@@ -143,6 +143,9 @@ pub struct Runtimes {
     /// shell, a lite atom's empty one, and an exec atom's command. The plan
     /// reads its statement.
     pub backend: atomic_exec::Backend,
+    /// The meter an exec atom's command's active time goes through; with
+    /// none, it is not accounted.
+    pub exec_meter: Metering,
     /// The durable step's recorded clock, for the atom's helper calls (see
     /// [`crate::astro::StepClock`]). Without one, each operation's helpers
     /// see the current time and a fresh seed.
@@ -1223,6 +1226,7 @@ pub async fn run_declarative_repairing(
             runtimes.clock.as_ref(),
             // The store the model runtimes check references against.
             &runtimes.codex.artifacts,
+            &runtimes.exec_meter,
         )
         .await;
     }
@@ -1391,6 +1395,7 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 /// an artifact `artifacts` does not hold as the contract requires, or fails
 /// the atom's validators: there is no model to repair it. The validators'
 /// helpers follow `clock`, the step's recorded clock, when there is one.
+#[allow(clippy::too_many_arguments)] // each is one thing the command needs
 pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
@@ -1399,9 +1404,13 @@ pub async fn run_exec(
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     clock: Option<&crate::astro::StepClock>,
     artifacts: &Artifacts,
+    meter: &Metering,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let workspace = open_exec_workspace(atom, identity, backend).await?;
-    run_exec_opened(atom, compiled, input, identity, workspace, clock, artifacts).await
+    run_exec_opened(
+        atom, compiled, input, identity, workspace, clock, artifacts, meter,
+    )
+    .await
 }
 
 /// Open the workspace an exec atom's command will run in, as [`run_exec`]
@@ -1439,8 +1448,21 @@ fn declared_env(atom: &AtomFile) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// The hosts an atom declares in `network.allow`, as the atom loaded them:
+/// checked against atomic's policy then ([`crate::network::check_hosts`]).
+fn declared_network(atom: &AtomFile) -> Vec<String> {
+    let hosts: Vec<String> = atom.frontmatter["network"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(str::to_owned))
+        .collect();
+    crate::network::check_hosts(&hosts).unwrap_or_default()
+}
+
 /// [`run_exec`] in a workspace [`open_exec_workspace`] opened, which it
 /// closes when the command has ended.
+#[allow(clippy::too_many_arguments)] // each is one thing the command needs
 pub async fn run_exec_opened(
     atom: &AtomFile,
     compiled: &Compiled,
@@ -1449,6 +1471,7 @@ pub async fn run_exec_opened(
     workspace: WorkspaceGuard,
     clock: Option<&crate::astro::StepClock>,
     artifacts: &Artifacts,
+    meter: &Metering,
 ) -> Result<(Value, RunMetadata), AtomError> {
     if compiled.hash != atom.program.hash() {
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
@@ -1520,27 +1543,72 @@ pub async fn run_exec_opened(
         ),
         None => (Vec::new(), Vec::new()),
     };
+    // Looked up first: nothing returns early between the command's
+    // admission and its settlement.
+    let output_contract = contract("Output")?;
+    // Its active time is metered like a turn's: it may take what the step's
+    // and the run's minutes caps leave, and is cut off when that runs out.
+    let (ticket, limit) = meter
+        .admit(crate::usage::Call {
+            index: 0,
+            model: crate::usage::WORK_MODEL.into(),
+            input_bound: None,
+            turn: false,
+            work: true,
+        })
+        .await
+        .map_err(|e| match e {
+            MeterError::Exhausted(why) => AtomError::Budget(why.to_string()),
+            e => AtomError::Runtime(format!("{}: meter its command: {e}", atom.name)),
+        })?;
+    let time = limit.time_within(EXEC_TIME_LIMIT);
+    let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
     let done = run_command(
         &workspace,
         program.clone(),
         args,
         stdin,
         identity.environment(),
+        time,
         exchange_env,
-        read_only,
+        Reach {
+            read_only,
+            network: declared_network(atom),
+        },
     )
     .await;
-    let finished = finish_exec(
-        atom,
-        &program,
-        done,
-        exchange,
-        artifacts,
-        identity,
-        contract("Output")?,
-        &workspace,
-    )
-    .await;
+    // Cut off by the minutes cap, not by a command's own limit.
+    let capped = time < EXEC_TIME_LIMIT
+        && matches!(
+            &done,
+            Err(CommandError::Exec(atomic_exec::ExecError::TimedOut { .. }))
+        );
+    let finished = if capped {
+        Err(cut_off_at_cap(atom, time, bounded_by.as_deref()))
+    } else {
+        finish_exec(
+            atom,
+            &program,
+            done,
+            exchange,
+            artifacts,
+            identity,
+            output_contract,
+            &workspace,
+        )
+        .await
+    };
+    // Whatever it came to, its time was spent; it used no tokens.
+    if let Err(e) = meter
+        .settle(ticket, crate::usage::Outcome::Reported(Default::default()))
+        .await
+    {
+        workspace.close().await;
+        return Err(AtomError::Runtime(format!(
+            "{}: meter its command: {e}",
+            atom.name
+        )));
+    }
     workspace.close().await;
     let (output, text) = finished?;
     let schema_error = |message: String| AtomError::Schema {
@@ -1585,6 +1653,35 @@ const GATHER_LOCKED_RETRIES: u32 = 3;
 const GATHER_LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 /// The longest wait between a gather's tries.
 const GATHER_LOCKED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An exec atom's command that the minutes cap cut off after `time`, all
+/// the time the allowance `bounded_by` had left. One whose effects are
+/// declared safe to repeat stops on the budget, so its run parks until a
+/// person raises the cap and it runs again; any other fails, since whether
+/// its effects happened is unknown.
+fn cut_off_at_cap(
+    atom: &AtomFile,
+    time: std::time::Duration,
+    bounded_by: Option<&str>,
+) -> AtomError {
+    let stopped = format!(
+        "{}: its command was stopped at its time limit of {:.1} s, all the active time the \
+         allowance {} had left",
+        atom.name,
+        time.as_secs_f64(),
+        bounded_by.unwrap_or("of its atom")
+    );
+    match atom.external() {
+        Some(_) => AtomError::Budget(format!(
+            "{stopped}; once the cap is raised, it runs again from the start"
+        )),
+        None => AtomError::Runtime(format!(
+            "{stopped}: stopped by the minutes cap, and whether its effects happened is \
+             unknown. Declare `effects: {{ external: 'idempotent' }}` (or `'read-only'`) for its \
+             run to park at the cap instead, and run it again once the cap is raised"
+        )),
+    }
+}
 
 /// An artifact store's failure, as an atom's error: a refusal is the
 /// command's output's fault, anything else the store's.
@@ -1742,18 +1839,31 @@ async fn finish_exec(
     Ok((output, text))
 }
 
+/// What an exec atom's command reaches beyond its workspace, when its
+/// backend confines it.
+struct Reach {
+    /// The inputs it is given, inside its scratch directory, which it only
+    /// reads.
+    read_only: Vec<PathBuf>,
+    /// The hosts its atom declares, and nothing else; with none, no network.
+    network: Vec<String>,
+}
+
 /// Run an exec atom's command in `workspace`: in its root, with its
 /// environment, `HOME` and `TMPDIR` at its scratch directory, and the step's
 /// effect identity (`effect`), which nothing the atom declares can replace.
+/// A confining backend lets it reach what `reach` says, and nothing else.
 /// The command runs on the blocking pool, never on an executor thread.
+#[allow(clippy::too_many_arguments)] // each is one thing the command needs
 async fn run_command(
     guard: &WorkspaceGuard,
     program: String,
     args: Vec<String>,
     stdin: Vec<u8>,
     effect: [(String, String); 3],
+    time_limit: std::time::Duration,
     exchange: Vec<(String, String)>,
-    read_only: Vec<PathBuf>,
+    reach: Reach,
 ) -> Result<atomic_exec::Completed, CommandError> {
     let workspace = guard.workspace();
     let cwd = workspace.require_root()?.clone();
@@ -1779,12 +1889,13 @@ async fn run_command(
         cwd,
         env,
         stdin,
-        time_limit: EXEC_TIME_LIMIT,
+        time_limit,
         output_limit: EXEC_OUTPUT_LIMIT,
         // A confining backend lets it write its scratch directory only.
         writable: workspace.scratch.iter().cloned().collect(),
         // Inside it, the inputs it is given, which it only reads.
-        read_only,
+        read_only: reach.read_only,
+        network: reach.network,
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

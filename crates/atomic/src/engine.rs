@@ -432,6 +432,7 @@ pub async fn open(
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         backend: exec,
+        exec_meter: Default::default(),
         clock: None,
     });
     // Never the developer's checkout: a run's worktree steps use the

@@ -377,6 +377,8 @@ pub async fn run(
                 &budgets,
                 &Budget::default(),
                 &[(atom.name.as_str(), &atom.budget, model.as_str())],
+                // An eval meters its model calls only.
+                &[],
             )
             .map_err(|(_, e)| {
                 Failure::new(
@@ -397,11 +399,19 @@ pub async fn run(
         std::process::id()
     );
 
+    // Every chosen atom's cases, loaded before the first atom runs: a case
+    // the load refuses, such as one its atom does not trust, stops the eval
+    // before any call, command or spend.
+    let loaded = chosen
+        .atoms
+        .iter()
+        .map(|(atom, settings, _)| eval::load_cases(atom, settings))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let mut reports = Vec::new();
     let mut tallies = Vec::new();
     let mut spent = Vec::new();
-    for (atom, settings, select) in &chosen.atoms {
-        let cases = eval::load_cases(atom, settings)?;
+    for ((atom, settings, select), cases) in chosen.atoms.iter().zip(loaded) {
         let cassette = match (calls_model(atom), source) {
             (false, _) | (true, Source::Live) => None,
             (true, recorded) => Some(
@@ -757,6 +767,7 @@ fn runtimes(
         },
         lite,
         backend: exec.clone(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
