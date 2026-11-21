@@ -1660,7 +1660,18 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
                 Some(Err(gone)) => !absent(&gone),
                 _ => true,
             };
-            let note = unusable(&e.to_string());
+            // With an endpoint configured, the sign-in is not looked for and
+            // a run uses the endpoint.
+            let configured =
+                resolved.sign_in_unreadable.is_none() && resolved.settings.model.base_url.is_some();
+            let note = if configured {
+                format!(
+                    "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \
+                     configured, which comes first"
+                )
+            } else {
+                unusable(&e.to_string())
+            };
             if there && !notes.contains(&note) {
                 notes.push(note);
             }

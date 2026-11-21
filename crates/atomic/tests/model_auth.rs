@@ -122,14 +122,22 @@ fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
 
 /// A stand-in for a local Ollama on loopback: it lists `synthetic` to every
 /// request, so a run that took it as its endpoint would reach no further
-/// than here.
-fn ollama_on_loopback() -> String {
+/// than here, and it keeps the first line of each request it was sent.
+fn ollama_on_loopback() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut request = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut request);
+            let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line = String::from_utf8_lossy(&request[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            log.lock().unwrap().push(line);
             let body = r#"{"models":[{"name":"synthetic"}]}"#;
             let _ = std::io::Write::write_all(
                 &mut stream,
@@ -141,7 +149,7 @@ fn ollama_on_loopback() -> String {
             );
         }
     });
-    addr
+    (addr, seen)
 }
 
 /// A sign-in that is there and cannot be used, unreadable, refused where it
@@ -152,7 +160,15 @@ fn ollama_on_loopback() -> String {
 #[test]
 fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     let f = Fixture::new("unusable");
-    let ollama = ollama_on_loopback();
+    let (ollama, seen) = ollama_on_loopback();
+    // What the stand-in was sent beyond the probe that detects it.
+    let calls = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| !l.starts_with("GET /api/tags"))
+            .count()
+    };
     let run = ["run", "tidy-codex", "--data", r#"{"text": "a note"}"#];
     let refused = |env: &[(&str, &str)]| {
         let mut all = vec![
@@ -192,12 +208,42 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     std::fs::create_dir_all(f.dir.join(".git")).unwrap();
     let inside = f.dir.join("atomic-home");
     let home = inside.to_str().unwrap().to_owned();
+    assert_eq!(calls(), 0, "a refused run reached the detected endpoint");
     let t = refused(&[("ATOMIC_HOME", home.as_str())]);
     assert!(!t.contains("cannot be used"), "{t}");
+    assert!(
+        calls() > 0,
+        "the detected endpoint did not take the run: {t}"
+    );
+    let before = calls();
     std::fs::create_dir_all(inside.join("credentials/codex-auth")).unwrap();
     let t = refused(&[("ATOMIC_HOME", home.as_str())]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
     assert!(t.contains("inside the checkout holding the project"), "{t}");
+    assert_eq!(
+        calls(),
+        before,
+        "a refused run reached the detected endpoint"
+    );
+    // With an endpoint configured, the sign-in is not looked for: the run
+    // goes to the endpoint, and `atomic config --explain` says the sign-in
+    // is not used, not that a run is refused.
+    let base = format!("http://{ollama}/v1");
+    let configured = [
+        ("ATOMIC_HOME", home.as_str()),
+        ("ATOMIC_MODEL_BASE_URL", base.as_str()),
+    ];
+    let t = refused(&configured);
+    assert!(!t.contains("cannot be used"), "{t}");
+    assert!(
+        calls() > before,
+        "the configured endpoint did not take the run: {t}"
+    );
+    let out = f.atomic(&["config", "--explain"], &configured);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("not used: a model endpoint is"), "{t}");
+    assert!(!t.contains("a run that calls a model is refused"), "{t}");
     std::fs::remove_dir_all(f.dir.join(".git")).unwrap();
     // A sign-in's directory under one this user cannot look in, accepted
     // where it is kept or refused there: never taken for absent.
@@ -218,13 +264,10 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
         .unwrap()
     };
     mode(0o000);
-    if std::fs::read_dir(closed.join("credentials")).is_ok() {
-        eprintln!(
-            "SKIPPED the unreadable-directory cases: this test runs as a user mode 000 does \
-             not keep out (root)"
-        );
-        return;
-    }
+    assert!(
+        std::fs::read_dir(closed.join("credentials")).is_err(),
+        "mode 000 did not keep this user out (root?): run the test as a user"
+    );
     let closed_home = closed.to_str().unwrap().to_owned();
     let t = refused(&[("ATOMIC_HOME", closed_home.as_str())]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
