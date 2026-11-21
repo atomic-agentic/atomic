@@ -140,6 +140,10 @@ pub struct Command {
     /// read, such as the inputs atomic hands it, when its backend confines
     /// it. A backend that does not confine its commands ignores it.
     pub read_only: Vec<PathBuf>,
+    /// The hosts it may reach, as its atom declares them, when its backend
+    /// confines it; with none, it has no network at all. A backend that does
+    /// not confine its commands ignores it.
+    pub network: Vec<String>,
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may
@@ -154,6 +158,18 @@ pub trait Confine: Send + Sync {
     /// directory, where the sandbox may keep records of its own.
     fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
 
+    /// As [`confine`](Self::confine), with what the confined command needs
+    /// while it runs, such as a proxy that carries its network traffic: the
+    /// backend holds it until the command has ended. A confinement that
+    /// needs nothing gives none.
+    fn confine_held(
+        &self,
+        command: &Command,
+        tmp: &std::path::Path,
+    ) -> Result<(Command, Option<Held>), ExecError> {
+        Ok((self.confine(command, tmp)?, None))
+    }
+
     /// Check, once, that commands can be confined here at all, so a machine
     /// that cannot confine them fails at connect with a reason rather than
     /// in every command.
@@ -162,6 +178,10 @@ pub trait Confine: Send + Sync {
         Ok(())
     }
 }
+
+/// What a confined command needs while it runs (see
+/// [`Confine::confine_held`]): kept until it has ended, then dropped.
+pub type Held = std::sync::Arc<dyn std::any::Any + Send + Sync>;
 
 /// How a command ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,9 +315,10 @@ pub trait ExecutionBackend: Send + Sync {
     /// Connect, and state what the control plane may plan on.
     fn connect(&self) -> Result<Statement, ExecError>;
 
-    /// Open a workspace for one attempt of one atom run. Each call opens a
-    /// workspace of its own, even for a request opened before: an attempt
-    /// that runs again starts in a new one.
+    /// Open a workspace for one attempt of one atom run. Each attempt opens
+    /// a workspace of its own: one that runs again, as a new attempt,
+    /// starts in a new one, and opening an attempt that is open already is
+    /// refused.
     fn open(&self, request: &Open) -> Result<Workspace, ExecError>;
 
     /// Run `command` to completion in a workspace this backend opened. A
@@ -447,11 +468,12 @@ impl LocalBackend {
     }
 
     /// `command` as this backend runs it: under its confinement, if it has
-    /// one.
-    pub fn prepare(&self, command: &Command) -> Result<Command, ExecError> {
+    /// one, with what the confined command needs while it runs, to hold
+    /// until it has ended.
+    pub fn prepare(&self, command: &Command) -> Result<(Command, Option<Held>), ExecError> {
         match &self.confine {
-            Some(confine) => confine.confine(command, &self.tmp),
-            None => Ok(command.clone()),
+            Some(confine) => confine.confine_held(command, &self.tmp),
+            None => Ok((command.clone(), None)),
         }
     }
 
@@ -551,7 +573,8 @@ impl ExecutionBackend for LocalBackend {
     /// Runs `command` under this backend's confinement, if it has one, in a
     /// process group of its own.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        Self::run_in(process::Group::Own, &self.prepare(command)?)
+        let (command, _held) = self.prepare(command)?;
+        Self::run_in(process::Group::Own, &command)
     }
 }
 

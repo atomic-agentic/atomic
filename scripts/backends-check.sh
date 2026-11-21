@@ -74,11 +74,12 @@ postgres)
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
     fi
-    # The command-line tests in crates/atomic/tests/run_cli.rs also use the
-    # database. That package's tests are too many and too slow to run
-    # wholesale without it, so its Postgres tests are selected by name, as
-    # their names say postgres; test_database.rs keeps the users of the
-    # database to these two places.
+    # The command-line tests in crates/atomic/tests/run_cli.rs, and one in
+    # crates/atomic/tests/failpoints.rs, also use the database. That
+    # package's tests are too many and too slow to run wholesale without it,
+    # so its Postgres tests are selected by name, as their names say
+    # postgres; test_database.rs keeps the users of the database to these
+    # places.
     ATOMIC_TEST_DATABASE_URL="" check "Postgres tests across the workspace, by name, with no database configured" \
         "ATOMIC_TEST_DATABASE_URL is not set" \
         --workspace --features "${FEATURES}" -- postgres

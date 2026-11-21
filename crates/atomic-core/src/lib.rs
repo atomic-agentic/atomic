@@ -27,10 +27,12 @@ pub mod helper_runtime;
 pub mod http_tools;
 pub mod lite;
 pub mod names;
+pub mod network;
 pub mod project;
 pub mod redact;
 pub mod render;
 pub mod runtime;
+pub mod signin;
 pub mod spans;
 pub mod state;
 #[cfg(any(test, feature = "fake-model"))]

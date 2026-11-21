@@ -66,16 +66,28 @@ pub struct EngineArgs {
     /// `ATOMIC_EXECUTOR_ID`).
     #[arg(long)]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have room
+    /// for its workspace before the run stops, unfinished and with nothing
+    /// recorded, for `atomic runs resume`. Without it, a step waits for as
+    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub backend_wait: Option<u64>,
 }
 
-/// The settings for the project at `state`, with `args` on top.
-pub fn settings(state: &ProjectState, args: &EngineArgs) -> anyhow::Result<settings::Resolved> {
-    settings::resolve(
-        &settings::config_dir(state.root()),
-        args,
-        &settings::Surroundings::here(),
-    )
-    .map_err(|e| {
+/// The settings for the project at `state`, with `args` on top. The
+/// person's sign-in is looked for only when `model_calls` says a model will
+/// be called on them: a replay or a run that calls no model never reads it.
+pub fn settings(
+    state: &ProjectState,
+    args: &EngineArgs,
+    model_calls: bool,
+) -> anyhow::Result<settings::Resolved> {
+    let around = if model_calls {
+        settings::Surroundings::here()
+    } else {
+        settings::Surroundings::here_without_sign_in()
+    };
+    settings::resolve(&settings::config_dir(state.root()), args, &around).map_err(|e| {
         Failure::new(
             "config.invalid",
             format!("the configuration cannot be read: {e}"),
@@ -116,21 +128,17 @@ pub fn exec_backend(
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
-    // They may write their scratch directory and the project's caches.
+    // They may write their scratch directory and their run's own build
+    // caches, which each workspace names, and nothing shared between runs.
     #[cfg(target_os = "linux")]
-    let local = {
-        let caches = atomic_core::worktree::Caches::for_state(state);
-        caches.create().context("the project's caches")?;
-        local.confined(std::sync::Arc::new(
-            atomic_core::codex::ExecSandbox::new(
-                paths,
-                atomic_core::codex::StateGuard::for_project(state)?,
-                state.codex_home(),
-            )
-            .context("confine exec atoms' commands")?
-            .also_writing(vec![caches.dir().to_owned()]),
-        ))
-    };
+    let local = local.confined(std::sync::Arc::new(
+        atomic_core::codex::ExecSandbox::new(
+            paths,
+            atomic_core::codex::StateGuard::for_project(state)?,
+            state.codex_home(),
+        )
+        .context("confine exec atoms' commands")?,
+    ));
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
         RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
@@ -146,11 +154,15 @@ pub fn exec_backend(
 /// The endpoint a replay of recorded model calls names: where the calls
 /// were recorded for, and the model, with no key, since no call reaches it.
 /// A key the project's files may not send is never read either, so a
-/// withheld key does not refuse a replay.
+/// withheld key does not refuse a replay. `resolved` is resolved without
+/// the sign-in (see [`settings`]): lite atoms, which are what replays, are
+/// never recorded on one.
 pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> {
     match resolved.endpoint() {
+        // No token is read either.
         Some(endpoint) => Ok(ModelEndpoint {
             api_key_env: None,
+            sign_in: None,
             ..endpoint
         }),
         None => Err(Failure::new(
@@ -165,8 +177,18 @@ pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> 
     }
 }
 
+/// Why a personal sign-in is not used with a PostgreSQL store.
+pub const SHARED_STORE: &str = "the store is shared (PostgreSQL)";
+
 /// The model endpoint, or with `required`, a failure saying how to set one.
-pub fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
+/// A configured endpoint comes first, then the person's ChatGPT sign-in,
+/// then what atomic detects (see [`settings::resolve`]). `personal_refused`
+/// says why the sign-in, which is the person's own, may not serve here.
+pub fn endpoint(
+    resolved: &settings::Resolved,
+    required: bool,
+    personal_refused: Option<&str>,
+) -> anyhow::Result<ModelEndpoint> {
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {
@@ -180,24 +202,69 @@ pub fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result
         )
         .into());
     }
+    if resolved.on_sign_in() {
+        match (personal_refused, required) {
+            (Some(why), true) => {
+                // Refused, never passed over for a key or a detected
+                // endpoint: the person learns why model calls do not go
+                // where they would at their own desk.
+                return Err(Failure::new(
+                    "config.model",
+                    format!(
+                        "you are signed in with ChatGPT, and a sign-in is personal: {why}, so \
+                         it is not used here, and nothing else is used in its place"
+                    ),
+                    "configure model.base_url (ATOMIC_MODEL_BASE_URL, or --model-base-url) and \
+                     model.name (ATOMIC_MODEL), with model.api_key_env naming the variable that \
+                     holds the endpoint's key (OPENAI_API_KEY for OpenAI's API); or run `atomic \
+                     model logout`, and atomic detects OPENAI_API_KEY or a local Ollama again",
+                )
+                .into());
+            }
+            // Nothing here calls a model, and nothing may on the sign-in.
+            (Some(_), false) => return Ok(unconfigured()),
+            (None, true) if resolved.settings.model.name.is_none() => {
+                return Err(Failure::new(
+                    "config.model",
+                    "you are signed in with ChatGPT, and no model is configured",
+                    "set ATOMIC_MODEL (or pass --model) to a model your plan offers for Codex",
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
     match resolved.endpoint() {
         Some(endpoint) => Ok(endpoint),
         None if required => Err(Failure::new(
             "config.model",
-            "no model endpoint is configured or detected, and model atoms need one",
-            "set OPENAI_API_KEY to use OpenAI's API, start Ollama on this machine, or set \
-             ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and --model), \
-             and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key; `atomic config \
-             --explain` shows what was found",
+            match &resolved.sign_in_unreadable {
+                Some(why) => format!(
+                    "no model endpoint is configured or detected, model atoms need one, and \
+                     the ChatGPT sign-in could not be read: {why}"
+                ),
+                None => {
+                    "no model endpoint is configured or detected, and model atoms need one".into()
+                }
+            },
+            "sign in with `atomic model login` (Codex atoms only), set OPENAI_API_KEY to use \
+             OpenAI's API, start Ollama on this machine, or set ATOMIC_MODEL_BASE_URL and \
+             ATOMIC_MODEL (or pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV \
+             if the endpoint needs a key; `atomic config --explain` shows what was found",
         )
         .into()),
-        // Nothing will call a model; an endpoint that cannot be reached
-        // makes any call that does fail loudly.
-        None => Ok(ModelEndpoint {
-            base_url: "http://127.0.0.1:9/unconfigured".into(),
-            model: "unconfigured".into(),
-            api_key_env: None,
-        }),
+        None => Ok(unconfigured()),
+    }
+}
+
+/// The endpoint when nothing will call a model: one that cannot be reached,
+/// so any call that does fails loudly.
+fn unconfigured() -> ModelEndpoint {
+    ModelEndpoint {
+        base_url: "http://127.0.0.1:9/unconfigured".into(),
+        model: "unconfigured".into(),
+        api_key_env: None,
+        sign_in: None,
     }
 }
 
@@ -259,6 +326,9 @@ pub struct Engine {
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
+    /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
+    /// use.
+    pub signed_in: bool,
 }
 
 impl Engine {
@@ -296,7 +366,13 @@ pub async fn open(
     // Held until the process exits: dropping the engine while a command it
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
-    let resolved = settings(state, args)?;
+    let resolved = settings(state, args, needs_model)?;
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     let database = store_of(state, &resolved.settings);
     let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
@@ -313,7 +389,19 @@ pub async fn open(
         )
         .into());
     }
-    let endpoint = endpoint(&resolved, needs_model)?;
+    // A personal sign-in serves runs in a store no other host's executors
+    // share, and never `atomic serve`; the store is the one the settings
+    // name, whichever file or variable names it. `atomic runs resume` on
+    // such a store uses it for whichever run is resumed.
+    let personal_refused = if matches!(database, Database::Postgres { .. }) {
+        Some(SHARED_STORE)
+    } else if takes == Takes::Waiting {
+        Some("`atomic serve` runs whatever the store's runs need")
+    } else {
+        None
+    };
+    let endpoint = endpoint(&resolved, needs_model, personal_refused)?;
+    let signed_in = endpoint.sign_in.is_some();
     // Where model calls go, when the person running this did not say.
     if let Some(line) = resolved.announcement() {
         atomic_core::log_line!("{line}");
@@ -344,6 +432,7 @@ pub async fn open(
             ..LiteRuntime::new(endpoint, AtomConfig::default())
         },
         exec,
+        exec_meter: Default::default(),
         clock: None,
     });
     // Never the developer's checkout: a run's worktree steps use the
@@ -359,6 +448,8 @@ pub async fn open(
             store,
             deployment: deployment(),
             worktrees,
+            // Each run's build caches, in a directory of its own here.
+            caches: Some(state.dir().join("cache")),
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public
@@ -380,6 +471,7 @@ pub async fn open(
         rt,
         store: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
+        signed_in,
     })
 }
 

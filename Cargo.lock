@@ -551,6 +551,9 @@ dependencies = [
  "codex-core-api",
  "codex-extension-api",
  "codex-keyring-store",
+ "codex-login",
+ "codex-network-proxy",
+ "codex-process-hardening",
  "codex-protocol",
  "deno_core",
  "dirs",
@@ -560,6 +563,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
+ "psl",
  "regex",
  "reqwest 0.12.28",
  "seccompiler",
@@ -5567,7 +5571,7 @@ dependencies = [
 [[package]]
 name = "durare"
 version = "0.6.0"
-source = "git+https://github.com/atomic-agentic/durare?rev=cbfc49374f5312f9ef176e0dffe512ba3c160b71#cbfc49374f5312f9ef176e0dffe512ba3c160b71"
+source = "git+https://github.com/atomic-agentic/durare?rev=7c37126d3abfc53c17fa6876fe26e5384b168547#7c37126d3abfc53c17fa6876fe26e5384b168547"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -5592,7 +5596,7 @@ dependencies = [
 [[package]]
 name = "durare-macros"
 version = "0.2.0"
-source = "git+https://github.com/atomic-agentic/durare?rev=cbfc49374f5312f9ef176e0dffe512ba3c160b71#cbfc49374f5312f9ef176e0dffe512ba3c160b71"
+source = "git+https://github.com/atomic-agentic/durare?rev=7c37126d3abfc53c17fa6876fe26e5384b168547#7c37126d3abfc53c17fa6876fe26e5384b168547"
 dependencies = [
  "heck",
  "proc-macro2",

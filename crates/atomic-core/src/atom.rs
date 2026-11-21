@@ -223,6 +223,17 @@ fn loads_code(name: &str) -> bool {
         || matches!(name, "GCONV_PATH" | "GLIBC_TUNABLES")
 }
 
+/// Whether `name`, in any case, is a variable that names a proxy or the
+/// hosts to reach without one: atomic sets these for a command that declares
+/// network access.
+fn proxy_variable(name: &str) -> bool {
+    codex_network_proxy::PROXY_ENV_KEYS
+        .iter()
+        .chain(codex_network_proxy::NO_PROXY_ENV_KEYS)
+        .chain(codex_network_proxy::ALL_PROXY_ENV_KEYS)
+        .any(|key| key.eq_ignore_ascii_case(name))
+}
+
 /// Variables that make a shell run a file or a command as it starts, or
 /// before each prompt. A codex atom's commands run in a shell the model
 /// drives, so one of these would have that shell source any file named,
@@ -281,6 +292,15 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         &format!(
                             "`{name}` would load code into Codex's sandbox helper, which runs \
                              outside the sandbox; a codex atom cannot declare it"
+                        ),
+                    );
+                }
+                if proxy_variable(name) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` names a proxy, which atomic sets for a command that \
+                             declares network access and no atom may set"
                         ),
                     );
                 }
@@ -436,21 +456,69 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             ));
         }
     }
-    let allows_network = match fm.get("network") {
-        None | Some(Value::Bool(false)) => false,
-        Some(Value::Object(n)) => n
-            .get("allow")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty()),
-        Some(_) => true,
-    };
-    if allows_network {
-        return Err(fail(
-            line_of("/network"),
-            "/network",
-            "network access for atoms is not supported by this version of atomic yet; atoms run with no network"
-                .into(),
-        ));
+    // How trusted its input must be: one of the three origins, exactly, so
+    // a misspelt value cannot silently accept anything.
+    match fm.get("trust") {
+        None => {}
+        Some(Value::String(s)) if crate::workflow::TRUST.contains(&s.as_str()) => {}
+        Some(other) => {
+            return Err(fail(
+                line_of("/trust"),
+                "/trust",
+                format!("`trust` is external, agent or team, not {other}"),
+            ));
+        }
+    }
+    // No network unless declared. An exec atom may name the hosts its
+    // command reaches, within atomic's policy; other atoms run with none.
+    // Every atom's `network` is held to the same shape.
+    match fm.get("network") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Object(n)) => {
+            if let Some(key) = n.keys().find(|k| *k != "allow") {
+                let pointer = format!("/network/{key}");
+                return Err(fail(
+                    line_of(&pointer),
+                    &pointer,
+                    format!("unknown field `{key}`; `network` has only `allow`, a list of hosts"),
+                ));
+            }
+            let hosts: Option<Vec<String>> = match n.get("allow") {
+                None => Some(Vec::new()),
+                Some(Value::Array(a)) => a.iter().map(|h| h.as_str().map(str::to_owned)).collect(),
+                Some(_) => None,
+            };
+            let Some(hosts) = hosts else {
+                return Err(fail(
+                    line_of("/network/allow"),
+                    "/network/allow",
+                    "`network.allow` is a list of host names, such as `['api.example.com']`".into(),
+                ));
+            };
+            if kind != "exec" && !hosts.is_empty() {
+                return Err(fail(
+                    line_of("/network"),
+                    "/network",
+                    "network access is for exec atoms' commands at this version of atomic; \
+                     this atom runs with no network"
+                        .into(),
+                ));
+            }
+            if let Err(why) = crate::network::check_hosts(&hosts) {
+                return Err(fail(
+                    line_of("/network/allow"),
+                    "/network/allow",
+                    format!("{why}; an atom may declare only public DNS names"),
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(fail(
+                line_of("/network"),
+                "/network",
+                "`network` is `false` or `{ allow: [hosts] }`".into(),
+            ));
+        }
     }
     let has_tools = match fm.get("tools") {
         None | Some(Value::Null) => false,

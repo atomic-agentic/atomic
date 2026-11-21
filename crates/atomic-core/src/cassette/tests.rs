@@ -33,6 +33,7 @@ fn runtimes(base_url: &str, model: &str, root: &Path) -> Runtimes {
         base_url: base_url.into(),
         model: model.into(),
         api_key_env: Some("PATH".into()),
+        sign_in: None,
     };
     Runtimes {
         codex: CodexRuntime {
@@ -49,6 +50,7 @@ fn runtimes(base_url: &str, model: &str, root: &Path) -> Runtimes {
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }

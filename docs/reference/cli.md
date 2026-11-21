@@ -141,6 +141,19 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 Lite atoms and workflows that change no code need neither flag. `atomic eval`
 takes the same pair when it is built.
 
+## Model access
+
+| Command | Purpose | Planned stage |
+| --- | --- | --- |
+| `atomic model login` | Sign in with ChatGPT through Codex's login, for Codex atoms; `--device-auth` on a machine with no browser | v0.1 local, Linux |
+| `atomic model status` | Say who is signed in (the email masked), on which plan and where it is kept, never a token; creates nothing; `--json` for scripts | v0.1 local, Linux |
+| `atomic model logout` | Revoke the sign-in where the issuer allows, and forget it in both the keyring and the file store, saying what it found | v0.1 local, Linux |
+
+With no model endpoint configured, Codex atoms use the sign-in and
+`ATOMIC_MODEL`, ahead of a detected `OPENAI_API_KEY` or Ollama.
+Lite atoms need an endpoint. See [subscriptions and
+authentication](../getting-started/authentication.md).
+
 ## Gates and supervision
 
 | Command or surface | Purpose | Planned stage |
@@ -272,7 +285,11 @@ it and its lock. Then it exits: `atomic serve` with status 1, `atomic run` and
 `atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
 next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
-as `outcome_unknown`. Each command runs in a process group of its own (under
+as `outcome_unknown`. A step waiting for room on the execution backend gives up
+its wait at the first signal. Besides 130, `atomic run` and `atomic runs resume`
+stop with 75 when a step found no room within `--backend-wait`, and with 78 when
+the sandbox cannot start; either way the run stays unfinished, with nothing
+recorded, for `atomic runs resume`. Each command runs in a process group of its own (under
 `--runner process`, its runner's), and on Linux it is killed if atomic dies.
 Whatever a command leaves running in its group when it ends is stopped then
 (under `--runner process`, when its runner ends). Output that arrives more than
@@ -310,6 +327,7 @@ Atomic refuses to start when the durable engine's own version variable
 | `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |
 | `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
 | `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
+| `backend_wait`, `ATOMIC_BACKEND_WAIT` (`--backend-wait`) | How many seconds, a whole number of at least 1, a step waits for the execution backend to have room for its workspace. Then `atomic run` and `atomic runs resume` stop, the run unfinished with nothing recorded and exit code 75, for `atomic runs resume`; `atomic serve` sets the step aside, says so, and keeps trying at most 30 seconds apart, saying so each time, and the run goes on once there is room. `atomic eval` waits no longer for each case. Without it a step waits for as long as it takes |
 
 `atomic --remote <url>` and shared/team service access arrive in **v0.5**, with
 identity and transport controls.
