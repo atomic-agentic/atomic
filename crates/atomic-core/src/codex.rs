@@ -2096,7 +2096,8 @@ where
 /// Codex finds repository instructions on its own: it walks up from a
 /// thread's working directory to the project root and, in each directory on
 /// the way, reads the first file it finds named `AGENTS.override.md` or
-/// `AGENTS.md`, sending their text to the model as user instructions. An
+/// `AGENTS.md` (a configured fallback name next, and atomic configures
+/// none), sending their text to the model as user instructions. An
 /// atom's inputs are what its file declares, so no thread atomic starts gets
 /// any of that text: a checkout's or worktree's instruction files are
 /// untrusted input that nothing has pinned or recorded the provenance of. At
