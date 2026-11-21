@@ -26,6 +26,7 @@ pending: only the Ollama case is run end to end. With `OPENAI_API_KEY` as the on
 # project sits outside any repository.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
+pending: the fixture turns only read (`cat` and `pwd`), and the second test has no developer checkout, so no test has a Codex atom write and then shows the checkout unchanged. The control that refuses a writing Codex atom outside a worktree (`target.unsafe`) has no test at all. A test would run a `workspace-write` Codex atom directly and in a step without a worktree, expect `target.unsafe` and an unchanged checkout, and give the fixture turn a file to write.
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings
@@ -53,10 +54,10 @@ budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
 ## While one resume is running, starting another is refused; an effect whose outcome is unknown remains parked.
 ### While one resume is running, starting another is refused
 # The refusal names the process that runs it and the command to wait for; on
-# Postgres, another executor working in the same store leaves a run its
-# resumer owns alone.
+# Postgres, resuming a run another live executor owns is refused until that
+# owner stops.
 run_cli a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time
-run_cli a_resumed_run_is_taken_only_by_its_resumer_on_postgres
+run_cli resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped
 ### an effect whose outcome is unknown remains parked
 run_cli an_unresolved_effect_stays_parked_across_resumes
 pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
@@ -70,10 +71,13 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
+pending: no test runs the coding example itself (`examples/02-change-request`) from outside the project: these use a one-step coding workflow a test writes, the run started from an unrelated directory stops at its gate before the coding turn, and its comparison of the fixture leaves out `git status`. A test would run the example with `--project` from an unrelated directory, with `--fixture` and `--fixture-rev`, to completion, and compare the fixture's full state.
 
 ## A bad path or a missing commit fails before any model call.
-# `fixture.path` for a path that is no repository or not one atomic can copy
-# whole, and `fixture.revision` for a revision the fixture does not have:
+# `fixture.path` for a path that is no repository or is inside one,
+# `fixture.unsupported` for a repository atomic cannot copy whole (submodules,
+# Git LFS), `fixture.revision` for a revision the fixture does not have, and
+# `fixture.input` for an input whose base is a placeholder or a stale commit:
 # typed refusals, each made against an endpoint nothing listens on. The first
 # test also shows that none of these starts a run.
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
