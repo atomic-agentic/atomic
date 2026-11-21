@@ -138,7 +138,9 @@ fn reached(id: &str, position: usize) -> Result<()> {
             *top = position;
             *entries = 0;
         }
-        if position == *top {
+        // A step that stopped for an artifact store held elsewhere, as a pin
+        // does, takes nothing toward dead-lettering, nor does it get further.
+        if position == *top && !atomic_core::runtime::take_held_stop(id) {
             *entries += 1;
         }
         *entries
@@ -723,9 +725,10 @@ fn failed(message: String) -> DurableError {
 /// run again: each try waits as long as the store waits for its lock, and
 /// the wait between tries doubles up to that long. With the store's 30 s,
 /// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
-/// between them) before it spends one of durare's recoveries.
-const LOCKED_RETRIES: u32 = 10;
-const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// between them) before it spends one of durare's recoveries. An exec
+/// step giving its command its inputs waits the same.
+const LOCKED_RETRIES: u32 = atomic_core::runtime::STORE_HELD_RETRIES;
+const LOCKED_BACKOFF: std::time::Duration = atomic_core::runtime::STORE_HELD_BACKOFF;
 
 /// How many times this process has found the artifact store held elsewhere
 /// for each run, try by try.
@@ -756,7 +759,7 @@ fn put_waiting_out_the_lock(
     let mut retries = 0;
     loop {
         match store.put(&mut &content[..], provenance.clone()) {
-            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+            Err(e @ ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
                 let waits = {
                     let mut all = STORE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
                     let n = all.entry(id.to_owned()).or_insert(0);
@@ -770,7 +773,11 @@ fn put_waiting_out_the_lock(
                     );
                 }
                 retries += 1;
-                std::thread::sleep(backoff);
+                // A stopping process waits no longer: the run stops as it
+                // does once the tries run out.
+                if atomic_core::runtime::sleep_unless_stopping(backoff) {
+                    return Err(e);
+                }
                 backoff = (backoff * 2).min(cap);
             }
             stored => return stored,
@@ -1495,6 +1502,7 @@ async fn turn<C: WorkflowContext>(
             step_id: t.name.clone(),
         };
         let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.backend.shared());
+        let (giving, artifacts) = (atom_input.clone(), runtimes.codex.artifacts.clone());
         // The run's own build caches, with a Cargo target of the turn's own.
         let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
@@ -1503,13 +1511,25 @@ async fn turn<C: WorkflowContext>(
             (attempt::begin(ctx, &attempt_step).await?, None)
         } else {
             attempt::begin_with(ctx, &attempt_step, move || async move {
-                let opened = atomic_core::runtime::open_exec_workspace(
+                let mut opened = atomic_core::runtime::open_exec_workspace(
                     &opening,
                     &who,
                     backend,
                     exec_caches.as_ref(),
                 )
                 .await;
+                // Its inputs are given here, before the attempt is recorded:
+                // a store held too long then stops the step with nothing
+                // run and nothing recorded, and the run is run again.
+                if let (Ok(workspace), Ok(compiled)) =
+                    (&opened, compile::compile(&opening, &Registry::new()))
+                    && let Err(e) = atomic_core::runtime::give_exec_inputs(
+                        &opening, &compiled, &giving, &who, workspace, &artifacts,
+                    )
+                    .await
+                {
+                    opened = Err(e);
+                }
                 crate::workflows::settled(opened, &place, true).await
             })
             .await?

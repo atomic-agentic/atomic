@@ -1,0 +1,1 @@
+exec-network-embedded-ipv4|crates/atomic-core/src/network.rs|const EMBEDDING_IPV4: &[&str] = &["64:ff9b:*", "2002:*:*", "2001:0:*", "2001::*"];|const EMBEDDING_IPV4: &[&str] = &[];|-p atomic-agentic-core --lib --features fake-model network::tests::embedded_ipv4_and_this_machines_addresses_are_never_reached
