@@ -140,8 +140,8 @@ fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignIn
         return Ok(());
     };
     let (here, project) = (
-        crate::state::real_path(dir),
-        crate::state::real_path(project),
+        crate::state::as_it_really_is(dir),
+        crate::state::as_it_really_is(project),
     );
     let checkouts = crate::state::checkouts_holding(&project)
         .map_err(|e| SignInError::Store(CredentialError::File(e)))?;

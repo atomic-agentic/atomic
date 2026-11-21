@@ -1,0 +1,1 @@
+room-disk-full-kind|crates/atomic-core/src/worktree.rs|        .contains(&source.kind())|        .contains(&std::io::ErrorKind::Other)|-p atomic-agentic-core --lib --features fake-model -- only_a_full_disk_or_quota_counts_as_full only_atomics_own_writes_on_a_full_disk_wait

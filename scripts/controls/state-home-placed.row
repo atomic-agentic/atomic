@@ -1,0 +1,1 @@
+state-home-placed|crates/atomic-core/src/state.rs|    std::path::absolute(path).ok()|    Some(path.to_path_buf()) // CONTROL_OFF|-p atomic-agentic --test state_cli -- a_relative_home_inside_the_configuration_directory_is_refused
