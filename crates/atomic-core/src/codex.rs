@@ -118,10 +118,11 @@ pub struct TurnSpec {
     /// The sandbox the thread runs in. The network is always restricted.
     pub sandbox: crate::typed::Sandbox,
     /// Environment variables set for every command the thread runs, such as
-    /// the project's shared caches (see [`crate::worktree::Caches`]).
+    /// those that point build tools at its run's caches (see
+    /// [`crate::worktree::Caches`]).
     pub env: BTreeMap<String, String>,
     /// Directories a `workspace-write` thread may write besides its working
-    /// directory, such as the project's shared caches. Absolute paths.
+    /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
 }
 
@@ -1034,7 +1035,7 @@ fn keep_sandbox_off_keyrings() {
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
 /// the same atomic home; only the command's own writable directories, such
-/// as its scratch directory, and the project's caches writable; no network
+/// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
 /// The command still runs with exactly its environment, in its directory.
@@ -1043,7 +1044,6 @@ pub struct ExecSandbox {
     helper: PathBuf,
     guard: StateGuard,
     codex_home: PathBuf,
-    also_writable: Vec<PathBuf>,
     /// The proxies that limit commands declaring network access to their
     /// hosts, shared by every command this sandbox confines.
     proxies: crate::network::Proxies,
@@ -1064,7 +1064,6 @@ impl ExecSandbox {
             helper,
             guard,
             codex_home,
-            also_writable: Vec::new(),
             proxies: crate::network::Proxies::default(),
             loopback_for_tests: Vec::new(),
         })
@@ -1085,13 +1084,6 @@ impl ExecSandbox {
         self
     }
 
-    /// The same confinement, letting every command also write `dirs`, such
-    /// as the project's build and package caches.
-    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
-        self.also_writable = dirs;
-        self
-    }
-
     /// The profile for a command that may write `writable`, except the
     /// directories in `read_only` inside them.
     fn profile(
@@ -1102,17 +1094,15 @@ impl ExecSandbox {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
         };
-        let mut writes = writable.to_vec();
-        writes.extend(self.also_writable.iter().cloned());
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
             None,
-            &writes,
+            writable,
         )?;
         let mut policy = base.file_system_sandbox_policy();
-        for dir in writable.iter().chain(&self.also_writable) {
+        for dir in writable {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
@@ -3096,7 +3086,7 @@ mod tests {
     /// An exec command, confined, is the sandbox helper running `env -i`
     /// with exactly the command's environment, then the command: its
     /// profile denies atomic's private state and lets it write only its own
-    /// directories and the project's caches.
+    /// directories and those it is given, such as its run's caches.
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
@@ -3112,9 +3102,7 @@ mod tests {
             private: state.join("private"),
             also: vec![state.join("keys")],
         });
-        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
-            .expect("a helper")
-            .also_writing(vec![state.join("cache")]);
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex")).expect("a helper");
         let tmp = state.join("scratch/.tmp");
         let confined = sandbox
             .confine(
@@ -3123,7 +3111,7 @@ mod tests {
                     args: vec!["-c".into(), "true".into()],
                     cwd: state.clone(),
                     env: vec![("HOME".into(), scratch_dir.display().to_string())],
-                    writable: vec![scratch_dir.clone()],
+                    writable: vec![scratch_dir.clone(), state.join("cache/run-1")],
                     ..Default::default()
                 },
                 &tmp,
@@ -3157,7 +3145,8 @@ mod tests {
                 "{denied:?}: {text}"
             );
         }
-        for writable in [&scratch_dir, &state.join("cache")] {
+        // Its scratch and its run's caches, as the command names them.
+        for writable in [&scratch_dir, &state.join("cache/run-1")] {
             assert!(
                 text.contains(&writable.display().to_string()),
                 "{writable:?}: {text}"
