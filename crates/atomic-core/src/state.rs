@@ -536,6 +536,36 @@ pub fn passwd_home() -> Option<PathBuf> {
     None
 }
 
+/// The name the password database gives `uid`; `None` when it has no entry
+/// or the name is not UTF-8.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn passwd_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value of the plain C struct.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, both of the
+    // sizes given and alive for the call, and sets `found` to null or to
+    // `entry`.
+    let code = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if code != 0 || found.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` points at a NUL-terminated string inside
+    // `buffer`, which is still alive.
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
+    name.to_str().ok().map(str::to_owned)
+}
+
 /// Make sure `dir` is readable by its owner only: create it so if it is
 /// missing, and close it if it is open to others. A directory already closed
 /// is left as it is, so one mounted read-only, such as a Kubernetes secret,

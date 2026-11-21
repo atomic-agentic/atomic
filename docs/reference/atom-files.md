@@ -436,10 +436,12 @@ a directory above it on the mount the place is under, and the mount
 table's root for it does not say so: the root has gone stale with nothing
 to mark it, as an overlay's does when a lower directory under a bound
 overlay directory is renamed. A mount point that is not there is passed
-over, and so is one, or a place, behind a directory someone else owns that
-you may not search; behind one of your own, which a command could step
-around from a user namespace of its own, nothing runs. Otherwise FUSE (`fuse.*`), 9p,
-virtiofs and other mounts are followed as local ones are. The
+over, and so is one behind a directory you may not search that someone
+else owns, by a uid you cannot map (`/etc/subuid`); behind one of your own,
+or of a uid you may map, which a command could step around from a user
+namespace of its own, nothing runs, and nor does it for a denied place
+that cannot be looked at. Otherwise FUSE (`fuse.*`), 9p, virtiofs and
+other mounts are followed as local ones are. The
 links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
 inside another, mounted twice as two filesystems, each with a device of its

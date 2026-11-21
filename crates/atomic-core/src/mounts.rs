@@ -367,9 +367,11 @@ type Points = std::collections::HashMap<PathBuf, Option<(u64, u64)>>;
 /// marker, as an overlay's does once a lower directory under a bound one is
 /// renamed, or a remote filesystem's when a directory above it is renamed
 /// on the server; the second mount then looks unrelated to the place. A
-/// mount point that is not there shows nothing, and nor does one, or a
-/// place, behind a directory someone else owns that this user may not
-/// search ([`out_of_reach`]); behind one of the user's own, it is refused.
+/// mount point that is not there shows nothing, and nor does one behind a
+/// directory this user may not search that is someone else's, by a uid the
+/// user cannot map ([`out_of_reach`]); behind any other, it is refused. A
+/// place, or a directory above it, that cannot be looked at for any reason
+/// but not being there refuses too: what it shows cannot be checked.
 #[cfg(unix)]
 fn shown_unlisted(
     home: &Mount,
@@ -397,9 +399,6 @@ fn shown_unlisted(
                 above.push(((m.dev(), m.ino()), dir, below));
             }
             Err(e) if not_there(&e) => break,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && out_of_reach(dir) => {
-                break;
-            }
             Err(e) => bail!(
                 "{} cannot be looked at ({e}), so atomic cannot check which other mounts show \
                  {}; it cannot deny it at each",
@@ -477,16 +476,66 @@ fn shown_unlisted(
 
 /// Whether `path`, which this user may not look at, is out of reach of any
 /// command run as this user too: the directory above it that refuses the
-/// search is someone else's. One of the user's own refuses only by its
-/// mode, which a command can step around from a user namespace of its own,
-/// where the user is root over what it owns (`unshare -r`); so is the
-/// path then, and the caller refuses.
+/// search is someone else's, by a uid the user cannot map. One of the
+/// user's own refuses only by its mode, which a command can step around
+/// from a user namespace of its own, where the user is root over what it
+/// owns (`unshare -r`); and so, through the user's subordinate uids
+/// (`/etc/subuid`, as rootless containers use them), can one the user may
+/// have given one of those. The caller then refuses.
 #[cfg(unix)]
 fn out_of_reach(path: &Path) -> bool {
     let Some(owner) = search_refused_by(path) else {
         return false;
     };
-    owner != this_uid()
+    if owner == this_uid() {
+        return false;
+    }
+    !mappable(owner)
+}
+
+/// Whether this user may map `uid` into a user namespace of its own: it is
+/// in one of the user's ranges in `/etc/subuid`, named by the user's name
+/// or uid. A file there that cannot be read or is not one such counts every
+/// uid as mappable; with none, the user maps only itself.
+#[cfg(unix)]
+fn mappable(uid: u32) -> bool {
+    let text = match subuid_file() {
+        Ok(text) => text,
+        Err(std::io::ErrorKind::NotFound) => return false,
+        Err(_) => return true,
+    };
+    let me = this_uid();
+    let name = crate::state::passwd_name(me);
+    let ranges: Option<Vec<(String, u64, u64)>> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let mut fields = line.split(':');
+            let (who, start, count) = (fields.next()?, fields.next()?, fields.next()?);
+            if fields.next().is_some() {
+                return None;
+            }
+            Some((who.to_owned(), start.parse().ok()?, count.parse().ok()?))
+        })
+        .collect();
+    let Some(ranges) = ranges else {
+        return true;
+    };
+    ranges.iter().any(|(who, start, count)| {
+        let mine = *who == me.to_string() || name.as_deref() == Some(who.as_str());
+        mine && (*start..start.saturating_add(*count)).contains(&u64::from(uid))
+    })
+}
+
+/// What `/etc/subuid` holds, or, in a test, what [`with_subuid`] stands in.
+#[cfg(unix)]
+fn subuid_file() -> Result<String, std::io::ErrorKind> {
+    #[cfg(test)]
+    if let Some(given) = SUBUID.with(|s| s.borrow().clone()) {
+        return given;
+    }
+    std::fs::read_to_string("/etc/subuid").map_err(|e| e.kind())
 }
 
 /// The owner of the directory above `path` that does not let this user
@@ -522,25 +571,46 @@ fn this_uid() -> u32 {
 #[cfg(test)]
 thread_local! {
     static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static SUBUID: std::cell::RefCell<Option<Result<String, std::io::ErrorKind>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Have [`this_uid`] answer `uid` on this thread until what it returns is
 /// dropped: a test's way to make its own directory someone else's.
 #[cfg(test)]
 pub(crate) fn with_uid(uid: u32) -> UidGuard {
-    UID.with(|u| u.set(Some(uid)));
-    UidGuard
+    UidGuard(UID.with(|u| u.replace(Some(uid))))
 }
 
-/// Ends [`with_uid`] when dropped.
+/// Puts back what [`this_uid`] answered before [`with_uid`] when dropped.
 #[cfg(test)]
 #[must_use]
-pub(crate) struct UidGuard;
+pub(crate) struct UidGuard(Option<u32>);
 
 #[cfg(test)]
 impl Drop for UidGuard {
     fn drop(&mut self) {
-        UID.with(|u| u.set(None));
+        UID.with(|u| u.set(self.0));
+    }
+}
+
+/// Have [`subuid_file`] answer `given` on this thread until what it returns
+/// is dropped: the file's text, or the error reading it gave.
+#[cfg(test)]
+pub(crate) fn with_subuid(given: Result<&str, std::io::ErrorKind>) -> SubuidGuard {
+    SubuidGuard(SUBUID.with(|s| s.replace(Some(given.map(str::to_owned)))))
+}
+
+/// Puts back what [`subuid_file`] answered before [`with_subuid`] when
+/// dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct SubuidGuard(Option<Result<String, std::io::ErrorKind>>);
+
+#[cfg(test)]
+impl Drop for SubuidGuard {
+    fn drop(&mut self) {
+        SUBUID.with(|s| *s.borrow_mut() = self.0.take());
     }
 }
 

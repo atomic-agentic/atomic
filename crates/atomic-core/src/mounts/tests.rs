@@ -567,17 +567,66 @@ fn what_hides_behind_the_users_own_locked_directory_is_refused() {
             .to_string()
             .contains(&format!("{} cannot be looked at", hidden.display())))
     );
-    // The same directory, someone else's: out of reach of the user's
-    // commands too, and passed.
-    let _other = with_uid(crate::state::effective_uid() + 1);
-    let mounts = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
+    // The same directory, someone else's, by a uid the user cannot map: a
+    // mount point behind it is out of reach of the user's commands too,
+    // and passed over; a place behind it still refuses, since what shows it
+    // elsewhere cannot be checked.
+    let me = crate::state::effective_uid();
+    let _other = with_uid(me + 1);
+    let _none = with_subuid(Err(std::io::ErrorKind::NotFound));
+    let behind = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
     assert_eq!(
-        aliases(&mounts, std::slice::from_ref(&place)).expect("out of reach"),
+        aliases(&behind, std::slice::from_ref(&place)).expect("out of reach"),
         Vec::<PathBuf>::new()
     );
     let mounts = parse(table(&elsewhere).as_bytes()).expect("parses");
-    assert_eq!(
-        aliases(&mounts, std::slice::from_ref(&hidden)).expect("out of reach"),
-        Vec::<PathBuf>::new()
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&hidden)).is_err_and(|e| e
+            .to_string()
+            .contains(&format!("{} cannot be looked at", hidden.display())))
     );
+}
+
+/// A directory someone else owns is out of reach only by a uid the user
+/// cannot map into a user namespace of its own (`/etc/subuid`): one the
+/// user may map counts as the user's, and a subordinate-uid file that
+/// cannot be read or is not one refuses.
+#[test]
+fn a_directory_of_a_uid_the_user_may_map_is_the_users_own() {
+    let dir = scratch("locked-mapped");
+    let place = dir.0.join("home/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    let _unlocked = locked(&dir.0.join("locked"));
+    let table = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 /x {} rw - ext4 /dev/sda1 rw\n",
+        dir.0.join("locked/m").display()
+    );
+    let mounts = parse(table.as_bytes()).expect("parses");
+    // The directory is this process's; the test stands in another user, so
+    // it is someone else's by a uid that user may or may not map.
+    let owner = crate::state::effective_uid();
+    let user = owner + 1;
+    let _other = with_uid(user);
+    let refused = |given: Result<&str, std::io::ErrorKind>| {
+        let _subuid = with_subuid(given);
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
+            e.to_string().contains(&format!(
+                "the mount at {} cannot be looked at",
+                dir.0.join("locked/m").display()
+            ))
+        })
+    };
+    // A range of the user's, by uid, that holds the owner: refused.
+    assert!(refused(Ok(&format!("{user}:{owner}:1\n"))));
+    // One that does not, or another user's: passed over.
+    assert!(!refused(Ok(&format!(
+        "{user}:{}:10\n{}:{owner}:1\n",
+        owner + 1,
+        user + 1
+    ))));
+    // No file: the user maps only itself.
+    assert!(!refused(Err(std::io::ErrorKind::NotFound)));
+    // A file that cannot be read, or is not one: refused.
+    assert!(refused(Err(std::io::ErrorKind::PermissionDenied)));
+    assert!(refused(Ok("not a subordinate uid file\n")));
 }
