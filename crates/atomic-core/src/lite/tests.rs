@@ -254,6 +254,65 @@ async fn a_provider_error_is_a_model_error_with_no_retry() {
     assert_eq!(model.calls(), 1);
 }
 
+/// A call that failed inside a step says on that step's note what its own
+/// span says — the status and the type the provider named, none of its body —
+/// which is what the step's span and its run's go on to say, since neither
+/// ever hears this error. The failure the run keeps still holds the body.
+#[tokio::test]
+async fn a_failed_call_says_on_its_step_what_its_span_says() {
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 401,
+        body: format!(
+            "{{\"error\":{{\"message\":\"{}\",\"type\":\"invalid_request_error\"}}}}",
+            "the provider's own words ".repeat(50)
+        ),
+    }])
+    .await
+    .expect("fake model");
+    let rt = runtime(&model, Wire::ChatCompletions);
+    // The step's own note, as the workflow that runs the step makes one.
+    let why = crate::usage::Why::for_step();
+    let answer = crate::usage::for_step(
+        "run:note",
+        "rank",
+        why.clone(),
+        run_lite_atom(&Classify, &note(), &rt, &Default::default()),
+    )
+    .await;
+    let Err(AtomError::Model(kept)) = &answer else {
+        panic!("expected a model error, got {answer:?}");
+    };
+    assert_eq!(
+        why.noted().as_deref(),
+        Some("401 Unauthorized: invalid_request_error"),
+        "the step's spans say what this call's span says, and none of its body"
+    );
+    assert!(
+        kept.contains("the provider's own words"),
+        "the failure the run keeps is the whole: {kept}"
+    );
+}
+
+/// A call that failed where no step was running notes on nothing: there is no
+/// span outliving it to say more than its own.
+#[tokio::test]
+async fn a_failed_call_outside_a_step_notes_nothing() {
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 503,
+        body: r#"{"error": "loading model"}"#.into(),
+    }])
+    .await
+    .expect("fake model");
+    let rt = runtime(&model, Wire::ChatCompletions);
+    let why = crate::usage::Why::for_step();
+    assert!(
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .is_err()
+    );
+    assert_eq!(why.noted(), None, "nothing was noted for a step");
+}
+
 #[tokio::test]
 async fn a_missing_api_key_fails_before_any_call() {
     let model = FakeModel::start(vec![Reply::Text(GOOD.into())])

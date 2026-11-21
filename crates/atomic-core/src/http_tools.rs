@@ -19,11 +19,18 @@
 //! a 429 or a 5xx; others are sent once. Responses are bounded. A success
 //! is checked against the response the operation declares for its status
 //! (its own code, else its range, else `default`): its schema, if it has
-//! one. A success with a status the operation declares no response for,
-//! when it declares any, is refused; it was answered, so it is not sent
-//! again.
+//! one, and no body at all only where that response declares no `content`
+//! at all, as a `204` does. A response that declares `content` atomic has
+//! no JSON schema for — a `*/*` or `text/plain` media type, or a JSON media
+//! type with no `schema` — declares a body whose shape nothing describes, so
+//! it is passed through unchecked. Because `default` is selected by every
+//! success no code or range declares, a contentless `default` refuses an
+//! undeclared success that comes back with a body; that is the restrictive
+//! reading, and it is deliberate. A success with a status the operation
+//! declares no response for, when it declares any, is refused; it was
+//! answered, so it is not sent again.
 
-use atomic_schema::openapi::Operation;
+use atomic_schema::openapi::{Operation, ResponseBody};
 use reqwest::Url;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -100,7 +107,11 @@ pub enum CallError {
         /// What failed.
         message: String,
     },
-    /// The response breaks the schema the operation declares for its status.
+    /// The response breaks the contract the operation declares for its
+    /// status: it does not fit that response's schema, or it carries a body
+    /// where that response declares no `content` at all. A response that
+    /// declares content with no JSON schema to check against is not a
+    /// violation either way; its body is passed through unchecked.
     #[error(
         "`{operation}` returned {status}, which does not fit its response `{response}`: {errors}"
     )]
@@ -134,6 +145,17 @@ fn redacted(headers: &[(String, String)]) -> Vec<String> {
         .iter()
         .map(|(name, _)| format!("{}: ***", name.to_ascii_lowercase()))
         .collect()
+}
+
+/// Whether a body carries nothing where the selected response declares no
+/// content: no bytes, or JSON's own whitespace only. A reply told to carry
+/// nothing may still frame an empty one, and whitespace carries nothing, so
+/// both read as no result. Form feed is not JSON whitespace, so a body of it
+/// is not blank here, and stays the parse failure it has always been.
+fn is_blank_body(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 impl std::fmt::Debug for HttpToolset {
@@ -537,13 +559,47 @@ impl HttpToolset {
             let status = response.status();
             let bytes = read_bounded(response).await.map_err(&transport)?;
             if status.is_success() {
-                let value = if bytes.is_empty() {
+                let code = status.as_u16();
+                let declared = self
+                    .operations
+                    .get(name)
+                    .and_then(|operation| operation.response(code));
+                // Only a response that declares no `content` at all declares
+                // no body: a `204`, or a `200` written with only a
+                // description. Anything that carries something with it
+                // breaks the contract, and is refused as such before it is
+                // parsed. A response that declares content atomic has no
+                // JSON schema for declares a body too, of a shape nothing
+                // describes, so what comes back is not held against it.
+                let mut nothing_declared = false;
+                if let Some((key, ResponseBody::NoBody)) = declared {
+                    nothing_declared = true;
+                    if !is_blank_body(&bytes) {
+                        return Err(CallError::Response {
+                            operation: name.to_owned(),
+                            status: code,
+                            response: key.to_owned(),
+                            errors: format!(
+                                "its response declares no body, and {} bytes were returned",
+                                bytes.len()
+                            ),
+                        });
+                    }
+                }
+                // An empty body is read as `null`. Reaching here with no
+                // content declared, the body is blank, and blank is no
+                // result either: the reply was told to carry nothing. Where
+                // a body was declared — a JSON schema, or a media type
+                // atomic does not read — only no bytes at all read as null;
+                // whitespace is not JSON, and stays the transport failure it
+                // has always been.
+                let value = if bytes.is_empty() || nothing_declared {
                     Value::Null
                 } else {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| transport(format!("the response is not JSON: {e}")))?
                 };
-                return self.check_response(name, status.as_u16(), value);
+                return self.check_response(name, code, value);
             }
             let error = CallError::Status {
                 operation: name.to_owned(),
@@ -563,17 +619,21 @@ impl HttpToolset {
     /// `value`, the body of a success with `status`, if it fits the schema
     /// the operation declares for that status (see
     /// [`atomic_schema::openapi::Operation::response`]), or the operation
-    /// declares none to fit: a response it declares with no JSON body, such
-    /// as a `204`, has nothing to check, and an operation that declares no
-    /// response at all takes any. A success whose status the operation does
-    /// not declare, when it declares others, is refused.
+    /// declares none to fit: a response that declares content with no JSON
+    /// schema declares a body nothing describes, so any body fits; a
+    /// response with no content at all, such as a `204`, has nothing to
+    /// check here, because its caller has already refused one that carried a
+    /// body; and an operation that declares no response at all takes any. A
+    /// success whose status the operation does not declare, when it declares
+    /// others, is refused.
     fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
         let Some(operation) = self.operations.get(name) else {
             return Ok(value);
         };
         let (key, schema) = match operation.response(status) {
-            Some((key, Some(schema))) => (key, schema),
-            Some((_, None)) => return Ok(value),
+            Some((key, ResponseBody::Json(schema))) => (key, schema),
+            // Declares a body, declares no schema to fit it: passed through.
+            Some((_, _)) => return Ok(value),
             None if operation.responses.is_empty() => return Ok(value),
             None => {
                 return Err(CallError::Undeclared {

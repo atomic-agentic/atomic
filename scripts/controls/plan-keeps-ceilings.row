@@ -1,0 +1,1 @@
+plan-keeps-ceilings|crates/atomic/src/metering.rs|                && caps.tokens > tokens|                && false /*CONTROL_OFF*/|-p atomic-agentic --test pipeline -- --exact a_budget_plan_above_the_caps_it_was_resolved_under_is_refused
