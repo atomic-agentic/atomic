@@ -753,7 +753,11 @@ const LINK_FILE_MAX: u64 = 4096;
 /// How a link file is opened: without waiting on a pipe's writer, and
 /// never as the process's controlling terminal.
 #[cfg(unix)]
-const LINK_OPEN_FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOCTTY;
+const LINK_OPEN_FLAGS: i32 = NOT_WAITING | libc::O_NOCTTY;
+
+/// What makes an open of a link file not wait on a pipe's writer.
+#[cfg(unix)]
+const NOT_WAITING: i32 = libc::O_NONBLOCK;
 
 /// What makes an open of another user's link file refuse a link where it
 /// ends, so it opens nothing that link names.
@@ -1375,7 +1379,10 @@ mod tests {
         );
         let held =
             checkouts_holding_as(&closed.join("inner/project"), me).expect("refuses nothing");
-        assert!(held.contains(&closed.join("inner")), "taken for absent: {held:?}");
+        assert!(
+            held.contains(&closed.join("inner")),
+            "taken for absent: {held:?}"
+        );
         drop(_reopened);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1399,14 +1406,17 @@ mod tests {
         assert_eq!(made, 0, "mkfifo");
         std::os::unix::fs::symlink(&fifo, gitdir.join("commondir")).expect("commondir");
         let foreign = link_file(&gitdir.join("commondir"), false).expect_err("refused");
-        assert!(foreign.contains("os error 40"), "the link was followed: {foreign}");
+        assert!(
+            foreign.contains("os error 40"),
+            "the link was followed: {foreign}"
+        );
         let own = link_file(&gitdir.join("commondir"), true).expect_err("refused");
         assert!(own.contains("is not a regular file"), "{own}");
         std::fs::create_dir_all(dir.join("project")).expect("project");
-        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", gitdir.display()))
-            .expect(".git");
-        let held = checkouts_holding_as(&dir.join("project"), Some(effective_uid().wrapping_add(1)))
-            .expect("refuses nothing");
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", gitdir.display())).expect(".git");
+        let held =
+            checkouts_holding_as(&dir.join("project"), Some(effective_uid().wrapping_add(1)))
+                .expect("refuses nothing");
         assert!(held.contains(&dir), "{held:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

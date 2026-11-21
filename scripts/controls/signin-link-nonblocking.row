@@ -1,1 +1,1 @@
-signin-link-nonblocking|crates/atomic-core/src/state.rs|custom_flags(&mut open, LINK_OPEN_FLAGS);|custom_flags(&mut open, 0 /*CONTROL_OFF*/);|-p atomic-agentic-core --lib state::tests::a_link_file_that_is_not_a_small_regular_file_is_refused
+signin-link-nonblocking|crates/atomic-core/src/state.rs|const NOT_WAITING: i32 = libc::O_NONBLOCK;|const NOT_WAITING: i32 = 0; /*CONTROL_OFF*/|-p atomic-agentic-core --lib state::tests::a_link_file_that_is_not_a_small_regular_file_is_refused
