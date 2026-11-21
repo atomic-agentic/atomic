@@ -43,9 +43,9 @@ no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
 gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with. An atom step's `review` is built
-for one reviewer atom with a typed verdict: a rejection gives the author repair
-rounds, and an escalation or a rejection with no rounds left goes to a person
-at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
+for one reviewer atom with a typed verdict: a request for changes gives the
+author repair rounds, and any other verdict but an approval, or a request for
+changes with no rounds left, goes to a person at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
 and calibrated decision atoms are not built yet.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,

@@ -296,6 +296,22 @@ where
     F: Fn(StepInfo) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
 {
+    Ok(execute_candidate_told(ctx, name, author).await?.0)
+}
+
+/// As [`execute_candidate_at`], with the position the author was told: its
+/// first turn's, however many times a park ran it again. It is the same on
+/// a replay of the turn, which runs no author.
+pub async fn execute_candidate_told<C, F, Fut>(
+    ctx: &C,
+    name: &str,
+    author: F,
+) -> Result<(Candidate, i32)>
+where
+    C: WorkflowContext,
+    F: Fn(StepInfo) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
+{
     let author = Arc::new(author);
     let mut first: Option<i32> = None;
     loop {
@@ -323,7 +339,22 @@ where
             })
             .await?;
         match turn {
-            Turn::Candidate(candidate) => return Ok(candidate),
+            Turn::Candidate(candidate) => {
+                let told = match first {
+                    Some(first) => first,
+                    None => candidate
+                        .id
+                        .rsplit_once(':')
+                        .and_then(|(_, p)| p.parse().ok())
+                        .ok_or_else(|| {
+                            DurableError::Failed(format!(
+                                "candidate {} does not name its turn's position",
+                                candidate.id
+                            ))
+                        })?,
+                };
+                return Ok((candidate, told));
+            }
             Turn::Parked { position, reason } => {
                 first.get_or_insert(position);
                 park(ctx, name, position, reason).await?;

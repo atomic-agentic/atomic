@@ -713,30 +713,34 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
     engine.register("parks", move |ctx: DurareContext, (): ()| {
         let t = t.clone();
         async move {
-            run_atom_at(
-                &ctx,
-                "plan",
-                move |step| {
-                    let t = t.clone();
-                    async move {
-                        let turns = {
-                            let mut told = t.lock().expect("told");
-                            told.push(step.step_id);
-                            told.len()
-                        };
-                        if turns < 3 {
-                            return Err(DurableError::Parked(format!("no room, turn {turns}")));
-                        }
-                        Ok(Proposal {
-                            output: json!("planned"),
-                            metadata: json!({}),
-                            writes: Vec::new(),
-                        })
+            let (candidate, told) = execute_candidate_told(&ctx, "plan.turn", move |step| {
+                let t = t.clone();
+                async move {
+                    let turns = {
+                        let mut told = t.lock().expect("told");
+                        told.push(step.step_id);
+                        told.len()
+                    };
+                    if turns < 3 {
+                        return Err(DurableError::Parked(format!("no room, turn {turns}")));
                     }
-                },
+                    Ok(Proposal {
+                        output: json!("planned"),
+                        metadata: json!({}),
+                        writes: Vec::new(),
+                    })
+                }
+            })
+            .await?;
+            let output = publish_candidate(
+                &ctx,
+                "plan.publish",
+                &candidate,
+                &review_candidate(&candidate),
                 Vec::new(),
             )
-            .await
+            .await?;
+            Ok((output, told))
         }
     });
     engine.launch().await?;
@@ -771,8 +775,8 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
     assert_ne!(second[1].id, first[0].id);
     assert_eq!(second[1].reason, "no room, turn 2");
     release(&engine, &second[1]).await?;
-    let published: Published = engine.result(&run).await?;
-    assert_eq!(published.output, json!("planned"));
+    let (output, told_back): (Value, i32) = engine.result(&run).await?;
+    assert_eq!(output, json!("planned"));
     // Every turn was told the first turn's position.
     let told = told.lock().expect("told").clone();
     assert_eq!(
@@ -781,6 +785,8 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
         "one turn per release; the repeat release did nothing"
     );
     assert!(told.iter().all(|p| *p == told[0]), "{told:?}");
+    // And the caller is given that position, not the last turn's.
+    assert_eq!(told_back, told[0]);
     let names: Vec<String> = engine
         .steps(&run)
         .await?

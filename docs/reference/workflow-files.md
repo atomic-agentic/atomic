@@ -88,7 +88,9 @@ with `approve` among them:
 The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
 own. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step
-`candidate.metadata.commit`; each binding must fit the reviewer's input. What
+`candidate.metadata.commit`; each binding must fit the reviewer's input. The
+reviewer runs in the project, not in the step's worktree, so of a coding
+step's change it has the commit's SHA, not the commit itself. What
 it reads of the candidate is external data, so a reviewer that accepts only
 more trusted input is refused. `rounds` (0 to 5, default 1) is how many repair
 rounds the author gets; an author that accepts only more trusted input than the

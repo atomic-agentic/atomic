@@ -73,7 +73,7 @@ use atomic_durable::gate::{self, Deployment, GateSpec, Resolution, Tier};
 use atomic_durable::usage::Ledger;
 use atomic_durable::{
     Acceptance, Candidate, DurableError, DurableRuntime, Proposal, Published, Result,
-    WorkflowContext, execute_candidate_at, failpoint, publish_candidate, review_candidate,
+    WorkflowContext, execute_candidate_told, failpoint, publish_candidate, review_candidate,
 };
 use atomic_schema::expr::Shape;
 use atomic_schema::registry::Registry;
@@ -1016,7 +1016,7 @@ async fn run_pipeline<C: WorkflowContext>(
             accepted: &accepted,
         };
         used_worktrees |= step.worktree;
-        let candidate = turn(
+        let (candidate, told) = turn(
             &ctx,
             &run,
             Turn {
@@ -1042,7 +1042,7 @@ async fn run_pipeline<C: WorkflowContext>(
                     review,
                     &values,
                     atom_input,
-                    candidate,
+                    (candidate, told),
                 )
                 .await?;
                 // What accepted it, kept with the run's record.
@@ -1178,7 +1178,11 @@ struct Turn {
 /// its caps and pinned model, an exec atom's attempt guard, a worktree, a
 /// replay's recorded result, and metering. Checkpoints the turn's result as
 /// a private candidate under `<name>.turn`; the caller publishes it.
-async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Result<Candidate> {
+async fn turn<C: WorkflowContext>(
+    ctx: &C,
+    run: &RunScope<'_>,
+    t: Turn,
+) -> Result<(Candidate, i32)> {
     let RunScope {
         pipeline,
         services,
@@ -1354,7 +1358,7 @@ async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Resul
     let serving = replay.clone();
     let repair = t.repair.clone();
     let charge = t.charge;
-    execute_candidate_at(ctx, &format!("{}.turn", t.name), move |position| {
+    execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
@@ -1492,12 +1496,6 @@ async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Resul
     .await
 }
 
-/// The position of the turn that checkpointed `candidate`, from its id
-/// (`<run>:<position>`).
-fn position_of(candidate: &Candidate) -> Option<i32> {
-    candidate.id.rsplit_once(':')?.1.parse().ok()
-}
-
 /// Review `candidate`, the author's turn of `step` on `input`: the reviewer
 /// gives a typed verdict on it (`<id>.review.<n>`); a request for changes
 /// with rounds left hands the verdict to the author for a repair round
@@ -1522,8 +1520,29 @@ async fn reviewed<C: WorkflowContext>(
     review: &ReviewStep,
     values: &[(&str, &Value, &Shape<'_>); 2],
     input: Value,
-    mut candidate: Candidate,
+    (mut candidate, author_turn): (Candidate, i32),
 ) -> Result<(Candidate, Acceptance)> {
+    // As the loader refuses them, for a run whose pipeline came from
+    // anywhere else.
+    if step.id.contains('.') {
+        return Err(failed(format!(
+            "step `{}` has a dot in its name, which its review's durable names would share",
+            step.id
+        )));
+    }
+    let kind = |name: &str| run.pipeline.atoms.get(name).map(|a| a.kind.as_str());
+    if kind(&step.atom) == Some("exec") {
+        return Err(failed(format!(
+            "step `{}`: an exec atom's output cannot be reviewed",
+            step.id
+        )));
+    }
+    if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
+        return Err(failed(format!(
+            "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
+            step.id, review.reviewer
+        )));
+    }
     if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
         return Err(failed(format!(
             "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
@@ -1543,7 +1562,6 @@ async fn reviewed<C: WorkflowContext>(
         seen_shape.push(("metadata", Shape::Schema(&commit_schema)));
     }
     let candidate_shape = Shape::fields(seen_shape);
-    let author_turn = position_of(&candidate);
     let mut first_verdict = None;
     let mut round = 0;
     let (verdict, said) = loop {
@@ -1562,7 +1580,7 @@ async fn reviewed<C: WorkflowContext>(
         }
         let name = format!("{}.review.{round}", step.id);
         keep_working(working).await;
-        let verdict = turn(
+        let (verdict, told) = turn(
             ctx,
             run,
             Turn {
@@ -1576,7 +1594,7 @@ async fn reviewed<C: WorkflowContext>(
             },
         )
         .await?;
-        first_verdict = first_verdict.or_else(|| position_of(&verdict));
+        first_verdict = first_verdict.or(Some(told));
         // The verdict is a reviewer's result like any atom's: published,
         // so the record shows what it decided.
         let verdict = publish_candidate(
@@ -1608,7 +1626,7 @@ async fn reviewed<C: WorkflowContext>(
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
                 keep_working(working).await;
-                candidate = turn(
+                (candidate, _) = turn(
                     ctx,
                     run,
                     Turn {
@@ -1621,7 +1639,7 @@ async fn reviewed<C: WorkflowContext>(
                             "output": candidate.proposal.output,
                             "review": verdict,
                         })),
-                        charge: author_turn,
+                        charge: Some(author_turn),
                     },
                 )
                 .await?;
@@ -1643,8 +1661,13 @@ async fn reviewed<C: WorkflowContext>(
     let approvers = gate::resolve(&id, None, &run.services.deployment)
         .map_err(|e| failed(format!("gate `{id}`: {e}")))?;
     let mut show = json!({"output": candidate.proposal.output, "verdict": verdict});
-    if let Some(commit) = candidate.proposal.metadata.get("commit") {
-        show["commit"] = commit.clone();
+    if step.worktree {
+        show["commit"] = candidate
+            .proposal
+            .metadata
+            .get("commit")
+            .cloned()
+            .unwrap_or(Value::Null);
     }
     let spec = GateSpec {
         workflow: run.pipeline.name.clone(),

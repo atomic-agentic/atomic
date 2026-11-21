@@ -622,6 +622,7 @@ pub fn load(
                         steps: &steps_schema,
                     },
                     &kinds,
+                    &mut warnings,
                     &fail,
                 )?;
             }
@@ -860,7 +861,8 @@ pub fn candidate_schema(output: &Value, worktree: bool) -> Value {
 
 /// The origin a review binding's `source` carries: what it reads of the
 /// step's scope, as [`binding_origin`] has it, and anything of `candidate`
-/// as external, since the candidate came from the author on data that may.
+/// as external, since the candidate is the author's output on data that may
+/// itself be external.
 pub fn review_origin(
     source: &str,
     kinds: &BTreeMap<String, String>,
@@ -883,6 +885,7 @@ fn check_review(
     scope: &Scope,
     roots: &Roots<'_>,
     kinds: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
     fail: &dyn Fn(&str, String) -> WorkflowError,
 ) -> Result<(), WorkflowError> {
     let author_name = reviewed.name;
@@ -1031,11 +1034,17 @@ fn check_review(
                 ("candidate", &candidate),
             ],
         );
-        if let Fit::No(why) = fits(from.as_ref(), field_schema) {
-            return Err(fail(
-                &wp,
-                format!("`{source}` cannot fit `{name}`'s input field `{field}`: {why}"),
-            ));
+        match fits(from.as_ref(), field_schema) {
+            Fit::Yes => {}
+            Fit::No(why) => {
+                return Err(fail(
+                    &wp,
+                    format!("`{source}` cannot fit `{name}`'s input field `{field}`: {why}"),
+                ));
+            }
+            Fit::Unknown => {
+                warnings.push(format!("{wp}: could not prove `{source}` fits `{field}`"))
+            }
         }
         let origin = review_origin(source, kinds).map_err(|m| fail(&wp, m))?;
         if trust_rank(origin) < trust_rank(&reviewer_accepts) {
