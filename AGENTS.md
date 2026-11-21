@@ -228,8 +228,8 @@ first.
     checkout's `.git` as docs/development.md describes), and quote each
     result line. The script refuses files that differ from HEAD, so it runs
     on committed work; if you have not been asked to commit, say which rows
-    are unrun and why. For each row, say what the switched-off code then does and which assertion fails.
-    A guard with two halves (kill and reap, the terms of a count, a check and
+    are unrun and why. For each row, say what the switched-off code then
+    does and which assertion fails. A guard with two halves (kill and reap, the terms of a count, a check and
     its message) is switched off one half at a time; a half whose removal
     fails no test gets its own test and row. With any control off, the test
     still needs no network and no real provider: point every endpoint it
