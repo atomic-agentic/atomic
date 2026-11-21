@@ -3338,8 +3338,9 @@ fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
 
 /// Under `atomic serve`, a run whose commands cannot be confined is set
 /// aside, unfinished and with nothing recorded, and serve goes on with the
-/// others and stops at once when asked; where the sandbox starts again the
-/// run resumes and finishes. `atomic run` stops with its exit code instead.
+/// others and stops at once when asked. It tries the sandbox again now and
+/// then, so once the machine is fixed serve itself finishes the run, its
+/// second step once. `atomic run` stops with its exit code instead.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -3406,7 +3407,7 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
         let log = dir.join("serve.log");
         let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
         wait_until("serve to set the run aside", || {
-            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("stays unfinished"))
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("until the sandbox can start"))
         });
         approve(&rt, &opened).await;
         let started = Instant::now();
@@ -3441,22 +3442,38 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
             "second never ran"
         );
 
-        // Where the sandbox starts, the run finishes, its second step once.
+        // A serve started while the sandbox still cannot start sets the run
+        // aside again, and once the machine is fixed it finishes the run
+        // itself, its second step once.
+        let log = dir.join("serve-2.log");
+        let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
+        wait_until("serve to set the run aside again", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("until the sandbox can start"))
+        });
         std::fs::remove_file(dir.join("bwrap-refuse")).expect("fixed");
-        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
-        let out = tokio::task::spawn_blocking(move || {
-            let mut env = UNUSED_MODEL.to_vec();
-            env.push(("PATH", e.as_str()));
-            atomic(&d, &p, &["--json", "runs", "resume", "two-1"], &env, "")
-        })
-        .await
-        .expect("child");
-        assert!(out.status.success(), "{}", text(&out));
-        // Each step's command ran once, in order, by the log the run kept.
-        assert_eq!(
-            stdout_json(&out)["output"]["steps"],
-            json!(["first start", "first end", "second"])
+        let started = Instant::now();
+        while rt.status("two-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "serve never tried the sandbox again: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(text_log.contains("the sandbox starts again"), "{text_log}");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
         );
+        // Each step's command ran once, in order, by the log the run kept.
+        let out: Value = rt.result("two-1").await.expect("finished");
+        assert_eq!(out["steps"], json!(["first start", "first end", "second"]));
     });
 }
 
@@ -6141,7 +6158,17 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
         ranking_atom(&project, "rank-for-team", Some("team"));
         ranking_atom(&project, "rank-for-agents", Some("agent"));
         let env = model_env(&model.base_url());
-        for atom in ["rank-for-team", "rank-for-agents"] {
+        for (atom, sources) in [
+            (
+                "rank-for-team",
+                "a gate a person decides, or a literal in the workflow file",
+            ),
+            (
+                "rank-for-agents",
+                "a model step's output, a gate a person decides, or a literal in the workflow \
+                 file",
+            ),
+        ] {
             let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
             let out = tokio::task::spawn_blocking(move || {
                 atomic(
@@ -6163,10 +6190,21 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
                 message.contains(&format!("atom `{atom}`")),
                 "{atom}: {message}"
             );
+            // The action names what the atom takes instead.
+            let action = error["action"].as_str().unwrap_or_default();
+            assert!(
+                action.contains(&format!(
+                    "run it from a workflow that binds the field to {sources}"
+                )) && action.contains("declare a lower `trust` on the atom"),
+                "{atom}: the action names what can take the field's place"
+            );
             // Refused as the run was loaded: no durable run was started,
             // which would name itself first on stderr.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+            assert!(
+                !stderr.contains("run run-"),
+                "{atom}: a run started: {stderr}"
+            );
         }
         assert_eq!(model.calls(), 0, "a model was called");
     });

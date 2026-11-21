@@ -4,7 +4,10 @@
 //! so a large result goes between steps by reference.
 //!
 //! Both live in the command's workspace, inside its scratch directory, the
-//! one directory a confined command may write ([`Exchange`]):
+//! one directory a confined command may write, and atomic reaches them only
+//! through the exchange the workspace's backend gives
+//! ([`atomic_exec::exchange`]), so it does no filesystem work in a
+//! workspace itself ([`Exchange`]):
 //!
 //! - its outputs directory (`ATOMIC_OUTPUTS`), where it writes a file it
 //!   produces and names it in its output, where the contract expects an
@@ -22,21 +25,21 @@
 //!   expects one, named by its digest. The directory is read-only to a
 //!   confined command, and the copies are read-only too.
 //!
-//! The outputs directory is opened before the command runs and read through
-//! that handle afterwards, so swapping it for a link leads nowhere. A file
-//! is opened beneath it without following links, must be a regular file
-//! with one link, is read up to the size it had when it was opened, and is
-//! held to [`Limits`]. An output may name at most [`MAX_FILES`] files, with
+//! A file the backend hands back must be a regular file of the command's
+//! own, never one a link names (on this machine, see
+//! [`atomic_exec::exchange::LocalExchange`]); it is read up to the size it
+//! had when it was opened, and is held to [`Limits`]. An output may name at most [`MAX_FILES`] files, with
 //! at most [`MAX_FILE_OBJECTS`] objects where its contract expects
 //! references.
 
-use super::{ArtifactError, ArtifactRef, ArtifactStore, Provenance};
+use super::{ArtifactError, ArtifactRef, ArtifactStore, Hold, Provenance};
+use atomic_exec::exchange::TakeError;
 use atomic_schema::artifact::ArtifactLookup;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -76,90 +79,68 @@ impl Default for Limits {
     }
 }
 
-/// A command's outputs and inputs directories, inside its scratch
-/// directory, with the outputs directory held open.
-#[derive(Debug)]
-pub struct Exchange {
-    /// Where the command writes the files it hands over.
-    pub outputs: PathBuf,
-    /// Where the command reads the artifacts it is given.
-    pub inputs: PathBuf,
-    /// The outputs directory, opened before the command ran.
-    outputs_dir: std::fs::File,
-}
+/// A command's outputs and inputs directories, as the exchange its
+/// workspace's backend gave reaches them.
+pub struct Exchange(Box<dyn atomic_exec::exchange::Exchange>);
 
-/// Make `path` a new private directory (0700).
-fn private_dir(path: &Path) -> Result<(), ArtifactError> {
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+impl std::fmt::Debug for Exchange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exchange")
+            .field("outputs", &self.outputs())
+            .field("inputs", &self.inputs())
+            .finish()
     }
-    builder.create(path).map_err(io(path))
-}
-
-/// Open the directory at `path` itself, not what a link there names.
-fn open_dir(path: &Path) -> Result<std::fs::File, ArtifactError> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    }
-    options.open(path).map_err(io(path))
 }
 
 impl Exchange {
-    /// Make the two directories in `scratch` and open the outputs one, before
-    /// the command runs.
-    pub fn create(scratch: &Path) -> Result<Self, ArtifactError> {
-        let (outputs, inputs) = (scratch.join("outputs"), scratch.join("inputs"));
-        private_dir(&outputs)?;
-        private_dir(&inputs)?;
-        let outputs_dir = open_dir(&outputs)?;
-        Ok(Self {
-            outputs,
-            inputs,
-            outputs_dir,
-        })
+    /// The exchange a workspace's backend gave, made before the command
+    /// runs ([`atomic_exec::ExecutionBackend::exchange`]).
+    pub fn new(backend: Box<dyn atomic_exec::exchange::Exchange>) -> Self {
+        Self(backend)
     }
 
-    /// Put a copy of each of `artifacts` in the inputs directory, named by
-    /// its digest and read-only, then make the directory read-only. Each copy
-    /// is checked against its digest as it is made.
+    /// Where the command writes the files it hands over, as its runner sees
+    /// it.
+    pub fn outputs(&self) -> &Path {
+        self.0.outputs()
+    }
+
+    /// Where the command reads the artifacts it is given, as its runner sees
+    /// it.
+    pub fn inputs(&self) -> &Path {
+        self.0.inputs()
+    }
+
+    /// Give the command a copy of each of `artifacts` in its inputs
+    /// directory, named by its digest and read-only, then make the
+    /// directory read-only. Each copy is checked against its digest as it is
+    /// made.
     pub fn mount(
         &self,
         store: &dyn ArtifactStore,
         artifacts: &[ArtifactRef],
     ) -> Result<(), ArtifactError> {
+        let mut given = HashSet::new();
         for artifact in artifacts {
-            let path = self.inputs.join(artifact.digest());
-            if path.exists() {
+            if !given.insert(artifact.digest()) {
                 continue;
             }
-            let mut content = store.open(artifact)?;
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o400);
-            }
-            let mut file = options.open(&path).map_err(io(&path))?;
-            if let Err(e) = std::io::copy(&mut content, &mut file) {
-                drop(file);
-                let _ = std::fs::remove_file(&path);
-                return Err(if e.kind() == std::io::ErrorKind::InvalidData {
+            // The store's reader says when the blob no longer matches its
+            // digest; whatever the exchange itself says is its own failure.
+            let mut content = Watched {
+                inner: store.open(artifact)?,
+                failed: false,
+            };
+            let given = self.0.give(artifact.digest(), &mut content);
+            given.map_err(|e| {
+                if content.failed && e.kind() == std::io::ErrorKind::InvalidData {
                     ArtifactError::Corrupt(artifact.clone())
                 } else {
-                    io(&path)(e)
-                });
-            }
-            set_mode(&path, 0o444)?;
+                    io(&self.inputs().join(artifact.digest()))(e)
+                }
+            })?;
         }
-        set_mode(&self.inputs, 0o555)
+        self.0.seal().map_err(io(self.inputs()))
     }
 
     /// Replace each `{"$file": …}` object in `output` that sits where
@@ -175,6 +156,11 @@ impl Exchange {
     /// fits [`Limits`]. Then every file is read aside, one at a time, and
     /// only when all were read whole are they stored. Each name is read
     /// once, and stored with a manifest for each media type it is given.
+    ///
+    /// Each stored file is [held](ArtifactStore::hold) before it is
+    /// committed, and the holds are returned: kept until the step that
+    /// gathered them has recorded its output, they keep a sweep from
+    /// removing what the output references before anything records it.
     #[allow(clippy::too_many_arguments)] // each is one thing the check needs
     pub fn gather(
         &self,
@@ -185,11 +171,8 @@ impl Exchange {
         validate: &dyn Fn(&Value) -> Result<(), String>,
         provenance: &Provenance,
         limits: Limits,
-    ) -> Result<(), ArtifactError> {
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
-        let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    ) -> Result<Vec<Hold>, ArtifactError> {
+        let nonce = nonce()?;
         self.gather_with(
             store, lookup, output, contract, validate, provenance, limits, &nonce,
         )
@@ -207,54 +190,18 @@ impl Exchange {
         provenance: &Provenance,
         limits: Limits,
         nonce: &str,
-    ) -> Result<(), ArtifactError> {
-        let mut candidates = Vec::new();
-        named_files(output, String::new(), &mut candidates, usize::MAX);
-        if candidates.is_empty() {
-            return Ok(());
-        }
-        // Each candidate stands in as a reference of its own, made from a
-        // nonce no output can know; the contract check says which stand
-        // where a reference does.
-        let stand_ins: HashMap<String, usize> = (0..candidates.len())
-            .map(|i| (stand_in(nonce, i).digest().to_owned(), i))
-            .collect();
-        if holds_any(output, &stand_ins) {
-            return Err(refused(
-                "the output holds a reference atomic uses while it checks one".into(),
-            ));
-        }
-        let mut probe = output.clone();
-        for (i, (pointer, _)) in candidates.iter().enumerate() {
-            if let Some(slot) = probe.pointer_mut(pointer) {
-                *slot = Value::String(stand_in(nonce, i).to_string());
-            }
-        }
-        let lookup = StandIns {
-            stand_ins: &stand_ins,
-            candidates: &candidates,
-            inner: lookup,
-            asked: std::sync::Mutex::new(HashSet::new()),
+    ) -> Result<Vec<Hold>, ArtifactError> {
+        let Some(Slots {
+            candidates,
+            asked,
+            probe,
+            checked,
+        }) = slots(output, contract, lookup, nonce)?
+        else {
+            return Ok(Vec::new());
         };
-        let checked = atomic_schema::artifact::check_refs(contract, &probe, &lookup);
-        let mut asked: Vec<usize> = lookup
-            .asked
-            .into_inner()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        asked.sort_unstable();
-        // Put back the objects that are the output's own.
-        let taken: HashSet<usize> = asked.iter().copied().collect();
-        for (i, (pointer, original)) in candidates.iter().enumerate() {
-            if !taken.contains(&i)
-                && let Some(slot) = probe.pointer_mut(pointer)
-            {
-                *slot = original.clone();
-            }
-        }
         if asked.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Only the objects that stand where references do count.
         if asked.len() > MAX_FILE_OBJECTS {
@@ -303,7 +250,7 @@ impl Exchange {
         };
         let mut total = 0u64;
         for name in names.keys() {
-            let (_, size) = self.open_file(name, limits)?;
+            let (_, size) = self.take(name, limits)?;
             within_step(&mut total, size)?;
         }
         // Then each, opened and checked again, read aside whole up to the
@@ -312,7 +259,7 @@ impl Exchange {
         let mut staged = Vec::with_capacity(names.len());
         let mut total = 0u64;
         for (&name, media) in &names {
-            let (file, size) = self.open_file(name, limits)?;
+            let (file, size) = self.take(name, limits)?;
             within_step(&mut total, size)?;
             let mut exact = Exact {
                 inner: file.take(size),
@@ -330,6 +277,7 @@ impl Exchange {
             }
         }
         let mut stored: HashMap<&str, String> = HashMap::new();
+        let mut held = Vec::with_capacity(staged.len());
         for (name, media, s) in staged {
             let each: Vec<Provenance> = media
                 .iter()
@@ -338,6 +286,9 @@ impl Exchange {
                     ..provenance.clone()
                 })
                 .collect();
+            // Held before it is stored, so no sweep finds it stored and
+            // not held, however long the rest of the step takes.
+            held.push(store.hold(&s.artifact()?)?);
             let manifests = store.commit(s, &each)?;
             if let Some(manifest) = manifests.first() {
                 stored.insert(name, manifest.artifact.to_string());
@@ -350,44 +301,40 @@ impl Exchange {
                 *slot = Value::String(reference.clone());
             }
         }
-        Ok(())
+        Ok(held)
     }
 
-    /// Open the file `name` in the outputs directory, beneath the handle
-    /// held since before the command ran, and check it: a regular file with
-    /// one link, within the per-file limit. Returns it and its size.
-    fn open_file(&self, name: &str, limits: Limits) -> Result<(std::fs::File, u64), ArtifactError> {
-        let path = self.outputs.join(name);
-        let file = open_beneath(&self.outputs_dir, name).map_err(|e| match e.raw_os_error() {
-            Some(libc::ELOOP) => refused(format!(
+    /// Take the file `name` from the outputs directory, through the
+    /// backend, which checks that it is a regular file of the command's own,
+    /// and hold it to the per-file limit. Returns it and its size.
+    fn take(
+        &self,
+        name: &str,
+        limits: Limits,
+    ) -> Result<(Box<dyn Read + Send>, u64), ArtifactError> {
+        let taken = self.0.take(name).map_err(|e| match e {
+            TakeError::Link => refused(format!(
                 "`{FILE_KEY}` names {name:?}, a link: a command hands over regular files only"
             )),
-            Some(libc::ENOENT) => refused(format!(
+            TakeError::Missing => refused(format!(
                 "`{FILE_KEY}` names {name:?}, which is not in the outputs directory"
             )),
-            Some(libc::EACCES) => refused(format!(
+            TakeError::Unreadable => refused(format!(
                 "`{FILE_KEY}` names {name:?}, which atomic may not read"
             )),
-            _ => io(&path)(e),
-        })?;
-        let meta = file.metadata().map_err(io(&path))?;
-        if !meta.is_file() {
-            return Err(refused(format!(
+            TakeError::NotRegular => refused(format!(
                 "`{FILE_KEY}` names {name:?}, which is not a regular file"
-            )));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if meta.nlink() != 1 {
-                return Err(refused(format!(
-                    "`{FILE_KEY}` names {name:?}, which has {} links: a command hands over \
-                     files of its own only",
-                    meta.nlink()
-                )));
-            }
-        }
-        let size = meta.len();
+            )),
+            TakeError::Links(n) => refused(format!(
+                "`{FILE_KEY}` names {name:?}, which has {n} links: a command hands over files \
+                 of its own only"
+            )),
+            TakeError::Name => refused(format!(
+                "`{FILE_KEY}` names {name:?}: one file name in the outputs directory, with no `/`"
+            )),
+            TakeError::Io(e) => io(&self.outputs().join(name))(e),
+        })?;
+        let (file, size) = (taken.content, taken.size);
         if size > limits.per_file {
             return Err(refused(format!(
                 "`{FILE_KEY}` names {name:?}, of {size} bytes: a file may be {} at most",
@@ -457,11 +404,97 @@ impl ArtifactLookup for StandIns<'_> {
     }
 }
 
-/// Whether `value` holds an object naming a file, `{"$file": …}`.
-pub fn names_a_file(value: &Value) -> bool {
-    let mut found = Vec::new();
-    named_files(value, String::new(), &mut found, 1);
-    !found.is_empty()
+/// Sixteen random bytes, in hex, for the stand-in references.
+fn nonce() -> Result<String, ArtifactError> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
+    Ok(nonce.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Where an output's `{"$file": …}` objects stand, as the contract check
+/// sees them.
+struct Slots {
+    /// Every such object, with its JSON Pointer.
+    candidates: Vec<(String, Value)>,
+    /// The candidates, by index and in order, that stand where the contract
+    /// expects an artifact reference.
+    asked: Vec<usize>,
+    /// The output with a stand-in reference in each of those places, and
+    /// the output's own objects everywhere else.
+    probe: Value,
+    /// The contract's reference checks on `probe`.
+    checked: Result<(), atomic_schema::artifact::ArtifactCheckError>,
+}
+
+/// Where `output`'s `$file` objects stand: each stands in as a reference of
+/// its own, made from `nonce`, which no output can know, and the contract
+/// check says which stand where a reference does. `None` when it has none.
+fn slots(
+    output: &Value,
+    contract: &Value,
+    lookup: &(dyn ArtifactLookup + Sync),
+    nonce: &str,
+) -> Result<Option<Slots>, ArtifactError> {
+    let mut candidates = Vec::new();
+    named_files(output, String::new(), &mut candidates, usize::MAX);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let stand_ins: HashMap<String, usize> = (0..candidates.len())
+        .map(|i| (stand_in(nonce, i).digest().to_owned(), i))
+        .collect();
+    if holds_any(output, &stand_ins) {
+        return Err(refused(
+            "the output holds a reference atomic uses while it checks one".into(),
+        ));
+    }
+    let mut probe = output.clone();
+    for (i, (pointer, _)) in candidates.iter().enumerate() {
+        if let Some(slot) = probe.pointer_mut(pointer) {
+            *slot = Value::String(stand_in(nonce, i).to_string());
+        }
+    }
+    let lookup = StandIns {
+        stand_ins: &stand_ins,
+        candidates: &candidates,
+        inner: lookup,
+        asked: std::sync::Mutex::new(HashSet::new()),
+    };
+    let checked = atomic_schema::artifact::check_refs(contract, &probe, &lookup);
+    let mut asked: Vec<usize> = lookup
+        .asked
+        .into_inner()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    asked.sort_unstable();
+    // Put back the objects that are the output's own.
+    let taken: HashSet<usize> = asked.iter().copied().collect();
+    for (i, (pointer, original)) in candidates.iter().enumerate() {
+        if !taken.contains(&i)
+            && let Some(slot) = probe.pointer_mut(pointer)
+        {
+            *slot = original.clone();
+        }
+    }
+    Ok(Some(Slots {
+        candidates,
+        asked,
+        probe,
+        checked,
+    }))
+}
+
+/// Whether `output` names a file where `contract` expects an artifact
+/// reference: what [`Exchange::gather`] would take. A `{"$file": …}` object
+/// anywhere else is the output's own.
+pub fn names_a_file_where_referenced(
+    output: &Value,
+    contract: &Value,
+    lookup: &(dyn ArtifactLookup + Sync),
+) -> Result<bool, ArtifactError> {
+    Ok(slots(output, contract, lookup, &nonce()?)?.is_some_and(|s| !s.asked.is_empty()))
 }
 
 /// The most `$file` objects one output may hold where its contract expects
@@ -555,49 +588,16 @@ fn file_object(value: &Value) -> Result<(&str, &str), String> {
     Ok((name, media))
 }
 
-/// Open `name` beneath `dir` for reading, not following a link, not waiting
-/// on a FIFO, and not taking a terminal.
-#[cfg(unix)]
-fn open_beneath(dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-    let name = std::ffi::CString::new(name)?;
-    // SAFETY: `dir` is an open directory for the whole call, `name` is a
-    // NUL-terminated string that outlives it, and the flags ask for nothing
-    // that writes.
-    #[allow(unsafe_code)]
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `fd` was just opened and nothing else owns it.
-    #[allow(unsafe_code)]
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+/// A reader that notes whether it failed, so its failure is told apart
+/// from that of whatever reads it.
+struct Watched<R> {
+    inner: R,
+    failed: bool,
 }
 
-#[cfg(not(unix))]
-fn open_beneath(_dir: &std::fs::File, name: &str) -> std::io::Result<std::fs::File> {
-    Err(std::io::Error::other(format!(
-        "{name}: handing files over is supported on Unix only"
-    )))
-}
-
-/// Set `path`'s mode where modes exist.
-fn set_mode(path: &Path, mode: u32) -> Result<(), ArtifactError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(io(path))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-        Ok(())
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).inspect_err(|_| self.failed = true)
     }
 }
 

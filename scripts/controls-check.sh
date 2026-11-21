@@ -21,13 +21,17 @@
 # the check: update the switch here with the code. Each control costs a rebuild
 # of the crates it is in.
 #
-# The source is edited in place, so the script guards it. Before any edit it
-# copies every file it will touch to target/controls-check/ and checks each
-# copy against the file's git hash-object; if that fails, nothing is edited. On
-# exit, however it ends, it copies the originals back and checks each file's
-# hash again, and fails loudly, keeping the copies, if one does not match. A run
-# killed outright leaves target/controls-check/ behind, and the next run refuses
-# to start until someone has looked. scripts/controls-check-test.sh tests this.
+# The source is edited in place, so the script guards it. It refuses to start
+# when a file a control names differs from HEAD, because it would restore that
+# dirty state and read as clean. Before any edit it copies every file it will
+# touch to target/controls-check/ and checks each copy against the file's git
+# hash-object; if that fails, nothing is edited. On exit, however it ends, it
+# copies the originals back, checks each file's hash again and asks git that the
+# file no longer differs from HEAD, and fails loudly, keeping the copies, if
+# either fails. Each file put back is touched, so cargo rebuilds it rather than
+# reusing an artefact built with the control off. A run killed outright leaves
+# target/controls-check/ behind, and the next run refuses to start until someone
+# has looked. scripts/controls-check-test.sh tests this.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -38,7 +42,9 @@ LOG="${STATE}/cargo.log"
 
 # name | file | text to replace | replacement | cargo test arguments. A
 # control guarded by several tests names them all after `--`; each must fail
-# with the control off.
+# with the control off. A row switches off the first place its text is found,
+# so where one control has two sites the text of each is unlike the other's
+# (stop-own-tool and stop-own-tool-wait), and there is a row for each.
 CONTROLS=(
     "git-hardening|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
     "git-filters|crates/atomic-core/src/git.rs|        let mut overrides = (*self.overrides).clone();|        let mut overrides = (*self.overrides).clone(); let names: Vec<String> = { let _ = names; Vec::new() };|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
@@ -56,6 +62,9 @@ CONTROLS=(
     "exec-network-own-wired|crates/atomic-core/src/network.rs|        let own = self.own()?;|        let own: BTreeSet<IpAddr> = BTreeSet::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model network::tests::a_prepared_proxy_refuses_this_machines_addresses"
     "exec-network-own-reuse|crates/atomic-core/src/network.rs|        self.own == *own && alive(self)|        alive(self)|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_is_not_reused_once_this_machines_addresses_change"
     "exec-network-own-nonempty|crates/atomic-core/src/network.rs|        !own.is_empty(),|        true,|-p atomic-agentic-core --lib --features fake-model network::tests::this_machines_addresses_come_from_its_interfaces"
+    "exec-network-public-suffix|crates/atomic-core/src/network.rs|    if lower.starts_with(\"*.\") && public_suffix(name) {|    if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
+    "exec-network-suffix-rule-parent|crates/atomic-core/src/network.rs|    is_suffix(&format!(\"atomic-probe.{name}\"))|    false|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
+    "exec-network-wildcard-one-site|crates/atomic-core/src/network.rs|                    && within_one_site(&host, parent)|                    && true|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_does_not_reach_across_a_public_suffix_below_it"
     "exec-network-allowlist|crates/atomic-core/src/network.rs|        } else if !declared(&self.0, &req.host) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-ports|crates/atomic-core/src/network.rs|        } else if !PORTS.contains(&req.port) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
@@ -66,6 +75,7 @@ CONTROLS=(
     "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
     "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-own-tool-wait|crates/atomic-exec/src/process.rs|                let waited = own(&all, &tools);|                let waited = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
     "scratch-deny|crates/atomic-core/src/runtime.rs|    spec.denied = workspace.denied.clone();|    spec.denied = Vec::new(); // CONTROL_OFF|--workspace --features ${FEATURES} --test turn_workspace a_turn_cannot_read_another_turns_scratch_and_keeps_its_own"
     "scratch-deny-helper|crates/atomic-core/src/codex.rs|    if linux && !denied.is_empty() && paths.linux_sandbox().is_none() {|    if /*CONTROL_OFF*/ false && linux && !denied.is_empty() && paths.linux_sandbox().is_none() {|-p atomic-agentic-core --lib --features fake-model a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_on_linux"
@@ -79,7 +89,23 @@ CONTROLS=(
     "signin-token-overrides|crates/atomic-core/src/codex.rs|        remove(name);|        let _ = name;|-p atomic-agentic-core --lib the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens"
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
+    "ticket-release|crates/atomic-core/src/usage.rs|        if let Some(release) = release {|        if let Some(release) = release.and(None::<Box<dyn FnOnce() + Send>>) /*CONTROL_OFF*/ {|--workspace --features ${FEATURES} --test budgets a_call_whose_task_panics_stops_its_heartbeat"
+    "heartbeat-forgotten|crates/atomic-durable/src/usage.rs|        \"DELETE FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = ?\",|        \"DELETE FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = ? AND 1 = 0\", /*CONTROL_OFF*/|-p atomic-agentic-durable --lib a_heartbeat_is_kept_only_until_its_attempts_time_is_settled"
+    "heartbeat-after-settle|crates/atomic-durable/src/usage.rs|                if running != 1 {|                if running != 1 && /*CONTROL_OFF*/ false {|-p atomic-agentic-durable --lib a_heartbeat_is_kept_only_until_its_attempts_time_is_settled"
+    "owner-measured-time|crates/atomic-durable/src/usage.rs|            let took = active.unwrap_or(now - admitted).clamp(0, reserved);|            let took = active.and(/*CONTROL_OFF*/ None).unwrap_or(now - admitted).clamp(0, reserved);|-p atomic-agentic-durable --lib a_machine_that_slept_is_not_charged_the_sleep"
+    "heartbeat-measured-time|crates/atomic-durable/src/usage.rs|                let seen = admitted.saturating_add(active.max(0)).min(now);|                let seen = /*CONTROL_OFF*/ now.max(admitted.saturating_add(active.max(0)));|-p atomic-agentic-durable --lib a_machine_that_slept_is_not_charged_the_sleep"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
+    "artifact-hold-gather|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(&s.artifact()?)?);|            let _ = &mut held; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
+    "artifact-hold-sweep|crates/atomic-core/src/artifact.rs|        let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;|        let (_held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?; let held = std::collections::HashSet::<String>::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone"
+    "artifact-hold-dead|crates/atomic-core/src/artifact.rs|            gone.push(path);|            let _ = path; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone opening_a_store_sweeps_only_dead_stores_leftovers"
+    "artifact-hold-release|crates/atomic/src/pipeline.rs|    drop(release);|    std::mem::forget(release); // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_steps_files_are_let_go_once_its_turn_is_recorded"
+    "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
+    "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
+    "exec-exchange-backend|crates/atomic-core/src/runtime.rs|                    .exchange(&opened)|                    .exchange(&opened).and(atomic_exec::LocalBackend::default().exchange(&opened)) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_remote_backend_gives_inputs_and_hands_a_file_over"
+    "artifact-hold-snapshot-first|crates/atomic/src/retention.rs|    between();|    let held = { between(); held_now(store).await? }; // CONTROL_OFF|-p atomic-agentic --lib retention::tests::the_holds_are_read_before_the_runs"
+    "exec-no-exchange-input|crates/atomic-core/src/runtime.rs|                    return match given.first() {|                    return match given.first().and(None::<&crate::artifact::ArtifactRef>) { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-no-exchange-output|crates/atomic-core/src/runtime.rs|    if none_given|    if std::hint::black_box(false) && none_given|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-exchange-corrupt-source|crates/atomic-core/src/artifact/files.rs|                if content.failed && e.kind() == std::io::ErrorKind::InvalidData {|                if e.kind() == std::io::ErrorKind::InvalidData { let _ = content.failed; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model an_exchanges_own_failure_is_not_a_damaged_blob"
 )
 
 die() {
@@ -96,6 +122,29 @@ die_unedited() {
 # Where a file's original is kept.
 copy_of() {
     echo "${STATE}/$(tr / % <<<"$1")"
+}
+
+# Put a file's saved original back, and make its mtime now. A plain cp already
+# does that, so cargo rebuilds what it built with the control off; the touch
+# keeps that true for a cp that preserves timestamps (cp -p, or an alias).
+put_back() {
+    cp -- "$(copy_of "$1")" "$1" && touch -- "$1"
+}
+
+# git's answer for how a file stands against HEAD: 0 when it matches the
+# commit, 1 when it differs, and anything else when git could not be asked --
+# in a linked worktree whose main checkout's .git is not mounted, for instance.
+# A file git does not track, or one marked assume-unchanged or skip-worktree,
+# counts as differing: git diff would say nothing about it either way.
+head_diff() {
+    local code=0 listed
+    listed="$(git ls-files -v -- "$1")" || return 2
+    case "${listed}" in
+        "H "*) ;;
+        *) return 1 ;;
+    esac
+    git diff --quiet HEAD -- "$1" || code=$?
+    return "${code}"
 }
 
 # The controls to check: all of them, or the one named.
@@ -119,6 +168,28 @@ if [ -e "${STATE}" ]; then
     die "${STATE} is left from a run that did not finish. Its manifest names each file that run edited, with the file's original hash, and the directory holds the originals: compare them with the files (git diff), put them back, then remove ${STATE}."
 fi
 
+# Refuse to start on a file that already differs from HEAD. The run saves what
+# it finds and puts that back, so a file dirty before the start would end the
+# run dirty again and read as a clean restore; and a switch applied to someone
+# else's uncommitted change is not this control. HEAD is the baseline for the
+# whole run, so ask for it before anything is edited.
+dirty=" "
+seen=" "
+for row in "${selected[@]}"; do
+    IFS='|' read -r _ file _ <<<"${row}"
+    case "${seen}" in *" ${file} "*) continue ;; esac
+    code=0
+    head_diff "${file}" || code=$?
+    if [ "${code}" -eq 1 ]; then
+        dirty+="${file} "
+    elif [ "${code}" -ne 0 ]; then
+        die_unedited "cannot compare ${file} with HEAD"
+    fi
+    seen+="${file} "
+done
+[ "${dirty}" = " " ] ||
+    die_unedited "these files differ from HEAD:${dirty% *} (a file git does not track as committed counts). A run edits them and puts back what it found, so it would restore that state and read as a clean restore; commit them or put them back first"
+
 # Save every file the selected controls edit, and check each copy, before
 # editing anything.
 mkdir -p "${STATE}" || die_unedited "cannot create ${STATE}"
@@ -137,9 +208,13 @@ for row in "${selected[@]}"; do
 done
 
 # Put every saved file back and check it. A file that cannot be put back is
-# named, and the originals stay.
+# named, and the originals stay. The saved copies and the manifest are this
+# script's own state, so neither is asked what the source should be: after the
+# hash, git says whether the file matches HEAD, and a restore that leaves it
+# differing is a failure even when it matches the copy. Each file is touched on
+# the way back, so the next cargo run rebuilds it.
 restore() {
-    local bad=0 hash file
+    local bad=0 hash file code
     if [ ! -r "${STATE}/manifest" ]; then
         echo "scripts/controls-check.sh: ${STATE}/manifest cannot be read, so no file can be checked. Compare the files with git and ${STATE} by hand." >&2
         return 1
@@ -149,7 +224,20 @@ restore() {
         if [ "$(git hash-object -- "${file}" 2>/dev/null)" != "${hash}" ]; then
             echo "scripts/controls-check.sh: ${file} IS LEFT MODIFIED: it does not match its original, ${hash}. Put it back by hand; ${STATE} keeps what was saved." >&2
             bad=1
+            continue
         fi
+        code=0
+        head_diff "${file}" || code=$?
+        if [ "${code}" -ne 0 ]; then
+            if [ "${code}" -eq 1 ]; then
+                echo "scripts/controls-check.sh: ${file} IS LEFT DIFFERENT FROM HEAD: it matches the copy made at the start, which was not HEAD. Put it back from HEAD; ${STATE} keeps what was saved." >&2
+            else
+                echo "scripts/controls-check.sh: cannot compare ${file} with HEAD, so it cannot be shown to be back as committed." >&2
+            fi
+            bad=1
+            continue
+        fi
+        touch -- "${file}" 2>/dev/null
     done <"${STATE}/manifest"
     if [ "${bad}" -eq 0 ]; then
         rm -rf "${STATE}"
@@ -243,7 +331,7 @@ for row in "${selected[@]}"; do
     switch_off "${file}" "${text}" "${replacement}" || die "cannot switch ${name} off"
     run_cargo "${args}"
     removed=$?
-    cp -- "$(copy_of "${file}")" "${file}" || die "cannot put ${file} back"
+    put_back "${file}" || die "cannot put ${file} back"
     if grep -q "^error\(\[E[0-9]*\]\)\?: could not compile\|^error: could not compile" "${LOG}"; then
         echo "FAIL ${name}: with the control off the code does not build" >&2
         grep -m5 -E "^error" "${LOG}" >&2
@@ -271,8 +359,14 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        # And read all of it, so `grep -F` does not stop at the first match:
+        # an earlier stage of the pipe would then die of SIGPIPE, which
+        # pipefail reports as a failure of the pipeline, and a test that did
+        # fail would read as one that was not seen.
+        if ! grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 |
+            grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
+        fi
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2

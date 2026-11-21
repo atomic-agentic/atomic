@@ -930,7 +930,9 @@ async fn run_pipeline_in<C: WorkflowContext>(
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
-    plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    plan(&pipeline, services.runtimes.backend.statement())?;
+    // Every step is held to its atom's trust before the run does anything.
+    trusted(&pipeline).map_err(failed)?;
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
@@ -1480,7 +1482,7 @@ async fn turn<C: WorkflowContext>(
             run_id: run_id.clone(),
             step_id: t.name.clone(),
         };
-        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.backend.shared());
         // The run's own build caches, with a Cargo target of the turn's own.
         let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
@@ -1515,7 +1517,13 @@ async fn turn<C: WorkflowContext>(
     let repair = t.repair.clone();
     let charge = t.charge;
     let step_caches = run.caches.map(|c| c.for_exec(&t.name));
-    execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
+    // What an exec step's command hands over is held until the turn has
+    // recorded the output that references it, then let go; and let go too
+    // when the turn is dropped or panics before that.
+    let release = guard
+        .as_ref()
+        .map(|(_, _, _, identity)| runtimes.codex.artifacts.releasing(identity.clone()));
+    let turn = execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
@@ -1568,33 +1576,44 @@ async fn turn<C: WorkflowContext>(
                     )));
                 }
             }
-            // An earlier execution's attempt replays as interrupted, but
-            // its command may never have started: a cap refused it and the
-            // step parked. The ledger says which: only a command admitted
-            // may have run.
-            let interrupted = match &guard {
-                Some((begun, false, _, _)) if begun.interrupted() => {
-                    !metered
-                        || ledgered.command_admitted(&at).await.map_err(|e| {
-                            failed(format!("step `{id}`: read its command's attempts: {e}"))
-                        })?
+            // The command may have run before when an earlier execution's
+            // attempt replays as interrupted, or when, in this process, an
+            // earlier run of the body took the workspace this attempt
+            // opened. Either way it may never have started: a cap refused it
+            // and the step parked. For a metered step the ledger says which:
+            // only a command admitted may have run. An unmetered one is
+            // taken to have run.
+            let (replayed, taken) = match &guard {
+                Some((begun, false, opened, _)) => {
+                    let replayed = begun.interrupted();
+                    // A replayed attempt opened no workspace here.
+                    (
+                        replayed,
+                        !replayed && opened.lock().map_or(true, |o| o.is_none()),
+                    )
                 }
-                _ => false,
+                _ => (false, false),
             };
-            if interrupted {
+            let admitted = if (replayed || taken) && metered {
+                ledgered
+                    .command_admitted(&at)
+                    .await
+                    .map_err(|e| failed(format!("step `{id}`: read its command's attempts: {e}")))?
+            } else {
+                true
+            };
+            if let Some(why) = ran_before(&atom.name, replayed && admitted, taken && admitted) {
                 return Err(failed(format!(
-                    "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
-                         before its result was saved, so whether its command's effects happened \
-                         is unknown. The step is parked and its command does not run again. If \
-                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
-                         (or `'read-only'` if it only reads)",
-                    atom.name
+                    "step `{id}`: outcome_unknown: {why}, so whether its command's effects \
+                     happened is unknown. The step is parked and its command does not run \
+                     again. If repeating it is safe, declare `effects: {{ external: \
+                     'idempotent' }}` (or `'read-only'` if it only reads)"
                 )));
             }
             let proposal = match (tree, guard) {
                 (_, Some((_, _, opened, identity))) => {
                     let clock = runtimes.clock.clone();
-                    let backend = runtimes.exec.shared();
+                    let backend = runtimes.backend.shared();
                     let exec_caches = step_caches.clone();
                     // The store the model runtimes check references against.
                     let artifacts = runtimes.codex.artifacts.clone();
@@ -1671,7 +1690,9 @@ async fn turn<C: WorkflowContext>(
         // Model calls name the run and step on their spans.
         crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
     })
-    .await
+    .await;
+    drop(release);
+    turn
 }
 
 /// Review `candidate`, the author's turn of `step` on `input`: the reviewer
@@ -2206,6 +2227,107 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     });
 }
 
+/// Hold every atom step's bindings to its atom's trust, and its review's to
+/// the reviewer's, as the loader does, from the pipeline alone: before a run
+/// does anything, so no step's effect lands before a later step is refused.
+/// Each binding's origin is the lower of what the run recorded for it
+/// (external, when it recorded nothing) and what its expression reads,
+/// recomputed from the steps before it, so a pipeline built some other way,
+/// or a run recorded before a check existed, cannot raise one. An atom whose
+/// `trust` is none of the three accepts nothing. A resumed or served run is
+/// checked on the pipeline it recorded.
+fn trusted(pipeline: &Pipeline) -> std::result::Result<(), String> {
+    use atomic_core::workflow::{
+        accepted_trust, review_origin, trusted_sources, unknown_trust, unknown_trust_advice,
+        untrusted_binding,
+    };
+    let atom_of = |id: &str, name: &str| {
+        let atom = pipeline
+            .atoms
+            .get(name)
+            .ok_or_else(|| format!("step `{id}`: no atom `{name}`"))?;
+        let accepts = accepted_trust(atom).map_err(|_| {
+            format!(
+                "step `{id}`: {}; {}",
+                unknown_trust(atom).unwrap_or_default(),
+                unknown_trust_advice(atom)
+            )
+        })?;
+        Ok::<_, String>((atom, accepts))
+    };
+    // A binding's origin at run time: the lower of what the run recorded
+    // (external, when it recorded nothing) and what its expression reads;
+    // and, when the run's `origins` entry is what lowered it, the advice to
+    // remove that entry.
+    let origin = |recorded: Option<&String>, read: &'static str| match recorded.map(String::as_str)
+    {
+        Some(entry) if rank(entry) < rank(read) => (
+            entry.to_owned(),
+            format!(", remove the `origins` entry that marks it {entry}"),
+        ),
+        None if rank("external") < rank(read) => ("external".to_owned(), String::new()),
+        _ => (read.to_owned(), String::new()),
+    };
+    let mut kinds = BTreeMap::new();
+    for step in &pipeline.steps {
+        let step = match step {
+            Step::Gate(gate) => {
+                kinds.insert(gate.id.clone(), "gate".to_owned());
+                continue;
+            }
+            Step::Atom(step) => step,
+        };
+        let (atom, accepts) = atom_of(&step.id, &step.atom)?;
+        for (field, source) in &step.with {
+            let read = origin_of(source, &kinds).unwrap_or("external");
+            let (origin, entry) = origin(step.origins.get(field), read);
+            if let Some(refused) = untrusted_binding(atom, source, &origin) {
+                return Err(format!(
+                    "step `{}`: `with.{field}`: {refused}; bind it to {} instead{entry}, or \
+                     declare a lower `trust` on the atom if it is built for {origin} input",
+                    step.id,
+                    trusted_sources(accepts),
+                ));
+            }
+        }
+        if let Some(review) = &step.review {
+            let (reviewer, reviewer_accepts) = atom_of(&step.id, &review.reviewer)?;
+            // What the reviewer's findings carry: a model's output on what
+            // it read.
+            let mut findings = "agent".to_owned();
+            for (field, source) in &review.with {
+                let read = review_origin(source, &kinds).unwrap_or("external");
+                let (origin, entry) = origin(review.origins.get(field), read);
+                if let Some(refused) = untrusted_binding(reviewer, source, &origin) {
+                    return Err(format!(
+                        "step `{}`: `review.with.{field}`: {refused}; a candidate under review \
+                         is external data; bind it to {} instead{entry}, or declare a lower \
+                         `trust` on the reviewer if it is built for {origin} input",
+                        step.id,
+                        trusted_sources(reviewer_accepts),
+                    ));
+                }
+                if rank(&origin) < rank(&findings) {
+                    findings = origin;
+                }
+            }
+            // A repair round hands the author the reviewer's findings: no
+            // more trusted than what the reviewer read.
+            if review.rounds > 0 && rank(&findings) < rank(accepts) {
+                return Err(format!(
+                    "step `{}`: `review.rounds`: a repair round hands `{}` the reviewer's \
+                     findings, which are {findings} data, and it accepts {accepts} input at \
+                     most (`trust: '{accepts}'`); set `rounds: 0`, so a person decides on a \
+                     rejection, or review it with what it can take",
+                    step.id, step.atom,
+                ));
+            }
+        }
+        kinds.insert(step.id.clone(), atom.kind.clone());
+    }
+    Ok(())
+}
+
 /// The name a replay of a recorded run is registered under.
 pub const REPLAY: &str = "atomic.replay";
 
@@ -2335,9 +2457,40 @@ fn recorded_results(
     Ok(recorded)
 }
 
+/// Why the command of exec atom `atom`, about to run in its step's body,
+/// may have run already, so that running it again could repeat its
+/// effects; `None` when this is its first run. Either an earlier execution
+/// was `interrupted` after the step's attempt began, or, in this process,
+/// an earlier run of the step's body took the workspace its attempt opened
+/// (`workspace_taken`), and so ran its command or began to.
+fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<String> {
+    if interrupted {
+        Some(format!(
+            "an earlier attempt of `{atom}` was interrupted before its result was saved"
+        ))
+    } else if workspace_taken {
+        Some(format!(
+            "this step already ran `{atom}`'s command, or began to, in this process"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command runs again only through the effects rule: after an
+    /// interrupted attempt, and after an earlier run of the step's body in
+    /// this process took its attempt's workspace.
+    #[test]
+    fn an_exec_command_that_may_have_run_is_not_run_again_unchecked() {
+        assert_eq!(ran_before("x", false, false), None, "its first run");
+        assert!(ran_before("x", true, true).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", true, false).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", false, true).is_some_and(|why| why.contains("in this process")));
+    }
 
     /// Only a recorded outcome, finished or failed, removes a run's caches:
     /// an execution that lost a race, or whose outcome went unrecorded,
