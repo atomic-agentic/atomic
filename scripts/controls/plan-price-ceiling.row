@@ -1,0 +1,1 @@
+plan-price-ceiling|crates/atomic/src/metering.rs|                bound(&what, "max_input_tokens", max, call.input_tokens)?;|                let _ = (&what, max);|-p atomic-agentic --test pipeline -- --exact a_pinned_plan_without_ceilings_is_held_to_your_own

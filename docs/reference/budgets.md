@@ -96,6 +96,62 @@ them: a run resumed after the configuration changed is metered as it began.
 `atomic config --explain` shows each budget setting with the layer it came
 from.
 
+## Your own caps are ceilings
+
+The caps you set in your own configuration are ceilings, not defaults. For each
+measure you set — an atom's or a run's `tokens`, `minutes` or `cost_usd`, and the
+most one call may use — the cap that binds is the smaller of yours and what
+`atomic.yaml`, `atomic.local.yaml`, an `ATOMIC_BUDGET_*` variable or a written
+`budget` block asks for. A project may bring a cap down to what you allowed, never
+above it, and a layer that writes no cap at all, `null` included, leaves yours
+standing. A measure you leave unset caps nothing. A dollar cap of yours binds even
+where nothing else sets one, so every model a run calls under it must be priced.
+
+Your prices are ceilings too. A project's `budget.pricing` cannot make a model you
+priced look cheaper than you priced it, and cannot give a model a per-call
+maximum above your `budget.call` cap — which is how a model is made to look free
+under a dollar cap. Under any dollar cap of yours, a project may not make a model
+free either: a project price of nothing, input and output both, for a model you
+did not price is refused at load, naming the model and saying to price it in your
+own configuration. A project price above nothing for such a model is the
+project's, and atomic sets no floor under it: instead, under a dollar cap of yours,
+`atomic config --explain` names every model only a layer above yours prices (the
+project's files or `ATOMIC_BUDGET_PRICING`), and a run or a live `atomic eval`
+that calls one says so on stderr at its start, so a price you did not set is never
+counted unseen. A model only you priced stays priced when another layer replaces
+the table below it.
+
+Your own `budget` section is read on its own, as well as merged: a cap there that
+is neither a number nor `null` (or, for a count, not a whole number), or a price
+that is not one (a price needs both `input_usd_per_mtok` and
+`output_usd_per_mtok`), is refused with your file and line, even where a project's
+file writes a value of its own over it.
+
+What holds is never shown without its reason: `atomic config --explain` shows the
+effective number with your file and line as its source, and says in a remark that
+your own configuration caps it. A cap that leaves no room for one call fails
+configuration and names your cap as the limit, in words such as `capped by your
+own budget.atom.tokens`.
+
+Ceilings come only from your own configuration file, which no project supplies:
+`budget.ceilings` is no setting, and a file that writes it is refused as an
+unknown setting. A run resolves them with its caps and records them with its plan,
+so a run resumed or recovered keeps the ceilings it began under, whatever your
+configuration says by then. A plan records that it was held to your ceilings and
+prices when it was made or pinned; one recorded before plans were has no such
+record, and a run resumed or recovered with one is held, before it goes on, to the
+settings, ceilings and prices of your own configuration now, as a pinned plan is
+below, and stops if it is above them, saying to start it again.
+
+A plan pinned in a run's input is held, before its first call, both to the
+ceilings it carries and to those of your own configuration now: its run's and
+atoms' tokens, minutes and dollars (no dollar cap at all counts as above a dollar
+ceiling), its call bound, and each model's per-call maxima in its prices, against
+your call ceilings. Its prices are held to the price table here: a price below the
+table's, input or output, is refused, and under a dollar ceiling of yours, so is a
+model the table does not price. A plan carrying no ceilings is held to yours all
+the same.
+
 Every model call a run makes is metered: a step whose atom calls a model and
 that the run has no caps for is refused, never run without a meter. A live
 `atomic eval` is metered as a step is (see [eval cases](eval-cases.md)). The
@@ -195,12 +251,24 @@ reported and that request, never just its reservation. Usage reported after the
 last record, and before the stop, is not known.
 
 An exec atom's command counts toward `minutes` the same way: its step reserves
-the active time its atom has left (or less, if the run has less), the command is
-stopped when that runs out or at its own five-minute limit, whichever is first,
-and the step is charged the time the command ran. A command uses no tokens and
-costs nothing, so an exec atom's budget needs no price, even under a dollar cap.
+the active time its atom has left (or less, if the run has less), at most the
+command's own five-minute limit and the 30 seconds its runner is allowed on top.
+The command is stopped when that time runs out or at its own limit, whichever
+is first. The step is charged from the command's admission to its settlement:
+the command itself, and also starting its runner, trying again while another
+runner held its workspace, and storing its output files. Only the command is
+stopped at the cap, so a command the cap stops can take its run past the cap by
+that extra time: up to its runner's 30 seconds, two retries a second apart, and
+about 1.4 seconds of waiting while a cleanup holds the artifact store, so about
+35 seconds, plus the time its output files take to store. Each exec step
+running at the same time can go past by that much. A
+command uses no tokens and costs nothing, so an exec atom's budget needs no
+price, even under a dollar cap, and only its time is checked: a run whose
+tokens or dollars went past their caps on earlier model calls still runs it.
 With less than half a second left, the command is not started: the run parks,
-and once a person raises the cap and releases it, the command runs. A command
+and once a person raises the cap and releases it, the command runs. An exec
+atom's `minutes` cap below half a second, or a run's when it has exec atoms,
+fails configuration, since no command could ever start under it. A command
 the cap stops mid-run parks the run the same way if its atom declares
 `effects: { external: 'idempotent' }` or `'read-only'`, and once the cap is
 raised it runs again from the start; any other fails, since whether its effects happened is

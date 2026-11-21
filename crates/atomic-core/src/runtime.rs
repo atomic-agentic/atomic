@@ -1908,6 +1908,8 @@ pub async fn run_exec_opened(
     let output_contract = contract("Output")?;
     // Its active time is metered like a turn's: it may take what the step's
     // and the run's minutes caps leave, and is cut off when that runs out.
+    // It reserves no more than its own limit and its runner's grace, the
+    // longest a command's runner is let run.
     let (ticket, limit) = meter
         .admit(crate::usage::Call {
             index: 0,
@@ -1915,6 +1917,7 @@ pub async fn run_exec_opened(
             input_bound: None,
             turn: false,
             work: true,
+            longest: Some(EXEC_TIME_LIMIT.saturating_add(atomic_exec::runner::RUNNER_GRACE)),
         })
         .await
         .map_err(|e| match e {
