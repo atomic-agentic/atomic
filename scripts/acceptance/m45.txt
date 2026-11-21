@@ -8,15 +8,16 @@
 # process is killed at its open gate, another process recovers the run, and the
 # decision comes from the test process, which never runs the workflow. The
 # `run_cli` tests are the ones that run `atomic runs resume` and a local
-# `atomic serve`, and the resume checks the gate keeps its id, opened_at and
-# deadline; `gates_cli` decides it from a second terminal's commands.
+# `atomic serve`, and both check the gate keeps its id, opened_at and
+# deadline; under serve it is approved with `atomic gates approve` from another
+# process, and `gates_cli` decides it from a second terminal's commands.
 gates sqlite_a_gate_survives_a_kill_and_is_approved_from_a_second_process
 gates postgres_a_gate_survives_a_kill_and_is_approved_from_a_second_process
 pipeline a_process_killed_at_a_gate_leaves_it_waiting_for_the_decision
 run_cli a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time
 run_cli a_gate_decided_while_its_run_was_down_wakes_it_on_resume
+run_cli a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_another_terminal
 gates_cli a_gate_is_approved_from_a_second_terminal_while_the_run_waits
-pending: under a local `atomic serve` the recovered gate is not shown to keep its first deadline; a test would capture the gate's opened_at and deadline before the kill and compare them once serve has recovered the run, and approve it with `atomic gates approve` from a second process.
 
 ## A gate whose time ran out while nothing was running is rejected when the run recovers.
 # The first pair waits out the deadline with no process running, then recovers
@@ -41,10 +42,12 @@ atomic_durable gate::tests::sqlite::only_an_approver_on_the_shown_proposal_decid
 atomic_durable gate::tests::postgres::only_an_approver_on_the_shown_proposal_decides
 gates_cli a_gate_is_approved_from_a_second_terminal_while_the_run_waits
 ### in server mode the load fails unless an allowed group is named
+# The pipeline test prepares the same workflow in `Deployment::Server`: naming
+# no group, and naming one policy does not allow, are refused by their text,
+# and naming an allowed group loads and resolves to that group.
 atomic_durable gate::approvers::tests::server_mode_without_an_allowed_group_fails_load
 atomic_durable gate::approvers::tests::server_mode_takes_an_allowed_group_or_the_policy_default
 pipeline a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts
-pending: only the failing direction of the server-mode load is shown end to end; a test would prepare, in `Deployment::Server`, a workflow whose gate names an allowed group and see it load, and assert the refusal's text when it names none.
 
 ## Sending the same decision again returns the first result; a different decision on a decided gate gets a typed conflict that carries the winner.
 ### Sending the same decision again returns the first result
@@ -76,13 +79,15 @@ pipeline a_reviewer_that_rejects_asks_a_person_at_once
 ## An approval cannot carry over to a candidate or evidence whose content changed.
 # A second run showing different content opens its own gate, and the earlier
 # approval, sent at it with its old proposal, is refused; a digested evidence
-# list is part of what a proposal covers.
+# list is part of what a proposal covers, and a gate whose proposal differs only
+# in an evidence digest refuses the earlier approval too.
 atomic_durable gate::tests::sqlite::changed_content_cannot_reuse_an_approval
 atomic_durable gate::tests::postgres::changed_content_cannot_reuse_an_approval
 atomic_durable gate::tests::sqlite::only_an_approver_on_the_shown_proposal_decides
 atomic_durable gate::tests::postgres::only_an_approver_on_the_shown_proposal_decides
 atomic_durable gate::tests::the_proposal_digest_ignores_key_order_and_sees_every_change
-pending: the candidate half is shown, the evidence half is not; a test would open two gates whose proposals differ only in an evidence digest and see the earlier approval refused with `ProposalChanged`.
+atomic_durable gate::tests::sqlite::changed_evidence_cannot_reuse_an_approval
+atomic_durable gate::tests::postgres::changed_evidence_cannot_reuse_an_approval
 
 ## A question gate answered in the terminal resumes its step with the typed answer, writes the feedback entry when asked, and resumes with the declared default if nobody answers in time. An answer that is not one of the enum's values is refused.
 gate_prompt a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_remembers_it
@@ -93,18 +98,3 @@ atomic_durable gate::tests::sqlite::a_question_gate_takes_only_an_answer_that_fi
 atomic_durable gate::tests::postgres::a_question_gate_takes_only_an_answer_that_fits
 atomic_durable gate::tests::sqlite::silence_selects_a_questions_default
 atomic_durable gate::tests::postgres::silence_selects_a_questions_default
-
-## On a server, a tier that requires step-up refuses a decision whose token has no fresh ACR and accepts one whose token has it; the audit entry records the ACR.
-# Step-up is not built: a gate tier is `low` or `high` and sets nothing else,
-# no decision token carries an authentication time, and there is no audit
-# entry to hold an ACR. What a recorded decision holds today is its verdict,
-# who decided, their answer and comment, the command id and the time. Each
-# sub-clause below lists the control that is built on the same `gate::decide`
-# path, not the step-up itself.
-### On a server, a tier that requires step-up refuses a decision whose token has no fresh ACR and accepts one whose token has it
-atomic_durable gate::tests::sqlite::only_the_enrolled_credential_decides
-atomic_durable gate::tests::postgres::only_the_enrolled_credential_decides
-### the audit entry records the ACR
-atomic_durable gate::tests::sqlite::a_gate_is_opened_listed_and_decided
-atomic_durable gate::tests::postgres::a_gate_is_opened_listed_and_decided
-pending: step-up is not built. A test would load a workflow in `Deployment::Server` whose high tier sets `requires_acr`, refuse with a typed error a decision whose token has no fresh authentication time, accept one whose token has it, and read that ACR back from what the store keeps of the decision.

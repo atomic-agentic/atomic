@@ -480,26 +480,67 @@ impl Drop for SetAsideForRoom {
     }
 }
 
-/// Open a workspace on `backend`, on the blocking pool. While the backend
-/// reports [`atomic_exec::ExecError::Unavailable`] (no room, or a sandbox
-/// that failed in a way that may pass, such as a full disk; nothing was
+/// Why [`wait_for_room`]'s attempt did not succeed.
+pub(crate) enum NotYet {
+    /// For a reason that may pass, such as a full disk: nothing was
+    /// started, and trying again later may succeed.
+    Room(String),
+    /// For good.
+    Fail(AtomError),
+    /// The backend cannot confine commands here, as when the sandbox cannot
+    /// start; nothing was started. A person may fix the machine.
+    Unconfinable(String),
+}
+
+/// What a step waits for in [`wait_for_room`], for what it says: `what`
+/// lacks room, and with room `what` can `doing`.
+#[derive(Clone, Copy)]
+pub(crate) struct Waiting<'a> {
+    /// The step's label, such as its atom's name.
+    pub label: &'a str,
+    /// The run.
+    pub run: &'a str,
+    /// The step's id.
+    pub step: &'a str,
+    /// Such as "the execution backend".
+    pub what: &'a str,
+    /// Such as "open its workspace".
+    pub doing: &'a str,
+}
+
+/// Run `attempt` on the blocking pool until it succeeds. While it finds no
+/// room ([`NotYet::Room`]: no room on the execution backend, or a sandbox
+/// that failed in a way that may pass, or a full disk; nothing was
 /// started) the run waits, trying again with a growing pause, for as long
 /// as it takes, or up to the process's limit ([`limit_backend_wait`]),
 /// after which it gives up with [`AtomError::NoRoom`], or, in a process
 /// that keeps trying ([`keep_trying_past_the_limit`]), is set aside and
-/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. A
-/// backend that cannot confine commands here gives up at once with
+/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. An
+/// attempt that finds the backend cannot confine commands here
+/// ([`NotYet::Unconfinable`]) gives up at once with
 /// [`AtomError::Unconfinable`], or, in a process that keeps trying, sets the
-/// step aside and tries again at most [`SANDBOX_RETRY_MAX`] apart. It records nothing
-/// and spends none of the durable engine's recovery attempts, and it says
-/// on stderr that it is waiting, then again every ten minutes. Stopping the
-/// run, or the process ([`stop_waiting_for_backend`]), stops the wait.
-pub(crate) async fn open_workspace(
-    backend: Arc<dyn ExecutionBackend>,
-    request: Open,
-) -> Result<WorkspaceGuard, AtomError> {
+/// step aside and tries again at most [`SANDBOX_RETRY_MAX`] apart. It
+/// records nothing and spends none of the durable engine's recovery
+/// attempts, and it says on stderr that it is waiting, then again every ten
+/// minutes. Stopping the run, or the process ([`stop_waiting_for_backend`]),
+/// stops the wait. What `attempt` returns is made on the blocking pool: if
+/// the run that awaits it is cancelled meanwhile, the attempt still
+/// finishes there, and what it made is dropped with the result no one
+/// takes.
+pub(crate) async fn wait_for_room<T, F>(waiting: Waiting<'_>, attempt: F) -> Result<T, AtomError>
+where
+    T: Send + 'static,
+    F: Fn() -> Result<T, NotYet> + Send + Sync + 'static,
+{
     use std::sync::atomic::Ordering;
-    let label = request.label.clone();
+    let Waiting {
+        label,
+        run,
+        step,
+        what,
+        doing,
+    } = waiting;
+    let attempt = Arc::new(attempt);
     let mut wait = OPEN_WAIT_FIRST;
     let mut reported: Option<std::time::Instant> = None;
     let started = std::time::Instant::now();
@@ -508,54 +549,32 @@ pub(crate) async fn open_workspace(
     let mut unconfinable: Option<std::time::Instant> = None;
     let mut sandbox_wait = SANDBOX_RETRY_FIRST;
     loop {
-        let (b, r) = (backend.clone(), request.clone());
-        // The workspace's closer is made where it opens, on the blocking
-        // pool: if the run that awaits it is cancelled meanwhile, the open
-        // still finishes there, and its closer, dropped with the result no
-        // one takes, closes it.
-        let opened = tokio::task::spawn_blocking(move || {
-            b.open(&r).map(|workspace| Closer {
-                inputs: Default::default(),
-                backend: b,
-                workspace: Some(workspace),
-            })
-        })
-        .await
-        .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
-        match opened {
-            Ok(closer) => {
-                let guard = WorkspaceGuard(Some(Arc::new(closer)));
-                // Counted as running again before the stop is read, so a
-                // stop that began meanwhile either finds it here or waits
-                // for it.
+        let once = attempt.clone();
+        let tried = tokio::task::spawn_blocking(move || once())
+            .await
+            .map_err(|e| AtomError::Runtime(format!("{label}: {doing}: {e}")))?;
+        match tried {
+            Ok(done) => {
+                // Counted as running again before the caller reads whether
+                // the process is stopping, so a stop that began meanwhile
+                // either finds it there or waits for it.
                 drop(set_aside.take());
-                // Opened as this process stops: nothing starts in it.
-                if STOP_WAITING.load(Ordering::SeqCst) {
-                    guard.close().await;
-                    return Err(AtomError::Stopping);
-                }
                 if reported.is_some() {
-                    crate::log_line!(
-                        "atomic: {label}: the execution backend can open its workspace again"
-                    );
+                    crate::log_line!("atomic: {label}: {what} can {doing} again");
                 }
                 if unconfinable.is_some() {
                     crate::log_line!(
-                        "atomic: {label} (run {}, step {}): the sandbox starts again, and the \
-                         step goes on",
-                        request.run,
-                        request.step
+                        "atomic: {label} (run {run}, step {step}): the sandbox starts again, \
+                         and the step goes on"
                     );
                 }
-                return Ok(guard);
+                return Ok(done);
             }
-            Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
+            Err(NotYet::Fail(e)) => return Err(e),
+            Err(NotYet::Room(e)) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
                     crate::log_line!(
-                        "atomic: {label} is waiting for the execution backend \
-                         (run {}, step {}): {e}",
-                        request.run,
-                        request.step
+                        "atomic: {label} is waiting for {what} (run {run}, step {step}): {e}"
                     );
                     reported = Some(std::time::Instant::now());
                 }
@@ -568,30 +587,24 @@ pub(crate) async fn open_workspace(
                     && !KEEP_TRYING.load(Ordering::SeqCst)
                 {
                     return Err(AtomError::NoRoom(format!(
-                        "{label}: the execution backend could not open its workspace in {}s, \
-                         the most this process waits (run {}, step {}): {e}",
+                        "{label}: {what} could not {doing} in {}s, the most this process waits \
+                         (run {run}, step {step}): {e}",
                         limit.as_secs(),
-                        request.run,
-                        request.step
                     )));
                 }
                 if past {
                     if set_aside.is_none() {
-                        set_aside = Some(SetAsideForRoom::start(&request.run));
+                        set_aside = Some(SetAsideForRoom::start(run));
                         crate::log_line!(
-                            "atomic: {label} (run {}, step {}) is set aside, with nothing \
-                             recorded: no room on the execution backend in the time this \
-                             process waits; it keeps trying, at most {}s apart",
-                            request.run,
-                            request.step,
+                            "atomic: {label} (run {run}, step {step}) is set aside, with nothing \
+                             recorded: no room on {what} in the time this process waits; it \
+                             keeps trying, at most {}s apart",
                             OPEN_WAIT_MAX.as_secs()
                         );
                     } else {
                         crate::log_line!(
-                            "atomic: {label} (run {}, step {}): still no room on the execution \
-                             backend; trying again in {}s",
-                            request.run,
-                            request.step,
+                            "atomic: {label} (run {run}, step {step}): still no room on {what}; \
+                             trying again in {}s",
                             wait.as_secs_f64().ceil()
                         );
                     }
@@ -615,7 +628,7 @@ pub(crate) async fn open_workspace(
                 }
                 wait = (wait * 2).min(OPEN_WAIT_MAX);
             }
-            Err(atomic_exec::ExecError::Unconfinable { message }) => {
+            Err(NotYet::Unconfinable(message)) => {
                 if !KEEP_TRYING.load(Ordering::SeqCst) {
                     return Err(AtomError::Unconfinable(message));
                 }
@@ -625,29 +638,21 @@ pub(crate) async fn open_workspace(
                 match unconfinable {
                     None => {
                         if set_aside.is_none() {
-                            set_aside = Some(SetAsideForRoom::start(&request.run));
+                            set_aside = Some(SetAsideForRoom::start(run));
                         }
+                        crate::log_line!("atomic: {label} (run {run}, step {step}): {message}");
                         crate::log_line!(
-                            "atomic: {label} (run {}, step {}): {message}",
-                            request.run,
-                            request.step
-                        );
-                        crate::log_line!(
-                            "atomic: {label} (run {}, step {}) is set aside, with nothing \
+                            "atomic: {label} (run {run}, step {step}) is set aside, with nothing \
                              recorded, until the sandbox can start; it tries again, at most \
                              {}s apart, and other runs go on",
-                            request.run,
-                            request.step,
                             SANDBOX_RETRY_MAX.as_secs()
                         );
                         unconfinable = Some(std::time::Instant::now());
                     }
                     Some(at) if at.elapsed() >= OPEN_WAIT_REPORT => {
                         crate::log_line!(
-                            "atomic: {label} (run {}, step {}): the sandbox still cannot start: \
-                             {message}",
-                            request.run,
-                            request.step
+                            "atomic: {label} (run {run}, step {step}): the sandbox still cannot \
+                             start: {message}"
                         );
                         unconfinable = Some(std::time::Instant::now());
                     }
@@ -664,9 +669,67 @@ pub(crate) async fn open_workspace(
                 }
                 sandbox_wait = (sandbox_wait * 2).min(SANDBOX_RETRY_MAX);
             }
-            Err(e) => return Err(AtomError::Runtime(format!("{label}: {e}"))),
         }
     }
+}
+
+/// Open a workspace on `backend`, waiting for room as [`wait_for_room`]
+/// does while the backend reports [`atomic_exec::ExecError::Unavailable`]
+/// (no room, or a sandbox that failed in a way that may pass, such as a
+/// full disk; nothing was started).
+pub(crate) async fn open_workspace(
+    backend: Arc<dyn ExecutionBackend>,
+    request: Open,
+) -> Result<WorkspaceGuard, AtomError> {
+    open_workspace_after(backend, request, || Ok(())).await
+}
+
+/// [`open_workspace`], running `prepare` first in each attempt: a
+/// [`NotYet::Room`] from it waits as the backend's lack of room does, and a
+/// [`NotYet::Fail`] fails at once, opening nothing.
+pub(crate) async fn open_workspace_after(
+    backend: Arc<dyn ExecutionBackend>,
+    request: Open,
+    prepare: impl Fn() -> Result<(), NotYet> + Send + Sync + 'static,
+) -> Result<WorkspaceGuard, AtomError> {
+    let label = request.label.clone();
+    let (run, step) = (request.run.clone(), request.step.clone());
+    let waiting = Waiting {
+        label: &label,
+        run: &run,
+        step: &step,
+        what: "the execution backend",
+        doing: "open its workspace",
+    };
+    let named = label.clone();
+    // The workspace's closer is made where it opens, on the blocking pool:
+    // if the run that awaits it is cancelled meanwhile, the open still
+    // finishes there, and its closer, dropped with the result no one
+    // takes, closes it.
+    let closer = wait_for_room(waiting, move || {
+        prepare()?;
+        let b = backend.clone();
+        match b.open(&request) {
+            Ok(workspace) => Ok(Closer {
+                inputs: Default::default(),
+                backend: b,
+                workspace: Some(workspace),
+            }),
+            Err(e @ atomic_exec::ExecError::Unavailable { .. }) => Err(NotYet::Room(e.to_string())),
+            Err(atomic_exec::ExecError::Unconfinable { message }) => {
+                Err(NotYet::Unconfinable(message))
+            }
+            Err(e) => Err(NotYet::Fail(AtomError::Runtime(format!("{named}: {e}")))),
+        }
+    })
+    .await?;
+    let guard = WorkspaceGuard(Some(Arc::new(closer)));
+    // Opened as this process stops: nothing starts in it.
+    if STOP_WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+        guard.close().await;
+        return Err(AtomError::Stopping);
+    }
+    Ok(guard)
 }
 
 /// An open workspace, closed however the run that holds it ends: by
@@ -1094,6 +1157,16 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
 /// no such handoff, and the command's `TMPDIR` is the turn's own directly.
 fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Result<(), AtomError> {
     let Some(scratch) = &workspace.scratch else {
+        // On Linux a shared directory goes to Codex's helper, and the
+        // command's own comes from its scratch directory: with no scratch,
+        // the command would be left the shared one.
+        if linux && workspace.tmp.is_some() {
+            return Err(AtomError::Runtime(format!(
+                "the backend gave {}'s turn a shared temporary directory but no scratch \
+                 directory of its own, where its commands' TMPDIR is made",
+                workspace.label
+            )));
+        }
         return Ok(());
     };
     let own = scratch.join("tmp");
@@ -1569,13 +1642,11 @@ pub async fn open_exec_workspace(
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     caches: Option<&crate::worktree::Caches>,
 ) -> Result<WorkspaceGuard, AtomError> {
-    if let Some(caches) = caches {
-        caches
-            .create()
-            .map_err(|e| AtomError::Runtime(format!("the run's build caches: {e}")))?;
-    }
     let (env, writable_roots) = exec_environment(atom, caches);
-    open_workspace(
+    // Made in each attempt to open the workspace, so a full disk waits for
+    // room as the backend's own lack of it does.
+    let caches = caches.cloned();
+    open_workspace_after(
         backend,
         Open {
             label: atom.name.clone(),
@@ -1586,6 +1657,10 @@ pub async fn open_exec_workspace(
             writable_roots,
             env,
             ..Open::default()
+        },
+        move || match &caches {
+            Some(caches) => caches.create_for_room(),
+            None => Ok(()),
         },
     )
     .await

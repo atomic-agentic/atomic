@@ -138,10 +138,12 @@ Ceilings come only from your own configuration file, which no project supplies:
 unknown setting. A run resolves them with its caps and records them with its plan,
 so a run resumed or recovered keeps the ceilings it began under, whatever your
 configuration says by then. A plan records that it was held to your ceilings and
-prices when it was made or pinned; one recorded before plans were has no such
-record, and a run resumed or recovered with one is held, before it goes on, to the
+prices when it was made or pinned. A plan without that record is treated as not
+held: a run resumed or recovered with one is held, before it goes on, to the
 settings, ceilings and prices of your own configuration now, as a pinned plan is
-below, and stops if it is above them, saying to start it again.
+below, and stops if it is above them, saying to start it again. Runs recorded under
+an earlier layout are not continued at all (see `atomic runs resume`), so this
+applies only to a plan recorded under this layout without the record.
 
 A plan pinned in a run's input is held, before its first call, both to the
 ceilings it carries and to those of your own configuration now: its run's and

@@ -1534,6 +1534,7 @@ async fn turn<C: WorkflowContext>(
             StepRequest {
                 run: run_id.clone(),
                 step: t.name.clone(),
+                atom: atom.name.clone(),
                 base: base.to_owned(),
                 message: format!("{}: {}", pipeline.name, t.name),
                 signature: Signature::default(),
@@ -2134,9 +2135,9 @@ async fn in_worktree(
         };
         // The run's build caches, with a Cargo target directory of this
         // worktree's own.
-        caches
-            .create()
-            .map_err(|e| AtomError::Runtime(format!("the build caches: {e}")))?;
+        // On a full disk the step waits for room, as for the execution
+        // backend's, rather than failing its run.
+        caches.create_waiting(&atom.name, &run_id, &step).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
@@ -2157,7 +2158,10 @@ async fn in_worktree(
             .await
             .map_err(|e| match e {
                 StepError::Body(e) => e,
-                StepError::Worktree(e) => AtomError::Runtime(format!("the step's worktree: {e}")),
+                StepError::Worktree(e) => {
+                    AtomError::Runtime(format!("the step's worktree: {}", e.described()))
+                }
+                StepError::Waited(e) => e,
             })
     })
     .await;
