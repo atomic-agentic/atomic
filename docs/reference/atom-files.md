@@ -179,9 +179,11 @@ clients and SDKs read and which come on top of its `env`; a client that ignores
 them reaches nothing. An atom's `env` cannot set any of them. It can open no
 other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
-names one. It serves only the sandbox it was started for: each connection
-must open with a token atomic gives that command's sandbox, and the command
-itself never sees, so another process on the machine cannot use the proxy.
+names one. Each connection must open with a token that atomic gives the
+command's sandbox and that the command itself never sees, so no sandboxed
+process and no other user's process can use the proxy. A process of your own
+user that runs outside any sandbox can still read the token from the sandbox
+helper's environment while the command runs.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
