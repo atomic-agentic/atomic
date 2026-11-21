@@ -480,7 +480,11 @@ denied to the command that runs then. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
-a command could move the directory above it away from its denial. The model
+a command could move the directory above it away from its denial, or when
+a denied place is a link atomic cannot resolve for a reason other than
+leading nowhere yet, such as a link to itself or into a directory you may
+not search: remove the link, or point it at something atomic can reach.
+The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
@@ -489,8 +493,9 @@ denied place points at, which each command looks for again as it starts,
 in the places the list was made with, and denies at its second mounts too,
 and so is a second mount of what the list denies made since it was built,
 as each command reads the mount table again; a command whose new link or
-new second mount leads somewhere atomic would refuse to deny does not
-start. As each command starts, the links up to four levels inside the
+new second mount leads somewhere atomic would refuse to deny, or whose
+denied place has become a link atomic cannot resolve for a reason other
+than leading nowhere, does not start. As each command starts, the links up to four levels inside the
 places that lead outside them to something atomic would deny, old and new,
 each target counted once, together with the second mounts of what the new
 ones point at and the second mounts made since the list was built, come to

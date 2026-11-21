@@ -717,7 +717,14 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would refuse it.
+            if !found && let Err(e) = resolved(&path) {
+                return Err(refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                )));
+            }
             let Some(target) = std::fs::canonicalize(&path)
                 .ok()
                 .filter(|t| deniable(t, !found))
@@ -1452,7 +1459,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -1488,8 +1494,10 @@ struct Late {
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold and
-/// those second mounts come to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_link_targets(
     denied: &[PathBuf],
@@ -4718,6 +4726,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
         let dir = scratch("linked-secrets");
         let home = dir.join("home");
@@ -4892,11 +4931,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 
