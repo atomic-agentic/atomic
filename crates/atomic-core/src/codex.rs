@@ -472,6 +472,11 @@ fn deniable(target: &Path) -> bool {
 /// a directory the thread may write, where a command could rename it out
 /// from under its denial.
 ///
+/// Each is denied too wherever else the mount table shows it, such as a
+/// home bound at a second path (see [`crate::mounts`]); nothing runs when
+/// the table cannot be read, or when such a place would cover what the
+/// thread needs or lies in a directory it may write.
+///
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
@@ -601,6 +606,36 @@ fn denied_paths(
         }
         all.push(path);
     }
+    // The same places wherever else they are mounted, such as a home bound
+    // at a second path or the host's files under /run/host: denied there
+    // too, or nothing runs (see `crate::mounts`).
+    let aliases = crate::mounts::second_mounts(&all)?;
+    if aliases.len() > MAX_LINK_TARGETS {
+        bail!(
+            "the places denied to atoms' commands are mounted at {} other places, more than \
+             the {MAX_LINK_TARGETS} atomic denies",
+            aliases.len()
+        );
+    }
+    for alias in &aliases {
+        if let Some(needed) = covers(alias) {
+            bail!(
+                "{} shows a place denied to atoms' commands at a second mount, and holds {}, \
+                 which they need; atomic cannot deny it",
+                alias.display(),
+                needed.display()
+            );
+        }
+        if let Some(root) = writable.iter().find(|w| alias.starts_with(w)) {
+            bail!(
+                "{} shows a place denied to atoms' commands at a second mount, inside {}, which \
+                 they may write; mount it elsewhere",
+                alias.display(),
+                root.display()
+            );
+        }
+    }
+    all.extend(aliases);
     // A path inside another denied path is denied with it, and the sandbox
     // cannot mount a denial inside one: such as the credential store inside
     // the person's own configuration directory.

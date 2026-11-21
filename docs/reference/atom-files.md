@@ -400,9 +400,16 @@ variables, `KUBECONFIG` and others) put them, and a link among them, up to
 four directory levels inside a denied directory, is denied as the file or
 directory it points at, when that is yours and outside the system's
 directories: a history file linked to `/dev/null`, or a tool linked to the
-system's `python3`, stays usable. A turn does not start when a denial would
-cover its working directory or a directory it may write, or when a linked
-secret lies inside a directory it may write. The model chooses the
+system's `python3`, stays usable. Each is denied too wherever else the
+same directory is mounted, as it is with your home bound at a second path,
+inside toolbox or distrobox (the host's files under `/run/host`), or with a
+btrfs top-level subvolume mounted elsewhere; atomic reads the mount table
+for this, and nothing runs when it cannot. A snapshot holds a copy, not the
+place itself, so a readable snapshot directory is not covered, nor is an
+overlay or FUSE filesystem built over a denied directory. A turn does
+not start when a denial would cover its working directory or a directory it
+may write, or when a linked secret, or a second mount of a denied place,
+lies inside a directory it may write. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

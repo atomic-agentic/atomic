@@ -26,6 +26,7 @@ pub mod git;
 pub mod helper_runtime;
 pub mod http_tools;
 pub mod lite;
+pub mod mounts;
 pub mod names;
 pub mod network;
 pub mod project;
