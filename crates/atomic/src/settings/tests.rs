@@ -53,6 +53,16 @@ fn resolved_signed_in(
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
         .collect();
     let env = |name: &str| vars.get(name).cloned();
+    // The same resolution the state check and the denial use, with the
+    // environment as `vars` gives it and no password home: a test's
+    // environment says nothing about this machine's user, and nothing here may
+    // read the real person's configuration.
+    let config_dir = || {
+        atomic_core::state::user_config_dir_in(
+            &|name| vars.get(name).cloned().map(std::ffi::OsString::from),
+            &None,
+        )
+    };
     resolve(
         dir,
         args,
@@ -60,6 +70,7 @@ fn resolved_signed_in(
             env: &env,
             env_names: vars.keys().cloned().collect(),
             ollama,
+            user_config_dir: &config_dir,
             sign_in,
         },
     )

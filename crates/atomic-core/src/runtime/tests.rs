@@ -1856,6 +1856,78 @@ fn an_unavailable_workspace_is_waited_for() {
     });
 }
 
+/// An exec step's build caches are made in each attempt to open its
+/// workspace, as the backend's room is waited for: caches the disk is too
+/// full for wait, opening nothing meanwhile, and caches that cannot be made
+/// for another reason fail the step at once.
+#[test]
+fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
+    use std::sync::atomic::AtomicUsize;
+    on_codex_runtime(async {
+        let (dir, a, _) = exec_project("exec-room", TOTAL, "");
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        // The backend has no room twice: the caches are there for the try
+        // that opens.
+        let busy = Recording {
+            unavailable: Arc::new(AtomicUsize::new(2)),
+            ..Recording::default()
+        };
+        let caches = crate::worktree::Caches::new(dir.join("state/cache/run-1-ab"));
+        let guard = open_exec_workspace(&a, &identity, busy.backend().shared(), Some(&caches))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(busy.calls(), ["open total"; 3]);
+        assert!(caches.dir().is_dir());
+        guard.close().await;
+
+        // The disk is full for the first two tries at making them: the step
+        // waits, and the backend is asked only once they are made.
+        let full = crate::worktree::Caches::new(dir.join("state/cache/run-2-cd"));
+        crate::worktree::FAIL_FOR_TESTS.lock().expect("fail").push((
+            full.dir().to_owned(),
+            std::io::ErrorKind::StorageFull,
+            2,
+        ));
+        let room = Recording::default();
+        let guard = open_exec_workspace(&a, &identity, room.backend().shared(), Some(&full))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(room.calls(), ["open total"]);
+        assert!(full.dir().is_dir());
+        assert!(
+            crate::worktree::FAIL_FOR_TESTS
+                .lock()
+                .expect("fail")
+                .iter()
+                .any(|(d, _, left)| d == full.dir() && *left == 0),
+            "it waited through both"
+        );
+        guard.close().await;
+
+        // Caches that cannot be made for another reason, under a file: the
+        // step fails at once, and nothing is opened.
+        std::fs::write(dir.join("file"), "").expect("file");
+        let never = Recording::default();
+        let refused = open_exec_workspace(
+            &a,
+            &identity,
+            never.backend().shared(),
+            Some(&crate::worktree::Caches::new(dir.join("file/run-1"))),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(AtomError::Runtime(m)) if m.contains("the run's build caches") && m.contains("Not a directory")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(never.calls().is_empty(), "{:?}", never.calls());
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// An atom that panics after its workspace opened still closes it.
 #[test]
 fn a_run_that_panics_closes_its_workspace() {
@@ -2748,7 +2820,8 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
 // ATOMIC_TURN_TMPDIR while Codex's helper keeps the backend's shared
 // directory for its registry; elsewhere directly, with no handoff variable
 // left for the command to see. The shared directory is never a turn's
-// writable root, and a Linux turn without one is refused.
+// writable root, and a Linux turn without one, or with one but no scratch
+// directory to make its own in, is refused.
 #[test]
 fn a_turns_tmpdir_is_its_own_on_every_platform() {
     let base = std::env::temp_dir().join(format!("atomic-turn-tmpdir-{}", std::process::id()));
@@ -2780,7 +2853,6 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     let linux = built(true, &workspace).expect("linux");
     assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
     assert_eq!(linux.env[codex::TURN_TMPDIR], own);
-    assert!(!linux.writable_roots.contains(&shared));
 
     let other = built(false, &workspace).expect("elsewhere");
     assert_eq!(other.env["TMPDIR"], own);
@@ -2789,7 +2861,18 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
         "{:?}",
         other.env
     );
-    assert!(!other.writable_roots.contains(&shared));
+    // Nor does the turn's whole setup make the shared directory writable.
+    let mut whole = TurnSpec::default();
+    let shelled = Workspace {
+        shell: atomic_exec::Shell::Local,
+        ..workspace.clone()
+    };
+    turn_in(&shelled, &mut whole).expect("set up");
+    assert!(
+        !whole.writable_roots.contains(&shared),
+        "{:?}",
+        whole.writable_roots
+    );
 
     assert!(std::path::Path::new(&own).is_dir(), "{own} was not made");
     let without = Workspace {
@@ -2802,6 +2885,22 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     assert_eq!(
         built(false, &without).expect("elsewhere").env["TMPDIR"],
         own
+    );
+    // A shared directory with no scratch directory would leave the command
+    // the shared one.
+    let unscratched = Workspace {
+        scratch: None,
+        ..workspace.clone()
+    };
+    assert!(
+        matches!(built(true, &unscratched), Err(AtomError::Runtime(m)) if m.contains("no scratch directory")),
+        "a Linux turn with a shared directory and no scratch runs"
+    );
+    assert!(
+        !built(false, &unscratched)
+            .expect("elsewhere")
+            .env
+            .contains_key("TMPDIR")
     );
     let _ = std::fs::remove_dir_all(&base);
 }

@@ -1,0 +1,1 @@
+listed-principal-escaped|crates/atomic/src/gates.rs|                let by = shown::line(d.by.as_str());|                let by = d.by.as_str(); /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_principal_and_command_are_shown_escaped

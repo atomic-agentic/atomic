@@ -267,8 +267,12 @@ states a marker opens a block, and only a block holds clauses, so what is
 written under a line that opens none, or under a deeper heading that states
 none, is read as nothing. Each such line is refused with its line number:
 outside a block, every line that leads with a spelling of `accept` and ends in
-a colon, however it is wrapped or spelt (`Acceptance:`, `__Acceptance:__`,
-`**Acceptence:**`, `- **Acceptance, files and data:**`); within a block, every
+a colon, however that word is spelt, and however it is wrapped in markdown
+punctuation (`-`, `_`, `*`, `~`, `>` and `#`, with spaces), which may carry one
+bullet's mark in front of the word (`- `, `* `, `+ `, or a number, then `.` or
+`)`, then a space), as in `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+`- **Acceptance, files and data:**` and `1. **Acceptance, files and data:**`;
+within a block, every
 line that begins `**Acceptance` and is not a marker; and under a deeper
 heading, every bullet, of whatever shape. A clause carried onto its next line
 is read as one clause only when that line is indented by at least two spaces
