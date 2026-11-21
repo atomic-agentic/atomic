@@ -2314,13 +2314,20 @@ fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
     );
     let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
     let doc = held(&held(&inner));
+    // Beside a value held JSON hides, so that opened under a hint it is
+    // written back from what text redaction made of it.
+    let token = concat!("Zx81", "kQ0pL2mN4bV6");
+    let beside = format!(
+        "{{\"k\": \"{token}\", \"body\": {}}}",
+        Value::String(held(&inner))
+    );
     // Under an ordinary name and under a hint, where held JSON is opened.
-    for parent in ["body", "key"] {
+    for (parent, doc) in [("body", &doc), ("key", &doc), ("key", &beside)] {
         let mut out = json!({ parent: doc.clone() });
         value(&mut out);
         assert!(
-            !out.to_string().contains(&key[4..]),
-            "under {parent}: the header's value showed"
+            !out.to_string().contains(&key[4..]) && !out.to_string().contains(&token[4..]),
+            "under {parent}: a secret showed"
         );
         let mut again = out.clone();
         value(&mut again);
