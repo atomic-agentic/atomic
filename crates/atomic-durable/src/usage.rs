@@ -608,10 +608,12 @@ pub fn heartbeat_every(reserved_millis: i64) -> i64 {
 /// Whose measure of an attempt's active time settles it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Measure {
-    /// The process that made the call, as the call ends: what passed since
-    /// admission. A time settled before, by someone who took the call for
-    /// dead, gives way to it if it is larger.
-    Owner,
+    /// The process that made the call, as the call ends: the active time it
+    /// measured since admission, on a clock that does not run while the
+    /// machine sleeps, or, from an owner that kept none, what passed on the
+    /// ledger's clock. A time settled before, by someone who took the call
+    /// for dead, gives way to it if it is larger.
+    Owner(Option<i64>),
     /// Anyone else, for a call whose process died: what passed until a
     /// heartbeat after the last one it recorded, so time the process was
     /// down is never charged.
@@ -659,8 +661,8 @@ async fn settle_time(
     );
     let settled = row.int_opt("settled_at")?.is_some();
     let measured = match measure {
-        Measure::Owner => {
-            let took = (now - admitted).clamp(0, reserved);
+        Measure::Owner(active) => {
+            let took = active.unwrap_or(now - admitted).clamp(0, reserved);
             if settled { took.max(charged) } else { took }
         }
         Measure::Dead if settled => return Ok(Some(charged)),
@@ -700,7 +702,20 @@ async fn settle_time(
         },
     )
     .await?;
+    // Its time is settled: no measure reads its heartbeat again.
+    forget_heartbeat(tx, request, attempt).await?;
     Ok(Some(measured))
+}
+
+/// Delete the heartbeat of attempt `attempt` at `request`, once its time is
+/// settled: it is read only to settle the time of a call whose process died.
+async fn forget_heartbeat(tx: &mut Tx<'_, '_>, request: &str, attempt: i64) -> Result<()> {
+    tx.execute(
+        "DELETE FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = ?",
+        &[Param::Text(request.to_owned()), Param::Int(attempt)],
+    )
+    .await?;
+    Ok(())
 }
 
 /// Settle the time of every attempt that died charged to `request`'s own
@@ -825,12 +840,16 @@ async fn partly(
     Ok(End::Commit(Settled::Uncertain))
 }
 
+/// Settle attempt `attempt` at `request` as `how` says, at `now` on the
+/// ledger's clock; `active` is the active time its owner measured, if it
+/// kept a clock (see [`Measure::Owner`]).
 async fn settle_in(
     tx: &mut Tx<'_, '_>,
     request: &str,
     attempt: i64,
     how: Settlement,
     now: i64,
+    active: Option<i64>,
 ) -> Result<End<Settled>> {
     let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
     // Locked before it is read, whatever its state, so an overlapping
@@ -881,7 +900,7 @@ async fn settle_in(
         // comes after, for a call whose process may be long gone.
         let measure = match how {
             Settlement::Reconciled { .. } => Measure::Dead,
-            _ => Measure::Owner,
+            _ => Measure::Owner(active),
         };
         settle_time(tx, request, attempt, now, measure).await?;
         if matches!(how, Settlement::Unknown) {
@@ -986,6 +1005,7 @@ async fn settle_in(
         },
     )
     .await?;
+    forget_heartbeat(tx, request, attempt).await?;
     Ok(End::Commit(Settled::Now))
 }
 
@@ -1038,19 +1058,46 @@ impl Ledger {
     }
 
     /// Record that the call of attempt `attempt` at `request` is still
-    /// running, so that if its process dies, the time charged for it stops
-    /// here rather than when someone finds it dead. A running call's meter
-    /// calls it every [`heartbeat_every`] of its reservation.
-    pub async fn heartbeat(&self, request: &str, attempt: i64) -> Result<()> {
+    /// running, `active` milliseconds of active time after its admission,
+    /// so that if its process dies, the time charged for it stops here
+    /// rather than when someone finds it dead. A running call's meter calls
+    /// it every [`heartbeat_every`] of its reservation, measuring `active`
+    /// on a clock that does not run while the machine sleeps, so a
+    /// suspended machine's sleep is not charged. Once the attempt's time is
+    /// settled, it records nothing.
+    pub async fn heartbeat(&self, request: &str, attempt: i64, active: i64) -> Result<()> {
         let (request, clock) = (request.to_owned(), self.clock.clone());
         self.transact(move |mut tx| {
             let (request, now) = (request.clone(), clock());
             Box::pin(async move {
+                let key = [Param::Text(request.clone()), Param::Int(attempt)];
+                // Locked first, so a settlement that overlaps this waits, or
+                // this waits for it and then finds its time settled.
+                let running = tx
+                    .execute(
+                        "UPDATE atomic_usage_attempts SET attempt = attempt \
+                         WHERE request_id = ? AND attempt = ? AND state = 'reserved' \
+                         AND settled_at IS NULL",
+                        &key,
+                    )
+                    .await?;
+                if running != 1 {
+                    return Ok(End::Rollback(()));
+                }
+                let admitted = tx
+                    .query_one(
+                        "SELECT admitted_at FROM atomic_usage_attempts \
+                         WHERE request_id = ? AND attempt = ?",
+                        &key,
+                    )
+                    .await?
+                    .int("admitted_at")?;
+                let seen = admitted.saturating_add(active.max(0)).min(now);
                 tx.execute(
                     "INSERT INTO atomic_usage_heartbeats (request_id, attempt, seen_at) \
                      VALUES (?, ?, ?) ON CONFLICT (request_id, attempt) \
                      DO UPDATE SET seen_at = excluded.seen_at",
-                    &[Param::Text(request), Param::Int(attempt), Param::Int(now)],
+                    &[Param::Text(request), Param::Int(attempt), Param::Int(seen)],
                 )
                 .await?;
                 Ok(End::Commit(()))
@@ -1062,10 +1109,11 @@ impl Ledger {
     /// Settle attempt `attempt` at `request` as unknown because its process
     /// is stopping before the call ended: its tokens and dollars stay
     /// charged as they are, at their bound or at what [`Ledger::progress`]
-    /// recorded, and its time is what passed. As
-    /// [`Settlement::Unknown`], without the crash tests' failpoint.
-    pub async fn interrupt(&self, request: &str, attempt: i64) -> Result<Settled> {
-        self.settle_once(request, attempt, Settlement::Unknown)
+    /// recorded, and its time is `active`, the active time its owner
+    /// measured since admission. As [`Settlement::Unknown`], without the
+    /// crash tests' failpoint.
+    pub async fn interrupt(&self, request: &str, attempt: i64, active: i64) -> Result<Settled> {
+        self.settle_once(request, attempt, Settlement::Unknown, Some(active))
             .await
     }
 
@@ -1107,14 +1155,40 @@ impl Ledger {
     }
 
     /// Settle attempt `attempt` at `request` once. Settling it again, or
-    /// settling a released attempt, changes nothing.
+    /// settling a released attempt, changes nothing. An unknown or partial
+    /// settlement charges the time that passed on the ledger's clock; the
+    /// call's own process settles with [`Ledger::settle_measured`] instead.
     pub async fn settle(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
+        self.settle_at(request, attempt, how, None).await
+    }
+
+    /// As [`Ledger::settle`], by the call's own process, which measured
+    /// `active` milliseconds of active time since its admission: an unknown
+    /// or partial settlement charges that, so a machine that slept while
+    /// the call ran is not charged the sleep.
+    pub async fn settle_measured(
+        &self,
+        request: &str,
+        attempt: i64,
+        how: Settlement,
+        active: i64,
+    ) -> Result<Settled> {
+        self.settle_at(request, attempt, how, Some(active)).await
+    }
+
+    async fn settle_at(
+        &self,
+        request: &str,
+        attempt: i64,
+        how: Settlement,
+        active: Option<i64>,
+    ) -> Result<Settled> {
         // Where a crash test kills the process: after the provider was
         // called, before its usage is recorded.
         if crate::failpoints::armed() {
             failpoint(&format!("usage:before-settle:{request}"));
         }
-        self.settle_once(request, attempt, how).await
+        self.settle_once(request, attempt, how, active).await
     }
 
     /// Release attempt `attempt` at `request`, left `reserved`, once it is
@@ -1122,7 +1196,7 @@ impl Ledger {
     /// charged. Releasing a settled or released attempt changes nothing; an
     /// attempt that reported usage spent something, and is refused.
     pub async fn release(&self, request: &str, attempt: i64) -> Result<Settled> {
-        self.settle_once(request, attempt, Settlement::NotDispatched)
+        self.settle_once(request, attempt, Settlement::NotDispatched, None)
             .await
     }
 
@@ -1193,11 +1267,17 @@ impl Ledger {
         .await
     }
 
-    async fn settle_once(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
+    async fn settle_once(
+        &self,
+        request: &str,
+        attempt: i64,
+        how: Settlement,
+        active: Option<i64>,
+    ) -> Result<Settled> {
         let (request, clock) = (request.to_owned(), self.clock.clone());
         self.transact(move |mut tx| {
             let (request, now) = (request.clone(), clock());
-            Box::pin(async move { settle_in(&mut tx, &request, attempt, how, now).await })
+            Box::pin(async move { settle_in(&mut tx, &request, attempt, how, now, active).await })
         })
         .await
     }
