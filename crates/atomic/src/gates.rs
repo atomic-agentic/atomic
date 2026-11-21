@@ -147,7 +147,7 @@ async fn enroll(rt: &Durare, state: &ProjectState, replace: bool) -> anyhow::Res
         gate::Enrollment::AlreadyEnrolled => "already enrolled",
         gate::Enrollment::Replaced => "enrolled a new credential for",
     };
-    println!("{said} {principal}");
+    println!("{said} {}", shown::line(principal.as_str()));
     Ok(())
 }
 
@@ -176,8 +176,16 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
                 format!("silence selected {}", shown::value(answer))
             }
             Some(gate::Resolution::Decided(d)) => match &d.answer {
-                Some(a) => format!("answered {} by {}", shown::value(a), d.by),
-                None => format!("{:?} by {}", d.verdict, d.by).to_lowercase(),
+                Some(a) => format!(
+                    "answered {} by {}",
+                    shown::value(a),
+                    shown::line(d.by.as_str())
+                ),
+                None => format!(
+                    "{} by {}",
+                    format!("{:?}", d.verdict).to_lowercase(),
+                    shown::line(d.by.as_str())
+                ),
             },
         };
         println!(
@@ -301,7 +309,7 @@ async fn decide(
     println!(
         "{} {what} by {} ({})",
         shown::line(&found.id),
-        decision.by,
+        shown::line(decision.by.as_str()),
         decision.command
     );
     Ok(())
