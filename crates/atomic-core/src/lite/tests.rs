@@ -1039,6 +1039,13 @@ fn an_endpoint_here_over_plain_http_is_told_from_one_elsewhere() {
         ("http://[::]:4000/v1", true),
         ("http://[::ffff:127.0.0.1]:4000/v1", true),
         ("http://[::ffff:0.0.0.0]:4000/v1", true),
+        // Other spellings of an address here, as a URL parser reads them.
+        ("http://127.1:4000/v1", true),
+        ("http://2130706433:4000/v1", true),
+        ("http://0x7f.0.0.1:4000/v1", true),
+        ("http://0177.0.0.1:4000/v1", true),
+        ("http://[0:0:0:0:0:0:0:1]:4000/v1", true),
+        ("HTTP://127.0.0.1:4000/v1", true),
         ("http://localhost:4000/v1", true),
         ("http://LocalHost.:4000/v1", true),
         ("http://api.localhost/v1", true),
@@ -1058,7 +1065,7 @@ fn an_endpoint_here_over_plain_http_is_told_from_one_elsewhere() {
 /// A server on this machine that answers every request with `response`, and
 /// counts the requests it was sent.
 fn answering(response: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = listener.local_addr().expect("address");
     let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1067,15 +1074,24 @@ fn answering(response: String) -> (String, std::sync::Arc<std::sync::atomic::Ato
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // The request head, then its body, read whole before answering,
+            // so the answer is never cut off by a reset.
             let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
             let mut line = String::new();
+            let mut length = 0;
             while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                if let Some((name, value)) = line.split_once(':')
+                    && name.eq_ignore_ascii_case("content-length")
+                {
+                    length = value.trim().parse().unwrap_or(0);
+                }
                 line.clear();
             }
+            let _ = reader.read_exact(&mut vec![0; length]);
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    (format!("http://{address}"), seen)
+    (format!("http://127.0.0.1:{}", address.port()), seen)
 }
 
 /// A lite atom's endpoint that answers with a redirect is not followed, so
@@ -1087,7 +1103,10 @@ async fn a_lite_atoms_endpoint_that_redirects_is_not_followed() {
         "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{GOOD}",
         GOOD.len()
     ));
-    let moved = elsewhere.replace("http://", "http://user:secret@");
+    let mut moved = reqwest::Url::parse(&elsewhere).expect("a URL");
+    moved.set_username("user").expect("a user");
+    moved.set_password(Some("secret")).expect("a password");
+    let moved = moved.as_str().trim_end_matches('/').to_owned();
     let (redirecting, asked) = answering(format!(
         "HTTP/1.1 307 Temporary Redirect\r\nlocation: {moved}/v2/chat/completions?sig=abc#x\r\n\
          content-length: 0\r\n\r\n"
@@ -1122,5 +1141,56 @@ async fn a_lite_atoms_endpoint_that_redirects_is_not_followed() {
         followed.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "the redirect was not followed"
+    );
+}
+
+/// A redirect is said with where it points, cut short and without a query
+/// or credentials; the base URL to set is suggested only for the same host,
+/// no weaker in scheme, with the call's own path kept.
+#[test]
+fn a_redirect_suggests_a_base_url_only_where_it_is_safe_to() {
+    let found = reqwest::StatusCode::FOUND;
+    let base = "https://api.example.com/v1";
+    let url = "https://api.example.com/v1/chat/completions";
+    let advice = |location: &str| redirect_advice(base, url, found, Some(location)).expect("said");
+    let moved = advice("https://user:pw@api.example.com/v2/chat/completions?sig=abc#x");
+    assert_eq!(
+        moved,
+        "the endpoint redirects to https://api.example.com/v2/chat/completions; atomic does not \
+         follow a redirect with the key; set model.base_url to https://api.example.com/v2"
+    );
+    let relative = advice("/v2/chat/completions");
+    assert!(
+        relative.ends_with("; set model.base_url to https://api.example.com/v2"),
+        "{relative}"
+    );
+    let weaker = advice("http://api.example.com/v1/chat/completions");
+    assert!(
+        weaker.ends_with("; the redirect gives up https, which would expose the key"),
+        "{weaker}"
+    );
+    let other = advice("https://elsewhere.example.com/v1/chat/completions");
+    assert!(
+        other.ends_with("; the redirect is to another host"),
+        "{other}"
+    );
+    let unlike = advice("https://api.example.com/login");
+    assert!(
+        unlike.ends_with("atomic does not follow a redirect with the key"),
+        "{unlike}"
+    );
+    let long = advice(&format!("/{}", "a".repeat(1000)));
+    assert!(long.len() < 400, "{long}");
+    assert!(long.contains("..."), "{long}");
+    assert_eq!(
+        redirect_advice(base, url, reqwest::StatusCode::BAD_GATEWAY, Some("/x")),
+        None
+    );
+    assert_eq!(redirect_advice(base, url, found, None), None);
+    // A location that does not parse is no advice, and the call still fails
+    // as the provider's answer.
+    assert_eq!(
+        redirect_advice(base, url, found, Some("http://[not a host")),
+        None
     );
 }

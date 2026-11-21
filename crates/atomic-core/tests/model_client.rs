@@ -38,7 +38,7 @@ fn serve(response: &'static str) -> (String, Arc<AtomicUsize>) {
             let _ = stream.write_all(response.as_bytes());
         }
     });
-    (format!("http://{address}"), seen)
+    (format!("http://127.0.0.1:{}", address.port()), seen)
 }
 
 #[test]
@@ -89,8 +89,9 @@ fn the_model_client_keeps_the_key_off_proxies_and_redirects() {
         assert_eq!(proxied.load(Ordering::SeqCst), 0, "no proxy saw the key");
 
         // Elsewhere, the proxy the environment names is used: what holds
-        // the key back is the endpoint being on this machine.
-        let answer = get("http://model.invalid/v1".to_owned()).await.unwrap();
+        // the key back is the endpoint being on this machine. The proxy
+        // answers itself, so nothing reaches this private address.
+        let answer = get("http://10.255.255.1/v1".to_owned()).await.unwrap();
         assert_eq!(answer.status(), 502);
         assert_eq!(proxied.load(Ordering::SeqCst), 1);
 

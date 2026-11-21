@@ -562,11 +562,8 @@ async fn call(
     let answer = if !status.is_success() {
         let answered =
             anyhow::Error::from(ProviderError::answered(&url, status, &text, value.as_ref()));
-        match redirected_to(base, &url, status, location.as_deref()) {
-            Some((target, moved)) => Err(answered.context(format!(
-                "POST {url}: the endpoint redirects to {target}; atomic does not follow a \
-                 redirect with the key; set model.base_url to {moved}"
-            ))),
+        match redirect_advice(base, &url, status, location.as_deref()) {
+            Some(advice) => Err(answered.context(format!("POST {url}: {advice}"))),
             None => Err(answered),
         }
     } else {
@@ -585,31 +582,49 @@ async fn call(
     Called { answer, usage }
 }
 
-/// Where a redirect from the call to `url`, under the endpoint `base`,
-/// points, and the base URL that would reach it directly, when `status` is a
-/// redirect with a `location`: both without a query, a fragment or
-/// credentials, which can carry a signature or a token.
-fn redirected_to(
+/// The longest redirect target an error repeats, in characters.
+const MAX_REDIRECT_SAID: usize = 256;
+
+/// What to say of a redirect answering the call to `url`, under the endpoint
+/// `base`, when `status` is a redirect with a `location`: where it points,
+/// without a query, a fragment or credentials, which can carry a signature or
+/// a token, and cut to [`MAX_REDIRECT_SAID`] characters. The base URL to set
+/// instead is suggested only for a redirect on the same host, no weaker in
+/// scheme, whose path keeps the call's own; a move to plain `http` or to
+/// another host is said as such, and anything else gets no suggestion.
+fn redirect_advice(
     base: &str,
     url: &str,
     status: reqwest::StatusCode,
     location: Option<&str>,
-) -> Option<(String, String)> {
+) -> Option<String> {
     if !status.is_redirection() {
         return None;
     }
-    let mut target = reqwest::Url::parse(url).ok()?.join(location?).ok()?;
+    let from = reqwest::Url::parse(url).ok()?;
+    let mut target = from.join(location?).ok()?;
     target.set_query(None);
     target.set_fragment(None);
     let _ = target.set_username("");
     let _ = target.set_password(None);
-    let target = target.to_string();
-    let call = url.strip_prefix(base).unwrap_or_default();
-    let moved = match target.strip_suffix(call) {
-        Some(moved) if !call.is_empty() => moved.to_owned(),
-        _ => target.clone(),
+    let said = |text: &str| match text.char_indices().nth(MAX_REDIRECT_SAID) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_owned(),
     };
-    Some((target, moved))
+    let target_text = target.to_string();
+    let mut advice = format!(
+        "the endpoint redirects to {}; atomic does not follow a redirect with the key",
+        said(&target_text)
+    );
+    let call = url.strip_prefix(base).unwrap_or_default();
+    if from.scheme() == "https" && target.scheme() != "https" {
+        advice.push_str("; the redirect gives up https, which would expose the key");
+    } else if target.host_str() != from.host_str() {
+        advice.push_str("; the redirect is to another host");
+    } else if let Some(moved) = target_text.strip_suffix(call).filter(|_| !call.is_empty()) {
+        advice.push_str(&format!("; set model.base_url to {}", said(moved)));
+    }
+    Some(advice)
 }
 
 /// A provider's answer that is not a success: its status, the start of its

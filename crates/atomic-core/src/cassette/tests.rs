@@ -456,7 +456,7 @@ async fn dropping_the_cassette_stops_its_connections() {
 /// never followed with the key, and nothing is recorded.
 #[tokio::test]
 async fn recording_never_follows_a_redirect_with_the_key() {
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let answering = |response: String| {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -467,15 +467,24 @@ async fn recording_never_follows_a_redirect_with_the_key() {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 counted.fetch_add(1, Ordering::SeqCst);
+                // The request head, then its body, read whole before
+                // answering, so the answer is never cut off by a reset.
                 let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
                 let mut line = String::new();
+                let mut length = 0;
                 while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap_or(0);
+                    }
                     line.clear();
                 }
+                let _ = reader.read_exact(&mut vec![0; length]);
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        (format!("http://{address}"), seen)
+        (format!("http://127.0.0.1:{}", address.port()), seen)
     };
     let (elsewhere, followed) =
         answering("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}".to_owned());
