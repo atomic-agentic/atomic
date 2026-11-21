@@ -1,0 +1,1 @@
+repository-skills|crates/atomic-core/src/codex.rs|        .set_enabled(Feature::SkipHostSkillDiscovery, true)|        .set_enabled(Feature::SkipHostSkillDiscovery, false) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_turn_is_sent_no_skill_of_the_checkout_it_runs_in

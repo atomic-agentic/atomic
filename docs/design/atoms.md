@@ -56,7 +56,16 @@ The same pipeline runs for every model-backed atom:
    sandbox, network policy and only its listed tools. In v0.1 Codex atoms run
    through Codex's `ThreadManager`; from v0.5 they run on the embedded
    app-server so the CLI can attach (see
-   [people in the loop](human-in-the-loop.md)).
+   [people in the loop](human-in-the-loop.md)). A Codex thread is given no
+   instructions Codex finds on its own, because an atom's inputs are only what
+   its file declares. Three things are switched off for it: repository
+   instruction discovery, so no `AGENTS.md` or `AGENTS.override.md` from the
+   project root down to the directory the thread runs in; repository skill
+   discovery, so no `SKILL.md` from a `.agents/skills` folder in those
+   directories, which a `$name` in a turn would otherwise pull in; and the
+   host's own instructions, so nothing read from the thread's Codex home,
+   which is the project's state directory. A lite atom builds its own request,
+   so it has no such file to read.
 4. **Turn.** The lowered schema constrains the final answer.
 5. **Normalize and check.** Remove each `null` that lowering introduced, then
    validate against the full contract, then run the atom's validators. On
@@ -95,12 +104,10 @@ The format follows a few choices:
   TypeScript-shaped subset; workflow mappings, gate titles and eval assertions
   use CEL. JSON Schema is the runtime contract throughout.
 - **Prompt sections stay text.** Lowercase element tags such as `<rubric>` are
-  prompt structure the model reads; section tags must balance and an unbalanced
-  one fails the load, and the `<data-…>` prefix is reserved for atomic's value
-  wrappers. The renderer does not enforce that balance yet, so an unbalanced
-  tag renders and moves text around; the gap is a defect against
-  [M11](milestones.md#m11-declarative-atoms), whose acceptance list keeps "An
-  unbalanced section tag fails the load."
+  prompt structure the model reads; section tags must balance, in the atom and
+  its components and inside expressions, and an unbalanced one fails the load,
+  naming its line ([M11](milestones.md#m11-declarative-atoms)). The `<data-…>`
+  prefix is reserved for atomic's value wrappers.
 - **Schemas are YAML by default (M11).** Sidecar schemas sit beside the atom
   file; a compact form is accepted for simple shapes. YAML is restricted to what
   JSON can express.

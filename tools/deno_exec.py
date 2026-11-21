@@ -15,8 +15,11 @@ The code itself is exercised by the example's own `deno test`.
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
+from pathlib import Path
 
 CHECKED = []
 CODE = "(code)"  # reserved; declarative Astro atoms never contain executable code
@@ -54,6 +57,78 @@ def _require(condition, message):
         raise ValueError(message)
 
 
+LOCK_FIX = "name a lockfile inside the project, such as deno.lock"
+
+
+def _unresolvable(where, fix, error):
+    """Refuses a path whose symlinks cannot be followed, naming the path and the fix.
+
+    An OSError carries a symlink loop as ELOOP; older pathlibs raise a plain
+    RuntimeError for one, which is the only thing strict resolving can raise
+    that is not an OSError. Anything else is said as the system told it.
+    """
+    loop = error.errno == errno.ELOOP if isinstance(error, OSError) else isinstance(error, RuntimeError)
+    reason = "is a symlink loop" if loop else f"cannot be resolved ({error})"
+    raise ValueError(f"{where} {reason}; {fix}") from error
+
+
+def _settled(path, where, fix):
+    """The real place `path` names, with every symlink above it followed.
+
+    A lockfile, a script or an imported module is read only once its path has
+    been shown to sit inside the project, and the project directory is what
+    every one of those is compared against, so each is settled first.
+    `Path.resolve` is not enough on its own. It leaves a name that does not
+    exist yet unresolved against whatever its directory is a link to, so a
+    path with nothing at the end can settle outside the project before
+    anything is read; and it reports a symlink loop differently by Python
+    version -- as a missing file, as an OSError, or as a RuntimeError -- none
+    of which says what to fix. So the part of the path that exists is settled
+    strictly, links followed, and the part that does not exist is put back
+    unchanged -- except a `..` among it, which is refused: put back, it moves
+    the settled path, and every caller compares that path against the project
+    without resolving it again. Every refusal says which path is wrong and
+    what to write instead.
+    """
+    tail = path if path.is_absolute() else Path.cwd() / path
+    missing = []
+    # The root exists wherever this runs, so stopping at it only keeps a path
+    # that exists nowhere from walking past the top of the tree forever.
+    while not os.path.lexists(tail) and tail != tail.parent:
+        missing.append(tail.name)
+        tail = tail.parent
+    try:
+        settled = tail.resolve(strict=True)
+    except FileNotFoundError:
+        # A link to a file that is not there settles as far as it goes, so
+        # that the caller still reports the file itself as missing. That
+        # settling follows links of its own, so it meets a symlink loop too:
+        # a link that points round has nothing at its end either, and is
+        # refused as a loop rather than raising out of the check.
+        try:
+            settled = tail.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            _unresolvable(where, fix, error)
+    except (OSError, RuntimeError) as error:
+        _unresolvable(where, fix, error)
+    # What is not there goes back as it was written, so a `..` among it would
+    # take the settled path with it, out of the project and past every
+    # comparison the caller makes -- each caller compares the settled path
+    # against the project without resolving it again. The walk only peels a
+    # component it cannot see, so this is reached by a directory that is
+    # missing and by one the checker may not enter alike; neither has a place
+    # a `..` could go up from.
+    _require(".." not in missing, f"{where} goes up from a directory that is not there or cannot be read; {fix}")
+    for name in reversed(missing):
+        settled = settled / name
+    return settled
+
+
+def _project(manifest):
+    """The settled directory a manifest stands in, which holds the project."""
+    return _settled(manifest.parent, f"{manifest}: the project directory", "keep the manifest in a project directory that exists")
+
+
 def check_manifest(config, manifest):
     """Validates the manifest's credentials and runtime.deno blocks and remembers them for the atom checks."""
     credentials = config.get("credentials", {})
@@ -65,7 +140,8 @@ def check_manifest(config, manifest):
         _require(isinstance(credential["aws_role"], str) and ROLE.fullmatch(credential["aws_role"]), f"{manifest}: credential {name}: aws_role is a role ARN")
         _require("duration" not in credential or (isinstance(credential["duration"], str) and DURATION.fullmatch(credential["duration"])),
                  f"{manifest}: credential {name}: duration is at least 15m, such as 15m or 1h")
-    CREDENTIALS[manifest.parent.resolve()] = credentials
+    project = _project(manifest)
+    CREDENTIALS[project] = credentials
     runtime = config.get("runtime")
     if runtime is None:
         return
@@ -85,7 +161,24 @@ def check_manifest(config, manifest):
     _require(isinstance(binary, str) and (binary in ("managed", "system") or binary.startswith("/")),
              f"{manifest}: binary is managed, system or an absolute path")
     _require(not any(v.endswith("*") for v in deno.get("install_scripts", [])), f"{manifest}: install_scripts names packages one by one")
-    SETTINGS[manifest.parent.resolve()] = deno
+    # The lock is the one every run must match, so it is checked as the
+    # manifest is read, against the project directory the manifest stands in,
+    # whether or not an atom ever reads it.
+    declared = deno.get("lock", "deno.lock")
+    # A NUL is not a name anything can open, so it is refused as the wrong name
+    # for the key rather than reaching the file system and raising there.
+    _require(isinstance(declared, str) and declared and "\x00" not in declared,
+             f"{manifest}: runtime.deno.lock is {deno.get('lock')!r}, not a path to a lockfile; {LOCK_FIX}")
+    lock = _settled(project / declared, f"{manifest}: runtime.deno.lock {declared!r}", LOCK_FIX)
+    _require(lock.is_relative_to(project),
+             f"{manifest}: runtime.deno.lock {declared!r} is {lock}, which is outside the project; {LOCK_FIX}")
+    # What the manifest names is the manifest's own fault to put right, so a
+    # route to the lock that the checker cannot walk is refused here, whether
+    # or not an atom ever reads it. That the lockfile is not there yet is left
+    # to the atom that needs it, which is the check that says which import a
+    # missing lock cannot vouch for.
+    _can_see(lock, manifest)
+    SETTINGS[project] = deno
 
 
 def _allowed(target, patterns):
@@ -104,7 +197,7 @@ def _specifiers(text, origin, project, seen):
         if target.startswith(PROVIDED):
             continue
         if target.startswith("."):
-            local = (origin.parent / target).resolve()
+            local = _settled(origin.parent / target, f"{origin}: import {target}", "import a module inside the project")
             _require(local.is_file() and local.is_relative_to(project), f"{origin}: import {target} is missing or leaves the project")
             if local not in seen:
                 seen.add(local)
@@ -114,27 +207,65 @@ def _specifiers(text, origin, project, seen):
     return found
 
 
+def _can_see(lock_path, where):
+    """Whether the settled lockfile is a file there, refusing a path nothing can see.
+
+    A directory above the lockfile that the checker may not enter is not a
+    lockfile that is missing: the file system reports a permission error for
+    it, and a lock the checker cannot see cannot vouch for an import either.
+    So that permission error becomes a refusal naming the path, rather than an
+    error escaping the check with nothing to say about the file at fault.
+    Whether the lockfile is simply absent is left to the caller, who knows
+    whether the project needed it.
+    """
+    try:
+        return lock_path.is_file()
+    except OSError as error:
+        raise ValueError(f"{where}: lockfile {lock_path.name} cannot be read ({error})") from error
+
+
+def _lock(path, deno, settings, project):
+    """The settled lockfile an atom's imports are checked against.
+
+    The lockfile beside the manifest is the default; the manifest may name
+    another and an atom a third. Whichever is chosen, its real path is settled
+    before it is checked or read: a relative path or a symlink must not lead
+    the checker out of the project, where a lockfile written elsewhere would
+    vouch for specifiers the project never recorded.
+    """
+    if "lock" in deno:
+        where, declared, base = f"{path}: runtime.deno.lock", deno["lock"], path.parent
+    elif "lock" in settings:
+        where, declared, base = f"{path}: the manifest's runtime.deno.lock", settings["lock"], project
+    else:
+        where, declared, base = f"{path}: the default lockfile beside the manifest", "deno.lock", project
+    _require(isinstance(declared, str) and declared and "\x00" not in declared,
+             f"{where} is {declared!r}, not a path to a lockfile; {LOCK_FIX}")
+    lock_path = _settled(base / declared, where, LOCK_FIX)
+    _require(lock_path.is_relative_to(project), f"{where} is {lock_path}, which is outside the project; {LOCK_FIX}")
+    return lock_path
+
+
 def _declaration(path, fm, project, specifiers):
     """The parts of an atom that say what its code may do."""
     deno = (fm.get("runtime") or {}).get("deno", {})
     _require(isinstance(deno, dict) and deno.keys() <= DENO_KEYS, f"{path}: runtime.deno takes only {sorted(DENO_KEYS)}")
     _require(set(deno.get("sys", [])) <= HARMLESS_SYS, f"{path}: runtime.deno.sys may hold only {sorted(HARMLESS_SYS)}")
-    # The lockfile beside the manifest is the default; the manifest may name
-    # another and an atom a third. Whichever is chosen, its real path is settled
-    # before it is checked or read: a relative path or a symlink must not lead
-    # the checker out of the project, where a lockfile written elsewhere would
-    # vouch for specifiers the project never recorded.
     settings = SETTINGS.get(project, {})
-    declared = deno.get("lock", settings.get("lock", "deno.lock"))
-    lock_path = ((path.parent if "lock" in deno else project) / declared).resolve()
-    _require(lock_path.is_relative_to(project),
-             f"{path}: lockfile {declared} is {lock_path}, which is outside the project")
+    lock_path = _lock(path, deno, settings, project)
+    _require(_can_see(lock_path, path), f"{path}: lockfile {lock_path.name} is missing")
+    # The lock is read once, for every import. Settled and shown to be a file,
+    # it is still one the checker may not be able to open, and a lock that
+    # cannot be read vouches for nothing.
+    try:
+        recorded = json.loads(lock_path.read_text()).get("specifiers", {})
+    except OSError as error:
+        raise ValueError(f"{path}: lockfile {lock_path.name} cannot be read ({error})") from error
     for source, target in sorted(specifiers):
         _require(PINNED.fullmatch(target), f"{source}: import {target!r} must be an npm: or jsr: package pinned to an exact version")
         _require("allow_packages" not in settings or _allowed(target, settings["allow_packages"]),
                  f"{source}: {target} is not in the manifest's runtime.deno.allow_packages")
-        _require(lock_path.is_file(), f"{path}: lockfile {lock_path.name} is missing")
-        _require(target in json.loads(lock_path.read_text()).get("specifiers", {}), f"{source}: {target} is not recorded in {lock_path.name}")
+        _require(target in recorded, f"{source}: {target} is not recorded in {lock_path.name}")
 
     hosts = []
     if "network" in fm:
@@ -177,12 +308,13 @@ def _declaration(path, fm, project, specifiers):
 
 def check_script(path, fm, project):
     """An exec atom that names a script for the Deno runtime."""
-    project = project.resolve()
+    project = _settled(project, f"{path}: the project directory", "keep the atom inside the project the manifest names")
     _require(fm.get("exec", {}).keys() == {"script"}, f"{path}: with a script, exec takes only `script`")
     _require(not path.read_text().split("\n---\n", 1)[1].strip(), f"{path}: an exec atom has no instructions")
     _require("deno" in (fm.get("runtime") or {}), f"{path}: a script needs runtime.deno")
     # References in an atom file are relative to that file.
-    script = (path.parent / fm["exec"]["script"]).resolve()
+    script = _settled(path.parent / fm["exec"]["script"], f"{path}: exec.script {fm['exec']['script']!r}",
+                      "name a TypeScript file inside the project")
     _require(script.is_file() and script.suffix == ".ts", f"{path}: script {fm['exec']['script']} is not a TypeScript file")
     _require(script.is_relative_to(project), f"{path}: script {fm['exec']['script']} is outside the project")
     specifiers = _specifiers(script.read_text(), script, project, {script})

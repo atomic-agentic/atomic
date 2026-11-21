@@ -13,11 +13,25 @@
 //! - a call reserves its whole bound, priced from the table;
 //! - a cap smaller than one call's reservation fails configuration, naming
 //!   the settings that make up the reservation;
+//! - the caps the person who runs atomic set are ceilings: a written limit
+//!   and an inherited default are both held to them, a smaller limit still
+//!   tightens, a dollar ceiling binds where nothing else set a dollar cap,
+//!   and a refusal says whose cap held;
 //! - out-of-range settings and budget values are refused.
 
 use super::*;
 use crate::config::{Layers, Source, resolve as layered};
 use serde_json::json;
+
+/// Settings with everything the default call reserves inside every cap, so a
+/// ceiling can be seen to bind without the room check getting in the way.
+fn roomy() -> BudgetSettings {
+    let mut settings = BudgetSettings::default();
+    settings.call.input_tokens = 1_000;
+    settings.call.output_tokens = 500;
+    settings.call.minutes = 1.0;
+    settings
+}
 
 fn atom(declared: &Budget, settings: &BudgetSettings) -> Resolved {
     resolve(declared, Level::Atom, settings, &["synthetic"]).expect("resolves")
@@ -164,6 +178,212 @@ fn priced() -> BudgetSettings {
         },
     );
     settings
+}
+
+/// Every cap the person's own configuration writes here, in one place.
+fn capped(tokens: u64, minutes: f64, cost_usd: f64) -> Caps {
+    Caps {
+        tokens: Some(tokens),
+        minutes: Some(minutes),
+        cost_usd: Some(cost_usd),
+    }
+}
+
+#[test]
+fn a_persons_cap_holds_a_written_limit_and_says_whose_cap_held() {
+    let mut settings = roomy();
+    // A dollar cap, theirs or the block's, needs a priced model to sit on.
+    settings.pricing = priced().pricing;
+    settings.ceilings.atom = capped(100_000, 10.0, 2.0);
+    // A `budget` block above every cap of theirs: the smaller of the two
+    // holds for each measure, and says that their cap was the smaller.
+    let above =
+        Budget::parse(&json!({"tokens": 400_000, "minutes": 25, "cost_usd": 9})).expect("parse");
+    let r = resolve(&above, Level::Atom, &settings, &["gpt-test"]).expect("resolves");
+    assert_eq!(
+        (r.tokens, r.millis, r.micro_usd),
+        (100_000, 600_000, Some(2_000_000)),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.origins,
+        [
+            Origin::Ceiled("budget.atom.tokens".into()),
+            Origin::Ceiled("budget.atom.minutes".into()),
+            Origin::Ceiled("budget.atom.cost_usd".into()),
+        ]
+    );
+    // Below their caps, the block's own numbers hold, and say they are the
+    // block's: a project may only bring a cap down to what they allowed.
+    let under =
+        Budget::parse(&json!({"tokens": 5_000, "minutes": 5, "cost_usd": 0.5})).expect("parse");
+    let r = resolve(&under, Level::Atom, &settings, &["gpt-test"]).expect("resolves");
+    assert_eq!(
+        (r.tokens, r.millis, r.micro_usd),
+        (5_000, 300_000, Some(500_000)),
+        "{r:?}"
+    );
+    assert_eq!(
+        r.origins,
+        [Origin::Declared, Origin::Declared, Origin::Declared,]
+    );
+    // A measure they cap, and the block writes nothing for: their cap holds
+    // the inherited default too, whose source is no longer the whole story.
+    settings.ceilings.atom = capped(100_000, 2.0, 2.0);
+    let r = resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]).expect("resolves");
+    assert_eq!(r.tokens, 100_000);
+    assert_eq!(r.origins[0], Origin::Ceiled("budget.atom.tokens".into()));
+    assert_eq!(r.millis, 120_000);
+    assert_eq!(r.origins[1], Origin::Ceiled("budget.atom.minutes".into()));
+    // The default dollar cap is held the same way, and a measure they never
+    // wrote keeps the configured default and its setting.
+    let mut one = roomy();
+    one.pricing = priced().pricing;
+    one.ceilings.atom = Caps {
+        tokens: None,
+        minutes: None,
+        cost_usd: Some(1.0),
+    };
+    one.atom.cost_usd = Some(7.0);
+    let r = resolve(&Budget::default(), Level::Atom, &one, &["gpt-test"]).expect("resolves");
+    assert_eq!(r.micro_usd, Some(1_000_000));
+    assert_eq!(r.origins[2], Origin::Ceiled("budget.atom.cost_usd".into()));
+    assert_eq!(r.tokens, BudgetSettings::default().atom.tokens);
+    assert_eq!(r.origins[0], Origin::Default("budget.atom.tokens".into()));
+}
+
+#[test]
+fn a_persons_dollar_cap_binds_where_nothing_else_set_one() {
+    // Neither the block nor any layer above the person sets a dollar cap:
+    // theirs still binds, by their setting, and needs the model priced.
+    let mut settings = roomy();
+    settings.pricing = priced().pricing;
+    settings.ceilings.atom = capped(100_000, 1.0, 1.0);
+    let r = resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]).expect("resolves");
+    assert_eq!(r.micro_usd, Some(1_000_000));
+    assert_eq!(
+        r.origins[2],
+        Origin::Ceiled("budget.atom.cost_usd".into()),
+        "the person's cap, by its setting"
+    );
+    settings.ceilings.workflow = capped(1_000_000, 60.0, 5.0);
+    let w = resolve(
+        &Budget::default(),
+        Level::Workflow,
+        &settings,
+        &["gpt-test"],
+    )
+    .expect("resolves");
+    assert_eq!(w.micro_usd, Some(5_000_000));
+    // On a model they did not price, their cap refuses the run rather than
+    // run it uncapped.
+    settings.pricing.clear();
+    assert!(matches!(
+        resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]),
+        Err(BudgetError::Unpriced { model }) if model == "gpt-test"
+    ));
+}
+
+#[test]
+fn a_persons_cap_binds_its_own_level_by_its_own_setting() {
+    let mut settings = roomy();
+    settings.workflow = Limits {
+        tokens: 5_000_000,
+        minutes: 600.0,
+        cost_usd: Some(50.0),
+    };
+    settings.ceilings.workflow = capped(1_000_000, 60.0, 5.0);
+    let w = resolve(&Budget::default(), Level::Workflow, &settings, &[]).expect("resolves");
+    assert_eq!(
+        (w.tokens, w.millis, w.micro_usd),
+        (1_000_000, 3_600_000, Some(5_000_000))
+    );
+    assert_eq!(
+        w.origins[0],
+        Origin::Ceiled("budget.workflow.tokens".into())
+    );
+    assert_eq!(
+        w.origins[1],
+        Origin::Ceiled("budget.workflow.minutes".into())
+    );
+    assert_eq!(
+        w.origins[2],
+        Origin::Ceiled("budget.workflow.cost_usd".into())
+    );
+    // A workflow run is one atom's parent, not its ceiling: their atom cap is
+    // a separate setting, and unset it leaves the atom's default standing.
+    let a = atom(&Budget::default(), &settings);
+    assert_eq!(a.tokens, BudgetSettings::default().atom.tokens);
+    assert_eq!(a.origins[0], Origin::Default("budget.atom.tokens".into()));
+    // And the other way round: their atom cap says nothing about the run.
+    let mut only_atom = roomy();
+    only_atom.workflow = Limits {
+        tokens: 5_000_000,
+        minutes: 600.0,
+        cost_usd: None,
+    };
+    only_atom.ceilings.atom.tokens = Some(120_000);
+    let w = resolve(&Budget::default(), Level::Workflow, &only_atom, &[]).expect("resolves");
+    assert_eq!(w.tokens, 5_000_000);
+    assert_eq!(
+        w.origins[0],
+        Origin::Default("budget.workflow.tokens".into())
+    );
+    assert_eq!(atom(&Budget::default(), &only_atom).tokens, 120_000);
+}
+
+#[test]
+fn a_persons_cap_with_no_room_for_one_call_names_whose_cap_held() {
+    let mut settings = roomy();
+    settings.ceilings.atom.tokens = Some(1_000);
+    // The block wrote a cap with room; their cap took it below one call.
+    let refused = resolve(
+        &Budget::parse(&json!({"tokens": 100_000})).expect("parse"),
+        Level::Atom,
+        &settings,
+        &["gpt-test"],
+    )
+    .expect_err("no room for one call");
+    let message = refused.to_string();
+    assert!(
+        matches!(&refused, BudgetError::BelowCall(below)
+            if below.field == "tokens" && below.from == "capped by your own budget.atom.tokens"),
+        "{refused:?}"
+    );
+    for says in [
+        "1000 tokens",
+        "capped by your own budget.atom.tokens",
+        "smaller than one call to model \"gpt-test\"",
+    ] {
+        assert!(message.contains(says), "{says:?} in {message}");
+    }
+}
+
+#[test]
+fn an_out_of_range_persons_cap_is_refused_as_the_setting_it_caps() {
+    fn refused(change: impl Fn(&mut Ceilings), setting: &str) {
+        let mut settings = priced();
+        change(&mut settings.ceilings);
+        let e =
+            resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]).expect_err(setting);
+        assert!(
+            matches!(&e, BudgetError::Default { setting: s, .. } if s == setting),
+            "{setting}: {e:?}"
+        );
+    }
+    refused(|c| c.atom.tokens = Some(0), "budget.atom.tokens");
+    refused(
+        |c| c.workflow.minutes = Some(-1.0),
+        "budget.workflow.minutes",
+    );
+    refused(|c| c.atom.cost_usd = Some(f64::NAN), "budget.atom.cost_usd");
+    refused(
+        |c| c.call.input_tokens = Some(0),
+        "budget.call.input_tokens",
+    );
+    refused(|c| c.call.minutes = Some(0.0), "budget.call.minutes");
+    // Their prices are not checked here: they join the price table before
+    // anything resolves, which is where a price is checked.
 }
 
 #[test]
