@@ -3781,3 +3781,183 @@ fn a_backend_with_no_exchange_refuses_what_it_cannot_hand_over() {
         assert_eq!(out, own);
     });
 }
+
+/// A store that notes when a hold finds the store's lock held elsewhere.
+struct Watching {
+    inner: crate::artifact::LocalStore,
+    locked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::artifact::ArtifactStore for Watching {
+    fn stage(
+        &self,
+        content: &mut dyn std::io::Read,
+    ) -> Result<crate::artifact::Staged, crate::artifact::ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[crate::artifact::Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, crate::artifact::ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<crate::artifact::Hold, crate::artifact::ArtifactError> {
+        let held = self.inner.hold(artifact);
+        if matches!(held, Err(crate::artifact::ArtifactError::Locked { .. })) {
+            self.locked.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        held
+    }
+    fn contains(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<bool, crate::artifact::ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<Box<dyn std::io::Read + Send>, crate::artifact::ArtifactError> {
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, crate::artifact::ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+    fn lock_wait(&self) -> std::time::Duration {
+        self.inner.lock_wait()
+    }
+}
+
+/// A store held by a sweep while a command's inputs are given is waited
+/// out for a bounded time; held past it, the command does not run, and the
+/// step stops to be run again rather than fail. An input that references an
+/// artifact the store does not hold is refused, and runs nothing either.
+#[cfg(unix)]
+#[test]
+fn a_store_held_while_inputs_are_given_runs_nothing() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let root = scratch("exec-locked-inputs");
+        let store = LocalStore::open(&root)
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let given = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let script = "import json, sys\njson.load(sys.stdin)\nopen('ran', 'a').write('x')\n\
+             json.dump({'total': 1}, sys.stdout)\n";
+        let (dir, _, _) = exec_project("exec-locked-inputs", script, "");
+        std::fs::write(
+            dir.join("atoms/total.input.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("input");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let locked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let artifacts = Artifacts(
+            Arc::new(store.clone()),
+            Some(Arc::new(Watching {
+                inner: store.clone(),
+                locked: locked.clone(),
+            })),
+            Default::default(),
+            Default::default(),
+        );
+        let hold = || {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("lock"))
+                .expect("the store's lock");
+            held.lock().expect("held");
+            held
+        };
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let meter = crate::usage::Metering::none();
+        let run = |input: Value| {
+            let (a, compiled, identity, artifacts, meter) = (
+                a.clone(),
+                compiled.clone(),
+                identity.clone(),
+                artifacts.clone(),
+                meter.clone(),
+            );
+            async move {
+                run_exec(
+                    &a,
+                    &compiled,
+                    &input,
+                    &identity,
+                    Arc::new(atomic_exec::LocalBackend::default()),
+                    None,
+                    &artifacts,
+                    &meter,
+                )
+                .await
+            }
+        };
+        let input = json!({"cents": [1], "patch": given.uri()});
+        // A reference to what the store does not hold.
+        let missing = format!("artifact://sha256/{}", "e".repeat(64));
+        let r = run(json!({"cents": [1], "patch": missing})).await;
+        assert!(
+            matches!(&r, Err(AtomError::Input(m)) if m.contains(&format!("no artifact {missing}"))),
+            "{r:?}"
+        );
+        assert!(
+            !dir.join("ran").exists(),
+            "the command ran without its input"
+        );
+        // Held throughout.
+        let held = hold();
+        let r = run(input.clone()).await;
+        assert!(
+            matches!(&r, Err(AtomError::StoreHeld(m)) if m.contains("its command did not run")),
+            "{r:?}"
+        );
+        assert!(!dir.join("ran").exists(), "the command ran");
+        drop(held);
+        // Let go once a try has found it held.
+        locked.store(false, std::sync::atomic::Ordering::SeqCst);
+        let held = hold();
+        let task = tokio::spawn(run(input));
+        let started = std::time::Instant::now();
+        while !locked.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "never found the store held"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(held);
+        task.await
+            .expect("joins")
+            .expect("given once the sweep let go");
+        assert!(dir.join("ran").exists(), "the command did not run");
+    });
+}

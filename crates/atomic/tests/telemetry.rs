@@ -234,9 +234,9 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    wait_for_gate(&dir, &model.base_url(), &mut child);
+    let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
-    let out = child.wait_with_output().unwrap();
+    let out = drained.wait(&mut child);
     assert!(!out.status.success(), "{}", text(&out));
 
     let spans = received.spans();
@@ -664,13 +664,13 @@ fn a_second_signal_stops_at_once_while_spans_are_sent() {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    wait_for_gate(&dir, &model.base_url(), &mut child);
+    let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
     // The gate's wait is no running step, so the flush starts at once: the
     // second signal comes well inside its deadline.
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "TERM");
-    let out = child.wait_with_output().unwrap();
+    let out = drained.wait(&mut child);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains(STOPPED_FLUSH), "{}", text(&out));
 }
