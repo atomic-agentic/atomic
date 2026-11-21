@@ -367,7 +367,7 @@ impl Drop for SetAsideForRoom {
 }
 
 /// Why [`wait_for_room`]'s attempt did not succeed.
-pub enum NotYet {
+pub(crate) enum NotYet {
     /// For a reason that may pass, such as a full disk: nothing was
     /// started, and trying again later may succeed.
     Room(String),
@@ -378,7 +378,7 @@ pub enum NotYet {
 /// What a step waits for in [`wait_for_room`], for what it says: `what`
 /// lacks room, and with room `what` can `doing`.
 #[derive(Clone, Copy)]
-pub struct Waiting<'a> {
+pub(crate) struct Waiting<'a> {
     /// The step's label, such as its atom's name.
     pub label: &'a str,
     /// The run.
@@ -406,7 +406,7 @@ pub struct Waiting<'a> {
 /// the run that awaits it is cancelled meanwhile, the attempt still
 /// finishes there, and what it made is dropped with the result no one
 /// takes.
-pub async fn wait_for_room<T, F>(waiting: Waiting<'_>, attempt: F) -> Result<T, AtomError>
+pub(crate) async fn wait_for_room<T, F>(waiting: Waiting<'_>, attempt: F) -> Result<T, AtomError>
 where
     T: Send + 'static,
     F: Fn() -> Result<T, NotYet> + Send + Sync + 'static,
@@ -505,8 +505,7 @@ where
 /// Open a workspace on `backend`, waiting for room as [`wait_for_room`]
 /// does while the backend reports [`atomic_exec::ExecError::Unavailable`]
 /// (no room, or a sandbox that failed in a way that may pass, such as a
-/// full disk; nothing was started). `prepare` runs first in each attempt,
-/// and its failures that may pass wait the same way.
+/// full disk; nothing was started).
 pub(crate) async fn open_workspace(
     backend: Arc<dyn ExecutionBackend>,
     request: Open,
@@ -514,7 +513,9 @@ pub(crate) async fn open_workspace(
     open_workspace_after(backend, request, || Ok(())).await
 }
 
-/// [`open_workspace`], running `prepare` first in each attempt.
+/// [`open_workspace`], running `prepare` first in each attempt: a
+/// [`NotYet::Room`] from it waits as the backend's lack of room does, and a
+/// [`NotYet::Fail`] fails at once, opening nothing.
 pub(crate) async fn open_workspace_after(
     backend: Arc<dyn ExecutionBackend>,
     request: Open,

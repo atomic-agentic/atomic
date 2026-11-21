@@ -1459,6 +1459,7 @@ async fn turn<C: WorkflowContext>(
             StepRequest {
                 run: run_id.clone(),
                 step: t.name.clone(),
+                atom: atom.name.clone(),
                 base: base.to_owned(),
                 message: format!("{}: {}", pipeline.name, t.name),
                 signature: Signature::default(),

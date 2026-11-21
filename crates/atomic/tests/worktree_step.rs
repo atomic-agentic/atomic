@@ -118,6 +118,7 @@ fn register(rt: &mut Durare, dir: &Path, base_url: &str) {
                 let request = StepRequest {
                     run: ctx.workflow_id().to_owned(),
                     step: "implement".into(),
+                    atom: "implement".into(),
                     base: run.base,
                     message: "Implement the change".into(),
                     signature: Signature::default(),

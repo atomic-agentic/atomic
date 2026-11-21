@@ -624,7 +624,7 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
 
 /// Whether `e` may pass if the same thing is tried again later: the disk or
 /// a quota is full, too many files are open, or the system is busy.
-pub fn transient(e: &std::io::Error) -> bool {
+pub(crate) fn transient(e: &std::io::Error) -> bool {
     use std::io::ErrorKind;
     let kind = matches!(
         e.kind(),

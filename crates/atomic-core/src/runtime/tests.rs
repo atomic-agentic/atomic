@@ -1789,9 +1789,9 @@ fn an_unavailable_workspace_is_waited_for() {
 }
 
 /// An exec step's build caches are made in each attempt to open its
-/// workspace, so a full disk making them waits as the backend's own lack of
-/// room does, opening nothing meanwhile; a directory that can never be made
-/// fails the step at once.
+/// workspace, as the backend's room is waited for. Caches that cannot be
+/// made wait while the disk has no room, opening nothing meanwhile, and
+/// fail the step once it has.
 #[test]
 fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
     use std::sync::atomic::AtomicUsize;
@@ -1815,31 +1815,13 @@ fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
         assert!(caches.dir().is_dir());
         guard.close().await;
 
-        // The disk is full for the first two tries at making them: the step
-        // waits, and the backend is asked only once they are made.
-        let full = crate::worktree::Caches::new(dir.join("state/cache/run-2-cd"));
-        crate::worktree::FULL_FOR_TESTS
-            .lock()
-            .expect("full")
-            .push((full.dir().to_owned(), 2));
-        let room = Recording::default();
-        let guard = open_exec_workspace(&a, &identity, room.backend().shared(), Some(&full))
-            .await
-            .expect("opens once there is room");
-        assert_eq!(room.calls(), ["open total"]);
-        assert!(full.dir().is_dir());
-        assert!(
-            crate::worktree::FULL_FOR_TESTS
-                .lock()
-                .expect("full")
-                .iter()
-                .any(|(p, left)| p == full.dir() && *left == 0),
-            "both full tries were made"
-        );
-        guard.close().await;
-
-        // Never makeable: the step fails at once, and nothing is opened.
+        // Caches that cannot be made, under a file: while the disk has no
+        // room the step waits, opening nothing, and once it has, it fails.
         std::fs::write(dir.join("file"), "").expect("file");
+        crate::worktree::ROOM_FOR_TESTS
+            .lock()
+            .expect("room")
+            .push((dir.join("file"), vec![(0, 0), (0, 0)]));
         let never = Recording::default();
         let refused = open_exec_workspace(
             &a,
@@ -1849,11 +1831,19 @@ fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
         )
         .await;
         assert!(
-            matches!(&refused, Err(AtomError::Runtime(m)) if m.contains("the run's build caches")),
+            matches!(&refused, Err(AtomError::Runtime(m)) if m.contains("the run's build caches") && m.contains("Not a directory")),
             "{:?}",
             refused.err()
         );
         assert!(never.calls().is_empty(), "{:?}", never.calls());
+        assert!(
+            crate::worktree::ROOM_FOR_TESTS
+                .lock()
+                .expect("room")
+                .iter()
+                .any(|(d, answers)| *d == dir.join("file") && answers.is_empty()),
+            "it waited through both"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
