@@ -3680,6 +3680,50 @@ fn trust_is_checked_per_binding() {
     .expect("agent accepted");
 }
 
+#[test]
+fn a_run_is_held_to_its_atoms_trust_where_each_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-dispatch");
+        let project = project(&dir);
+        // Prepared as the loader allows, then handed to the engine with the
+        // rank step's atom trusting only team input: as a run prepared some
+        // other way would be, the step that maps external data is refused
+        // where it runs, before its model is called.
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline
+            .atoms
+            .get_mut("rank-note")
+            .expect("rank-note")
+            .frontmatter["trust"] = json!("team");
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "untrusted", run).await.expect("start");
+        let error = rt
+            .result::<Value>("untrusted")
+            .await
+            .expect_err("refused at dispatch")
+            .to_string();
+        assert!(
+            error.contains("step `rank`") && error.contains("accepts team input at most"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "only the read step called its model");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// The shape of a serialized value: each object's keys, with the shape of
 /// what each holds, an array's first element, and a scalar's type. The
 /// values under `opaque` keys are data whose keys are not layout, such as a

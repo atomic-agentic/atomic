@@ -1018,6 +1018,19 @@ async fn run_pipeline_in<C: WorkflowContext>(
             .get(&step.atom)
             .cloned()
             .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", step.id, step.atom)))?;
+        // Held to the atom's trust again where it runs, however the run was
+        // prepared: a resumed or served run, or one built by a constructor
+        // that skipped the loader's check. A field with no recorded origin
+        // is taken as external.
+        for (field, source) in &step.with {
+            let origin = step.origins.get(field).map_or("external", String::as_str);
+            if let Some(refused) = atomic_core::workflow::untrusted_binding(&atom, source, origin) {
+                return Err(failed(format!(
+                    "step `{}`: `with.{field}`: {refused}",
+                    step.id
+                )));
+            }
+        }
         let mut runtimes = (*services.runtimes).clone();
         // An atom with captured helpers gets its step's logical time and seed
         // from a step of its own, recorded once and read back on every retry,

@@ -436,6 +436,22 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             ));
         }
     }
+    // How trusted its input must be: one of the three origins, exactly, so
+    // a misspelt value cannot silently accept anything.
+    match fm.get("trust") {
+        None => {}
+        Some(Value::String(s)) if crate::workflow::TRUST.contains(&s.as_str()) => {}
+        Some(other) => {
+            return Err(fail(
+                line_of("/trust"),
+                "/trust",
+                format!(
+                    "`trust` is {}, not {other}",
+                    crate::workflow::TRUST.join(", ")
+                ),
+            ));
+        }
+    }
     let allows_network = match fm.get("network") {
         None | Some(Value::Bool(false)) => false,
         Some(Value::Object(n)) => n

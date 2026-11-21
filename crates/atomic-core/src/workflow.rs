@@ -95,11 +95,21 @@ pub fn untrusted_binding(atom: &Atom, source: &str, origin: &str) -> Option<Stri
     (trust_rank(origin) < trust_rank(accepts)).then(|| {
         format!(
             "`{source}` is {origin} data, and atom `{}` accepts {accepts} input at most \
-             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
-             on the atom if it is built for {origin} input",
+             (`trust: '{accepts}'`)",
             atom.name
         )
     })
+}
+
+/// Where data `trust` accepts can come from: what a binding refused by
+/// [`untrusted_binding`] could read instead. Only a person's decision at a
+/// gate, or a literal the workflow file writes, is team data; a model's
+/// output is agent data as well.
+pub fn trusted_sources(trust: &str) -> &'static str {
+    match trust {
+        "team" => "a gate a person decides, or a literal in the workflow file",
+        _ => "a model step's output, a gate a person decides, or a literal in the workflow file",
+    }
 }
 
 /// The most a binding's sources allow it to be trusted: the least trusted
@@ -528,7 +538,14 @@ pub fn load(
                     None => allowed,
                 };
                 if let Some(refused) = untrusted_binding(atom, source, origin) {
-                    return Err(fail(&wp, refused));
+                    return Err(WorkflowError {
+                        action: Some(format!(
+                            "bind it to {} instead, or declare a lower `trust` on the atom if it \
+                             is built for {origin} input",
+                            trusted_sources(accepted_trust(atom))
+                        )),
+                        ..fail(&wp, refused)
+                    });
                 }
             }
             for r in &required {

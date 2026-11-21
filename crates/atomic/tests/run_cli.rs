@@ -5274,7 +5274,10 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
             // Refused as the run was loaded: no durable run was started,
             // which would name itself first on stderr.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+            assert!(
+                !stderr.contains("run run-"),
+                "{atom}: a run started: {stderr}"
+            );
         }
         assert_eq!(model.calls(), 0, "a model was called");
     });
