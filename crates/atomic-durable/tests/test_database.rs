@@ -16,7 +16,11 @@ use std::path::{Path, PathBuf};
 
 /// Where tests may use the test database, under crates/: a directory, with
 /// its slash, or a file. scripts/backends-check.sh checks each of these.
-const USERS: &[&str] = &["atomic-durable/", "atomic/tests/run_cli.rs"];
+const USERS: &[&str] = &[
+    "atomic-durable/",
+    "atomic/tests/run_cli.rs",
+    "atomic/tests/failpoints.rs",
+];
 
 /// Why `text`, a source outside [`USERS`], reaches the test database's
 /// helpers, if it does: by naming `atomic_durable::testing`, in a path or

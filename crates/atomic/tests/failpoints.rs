@@ -495,7 +495,7 @@ const ENV_PG_SCHEMA: &str = "ATOMIC_FAILPOINTS_PG_SCHEMA";
 #[cfg(feature = "postgres-tests")]
 #[test]
 #[ignore = "run by the failpoint tests in a child process"]
-fn failpoints_postgres_child() {
+fn failpoints_pg_child() {
     let (Ok(dir), Ok(url), Ok(schema)) = (
         std::env::var(ENV_DIR),
         std::env::var(ENV_PG_URL),
@@ -580,12 +580,7 @@ fn a_transaction_whose_commit_fails_runs_again_and_reaches_its_failpoints_once_o
     });
     let stderr = dir.join("first.log.stderr");
     let status = Command::new(std::env::current_exe().expect("this test binary"))
-        .args([
-            "--exact",
-            "failpoints_postgres_child",
-            "--ignored",
-            "--nocapture",
-        ])
+        .args(["--exact", "failpoints_pg_child", "--ignored", "--nocapture"])
         .env(ENV_DIR, &dir)
         .env(ENV_PG_URL, guard.url())
         .env(ENV_PG_SCHEMA, &schema)
