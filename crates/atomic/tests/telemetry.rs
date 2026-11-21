@@ -224,20 +224,27 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into())]);
     let (url, received) = collector();
-    let mut child = command(
-        &dir,
-        &model.base_url(),
-        &["run", "gated", "--data", NOTE],
-        &exporting(&url, "http/json"),
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+    let mut child = Child::new(
+        command(
+            &dir,
+            &model.base_url(),
+            &["run", "gated", "--data", NOTE],
+            &exporting(&url, "http/json"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
     let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
     let out = drained.wait(&mut child);
     assert!(!out.status.success(), "{}", text(&out));
+    // The run has until its flush's deadline to send the last spans. If it
+    // missed that, it says so on stderr, and that is what failed here: not a
+    // span some collector never took.
+    let shown = String::from_utf8_lossy(&out.stderr);
+    assert!(!shown.contains(DROPPED_SPANS), "{shown}");
 
     let spans = received.spans();
     let workflow = named(&spans, "invoke_workflow gated");
@@ -252,6 +259,102 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
         assert!(!failed(span), "a stop is not a failure: {span}");
     }
     named(&spans, "invoke_agent rank-note");
+}
+
+/// A command that ends before a gate opens fails the wait for it, and the
+/// message that fails the test quotes what the last `atomic gates list`
+/// answered and says how many polls that took and how long the last one
+/// took: what a poll which stops answering is judged by.
+#[test]
+fn a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for() {
+    let dir = scratch("no-gate");
+    project(&dir);
+    // A command that ends at once, in the project the gate would open in:
+    // no gate can ever be listed for it.
+    let mut child = Child::new(
+        command(&dir, "http://127.0.0.1:9/v1", &["debug", "state-dir"], &[])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let why = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for_gate(&dir, "http://127.0.0.1:9/v1", &mut child)
+    }))
+    .err()
+    .and_then(|payload| payload.downcast_ref::<String>().cloned())
+    .expect("waiting for a gate that never opens fails the test");
+    assert!(
+        why.contains("the run ended before its gate"),
+        "not reported as what happened: {why}"
+    );
+    // The poll's own answer, which is only there if its output was read.
+    assert!(
+        why.contains("`atomic gates list` last said: stdout: ["),
+        "the last poll is not quoted: {why}"
+    );
+    let counted = why
+        .split(" poll(s), the last took ")
+        .next()
+        .and_then(|head| head.rsplit('(').next())
+        .and_then(|polls| polls.parse::<usize>().ok())
+        .expect("the message counts the polls it made");
+    assert!(counted >= 1, "no poll counted: {why}");
+    let took = why
+        .split(" poll(s), the last took ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|ms| ms.parse::<u128>().ok())
+        .expect("the message says how long the last poll took");
+    assert!(took > 0, "the last poll took no time at all: {why}");
+}
+
+/// What a run writes as it goes is read line by line as it goes: a test can
+/// wait for one line before the run ends, and a run that has not written it
+/// fails the test with the lines it did write. And a command left running
+/// when a test ends is killed and reaped, not left behind.
+#[test]
+fn a_line_is_read_off_a_run_as_it_writes_it() {
+    // Two lines, then nothing: the reader has to hand them out while the
+    // writer still runs, and a line after the sleep never comes.
+    let mut child = Child::new(
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("echo first >&2; echo the second line >&2; sleep 30; echo never >&2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut drained = Drained::of(&mut child);
+    // The wait goes on past the first line to the one it is for.
+    drained.wait_for_stderr("the second", std::time::Duration::from_secs(30));
+    // A line written before the call counts too: the run said it already.
+    drained.wait_for_stderr("first", std::time::Duration::from_secs(30));
+    // The writer is asleep and the line is not coming: the wait gives up at
+    // its limit, with the lines the run did write, without waiting for it to
+    // end.
+    let why = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drained.wait_for_stderr("never", std::time::Duration::from_millis(500))
+    }))
+    .err()
+    .and_then(|payload| payload.downcast_ref::<String>().cloned())
+    .expect("waiting for a line that never comes fails the test");
+    assert!(
+        why.contains("no stderr line holds \"never\" within 500ms"),
+        "{why}"
+    );
+    assert!(why.contains("the second line"), "{why}");
+    assert!(!why.contains("never\n"), "a line never written: {why}");
+    // The writer is still asleep. Ending the test must not leave it, or an
+    // unreaped process, behind.
+    let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+    drop(child);
+    // SAFETY: a signal of 0 only asks whether that process is there.
+    #[allow(unsafe_code)]
+    let still_there = unsafe { libc::kill(pid, 0) } == 0;
+    assert!(!still_there, "the run outlived the guard that ends it");
 }
 
 /// A lite provider's error: its excerpt is redacted where it is made, so
@@ -461,6 +564,23 @@ fn drain(mut out: impl std::io::Read + Send + 'static) -> std::thread::JoinHandl
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 const STOPPED_FLUSH: &str = "stopping now, without sending the last spans";
 
+/// What a stopped process writes when its collector has not taken its last
+/// spans by the flush's deadline, after which they are lost. A test that
+/// then reads the spans looks for this first, so that a missed flush is
+/// reported as the run's own words and not as a span that is missing.
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+const DROPPED_SPANS: &str = "they are dropped";
+
+/// What a run writes as it begins stopping, before it sends its last spans.
+/// A test that stops one waits for this line before it signals again.
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+const STOPPING: &str = "stopping;";
+
+/// How long a run gets to show on its stderr that it noticed a signal: far
+/// more than noticing one takes, however loaded the machine.
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+const SEEN_BY_RUN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// A command that ends normally sends its last spans, and a signal stops a
 /// collector that never answers from holding it up at all.
 // needs_sandbox
@@ -659,20 +779,27 @@ fn a_second_signal_stops_at_once_while_spans_are_sent() {
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into())]);
     let url = hung_collector();
-    let mut child = command(
-        &dir,
-        &model.base_url(),
-        &["run", "gated", "--data", NOTE],
-        &exporting(&url, "http/json"),
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-    let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
+    let mut child = Child::new(
+        command(
+            &dir,
+            &model.base_url(),
+            &["run", "gated", "--data", NOTE],
+            &exporting(&url, "http/json"),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let mut drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
-    // The gate's wait is no running step, so the flush starts at once: the
-    // second signal comes well inside its deadline.
+    // The gate's wait is no running step, so the flush starts at once and
+    // the second signal has to find it running. Wait for the run's own word
+    // that it is stopping rather than for a fixed beat, which a loaded
+    // machine can spend before the run has even noticed the first signal;
+    // then a short beat, so that the second signal finds the flush started
+    // and not the run still on its way to it.
+    drained.wait_for_stderr(STOPPING, SEEN_BY_RUN);
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "TERM");
     let out = drained.wait(&mut child);
