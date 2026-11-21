@@ -57,18 +57,47 @@ use atomic_exec::{ExecutionBackend, Open, Shell, Workspace};
 /// Where a runtime looks up the artifacts an output references, and, when
 /// it has a store, where an exec atom's command hands files over and reads
 /// the artifacts it is given (see [`crate::artifact::files`]).
+///
+/// The files a step's command handed over stay [held](crate::artifact::Hold)
+/// from before they are stored until [`Artifacts::release`] lets them go
+/// once the step has recorded its output, or until the store closes.
 #[derive(Clone)]
 pub struct Artifacts(
     Arc<dyn ArtifactLookup + Send + Sync>,
     Option<Arc<dyn crate::artifact::ArtifactStore + Send + Sync>>,
     crate::artifact::files::Limits,
+    Arc<Holding>,
 );
+
+/// Lets go of what a step's command handed over when dropped (see
+/// [`Artifacts::releasing`]).
+#[must_use = "dropping it at once lets go of the step's holds at once"]
+pub struct Releasing {
+    artifacts: Artifacts,
+    identity: EffectIdentity,
+}
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        self.artifacts.release(&self.identity);
+    }
+}
+
+/// The holds on what each step's command handed over, by the step's effect
+/// key, until the step lets them go.
+#[derive(Default)]
+struct Holding(std::sync::Mutex<std::collections::HashMap<String, Vec<crate::artifact::Hold>>>);
 
 impl Artifacts {
     /// Look artifacts up in `lookup`, such as a [`crate::artifact::LocalStore`].
     /// Commands can hand no files over.
     pub fn new(lookup: impl ArtifactLookup + Send + Sync + 'static) -> Self {
-        Self(Arc::new(lookup), None, Default::default())
+        Self(
+            Arc::new(lookup),
+            None,
+            Default::default(),
+            Default::default(),
+        )
     }
 
     /// Look artifacts up in `store`, and store the files commands hand over
@@ -77,7 +106,44 @@ impl Artifacts {
         store: crate::artifact::LocalStore,
         limits: crate::artifact::files::Limits,
     ) -> Self {
-        Self(Arc::new(store.clone()), Some(Arc::new(store)), limits)
+        Self(
+            Arc::new(store.clone()),
+            Some(Arc::new(store)),
+            limits,
+            Default::default(),
+        )
+    }
+
+    /// Let go of what the step `identity` names had its command hand over:
+    /// once the step has recorded its output, which references it, a sweep
+    /// keeps it for that.
+    pub fn release(&self, identity: &EffectIdentity) {
+        let gone = (self.3)
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&identity.key());
+        drop(gone);
+    }
+
+    /// A guard that [releases](Self::release) the step `identity` names when
+    /// it is dropped, however the step ends: when it has recorded its output,
+    /// or when the step is dropped, cancelled or panics on the way.
+    pub fn releasing(&self, identity: EffectIdentity) -> Releasing {
+        Releasing {
+            artifacts: self.clone(),
+            identity,
+        }
+    }
+
+    /// Keep `holds` for the step `identity` names, until it is released.
+    fn keep(&self, identity: &EffectIdentity, holds: Vec<crate::artifact::Hold>) {
+        if holds.is_empty() {
+            return;
+        }
+        // A poisoned registry still keeps them: they go with the store.
+        let mut held = (self.3).0.lock().unwrap_or_else(|e| e.into_inner());
+        held.entry(identity.key()).or_default().extend(holds);
     }
 
     /// No store: every reference fails (see [`NoArtifacts`]).
@@ -521,6 +587,15 @@ impl WorkspaceGuard {
             .expect("an open workspace")
     }
 
+    /// The backend that opened it.
+    pub(crate) fn backend(&self) -> Arc<dyn ExecutionBackend> {
+        // Present until the guard closes it.
+        self.0
+            .as_ref()
+            .map(|closer| closer.backend.clone())
+            .expect("an open workspace")
+    }
+
     /// Keep the workspace open while the holder lives, such as a command
     /// running in it.
     pub(crate) fn hold(&self) -> Arc<Closer> {
@@ -733,7 +808,7 @@ async fn run_contract(
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
-        None => AtomError::Model(format!("{e:#}")),
+        None => turn_failure(&e),
     })?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
@@ -753,6 +828,18 @@ async fn run_contract(
         (None, None) => Err(AtomError::Runtime(
             "the turn ended without an answer".into(),
         )),
+    }
+}
+
+/// What a turn that failed failed of: the model, or, when the sandbox's
+/// deny list could not be made, the machine it would have run on.
+fn turn_failure(e: &anyhow::Error) -> AtomError {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())
+    {
+        Some(refused) => AtomError::Runtime(refused.to_string()),
+        None => AtomError::Model(format!("{e:#}")),
     }
 }
 
@@ -944,7 +1031,7 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         )
         .await
         .map(|(answer, _)| answer)
-        .map_err(|e| AtomError::Model(format!("{e:#}"))),
+        .map_err(|e| turn_failure(&e)),
         Err(e) => Err(e),
     };
     workspace.close().await;
@@ -1448,39 +1535,59 @@ pub async fn run_exec_opened(
     }
     h.update(&stdin);
     let prompt_hash = format!("{:x}", h.finalize());
-    // With a store, the command gets its exchange: an outputs directory to
-    // hand files over in, and the artifacts its input references, read-only.
-    // Unix only: elsewhere a command hands no files over, and an output
-    // that names one is refused (see `finish_exec`).
-    let exchange = match (&artifacts.1, workspace.workspace().scratch.clone()) {
-        (Some(store), Some(scratch)) if cfg!(unix) => {
+    // With a store, the command gets its exchange, from its workspace's
+    // backend, which alone touches the workspace's files: an outputs
+    // directory to hand files over in, and the artifacts its input
+    // references, read-only. A backend that hands no files over gives none:
+    // an input that references artifacts is then refused, and so is an
+    // output that names a file (see `finish_exec`).
+    let exchange = match &artifacts.1 {
+        Some(store) => {
             let (store, input, contract) =
                 (store.clone(), input.clone(), contract("Input")?.clone());
             let lookup = artifacts.0.clone();
+            let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
+            let name = atom.name.clone();
             // The workspace stays open while its inputs are copied in, even
             // when the run is cancelled meanwhile.
             let held = workspace.hold();
             let made = tokio::task::spawn_blocking(move || {
                 let _held = held;
-                let exchange = crate::artifact::files::Exchange::create(&scratch)?;
                 let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref());
-                exchange.mount(store.as_ref(), &given)?;
-                Ok::<_, crate::artifact::ArtifactError>(exchange)
+                let exchange = backend
+                    .exchange(&opened)
+                    .map_err(|e| AtomError::Runtime(format!("{name}: prepare its files: {e}")))?;
+                let Some(exchange) = exchange else {
+                    return match given.first() {
+                        Some(a) => Err(AtomError::Runtime(format!(
+                            "{name}: its input references {a}, and its backend gives commands \
+                             no files"
+                        ))),
+                        None => Ok(None),
+                    };
+                };
+                let exchange = crate::artifact::files::Exchange::new(exchange);
+                exchange
+                    .mount(store.as_ref(), &given)
+                    .map_err(|e| store_error(&name, "give the command its input files", e))?;
+                Ok(Some(Arc::new(exchange)))
             })
             .await
-            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))?
-            .map_err(|e| store_error(&atom.name, "give the command its input files", e))?;
-            Some(Arc::new(made))
+            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))??;
+            Some(made)
         }
-        _ => None,
+        None => None,
     };
-    let (exchange_env, read_only) = match &exchange {
+    let (exchange_env, read_only) = match exchange.as_ref().and_then(Option::as_ref) {
         Some(x) => (
             vec![
-                ("ATOMIC_OUTPUTS".to_owned(), x.outputs.display().to_string()),
-                ("ATOMIC_INPUTS".to_owned(), x.inputs.display().to_string()),
+                (
+                    "ATOMIC_OUTPUTS".to_owned(),
+                    x.outputs().display().to_string(),
+                ),
+                ("ATOMIC_INPUTS".to_owned(), x.inputs().display().to_string()),
             ],
-            vec![x.inputs.clone()],
+            vec![x.inputs().to_owned()],
         ),
         None => (Vec::new(), Vec::new()),
     };
@@ -1651,7 +1758,8 @@ async fn finish_exec(
     atom: &AtomFile,
     program: &str,
     done: Result<atomic_exec::Completed, CommandError>,
-    exchange: Option<Arc<crate::artifact::files::Exchange>>,
+    // With a store: the exchange its backend gave, if any.
+    exchange: Option<Option<Arc<crate::artifact::files::Exchange>>>,
     artifacts: &Artifacts,
     identity: &EffectIdentity,
     output_contract: &Value,
@@ -1692,7 +1800,9 @@ async fn finish_exec(
     let output_contract = output_contract.clone();
     // The files it handed over go into the store, and their references into
     // the output, before the output is checked; off the async workers.
-    if let (Some(exchange), Some(store)) = (exchange, artifacts.1.clone()) {
+    // A store, and no exchange: the backend hands no files over.
+    let none_given = matches!(exchange, Some(None));
+    if let (Some(Some(exchange)), Some(store)) = (exchange, artifacts.1.clone()) {
         let provenance = crate::artifact::Provenance {
             media_type: crate::artifact::files::DEFAULT_MEDIA_TYPE.into(),
             workflow: Some(identity.run_id.clone()),
@@ -1746,21 +1856,31 @@ async fn finish_exec(
                         std::thread::sleep(wait);
                         wait = (wait * 2).min(GATHER_LOCKED_BACKOFF_MAX);
                     }
-                    gathered => break gathered.map(|()| output),
+                    gathered => break gathered.map(|holds| (output, holds)),
                 }
             }
         })
         .await
         .map_err(|e| AtomError::Runtime(format!("{}: store its files: {e}", atom.name)))?;
-        output = gathered.map_err(|e| match e {
+        let holds;
+        (output, holds) = gathered.map_err(|e| match e {
             crate::artifact::ArtifactError::Refused(message) => schema_error(message),
             e => store_error(&atom.name, "store its files", e),
         })?;
+        // Held until the step records the output that references them.
+        artifacts.keep(identity, holds);
     }
-    if !cfg!(unix) && crate::artifact::files::names_a_file(&output) {
+    // As gather would take them: an object anywhere else is the output's own.
+    if none_given
+        && crate::artifact::files::names_a_file_where_referenced(
+            &output,
+            &output_contract,
+            artifacts.0.as_ref(),
+        )
+        .map_err(|e| schema_error(e.to_string()))?
+    {
         return Err(schema_error(format!(
-            "the output names a file with `{}`: handing files over is supported on Linux and \
-             macOS only",
+            "the output names a file with `{}`, and its backend hands no files over",
             crate::artifact::files::FILE_KEY
         )));
     }

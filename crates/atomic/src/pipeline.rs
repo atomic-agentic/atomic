@@ -1517,7 +1517,13 @@ async fn turn<C: WorkflowContext>(
     let repair = t.repair.clone();
     let charge = t.charge;
     let step_caches = run.caches.map(|c| c.for_exec(&t.name));
-    execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
+    // What an exec step's command hands over is held until the turn has
+    // recorded the output that references it, then let go; and let go too
+    // when the turn is dropped or panics before that.
+    let release = guard
+        .as_ref()
+        .map(|(_, _, _, identity)| runtimes.codex.artifacts.releasing(identity.clone()));
+    let turn = execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
@@ -1673,7 +1679,9 @@ async fn turn<C: WorkflowContext>(
         // Model calls name the run and step on their spans.
         crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
     })
-    .await
+    .await;
+    drop(release);
+    turn
 }
 
 /// Review `candidate`, the author's turn of `step` on `input`: the reviewer

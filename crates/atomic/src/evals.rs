@@ -183,6 +183,7 @@ impl Meter for Replayed {
                     time: None,
                 },
                 bounded_by: None,
+                release: atomic_core::usage::Release::default(),
             })
         })
     }
