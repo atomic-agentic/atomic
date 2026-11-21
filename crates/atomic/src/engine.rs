@@ -347,14 +347,16 @@ pub fn deployment() -> Deployment {
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
-    /// Where its store is, for messages.
-    pub store: String,
+    /// Where its durable store is, for messages.
+    pub store_description: String,
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// The project's artifact store, which its runs read and write.
+    pub artifacts: LocalStore,
 }
 
 impl Engine {
@@ -467,7 +469,7 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
-            store,
+            store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
@@ -491,9 +493,10 @@ pub async fn open(
     }
     Ok(Engine {
         rt,
-        store: describe(&database),
+        store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        artifacts: store,
     })
 }
 
