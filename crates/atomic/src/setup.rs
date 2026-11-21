@@ -19,13 +19,17 @@
 //! message cannot hold them all. Once the directory passes, setup rewrites the
 //! pack's files and the instructions section, records what it wrote in the
 //! manifest, and touches nothing else: skills installed beside atomic's, and the
-//! rest of the instructions file, stay as they were.
+//! rest of the instructions file, stay as they were. Each file goes down as a
+//! temporary written beside it and then renamed into place, so a write never
+//! passes through a link standing where the file belongs and a file is never
+//! left half written.
 
 use crate::shown::line;
 use crate::skills;
 use anyhow::{Context, bail, ensure};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Component, Path, PathBuf};
 
 /// A coding agent atomic can set up.
@@ -157,9 +161,16 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     // with the files its manifest says are atomic's, still unmodified, that
     // this pack no longer ships.
     let skills = owned_dirs(&pack)?;
+    // What this pack writes, by pack path, so that a listed file or a pack path
+    // holding exactly these bytes is known to be atomic's own work and not
+    // someone's. A pack never repeats a path, so nothing here is lost.
+    let mut pack_bytes: BTreeMap<&str, &[u8]> = BTreeMap::new();
+    for file in &pack {
+        pack_bytes.insert(file.path.as_str(), file.contents.as_bytes());
+    }
     let mut owned = Vec::new();
     for skill in &skills {
-        let dir = OwnedDir::new(&root, skills_dir, skill, &pack);
+        let dir = OwnedDir::new(&root, skills_dir, skill, &pack, &pack_bytes);
         let stale = dir.check()?;
         owned.push((dir, stale));
     }
@@ -183,6 +194,18 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         &root.join(instructions),
         &instructions_files,
     )?;
+    // Where the instructions file really is, which is where the write below goes.
+    // For the one link `link_to_own_file` allows, to the other agent's
+    // instructions file, that is the other file: `write_inside` is pointed at it
+    // rather than at the link, because a write goes to where a file is, not
+    // through a link. For a plain file, and for one not written yet, this is the
+    // path as it was given.
+    let mut instructions_target = root.join(instructions);
+    if let Ok(resolved) = std::fs::canonicalize(&instructions_target) {
+        if let Ok(below) = resolved.strip_prefix(&root) {
+            instructions_target = below.to_path_buf();
+        }
+    }
     // What the instructions file is to hold, read and put together before
     // anything is written: an instructions file atomic cannot read, or one whose
     // atomic section is broken, is refused here, so a refusal leaves the skill
@@ -195,9 +218,22 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let updated = with_section(current.as_deref(), &section())
         .with_context(|| format!("update {}", instructions.display()))?;
     for (dir, stale) in &owned {
+        let mut emptied: BTreeSet<&str> = BTreeSet::new();
         for gone in stale {
             std::fs::remove_file(dir.path.join(gone))
                 .with_context(|| format!("remove {}", dir.shown(gone)))?;
+            emptied.extend(parents_of(gone));
+        }
+        // A directory of the old pack that held only the files just removed is
+        // empty now, and an empty directory the next pack has no reason to write
+        // in is one the next setup would refuse. Deepest first, so emptying an
+        // inner one is what can empty the one above it. One that still holds
+        // anything is left: `remove_dir` refuses a directory that is not empty,
+        // so nothing here can take a file away.
+        let mut emptied: Vec<&str> = emptied.into_iter().collect();
+        emptied.sort_by_key(|parent| std::cmp::Reverse(parent.split('/').count()));
+        for parent in emptied {
+            let _ = std::fs::remove_dir(dir.path.join(parent));
         }
     }
     let mut written = Vec::new();
@@ -206,16 +242,19 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         write_inside(&root, &relative, file.contents.as_bytes())?;
         written.push(relative);
     }
-    // After the files, so a setup that stopped halfway leaves the manifest of
-    // the run before it, which then refuses the directory rather than vouching
-    // for bytes it never saw.
+    // After the files, so a setup that stopped halfway leaves the record of the
+    // run before it and never one that vouches for bytes atomic never wrote.
+    // Running setup again finishes such a run: every file on disk then holds
+    // either the bytes the old record still describes or the bytes this pack
+    // writes, and a file the interrupted run had already removed is simply not
+    // there to be accounted for.
     for (dir, _) in &owned {
         let relative = skills_dir.join(dir.skill).join(MANIFEST);
         write_inside(&root, &relative, dir.manifest().as_bytes())?;
         written.push(relative);
     }
     if current.as_deref() != Some(updated.as_str()) {
-        write_inside(&root, instructions, updated.as_bytes())?;
+        write_inside(&root, &instructions_target, updated.as_bytes())?;
         written.push(instructions.to_owned());
     }
     Ok(written)
@@ -227,14 +266,18 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
 fn owned_dirs(pack: &[skills::SkillFile]) -> anyhow::Result<Vec<String>> {
     let mut dirs = BTreeSet::new();
     for file in pack {
-        let dir = file
-            .path
-            .split('/')
-            .next()
-            .expect("a path has at least one piece");
+        // Both halves have to be there: what is owned is the directory in front
+        // of the `/`, and a path with no `/`, or with nothing on one side of it,
+        // names no such directory. A pack is built here from paths this crate
+        // writes, so this is a statement about the pack, not a judgement on
+        // anything a person left.
+        let (dir, name) = match file.path.split_once('/') {
+            Some(halves) => halves,
+            None => ("", ""),
+        };
         ensure!(
-            !dir.is_empty(),
-            "the pack writes {}, loose in the skills directory, not inside a skill",
+            !dir.is_empty() && !name.is_empty(),
+            "the pack writes {}, which is not a file inside a skill directory",
             line(&file.path)
         );
         dirs.insert(dir);
@@ -290,6 +333,7 @@ impl Report {
 /// setup reads it before it writes, so that it may replace its own work and
 /// refuse what anyone else left there.
 #[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
     /// The manifest's format version. A file written to a format this atomic
     /// does not know is refused, not guessed at.
@@ -339,11 +383,15 @@ impl Manifest {
             read.format
         );
         for (path, hash) in &read.files {
+            // Both are the manifest's text, not atomic's: escaped, so that a
+            // path or a hash written to split the refusal cannot do so.
             ensure!(
                 is_plain_relative(path)
                     && hash.len() == 64
                     && hash.bytes().all(|b| b.is_ascii_hexdigit()),
-                "{here} lists {path} as {hash}, which is not how atomic records a file"
+                "{here} lists {} as {}, which is not how atomic records a file",
+                line(path),
+                line(hash)
             );
         }
         Ok(read)
@@ -376,6 +424,23 @@ fn sha256(bytes: impl AsRef<[u8]>) -> String {
 fn manifest_vouches_for(manifest: Option<&Manifest>, relative: &str, bytes: &[u8]) -> bool {
     manifest.is_some_and(|m| m.holds(relative, bytes))
 }
+
+/// Whether `pack` writes exactly `bytes` at `path`. This is the other way a file
+/// is known to be atomic's own work: with no manifest to read, or with one that
+/// does not list the path, bytes that are this pack's are bytes atomic was going
+/// to write there anyway. It is one call so that the control of it has one site,
+/// which `scripts/controls/skill-dir-pack-bytes.row` switches off.
+fn pack_holds(pack: &BTreeMap<&str, &[u8]>, path: &str, bytes: &[u8]) -> bool {
+    pack.get(path).is_some_and(|written| *written == bytes)
+}
+
+/// How far setup will read a file of the skill directory to find out what it
+/// holds. Every file of the pack is read here, and so is every file a manifest
+/// lists, so the bound has to cover the largest of them; what is larger than any
+/// file atomic writes is not one of them, and is refused where it stands rather
+/// than read for its hash. `pack_files_fit_their_limits` keeps this above every
+/// file of the pack.
+const READ_BYTES_MAX: u64 = 4 * 1024 * 1024;
 
 /// Whether `path` is a plain relative path of the kind atomic writes below a
 /// skill directory: `/`-separated, with no leading `/` and no piece that is
@@ -412,6 +477,15 @@ struct OwnedDir<'a> {
     /// The pack, for the content each allowed file must hold where no manifest
     /// says who wrote it.
     pack: &'a [skills::SkillFile],
+    /// What this pack writes, by pack path, for a file on disk to be recognised
+    /// as atomic's own bytes.
+    pack_bytes: &'a BTreeMap<&'a str, &'a [u8]>,
+    /// The directories the walk refused as ones atomic does not write which
+    /// hold nothing at all, by where they sit below this one. A directory is the
+    /// one thing a refusal names that setup can still clear: an empty one is
+    /// often the shell an earlier pack left when its files went, and nothing a
+    /// person can see is there to remove.
+    empty: RefCell<BTreeSet<String>>,
 }
 
 impl<'a> OwnedDir<'a> {
@@ -420,6 +494,7 @@ impl<'a> OwnedDir<'a> {
         skills_dir: &Path,
         skill: &'a str,
         pack: &'a [skills::SkillFile],
+        pack_bytes: &'a BTreeMap<&'a str, &'a [u8]>,
     ) -> Self {
         let prefix = format!("{skill}/");
         let files: BTreeSet<&'a str> = pack
@@ -446,6 +521,8 @@ impl<'a> OwnedDir<'a> {
             files,
             dirs,
             pack,
+            pack_bytes,
+            empty: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -456,9 +533,11 @@ impl<'a> OwnedDir<'a> {
     /// What the directory's manifest lists is what atomic wrote there. A listed
     /// file still holding the bytes it records may be written over, and comes
     /// back from here for removal when this pack no longer ships it; a listed
-    /// file holding other bytes was edited since and is refused. With no
-    /// manifest to go by, only a directory holding exactly this pack's files,
-    /// with this pack's bytes, passes.
+    /// file holding other bytes was edited since and is refused. A file that is
+    /// not listed but holds exactly what this pack writes there is atomic's own
+    /// work too, which is what lets a run that stopped halfway be run again.
+    /// With no manifest to go by, only a directory holding exactly this pack's
+    /// files, with this pack's bytes, passes.
     fn check(&self) -> anyhow::Result<Vec<String>> {
         let mut report = Report::default();
         if let Some(link) = self.chain_link() {
@@ -474,10 +553,39 @@ impl<'a> OwnedDir<'a> {
             if report.is_empty() {
                 return Ok(self.leftovers(&manifest, &report));
             }
-            bail!("{}", self.refusal(&report));
+            // A directory atomic has no reason to write in is refused with the
+            // words "remove what is named", and an empty one shows nothing a
+            // person can see to remove -- often the shell of a directory an
+            // earlier pack wrote, whose files a later one stopped removing. It
+            // holds nothing atomic is asked to keep, so it goes, and the next
+            // setup finds the directory clean. What still holds something stays.
+            let cleared = self.clear_empty_dirs();
+            let cleared = match cleared.len() {
+                0 => String::new(),
+                1 => format!(" ({} was empty and is removed)", cleared[0]),
+                n => format!(" ({n} empty directories are removed: {})", cleared.join(", ")),
+            };
+            bail!("{}{}", self.refusal(&report), cleared);
         }
         ensure!(report.is_empty(), "{}", self.refusal(&report));
         Ok(Vec::new())
+    }
+
+    /// The empty directories this walk refused, deepest first, each emptied of
+    /// itself: a directory that turned out not to be empty after all is left, as
+    /// is one that could not be opened. Only a directory the walk itself refused
+    /// and found with nothing in it is ever tried, and `remove_dir` refuses a
+    /// directory that holds anything, so nothing here can take a file away.
+    fn clear_empty_dirs(&self) -> Vec<String> {
+        let mut empty: Vec<String> = self.empty.borrow().iter().cloned().collect();
+        empty.sort_by_key(|at| std::cmp::Reverse(at.split('/').count()));
+        let mut cleared = Vec::new();
+        for at in empty {
+            if std::fs::remove_dir(self.path.join(&at)).is_ok() {
+                cleared.push(self.shown(&at));
+            }
+        }
+        cleared
     }
 
     /// The manifest this directory carries, if it has one: what the last setup
@@ -609,6 +717,12 @@ impl<'a> OwnedDir<'a> {
     /// the pack writes a file under it or the manifest lists one there, so what
     /// atomic never wrote is refused with the directory holding it and nothing
     /// here descends past what atomic itself nested.
+    ///
+    /// A name that is not text is refused where it stands. Naming it is only
+    /// possible lossily, and two entries whose names differ only in bytes that
+    /// are not text have the same lossy name: judging an entry by a name another
+    /// entry shares would let one hide the other, so no entry is judged by a name
+    /// it does not have. Every filesystem call is made with the entry's own path.
     fn inspect(
         &self,
         at: &str,
@@ -627,15 +741,32 @@ impl<'a> OwnedDir<'a> {
             .collect::<Result<Vec<_>, _>>()?;
         names.sort();
         for name in names {
+            // The entry's own path, which is what every call below makes. The
+            // name is taken lossily only to refuse it: names that differ only in
+            // bytes which are not text have the same lossy name, so an entry
+            // judged by a name another entry shares could hide that other entry.
+            let entry = self.path.join(at).join(&name);
+            let Some(name) = name.to_str() else {
+                let below = if at.is_empty() {
+                    name.to_string_lossy().into_owned()
+                } else {
+                    format!("{at}/{}", name.to_string_lossy())
+                };
+                report.extra.push(format!(
+                    "{} is not a name atomic can read as text",
+                    self.shown(&below)
+                ));
+                continue;
+            };
             let relative = if at.is_empty() {
-                name.to_string_lossy().into_owned()
+                name.to_owned()
             } else {
-                format!("{at}/{}", name.to_string_lossy())
+                format!("{at}/{name}")
             };
             let shown = self.shown(&relative);
             // What an entry is, not what it points at: a symbolic link is
             // named as one and never followed, read from or written through.
-            let meta = std::fs::symlink_metadata(self.path.join(&relative))
+            let meta = std::fs::symlink_metadata(&entry)
                 .with_context(|| format!("cannot inspect {shown}"))?;
             let kind = meta.file_type();
             if kind.is_symlink() {
@@ -657,6 +788,15 @@ impl<'a> OwnedDir<'a> {
                     report
                         .extra
                         .push(format!("{shown} is not a directory atomic writes"));
+                    // Whether it holds anything is what tells the shell of a
+                    // directory whose files an earlier setup removed from one
+                    // someone is using. An empty one is named and then cleared,
+                    // because there is nothing in it for a person to go and
+                    // remove; anything else is left exactly as it is found.
+                    if std::fs::read_dir(&entry).is_ok_and(|mut entries| entries.next().is_none())
+                    {
+                        self.empty.borrow_mut().insert(relative);
+                    }
                     continue;
                 }
                 self.inspect(&relative, manifest, report)?;
@@ -679,10 +819,14 @@ impl<'a> OwnedDir<'a> {
             }
             if listed {
                 // The manifest says atomic wrote these bytes here. If they are
-                // still here, the file is atomic's to replace; if not, someone
-                // edited it, and their work is not atomic's to throw away.
-                let bytes = self.bytes(&relative, &shown)?;
+                // still here, the file is atomic's to replace; so is one holding
+                // exactly what this pack writes there, which is what a run that
+                // stopped after the files and before its manifest leaves.
+                // Anything else was edited since, and is not atomic's to throw
+                // away.
+                let bytes = self.bytes(&entry, &shown, meta.len())?;
                 let holds = manifest_vouches_for(manifest, &relative, &bytes);
+                let holds = holds || pack_holds(self.pack_bytes, &self.pack_path(&relative), &bytes);
                 if holds {
                     report.unmodified.insert(relative);
                 } else {
@@ -695,14 +839,17 @@ impl<'a> OwnedDir<'a> {
             // No manifest vouches for this path, so nothing but what this very
             // pack would write there counts as atomic's: a leftover from
             // another version, or an edit, is refused instead of taken in.
+            let path = self.pack_path(&relative);
             let file = self
                 .pack
                 .iter()
-                .find(|f| f.path == self.pack_path(&relative))
+                .find(|f| f.path == path)
                 .expect("the pack has its own path");
             // Sizes first, so a large leftover costs no reading.
-            let other = meta.len() != file.contents.len() as u64
-                || self.bytes(&relative, &shown)? != file.contents.as_bytes();
+            let other = meta.len() != file.contents.len() as u64 || {
+                let bytes = self.bytes(&entry, &shown, meta.len())?;
+                !pack_holds(self.pack_bytes, &path, &bytes)
+            };
             if other {
                 report.changed.push(format!(
                     "{shown} holds other content than the pack's, which atomic wrote there and \
@@ -713,10 +860,17 @@ impl<'a> OwnedDir<'a> {
         Ok(())
     }
 
-    /// The bytes of the plain file at `relative`, which the walk has seen to be
-    /// one.
-    fn bytes(&self, relative: &str, shown: &str) -> anyhow::Result<Vec<u8>> {
-        std::fs::read(self.path.join(relative)).with_context(|| format!("cannot read {shown}"))
+    /// The bytes of a plain file the walk has seen to be one, read from `entry`,
+    /// which is where the walk saw it. `size` is what its own directory entry
+    /// said, and `READ_BYTES_MAX` is the most that will be read for a hash.
+    fn bytes(&self, entry: &Path, shown: &str, size: u64) -> anyhow::Result<Vec<u8>> {
+        ensure!(
+            size <= READ_BYTES_MAX,
+            "{shown} is {size} bytes, more than the {} any file atomic writes holds; replace it \
+             and run `atomic setup` again",
+            READ_BYTES_MAX
+        );
+        std::fs::read(entry).with_context(|| format!("cannot read {shown}"))
     }
 
     /// The pack path of a file at `relative` below this directory.
@@ -741,6 +895,25 @@ fn link_named(at: &str) -> String {
 /// Whether `path` is itself a symbolic link.
 fn is_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+/// The directories the path `relative` passes through, deepest first: `a/b/c`
+/// gives `a/b` and then `a`. Deepest first is the order to try removing them in,
+/// because emptying the inner one is what can empty the one above it.
+fn parents_of(relative: &str) -> Vec<&str> {
+    let mut parents = Vec::new();
+    let mut at = relative
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("");
+    while !at.is_empty() {
+        parents.push(at);
+        at = at
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+    }
+    parents
 }
 
 /// `text` with atomic's section replaced, or appended when it has none.
@@ -769,26 +942,31 @@ fn with_section(text: Option<&str>, section: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Write `relative` under `root`, creating directories, and refuse any path that
-/// leaves `root` through `..` or a symbolic link.
+/// Write `contents` at `relative` under `root`, creating directories, and refuse
+/// any path that leaves `root` through `..` or a symbolic link.
 ///
-/// The caller has refused what stands at the path itself: see
-/// [`link_to_own_file`], which `install` asks of the one path below the
-/// repository root that no skill directory's check covers, before it writes
-/// anything.
+/// Nothing is written *through* what stands where the file belongs. The bytes go
+/// to a temporary beside the target and the temporary is renamed over it: a
+/// rename replaces whatever is there, a link included, without following it, and
+/// it puts the whole file down at once, so a run that stops halfway leaves the
+/// file before it or the file after it, never half of either.
+///
+/// [`link_to_own_file`] is asked of the instructions file before anything is
+/// written, and `install` hands over where that link leads when there is one, so
+/// what is named here is a place to write, not a link to write through.
 fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result<()> {
     ensure!(
         relative
             .components()
             .all(|c| matches!(c, Component::Normal(_))),
         "{} is not a plain relative path",
-        relative.display()
+        line(&relative.to_string_lossy())
     );
     let outside = || {
         anyhow::anyhow!(
             "{} leads outside {} through a symbolic link",
-            relative.display(),
-            root.display()
+            line(&relative.to_string_lossy()),
+            line(&root.to_string_lossy())
         )
     };
     // Each directory is checked before anything is created below it.
@@ -801,17 +979,57 @@ fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result
                 if !resolved.starts_with(root) {
                     return Err(outside());
                 }
-                ensure!(resolved.is_dir(), "{} is not a directory", dir.display());
+                ensure!(
+                    resolved.is_dir(),
+                    "{} is not a directory",
+                    line(&dir.to_string_lossy())
+                );
                 dir = resolved;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+                std::fs::create_dir(&dir)
+                    .with_context(|| format!("create {}", line(&dir.to_string_lossy())))?;
             }
-            Err(e) => return Err(e).with_context(|| format!("inspect {}", dir.display())),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("inspect {}", line(&dir.to_string_lossy())));
+            }
         }
     }
-    let file = dir.join(relative.file_name().context("a file has a name")?);
-    std::fs::write(&file, contents).with_context(|| format!("write {}", relative.display()))
+    let name = relative.file_name().context("a file has a name")?;
+    let file = dir.join(name);
+    // The chain is one path component at a time, refusing the first link: this
+    // asks whether anything *is* a link, where resolving would answer what a link
+    // leads to and read a broken one as no path at all. The directories were
+    // weighed before anything was made below them, and a link put in their place
+    // since then would point the rest of this at somewhere else.
+    let mut chain = root.to_owned();
+    for part in relative.parent().into_iter().flat_map(Path::components) {
+        chain.push(part);
+        ensure!(
+            !is_link(&chain),
+            "{} is reached through {}, which is a symbolic link",
+            line(&relative.to_string_lossy()),
+            line(&chain.to_string_lossy())
+        );
+    }
+    // `.` and `..` are refused above, so the temporary cannot be written
+    // anywhere but the directory the file belongs in, and a rename between two
+    // names in one directory is the one write that cannot land on a link: the
+    // link at the target is what goes, and the plain file takes its place. A run
+    // killed between these two calls leaves the temporary, which the next setup
+    // of that directory refuses by name rather than takes in.
+    let temp = file.with_extension("atomic-writing");
+    let wrote = |e: std::io::Error| {
+        let _ = std::fs::remove_file(&temp);
+        anyhow::Error::new(e).context(format!("write {}", line(&relative.to_string_lossy())))
+    };
+    let mut made = std::fs::File::create(&temp).map_err(wrote)?;
+    made.write_all(contents).map_err(wrote)?;
+    made.sync_all().map_err(wrote)?;
+    drop(made);
+    std::fs::rename(&temp, &file).map_err(wrote)?;
+    Ok(())
 }
 
 /// Refuse to write `file`, which stands at `relative` below `root`, when it is a
@@ -820,7 +1038,10 @@ fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result
 /// in `may_lead_to`. A link inside the repository is not enough on its own: what
 /// it leads to may be the person's own work, or one of a skill's files, which
 /// hold the pack rather than the instructions. Where two agents share one
-/// instructions file the link leads to the other's, and that one is followed.
+/// instructions file the link leads to the other's, and that one is followed --
+/// one link, to a plain file. A chain of two is refused, because what `install`
+/// then writes through is a file that is itself an alias, which is the question
+/// this check exists to ask and not an answer to it.
 fn link_to_own_file(
     root: &Path,
     relative: &Path,
@@ -830,27 +1051,28 @@ fn link_to_own_file(
     if !is_link(file) {
         return Ok(());
     }
-    let resolved = std::fs::canonicalize(file)
-        .with_context(|| format!("{} is a broken symbolic link", relative.display()))?;
+    let resolved = std::fs::canonicalize(file).with_context(|| {
+        format!(
+            "{} is a broken symbolic link",
+            line(&relative.to_string_lossy())
+        )
+    })?;
     ensure!(
         resolved.starts_with(root),
         "{} is a symbolic link outside {}",
-        relative.display(),
-        root.display()
+        line(&relative.to_string_lossy()),
+        line(&root.to_string_lossy())
     );
-    // The path being written is not its own target; only another of the files
-    // named is, and that is read plain rather than through a link of its own,
-    // which would be the same question one step on.
     let leads_to = |path: &Path| {
-        path != relative
-            && std::fs::canonicalize(root.join(path)).is_ok_and(|target| target == resolved)
+        let other = root.join(path);
+        path != relative && other == resolved && !is_link(&other)
     };
     ensure!(
         may_lead_to.iter().any(|path| leads_to(path)),
         "{} is a symbolic link to {}, which is not a file atomic may write through from here; \
          atomic writes this path plain, or through a link to the other agent's instructions file",
-        relative.display(),
-        resolved.display()
+        line(&relative.to_string_lossy()),
+        line(&resolved.to_string_lossy())
     );
     Ok(())
 }
