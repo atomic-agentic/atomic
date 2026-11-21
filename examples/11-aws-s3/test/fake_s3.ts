@@ -37,8 +37,13 @@ export interface StreamBody {
   total: number;
   /** Bytes per chunk. */
   chunkBytes?: number;
-  /** Pause before each chunk, so an early stop is observed, not raced. */
-  delayMs?: number;
+  /** Pause before the first chunk, so a step that refuses from the declared
+   * length has time to give up before a byte of the body is on its way. */
+  firstDelayMs?: number;
+  /** Pause before every chunk after the first, so a step that refuses
+   * partway through is not racing the socket's own buffers. Names on their
+   * own pause every chunk, the first included. */
+  chunkDelayMs?: number;
   /** False leaves off Content-Length, so only counting the bytes as they
    * arrive can tell how big the body is. */
   contentLength?: boolean;
@@ -54,6 +59,9 @@ export interface Transfer {
    * a client stops reading, and when it closes after the last byte, so a
    * test reads this with finished, which says whether bytes were left. */
   closedEarly: boolean;
+  /** Milliseconds between this GET beginning and the stream being given up
+   * on; missing while the server is still sending. */
+  stoppedMs?: number;
 }
 
 export class FakeS3 {
@@ -85,16 +93,46 @@ export class FakeS3 {
   stream(bucket: string, key: string, body: StreamBody): void {
     const path = `${bucket}/${key}`;
     this.#streams.set(path, body);
-    this.transfers.set(path, { sent: 0, finished: false, closedEarly: false });
+    this.transfers.set(path, {
+      sent: 0,
+      finished: false,
+      closedEarly: false,
+      stoppedMs: undefined,
+    });
   }
 
-  close(): Promise<void> {
-    return this.#server.shutdown();
+  /**
+   * Ends the server.
+   *
+   * Deno's shutdown waits for a connection whose client has stopped reading,
+   * and on a refusal that client is the step under test. A step that gave up
+   * on an over-big body has closed its connection on the way out, so the
+   * shutdown goes at once. A step that left a transfer running is the thing
+   * these tests look for, and waiting behind it would hang the test instead of
+   * reporting it — nothing the server does can finish a response nobody is
+   * reading — so the wait is bounded. What that step left behind is on the
+   * transfer record, which is where the test that asked for it reads it.
+   */
+  async close(): Promise<void> {
+    const shuttingDown = this.#server.shutdown();
+    const ended = await Promise.race([
+      shuttingDown.then(() => true),
+      new Promise<boolean>((ready) => setTimeout(() => ready(false), 2_000)),
+    ]);
+    if (ended) {
+      await shuttingDown;
+      return;
+    }
+    // Nobody is waiting on this shutdown any more. Its failure is the broken
+    // body of a step that moved on, and there is no test left to hand it to.
+    shuttingDown.catch(() => {});
+    this.#server.unref();
   }
 
   /** The streamed body, and a record of how far the client let it go. */
   #streamed(path: string, spec: StreamBody): Response {
     const transfer = this.transfers.get(path)!;
+    const began = performance.now();
     const chunkBytes = spec.chunkBytes ?? 8192;
     const headers: Record<string, string> = {
       etag: '"streamed"',
@@ -102,10 +140,18 @@ export class FakeS3 {
     };
     if (spec.contentLength !== false) headers["content-length"] = String(spec.total);
     let written = 0;
+    let pulls = 0;
     return new Response(
       new ReadableStream<Uint8Array>({
         async pull(controller) {
-          if (spec.delayMs) await new Promise((r) => setTimeout(r, spec.delayMs));
+          // firstDelayMs holds the first byte back, so a refusal from the
+          // declared length lands before any of the body is on its way;
+          // chunkDelayMs paces every later chunk, so a refusal partway
+          // through does not race the socket's own buffers.
+          const delay = pulls++ === 0
+            ? spec.firstDelayMs ?? spec.chunkDelayMs ?? 0
+            : spec.chunkDelayMs ?? 0;
+          if (delay) await new Promise((r) => setTimeout(r, delay));
           if (written >= spec.total) {
             transfer.finished = true;
             controller.close();
@@ -118,8 +164,13 @@ export class FakeS3 {
           controller.enqueue(new Uint8Array(size).fill(0x78));
         },
         cancel() {
-          // Reached only when the reader went away before the body ended.
-          if (!transfer.finished) transfer.closedEarly = true;
+          // Deno ends a response this way whether the client gave up or the
+          // body went out whole, so only a stream with bytes left counts, and
+          // only the first such ending is timed.
+          if (!transfer.finished && transfer.stoppedMs === undefined) {
+            transfer.closedEarly = true;
+            transfer.stoppedMs = Math.round(performance.now() - began);
+          }
         },
       }),
       { headers },

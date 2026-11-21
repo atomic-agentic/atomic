@@ -24,16 +24,24 @@ export async function fetchReport(input: SummarizeReportInput) {
         Key: input.key,
       }),
     );
+    // The body is taken up as one web stream whether it gets read or dropped:
+    // giving up on that stream is what ends the transfer. Under Deno the SDK's
+    // body is Node's IncomingMessage, and cancelling this web view of it is
+    // what makes the server stop sending.
+    const body = object.Body!.transformToWebStream();
     // When S3 declares the length, an object that is already too big is
-    // refused before its body is read.
+    // refused before its body is read, and the transfer is given up on rather
+    // than left to arrive on its own. A refusal that only threw would leave
+    // the server sending: see test/fetch_report_test.ts.
     const length = object.ContentLength;
     if (length !== undefined && length > MAX_BYTES) {
+      await body.cancel();
       throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
     }
     // Counts the body as it arrives, so an object whose length was not
     // declared is refused partway through instead of after all of it.
     const chunks: Uint8Array[] = [];
-    const reader = object.Body!.transformToWebStream().getReader();
+    const reader = body.getReader();
     let total = 0;
     try {
       for (;;) {
@@ -43,7 +51,8 @@ export async function fetchReport(input: SummarizeReportInput) {
         }
         total += chunk.value.length;
         if (total > MAX_BYTES) {
-          // Stops here; what was read is dropped with this call frame.
+          // Stops here, and cancelling the stream ends the transfer with it;
+          // what was read is dropped with this call frame.
           await reader.cancel();
           throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
         }

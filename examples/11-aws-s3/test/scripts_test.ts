@@ -215,17 +215,26 @@ Deno.test("fetch-report reassembles a report that arrives in pieces", () =>
 
 Deno.test("fetch-report refuses an over-limit report without reading its body", () =>
   withFake(async (s3, host) => {
-    // One byte over the limit, length declared, and sent a chunk at a time
-    // with a pause, so a step that read it all would show it had.
+    // Well over the limit, length declared, and no byte on its way until
+    // 250 ms in: the refusal comes from the declared length while the body
+    // has only just begun, so a step that read any of it would show it had.
     s3.stream(BUCKET, report, {
-      total: MAX_BYTES + 1,
+      total: 10 * 1024 * 1024,
       chunkBytes: 8192,
-      delayMs: 5,
+      firstDelayMs: 250,
+      chunkDelayMs: 5,
     });
+    const started = Date.now();
     const result = await fetchReport(s3, host);
+    const seconds = (Date.now() - started) / 1000;
     if (result.code === 0) throw new Error("expected a failure");
     if (!result.stderr.includes(`${report} is larger than ${MAX_BYTES} bytes`)) {
       throw new Error(result.stderr);
+    }
+    // The declared length answers the refusal; waiting for the first byte
+    // would be reading the body after all.
+    if (seconds > 1) {
+      throw new Error(`returned only after ${seconds.toFixed(1)}s`);
     }
     const transfer = await settled(s3);
     if (transfer.finished || !transfer.closedEarly) {
@@ -236,10 +245,13 @@ Deno.test("fetch-report refuses an over-limit report without reading its body", 
 Deno.test("fetch-report refuses an over-limit report of no declared length partway through", () =>
   withFake(async (s3, host) => {
     // 10 MB with no Content-Length, so only counting the bytes as they
-    // arrive can stop this.
+    // arrive can stop this. The small pace is what makes the early close
+    // deterministic: without it the whole body sits in socket buffers before
+    // the step has read past the cap, and the fake has nothing left to stop.
     s3.stream(BUCKET, report, {
       total: 10 * 1024 * 1024,
       chunkBytes: 65_536,
+      chunkDelayMs: 5,
       contentLength: false,
     });
     const result = await fetchReport(s3, host);
@@ -258,12 +270,14 @@ Deno.test("fetch-report refuses an over-limit report of no declared length partw
 
 Deno.test("fetch-report answers while an over-limit report is still arriving", () =>
   withFake(async (s3, host) => {
-    // Takes over ten seconds to send if read to the end; the step must not
-    // wait for it.
+    // 10 MB with no Content-Length, a chunk every 10 ms: over ten seconds of
+    // sending if it is read to the end, and no declared length to refuse
+    // from, so the step has to stop partway through a body that is arriving.
     s3.stream(BUCKET, report, {
       total: 10 * 1024 * 1024,
       chunkBytes: 8192,
-      delayMs: 10,
+      chunkDelayMs: 10,
+      contentLength: false,
     });
     const started = Date.now();
     const result = await fetchReport(s3, host);
@@ -283,7 +297,10 @@ Deno.test("fetch-report answers while an over-limit report is still arriving", (
       throw new Error(`the fake never saw the read stop: ${JSON.stringify(transfer)}`);
     }
     // Sending is the slow side here, so how far it got says where the reader
-    // gave up: about the cap, not far into the 10 MB.
+    // gave up: about the cap, not far into the 10 MB. Whether the transfer
+    // ended with that refusal is not visible from here, because the child
+    // exits either way; test/fetch_report_test.ts refuses from a process that
+    // stays alive, and is what checks that.
     if (transfer.sent > 3 * MAX_BYTES) {
       throw new Error(`the read went far past the cap: ${JSON.stringify(transfer)}`);
     }
