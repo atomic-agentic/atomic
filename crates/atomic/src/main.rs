@@ -430,7 +430,8 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         }
         Some(Command::Debug(Debug::CodexPrompt(args))) => {
             let answer = prompt(&paths, &state, &args).await?;
-            println!("{answer}");
+            // A model's answer, as text, escaped for the terminal.
+            println!("{}", shown::block(&answer));
             Ok(())
         }
         Some(Command::Debug(Debug::Probe(args))) => {
@@ -440,7 +441,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
                 state.database().display()
             );
             let answer = prompt(&paths, &state, &args).await?;
-            println!("codex: {answer}");
+            println!("codex: {}", shown::block(&answer));
             Ok(())
         }
     }
@@ -823,14 +824,13 @@ async fn prompt(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: codex::StateGuard::for_project(state)?,
-        backend,
         caches: None,
     };
     let spec = codex::TurnSpec {
         prompt: args.prompt.join(" "),
         ..codex::TurnSpec::default()
     };
-    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
+    Ok(atomic_core::runtime::run_turn(&runtime, &backend, &spec).await?)
 }
 
 /// `atomic model`.

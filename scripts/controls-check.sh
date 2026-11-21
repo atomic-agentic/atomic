@@ -341,8 +341,14 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        # And read all of it, so `grep -F` does not stop at the first match:
+        # an earlier stage of the pipe would then die of SIGPIPE, which
+        # pipefail reports as a failure of the pipeline, and a test that did
+        # fail would read as one that was not seen.
+        if ! grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 |
+            grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
+        fi
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2
