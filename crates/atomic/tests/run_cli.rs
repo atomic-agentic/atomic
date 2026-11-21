@@ -2465,7 +2465,8 @@ fn a_confined_command_has_no_controlling_terminal() {
             .and_then(|start| out[start..].rfind('}').map(|end| &out[start..=start + end]))
             .unwrap_or_else(|| panic!("{runner}: no result in {out}"));
         let result: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out}"));
-        // Each fails, as OSError or one of its kinds.
+        // Each fails, as OSError or one of its kinds; opening the terminal
+        // by its path fails on that path, not on a slip in the probe.
         for probe in ["tty", "sti", "by_path", "through_proc"] {
             assert!(
                 result[probe]
@@ -2474,7 +2475,180 @@ fn a_confined_command_has_no_controlling_terminal() {
                 "{runner}: {probe}: {result}"
             );
         }
+        assert!(
+            result["by_path"]
+                .as_str()
+                .is_some_and(|r| r.contains("'/dev/pts/")),
+            "{runner}: by_path: {result}"
+        );
     }
+}
+
+/// An exec atom's command has no network unless its atom declares hosts,
+/// and then reaches only those, on ports 80 and 443, through atomic's proxy.
+/// No test reaches the outside world: the declared host is under the
+/// reserved `.invalid` domain, which never resolves. The proxy refuses a host
+/// the atom did not declare (`not_allowed`) and a declared one on another
+/// port (`port_not_allowed`) before any lookup. A declared host on port 80
+/// or 443 passes both and is refused only by the next check, which resolves
+/// it to make sure it is not on a private network and fails closed when it
+/// does not resolve (`not_allowed_local`). A proxy named in atomic's own
+/// environment changes none of this, and is never used. No connection leaves
+/// the command except through the proxy.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn an_exec_atom_reaches_only_the_hosts_it_declares() {
+    support::require_sandbox();
+    let dir = scratch("network");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("tools/net.py"),
+        "import json, os, socket, sys, urllib.request\n\
+         json.load(sys.stdin)\n\
+         proxy = os.environ.get('HTTP_PROXY')\n\
+         opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy} if proxy else {}))\n\
+         def reason(body):\n\
+         \x20   try: return json.loads(body).get('reason', '')\n\
+         \x20   except Exception: return body.decode(errors='replace').strip()\n\
+         def attempt(f):\n\
+         \x20   try:\n\
+         \x20       return f()\n\
+         \x20   except urllib.error.HTTPError as e:\n\
+         \x20       return ('HTTP ' + str(e.code) + ' ' + reason(e.read())).strip()\n\
+         \x20   except Exception as e:\n\
+         \x20       return type(e).__name__\n\
+         def fetch(url):\n\
+         \x20   def get():\n\
+         \x20       opener.open(url, timeout=20).read()\n\
+         \x20       return 'ok'\n\
+         \x20   return get\n\
+         def tunnel(target):\n\
+         \x20   def connect():\n\
+         \x20       host, port = proxy.split('//')[1].rstrip('/').rsplit(':', 1)\n\
+         \x20       s = socket.create_connection((host, int(port)), timeout=20)\n\
+         \x20       s.sendall(('CONNECT ' + target + ' HTTP/1.1\\r\\nHost: ' + target + '\\r\\n\\r\\n').encode())\n\
+         \x20       data = b''\n\
+         \x20       while b'\\r\\n\\r\\n' not in data:\n\
+         \x20           chunk = s.recv(4096)\n\
+         \x20           if not chunk: break\n\
+         \x20           data += chunk\n\
+         \x20       head, _, body = data.partition(b'\\r\\n\\r\\n')\n\
+         \x20       length = [int(l.split(b':')[1]) for l in head.split(b'\\r\\n') if l.lower().startswith(b'content-length:')]\n\
+         \x20       while length and len(body) < length[0]:\n\
+         \x20           chunk = s.recv(4096)\n\
+         \x20           if not chunk: break\n\
+         \x20           body += chunk\n\
+         \x20       code = head.split(b' ')[1].decode()\n\
+         \x20       return ('HTTP ' + code + ' ' + reason(body)).strip() if code != '200' else 'tunnel'\n\
+         \x20   return connect\n\
+         def direct():\n\
+         \x20   socket.create_connection(('192.0.2.1', 80), timeout=5).close()\n\
+         \x20   return 'ok'\n\
+         if proxy:\n\
+         \x20   ports = {'tunnel_443': attempt(tunnel('allowed.invalid:443')), 'tunnel_22': attempt(tunnel('allowed.invalid:22'))}\n\
+         else:\n\
+         \x20   ports = {'tunnel_443': 'no proxy', 'tunnel_22': 'no proxy'}\n\
+         json.dump({'proxied': proxy is not None, 'declared': attempt(fetch('http://allowed.invalid/')), \
+         'undeclared': attempt(fetch('http://blocked.invalid/')), 'direct': attempt(direct)} | ports, sys.stdout)\n",
+    )
+    .expect("script");
+    let schema = object(json!({
+        "proxied": {"type": "boolean"},
+        "declared": {"type": "string"},
+        "undeclared": {"type": "string"},
+        "direct": {"type": "string"},
+        "tunnel_443": {"type": "string"},
+        "tunnel_22": {"type": "string"},
+    }));
+    write_atom(
+        &project,
+        "declares-network",
+        "description: 'Reach a declared host.', kind: 'exec', exec: { command: ['python3', 'tools/net.py'] }, \
+         network: { allow: ['allowed.invalid'] }",
+        "",
+        object(json!({})),
+        schema.clone(),
+    );
+    write_atom(
+        &project,
+        "no-network",
+        "description: 'Declare no network.', kind: 'exec', exec: { command: ['python3', 'tools/net.py'] }",
+        "",
+        object(json!({})),
+        schema,
+    );
+    // A proxy in atomic's own environment, which answers anything it gets:
+    // nothing may go through it.
+    let upstream = std::net::TcpListener::bind("127.0.0.1:0").expect("upstream");
+    let upstream_url = format!("http://{}", upstream.local_addr().expect("address"));
+    upstream.set_nonblocking(true).expect("nonblocking");
+    let upstream_env = [
+        ("HTTP_PROXY", upstream_url.as_str()),
+        ("HTTPS_PROXY", upstream_url.as_str()),
+        ("ALL_PROXY", upstream_url.as_str()),
+        ("http_proxy", upstream_url.as_str()),
+        ("https_proxy", upstream_url.as_str()),
+        ("all_proxy", upstream_url.as_str()),
+    ];
+    for (runner, env) in [
+        ("local", &[][..]),
+        ("process", &[][..]),
+        ("local", &upstream_env[..]),
+    ] {
+        let case = format!(
+            "{runner}{}",
+            if env.is_empty() {
+                ""
+            } else {
+                " with a proxy in atomic's environment"
+            }
+        );
+        let run = |atom: &str| {
+            let out = atomic(
+                &dir,
+                &project,
+                &["run", atom, "--runner", runner, "--data", "{}"],
+                env,
+                "",
+            );
+            assert!(out.status.success(), "{case} {atom}: {}", text(&out));
+            stdout_json(&out)
+        };
+        let declared = run("declares-network");
+        assert_eq!(
+            declared,
+            json!({
+                "proxied": true,
+                "declared": "HTTP 403 not_allowed_local",
+                "undeclared": "HTTP 403 not_allowed",
+                "direct": declared["direct"],
+                // A tunnel's refusal is text: the name passed the list on
+                // 443 and failed only its address check, and on 22 it did
+                // not pass the list.
+                "tunnel_443": "HTTP 403 Sandbox policy blocks local/private network addresses.",
+                "tunnel_22": "HTTP 403 Request blocked by network policy.",
+            }),
+            "{case}"
+        );
+        assert_ne!(declared["direct"], "ok", "{case}: {declared}");
+
+        let none = run("no-network");
+        assert_eq!(none["proxied"], false, "{case}: {none}");
+        for probe in ["declared", "undeclared", "direct"] {
+            assert!(
+                none[probe]
+                    .as_str()
+                    .is_some_and(|r| !r.starts_with("HTTP") && r != "ok"),
+                "{case}: {probe}: {none}"
+            );
+        }
+    }
+    assert!(
+        upstream.accept().is_err(),
+        "a request went through the proxy in atomic's environment"
+    );
 }
 
 /// A `bwrap` in front of the real one, in `dir/bwrap-bin`: while

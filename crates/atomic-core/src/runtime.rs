@@ -1226,6 +1226,18 @@ fn declared_env(atom: &AtomFile) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// The hosts an atom declares in `network.allow`, as the atom loaded them:
+/// checked against atomic's policy then ([`crate::network::check_hosts`]).
+fn declared_network(atom: &AtomFile) -> Vec<String> {
+    let hosts: Vec<String> = atom.frontmatter["network"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(str::to_owned))
+        .collect();
+    crate::network::check_hosts(&hosts).unwrap_or_default()
+}
+
 /// [`run_exec`] in a workspace [`open_exec_workspace`] opened, which it
 /// closes when the command has ended.
 pub async fn run_exec_opened(
@@ -1314,7 +1326,10 @@ pub async fn run_exec_opened(
         stdin,
         identity.environment(),
         exchange_env,
-        read_only,
+        Reach {
+            read_only,
+            network: declared_network(atom),
+        },
     )
     .await;
     let finished = finish_exec(
@@ -1529,9 +1544,20 @@ async fn finish_exec(
     Ok((output, text))
 }
 
+/// What an exec atom's command reaches beyond its workspace, when its
+/// backend confines it.
+struct Reach {
+    /// The inputs it is given, inside its scratch directory, which it only
+    /// reads.
+    read_only: Vec<PathBuf>,
+    /// The hosts its atom declares, and nothing else; with none, no network.
+    network: Vec<String>,
+}
+
 /// Run an exec atom's command in `workspace`: in its root, with its
 /// environment, `HOME` and `TMPDIR` at its scratch directory, and the step's
 /// effect identity (`effect`), which nothing the atom declares can replace.
+/// A confining backend lets it reach what `reach` says, and nothing else.
 /// The command runs on the blocking pool, never on an executor thread.
 async fn run_command(
     guard: &WorkspaceGuard,
@@ -1540,7 +1566,7 @@ async fn run_command(
     stdin: Vec<u8>,
     effect: [(String, String); 3],
     exchange: Vec<(String, String)>,
-    read_only: Vec<PathBuf>,
+    reach: Reach,
 ) -> Result<atomic_exec::Completed, CommandError> {
     let workspace = guard.workspace();
     let cwd = workspace.require_root()?.clone();
@@ -1571,7 +1597,8 @@ async fn run_command(
         // A confining backend lets it write its scratch directory only.
         writable: workspace.scratch.iter().cloned().collect(),
         // Inside it, the inputs it is given, which it only reads.
-        read_only,
+        read_only: reach.read_only,
+        network: reach.network,
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

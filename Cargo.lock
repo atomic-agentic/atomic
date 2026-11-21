@@ -552,6 +552,7 @@ dependencies = [
  "codex-extension-api",
  "codex-keyring-store",
  "codex-login",
+ "codex-network-proxy",
  "codex-process-hardening",
  "codex-protocol",
  "deno_core",

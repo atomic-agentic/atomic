@@ -185,7 +185,10 @@ command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
 directory and a worktree's git directory out of a turn's reach, its exclusion
 of `/tmp`, and its denial of atomic's private state, to turns and to exec
-atoms' commands; and the confinement of exec atoms' commands itself), it
+atoms' commands; the confinement of exec atoms' commands itself; and their
+network: none unless declared, and through the proxy only the declared hosts,
+on ports 80 and 443, never through another proxy, with the declaration checked
+when the atom loads and again before the command runs), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -270,10 +273,11 @@ CI runs it on Linux, in a job of its own ("Crash suite").
 
 ## Continuous integration
 
-CI (`.github/workflows/ci.yml`) runs on every push to main and every pull
-request, on Linux. The checks that need no Rust build run in small jobs of
-their own. The Rust checks run in parallel jobs, so a pull request waits for
-the slowest one rather than for all of them in turn:
+CI (`.github/workflows/ci.yml`) runs on every push to main, every pull request
+and every merge group of the merge queue, on Linux. The checks that need no
+Rust build run in small jobs of their own. The Rust checks run in parallel
+jobs, so a pull request waits for the slowest one rather than for all of them
+in turn:
 
 | Job | What it runs |
 | --- | --- |
@@ -287,6 +291,13 @@ the slowest one rather than for all of them in turn:
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
 requests too, and nothing in CI waits for it.
+
+Main is merged through a merge queue. Once a pull request's checks pass, it can
+be added to the queue, which runs CI again on the pull request merged onto main
+and the pull requests queued ahead of it (the `merge_group` event), and merges
+it only if those checks pass. So what reaches main has passed CI as it is
+merged, and a pull request is not held back by changes elsewhere on main.
+CodeQL is not one of the queue's checks.
 
 ### Test shards
 
