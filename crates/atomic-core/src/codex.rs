@@ -607,14 +607,7 @@ fn denied_paths(
     // needs no denial of its own beside: a place as it is, or what a place
     // that is a link points at, when that is denied.
     let base = denied.len();
-    let places: Vec<PathBuf> = denied
-        .iter()
-        .filter_map(|p| {
-            let meta = std::fs::symlink_metadata(p).ok()?;
-            let target = real(p);
-            (!meta.file_type().is_symlink() || deniable(&target, true)).then_some(target)
-        })
-        .collect();
+    let places = as_built(&denied);
     let mut links = Vec::new();
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
@@ -1151,7 +1144,11 @@ pub fn run_helper() -> anyhow::Result<()> {
 /// start, a moment later, which that command may then read through; and a
 /// link made while a long-lived command, such as a turn's unified-exec
 /// session, keeps running, since the walk is made once as each command
-/// starts.
+/// starts. Codex's own file helper, which it starts for a turn's file
+/// operations with only PATH, TMPDIR, TMP and TEMP, is not handed
+/// [`PLACES`]: it walks the places inferred from the list's entries, so for
+/// it a place that was already a link when the list was built, and has been
+/// pointed elsewhere since, is not followed again.
 fn deny_links_made_since_the_list() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
@@ -1224,7 +1221,7 @@ pub(crate) const RELISTED: &str = "ATOMIC_SANDBOX_RELISTED";
 pub(crate) const PLACES: &str = "ATOMIC_SANDBOX_PLACES";
 
 /// The places of `guard`'s list, as [`PLACES`] carries them; `None` when it
-/// denies nothing, or a place is not UTF-8.
+/// denies nothing, and an error when a place is not UTF-8.
 fn places_text(guard: &StateGuard) -> anyhow::Result<Option<String>> {
     let StateGuard::Deny(private) = guard else {
         return Ok(None);
@@ -1241,14 +1238,26 @@ fn places_text(guard: &StateGuard) -> anyhow::Result<Option<String>> {
 }
 
 /// When this process is the outer stage of Codex's Linux sandbox helper,
-/// make it non-dumpable, or exit.
+/// make it non-dumpable, or exit. The outer stage stays outside the sandbox
+/// while the command runs and was started with the command's proxy token
+/// in its environment: from then on no process of the same user without
+/// `CAP_SYS_PTRACE` over its user namespace can read that environment
+/// through /proc; between its exec and this prologue, a few milliseconds,
+/// one can. Exec resets it, so a helper started again comes here again;
+/// where the outer stage has no mounts of its own to manage it execs
+/// bubblewrap itself, by which time Codex's helper has taken the token out
+/// of its environment, and the bridges it forked first keep the token,
+/// non-dumpable.
 fn helper_not_dumpable() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox()
         && !is_inner_stage(std::env::args_os())
         && let Err(e) = not_dumpable()
     {
-        crate::log_line!("atomic: cannot make the sandbox helper non-dumpable: {e}");
+        crate::log_line!(
+            "atomic: cannot make the sandbox helper, which holds the command's proxy token, \
+             non-dumpable: {e}"
+        );
         std::process::exit(1);
     }
 }
@@ -1345,11 +1354,9 @@ fn relisted(
     // inside one now made is denied with it: the sandbox cannot mount one
     // inside another.
     let gone = |path: &Path| {
-        late.replaced.iter().any(|r| r == path)
-            || late
-                .targets
-                .iter()
-                .any(|t| path != t && path.starts_with(t))
+        let replaced = late.replaced.iter().any(|r| r == path);
+        let inside_new = inside_any(path, &late.targets);
+        replaced || inside_new
     };
     policy.entries.retain(|e| {
         !(e.access == FileSystemAccessMode::Deny
@@ -1423,7 +1430,9 @@ fn late_link_targets(
                 .iter()
                 .filter(|p| {
                     let p = real(p);
-                    !followed.contains(&p) && !aliases[0].contains(&p)
+                    let found = followed.contains(&p);
+                    let shown = aliases[0].contains(&p);
+                    !(found || shown)
                 })
                 .cloned()
                 .collect()
@@ -1451,6 +1460,25 @@ fn late_link_targets(
         Ok(())
     };
     let mut late = Late::default();
+    // A denied entry that is now a link, however it is spelled: the list
+    // never holds one, and the sandbox cannot mount on one. Its denial is
+    // replaced by that of what it points at, held to the same rules.
+    for entry in denied {
+        if !std::fs::symlink_metadata(entry).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        late.replaced.push(entry.clone());
+        let Ok(target) = std::fs::canonicalize(entry) else {
+            continue;
+        };
+        refuse(entry, &target)?;
+        if deniable(&target, true) && !covered.iter().any(|c| target.starts_with(c)) {
+            late.targets.push(target);
+        }
+    }
+    // The places as the list's builder takes them, which what is found
+    // inside needs no denial of its own beside.
+    let inside = as_built(&places);
     // Every link target the places hold outside them, old and new: what the
     // cap counts, as the list's builder counts it.
     let mut held = std::collections::BTreeSet::new();
@@ -1466,9 +1494,6 @@ fn late_link_targets(
                 continue;
             };
             refuse(place, &target)?;
-            if denied.contains(place) {
-                late.replaced.push(place.clone());
-            }
             if deniable(&target, true) && !covered.iter().any(|c| target.starts_with(c)) {
                 late.targets.push(target.clone());
             }
@@ -1486,7 +1511,7 @@ fn late_link_targets(
             let Ok(target) = std::fs::canonicalize(&link) else {
                 continue;
             };
-            if !deniable(&target, false) || places.iter().any(|p| target.starts_with(real(p))) {
+            if !deniable(&target, false) || inside.iter().any(|p| target.starts_with(p)) {
                 continue;
             }
             held.insert(target.clone());
@@ -1500,12 +1525,15 @@ fn late_link_targets(
     collapse(&mut late.targets);
     // Their second mounts too, held to the same rules.
     if !late.targets.is_empty() {
-        let found = crate::mounts::second_mounts(&[&late.targets])
+        let mut found = crate::mounts::second_mounts(&[&late.targets])
             .map_err(|e| DenyRefused(format!("{e:#}")))?;
         for alias in &found[0] {
             refuse(alias, alias)?;
         }
         let aliases = found[0].len();
+        // A second mount a denial covers already needs none of its own.
+        let uncovered = |a: &PathBuf| !covered.iter().any(|c| real(a).starts_with(c));
+        found[0].retain(uncovered);
         late.targets.extend(found.into_iter().flatten());
         collapse(&mut late.targets);
         let count = held.len() + aliases;
@@ -1539,6 +1567,21 @@ fn collapse(paths: &mut Vec<PathBuf>) {
             paths.push(p.clone());
         }
     }
+}
+
+/// The places a list is built with, resolved, which what is found inside
+/// them needs no denial of its own beside: a place as it is, or what a
+/// place that is a link points at, when that is denied. A place not there
+/// is none.
+fn as_built(places: &[PathBuf]) -> Vec<PathBuf> {
+    places
+        .iter()
+        .filter_map(|p| {
+            let meta = std::fs::symlink_metadata(p).ok()?;
+            let target = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+            (!meta.file_type().is_symlink() || deniable(&target, true)).then_some(target)
+        })
+        .collect()
 }
 
 /// Whether `path` lies inside another of `all`.
@@ -1625,16 +1668,7 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
 /// runs off the kernel keyrings, or exit: with them in reach the command
-/// could read what they hold, or plant a key. The outer stage, which stays
-/// outside the sandbox while the command runs and was started with the
-/// command's proxy token in its environment, is also made non-dumpable, so
-/// that from then on no process of the same user without `CAP_SYS_PTRACE`
-/// over its user namespace can read that environment through /proc; between
-/// its exec and this prologue, a few milliseconds, one can. Exec resets
-/// it: where the outer stage has no mounts of its own to manage it execs
-/// bubblewrap itself, by which time Codex's helper has taken the token out
-/// of its environment, and the bridges it forked first keep the token,
-/// non-dumpable.
+/// could read what they hold, or plant a key.
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1648,13 +1682,6 @@ fn keep_sandbox_off_keyrings() {
         if let Err(e) = kept_off {
             crate::log_line!(
                 "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
-            );
-            std::process::exit(1);
-        }
-        if !inner && let Err(e) = not_dumpable() {
-            crate::log_line!(
-                "atomic: cannot make the sandbox helper, which holds the command's proxy \
-                 token, non-dumpable: {e}"
             );
             std::process::exit(1);
         }
@@ -1922,6 +1949,8 @@ impl atomic_exec::Confine for ExecSandbox {
             clear = [
                 "TMPDIR",
                 "PATH",
+                PLACES,
+                RELISTED,
                 codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY,
             ]
             .into_iter()
@@ -2415,9 +2444,13 @@ where
         _ => None,
     };
     let mut env = spec.env.clone();
-    // The places its list was built with, which the sandbox helper walks
-    // again as each command starts, and takes off before the command runs.
-    if let Some(places) = places_text(guard)? {
+    // The places its list was built with, which the Linux sandbox helper
+    // walks again as each command starts, and takes off before the command
+    // runs. Elsewhere no helper would take it off, and the command would
+    // see the list.
+    if cfg!(target_os = "linux")
+        && let Some(places) = places_text(guard)?
+    {
         env.insert(PLACES.to_owned(), places);
     }
     if let Some(temp) = &temp {
@@ -3507,6 +3540,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_late_link_is_found_and_one_that_cannot_be_denied_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-links");
         let place = dir.join("home/.aws");
         let work = dir.join("work");
@@ -3554,6 +3588,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_static_chain_of_links_finds_nothing_new() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-static");
         let place = dir.join("home/.codex");
         let skills = dir.join("dev/skills");
@@ -3582,6 +3617,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_place_that_became_a_link_is_replaced_by_its_target() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-place");
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -3630,6 +3666,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nested_late_targets_collapse_to_the_outer() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-nested");
         let home = dir.join("home");
         let kept = dir.join("dev/kept");
@@ -3654,6 +3691,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_late_cap_counts_only_links_that_lead_out() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-cap");
         let place = dir.join("home/.password-store");
         std::fs::create_dir_all(place.join("files")).expect("dir");
@@ -3683,6 +3721,16 @@ mod tests {
             .expect_err("refused")
             .to_string();
         assert!(refused.contains("more than the 512"), "{refused}");
+        // As many leading out, none denied yet: refused too, with the new
+        // ones' second mounts counted.
+        let refused = late_link_targets(only, Some(only), &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused
+                .contains("with 0 second mounts of what the new ones point at, more than the 512"),
+            "{refused}"
+        );
     }
 
     /// A place carried from the builder is walked even where the profile
@@ -3691,6 +3739,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_carried_place_is_walked_through_a_link() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("late-carried");
         let ssh = dir.join("home/.ssh");
         let gnupg = dir.join("dev/gnupg");
@@ -3728,6 +3777,279 @@ mod tests {
         let again = Path::new("/again").join(creds.strip_prefix("/").expect("absolute"));
         assert!(late.targets.contains(&creds), "{late:?}");
         assert!(late.targets.contains(&again), "{late:?}");
+        // A second mount a denial covers already needs none of its own.
+        let built = [place.clone(), PathBuf::from("/again")];
+        let late = late_link_targets(&built, Some(only), &[], &[]).expect("walked");
+        assert_eq!(late.targets, [creds], "{late:?}");
+    }
+
+    /// A mount table of the root alone, so that what a test finds does not
+    /// hang on the host's mounts.
+    const ONE_MOUNT: &[u8] = b"1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+
+    /// A denied entry that has become a link is replaced by what it points
+    /// at however it is spelled, as when the place is named through a linked
+    /// directory and the list holds it by its real path, and is held to the
+    /// same rules.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_entry_that_became_a_link_is_replaced_however_it_is_spelled() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("late-spelled");
+        let real_home = dir.join("data/u");
+        std::fs::create_dir_all(&real_home).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        std::fs::create_dir_all(dir.join("work")).expect("dir");
+        link(&real_home, &dir.join("home"));
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        let entry = real(&real_home).join(".netrc");
+        std::fs::write(&entry, "machine x").expect("netrc");
+        // The place as named, through the linked directory; the list's
+        // entry by its real path.
+        let places = [dir.join("home/.netrc")];
+        let denied = [entry.clone()];
+        assert_eq!(
+            late_link_targets(&denied, Some(&places), &[], &[]).expect("walked"),
+            Late::default()
+        );
+        let kept = dir.join("elsewhere/netrc");
+        std::fs::write(&kept, "machine y").expect("netrc");
+        std::fs::remove_file(&entry).expect("unlink");
+        link(&kept, &entry);
+        assert_eq!(
+            late_link_targets(&denied, Some(&places), &[], &[]).expect("walked"),
+            Late {
+                targets: vec![real(&kept)],
+                replaced: vec![entry.clone()],
+            }
+        );
+        // Leading to what the command needs, with no place to walk: the
+        // entry alone refuses.
+        std::fs::remove_file(&entry).expect("unlink");
+        link(&dir.join("work"), &entry);
+        let refused = late_link_targets(&denied, Some(&[]), &[dir.join("work")], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} now leads to", entry.display()))
+                && refused.contains("which this command needs"),
+            "{refused}"
+        );
+    }
+
+    /// The helper, given a profile for a place named through a linked
+    /// directory, which the list denies at both spellings, leaves no link
+    /// denied once the place has become one: the sandbox cannot mount on a
+    /// link.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_under_a_linked_directory_that_became_a_link_leaves_no_link_denied() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("relisted-spelled");
+        let real_home = dir.join("data/u");
+        let work = dir.join("work");
+        let codex = dir.join("codex");
+        for d in [&real_home, &work, &codex, &dir.join("elsewhere")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        link(&real_home, &dir.join("home"));
+        let place = dir.join("home/.netrc");
+        std::fs::write(&place, "machine x").expect("netrc");
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![place.clone()],
+        });
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let args: Vec<std::ffi::OsString> = [
+            "codex-linux-sandbox".to_owned(),
+            "--sandbox-policy-cwd".to_owned(),
+            work.display().to_string(),
+            "--command-cwd".to_owned(),
+            work.display().to_string(),
+            "--permission-profile".to_owned(),
+            serde_json::to_string(&profile).expect("json"),
+            "--".to_owned(),
+            "true".to_owned(),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let places = [place.clone()];
+        assert_eq!(relisted(&args, Some(&places)).expect("nothing new"), None);
+        let kept = dir.join("elsewhere/netrc");
+        std::fs::write(&kept, "machine y").expect("netrc");
+        let real_place = std::fs::canonicalize(&real_home)
+            .expect("real")
+            .join(".netrc");
+        std::fs::remove_file(&real_place).expect("unlink");
+        link(&kept, &real_place);
+        let again = relisted(&args, Some(&places))
+            .expect("relisted")
+            .expect("more denied");
+        let at = again
+            .iter()
+            .position(|a| a == "--permission-profile")
+            .expect("flag");
+        let profile: PermissionProfile =
+            serde_json::from_str(again[at + 1].to_str().expect("text")).expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let denied: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        let links: Vec<&PathBuf> = denied
+            .iter()
+            .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()))
+            .collect();
+        assert!(
+            links.is_empty(),
+            "links left denied: {links:?} in {denied:?}"
+        );
+        assert!(
+            denied.contains(&std::fs::canonicalize(&kept).expect("real")),
+            "{denied:?}"
+        );
+    }
+
+    /// A denial the list holds inside what a new link points at is taken
+    /// out, as the sandbox cannot mount one denial inside another.
+    #[cfg(unix)]
+    #[test]
+    fn a_denial_inside_a_late_target_is_taken_out() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("relisted-inner");
+        let place = dir.join("home/.aws");
+        let kept = dir.join("dev/kept");
+        let work = dir.join("work");
+        let codex = dir.join("codex");
+        for d in [&place, &kept.join("inner"), &work, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let kept = std::fs::canonicalize(&kept).expect("real");
+        let inner = kept.join("inner");
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![place.clone(), inner.clone()],
+        });
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let args: Vec<std::ffi::OsString> = [
+            "codex-linux-sandbox".to_owned(),
+            "--command-cwd".to_owned(),
+            work.display().to_string(),
+            "--permission-profile".to_owned(),
+            serde_json::to_string(&profile).expect("json"),
+            "--".to_owned(),
+            "true".to_owned(),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let places = [place.clone(), inner.clone()];
+        link(&kept, &place.join("kept"));
+        let again = relisted(&args, Some(&places))
+            .expect("relisted")
+            .expect("more denied");
+        let at = again
+            .iter()
+            .position(|a| a == "--permission-profile")
+            .expect("flag");
+        let profile: PermissionProfile =
+            serde_json::from_str(again[at + 1].to_str().expect("text")).expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let denied: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        assert!(denied.contains(&kept), "{denied:?}");
+        assert!(!denied.contains(&inner), "{denied:?}");
+    }
+
+    /// Where no places come with the profile, what the list denies as a
+    /// second mount of a link's target is not walked as a place: a link in
+    /// it, as in what it shows, was never followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_mount_in_the_list_is_not_walked_as_a_place() {
+        let dir = scratch("late-inferred-alias");
+        let place = dir.join("home/.config/gh");
+        let shown = dir.join("dev/gh");
+        let again = dir.join("again/gh");
+        for d in [&place, &shown, &again, &dir.join("secret")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        link(&shown, &place.join("hosts"));
+        let (shown, again) = (real(&shown), real(&again));
+        // `again` is a second mount of what the place's link points at.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            shown.display(),
+            again.display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        std::fs::write(dir.join("secret/key"), "x").expect("key");
+        link(&dir.join("secret/key"), &again.join("key"));
+        let built = [place.clone(), shown.clone(), again.clone()];
+        let late = late_link_targets(&built, None, &[], &[]).expect("walked");
+        assert_eq!(late, Late::default());
+    }
+
+    /// A place that is a link to a directory the list never denies, such as
+    /// one of the system's top-level ones, is no place to hold what a new
+    /// link elsewhere points at: that is denied, as the builder would.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_linked_to_a_never_denied_directory_covers_nothing() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = std::fs::canonicalize(scratch("late-top")).expect("real");
+        let top: PathBuf = dir.components().take(2).collect();
+        assert!(
+            NEVER_DENIED.iter().any(|p| Path::new(p) == top),
+            "{} is not under one of the system's top-level directories",
+            dir.display()
+        );
+        let place = dir.join("home/.aws");
+        std::fs::create_dir_all(&place).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        let linked = dir.join("home/.docker");
+        link(&top, &linked);
+        let places = [place.clone(), linked];
+        let creds = dir.join("elsewhere/creds");
+        std::fs::write(&creds, "x").expect("creds");
+        link(&creds, &place.join("credentials"));
+        let late = late_link_targets(std::slice::from_ref(&place), Some(&places), &[], &[])
+            .expect("walked");
+        // Through the linked place the walk goes over all of that directory,
+        // as the builder's does: what else it finds there is not this test's.
+        assert!(late.targets.contains(&creds), "{late:?}");
     }
 
     /// The helper's own reading of its arguments: a turn's workspace-write

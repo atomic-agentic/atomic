@@ -1,1 +1,1 @@
-sandbox-late-links-places-only|crates/atomic-core/src/codex.rs|                    !followed.contains(&p) && !aliases[0].contains(&p)|                    true // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_static_chain_of_links_finds_nothing_new
+sandbox-late-links-places-only|crates/atomic-core/src/codex.rs|                    let found = followed.contains(&p);|                    let found = false; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_static_chain_of_links_finds_nothing_new

@@ -107,9 +107,14 @@ fn exec_atom(dir: &Path) -> (atomic_core::atom::Atom, atomic_core::compile::Comp
     (atom, compiled)
 }
 
-/// `seen` names none of atomic's own variables and holds none of their
-/// values, and holds `DECLARED=yes`.
+/// `seen` names none of atomic's own variables, nor one meant for the
+/// sandbox helper, and holds none of their values, and holds `DECLARED=yes`.
 fn assert_clean(what: &str, seen: &str) {
+    // What atomic hands the sandbox helper, which takes it off.
+    assert!(
+        !seen.contains("ATOMIC_SANDBOX_"),
+        "{what}: a variable meant for the sandbox helper reached the command: {seen}"
+    );
     for (name, value) in SECRETS {
         // `ATOMIC_DATABASE_URL` holds `DATABASE_URL`: match whole names.
         assert!(
@@ -235,6 +240,8 @@ async fn codex_turn() {
     .await
     .expect("fake model");
     let scratch_root = dir.join("state/scratch");
+    let state = dir.join("atomic-home/projects/p");
+    std::fs::create_dir_all(&state).expect("state");
     let runtime = CodexRuntime {
         paths: CodexPaths::with_helpers(
             PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
@@ -251,7 +258,9 @@ async fn codex_turn() {
         defaults: Default::default(),
         artifacts: Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
-        guard: atomic_core::codex::StateGuard::NoProjectState,
+        // A list of places to deny, so that what carries them to the
+        // sandbox helper is there to leak.
+        guard: atomic_core::codex::StateGuard::deny_state_dir(&state).expect("guard"),
         caches: None,
     };
     let backend =
