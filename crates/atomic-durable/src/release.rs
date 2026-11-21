@@ -291,6 +291,13 @@ pub async fn release_park<R: DurableRuntime>(
                 let Some(park) = read_park(&mut tx, &cmd.park).await? else {
                     return Ok(Err(ReleaseError::NoSuchPark(cmd.park.clone())));
                 };
+                // A finished run has nothing to wake, released or not.
+                if finished(&mut tx, &park.run).await? {
+                    return Ok(Err(ReleaseError::RunFinished {
+                        park: park.id.clone(),
+                        run: park.run.clone(),
+                    }));
+                }
                 if let Some(row) = tx
                     .query_opt(
                         "SELECT released_by FROM atomic_park_releases WHERE park_id = ?",
@@ -302,12 +309,6 @@ pub async fn release_park<R: DurableRuntime>(
                         park: Box::new(park.clone()),
                         by: Principal::stored(row.text("released_by")?),
                         wake_failed: None,
-                    }));
-                }
-                if finished(&mut tx, &park.run).await? {
-                    return Ok(Err(ReleaseError::RunFinished {
-                        park: park.id.clone(),
-                        run: park.run.clone(),
                     }));
                 }
                 if let Some(raise) = &cmd.raise

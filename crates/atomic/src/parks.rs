@@ -11,7 +11,6 @@ use anyhow::Context;
 use atomic_core::credential;
 use atomic_core::state::ProjectState;
 use atomic_durable::Durare;
-use atomic_durable::gate::{HumanCredential, Principal};
 use atomic_durable::release::{self, Raise, ReleaseCommand};
 use atomic_durable::usage::Caps;
 use clap::{Args, Subcommand};
@@ -48,16 +47,18 @@ pub struct ReleaseArgs {
     command_id: Option<String>,
 }
 
-/// The local operator's enrolled credential for this project.
-fn operator_credential(state: &ProjectState) -> anyhow::Result<HumanCredential> {
-    let user = credential::local_user().context("no user name in $USER or $LOGNAME")?;
-    let principal = Principal::local(&user);
-    let store = credential::configured_store(state.root())?;
-    let account = credential::operator_account(state, &user);
-    let secret = credential::operator_secret(store.as_ref(), &account)?.with_context(|| {
-        format!("{principal} has no operator credential here; run atomic gates enroll")
-    })?;
-    Ok(HumanCredential::new(principal, secret))
+/// What `caps` allow, for a person: tokens, active minutes and, when it is
+/// capped, dollars.
+fn allows(caps: &Caps) -> String {
+    let mut said = format!(
+        "{} tokens and {} active minutes",
+        caps.tokens,
+        caps.millis as f64 / 60_000.0
+    );
+    if let Some(micro) = caps.micro_usd {
+        said.push_str(&format!(" and ${:.2}", micro as f64 / 1_000_000.0));
+    }
+    said
 }
 
 /// `value`, rounded to a whole number, for the flag `flag`: refused when it
@@ -104,7 +105,6 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                     None => None,
                 },
             };
-            let credential = operator_credential(state)?;
             // The park as recorded, released or not, so a repeat of the
             // command raises what the first one did.
             let Some(park) = release::park(&rt, &args.park).await? else {
@@ -113,6 +113,7 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                     args.park
                 );
             };
+            let credential = crate::gates::operator_credential(state)?;
             let raise = if raising {
                 let scope = match (&args.scope, park.scope()) {
                     (Some(scope), _) => scope.clone(),
@@ -147,8 +148,12 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
             let released = &release.released;
             match &released.raised {
                 Some(a) => println!(
-                    "{} released by {} ({}); {} now allows {} tokens",
-                    released.park.id, released.by, command_id, a.scope, a.caps.tokens
+                    "{} released by {} ({}); {} now allows {}",
+                    released.park.id,
+                    released.by,
+                    command_id,
+                    a.scope,
+                    allows(&a.caps)
                 ),
                 None => println!(
                     "{} released by {} ({})",

@@ -237,15 +237,13 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
         .await
         .expect("replay");
     assert_eq!(again.released, released);
+    // The run has finished since: another release is told so, not that its
+    // run was woken again.
     let again = release_park(&rt, &mine, command(&park.id, "c2", None))
         .await
-        .expect_err("already released");
+        .expect_err("its run has finished");
     assert!(
-        matches!(&again, ReleaseError::AlreadyReleased { by, wake_failed: None, .. } if *by == operator()),
-        "{again}"
-    );
-    assert!(
-        again.to_string().contains("its run was woken again"),
+        matches!(&again, ReleaseError::RunFinished { .. }),
         "{again}"
     );
     assert!(matches!(
@@ -339,6 +337,7 @@ static PAUSES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Pause
 static WAKES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
     std::sync::LazyLock::new(Mutex::default);
 
+#[cfg(feature = "postgres-tests")]
 /// Hold the next release of `park` after it raised its cap, before it marks
 /// the park released, until the returned pause's second notify fires.
 fn pause_before_marking(park: &str) -> Pause {
@@ -348,6 +347,15 @@ fn pause_before_marking(park: &str) -> Pause {
         .expect("pauses")
         .insert(park.to_owned(), pause.clone());
     pause
+}
+
+/// Wait, at most half a minute, for a release held by `pause` to reach it:
+/// one that fails before it would otherwise hang the test.
+#[cfg(feature = "postgres-tests")]
+async fn reached(pause: &Pause) {
+    tokio::time::timeout(Duration::from_secs(30), pause.0.notified())
+        .await
+        .expect("the first release never reached its pause: it failed or stopped before it");
 }
 
 /// Called by the release transaction after its savepoint and raise.
@@ -394,6 +402,7 @@ async fn bare_park<R: DurableRuntime>(rt: &R, run: &str, tokens: i64) -> String 
     park
 }
 
+#[cfg(feature = "postgres-tests")]
 fn raising(run: &str, tokens: i64) -> Option<Raise> {
     Some(Raise {
         scope: format!("run:{run}"),
@@ -485,7 +494,7 @@ async fn a_release_that_loses_the_park_undoes_its_raise_on_postgres() {
         .await
     });
     // The first has raised the run's cap and holds before marking the park.
-    pause.0.notified().await;
+    reached(&pause).await;
     let won = release_park(
         &*rt,
         &mine,
@@ -549,7 +558,7 @@ async fn a_release_that_loses_its_command_id_undoes_itself_on_postgres() {
         )
         .await
     });
-    pause.0.notified().await;
+    reached(&pause).await;
     release_park(&*rt, &mine, command(&second_park, "shared", None))
         .await
         .expect("the second records the command");
@@ -570,9 +579,43 @@ async fn a_release_that_loses_its_command_id_undoes_itself_on_postgres() {
     );
 }
 
+#[cfg(feature = "postgres-tests")]
 /// The run of park `park` (`<run>:<n>`).
 fn run_of(park: &str) -> String {
     park.rsplit_once(':')
         .map(|(r, _)| r.to_owned())
         .unwrap_or_default()
+}
+
+#[test]
+fn a_repeated_release_says_whether_its_run_was_woken_again() {
+    let park = Park {
+        id: "run-1:3".into(),
+        run: "run-1".into(),
+        step: "plan.park".into(),
+        reason: "no room".into(),
+        parked_at: 1,
+        scope: None,
+    };
+    let woken = ReleaseError::AlreadyReleased {
+        park: Box::new(park.clone()),
+        by: operator(),
+        wake_failed: None,
+    };
+    assert_eq!(
+        woken.to_string(),
+        "park run-1:3 was already released by local:dev; its run was woken again, in case its \
+         wake-up was lost"
+    );
+    let failed = ReleaseError::AlreadyReleased {
+        park: Box::new(park),
+        by: operator(),
+        wake_failed: Some("the store is down".into()),
+    };
+    let said = failed.to_string();
+    assert!(
+        said.contains("waking its run again failed (the store is down)"),
+        "{said}"
+    );
+    assert!(said.contains("atomic runs resume run-1"), "{said}");
 }

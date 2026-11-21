@@ -5249,3 +5249,35 @@ fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
         assert_eq!(model.calls(), 2);
     });
 }
+
+/// `atomic parks release` refuses a negative cap before anything, and a
+/// park that does not exist with how to find the ones that do.
+#[test]
+fn a_release_names_what_is_wrong_with_its_park_or_its_cap() {
+    let dir = scratch("parks-refused");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1", "--tokens=-5"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        t.contains("--tokens must be a whole number, zero or more"),
+        "{t}"
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no park no-such-run:1"), "{t}");
+    assert!(t.contains("`atomic parks list`"), "{t}");
+}
