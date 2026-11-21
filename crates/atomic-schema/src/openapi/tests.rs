@@ -9,6 +9,17 @@ fn yaml(text: &str) -> Value {
         .value
 }
 
+/// What a response that names exactly one media type keeps: that schema,
+/// under the media type as the spec wrote it.
+fn one(media: &str, schema: Value) -> ResponseBody {
+    ResponseBody::Json([(media.to_owned(), schema)].into_iter().collect())
+}
+
+/// The media types a response declares schemas under, as it keeps them.
+fn declared_media(body: &ResponseBody) -> Vec<&str> {
+    body.schemas().map(|(media, _)| media.as_str()).collect()
+}
+
 /// One forecast API, written once for OpenAPI 3.0 and once for 3.1, in
 /// each version's own dialect.
 const V30: &str = r##"openapi: 3.0.3
@@ -176,12 +187,15 @@ fn an_operation_becomes_one_input_object_with_its_parameters_and_body() {
             assert!(!validator.is_valid(&json!({ "latitude": 98, "longitude": -9.1 })));
             assert!(!validator.is_valid(&json!({ "latitude": 1, "longitude": 1, "extra": 1 })));
         }
-        for schema in op
-            .output
-            .iter()
-            .chain(op.responses.values().filter_map(ResponseBody::schema))
-        {
-            registry.validator_for(schema).expect("response schema");
+        for schema in op.output.iter() {
+            registry.validator_for(schema).expect("output schema");
+        }
+        // Every schema a response declares, not only the first: the executor
+        // checks a reply against whichever media type it names.
+        for body in op.responses.values() {
+            for (_, schema) in body.schemas() {
+                registry.validator_for(schema).expect("response schema");
+            }
         }
     }
 }
@@ -386,7 +400,7 @@ paths:
     assert_eq!(*declared("200"), ResponseBody::NoBody);
     assert_eq!(
         *declared("201"),
-        ResponseBody::Json(json!({ "type": "object" })),
+        one("*/*", json!({ "type": "object" })),
         "`*/*` names the schema its body has to fit"
     );
     assert_eq!(
@@ -406,7 +420,7 @@ paths:
     );
     assert_eq!(
         *declared("205"),
-        ResponseBody::Json(json!({ "type": "array" })),
+        one("application/*", json!({ "type": "array" })),
         "`application/*` names the schema its body has to fit"
     );
     assert_eq!(
@@ -490,5 +504,126 @@ paths:
         wild.input["properties"].get("body").is_none(),
         "{}",
         wild.input
+    );
+}
+
+// A response may declare the shape of its body under more than one JSON media
+// type — what it returns normally and the `problem+json` its failures carry,
+// say. Every schema it declares is kept, under the media type as the spec
+// writes it, because a reply says which of them it is by its `Content-Type`:
+// keeping only one would leave a reply of another declared type checked against
+// a schema nothing wrote for it. The first in sorted order is still what the
+// tool's `output` describes, and a component schema reference resolves in every
+// one of them, not only in the first.
+#[test]
+fn every_json_media_types_schema_is_kept_for_a_response() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Many, version: "1" }
+paths:
+  /thing:
+    get:
+      operationId: thing
+      responses:
+        "200":
+          description: three json media types, each with its own schema
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Thing" } }
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+            "text/vnd.acme.echo+json; charset=utf-8": { schema: { type: string } }
+        "201":
+          description: a json media type with no schema beside one with, and a wildcard
+          content:
+            application/json: {}
+            application/vnd.acme.ack+json: { schema: { type: object } }
+            "application/*": { schema: { type: integer } }
+        "202":
+          description: the same type, twice, however the spec spells it
+          content:
+            "Application/JSON; charset=utf-8": { schema: { type: boolean } }
+            application/problem+json: { schema: { type: integer } }
+        "203":
+          description: a json media type with no schema, only
+          content:
+            application/json: {}
+  /echo:
+    post:
+      operationId: echoThing
+      requestBody: { required: true, content: { "text/vnd.acme.echo+json": { schema: { type: object } } } }
+components:
+  schemas:
+    Thing: { type: object, required: [thing], properties: { thing: { type: string } } }
+    Problem: { type: object, required: [title], properties: { title: { type: string } } }
+"##,
+    ))
+    .expect("spec");
+    let op = ops.iter().find(|op| op.name == "thing").expect("the get");
+    let thing = op.responses.get("200").expect("200");
+    assert_eq!(
+        declared_media(thing),
+        [
+            "application/json",
+            "application/problem+json",
+            "text/vnd.acme.echo+json; charset=utf-8",
+        ],
+        "every media type that names a schema, each as the spec writes it"
+    );
+    // Each is its own schema, compiles, and carries the components its
+    // reference needs — none of them is the first one twice.
+    let registry = Registry::new();
+    for (_, schema) in thing.schemas() {
+        registry.validator_for(schema).expect("compiles");
+        assert!(schema.get("$defs").is_some(), "{schema}");
+    }
+    let (_, problem) = thing
+        .schemas()
+        .find(|(media, _)| media.as_str() == "application/problem+json")
+        .expect("the problem media type keeps its own schema");
+    let validator = registry.validator_for(problem).expect("compiles");
+    assert!(validator.is_valid(&json!({ "title": "no such thing" })));
+    assert!(
+        !validator.is_valid(&json!({ "thing": "x" })),
+        "the two schemas are the same schema"
+    );
+    assert_eq!(
+        op.output.as_ref().map(|s| s["$ref"].clone()),
+        Some(json!("#/$defs/Thing")),
+        "the tool describes the first media type's schema, as it did"
+    );
+    // A JSON media type that names no schema adds nothing to keep; the one
+    // beside it is kept, and the wildcard stays preempted by any JSON media
+    // type that names a schema.
+    assert_eq!(
+        declared_media(op.responses.get("201").expect("201")),
+        ["application/vnd.acme.ack+json"],
+        "the only schema it declares"
+    );
+    // The media type is kept as written, so a spec that spells the same type
+    // two ways keeps both, in the order the executor walks them.
+    assert_eq!(
+        declared_media(op.responses.get("202").expect("202")),
+        [
+            "Application/JSON; charset=utf-8",
+            "application/problem+json"
+        ],
+        "sorted by what the spec wrote, so the uppercase spelling first"
+    );
+    // A response whose only JSON media type names no schema still declares a
+    // body nothing describes.
+    assert_eq!(
+        *op.responses.get("203").expect("203"),
+        ResponseBody::NoJsonSchema
+    );
+    // A `+json` type is a JSON media type whichever tree it sits under, so a
+    // request body declared under one is one atomic can send: the operation
+    // stays callable, with that schema as its `body`.
+    let echo = ops
+        .iter()
+        .find(|op| op.name == "echoThing")
+        .expect("the post");
+    assert_eq!(echo.unsupported, None);
+    assert_eq!(
+        echo.input["properties"]["body"],
+        json!({ "type": "object" })
     );
 }

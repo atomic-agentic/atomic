@@ -4,9 +4,29 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The header every reply of `server` carries: a reply that names no media
+/// type, or another one, goes through `server_at`, which writes its own
+/// headers.
+const JSON_HEADER: &str = "content-type: application/json\r\n";
+
 /// A local HTTP server that answers from `replies` in turn and records each
-/// request line, headers and body it receives.
+/// request line, headers and body it receives, each reply a JSON one.
 async fn server(replies: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<String>>>) {
+    server_at(
+        replies
+            .into_iter()
+            .map(|(status, body)| (status, JSON_HEADER, body))
+            .collect(),
+    )
+    .await
+}
+
+/// A local HTTP server answering from `replies` in turn, each with the
+/// headers to write before its `content-length`: what a reply says it is,
+/// that it is at all, and what it carries.
+async fn server_at(
+    replies: Vec<(u16, &'static str, &'static str)>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -42,9 +62,9 @@ async fn server(replies: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<Vec<Str
             log.lock()
                 .expect("log")
                 .push(String::from_utf8_lossy(&buffer).into_owned());
-            let (status, body) = replies.next().unwrap_or((500, "{}"));
+            let (status, headers, body) = replies.next().unwrap_or((500, JSON_HEADER, "{}"));
             let reply = format!(
-                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} X\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = socket.write_all(reply.as_bytes()).await;
@@ -419,6 +439,39 @@ paths:
           content:
             application/json: { schema: { type: object, required: [specific] } }
             "*/*": { schema: { type: object, required: [never_governs] } }
+  /problem:
+    get:
+      operationId: problem
+      responses:
+        "200":
+          description: a thing, or the problem it is, each with its own schema
+          content:
+            application/json: { schema: { type: object, required: [thing], properties: { thing: { type: string } } } }
+            application/problem+json: { schema: { type: object, required: [title], properties: { title: { type: string } } } }
+  /param:
+    get:
+      operationId: param
+      responses:
+        "200": { description: json, however it is spelled, content: { "application/json; charset=utf-8": { schema: { type: object, required: [count], properties: { count: { type: integer } } } } } }
+  /twospelled:
+    get:
+      operationId: twospelled
+      responses:
+        "200":
+          description: two media types, one spelled with parameters
+          content:
+            "application/json; charset=utf-8": { schema: { type: object, required: [count], properties: { count: { type: integer } } } }
+            application/problem+json: { schema: { type: object, required: [title], properties: { title: { type: string } } } }
+  /anytype:
+    get:
+      operationId: anytype
+      responses:
+        "200":
+          description: two json media types and a wildcard naming neither
+          content:
+            application/json: { schema: { type: object, required: [thing], properties: { thing: { type: string } } } }
+            application/problem+json: { schema: { type: object, required: [title], properties: { title: { type: string } } } }
+            "application/*": { schema: { type: object, required: [never_governs] } }
   /wildopen:
     get:
       operationId: wildopen
@@ -819,5 +872,215 @@ async fn a_contentless_default_refuses_a_body_on_an_undeclared_success() {
             .await
             .expect("a blank body is no body"),
         Value::Null
+    );
+}
+
+// A response may declare its body's shape under several JSON media types, and
+// a reply says which of them it is held to by the media type it names: the
+// schemas are different, so each type's reply is checked against its own and a
+// reply that fits another's does not pass. A media type is compared as one is
+// compared — type and subtype whatever their case, parameters such as
+// `charset` ignored, in the media type the spec wrote as well as the one the
+// reply names. A reply that names a media type the response does not declare,
+// or names none, is held to the response's only schema where it has exactly
+// one, and refused where it has several, since nothing then says which governs
+// it. The refusal names the media types the response declares, never the body;
+// a reply of some other media type is held to no schema of its own, and a
+// wildcard beside specific ones governs nothing.
+#[tokio::test]
+async fn a_reply_is_checked_against_the_schema_its_content_type_names() {
+    // The headers a reply names itself by, where that is not plain JSON.
+    const PROBLEM_JSON: &str = "content-type: application/problem+json\r\n";
+    const JSON_UTF8: &str = "content-type: APPLICATION/JSON; charset=UTF-8\r\n";
+    const TEXT_PLAIN: &str = "content-type: text/plain\r\n";
+    const NO_TYPE: &str = "";
+    let (host, _) = server_at(vec![
+        // `/problem` declares two JSON media types, each with its own schema.
+        (200, JSON_HEADER, r#"{"thing": "a"}"#), // fits the one it names
+        (200, PROBLEM_JSON, r#"{"title": "gone"}"#), // fits the one it names
+        (200, PROBLEM_JSON, r#"{"thing": "a"}"#), // fits the other one's only
+        (200, JSON_HEADER, r#"{"title": "gone"}"#), // the same, the other way
+        // `/param` declares one schema, under `application/json; charset=utf-8`.
+        (200, JSON_UTF8, r#"{"count": 1}"#), // its parameters and case ignored
+        (200, JSON_UTF8, r#"{"count": "one"}"#), // and still held to that schema
+        (200, NO_TYPE, r#"{"count": 7}"#),   // names none: the only schema governs
+        (200, TEXT_PLAIN, r#"{"count": 8}"#), // names another: the same fallback
+        // `/twospelled` declares two, one of them written with parameters.
+        (200, PROBLEM_JSON, r#"{"title": "gone"}"#), // its own, not the other's
+        (200, PROBLEM_JSON, r#"{"title": 1}"#),      // and it is held to that one
+        (200, JSON_UTF8, r#"{"count": 3}"#),         // the type written with parameters
+        (200, NO_TYPE, r#"{"anything": 1}"#),        // names none, several are declared
+        (200, TEXT_PLAIN, r#"{"anything": 1}"#),     // names one it does not declare
+        // `/anytype` declares those two media types and a wildcard beside them.
+        (200, PROBLEM_JSON, r#"{"title": "gone"}"#), // the specific one governs
+        (200, NO_TYPE, r#"{"anything": 1}"#),        // and the wildcard settles nothing
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    // Each declared media type's reply is checked against that media type's own
+    // schema: the body that fits it passes, and the one that fits only the other
+    // declared type's schema is refused for what its own wanted.
+    assert_eq!(
+        tools
+            .call("problem", &args)
+            .await
+            .expect("an `application/json` reply that fits"),
+        json!({ "thing": "a" })
+    );
+    assert_eq!(
+        tools
+            .call("problem", &args)
+            .await
+            .expect("an `application/problem+json` reply that fits"),
+        json!({ "title": "gone" })
+    );
+    for (what, wanted, absent) in [
+        (
+            "an `application/problem+json` reply",
+            "\"title\" is a required property",
+            "\"thing\"",
+        ),
+        (
+            "an `application/json` reply",
+            "\"thing\" is a required property",
+            "\"title\"",
+        ),
+    ] {
+        let error = tools
+            .call("problem", &args)
+            .await
+            .expect_err(&format!("{what} whose body fits the other schema"));
+        assert!(
+            matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+            "{what}: {error}"
+        );
+        let said = error.to_string();
+        assert!(said.contains(wanted), "{what}: {said}");
+        assert!(
+            !said.contains(absent),
+            "{what}: checked against the other media type's schema: {said}"
+        );
+    }
+    // One schema, declared under a media type written with parameters: a reply
+    // that names the same type with its own parameters, in its own case, is that
+    // media type and is held to that schema.
+    assert_eq!(
+        tools
+            .call("param", &args)
+            .await
+            .expect("`APPLICATION/JSON; charset=UTF-8` is `application/json`"),
+        json!({ "count": 1 })
+    );
+    let error = tools
+        .call("param", &args)
+        .await
+        .expect_err("the same media type, a body that does not fit");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("/count"), "{error}");
+    // A reply naming no media type, or another one, is held to the only schema
+    // the response declares.
+    assert_eq!(
+        tools
+            .call("param", &args)
+            .await
+            .expect("names no media type, declares one schema"),
+        json!({ "count": 7 })
+    );
+    assert_eq!(
+        tools
+            .call("param", &args)
+            .await
+            .expect("names `text/plain`, declares one schema"),
+        json!({ "count": 8 })
+    );
+    // Two schemas, one of them declared under a media type written with
+    // parameters: a reply matches either, on what the two say once their
+    // parameters are dropped and their case folded.
+    assert_eq!(
+        tools
+            .call("twospelled", &args)
+            .await
+            .expect("the media type the spec wrote plain"),
+        json!({ "title": "gone" })
+    );
+    let error = tools
+        .call("twospelled", &args)
+        .await
+        .expect_err("that media type, a body that breaks its schema");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, .. }),
+        "{error}"
+    );
+    assert!(error.to_string().contains("/title"), "{error}");
+    assert_eq!(
+        tools
+            .call("twospelled", &args)
+            .await
+            .expect("the media type the spec wrote with parameters"),
+        json!({ "count": 3 })
+    );
+    // Where the response declares several schemas and the reply matches none,
+    // nothing says which governs: the reply is refused, and what is said names
+    // the media types the response declares, never the body.
+    for (what, says) in [
+        (
+            "names no media type",
+            "its reply names no media type, which its response declares no schema for",
+        ),
+        (
+            "names `text/plain`",
+            "its reply is `text/plain`, which its response declares no schema for",
+        ),
+    ] {
+        let error = tools.call("twospelled", &args).await.expect_err(&format!(
+            "a reply that {what} while two schemas are declared"
+        ));
+        assert!(
+            matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+            "{what}: {error}"
+        );
+        let said = error.to_string();
+        assert!(said.contains(says), "{what}: {said}");
+        assert!(
+            said.contains("it declares application/json; charset=utf-8, application/problem+json"),
+            "{what}: the media types it declares are not said: {said}"
+        );
+        assert!(
+            !said.contains("anything"),
+            "{what}: the body was echoed: {said}"
+        );
+    }
+    // Beside specific media types a wildcard governs nothing: the reply of one
+    // declared type is held to that type's schema, which asks for something the
+    // wildcard's does not.
+    assert_eq!(
+        tools
+            .call("anytype", &args)
+            .await
+            .expect("the specific schema, not the wildcard's"),
+        json!({ "title": "gone" })
+    );
+    // And a reply naming no media type is not settled by the wildcard either:
+    // the two JSON schemas are still two, and the refusal says those two.
+    let error = tools
+        .call("anytype", &args)
+        .await
+        .expect_err("a wildcard does not make several schemas one");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(
+        said.contains("it declares application/json, application/problem+json"),
+        "{said}"
+    );
+    assert!(
+        !said.contains("application/*") && !said.contains("anything"),
+        "the wildcard was said or the body echoed: {said}"
     );
 }

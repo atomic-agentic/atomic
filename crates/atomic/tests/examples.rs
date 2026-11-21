@@ -416,6 +416,25 @@ fn atomic_check_reads_openapi_toolsets() {
         "{error}"
     );
     std::fs::remove_file(dir.join("toolsets/jobs.openapi.yaml")).expect("remove");
+    // The same for a response that declares its body under more than one media
+    // type: the reply's `Content-Type` picks which schema governs it, so the
+    // second one is checked too, and must compile.
+    std::fs::write(
+        dir.join("toolsets/media.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Media, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: two media types, the second one's schema broken\n          content:\n            application/json: { schema: { type: object } }\n            application/problem+json: { schema: { type: object, properties: { title: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a second media type's schema that does not compile passed"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("media.openapi.yaml") && error.contains("operation `thing`"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/media.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",

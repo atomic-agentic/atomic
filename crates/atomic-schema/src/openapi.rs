@@ -19,15 +19,19 @@
 //! A response is held to a schema the same way, and additionally to the
 //! schema of a wildcard media type (`*/*`, `application/*`) when no JSON
 //! media type names one: such a response declares a body that may be JSON,
-//! so atomic reads it as JSON and checks it. Request bodies are unchanged:
-//! atomic sends a JSON request body under a JSON media type, never under a
-//! wildcard, so a request body declared only under one still leaves a
-//! required body unsupported.
+//! so atomic reads it as JSON and checks it. Every JSON media type that
+//! names a schema is kept for a response, not only one of them, because a
+//! reply says which of them it is by its `Content-Type`. A request body
+//! keeps only the first, which changes nothing about it: atomic sends one
+//! JSON body under one JSON media type, never under a wildcard, so a request
+//! body declared only under a wildcard still leaves a required body
+//! unsupported.
 //!
 //! Each response says which of three things it declares about its body — no
 //! `content` map at all, a `content` map with no schema to check against, or
-//! a schema — as [`ResponseBody`]. Only the first says there is no body to
-//! read; only the last says what shape the body has.
+//! a schema under each media type it names one under — as [`ResponseBody`].
+//! Only the first says there is no body to read; only the last says what
+//! shape the body has.
 
 use serde_json::{Map, Value, json};
 
@@ -45,32 +49,53 @@ pub enum ResponseBody {
     /// It declares a `content` map, but one that gives atomic no schema to
     /// check against: it names only media types atomic does not read and
     /// wildcards that name no schema (`text/plain`,
-    /// `application/octet-stream`, `*/*`, `application/*`), or a JSON media
-    /// type with no `schema`. A body is declared, of a shape nothing in the
-    /// spec describes.
+    /// `application/octet-stream`, `*/*`, `application/*`), or only JSON
+    /// media types with no `schema`. A body is declared, of a shape nothing
+    /// in the spec describes.
     NoJsonSchema,
-    /// It declares a schema, under a JSON media type or under a wildcard
-    /// media type no JSON media type preempts, which its body has to fit.
-    Json(Value),
+    /// It declares one or more schemas, each under a media type its body may
+    /// arrive with: under one or more JSON media types, or, where no JSON
+    /// media type names a schema at all, under one wildcard media type. Every
+    /// media type that names a schema is kept, keyed by how the spec writes
+    /// it, because a reply says which of them it is by its `Content-Type`,
+    /// and what atomic does when the reply names none of them is the
+    /// executor's to decide.
+    Json(std::collections::BTreeMap<String, Value>),
 }
 
 impl ResponseBody {
-    /// The schema a body of this response is checked against, when the
-    /// response declares one.
+    /// The first schema it declares, in the sorted order of the media types
+    /// they are declared under, when it declares one. That one is what the
+    /// tool's `output` describes; a reply is checked against whichever of
+    /// them its `Content-Type` names, see [`ResponseBody::schemas`].
     pub fn schema(&self) -> Option<&Value> {
         match self {
-            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::Json(schemas) => schemas.values().next(),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
     }
 
-    /// The schema to change in place, when there is one;
-    /// [`ResponseBody::schema`] borrows it read-only.
-    fn schema_mut(&mut self) -> Option<&mut Value> {
+    /// Every schema it declares, with the media type each is declared under
+    /// as the spec writes it, in that order. Empty for a response that
+    /// declares none to check a body against.
+    pub fn schemas(&self) -> impl Iterator<Item = (&String, &Value)> {
         match self {
-            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::Json(schemas) => Some(schemas.iter()),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Every schema to change in place, when there are any;
+    /// [`ResponseBody::schema`] borrows the first read-only.
+    fn schemas_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        match self {
+            ResponseBody::Json(schemas) => Some(schemas.values_mut()),
+            ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
+        }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -95,8 +120,10 @@ pub struct Operation {
     /// JSON request body.
     pub input: Value,
     /// The JSON schema of its success response, when it declares one: the
-    /// first success code's, else `default`'s. A tool's output, for what
-    /// describes it; a response is checked against [`Operation::response`].
+    /// first schema the first success code declares, else `default`'s. A
+    /// tool's output, for what describes it; what a reply is checked against
+    /// is [`Operation::response`], and within it whichever schema the reply's
+    /// `Content-Type` names.
     pub output: Option<Value>,
     /// Each response it declares, success or not, by the status it is
     /// declared for as the spec writes it: a code such as `200` or `404`, a
@@ -116,7 +143,9 @@ impl Operation {
     /// never checks, and for a success it declares none of them for. What
     /// the response declares about its body is the [`ResponseBody`] it
     /// comes with; a status can select one that declares no body as well as
-    /// one whose body has a schema.
+    /// one whose body has a schema. A response that declares a schema under
+    /// more than one media type leaves which of them governs a reply to the
+    /// reply's `Content-Type`, which is not known here.
     pub fn response(&self, status: u16) -> Option<(&str, &ResponseBody)> {
         if !(200..=299).contains(&status) {
             return None;
@@ -145,17 +174,18 @@ fn styles_for(place: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether `media` is a JSON media type: `application/json`, with or
-/// without parameters, or a structured `+json` type.
+/// Whether `media` is a JSON media type: `application/json`, with or without
+/// parameters, or a structured `+json` type of any tree (`application/`,
+/// `text/`, vendor or standards-prefixed trees alike), which is what RFC 6839
+/// says a `+json` suffix means.
 pub fn is_json_media(media: &str) -> bool {
     let essence = media_essence(media);
-    essence == "application/json"
-        || (essence.starts_with("application/") && essence.ends_with("+json"))
+    essence == "application/json" || (essence.contains('/') && essence.ends_with("+json"))
 }
 
 /// A media type with its parameters dropped and its case folded, as media
 /// types are compared.
-fn media_essence(media: &str) -> String {
+pub fn media_essence(media: &str) -> String {
     media
         .split(';')
         .next()
@@ -186,22 +216,30 @@ fn declared_body(response: &Value) -> ResponseBody {
         return ResponseBody::NoBody;
     };
     match response_content(content) {
-        Some(schema) => ResponseBody::Json(schema.clone()),
-        None => ResponseBody::NoJsonSchema,
+        schemas if schemas.is_empty() => ResponseBody::NoJsonSchema,
+        schemas => ResponseBody::Json(schemas),
     }
 }
 
-/// The schema a response's body is held to under a `content` map: the first
-/// JSON media type's, as `json_content` picks one, which a wildcard never
+/// The schemas a response's body is held to under a `content` map: every JSON
+/// media type's, as `json_schemas` keeps them, which a wildcard never
 /// overrides; else the first wildcard media type's that names a schema, so
 /// that a response declaring a schema only under `*/*` or `application/*`
 /// holds its body to it. A content map with neither declares a body of a
 /// shape nothing describes.
-fn response_content(content: &Value) -> Option<&Value> {
-    json_content(content).or_else(|| wildcard_content(content))
+fn response_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let schemas = json_schemas(content);
+    if schemas.is_empty() {
+        return wildcard_content(content);
+    }
+    schemas
 }
 
-/// The schema under a `content` map's first JSON media type, if any.
+/// The schema under a `content` map's first JSON media type, if any — which
+/// is what a request body is held to, since atomic sends one JSON body under
+/// one JSON media type. `None` when the first one names no `schema`, even
+/// where a later one does, which is what leaves such a request body
+/// unsupported.
 fn json_content(content: &Value) -> Option<&Value> {
     let content = content.as_object()?;
     let mut keys: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
@@ -209,13 +247,42 @@ fn json_content(content: &Value) -> Option<&Value> {
     keys.first().and_then(|k| content[k.as_str()].get("schema"))
 }
 
+/// Every schema under a `content` map's JSON media types, each keyed by the
+/// media type as the map writes it, because a reply says which of them it is
+/// by its `Content-Type`. A JSON media type naming no `schema` is kept apart
+/// from these: it names nothing to check a body against.
+fn json_schemas(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let Some(content) = content.as_object() else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut types: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
+    types.sort();
+    types
+        .iter()
+        .filter_map(|k| {
+            content[k.as_str()]
+                .get("schema")
+                .map(|schema| ((*k).clone(), schema.clone()))
+        })
+        .collect()
+}
+
 /// The schema under a `content` map's first wildcard media type that names
-/// one, if any, the media types in sorted order.
-fn wildcard_content(content: &Value) -> Option<&Value> {
-    let content = content.as_object()?;
+/// one, if any, the media types in sorted order, keyed by that media type.
+fn wildcard_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(content) = content.as_object() else {
+        return out;
+    };
     let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k)).collect();
     keys.sort();
-    keys.iter().find_map(|k| content[k.as_str()].get("schema"))
+    if let Some((key, schema)) = keys
+        .iter()
+        .find_map(|k| content[k.as_str()].get("schema").map(|s| ((*k).clone(), s)))
+    {
+        out.insert(key, schema.clone());
+    }
+    out
 }
 
 /// Why a spec cannot become a toolset.
@@ -426,13 +493,14 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             }
             // Every response it declares, each with what it declares for its
             // body: a reply is checked against the one for its status, never
-            // another's.
+            // another's, and against the schema of the media type its reply
+            // names, never another one's.
             let mut kept = std::collections::BTreeMap::new();
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
                 for (code, response) in responses {
                     let response = resolve(spec, response, &at)?;
                     let mut body = declared_body(&response);
-                    if let Some(schema) = body.schema_mut() {
+                    for schema in body.schemas_mut() {
                         *schema = convert(schema, &format!("{at}/responses/{code}"))?;
                     }
                     kept.insert(code.clone(), body);
@@ -440,13 +508,16 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             }
             if !defs.is_empty() {
                 input["$defs"] = Value::Object(defs.clone());
-                for schema in kept.values_mut().filter_map(ResponseBody::schema_mut) {
-                    if let Value::Object(map) = schema {
-                        map.insert("$defs".into(), Value::Object(defs.clone()));
+                for body in kept.values_mut() {
+                    for schema in body.schemas_mut() {
+                        if let Value::Object(map) = schema {
+                            map.insert("$defs".into(), Value::Object(defs.clone()));
+                        }
                     }
                 }
             }
-            // The first success's, in the map's sorted order, else default's.
+            // The first schema of the first success, in the map's sorted
+            // order, else default's.
             let output = kept
                 .iter()
                 .find(|(code, _)| code.starts_with('2'))
