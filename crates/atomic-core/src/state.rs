@@ -268,6 +268,29 @@ impl ProjectState {
         self.dir.join("codex")
     }
 
+    /// Every scratch root of the project's backends: `atomic run`, `atomic
+    /// serve` and `atomic eval`'s, and `atomic debug prompt`'s, which is apart because
+    /// that command takes no execution lock. Each backend denies its
+    /// workspaces' commands all of them, its own scratch directory excepted.
+    /// A backend with a scratch root of its own must be added here.
+    fn scratch_roots(&self) -> [PathBuf; 2] {
+        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+    }
+
+    /// The local backend `atomic run`, `atomic serve` and `atomic eval` run
+    /// atoms on, its scratch directories in the state directory.
+    pub fn run_backend(&self) -> atomic_exec::LocalBackend {
+        let [run, _] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())
+    }
+
+    /// The local backend `atomic debug prompt` runs its turn on, beside the
+    /// one runs use.
+    pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
+        let [_, debug] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(debug).denying(self.scratch_roots())
+    }
+
     /// The file the execution lock is held on.
     pub fn lock_file(&self) -> PathBuf {
         self.private_dir().join("runtime.lock")
@@ -619,6 +642,51 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither backend's commands may read the other's attempts: each
+    /// backend of the project denies its workspaces both scratch roots, which
+    /// it makes if they are missing, its own attempt's directory apart.
+    #[test]
+    fn the_run_and_debug_backends_deny_each_others_scratch() {
+        use atomic_exec::ExecutionBackend;
+        let home =
+            std::env::temp_dir().join(format!("atomic-scratch-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let roots = [
+            state.dir().join("scratch"),
+            state.dir().join("scratch-debug"),
+        ];
+        for (what, backend, own) in [
+            ("run", state.run_backend(), &roots[0]),
+            ("debug", state.debug_backend(), &roots[1]),
+        ] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: what.into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            let scratch = workspace.scratch.clone().expect("scratch");
+            assert!(scratch.starts_with(own), "{what}: {}", scratch.display());
+            let mut denied = workspace.denied.clone();
+            denied.sort();
+            assert_eq!(denied, roots.to_vec(), "{what}");
+            for dir in &roots {
+                assert!(dir.is_dir(), "{what}: {} was not made", dir.display());
+            }
+            backend.close(&workspace).expect("closes");
+            let _ = std::fs::remove_dir_all(&roots[0]);
+            let _ = std::fs::remove_dir_all(&roots[1]);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[cfg(unix)]
     #[test]

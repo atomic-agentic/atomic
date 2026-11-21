@@ -493,6 +493,208 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
     });
 }
 
+/// A turn's commands cannot read another live attempt's scratch directory,
+/// its `HOME` or its `TMPDIR`, on its own backend or on another backend of
+/// the project, though a `workspace-write` turn reads and writes its own: a
+/// backend denies a turn every scratch root it names, a writing turn's own
+/// directory apart. A `read-only` turn, which may not write its own, cannot
+/// reach it at all. One turn leaves a secret in both and holds its attempt
+/// open, as does a neighbour on a backend with a scratch root of its own,
+/// while the others look for the secrets everywhere under both roots once
+/// the markers the two leave say they are there.
+#[test]
+fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("scratch-deny");
+        let root = shared_scratch();
+        let sibling = root.with_file_name("scratch-debug");
+        // Two backends of one project, as `atomic run` and `atomic debug
+        // prompt` have, each told to deny the other's scratch root.
+        let backend =
+            Backend::connect(LocalBackend::in_dir(root.clone()).denying([sibling.clone()]))
+                .expect("connects");
+        let neighbours =
+            Backend::connect(LocalBackend::in_dir(sibling.clone()).denying([root.clone()]))
+                .expect("connects");
+        let turn = |commands: Vec<String>, sandbox: Sandbox, backend: &Backend| {
+            let (dir, backend) = (dir.clone(), backend.clone());
+            async move {
+                let mut script: Vec<Reply> = commands.iter().map(|c| tool(c)).collect();
+                script.push(Reply::Text("Done.".into()));
+                let model = FakeModel::start(script).await.expect("fake model");
+                let rt = runtime(&dir, &model);
+                let answer = run_turn(
+                    &rt,
+                    &backend,
+                    &TurnSpec {
+                        prompt: "Do the work.".into(),
+                        sandbox,
+                        ..TurnSpec::default()
+                    },
+                )
+                .await
+                .expect("the turn runs");
+                assert_eq!(answer, "Done.");
+                model
+                    .requests()
+                    .last()
+                    .cloned()
+                    .expect("requests")
+                    .to_string()
+            }
+        };
+        // The markers are in the shared working directory, outside every
+        // scratch root; a look starts once they are there, and gives up
+        // after 30 s.
+        let wait = |marker: &str| {
+            format!("for i in $(seq 300); do [ -e {marker} ] && break; sleep 0.1; done")
+        };
+        let look = |name: &str, under: &Path, secret: &str| {
+            format!(
+                "echo {name}=$(grep -rls {secret} {} 2>/dev/null | grep -c .)",
+                under.display()
+            )
+        };
+        // A holder holds its attempt open until this test, once every look
+        // has ended and it has seen the secrets still there, leaves
+        // `release`: in calls of up to 8 s, under the 10 s a command may run
+        // before its turn goes on, and up to 64 s in all.
+        let hold = |who: &str| {
+            let mut calls = vec![
+                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done"
+                    .to_owned();
+                7
+            ];
+            calls.push(format!(
+                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done; \
+                 [ -e release ] && echo {who}-held"
+            ));
+            calls
+        };
+        let first = tokio::spawn(turn(
+            [
+                vec![
+                    "echo secret-of-the-first > \"$HOME/secret\" && \
+                     echo secret-of-the-first > \"$TMPDIR/secret\" && touch first-wrote && \
+                     echo first-wrote"
+                        .to_owned(),
+                ],
+                hold("first"),
+            ]
+            .concat(),
+            Sandbox::WorkspaceWrite,
+            &backend,
+        ));
+        let neighbour = tokio::spawn(turn(
+            [
+                vec![format!(
+                    "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
+                     {}; {}; touch neighbour-looked",
+                    wait("first-wrote"),
+                    look("neighbour-found", &root, "secret-of-the-first"),
+                )],
+                hold("neighbour"),
+            ]
+            .concat(),
+            Sandbox::WorkspaceWrite,
+            &neighbours,
+        ));
+        let writer = tokio::spawn(turn(
+            vec![format!(
+                "{}; {}; {}; {}; \
+                 echo mine > \"$HOME/m\" && cat \"$HOME/m\" && \
+                 echo also > \"$TMPDIR/m\" && cat \"$TMPDIR/m\" && echo writer-own-ok; \
+                 echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')",
+                wait("first-wrote"),
+                wait("neighbour-wrote"),
+                look("writer-found", &root, "secret-of-the-first"),
+                look("writer-sibling-found", &sibling, "secret-of-the-neighbour"),
+            )],
+            Sandbox::WorkspaceWrite,
+            &backend,
+        ));
+        let reader = tokio::spawn(turn(
+            vec![format!(
+                "{}; {}; \
+                 if ls -A \"$HOME\" >/dev/null 2>&1; then echo reader-home=listed; \
+                 else echo reader-home=unreachable; fi; \
+                 echo reader-home-says=$(ls -A \"$HOME\" 2>&1 | head -1)",
+                wait("first-wrote"),
+                look("reader-found", &root, "secret-of-the-first"),
+            )],
+            Sandbox::ReadOnly,
+            &backend,
+        ));
+        let (writer, reader) = (writer.await.expect("writer"), reader.await.expect("reader"));
+        let cwd = dir.join("project");
+        for _ in 0..300 {
+            if cwd.join("neighbour-looked").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Every look has ended, and what it looked for is still there: the
+        // holders still hold their attempts.
+        assert!(
+            cwd.join("neighbour-looked").exists(),
+            "the neighbour never looked"
+        );
+        assert!(
+            holds(&root, "secret-of-the-first"),
+            "the first's secret was gone"
+        );
+        assert!(
+            holds(&sibling, "secret-of-the-neighbour"),
+            "the neighbour's secret was gone"
+        );
+        std::fs::write(cwd.join("release"), "").expect("release");
+        let (first, neighbour) = (
+            first.await.expect("first"),
+            neighbour.await.expect("neighbour"),
+        );
+        assert!(
+            first.contains("first-wrote") && first.contains("first-held"),
+            "{first}"
+        );
+        assert!(
+            neighbour.contains("neighbour-found=0\\n") && neighbour.contains("neighbour-held"),
+            "the neighbour read the first's scratch: {neighbour}"
+        );
+        // Its own scratch directory holds its TMPDIR and what it wrote.
+        assert!(
+            writer.contains("writer-found=0\\n")
+                && writer.contains("writer-sibling-found=0\\n")
+                && writer.contains("writer-own-ok")
+                && writer.contains("writer-home-own=2\\n"),
+            "the writing turn read another's scratch, or lost its own: {writer}"
+        );
+        // Not an empty directory: one it may not open at all.
+        assert!(
+            reader.contains("reader-found=0\\n")
+                && reader.contains("reader-home=unreachable")
+                && reader.contains("Permission denied"),
+            "the read-only turn read the first's scratch, or reached its own: {reader}"
+        );
+    });
+}
+
+/// Whether a file under `dir` holds `needle`, as this test process, which no
+/// sandbox confines, finds it.
+fn holds(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            holds(&path, needle)
+        } else {
+            std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
+}
+
 /// The variable that says `/tmp` belongs to this test run alone, as in
 /// `scripts/dev.sh`'s container or a CI job's machine: only then does a test
 /// create and remove `/tmp/.codex`, which any Codex session sharing that
