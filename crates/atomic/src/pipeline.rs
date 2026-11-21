@@ -1553,26 +1553,29 @@ async fn turn<C: WorkflowContext>(
                     )));
                 }
             }
-            // An earlier execution's attempt replays as interrupted, but
-            // its command may never have started: a cap refused it and the
-            // step parked. The ledger says which: only a command admitted
-            // may have run.
-            let interrupted = match &guard {
-                Some((begun, false, _, _)) if begun.interrupted() => {
-                    !metered
-                        || ledgered.command_admitted(&at).await.map_err(|e| {
-                            failed(format!("step `{id}`: read its command's attempts: {e}"))
-                        })?
+            // The command may have run before when an earlier execution's
+            // attempt replays as interrupted, or when, in this process, an
+            // earlier run of the body took the workspace this attempt
+            // opened. Either way it may never have started: a cap refused it
+            // and the step parked. For a metered step the ledger says which:
+            // only a command admitted may have run. An unmetered one is
+            // taken to have run.
+            let (replayed, taken) = match &guard {
+                Some((begun, false, opened, _)) => {
+                    let replayed = begun.interrupted();
+                    // A replayed attempt opened no workspace here.
+                    (replayed, !replayed && opened.lock().map_or(true, |o| o.is_none()))
                 }
-                _ => false,
+                _ => (false, false),
             };
-            if let Some((_, false, opened, _)) = &guard
-                && let Some(why) = ran_before(
-                    &atom.name,
-                    interrupted,
-                    opened.lock().map_or(true, |o| o.is_none()),
-                )
-            {
+            let admitted = if (replayed || taken) && metered {
+                ledgered.command_admitted(&at).await.map_err(|e| {
+                    failed(format!("step `{id}`: read its command's attempts: {e}"))
+                })?
+            } else {
+                true
+            };
+            if let Some(why) = ran_before(&atom.name, replayed && admitted, taken && admitted) {
                 return Err(failed(format!(
                     "step `{id}`: outcome_unknown: {why}, so whether its command's effects \
                      happened is unknown. The step is parked and its command does not run \
