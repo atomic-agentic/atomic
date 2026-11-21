@@ -55,6 +55,12 @@ CONTROLS=(
     "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
     "exec-network-recheck|crates/atomic-core/src/codex.rs|            let hosts = crate::network::check_hosts(&hosts)|            let hosts = /*CONTROL_OFF*/ Ok::<Vec<String>, String>(hosts)|--workspace --features ${FEATURES} --test exec_network a_confined_command_reaches_only_the_hosts_it_is_given"
     "exec-network-policy|crates/atomic-core/src/atom.rs|            if let Err(why) = crate::network::check_hosts(&hosts) {|            if let Err(why) = /*CONTROL_OFF*/ Ok::<(), String>(()) { let _ = &hosts;|-p atomic-agentic-core --lib --features fake-model exec_declarations_are_checked_at_load"
+    "stop-subreaper|crates/atomic-exec/src/process.rs|            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);|            let _ = libc::PR_SET_CHILD_SUBREAPER; // CONTROL_OFF|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-wait-complete|crates/atomic-exec/src/process.rs|            if left.is_empty() && complete {|            if left.is_empty() /*CONTROL_OFF*/ {|-p atomic-agentic-exec --lib the_wait_ends_only_after_a_complete_look"
+    "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
+    "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
 )
 
 die() {

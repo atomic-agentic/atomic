@@ -221,10 +221,12 @@ check itself.
 atomic's crash tests kill the process at named failpoints. A failpoint is
 compiled in only with the `failpoints` features of `atomic-agentic-durable` and
 `atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
-release build has none. Two variables drive them:
+release build has none. Three variables drive them:
 
 - `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL, so no core is dumped)
   at the first failpoint of that name;
+- `ATOMIC_FAILPOINT_PANIC=<name>` makes the code that reaches the first
+  failpoint of that name panic, as a bug in atomic would;
 - `ATOMIC_FAILPOINT_LOG=<file>` appends the name of every failpoint the process
   reaches to `<file>`.
 

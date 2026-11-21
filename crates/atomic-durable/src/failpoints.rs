@@ -3,11 +3,14 @@
 //! Named failpoints, where a crash test kills the process.
 //!
 //! A failpoint is a named place in atomic's code. With the `failpoints`
-//! feature, two environment variables drive them:
+//! feature, three environment variables drive them:
 //!
 //! - `ATOMIC_FAILPOINT=<name>`: the process kills itself with SIGKILL at the
 //!   first failpoint of that name. Nothing is flushed, no destructor runs, the
 //!   engine does not shut down and no core is dumped.
+//! - `ATOMIC_FAILPOINT_PANIC=<name>`: the code that reaches the first
+//!   failpoint of that name panics there, as a bug in atomic would; the
+//!   process goes on as it does after any panic.
 //! - `ATOMIC_FAILPOINT_LOG=<file>`: every failpoint the process reaches is
 //!   appended to `<file>`, one name per line, before it is checked. A log
 //!   that cannot be written kills the process too, saying why, so a test
@@ -177,6 +180,11 @@ pub fn failpoint(name: &str) {
         if std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name) {
             eprintln!("failpoint {name}: killing the process");
             kill_self();
+        }
+        // A panic in atomic's own code at this point, for a test of how a
+        // panicked run is reported.
+        if std::env::var("ATOMIC_FAILPOINT_PANIC").is_ok_and(|f| f == name) {
+            panic!("failpoint {name}: atomic's own code panicked here, as a test asked");
         }
     }
     #[cfg(not(feature = "failpoints"))]
