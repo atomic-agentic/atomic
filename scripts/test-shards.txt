@@ -42,6 +42,7 @@ test examples
 test exec_private_state
 test late_links
 test second_mounts
+test stale_roots
 test exec_caches
 test exec_network
 test exec_network_fds
@@ -67,6 +68,7 @@ test git_safety
 test cancelled_open
 test stopping_open
 test worktrees
+test model_client
 test dbos_schema
 test executor_identity
 test gates

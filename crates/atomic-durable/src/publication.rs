@@ -131,7 +131,12 @@ fn digest(proposal: &Proposal) -> Result<String> {
 #[derive(Serialize)]
 enum Turn {
     Candidate(Candidate),
-    Parked { position: i32, reason: String },
+    Parked {
+        position: i32,
+        reason: String,
+        #[serde(default)]
+        scope: Option<String>,
+    },
 }
 
 /// A turn checkpoint as stored. A store written before turns could park
@@ -142,7 +147,12 @@ impl<'de> Deserialize<'de> for Turn {
         #[derive(Deserialize)]
         enum Tagged {
             Candidate(Candidate),
-            Parked { position: i32, reason: String },
+            Parked {
+                position: i32,
+                reason: String,
+                #[serde(default)]
+                scope: Option<String>,
+            },
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -152,9 +162,15 @@ impl<'de> Deserialize<'de> for Turn {
         }
         Ok(match Stored::deserialize(d)? {
             Stored::Tagged(Tagged::Candidate(c)) | Stored::Bare(c) => Turn::Candidate(c),
-            Stored::Tagged(Tagged::Parked { position, reason }) => {
-                Turn::Parked { position, reason }
-            }
+            Stored::Tagged(Tagged::Parked {
+                position,
+                reason,
+                scope,
+            }) => Turn::Parked {
+                position,
+                reason,
+                scope,
+            },
         })
     }
 }
@@ -243,14 +259,23 @@ pub struct Park {
     pub step: String,
     /// Why, for a person.
     pub reason: String,
+    /// The allowance that had no room, when the refusal named one.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// When, in milliseconds since the Unix epoch.
     pub parked_at: i64,
 }
 
 impl Park {
     /// The topic the parked run waits on: a message on it releases the park.
-    pub fn topic(&self) -> String {
+    pub(crate) fn topic(&self) -> String {
         topic(&self.id)
+    }
+
+    /// The allowance that refused the parked call, as the refusal recorded
+    /// it.
+    pub fn scope(&self) -> Option<&str> {
+        self.scope.as_deref()
     }
 }
 
@@ -333,7 +358,11 @@ where
                             digest,
                         }))
                     }
-                    Err(DurableError::Parked(reason)) => Ok(Turn::Parked { position, reason }),
+                    Err(DurableError::Parked { reason, scope }) => Ok(Turn::Parked {
+                        position,
+                        reason,
+                        scope,
+                    }),
                     Err(e) => Err(e),
                 }
             })
@@ -355,9 +384,13 @@ where
                 };
                 return Ok((candidate, told));
             }
-            Turn::Parked { position, reason } => {
+            Turn::Parked {
+                position,
+                reason,
+                scope,
+            } => {
                 first.get_or_insert(position);
-                park(ctx, name, position, reason).await?;
+                park(ctx, name, position, reason, scope).await?;
             }
         }
     }
@@ -369,6 +402,7 @@ async fn park<C: WorkflowContext>(
     turn: &str,
     position: i32,
     reason: String,
+    scope: Option<String>,
 ) -> Result<()> {
     let run = ctx.workflow_id().to_owned();
     let id = format!("{run}:{position}");
@@ -378,6 +412,7 @@ async fn park<C: WorkflowContext>(
         run,
         step: step.clone(),
         reason,
+        scope,
         parked_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -398,6 +433,14 @@ async fn park<C: WorkflowContext>(
                 ],
             )
             .await?;
+            if let Some(scope) = &row.scope {
+                tx.execute(
+                    "INSERT INTO atomic_park_scopes (park_id, scope) VALUES (?, ?) \
+                     ON CONFLICT (park_id) DO NOTHING",
+                    &[Param::Text(row.id.clone()), Param::Text(scope.clone())],
+                )
+                .await?;
+            }
             Ok(())
         })
     })
@@ -411,12 +454,14 @@ async fn park<C: WorkflowContext>(
     }
 }
 
-/// Release `park`: its run runs the parked turn again, admitting its calls
-/// afresh. Releasing does not raise a cap; a release with no more room than
-/// before parks the run again. A person's action, such as raising the cap in
-/// the usage ledger, comes first, from a human credential only. Releasing
-/// the same park twice delivers one wake-up.
-pub async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
+/// Wake `park`'s run: it runs the parked turn again, admitting its calls
+/// afresh. Waking does not raise a cap; a wake with no more room than before
+/// parks the run again. Waking the same park twice delivers one wake-up.
+///
+/// Not public: a person releases a park through
+/// [`crate::release::release_park`], with a human credential, which records
+/// the release and then wakes the run.
+pub(crate) async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
     rt.send(
         &park.run,
         &park.topic(),
@@ -424,6 +469,24 @@ pub async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
         &format!("release:{}", park.id),
     )
     .await
+}
+
+/// Every park with the allowance that refused it, if it named one: what
+/// [`park_from`] reads, as `p` for further conditions.
+pub(crate) const PARKS: &str = "SELECT p.park_id AS park_id, p.run AS run, p.step AS step, \
+     p.reason AS reason, s.scope AS scope, p.parked_at AS parked_at FROM atomic_parks p \
+     LEFT JOIN atomic_park_scopes s ON s.park_id = p.park_id";
+
+/// A park from a row of [`PARKS`].
+pub(crate) fn park_from(r: &crate::runtime::Row) -> Result<Park> {
+    Ok(Park {
+        id: r.text("park_id")?,
+        run: r.text("run")?,
+        step: r.text("step")?,
+        reason: r.text("reason")?,
+        scope: r.text_opt("scope")?,
+        parked_at: r.int("parked_at")?,
+    })
 }
 
 /// The parks recorded for run `run`, oldest first.
@@ -434,22 +497,11 @@ pub async fn parks<R: DurableRuntime>(rt: &R, run: &str) -> Result<Vec<Park>> {
         Box::pin(async move {
             let rows = tx
                 .query_all(
-                    "SELECT park_id, run, step, reason, parked_at FROM atomic_parks \
-                     WHERE run = ? ORDER BY parked_at, park_id",
+                    &format!("{PARKS} WHERE p.run = ? ORDER BY p.parked_at, p.park_id"),
                     &[Param::Text(run)],
                 )
                 .await?;
-            rows.iter()
-                .map(|r| {
-                    Ok(Park {
-                        id: r.text("park_id")?,
-                        run: r.text("run")?,
-                        step: r.text("step")?,
-                        reason: r.text("reason")?,
-                        parked_at: r.int("parked_at")?,
-                    })
-                })
-                .collect()
+            rows.iter().map(park_from).collect()
         })
     })
     .await

@@ -283,8 +283,10 @@ Budgets are partly built: the `budget` field on atoms and workflows, its
 configured defaults and price table, and the durable usage ledger that reserves
 each model call before it is dispatched, and each exec atom's command, by its
 active time, before it starts, settles each once, and parks a run that reaches
-a cap. A released park admits the call again against the caps as stored;
-the command a person uses to raise a cap and release the park is not built yet.
+a cap. A released park admits the call again against the caps as stored.
+`atomic parks list` and `atomic parks release` let the local operator, with
+their enrolled credential, raise a cap and release a park, recorded with who did
+it.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
