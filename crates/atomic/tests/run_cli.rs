@@ -2262,6 +2262,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             "killed at the failpoint: {}",
             text(&out)
         );
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
         let (d, p, e, o) = (dir.clone(), project.clone(), env.clone(), other.clone());
         let out = tokio::task::spawn_blocking(move || {
@@ -2307,6 +2308,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             "killed at the failpoint: {}",
             std::fs::read_to_string(dir.join("serve-killed.log")).unwrap_or_default()
         );
+        assert_eq!(model.calls(), 4, "each run's rank and summarize once");
         ran_once_live(&dir, 1);
         let mut serve = spawn_as(
             &other,
@@ -5921,6 +5923,7 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             .await
             .expect("child");
         assert!(!out.status.success(), "killed: {}", text(&out));
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
         let out = call(b, &["--json", "runs", "resume", "queued-1"])
             .await
