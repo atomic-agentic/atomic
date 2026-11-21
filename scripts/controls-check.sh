@@ -42,7 +42,9 @@ LOG="${STATE}/cargo.log"
 
 # name | file | text to replace | replacement | cargo test arguments. A
 # control guarded by several tests names them all after `--`; each must fail
-# with the control off.
+# with the control off. A row switches off the first place its text is found,
+# so where one control has two sites the text of each is unlike the other's
+# (stop-own-tool and stop-own-tool-wait), and there is a row for each.
 CONTROLS=(
     "git-hardening|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
     "git-filters|crates/atomic-core/src/git.rs|        let mut overrides = (*self.overrides).clone();|        let mut overrides = (*self.overrides).clone(); let names: Vec<String> = { let _ = names; Vec::new() };|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
@@ -73,6 +75,7 @@ CONTROLS=(
     "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
     "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-own-tool-wait|crates/atomic-exec/src/process.rs|                let waited = own(&all, &tools);|                let waited = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
     "exec-caches-own|crates/atomic-core/src/runtime.rs|    env.extend(declared_env(atom));|    writable_roots.extend(caches.map(crate::worktree::Caches::dir).and_then(std::path::Path::parent).map(std::path::Path::to_path_buf)); env.extend(declared_env(atom));|--workspace --features ${FEATURES} --test exec_caches an_exec_steps_caches_are_its_runs_alone_and_go_with_it"
     "signin-personal-only|crates/atomic/src/engine.rs|            (Some(why), true) => {|            (Some(why), true) if std::hint::black_box(false) => {|-p atomic-agentic --test model_auth -- a_shared_store_or_serve_refuses_the_personal_sign_in where_the_sign_in_is_refused_nothing_takes_its_place_and_it_says_what_to_do"
@@ -84,6 +87,11 @@ CONTROLS=(
     "signin-token-overrides|crates/atomic-core/src/codex.rs|        remove(name);|        let _ = name;|-p atomic-agentic-core --lib the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens"
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
+    "ticket-release|crates/atomic-core/src/usage.rs|        if let Some(release) = release {|        if let Some(release) = release.and(None::<Box<dyn FnOnce() + Send>>) /*CONTROL_OFF*/ {|--workspace --features ${FEATURES} --test budgets a_call_whose_task_panics_stops_its_heartbeat"
+    "heartbeat-forgotten|crates/atomic-durable/src/usage.rs|        \"DELETE FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = ?\",|        \"DELETE FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = ? AND 1 = 0\", /*CONTROL_OFF*/|-p atomic-agentic-durable --lib a_heartbeat_is_kept_only_until_its_attempts_time_is_settled"
+    "heartbeat-after-settle|crates/atomic-durable/src/usage.rs|                if running != 1 {|                if running != 1 && /*CONTROL_OFF*/ false {|-p atomic-agentic-durable --lib a_heartbeat_is_kept_only_until_its_attempts_time_is_settled"
+    "owner-measured-time|crates/atomic-durable/src/usage.rs|            let took = active.unwrap_or(now - admitted).clamp(0, reserved);|            let took = active.and(/*CONTROL_OFF*/ None).unwrap_or(now - admitted).clamp(0, reserved);|-p atomic-agentic-durable --lib a_machine_that_slept_is_not_charged_the_sleep"
+    "heartbeat-measured-time|crates/atomic-durable/src/usage.rs|                let seen = admitted.saturating_add(active.max(0)).min(now);|                let seen = /*CONTROL_OFF*/ now.max(admitted.saturating_add(active.max(0)));|-p atomic-agentic-durable --lib a_machine_that_slept_is_not_charged_the_sleep"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
     "review-checked-first|crates/atomic/src/pipeline.rs|    check_reviews(&pipeline)?;|    let _ = check_reviews;|-p atomic-agentic --test pipeline a_hand_built_review_the_loader_would_refuse_is_refused_before_any_call"
     "artifact-hold-gather|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(&s.artifact()?)?);|            let _ = &mut held; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
@@ -92,6 +100,11 @@ CONTROLS=(
     "artifact-hold-release|crates/atomic/src/pipeline.rs|    drop(release);|    std::mem::forget(release); // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_steps_files_are_let_go_once_its_turn_is_recorded"
     "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
     "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
+    "exec-exchange-backend|crates/atomic-core/src/runtime.rs|                    .exchange(&opened)|                    .exchange(&opened).and(atomic_exec::LocalBackend::default().exchange(&opened)) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_remote_backend_gives_inputs_and_hands_a_file_over"
+    "artifact-hold-snapshot-first|crates/atomic/src/retention.rs|    between();|    let held = { between(); held_now(store).await? }; // CONTROL_OFF|-p atomic-agentic --lib retention::tests::the_holds_are_read_before_the_runs"
+    "exec-no-exchange-input|crates/atomic-core/src/runtime.rs|                    return match given.first() {|                    return match given.first().and(None::<&crate::artifact::ArtifactRef>) { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-no-exchange-output|crates/atomic-core/src/runtime.rs|    if none_given|    if std::hint::black_box(false) && none_given|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-exchange-corrupt-source|crates/atomic-core/src/artifact/files.rs|                if content.failed && e.kind() == std::io::ErrorKind::InvalidData {|                if e.kind() == std::io::ErrorKind::InvalidData { let _ = content.failed; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model an_exchanges_own_failure_is_not_a_damaged_blob"
 )
 
 die() {
@@ -345,8 +358,14 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        # And read all of it, so `grep -F` does not stop at the first match:
+        # an earlier stage of the pipe would then die of SIGPIPE, which
+        # pipefail reports as a failure of the pipeline, and a test that did
+        # fail would read as one that was not seen.
+        if ! grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 |
+            grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
+        fi
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2
