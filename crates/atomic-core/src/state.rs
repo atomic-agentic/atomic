@@ -1278,6 +1278,23 @@ pub(crate) fn passwd_name(uid: u32) -> Option<String> {
 /// to: it is accepted only when its target is a directory the user owns and
 /// no one else can enter.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
+    if existing_private_dir(dir)? {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|source| StateError::Create {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// [`private_dir`]'s checks on `dir` where it is, made private as they
+/// make it, without making it: whether it is there. Not there, nothing is
+/// made.
+pub(crate) fn existing_private_dir(dir: &Path) -> Result<bool, StateError> {
     let fail = |source| StateError::Create {
         path: dir.to_owned(),
         source,
@@ -1287,13 +1304,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         why,
     };
     let meta = match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            return builder.create(dir).map_err(fail);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(fail(e)),
         Ok(meta) => meta,
     };
@@ -1303,7 +1314,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         if meta.file_type().is_symlink() {
             let target = std::fs::metadata(dir).map_err(fail)?;
             if target.is_dir() && target.uid() == effective_uid() && target.mode() & 0o077 == 0 {
-                return Ok(());
+                return Ok(true);
             }
             return Err(refuse(
                 "is a symbolic link to a directory that is not yours alone: make the target \
@@ -1328,7 +1339,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     if !meta.is_dir() {
         return Err(refuse("is not a directory".into()));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A readable, collision-resistant id: the root's last component, then the
