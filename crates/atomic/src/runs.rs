@@ -219,7 +219,7 @@ async fn finish(
             // Names and atomic's words only, written as they are: a run id
             // such as `rotate-secret` is not a secret.
             atomic_core::redact::Line::new()
-                .plain(&format!(
+                .shown(&format!(
                     "{who}: {signal}: run {run_id} stays unfinished; continue it with \
                      `atomic runs resume {run_id}`"
                 ))
@@ -331,7 +331,7 @@ pub async fn run(
     // Names only, written as they are: a run id such as `rotate-secret` is
     // not a secret.
     atomic_core::redact::Line::new()
-        .plain(&format!(
+        .shown(&format!(
             "run {run_id}: {} in project {}",
             run.pipeline.name, found.name
         ))
@@ -458,7 +458,7 @@ pub async fn resume(
                 .into());
             }
             atomic_core::redact::Line::new()
-                .plain(&format!("run {id}: resuming"))
+                .shown(&format!("run {id}: resuming"))
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;

@@ -1260,3 +1260,53 @@ fn a_cookie_line_cut_at_a_tails_start_is_not_shown() {
     assert!(!out.contains("SEEDED"), "the cookie's values were shown");
     assert!(out.starts_with('…'), "the tail does not say it was cut");
 }
+
+/// Two keys that redact to the same text each keep their entry: neither
+/// value is lost, nor shown under the other's key.
+#[test]
+fn keys_that_redact_alike_keep_both_entries() {
+    let block = concat!("-----BEGIN PRIVATE", " KEY-----");
+    let mut keyed = json!({
+        format!("{block}1"): "harmless",
+        format!("{block}2"): "rm -rf /",
+    });
+    value(&mut keyed);
+    let fields = keyed.as_object().expect("an object");
+    assert_eq!(fields.len(), 2, "an entry was lost: {keyed}");
+    let mut values: Vec<&str> = fields.values().filter_map(Value::as_str).collect();
+    values.sort_unstable();
+    assert_eq!(values, ["harmless", "rm -rf /"]);
+    assert!(fields.contains_key("[REDACTED]"), "{keyed}");
+    assert!(fields.contains_key("[REDACTED] (2)"), "{keyed}");
+    // Assignments in keys, the same way.
+    let mut assigned = json!({"password=1": "a", "password=2": "b"});
+    value(&mut assigned);
+    assert_eq!(
+        assigned.as_object().expect("an object").len(),
+        2,
+        "{assigned}"
+    );
+    // Redacting again changes nothing.
+    let again = keyed.clone();
+    value(&mut keyed);
+    assert_eq!(keyed, again);
+}
+
+/// A line is written as it was put together, and bounded: atomic's words
+/// and the names in it are never redacted, so a run named for a secret
+/// reads as it is.
+#[test]
+fn a_line_is_written_as_it_was_put_together() {
+    let line = Line::new()
+        .plain("run ")
+        .shown("rotate-secret")
+        .plain(": waits at gate ")
+        .shown("password-reset");
+    assert_eq!(
+        line.written(),
+        "run rotate-secret: waits at gate password-reset"
+    );
+    let long = Line::new().shown(&"x".repeat(MAX_TEXT + 10));
+    assert_eq!(long.written().chars().count(), MAX_TEXT + 1);
+    assert!(long.written().ends_with('…'));
+}
