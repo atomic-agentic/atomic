@@ -120,8 +120,9 @@ pub fn exec_backend(
     paths: &CodexPaths,
     runner: RunnerKind,
 ) -> anyhow::Result<atomic_exec::Backend> {
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
+    // Scratch directories live in the atomic home's `scratch/`, beside
+    // every other project's, outside every directory a sandboxed turn may
+    // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = state.run_backend();

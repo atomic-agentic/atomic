@@ -6411,9 +6411,11 @@ fn first_command_output(model: &FakeModel) -> String {
 }
 
 /// A turn of `atomic run` cannot read what an attempt of `atomic debug
-/// codex-prompt` keeps in its scratch directory, nor the other way round: as
-/// atomic wires each command's backend, each denies its turns both of the
-/// project's scratch roots. What each looks for is there all along.
+/// codex-prompt` keeps in its scratch directory, nor the other way round,
+/// nor what another project's attempts keep in theirs: as atomic wires each
+/// command's backend, each denies its turns the home's whole `scratch/`,
+/// where every project's scratch roots are. What each looks for is there all
+/// along.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[cfg(target_os = "linux")]
@@ -6429,17 +6431,26 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
                 .await
                 .expect("state")
         };
-        let plant = |root: &str| {
-            let secret = state.join(root).join("planted").join("secret");
+        // Every project's scratch roots are in the home's `scratch/`, by
+        // project id.
+        let id = state.file_name().expect("a project id").to_string_lossy().into_owned();
+        let home = state.parent().and_then(Path::parent).expect("the atomic home").to_owned();
+        let plant = |project: &str, root: &str| {
+            let secret = home.join("scratch").join(project).join(root).join("planted/secret");
             std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
-            std::fs::write(&secret, format!("secret-in-{root}")).expect("secret");
+            std::fs::write(&secret, format!("secret-in-{project}-{root}")).expect("secret");
             secret
         };
-        let (in_run, in_debug) = (plant("scratch"), plant("scratch-debug"));
-        let look = |secret: &Path| Reply::Tool {
+        let (in_run, in_debug) = (plant(&id, "run"), plant(&id, "debug"));
+        let in_other = plant("another-project-0123456789ab", "run");
+        let look = |secrets: &[&PathBuf]| Reply::Tool {
             name: "exec_command".into(),
             arguments: json!({
-                "cmd": format!("cat '{}' 2>&1; echo cat-exit=$?", secret.display()),
+                "cmd": secrets
+                    .iter()
+                    .map(|s| format!("cat '{}' 2>&1; echo cat-exit=$?", s.display()))
+                    .collect::<Vec<_>>()
+                    .join("; "),
                 "yield_time_ms": 10000,
             }),
         };
@@ -6454,7 +6465,7 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
             object(json!({"done": {"type": "boolean"}})),
         );
         let model = FakeModel::start(vec![
-            look(&in_debug),
+            look(&[&in_debug, &in_other]),
             Reply::Text(r#"{"done": true}"#.into()),
         ])
         .await
@@ -6477,12 +6488,12 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         assert!(out.status.success(), "{}", text(&out));
         let said = first_command_output(&model);
         assert!(
-            !said.contains("secret-in-scratch-debug") && said.contains("cat-exit=1"),
-            "a run's turn read the debug prompt's scratch: {said}"
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a run's turn read the debug prompt's or another project's scratch: {said}"
         );
 
         // A debug prompt's turn looks in the runs' scratch root.
-        let model = FakeModel::start(vec![look(&in_run), Reply::Text("Done.".into())])
+        let model = FakeModel::start(vec![look(&[&in_run, &in_other]), Reply::Text("Done.".into())])
             .await
             .expect("fake model");
         let url = model.base_url();
@@ -6511,10 +6522,10 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         assert!(out.status.success(), "{}", text(&out));
         let said = first_command_output(&model);
         assert!(
-            !said.contains("secret-in-scratch") && said.contains("cat-exit=1"),
-            "a debug prompt's turn read the runs' scratch: {said}"
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a debug prompt's turn read the runs' or another project's scratch: {said}"
         );
         // The denial kept them out, not the secrets' absence.
-        assert!(in_run.exists() && in_debug.exists());
+        assert!(in_run.exists() && in_debug.exists() && in_other.exists());
     });
 }

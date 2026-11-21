@@ -49,6 +49,9 @@ pub struct ProjectState {
     root: PathBuf,
     dir: PathBuf,
     private: PathBuf,
+    /// Its backends' scratch roots' parent, in the home's `scratch/`, beside
+    /// every other project's.
+    scratch: PathBuf,
 }
 
 /// Why the state directory could not be resolved or created.
@@ -118,6 +121,7 @@ impl ProjectState {
             root: root.to_owned(),
             dir: home.join("projects/test"),
             private: home.join("private/test"),
+            scratch: home.join("scratch/test"),
         }
     }
 
@@ -133,6 +137,7 @@ impl ProjectState {
         Ok(Self {
             dir: home.join("projects").join(&id),
             private: home.join("private").join(&id),
+            scratch: home.join("scratch").join(&id),
             root,
         })
     }
@@ -268,28 +273,39 @@ impl ProjectState {
         self.dir.join("codex")
     }
 
-    /// Every scratch root of the project's backends: `atomic run`, `atomic
+    /// The scratch roots of the project's backends: `atomic run`, `atomic
     /// serve` and `atomic eval`'s, and that of `atomic debug codex-prompt` and
     /// `atomic debug probe`, which is apart because those commands take no
-    /// execution lock. Each backend denies its
-    /// workspaces' commands all of them, its own scratch directory excepted.
-    /// A backend with a scratch root of its own must be added here.
+    /// execution lock. They lie in [`ProjectState::scratch_home`], beside
+    /// every other project's.
     fn scratch_roots(&self) -> [PathBuf; 2] {
-        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+        [self.scratch.join("run"), self.scratch.join("debug")]
+    }
+
+    /// Where every project of the home keeps its backends' scratch roots,
+    /// `<home>/scratch/`: denied whole, by one entry however many projects
+    /// there are, to every backend's commands, their own attempt's directory
+    /// apart, so no turn or command reads another attempt's, of this project
+    /// or another.
+    pub fn scratch_home(&self) -> PathBuf {
+        self.scratch
+            .parent()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.scratch.clone())
     }
 
     /// The local backend `atomic run`, `atomic serve` and `atomic eval` run
-    /// atoms on, its scratch directories in the state directory.
+    /// atoms on.
     pub fn run_backend(&self) -> atomic_exec::LocalBackend {
         let [run, _] = self.scratch_roots();
-        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())
+        atomic_exec::LocalBackend::in_dir(run).denying([self.scratch_home()])
     }
 
     /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
     /// run their turn on, beside the one runs use.
     pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
         let [_, debug] = self.scratch_roots();
-        atomic_exec::LocalBackend::in_dir(debug).denying(self.scratch_roots())
+        atomic_exec::LocalBackend::in_dir(debug).denying([self.scratch_home()])
     }
 
     /// The file the execution lock is held on.
@@ -644,11 +660,13 @@ fn project_id(root: &Path) -> String {
 mod tests {
     use super::*;
 
-    /// Neither backend's commands may read the other's attempts: each
-    /// backend of the project denies its workspaces both scratch roots, which
-    /// it makes if they are missing, its own attempt's directory apart.
+    /// No backend's commands may read another's attempts, of this project or
+    /// another: each backend of the project keeps its scratch root in the
+    /// home's `scratch/`, beside every other project's, and denies its
+    /// workspaces that directory whole, by one entry, which it makes if
+    /// missing; its own attempt's directory is apart.
     #[test]
-    fn the_run_and_debug_backends_deny_each_others_scratch() {
+    fn every_backend_denies_every_projects_scratch() {
         use atomic_exec::ExecutionBackend;
         let home =
             std::env::temp_dir().join(format!("atomic-scratch-roots-{}", std::process::id()));
@@ -656,10 +674,11 @@ mod tests {
         let root = home.join("project");
         std::fs::create_dir_all(&root).expect("project");
         let state = ProjectState::under(&home, &root);
-        let roots = [
-            state.dir().join("scratch"),
-            state.dir().join("scratch-debug"),
-        ];
+        let all = home.join("scratch");
+        assert_eq!(state.scratch_home(), all);
+        let roots = [all.join("test/run"), all.join("test/debug")];
+        // Another project's, which no backend of this one may read.
+        let other = all.join("other/run");
         for (what, backend, own) in [
             ("run", state.run_backend(), &roots[0]),
             ("debug", state.debug_backend(), &roots[1]),
@@ -676,15 +695,22 @@ mod tests {
                 .expect("opens");
             let scratch = workspace.scratch.clone().expect("scratch");
             assert!(scratch.starts_with(own), "{what}: {}", scratch.display());
-            let mut denied = workspace.denied.clone();
-            denied.sort();
-            assert_eq!(denied, roots.to_vec(), "{what}");
-            for dir in &roots {
-                assert!(dir.is_dir(), "{what}: {} was not made", dir.display());
+            assert!(
+                workspace.denied.contains(&all),
+                "{what}: {:?}",
+                workspace.denied
+            );
+            for dir in roots.iter().chain([&other]) {
+                assert!(
+                    workspace.denied.iter().any(|d| dir.starts_with(d)),
+                    "{what}: {} is not denied: {:?}",
+                    dir.display(),
+                    workspace.denied
+                );
             }
+            assert!(all.is_dir(), "{what}: {} was not made", all.display());
             backend.close(&workspace).expect("closes");
-            let _ = std::fs::remove_dir_all(&roots[0]);
-            let _ = std::fs::remove_dir_all(&roots[1]);
+            let _ = std::fs::remove_dir_all(&all);
         }
         let _ = std::fs::remove_dir_all(&home);
     }
