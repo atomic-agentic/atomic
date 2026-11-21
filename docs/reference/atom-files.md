@@ -427,7 +427,10 @@ any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
 overlay) mounted more than once whose root the kernel shows as lost, as
 when a FUSE server is away or another Ceph client renamed the directory;
 or when, on such a filesystem, the place is there and its second place is
-missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
+missing, is another file or directory, or is a link, which is not
+followed, or the place, or the part of it a second mount shows, cannot be
+looked at for a reason other than not being there. A second mount of part
+of a place is checked against that part. Otherwise FUSE (`fuse.*`), 9p,
 virtiofs and other mounts are followed as local ones are. The
 links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
