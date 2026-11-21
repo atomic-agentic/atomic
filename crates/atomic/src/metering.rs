@@ -66,10 +66,12 @@ pub struct BudgetPlan {
     #[serde(default)]
     pub ceilings: Ceilings,
     /// Whether the plan was held to the ceilings and prices of the person
-    /// it ran for when it was made or pinned. A plan recorded before plans
-    /// were has `false`, and a run resumed or recovered with one is held to
-    /// the person's ceilings and prices then; a plan held already keeps its
-    /// own, whatever the configuration says by then.
+    /// it ran for when it was made or pinned. A plan without the record reads
+    /// as `false` and is treated as not held: a run resumed or recovered with
+    /// one is held to the person's ceilings and prices then. Runs of an
+    /// earlier layout are not continued at all, so this is a fail-closed guard
+    /// for a plan of this layout that lacks the record. A plan held already
+    /// keeps its own, whatever the configuration says by then.
     #[serde(default)]
     pub held: bool,
 }
