@@ -19,10 +19,13 @@
 //!
 //! It also keeps anything written within the grace period before it began
 //! reading these, however long the reading and the wait for the store's
-//! lock take. What it cannot see: a producer that stores content more than
-//! a grace period before the step that refers to it is checkpointed. And
-//! what lives in the source tree (eval cases, cassettes, reports) refers to
-//! artifacts no run records, so only the caller's keep set covers it.
+//! lock take, and anything a store holds as it begins reading or as it
+//! sweeps: an exec step holds the files its command handed over from before
+//! they are stored until its turn is checkpointed. What it cannot see: any
+//! other producer that stores content more than a grace period before the
+//! step that refers to it is checkpointed. And what lives in the source tree
+//! (eval cases, cassettes, reports) refers to artifacts no run records, so
+//! only the caller's keep set covers it.
 //!
 //! Nothing sweeps on its own: a caller decides when.
 
@@ -44,17 +47,45 @@ pub struct Kept {
     pub read_at: std::time::SystemTime,
 }
 
-/// Read what a sweep of `store` keeps: `keep` and everything
-/// [`referenced`] finds, with the time the reading began.
+/// Read what a sweep of `store` keeps: `keep`, everything held as the
+/// reading begins, and everything [`referenced`] finds, with the time the
+/// reading began.
+///
+/// The holds are read first: a step lets its hold go once it has recorded
+/// the reference, which the reading of the runs may already have passed,
+/// so the holds the sweep reads later under the store's lock may no longer
+/// show it.
 pub async fn read_kept(
     store: &LocalStore,
     rt: &Durare,
     keep: &BTreeSet<ArtifactRef>,
 ) -> anyhow::Result<Kept> {
+    read_kept_then(store, rt, keep, || {}).await
+}
+
+/// [`read_kept`], calling `between` once the holds are read and before the
+/// runs are: [`read_kept`] calls nothing there, and this module's tests let
+/// a hold go there, as a step that records its reference in that window
+/// would.
+async fn read_kept_then(
+    store: &LocalStore,
+    rt: &Durare,
+    keep: &BTreeSet<ArtifactRef>,
+    between: impl FnOnce(),
+) -> anyhow::Result<Kept> {
     let read_at = std::time::SystemTime::now();
     let mut artifacts = keep.clone();
+    let held = held_now(store).await?;
+    between();
+    artifacts.extend(held);
     artifacts.extend(referenced(store, rt).await?);
     Ok(Kept { artifacts, read_at })
+}
+
+/// What every store holds now, read off the async workers.
+async fn held_now(store: &LocalStore) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let store = store.clone();
+    Ok(tokio::task::spawn_blocking(move || store.held()).await??)
 }
 
 /// Every blob of `present` that `text` may name, in either case: any 64 hex
@@ -193,4 +224,64 @@ pub async fn sweep(
         tokio::task::spawn_blocking(move || store.sweep(&kept.artifacts, grace, kept.read_at))
             .await??,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::artifact::{ArtifactStore, Provenance};
+
+    /// The holds are read before the runs: a step that records its
+    /// reference and lets its hold go while the sweep reads the runs, after
+    /// the sweep has read past its run, still keeps its content.
+    #[test]
+    fn the_holds_are_read_before_the_runs() {
+        atomic_core::testing::on_codex_runtime(async {
+            let dir = std::env::temp_dir().join(format!(
+                "atomic-retention-holds-first-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            rt.launch().await.expect("launch");
+            let store = LocalStore::open(dir.join("artifacts")).expect("artifacts");
+            let patch = store
+                .put(
+                    &mut &b"let go as the runs are read"[..],
+                    Provenance::default(),
+                )
+                .expect("put")
+                .artifact;
+            for blob in store.stored().expect("stored") {
+                let path = dir
+                    .join("artifacts/blobs/sha256")
+                    .join(&blob.digest()[..2])
+                    .join(&blob.digest()[2..]);
+                std::fs::File::open(&path)
+                    .and_then(|f| {
+                        f.set_modified(
+                            std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+                        )
+                    })
+                    .expect("backdate");
+            }
+            let hold = store.hold(&patch).expect("hold");
+            let kept = read_kept_then(&store, &rt, &BTreeSet::new(), || drop(hold))
+                .await
+                .expect("read");
+            let swept = store
+                .sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at)
+                .expect("sweep");
+            assert!(swept.removed.is_empty(), "{swept:?}");
+            assert!(
+                store.contains(&patch).expect("contains"),
+                "removed after its hold was let go"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 }
