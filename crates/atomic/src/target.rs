@@ -285,6 +285,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         budget: Default::default(),
         // Resolved, and recorded, by the run's first step.
         budgets: None,
+        fixture: None,
     })
 }
 
