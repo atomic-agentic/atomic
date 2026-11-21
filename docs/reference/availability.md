@@ -74,11 +74,18 @@ Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
-says so once, waits and tries again for a bounded time (about 7.4 minutes with
-the store's 30-second wait: 11 tries and the pauses between them), then stops
-and is run again. Each stop spends one
-of durare's recoveries of the run, and once they run out the run waits for
-`atomic runs resume`.
+as it pins its definitions or gives an exec atom's command the artifacts its
+input references, says so (a pin once a run, an exec step once each time it
+waits), waits and tries again for a bounded time (about 7.4 minutes with the
+store's 30-second wait: 11 tries and the pauses between them), then stops,
+recording nothing and running nothing, and is run again. A process that is
+stopping waits out no more pauses between tries, though a try already
+waiting on the store's lock runs to the end of that lock's wait. Such stops never count toward dead-lettering the
+run, however many there are; each spends one of durare's recoveries of the
+run, and once they run out the run waits for `atomic runs resume`. The files
+a command hands over are stored after it has run: a store held then is
+waited out a few times, and past that the step's outcome is unknown, as
+after a crash there.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -144,16 +151,18 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them), and the file or directory of yours that a link
-among them points at, up to four directory levels inside a denied directory;
+`KUBECONFIG`, put them), and what a link among them points at, up to four
+directory levels inside a denied directory (except a device, anything under
+the system's program, library and device directories, and, for a link found
+inside a credential place, a program or a directory someone else owns);
 the kernel keyrings; the network, unless an exec atom declares the hosts it
 reaches, and then all but those, which it reaches through atomic's proxy; and
 sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
-`credentials.toml` is not protected. A link to something outside your own
-files, such as a history file linked to `/dev/null`, is left alone, and a
-command does not start when a denial would cover its working directory or a
-directory it may write, or a linked secret lies inside one. Other projects'
+`credentials.toml` is not protected. A command does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place or a linked secret lies two or more levels inside a directory it
+may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
@@ -169,9 +178,10 @@ terminal's path in `/dev/pts` or another process's descriptors. A step that runs
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
-when resumed where the sandbox can start. `atomic serve` instead leaves that run
-unfinished, says so, and goes on serving the others; the run continues when a
-later process recovers it. A sandbox that fails in a way that may pass, such as
+when resumed where the sandbox can start. `atomic serve` instead sets that run
+aside, unfinished, says so, and goes on serving the others; it tries the
+sandbox again, first after a few seconds and then at most a minute apart, and
+the run goes on once the sandbox starts. A sandbox that fails in a way that may pass, such as
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's

@@ -28,10 +28,18 @@
 //! the same hosts. The sandbox helper's bridge opens each connection with a
 //! token atomic made for its command alone (Codex's attribution frame), and
 //! the proxy refuses every request on a connection without a token it issued,
-//! so a sandboxed process or another user's process reaches nothing through
-//! it. A process of the same user outside any sandbox can still read a token
-//! from the helper's environment. A command's token admits no new connection
-//! once the command ends, and the proxy stops once no command needs it.
+//! so no sandboxed process and no other user's process reaches anything
+//! through it. A process of the same user outside any sandbox is not kept
+//! out: it can enter the command's namespaces through /proc and use the
+//! bridge, which adds the token itself. Non-dumpable helpers only narrow who
+//! can read the token: the sandbox helper's outer stage and its bridges, and
+//! `atomic runner`, are non-dumpable once atomic's prologue has run, so only
+//! a process with `CAP_SYS_PTRACE` over their user namespace can read the
+//! token from the helpers' environment or from the runner's memory, where
+//! its request puts it; in the few milliseconds between the helper's exec
+//! and that prologue, a process of the same user can read it too. A
+//! command's token admits no new connection once the command ends, and the
+//! proxy stops once no command needs it.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
@@ -66,8 +74,10 @@ pub const UNATTRIBUTED_REFUSED: &str = "not_from_a_command";
 /// IP addresses in any spelling (dotted, decimal, hexadecimal or octal),
 /// `localhost` and names under it, single-label names (which resolve on the
 /// local network), names under `.local`, `.internal`, `.lan`, `.home.arpa`
-/// and other private suffixes, a bare `*`, and anything with a scheme, a
-/// port, a path or a Unix socket.
+/// and other private suffixes, a bare `*`, a wildcard over a public suffix
+/// (`*.co.uk`, or `*.github.io` from the list's private section, where each
+/// name below is someone else's), and anything with a scheme, a port, a
+/// path or a Unix socket.
 pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
     if hosts.len() > MAX_HOSTS {
         return Err(format!("an atom may declare at most {MAX_HOSTS} hosts"));
@@ -153,19 +163,53 @@ fn check_host(host: &str) -> Result<String, String> {
             "a name on a private network or this machine is not a host an atom may declare",
         );
     }
+    if lower.starts_with("*.") && public_suffix(name) {
+        return refuse(
+            "a wildcard over a public suffix reaches every site anyone has under it; \
+             declare the names you reach, or a wildcard under a name you control",
+        );
+    }
     Ok(lower.strip_suffix('.').unwrap_or(&lower).to_owned())
 }
 
+/// Whether `*.<name>` covers names under which anyone can have a site: when
+/// `name` is a public suffix on the Public Suffix List, from its ICANN
+/// section (`co.uk`) or its private one (`github.io`, `s3.amazonaws.com`),
+/// or when a wildcard rule makes every name just below it one (`*.run.app`,
+/// `*.kawasaki.jp`), which a child that is a suffix shows. A name above a
+/// suffix (`amazonaws.com`, above `s3.amazonaws.com`) passes here; the
+/// proxy keeps such a wildcard from reaching that suffix's names
+/// ([`declared`]).
+fn public_suffix(name: &str) -> bool {
+    let is_suffix = |n: &str| psl::suffix(n.as_bytes()).is_some_and(|suffix| suffix == n);
+    if is_suffix(name) {
+        return true;
+    }
+    is_suffix(&format!("atomic-probe.{name}"))
+}
+
+/// Whether `host` is under `parent` without crossing a public suffix: its
+/// own public suffix is shorter than `parent`, so the site it belongs to is
+/// at or below `parent`. Under `*.amazonaws.com`, `foo.amazonaws.com` is,
+/// and `bucket.s3.amazonaws.com` is not, since `s3.amazonaws.com` is a
+/// suffix of its own, whose sites are other people's.
+fn within_one_site(host: &str, parent: &str) -> bool {
+    psl::suffix(host.as_bytes()).is_some_and(|suffix| suffix.trim().as_bytes().len() < parent.len())
+}
+
 /// Whether `host`, as a request names it, is one of `declared`: the name
-/// itself, or a subdomain of a `*.` name.
+/// itself, or a subdomain of a `*.` name that does not cross a public
+/// suffix below it.
 fn declared(declared: &[String], host: &str) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     declared
         .iter()
         .any(|pattern| match pattern.strip_prefix("*.") {
-            Some(parent) => host
-                .strip_suffix(parent)
-                .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.')),
+            Some(parent) => {
+                host.strip_suffix(parent)
+                    .is_some_and(|rest| rest.len() > 1 && rest.ends_with('.'))
+                    && within_one_site(&host, parent)
+            }
             None => host == *pattern,
         })
 }
@@ -232,13 +276,14 @@ fn denied_addresses(own: &BTreeSet<IpAddr>) -> Vec<String> {
         .collect()
 }
 
-/// `own`, read as this machine's addresses, or why not: a machine always
-/// has its loopback interface's, so a list without any is wrong, and a
-/// proxy given it would refuse none of them.
+/// `own`, read as this machine's addresses, or why not: with its loopback
+/// interface up a machine has at least that one's, so a list without any
+/// is wrong, and a proxy given it would refuse none of them.
 fn checked(own: BTreeSet<IpAddr>) -> anyhow::Result<BTreeSet<IpAddr>> {
     anyhow::ensure!(
         !own.is_empty(),
-        "this machine's network interfaces were listed with no addresses, not even loopback's"
+        "this machine's network interfaces were listed with no addresses; is the loopback \
+         interface up?"
     );
     Ok(own)
 }
@@ -282,7 +327,7 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
     }
     // SAFETY: `list` came from getifaddrs and is not used after this.
     unsafe { libc::freeifaddrs(list) };
-    checked(own)
+    Ok(own)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
@@ -421,15 +466,18 @@ impl Proxies {
     /// test's.
     fn own(&self) -> anyhow::Result<BTreeSet<IpAddr>> {
         #[cfg(test)]
-        if let Some(own) = self
+        let own = match self
             .own_for_tests
             .lock()
             .map_err(|_| anyhow::anyhow!("the test's addresses' lock is poisoned"))?
             .clone()
         {
-            return checked(own);
-        }
-        own_addresses()
+            Some(own) => own,
+            None => own_addresses()?,
+        };
+        #[cfg(not(test))]
+        let own = own_addresses()?;
+        checked(own)
     }
 
     /// Have the proxies take `own` as this machine's addresses.
@@ -525,14 +573,16 @@ mod tests {
     fn only_public_dns_names_may_be_declared() {
         let ok = check_hosts(&[
             "API.example.com".into(),
-            "*.s3.amazonaws.com".into(),
+            "*.example.com".into(),
+            "*.acme.github.io".into(),
             "acme-reports.s3.us-east-1.amazonaws.com.".into(),
         ])
         .expect("public names");
         assert_eq!(
             ok,
             [
-                "*.s3.amazonaws.com",
+                "*.acme.github.io",
+                "*.example.com",
                 "acme-reports.s3.us-east-1.amazonaws.com",
                 "api.example.com"
             ]
@@ -568,6 +618,11 @@ mod tests {
             "user@example.com",
             "-bad.example.com",
             "bad_label.example.com",
+            "*.github.io",
+            "*.s3.amazonaws.com",
+            "*.S3.amazonaws.com.",
+            "*.co.uk",
+            "*.com.au",
         ] {
             assert!(check_hosts(&[refused.into()]).is_err(), "{refused:?}");
         }
@@ -595,6 +650,35 @@ mod tests {
             "xcdn.example.net",
             "api.example.com.evil.test",
             "127.0.0.1",
+        ] {
+            assert!(!declared(&hosts, no), "{no}");
+        }
+    }
+
+    /// A wildcard reaches the names below it only as far as the site they
+    /// belong to: one above a public suffix does not reach that suffix's
+    /// sites, which are other people's.
+    #[test]
+    fn a_wildcard_does_not_reach_across_a_public_suffix_below_it() {
+        let hosts = [
+            "*.amazonaws.com".to_owned(),
+            "*.example.com".to_owned(),
+            "*.acme.github.io".to_owned(),
+            "api.example.net".to_owned(),
+        ];
+        for yes in [
+            "foo.amazonaws.com",
+            "a.b.example.com",
+            "www.acme.github.io",
+            "api.example.net",
+        ] {
+            assert!(declared(&hosts, yes), "{yes}");
+        }
+        for no in [
+            "attacker.s3.amazonaws.com",
+            "x.s3.us-east-1.amazonaws.com",
+            "lb.us-east-1.elb.amazonaws.com",
+            "other.github.io",
         ] {
             assert!(!declared(&hosts, no), "{no}");
         }
@@ -712,9 +796,14 @@ mod tests {
             .prepare(&hosts, &[], HashMap::new())
             .expect("starts");
         // Another command keeps the proxy running after the first ends.
-        let (_, other) = proxies
+        let (other_env, other) = proxies
             .prepare(&hosts, &[], HashMap::new())
             .expect("reused");
+        let other_token =
+            other_env.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone();
+        // A connection dropped at the frame: the proxy accepted it and
+        // answered nothing.
+        let dropped = |got: &str| matches!(got, "none" | "ConnectionReset" | "BrokenPipe");
         let addr = prepared.env["HTTP_PROXY"]
             .trim_start_matches("http://")
             .trim_end_matches('/')
@@ -723,18 +812,17 @@ mod tests {
 
         assert_eq!(fetch(&addr, None), format!("403 {UNATTRIBUTED_REFUSED}"));
         let forged = fetch(&addr, Some(&"0".repeat(64)));
-        assert!(
-            !forged.starts_with("403") && !forged.starts_with("200"),
-            "{forged}"
-        );
+        assert!(dropped(&forged), "{forged}");
         assert_eq!(fetch(&addr, Some(&token)), "403 not_allowed_local");
 
         drop(lease);
         assert_eq!(proxies.running(), 1, "the other command holds it");
         let ended = fetch(&addr, Some(&token));
-        assert!(
-            !ended.starts_with("403") && !ended.starts_with("200"),
-            "{ended}"
+        assert!(dropped(&ended), "{ended}");
+        assert_eq!(
+            fetch(&addr, Some(&other_token)),
+            "403 not_allowed_local",
+            "the other command's token still works"
         );
         drop(other);
     }
@@ -790,7 +878,10 @@ mod tests {
         else {
             panic!("a proxy without this machine's addresses");
         };
-        assert!(refused.to_string().contains("no addresses"), "{refused}");
+        assert!(
+            refused.to_string().contains("loopback interface up"),
+            "{refused}"
+        );
     }
 
     /// A proxy a command prepares refuses this machine's own addresses: one
@@ -853,5 +944,45 @@ mod tests {
             fetch_from(&proxy_of(&first), None, "[2001:db8::5]"),
             "403 denied"
         );
+    }
+
+    /// A wildcard over a public suffix, from the list's ICANN section or its
+    /// private one, would reach every tenant under it, and is refused; a
+    /// wildcard under one tenant's name, and an exact name that is itself a
+    /// suffix, are not.
+    #[test]
+    fn a_wildcard_over_a_public_suffix_is_refused() {
+        for refused in [
+            "*.github.io",
+            "*.s3.amazonaws.com",
+            "*.co.uk",
+            // Instances of wildcard rules (`*.ck`, `*.kawasaki.jp`).
+            "*.co.ck",
+            "*.foo.kawasaki.jp",
+            // Parents of wildcard rules: every name below is a suffix.
+            "*.run.app",
+            "*.kawasaki.jp",
+            "*.elb.amazonaws.com",
+            // On the list, so name the exact hosts instead.
+            "*.googleapis.com",
+            "*.githubusercontent.com",
+            "*.cloudfront.net",
+        ] {
+            let why = check_hosts(&[refused.into()]).expect_err(refused);
+            assert!(why.contains("public suffix"), "{refused}: {why}");
+        }
+        for accepted in [
+            "*.example.com",
+            "*.acme.github.io",
+            "github.io",
+            "allowed.invalid",
+            // An exception to the `*.kawasaki.jp` rule is one site.
+            "*.city.kawasaki.jp",
+            // Above a suffix: it loads, and the proxy keeps it to its own
+            // sites (see the next test).
+            "*.amazonaws.com",
+        ] {
+            assert!(check_hosts(&[accepted.into()]).is_ok(), "{accepted}");
+        }
     }
 }

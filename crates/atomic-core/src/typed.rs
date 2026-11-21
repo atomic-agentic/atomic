@@ -116,6 +116,12 @@ pub enum AtomError {
     /// is room.
     #[error("{0}")]
     NoRoom(String),
+    /// The artifact store was held elsewhere, such as by a sweep, for as
+    /// long as the step waits to give its command its inputs; nothing ran.
+    /// Not a failure of the atom: a durable run stops without recording
+    /// anything, and is run again.
+    #[error("{0}")]
+    StoreHeld(String),
     /// This process is stopping, so a step that waited for its workspace
     /// gave up the wait; nothing ran, and nothing is recorded.
     #[error("this process is stopping")]

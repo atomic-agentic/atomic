@@ -81,7 +81,7 @@ fn plain_git(dir: &Path, args: &[&str]) {
 /// reported as `<name>=ok:<what>` or `<name>=refused:<why>`.
 const PROBE: &str = r#"
 import ctypes, glob, os, platform, socket, sqlite3, sys, time
-state, gate, key, description, sock = sys.argv[1:6]
+state, gate, key, description, sock, private = sys.argv[1:7]
 
 def attempt(name, f):
     try:
@@ -90,7 +90,7 @@ def attempt(name, f):
         print(f"{name}=refused:{type(e).__name__}: {e}", flush=True)
 
 def forge():
-    db = sqlite3.connect(os.path.join(state, "private", "atomic.db"), timeout=10)
+    db = sqlite3.connect(os.path.join(private, "atomic.db"), timeout=10)
     n = db.execute(
         "UPDATE atomic_gates SET state = 'approved', decided_by = 'local:dev', "
         "decided_at = ?, command_id = 'forged' WHERE gate_id = ? AND state = 'open'",
@@ -165,7 +165,7 @@ def connect():
     return "connected"
 
 attempt("forge", forge)
-attempt("list", lambda: os.listdir(os.path.join(state, "private")))
+attempt("list", lambda: os.listdir(private))
 attempt("codexdb", codex_db)
 attempt("key", lambda: read(int(key)))
 attempt("search", search)
@@ -281,6 +281,23 @@ async fn sandboxed(
     cwd: &Path,
     command: &str,
 ) -> String {
+    let (output, answer) = try_sandboxed(dir, state, guard, cwd, command).await;
+    assert_eq!(answer.unwrap(), "Done.");
+    output()
+}
+
+/// [`sandboxed`], returning the turn's answer, and what the command printed
+/// once asked for.
+async fn try_sandboxed(
+    dir: &Path,
+    state: &Path,
+    guard: &StateGuard,
+    cwd: &Path,
+    command: &str,
+) -> (
+    impl FnOnce() -> String,
+    Result<String, atomic_core::AtomError>,
+) {
     let model = FakeModel::start(vec![
         Reply::Tool {
             name: "exec_command".into(),
@@ -310,11 +327,13 @@ async fn sandboxed(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: guard.clone(),
-        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
         caches: None,
     };
+    let backend =
+        atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap();
     let answer = atomic_core::runtime::run_turn(
         &runtime,
+        &backend,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
@@ -322,10 +341,57 @@ async fn sandboxed(
             ..TurnSpec::default()
         },
     )
-    .await
-    .unwrap();
-    assert_eq!(answer, "Done.");
-    command_output(&model)
+    .await;
+    (move || command_output(&model), answer)
+}
+
+/// A turn that may write a directory holding the gate store two levels
+/// down, where a command could move it away from its denial, never starts:
+/// the turn fails as the machine's doing, and its command never runs.
+#[test]
+fn a_turn_that_could_move_the_private_state_away_never_starts() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-movable-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "project",
+            "state/codex",
+            "state/keep/private",
+            "bin",
+            "credentials",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let state = dir.join("state");
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: state.join("keep/private"),
+            also: vec![dir.join("credentials")],
+        });
+        let (_, answer) = try_sandboxed(
+            &dir,
+            &state,
+            &guard,
+            &dir.join("project"),
+            "echo the-command-ran",
+        )
+        .await;
+        match answer {
+            Err(atomic_core::AtomError::Runtime(why)) => {
+                assert!(why.contains("may write"), "{why}")
+            }
+            other => panic!("the turn was not refused as the machine's: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]
@@ -335,13 +401,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("atomic-self-approval-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        for sub in [
-            "project",
-            "state/codex",
-            "state/private",
-            "bin",
-            "credentials",
-        ] {
+        for sub in ["project", "state/codex", "private", "bin", "credentials"] {
             std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
         let dir = std::fs::canonicalize(dir).unwrap();
@@ -357,8 +417,10 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
         .unwrap();
         std::fs::write(dir.join("bin/probe.py"), PROBE).unwrap();
 
-        // A run waits at its gate, in the gate store in the private state.
-        let mut rt = Durare::sqlite(&state.join("private/atomic.db"))
+        // A run waits at its gate, in the gate store in the private state,
+        // which is beside the project states, as atomic keeps it: one
+        // inside a directory the turn may write would be refused.
+        let mut rt = Durare::sqlite(&dir.join("private/atomic.db"))
             .await
             .unwrap();
         register(&mut rt);
@@ -419,7 +481,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
-            private: state.join("private"),
+            private: dir.join("private"),
             also: vec![dir.join("credentials")],
         });
         // Files Codex reads from its home, which a command must not plant
@@ -446,11 +508,12 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .collect();
         let command = format!(
             "printf 'changed\\n' > a.txt; echo wrote-exit=$?; {plants}\
-             python3 {} {} {} {key} {description} {}",
+             python3 {} {} {} {key} {description} {} {}",
             dir.join("bin/probe.py").display(),
             state.display(),
             opened.id,
             sock.display(),
+            dir.join("private").display(),
         );
         let output = sandboxed(&dir, &state, &guard, &wt.path, &command).await;
         let planted = Command::new("python3")
@@ -741,13 +804,14 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
                 private: state.join("private"),
                 also: vec![dir.join("credentials")],
             }),
-            backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-                dir.join("scratch-root"),
-            ))
-            .unwrap(),
         };
+        let exec = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+            dir.join("scratch-root"),
+        ))
+        .unwrap();
         let answer = atomic_core::runtime::run_turn(
             &runtime,
+            &exec,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,

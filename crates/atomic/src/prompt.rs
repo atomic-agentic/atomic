@@ -309,6 +309,32 @@ fn ask(g: &Gate) {
         .prompt();
 }
 
+/// A fault a person is told about once: the gate store is read again and
+/// again while a gate is shown, and one that outlives a single read must
+/// not be written on every pass. The same fault again is silence; a
+/// different one, or the store answering, lets it be said again.
+#[derive(Default)]
+struct Notice {
+    said: Option<String>,
+}
+
+impl Notice {
+    /// Whether `what` is not the fault already said, and remember it as
+    /// said.
+    fn is_new(&mut self, what: &str) -> bool {
+        if self.said.as_deref() == Some(what) {
+            return false;
+        }
+        self.said = Some(what.to_owned());
+        true
+    }
+
+    /// The store answered: a fault that comes back is news again.
+    fn clear(&mut self) {
+        self.said = None;
+    }
+}
+
 /// Why the prompt for a gate ended.
 enum Done {
     /// Its decision is recorded, or it was resolved elsewhere.
@@ -324,6 +350,8 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
     flush_input();
     lines.drain();
     describe(g);
+    // A store that keeps failing is said once, not on every pass.
+    let mut failing = Notice::default();
     loop {
         // Taken before the prompt is written: a reply to it arrives after
         // the write, so it is never older than this, however long this
@@ -353,8 +381,13 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
                         .log();
                     return Done::Settled;
                 }
-                Err(e) => atomic_core::log_line!("\nthe gate store: {e}"),
-                _ => {}
+                Ok(_) => failing.clear(),
+                Err(e) => {
+                    let e = e.to_string();
+                    if failing.is_new(&e) {
+                        atomic_core::log_line!("\nthe gate store: {e}");
+                    }
+                }
             }
             if g.deadline.is_some_and(|d| now_ms() >= d) {
                 Line::new()
@@ -418,7 +451,7 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
 pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
     let mut done: BTreeSet<String> = BTreeSet::new();
     let mut lines: Option<Lines> = None;
-    let mut failing: Option<String> = None;
+    let mut failing = Notice::default();
     loop {
         let open = match gate::gates(
             rt,
@@ -430,15 +463,14 @@ pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
         .await
         {
             Ok(open) => {
-                failing = None;
+                failing.clear();
                 open
             }
             Err(e) => {
                 // Said once, not every poll.
                 let said = e.to_string();
-                if failing.as_deref() != Some(said.as_str()) {
+                if failing.is_new(&said) {
                     atomic_core::log_line!("cannot read the gate store: {said}");
-                    failing = Some(said);
                 }
                 Vec::new()
             }
@@ -506,6 +538,32 @@ mod tests {
             }),
             resolution: None,
         }
+    }
+
+    /// A store that stays broken is told once, not on every 50 ms pass, and
+    /// can be told again once it changes or answers.
+    #[test]
+    fn a_store_fault_is_said_once_until_it_changes_or_clears() {
+        let mut failing = Notice::default();
+        assert!(
+            failing.is_new("database is locked"),
+            "the first pass says it"
+        );
+        assert!(
+            !failing.is_new("database is locked"),
+            "the same fault on the next pass is silence"
+        );
+        assert!(
+            failing.is_new("no such table: gate"),
+            "a different fault is news again"
+        );
+        assert!(!failing.is_new("no such table: gate"));
+        failing.clear();
+        assert!(
+            failing.is_new("no such table: gate"),
+            "after the store answers, the fault coming back is news"
+        );
+        assert!(!failing.is_new("no such table: gate"));
     }
 
     #[test]

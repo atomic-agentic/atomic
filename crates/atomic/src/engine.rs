@@ -141,14 +141,40 @@ pub fn exec_backend(
     ));
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
-        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
-            workspaces: local,
-            ..ProcessRunner::atomic(
-                std::env::current_exe().context("find atomic's own executable for its runners")?,
-            )
-        }),
+        RunnerKind::Process => atomic_exec::Backend::connect(process_runner(
+            local,
+            std::env::current_exe().context("find atomic's own executable for its runners")?,
+        )),
     }
     .context("connect to the execution backend")
+}
+
+/// The runner `--runner process` runs each command in: `atomic runner`,
+/// from `atomic`, with only `PATH` from this process's environment, opening
+/// workspaces on `local`.
+fn process_runner(local: atomic_exec::LocalBackend, atomic: std::path::PathBuf) -> ProcessRunner {
+    ProcessRunner {
+        workspaces: local,
+        ..ProcessRunner::atomic(atomic)
+    }
+}
+
+#[cfg(test)]
+mod process_runner_tests {
+    /// The runner `--runner process` starts gets only `PATH` from atomic's
+    /// environment, and is `atomic runner`.
+    #[test]
+    fn the_process_runner_gets_only_path_from_atomics_environment() {
+        assert!(std::env::var_os("PATH").is_some(), "this test needs PATH");
+        let runner = super::process_runner(
+            atomic_exec::LocalBackend::default(),
+            std::path::PathBuf::from("/opt/atomic"),
+        );
+        let names: Vec<&str> = runner.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["PATH"]);
+        assert_eq!(runner.args, ["runner"]);
+        assert_eq!(runner.program, std::path::PathBuf::from("/opt/atomic"));
+    }
 }
 
 /// The endpoint a replay of recorded model calls names: where the calls
@@ -424,14 +450,10 @@ pub async fn open(
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
-            backend: exec.clone(),
             caches: None,
         },
-        lite: LiteRuntime {
-            backend: exec.clone(),
-            ..LiteRuntime::new(endpoint, AtomConfig::default())
-        },
-        exec,
+        lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        backend: exec,
         exec_meter: Default::default(),
         clock: None,
     });
