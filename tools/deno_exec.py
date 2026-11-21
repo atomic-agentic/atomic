@@ -60,6 +60,18 @@ def _require(condition, message):
 LOCK_FIX = "name a lockfile inside the project, such as deno.lock"
 
 
+def _unresolvable(where, fix, error):
+    """Refuses a path whose symlinks cannot be followed, naming the path and the fix.
+
+    An OSError carries a symlink loop as ELOOP; older pathlibs raise a plain
+    RuntimeError for one, which is the only thing strict resolving can raise
+    that is not an OSError. Anything else is said as the system told it.
+    """
+    loop = error.errno == errno.ELOOP if isinstance(error, OSError) else isinstance(error, RuntimeError)
+    reason = "is a symlink loop" if loop else f"cannot be resolved ({error})"
+    raise ValueError(f"{where} {reason}; {fix}") from error
+
+
 def _settled(path, where, fix):
     """The real place `path` names, with every symlink above it followed.
 
@@ -73,8 +85,10 @@ def _settled(path, where, fix):
     version -- as a missing file, as an OSError, or as a RuntimeError -- none
     of which says what to fix. So the part of the path that exists is settled
     strictly, links followed, and the part that does not exist is put back
-    unchanged. Every refusal says which path is wrong and what to write
-    instead.
+    unchanged -- except a `..` among it, which is refused: put back, it moves
+    the settled path, and every caller compares that path against the project
+    without resolving it again. Every refusal says which path is wrong and
+    what to write instead.
     """
     tail = path if path.is_absolute() else Path.cwd() / path
     missing = []
@@ -87,15 +101,24 @@ def _settled(path, where, fix):
         settled = tail.resolve(strict=True)
     except FileNotFoundError:
         # A link to a file that is not there settles as far as it goes, so
-        # that the caller still reports the file itself as missing.
-        settled = tail.resolve(strict=False)
+        # that the caller still reports the file itself as missing. That
+        # settling follows links of its own, so it meets a symlink loop too:
+        # a link that points round has nothing at its end either, and is
+        # refused as a loop rather than raising out of the check.
+        try:
+            settled = tail.resolve(strict=False)
+        except (OSError, RuntimeError) as error:
+            _unresolvable(where, fix, error)
     except (OSError, RuntimeError) as error:
-        # An OSError carries the loop as ELOOP; older pathlibs raise a plain
-        # RuntimeError for one, which is the only thing strict resolving can
-        # raise that is not an OSError.
-        loop = error.errno == errno.ELOOP if isinstance(error, OSError) else isinstance(error, RuntimeError)
-        reason = "is a symlink loop" if loop else f"cannot be resolved ({error})"
-        raise ValueError(f"{where} {reason}; {fix}") from error
+        _unresolvable(where, fix, error)
+    # What is not there goes back as it was written, so a `..` among it would
+    # take the settled path with it, out of the project and past every
+    # comparison the caller makes -- each caller compares the settled path
+    # against the project without resolving it again. The walk only peels a
+    # component it cannot see, so this is reached by a directory that is
+    # missing and by one the checker may not enter alike; neither has a place
+    # a `..` could go up from.
+    _require(".." not in missing, f"{where} goes up from a directory that is not there or cannot be read; {fix}")
     for name in reversed(missing):
         settled = settled / name
     return settled
@@ -103,7 +126,7 @@ def _settled(path, where, fix):
 
 def _project(manifest):
     """The settled directory a manifest stands in, which holds the project."""
-    return _settled(manifest.parent, f"{manifest}: the project directory", "keep the manifest in a directory that exists")
+    return _settled(manifest.parent, f"{manifest}: the project directory", "keep the manifest in a project directory that exists")
 
 
 def check_manifest(config, manifest):
@@ -142,11 +165,19 @@ def check_manifest(config, manifest):
     # manifest is read, against the project directory the manifest stands in,
     # whether or not an atom ever reads it.
     declared = deno.get("lock", "deno.lock")
-    _require(isinstance(declared, str) and declared,
+    # A NUL is not a name anything can open, so it is refused as the wrong name
+    # for the key rather than reaching the file system and raising there.
+    _require(isinstance(declared, str) and declared and "\x00" not in declared,
              f"{manifest}: runtime.deno.lock is {deno.get('lock')!r}, not a path to a lockfile; {LOCK_FIX}")
     lock = _settled(project / declared, f"{manifest}: runtime.deno.lock {declared!r}", LOCK_FIX)
     _require(lock.is_relative_to(project),
              f"{manifest}: runtime.deno.lock {declared!r} is {lock}, which is outside the project; {LOCK_FIX}")
+    # What the manifest names is the manifest's own fault to put right, so a
+    # route to the lock that the checker cannot walk is refused here, whether
+    # or not an atom ever reads it. That the lockfile is not there yet is left
+    # to the atom that needs it, which is the check that says which import a
+    # missing lock cannot vouch for.
+    _can_see(lock, manifest)
     SETTINGS[project] = deno
 
 
@@ -176,6 +207,23 @@ def _specifiers(text, origin, project, seen):
     return found
 
 
+def _can_see(lock_path, where):
+    """Whether the settled lockfile is a file there, refusing a path nothing can see.
+
+    A directory above the lockfile that the checker may not enter is not a
+    lockfile that is missing: the file system reports a permission error for
+    it, and a lock the checker cannot see cannot vouch for an import either.
+    So that permission error becomes a refusal naming the path, rather than an
+    error escaping the check with nothing to say about the file at fault.
+    Whether the lockfile is simply absent is left to the caller, who knows
+    whether the project needed it.
+    """
+    try:
+        return lock_path.is_file()
+    except OSError as error:
+        raise ValueError(f"{where}: lockfile {lock_path.name} cannot be read ({error})") from error
+
+
 def _lock(path, deno, settings, project):
     """The settled lockfile an atom's imports are checked against.
 
@@ -191,7 +239,7 @@ def _lock(path, deno, settings, project):
         where, declared, base = f"{path}: the manifest's runtime.deno.lock", settings["lock"], project
     else:
         where, declared, base = f"{path}: the default lockfile beside the manifest", "deno.lock", project
-    _require(isinstance(declared, str) and declared,
+    _require(isinstance(declared, str) and declared and "\x00" not in declared,
              f"{where} is {declared!r}, not a path to a lockfile; {LOCK_FIX}")
     lock_path = _settled(base / declared, where, LOCK_FIX)
     _require(lock_path.is_relative_to(project), f"{where} is {lock_path}, which is outside the project; {LOCK_FIX}")
@@ -205,12 +253,19 @@ def _declaration(path, fm, project, specifiers):
     _require(set(deno.get("sys", [])) <= HARMLESS_SYS, f"{path}: runtime.deno.sys may hold only {sorted(HARMLESS_SYS)}")
     settings = SETTINGS.get(project, {})
     lock_path = _lock(path, deno, settings, project)
+    _require(_can_see(lock_path, path), f"{path}: lockfile {lock_path.name} is missing")
+    # The lock is read once, for every import. Settled and shown to be a file,
+    # it is still one the checker may not be able to open, and a lock that
+    # cannot be read vouches for nothing.
+    try:
+        recorded = json.loads(lock_path.read_text()).get("specifiers", {})
+    except OSError as error:
+        raise ValueError(f"{path}: lockfile {lock_path.name} cannot be read ({error})") from error
     for source, target in sorted(specifiers):
         _require(PINNED.fullmatch(target), f"{source}: import {target!r} must be an npm: or jsr: package pinned to an exact version")
         _require("allow_packages" not in settings or _allowed(target, settings["allow_packages"]),
                  f"{source}: {target} is not in the manifest's runtime.deno.allow_packages")
-        _require(lock_path.is_file(), f"{path}: lockfile {lock_path.name} is missing")
-        _require(target in json.loads(lock_path.read_text()).get("specifiers", {}), f"{source}: {target} is not recorded in {lock_path.name}")
+        _require(target in recorded, f"{source}: {target} is not recorded in {lock_path.name}")
 
     hosts = []
     if "network" in fm:
