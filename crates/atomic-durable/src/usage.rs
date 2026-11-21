@@ -15,12 +15,13 @@
 //!    new attempt at the call's stable request id, and reserves the call's
 //!    whole bound against every allowance in the chain, root first, each
 //!    reservation a conditional update that fails when the cap has no room.
-//!    Either every allowance takes the reservation or none does. The
-//!    conditional update is the lock: on PostgreSQL a concurrent admission
-//!    against the same allowance waits for this one to commit and then sees
-//!    its charge, and on SQLite every write transaction runs alone. Two
-//!    parallel children can therefore never both take the last of their
-//!    parent's allowance.
+//!    Either every allowance takes the reservation or none does; an amount
+//!    a call reserves none of, such as a command's tokens, is not checked.
+//!    The conditional update is the lock: on PostgreSQL a concurrent
+//!    admission against the same allowance waits for this one to commit and
+//!    then sees its charge, and on SQLite every write transaction runs
+//!    alone. Two parallel children can therefore never both take the last
+//!    of their parent's allowance.
 //! 2. **Progress**, while a Codex turn runs, as often as what it reported
 //!    grows ([`Ledger::progress`]): the attempt is charged what it reported
 //!    and one request taken to be in flight, at least what it was charged
@@ -142,6 +143,11 @@ pub struct Request {
     /// `reserve.millis`, and is cut off when that runs out. Less time left
     /// than `reserve.millis`, one request's bound, refuses it.
     pub turn: bool,
+    /// For a turn, the longest it can run in active milliseconds, when it
+    /// has a limit of its own, such as a command's: it reserves no more of
+    /// the time left than that, or than `reserve.millis` if that is more,
+    /// so the rest stays free for its siblings.
+    pub longest: Option<i64>,
 }
 
 /// What admission decided.
@@ -404,10 +410,13 @@ async fn add_charge(tx: &mut Tx<'_, '_>, scopes: &[String], delta: Charge) -> Re
 }
 
 /// Why `a` has no room for `r`, one reason per cap it would pass; empty
-/// when it has room.
+/// when it has room. An amount `r` reserves none of is not checked: a call
+/// that takes none of it, such as a command's tokens, cannot take it past
+/// its cap, even when earlier calls already did.
 fn shortfall(a: &Allowance, r: Charge) -> Vec<String> {
-    let over =
-        |charged: i64, cap: i64, reserve: i64| charged.checked_add(reserve).is_none_or(|n| n > cap);
+    let over = |charged: i64, cap: i64, reserve: i64| {
+        reserve > 0 && charged.checked_add(reserve).is_none_or(|n| n > cap)
+    };
     let mut short = Vec::new();
     if over(a.charged.tokens, a.caps.tokens, r.tokens) {
         short.push(format!(
@@ -446,14 +455,14 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Result<En
         )));
     }
     let mut r = request.reserve;
-    let amounts =
-        [r.tokens, r.millis, r.micro_usd]
-            .into_iter()
-            .chain(request.chain.iter().flat_map(|s| {
-                [s.caps.tokens, s.caps.millis]
-                    .into_iter()
-                    .chain(s.caps.micro_usd)
-            }));
+    let amounts = [r.tokens, r.millis, r.micro_usd]
+        .into_iter()
+        .chain(request.longest)
+        .chain(request.chain.iter().flat_map(|s| {
+            [s.caps.tokens, s.caps.millis]
+                .into_iter()
+                .chain(s.caps.micro_usd)
+        }));
     if amounts.into_iter().any(|n| !(0..=MOST).contains(&n)) {
         return Err(corrupt(format!(
             "request {} reserves or caps an amount below zero or past {MOST}",
@@ -518,8 +527,15 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Result<En
                 ),
             );
         }
-        bounded_by = Some(least.scope.clone());
-        r.millis = left;
+        // At most what it can take, if it has a limit of its own: then that
+        // limit, not the allowance, is what cuts it off.
+        match request.longest {
+            Some(longest) if longest.max(r.millis) < left => r.millis = longest.max(r.millis),
+            _ => {
+                bounded_by = Some(least.scope.clone());
+                r.millis = left;
+            }
+        }
     }
     for (scope, a) in request.chain.iter().zip(&allowances) {
         let short = shortfall(a, r);
@@ -538,16 +554,19 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Result<En
             .execute(
                 "UPDATE atomic_usage_allowances SET tokens_charged = tokens_charged + ?, \
                  millis_charged = millis_charged + ?, micro_usd_charged = micro_usd_charged + ? \
-                 WHERE scope = ? AND tokens_charged + ? <= tokens_cap \
-                 AND millis_charged + ? <= millis_cap \
-                 AND (micro_usd_cap IS NULL OR micro_usd_charged + ? <= micro_usd_cap)",
+                 WHERE scope = ? AND (? = 0 OR tokens_charged + ? <= tokens_cap) \
+                 AND (? = 0 OR millis_charged + ? <= millis_cap) \
+                 AND (micro_usd_cap IS NULL OR ? = 0 OR micro_usd_charged + ? <= micro_usd_cap)",
                 &[
                     Param::Int(r.tokens),
                     Param::Int(r.millis),
                     Param::Int(r.micro_usd),
                     Param::Text(scope.id.clone()),
                     Param::Int(r.tokens),
+                    Param::Int(r.tokens),
                     Param::Int(r.millis),
+                    Param::Int(r.millis),
+                    Param::Int(r.micro_usd),
                     Param::Int(r.micro_usd),
                 ],
             )

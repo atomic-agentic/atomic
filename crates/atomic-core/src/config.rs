@@ -358,7 +358,11 @@ fn kind(v: &Value) -> &'static str {
 /// replaced by `"…"` or `` `…` ``: double quotes, inside which a quote
 /// escaped with a backslash is part of the value, and backticks, in which
 /// serde quotes a variant or a field. An unclosed quote hides the rest.
-fn without_values(message: &str) -> String {
+///
+/// Every error this crate's layers raise is scrubbed with it, and so is any
+/// other error the command raises about a configured value, so a value put in
+/// the wrong place is never repeated where the configuration is read.
+pub fn without_values(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.chars();
     while let Some(c) = chars.next() {
@@ -414,11 +418,23 @@ fn parse_like(target: &Value, raw: &str) -> Result<Value, String> {
         Value::String(_) => Ok(Value::String(raw.to_owned())),
         // An optional setting (default null): read the value as a YAML
         // scalar, so numbers and booleans keep their type; else a string.
-        _ => Ok(yaml::load(Path::new("environment"), raw)
-            .ok()
-            .map(|d| d.value)
-            .filter(|v| !v.is_object() && !v.is_array())
-            .unwrap_or_else(|| Value::String(raw.to_owned()))),
+        //
+        // A spelling the loader refuses as an integer is refused here and not
+        // fallen back to a string. The fallback is faithful where every version
+        // reads the text as a string -- `yes`, `.inf` -- and was not here: this
+        // branch read `0200` as the number 200 until the loader began refusing
+        // that spelling, and a setting that changes its own type is worse than
+        // one that says what to write instead. The message names both fixes.
+        _ => {
+            if let Some(why) = yaml::refused_number(raw.trim()) {
+                return Err(why.as_value());
+            }
+            Ok(yaml::load(Path::new("environment"), raw)
+                .ok()
+                .map(|d| d.value)
+                .filter(|v| !v.is_object() && !v.is_array())
+                .unwrap_or_else(|| Value::String(raw.to_owned())))
+        }
     }
 }
 

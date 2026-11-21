@@ -1,0 +1,1 @@
+signin-link-file-regular|crates/atomic-core/src/state.rs|        Ok(m) if !m.is_file() => return refused("is not a regular file"),|        Ok(m) if false && !m.is_file() => return refused("is not a regular file"),|-p atomic-agentic-core --lib state::tests::a_link_file_that_is_not_a_small_regular_file_is_refused

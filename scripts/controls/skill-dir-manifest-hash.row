@@ -1,0 +1,1 @@
+skill-dir-manifest-hash|crates/atomic/src/setup.rs|                let holds = manifest_vouches_for(manifest, &relative, &bytes);|                let holds = true; let _ = manifest_vouches_for(manifest, &relative, &bytes); // CONTROL_OFF|-p atomic-agentic --test setup_cli -- an_edited_pack_file_is_refused_and_kept

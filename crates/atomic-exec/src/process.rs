@@ -1054,6 +1054,51 @@ pub fn run_in(
     stdin: &[u8],
     limits: Limits,
 ) -> Result<Completed, ExecError> {
+    let none = crate::SecretEnv::default();
+    run_in_with_secret(group, program, args, cwd, env, &none, stdin, limits)
+}
+
+/// A connected Unix socket holding `secret`'s entries, with its other end
+/// written and closed, which a child inherits; none for an empty one. A
+/// socket rather than a pipe: another process cannot reopen it through
+/// `/proc/<pid>/fd` before the child has protected itself.
+#[cfg(unix)]
+fn secret_pipe(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    use std::io::Write;
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    let bytes = secret.encode().map_err(std::io::Error::other)?;
+    // A socket's buffer holds this much without a reader; the entries are a
+    // token or two, far less.
+    if bytes.len() > 4096 {
+        return Err(std::io::Error::other(
+            "the secret variables are too long to hand over",
+        ));
+    }
+    // Both ends are close-on-exec; the child clears it on its own copy of
+    // the end it reads.
+    let (read, mut write) = std::os::unix::net::UnixStream::pair()?;
+    write.write_all(&bytes)?;
+    write.shutdown(std::net::Shutdown::Write)?;
+    drop(write);
+    Ok(Some(std::os::fd::OwnedFd::from(read)))
+}
+
+/// [`run_in`], with `secret` on a socket the child inherits, whose
+/// descriptor it finds in [`crate::SECRET_ENV_FD`]; the variables are never
+/// in its environment.
+#[allow(clippy::too_many_arguments)]
+pub fn run_in_with_secret(
+    group: Group,
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    secret: &crate::SecretEnv,
+    stdin: &[u8],
+    limits: Limits,
+) -> Result<Completed, ExecError> {
     let name = program.display().to_string();
     let mut command = std::process::Command::new(program);
     command
@@ -1065,6 +1110,39 @@ pub fn run_in(
         .stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    let secret_read_end = {
+        use std::os::fd::AsRawFd;
+        let pipe = secret_pipe(secret).map_err(|e| ExecError::Start {
+            program: name.clone(),
+            message: format!("hand it its secret variables: {e}"),
+        })?;
+        if let Some(pipe) = &pipe {
+            let fd = pipe.as_raw_fd();
+            command.env(crate::SECRET_ENV_FD, fd.to_string());
+            // SAFETY: between fork and exec the closure makes one
+            // async-signal-safe call, fcntl, and allocates nothing.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                    // The child keeps the read end across exec; this process
+                    // closes its own once the child has started.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        pipe
+    };
+    #[cfg(not(unix))]
+    if !secret.is_empty() {
+        return Err(ExecError::Start {
+            program: name,
+            message: "secret variables are handed on a socket only on Unix".into(),
+        });
     }
     #[cfg(unix)]
     {
@@ -1118,6 +1196,9 @@ pub fn run_in(
         program: name.clone(),
         message: e.to_string(),
     })?;
+    // The child has its own copy of the secret socket.
+    #[cfg(unix)]
+    drop(secret_read_end);
     // A process in this one's group is stopped with this process.
     let own = (group != Group::Inherit).then(|| child.id());
     running.extend(own);
