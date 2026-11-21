@@ -71,6 +71,7 @@ pub struct Artifacts(
 
 /// Lets go of what a step's command handed over when dropped (see
 /// [`Artifacts::releasing`]).
+#[must_use = "dropping it at once lets go of the step's holds at once"]
 pub struct Releasing {
     artifacts: Artifacts,
     identity: EffectIdentity,
@@ -1831,7 +1832,15 @@ async fn finish_exec(
         // Held until the step records the output that references them.
         artifacts.keep(identity, holds);
     }
-    if none_given && crate::artifact::files::names_a_file(&output) {
+    // As gather would take them: an object anywhere else is the output's own.
+    if none_given
+        && crate::artifact::files::names_a_file_where_referenced(
+            &output,
+            &output_contract,
+            artifacts.0.as_ref(),
+        )
+        .map_err(|e| schema_error(e.to_string()))?
+    {
         return Err(schema_error(format!(
             "the output names a file with `{}`, and its backend hands no files over",
             crate::artifact::files::FILE_KEY

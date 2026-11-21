@@ -846,3 +846,46 @@ fn a_sweep_racing_a_slow_gather_keeps_the_gathered_files() {
     drop(held);
     assert_eq!(sweeping.sweep().removed.len(), 2);
 }
+
+/// An exchange that fails every give with invalid data of its own.
+struct Refusing;
+
+impl atomic_exec::exchange::Exchange for Refusing {
+    fn outputs(&self) -> &Path {
+        Path::new("/nowhere/outputs")
+    }
+    fn inputs(&self) -> &Path {
+        Path::new("/nowhere/inputs")
+    }
+    fn give(&self, _: &str, _: &mut dyn Read) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the runner refused it",
+        ))
+    }
+    fn seal(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn take(
+        &self,
+        _: &str,
+    ) -> Result<atomic_exec::exchange::Taken, atomic_exec::exchange::TakeError> {
+        Err(atomic_exec::exchange::TakeError::Missing)
+    }
+}
+
+/// An exchange's own failure to give an input is its failure, not a sign
+/// that the store's content is damaged: only the store's reader says that.
+#[test]
+fn an_exchanges_own_failure_is_not_a_damaged_blob() {
+    let f = fixture("refusing");
+    let patch = f
+        .store
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance())
+        .expect("put")
+        .artifact;
+    let e = Exchange::new(Box::new(Refusing))
+        .mount(&f.store, std::slice::from_ref(&patch))
+        .expect_err("refused");
+    assert!(matches!(e, ArtifactError::Io { .. }), "{e:?}");
+}

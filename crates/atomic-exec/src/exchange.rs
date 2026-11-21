@@ -30,6 +30,12 @@ use std::path::PathBuf;
 
 /// A command's inputs and outputs directories, as its backend reaches them.
 ///
+/// The control plane asks a backend for a workspace's exchange once, before
+/// the command runs ([`crate::ExecutionBackend::exchange`]), gives each
+/// input once, seals the inputs, and only then runs the command. Afterwards
+/// it may take the same file more than once: it opens every file a command
+/// names to check it before it reads any.
+///
 /// Every method may block: callers on an async executor call it on the
 /// blocking pool.
 pub trait Exchange: Send + Sync {
@@ -42,9 +48,11 @@ pub trait Exchange: Send + Sync {
     fn inputs(&self) -> &Path;
 
     /// Put what `content` reads in the inputs directory as a new file,
-    /// `name`, which the command may only read. A file not written whole is
-    /// removed, and the error that stopped it, such as one `content` gave,
-    /// is returned as it was. `name` is one plain file name.
+    /// `name`, which the command may only read. Each name is given once. A
+    /// file not written whole is removed, and the error that stopped it is
+    /// returned; an error `content` gave is returned as it was, since the
+    /// caller tells its reader's failures apart from the exchange's. `name`
+    /// is one plain file name.
     fn give(&self, name: &str, content: &mut dyn Read) -> std::io::Result<()>;
 
     /// Make the inputs directory read-only, once everything is given.
@@ -52,7 +60,9 @@ pub trait Exchange: Send + Sync {
 
     /// Open the file `name` the command wrote in its outputs directory, as
     /// it is now, with its size: a regular file of the command's own, never
-    /// one a link names. `name` is one plain file name.
+    /// one a link names. Taking a file consumes nothing: the same name may
+    /// be taken again, and is then opened afresh, as it is by then. `name`
+    /// is one plain file name.
     fn take(&self, name: &str) -> Result<Taken, TakeError>;
 }
 

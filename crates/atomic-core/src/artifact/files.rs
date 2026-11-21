@@ -125,9 +125,15 @@ impl Exchange {
             if !given.insert(artifact.digest()) {
                 continue;
             }
-            let mut content = store.open(artifact)?;
-            self.0.give(artifact.digest(), &mut content).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidData {
+            // The store's reader says when the blob no longer matches its
+            // digest; whatever the exchange itself says is its own failure.
+            let mut content = Watched {
+                inner: store.open(artifact)?,
+                failed: false,
+            };
+            let given = self.0.give(artifact.digest(), &mut content);
+            given.map_err(|e| {
+                if content.failed && e.kind() == std::io::ErrorKind::InvalidData {
                     ArtifactError::Corrupt(artifact.clone())
                 } else {
                     io(&self.inputs().join(artifact.digest()))(e)
@@ -166,10 +172,7 @@ impl Exchange {
         provenance: &Provenance,
         limits: Limits,
     ) -> Result<Vec<Hold>, ArtifactError> {
-        let mut nonce = [0u8; 16];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
-        let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let nonce = nonce()?;
         self.gather_with(
             store, lookup, output, contract, validate, provenance, limits, &nonce,
         )
@@ -188,51 +191,15 @@ impl Exchange {
         limits: Limits,
         nonce: &str,
     ) -> Result<Vec<Hold>, ArtifactError> {
-        let mut candidates = Vec::new();
-        named_files(output, String::new(), &mut candidates, usize::MAX);
-        if candidates.is_empty() {
+        let Some(Slots {
+            candidates,
+            asked,
+            probe,
+            checked,
+        }) = slots(output, contract, lookup, nonce)?
+        else {
             return Ok(Vec::new());
-        }
-        // Each candidate stands in as a reference of its own, made from a
-        // nonce no output can know; the contract check says which stand
-        // where a reference does.
-        let stand_ins: HashMap<String, usize> = (0..candidates.len())
-            .map(|i| (stand_in(nonce, i).digest().to_owned(), i))
-            .collect();
-        if holds_any(output, &stand_ins) {
-            return Err(refused(
-                "the output holds a reference atomic uses while it checks one".into(),
-            ));
-        }
-        let mut probe = output.clone();
-        for (i, (pointer, _)) in candidates.iter().enumerate() {
-            if let Some(slot) = probe.pointer_mut(pointer) {
-                *slot = Value::String(stand_in(nonce, i).to_string());
-            }
-        }
-        let lookup = StandIns {
-            stand_ins: &stand_ins,
-            candidates: &candidates,
-            inner: lookup,
-            asked: std::sync::Mutex::new(HashSet::new()),
         };
-        let checked = atomic_schema::artifact::check_refs(contract, &probe, &lookup);
-        let mut asked: Vec<usize> = lookup
-            .asked
-            .into_inner()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        asked.sort_unstable();
-        // Put back the objects that are the output's own.
-        let taken: HashSet<usize> = asked.iter().copied().collect();
-        for (i, (pointer, original)) in candidates.iter().enumerate() {
-            if !taken.contains(&i)
-                && let Some(slot) = probe.pointer_mut(pointer)
-            {
-                *slot = original.clone();
-            }
-        }
         if asked.is_empty() {
             return Ok(Vec::new());
         }
@@ -437,11 +404,97 @@ impl ArtifactLookup for StandIns<'_> {
     }
 }
 
-/// Whether `value` holds an object naming a file, `{"$file": …}`.
-pub fn names_a_file(value: &Value) -> bool {
-    let mut found = Vec::new();
-    named_files(value, String::new(), &mut found, 1);
-    !found.is_empty()
+/// Sixteen random bytes, in hex, for the stand-in references.
+fn nonce() -> Result<String, ArtifactError> {
+    let mut nonce = [0u8; 16];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
+    Ok(nonce.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Where an output's `{"$file": …}` objects stand, as the contract check
+/// sees them.
+struct Slots {
+    /// Every such object, with its JSON Pointer.
+    candidates: Vec<(String, Value)>,
+    /// The candidates, by index and in order, that stand where the contract
+    /// expects an artifact reference.
+    asked: Vec<usize>,
+    /// The output with a stand-in reference in each of those places, and
+    /// the output's own objects everywhere else.
+    probe: Value,
+    /// The contract's reference checks on `probe`.
+    checked: Result<(), atomic_schema::artifact::ArtifactCheckError>,
+}
+
+/// Where `output`'s `$file` objects stand: each stands in as a reference of
+/// its own, made from `nonce`, which no output can know, and the contract
+/// check says which stand where a reference does. `None` when it has none.
+fn slots(
+    output: &Value,
+    contract: &Value,
+    lookup: &(dyn ArtifactLookup + Sync),
+    nonce: &str,
+) -> Result<Option<Slots>, ArtifactError> {
+    let mut candidates = Vec::new();
+    named_files(output, String::new(), &mut candidates, usize::MAX);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let stand_ins: HashMap<String, usize> = (0..candidates.len())
+        .map(|i| (stand_in(nonce, i).digest().to_owned(), i))
+        .collect();
+    if holds_any(output, &stand_ins) {
+        return Err(refused(
+            "the output holds a reference atomic uses while it checks one".into(),
+        ));
+    }
+    let mut probe = output.clone();
+    for (i, (pointer, _)) in candidates.iter().enumerate() {
+        if let Some(slot) = probe.pointer_mut(pointer) {
+            *slot = Value::String(stand_in(nonce, i).to_string());
+        }
+    }
+    let lookup = StandIns {
+        stand_ins: &stand_ins,
+        candidates: &candidates,
+        inner: lookup,
+        asked: std::sync::Mutex::new(HashSet::new()),
+    };
+    let checked = atomic_schema::artifact::check_refs(contract, &probe, &lookup);
+    let mut asked: Vec<usize> = lookup
+        .asked
+        .into_inner()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    asked.sort_unstable();
+    // Put back the objects that are the output's own.
+    let taken: HashSet<usize> = asked.iter().copied().collect();
+    for (i, (pointer, original)) in candidates.iter().enumerate() {
+        if !taken.contains(&i)
+            && let Some(slot) = probe.pointer_mut(pointer)
+        {
+            *slot = original.clone();
+        }
+    }
+    Ok(Some(Slots {
+        candidates,
+        asked,
+        probe,
+        checked,
+    }))
+}
+
+/// Whether `output` names a file where `contract` expects an artifact
+/// reference: what [`Exchange::gather`] would take. A `{"$file": …}` object
+/// anywhere else is the output's own.
+pub fn names_a_file_where_referenced(
+    output: &Value,
+    contract: &Value,
+    lookup: &(dyn ArtifactLookup + Sync),
+) -> Result<bool, ArtifactError> {
+    Ok(slots(output, contract, lookup, &nonce()?)?.is_some_and(|s| !s.asked.is_empty()))
 }
 
 /// The most `$file` objects one output may hold where its contract expects
@@ -533,6 +586,19 @@ fn file_object(value: &Value) -> Result<(&str, &str), String> {
         Some(other) => return Err(format!("`mediaType` must be a media type, not {other}")),
     };
     Ok((name, media))
+}
+
+/// A reader that notes whether it failed, so its failure is told apart
+/// from that of whatever reads it.
+struct Watched<R> {
+    inner: R,
+    failed: bool,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf).inspect_err(|_| self.failed = true)
+    }
 }
 
 /// A reader of exactly `left` more bytes: one that ends sooner fails, and

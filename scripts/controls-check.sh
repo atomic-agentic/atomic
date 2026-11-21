@@ -79,6 +79,10 @@ CONTROLS=(
     "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
     "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
     "exec-exchange-backend|crates/atomic-core/src/runtime.rs|                    .exchange(&opened)|                    .exchange(&opened).and(atomic_exec::LocalBackend::default().exchange(&opened)) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_remote_backend_gives_inputs_and_hands_a_file_over"
+    "artifact-hold-snapshot-first|crates/atomic/src/retention.rs|    between();|    let held = { between(); held_now(store).await? }; // CONTROL_OFF|-p atomic-agentic --test retention the_holds_are_read_before_the_runs"
+    "exec-no-exchange-input|crates/atomic-core/src/runtime.rs|                    return match given.first() {|                    return match given.first().and(None::<&crate::artifact::ArtifactRef>) { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-no-exchange-output|crates/atomic-core/src/runtime.rs|    if none_given|    if std::hint::black_box(false) && none_given|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over"
+    "exec-exchange-corrupt-source|crates/atomic-core/src/artifact/files.rs|                if content.failed && e.kind() == std::io::ErrorKind::InvalidData {|                if e.kind() == std::io::ErrorKind::InvalidData { let _ = content.failed; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model an_exchanges_own_failure_is_not_a_damaged_blob"
 )
 
 die() {

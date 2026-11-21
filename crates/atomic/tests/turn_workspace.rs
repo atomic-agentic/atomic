@@ -136,6 +136,13 @@ impl ExecutionBackend for Relocating {
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         self.local.close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, ExecError> {
+        self.local.exchange(workspace)
+    }
 }
 
 /// A read-only codex atom that reports whether its work is done.

@@ -317,6 +317,13 @@ impl atomic_exec::ExecutionBackend for Logging {
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.local.close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
+    }
 }
 
 /// [`engine`], with every atom running on `backend`.
@@ -1399,6 +1406,13 @@ impl atomic_exec::ExecutionBackend for Stating {
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         atomic_exec::LocalBackend::default().close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().exchange(workspace)
+    }
 }
 
 /// The run plans from what the backend states, not from which backend it
@@ -1511,6 +1525,13 @@ impl atomic_exec::ExecutionBackend for Busy {
     }
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.local.close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
     }
 }
 
@@ -2187,7 +2208,7 @@ fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
             assert_eq!(holds.len(), 1, "{seen:?}");
             assert!(holds[0].starts_with(patch.digest()), "{seen:?}");
         }
-        // The first step's recorded output names what it held.
+        // A recorded step output names what was held.
         let steps = rt.steps("patch-1").await.expect("steps");
         assert!(
             steps
