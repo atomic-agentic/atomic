@@ -1,0 +1,1 @@
+deno-import-visible|tools/deno_exec.py|            _require(_can_see(local, origin, "import"), f"{origin}: import {target} is missing or leaves the project")|            _require(True, f"{origin}: import {target} is missing or leaves the project")|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read
