@@ -240,10 +240,12 @@ async fn finish(
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            // Names and atomic's words only, written as they are: a run id
-            // such as `rotate-secret` is not a secret.
+            // Names and atomic's words only, not redacted, since a run id
+            // such as `rotate-secret` is not a secret, but escaped for the
+            // terminal.
+            let run_id = crate::shown::line(run_id);
             atomic_core::redact::Line::new()
-                .plain(&format!(
+                .shown(&format!(
                     "{who}: {signal}: run {run_id} stays unfinished; continue it with \
                      `atomic runs resume {run_id}`"
                 ))
@@ -343,6 +345,23 @@ pub async fn run(
         engine::Takes::Own,
     )
     .await?;
+    // Refused before it starts, not at its first lite step.
+    let lite = target::lite_atoms(&run);
+    if engine.signed_in && !lite.is_empty() {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "config.model",
+            format!(
+                "{} calls a model API itself (lite: {}), and the ChatGPT sign-in serves Codex \
+                 atoms only",
+                run.pipeline.name,
+                lite.join(", ")
+            ),
+            "set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL to an OpenAI-compatible endpoint, and \
+             ATOMIC_MODEL_API_KEY_ENV to the variable holding its key if it needs one",
+        )
+        .into());
+    }
     let run_id = match args.run_id {
         Some(id) => id,
         None => new_run_id()?,
@@ -370,12 +389,14 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    // Names only, written as they are: a run id such as `rotate-secret` is
-    // not a secret.
+    // Names only, not redacted, since a run id such as `rotate-secret` is
+    // not a secret, but escaped for the terminal.
     atomic_core::redact::Line::new()
-        .plain(&format!(
-            "run {run_id}: {} in project {}",
-            run.pipeline.name, found.name
+        .shown(&format!(
+            "run {}: {} in project {}",
+            crate::shown::line(&run_id),
+            crate::shown::line(&run.pipeline.name),
+            crate::shown::line(&found.name)
         ))
         .log();
     if let Some(f) = &run.pipeline.fixture {
@@ -510,7 +531,7 @@ pub async fn resume(
                 .into());
             }
             atomic_core::redact::Line::new()
-                .plain(&format!("run {id}: resuming"))
+                .shown(&format!("run {}: resuming", crate::shown::line(id)))
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
@@ -630,7 +651,11 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     // The engine's drain ends at its time limit whether or not its steps
     // did, so whatever still runs is stopped here, and its end is never
     // recorded: this process exits first.
-    let stopped = atomic_exec::process::stop_all();
+    // It returns once every process this one started has ended, so the
+    // execution lock, which goes with this process, outlasts them all.
+    let stopped = atomic_exec::process::stop_all(&mut |what| {
+        atomic_core::log_line!("{who}: {what}");
+    });
     if stopped > 0 {
         atomic_core::log_line!(
             "{who}: stopped {stopped} command(s) that had not finished; their runs continue with \
@@ -646,7 +671,9 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     .await
     .unwrap_or(0);
     if interrupted > 0 {
-        atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
+        atomic_core::log_line!(
+            "{who}: settled {interrupted} model call(s) or command(s) that had not finished"
+        );
     }
     // Spans still open end and are sent; a collector that does not answer
     // holds this up until another signal or the flush's deadline, whichever
@@ -658,6 +685,8 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
             atomic_core::log_line!("{who}: {again}: stopping now, without sending the last spans");
         }
     }
+    // Once more, for what started since, such as a model turn's command.
+    atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("{who}: {what}"));
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
     std::process::exit(match exit {
@@ -678,6 +707,9 @@ pub async fn serve(
     // One run whose commands cannot be confined here does not stop the
     // others: it stays unfinished, and serve goes on.
     atomic_app::workflows::serve_past_unconfinable_steps();
+    // A step that has waited its limit for room is set aside, and keeps
+    // trying, rather than stopping serve or waiting for a restart.
+    atomic_core::runtime::keep_trying_past_the_limit();
     let state = state(project)?;
     let engine = engine::open(
         &state,

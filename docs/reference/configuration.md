@@ -33,7 +33,8 @@ and nothing else is sent anywhere; `ATOMIC_DETECT_OLLAMA_ADDR` names another
 loopback address, as an IP address and port, and any other address is
 refused. No key is sent to a detected Ollama, even when `model.api_key_env`
 is set. A model endpoint set in a file, a variable or a flag turns detection
-off.
+off, and so does a ChatGPT sign-in (`atomic model login`): a configured
+endpoint comes first, then the sign-in, for Codex atoms, then detection.
 
 When the endpoint was detected, or set by the project's files rather than by
 whoever runs it, `atomic run`, `atomic runs resume` and `atomic serve` say
@@ -50,7 +51,14 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `database.schema` | `ATOMIC_DATABASE_SCHEMA` | |
 | `runner` | `ATOMIC_RUNNER` | `--runner` |
 | `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
+| `backend_wait` | `ATOMIC_BACKEND_WAIT` | `--backend-wait` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
+
+`backend_wait` is a whole number of seconds, at least 1. An empty
+`ATOMIC_BACKEND_WAIT` sets nothing, but a null, `~` or blank value, in a file
+or a variable, is refused, so a higher layer cannot remove a limit a lower one
+set: to override it, set a larger number. Without any, a step waits for as
+long as it takes.
 
 Your own configuration is `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
 `~/.config/atomic/config.yaml`. No project supplies it. It holds the same
@@ -143,7 +151,7 @@ search mode and service-connection configuration remain to be finalized.
 used for that purpose because it commonly belongs to the application being worked
 on. Application data sources are separately declared capabilities.
 
-For upstream subscription support and Atomic login status, see
+For signing in with ChatGPT (`atomic model login`) and API keys, see
 [subscriptions and authentication](../getting-started/authentication.md).
 
 ## Limit what exec atoms hand over

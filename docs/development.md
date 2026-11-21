@@ -78,6 +78,19 @@ dependency debug info turned off, so keep that much space free.
 Exit code 124 means the command hit the time limit, and 137 usually means it
 hit the memory limit.
 
+Stopping `scripts/dev.sh` with Ctrl-C, SIGTERM or SIGHUP removes the
+container it started before it exits, with 130, 143 or 129. Killing it outright,
+or its whole process group, or the process that started it, removes the
+container within a few seconds: a watcher in a session of its own sees to that,
+and when the parent died it stops dev.sh first, which then exits 143. Only that
+container: each run labels its own with a token of its own
+(`org.atomic-agentic.dev-run`), and nothing else on the host is touched. The
+test Postgres stays up, since every run shares it. A run started with
+`ATOMIC_DEV_DETACHED=1`, as for `nohup scripts/dev.sh … &`, outlives the
+process that started it, as does one the system's first process starts.
+`scripts/dev-sh-test.sh` runs on the host, with docker or podman, and checks
+each of these; it exits 75 at once while `ATOMIC_DEV_WAIT_LOCK` exists.
+
 ## The test database
 
 `scripts/dev.sh` starts a Postgres 18 container for tests before it runs your
@@ -159,10 +172,11 @@ message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
 commands, and stops before such a step without it, so the tests in
-`crates/atomic/tests/run_cli.rs` that run commands are behind the same feature
-there, each marked `// needs_sandbox`; the rest of that file runs in a plain
-`cargo test`. The sandbox check runs each marked test, as it runs every test
-of a file that is behind the feature as a whole.
+`crates/atomic/tests/run_cli.rs` and `crates/atomic/tests/telemetry.rs` that
+run commands are behind the same feature there, each marked
+`// needs_sandbox`; the rest of those files runs in a plain `cargo test`. The
+sandbox check runs each marked test, as it runs every test of a file that is
+behind the feature as a whole.
 
 ## Controls are tested by removing them
 
@@ -172,7 +186,10 @@ command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
 directory and a worktree's git directory out of a turn's reach, its exclusion
 of `/tmp`, and its denial of atomic's private state, to turns and to exec
-atoms' commands; and the confinement of exec atoms' commands itself), it
+atoms' commands; the confinement of exec atoms' commands itself; and their
+network: none unless declared, and through the proxy only the declared hosts,
+on ports 80 and 443, never through another proxy, with the declaration checked
+when the atom loads and again before the command runs), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -257,10 +274,11 @@ CI runs it on Linux, in a job of its own ("Crash suite").
 
 ## Continuous integration
 
-CI (`.github/workflows/ci.yml`) runs on every push to main and every pull
-request, on Linux. The checks that need no Rust build run in small jobs of
-their own. The Rust checks run in parallel jobs, so a pull request waits for
-the slowest one rather than for all of them in turn:
+CI (`.github/workflows/ci.yml`) runs on every push to main, every pull request
+and every merge group of the merge queue, on Linux. The checks that need no
+Rust build run in small jobs of their own. The Rust checks run in parallel
+jobs, so a pull request waits for the slowest one rather than for all of them
+in turn:
 
 | Job | What it runs |
 | --- | --- |
@@ -274,6 +292,13 @@ the slowest one rather than for all of them in turn:
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
 requests too, and nothing in CI waits for it.
+
+Main is merged through a merge queue. Once a pull request's checks pass, it can
+be added to the queue, which runs CI again on the pull request merged onto main
+and the pull requests queued ahead of it (the `merge_group` event), and merges
+it only if those checks pass. So what reaches main has passed CI as it is
+merged, and a pull request is not held back by changes elsewhere on main.
+CodeQL is not one of the queue's checks.
 
 ### Test shards
 

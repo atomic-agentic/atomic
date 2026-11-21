@@ -231,6 +231,13 @@ where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
+    if runtime.endpoint.sign_in.is_some() {
+        bail!(
+            "a lite atom calls a model API itself, and a ChatGPT sign-in serves Codex atoms \
+             only: set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL to an OpenAI-compatible endpoint \
+             for it, and ATOMIC_MODEL_API_KEY_ENV to the variable holding its key if it needs one"
+        );
+    }
     let model = first
         .model
         .clone()
@@ -279,6 +286,7 @@ where
                 model: model.clone(),
                 input_bound,
                 turn: false,
+                work: false,
             })
             .await
             .map_err(meter_error)?;

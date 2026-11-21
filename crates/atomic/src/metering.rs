@@ -45,6 +45,11 @@ pub struct BudgetPlan {
     pub atoms: BTreeMap<String, Resolved>,
     /// The model each model atom calls, by atom name.
     pub models: BTreeMap<String, String>,
+    /// Each exec atom's caps, by atom name: its command's active time is
+    /// charged to them and to the run's. A plan without them reads, as one
+    /// with none, but a run that needs them refuses it.
+    #[serde(default)]
+    pub exec: BTreeMap<String, Resolved>,
     /// The most one call may use, when its model has no maximum of its own.
     pub call: PlannedCall,
     /// The price table, cut to the models the run calls.
@@ -87,6 +92,7 @@ impl BudgetPlan {
         settings: &BudgetSettings,
         declared: &Budget,
         atoms: &[(&str, &Budget, &str)],
+        exec: &[(&str, &Budget)],
     ) -> Result<Self, (Option<String>, BudgetError)> {
         let models: Vec<&str> = atoms.iter().map(|(_, _, model)| *model).collect();
         let run = resolve(declared, Level::Workflow, settings, &models).map_err(|e| (None, e))?;
@@ -96,9 +102,18 @@ impl BudgetPlan {
                 .map_err(|e| (Some((*name).to_owned()), e))?;
             resolved.insert((*name).to_owned(), caps);
         }
+        // An exec atom calls no model: its caps need no price, and its
+        // tokens and cost stay at nothing.
+        let mut exec_caps = BTreeMap::new();
+        for (name, budget) in exec {
+            let caps = resolve(budget, Level::Atom, settings, &[])
+                .map_err(|e| (Some((*name).to_owned()), e))?;
+            exec_caps.insert((*name).to_owned(), caps);
+        }
         Ok(Self {
             run,
             atoms: resolved,
+            exec: exec_caps,
             models: atoms
                 .iter()
                 .map(|(name, _, model)| ((*name).to_owned(), (*model).to_owned()))
@@ -155,12 +170,20 @@ impl BudgetPlan {
     }
 
     /// Check that the plan has caps and a model for each of `atoms`, every
-    /// atom a run calls a model from.
-    pub fn covers(&self, atoms: &[&str]) -> Result<(), String> {
+    /// atom a run calls a model from, and caps for each of `exec`, every exec
+    /// atom it runs: none runs unmetered.
+    pub fn covers(&self, atoms: &[&str], exec: &[&str]) -> Result<(), String> {
         for atom in atoms {
             if !self.atoms.contains_key(*atom) || !self.models.contains_key(*atom) {
                 return Err(format!(
                     "atom {atom} calls a model, and the plan has no caps or model for it"
+                ));
+            }
+        }
+        for atom in exec {
+            if !self.exec.contains_key(*atom) {
+                return Err(format!(
+                    "atom {atom} runs a command, and the plan has no caps for it"
                 ));
             }
         }
@@ -273,8 +296,55 @@ impl RunBudget {
         resolve(declared, Level::Atom, &self.settings, &[model])
     }
 
+    /// Whether an exec atom's command at step `step` was ever admitted, so
+    /// may have started: the ledger holds its work attempt. One that a cap
+    /// refused, and that parked, never started. An admitted attempt still
+    /// reserved belongs to a process that died with it, and is settled now,
+    /// so its reservation is not held for good: a command uses no tokens
+    /// and costs nothing, so that is all it spent, and its time is charged
+    /// until its last heartbeat.
+    ///
+    /// That rests on the step running again only once the process that
+    /// admitted the command is gone: a durable step runs in one process at
+    /// a time, and a stopping process kills its commands before it exits,
+    /// so a reserved attempt found here is no longer running.
+    pub async fn command_admitted(&self, step: &StepInfo) -> anyhow::Result<bool> {
+        let request = format!("{}:{}:0", step.workflow_id, step.step_id);
+        let attempts = self.ledger.attempts(&step.workflow_id).await?;
+        let mut admitted = false;
+        for a in attempts
+            .iter()
+            .filter(|a| a.request == request && a.model == atomic_core::usage::WORK_MODEL)
+        {
+            admitted = true;
+            if a.state == "reserved" {
+                self.ledger
+                    .settle(
+                        &a.request,
+                        a.attempt,
+                        atomic_durable::usage::Settlement::Reconciled {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            micro_usd: 0,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(admitted)
+    }
+
     /// The meter for the atom step `step`, with caps `atom`.
     pub fn meter(&self, step: &StepInfo, atom: &Resolved) -> Metering {
+        self.meter_charged(step, step.step_id, atom)
+    }
+
+    /// As [`RunBudget::meter`], charging the atom allowance of the turn at
+    /// `allowance` rather than `step`'s own: a review's repair rounds share
+    /// the author's first turn's allowance, and its later verdicts the
+    /// first verdict's. Each call is still its own ledger request, keyed by
+    /// `step`.
+    pub fn meter_charged(&self, step: &StepInfo, allowance: i32, atom: &Resolved) -> Metering {
         let run = step.workflow_id.as_str();
         Metering::new(Arc::new(LedgerMeter {
             ledger: self.ledger.clone(),
@@ -287,11 +357,62 @@ impl RunBudget {
                 .cloned()
                 .chain([
                     Scope::run(run, caps(&self.run)),
-                    Scope::atom(run, step.step_id, caps(atom)),
+                    Scope::atom(run, allowance, caps(atom)),
                 ])
                 .collect(),
             dollar_capped: self.run.micro_usd.is_some() || atom.micro_usd.is_some(),
         }))
+    }
+}
+
+/// The least active time worth starting a command with: less left than
+/// this refuses it, and the run parks.
+const LEAST_WORK: Duration = Duration::from_millis(500);
+
+impl LedgerMeter {
+    /// Admit active work that is not a model call, such as an exec atom's
+    /// command: no tokens and no cost, and all the active time the chain has
+    /// left, as a turn takes; it is cut off when that runs out.
+    async fn admit_work(&self, call: Call) -> Result<Ticket, MeterError> {
+        let least = Charge {
+            tokens: 0,
+            millis: int(u64::try_from(LEAST_WORK.as_millis()).unwrap_or(500)),
+            micro_usd: 0,
+        };
+        let request = Request {
+            id: format!("{}:{}:{}", self.run, self.step, call.index),
+            run: self.run.clone(),
+            model: call.model.clone(),
+            chain: self.chain.clone(),
+            reserve: least,
+            maximum: least,
+            turn: true,
+        };
+        match self.ledger.admit(request).await.map_err(store)? {
+            Admission::Admitted {
+                request,
+                attempt,
+                millis,
+                bounded_by,
+            } => {
+                beat(&self.ledger, &request, attempt, millis);
+                if atomic_durable::failpoints::armed() {
+                    atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
+                }
+                Ok(Ticket {
+                    request,
+                    attempt,
+                    model: call.model,
+                    admitted: Instant::now(),
+                    limit: Limit {
+                        output_tokens: None,
+                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
+                    },
+                    bounded_by,
+                })
+            }
+            Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
+        }
     }
 }
 
@@ -345,6 +466,9 @@ impl LedgerMeter {
 impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
+            if call.work {
+                return self.admit_work(call).await;
+            }
             // A dollar cap can hold only over priced calls: a call to a model
             // the plan does not price, as when the model changed since the
             // budget was resolved, is not made.

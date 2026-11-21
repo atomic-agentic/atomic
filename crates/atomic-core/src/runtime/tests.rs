@@ -72,6 +72,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
@@ -89,6 +90,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -829,6 +831,7 @@ fn an_output_must_reference_artifacts_that_exist_with_the_right_type() {
                     base_url: model.base_url(),
                     model: "synthetic".into(),
                     api_key_env: None,
+                    sign_in: None,
                 },
                 AtomConfig::default(),
             );
@@ -1102,6 +1105,7 @@ fn exec_validators_follow_the_steps_clock() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1115,6 +1119,7 @@ fn exec_validators_follow_the_steps_clock() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -1281,6 +1286,85 @@ fn exec_declarations_are_checked_at_load() {
             "kind: 'lite', effects: { external: 'read-only' }",
             "for `kind: 'exec'`",
         ),
+        // Network: only an exec atom's command, only public DNS names.
+        (
+            "kind: 'codex', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'lite', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['localhost'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['127.0.0.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['169.254.169.254'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['metadata.google.internal'] }",
+            "private network",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['*'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['unix:/var/run/docker.sock'] }",
+            "Unix socket",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['api.example.com:443'] }",
+            "no scheme, port",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: 'api.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['a.example.com'], unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: true",
+            "is `false` or",
+        ),
+        ("kind: 'codex', network: true", "is `false` or"),
+        (
+            "kind: 'lite', network: { allow: 'x.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'codex', network: { unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['0x7f.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['8.8.8.0x8'] }",
+            "an IP address",
+        ),
+        // Proxy variables are atomic's to set, in any case.
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { https_proxy: 'http://evil.example.com' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { NO_PROXY: '*' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'codex', env: { All_Proxy: 'socks5://x' }",
+            "names a proxy",
+        ),
     ] {
         let dir = scratch("exec-load");
         std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
@@ -1305,6 +1389,25 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+/// An exec atom may declare public hosts for its command, in any case and
+/// order, and they reach the command as one canonical list.
+#[test]
+fn an_exec_atom_declares_the_public_hosts_its_command_reaches() {
+    let (_, a, _) = exec_project(
+        "network-load",
+        TOTAL,
+        ", network: { allow: ['API.example.com', '*.s3.amazonaws.com'] }",
+    );
+    assert_eq!(
+        declared_network(&a),
+        ["*.s3.amazonaws.com", "api.example.com"]
+    );
+    let (_, none, _) = exec_project("network-none", TOTAL, ", network: false");
+    assert!(declared_network(&none).is_empty());
+    let (_, plain, _) = exec_project("network-plain", TOTAL, "");
+    assert!(declared_network(&plain).is_empty());
 }
 
 /// A lite atom with [`Classify`]'s contract.
@@ -2049,6 +2152,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
+                &crate::usage::Metering::none(),
             )
             .await;
             match want {
@@ -2143,12 +2247,248 @@ fn an_exec_output_cel_cannot_read_fails() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(
             matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
             "{r:?}"
         );
+    });
+}
+
+/// A ChatGPT sign-in, as Codex's login keeps it in a file store, with a
+/// token no real backend would take, refreshed now.
+fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    signed_in_at(dir, backend, now)
+}
+
+/// The same, last refreshed `refreshed` seconds after the epoch. Its issuer
+/// is the test backend's host, so a refresh, on a stale sign-in or a 401,
+/// goes there and never to OpenAI's.
+fn signed_in_at(dir: &std::path::Path, backend: &str, refreshed: u64) -> crate::signin::SignIn {
+    std::fs::create_dir_all(dir).expect("auth home");
+    let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
+    let issuer = backend.trim_end_matches("/backend-api");
+    std::fs::write(
+        dir.join("auth.json"),
+        json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "synthetic-access-token",
+                "refresh_token": "synthetic-refresh-token",
+                "account_id": "account-1",
+                "oauth_provenance": {"issuer": issuer, "client_id": codex_login::CLIENT_ID},
+            },
+            "last_refresh": chrono_like(refreshed),
+        })
+        .to_string(),
+    )
+    .expect("auth.json");
+    crate::signin::SignIn::in_files(dir).with_backend(backend)
+}
+
+/// `secs` since the epoch as an RFC 3339 UTC time.
+fn chrono_like(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+// Sign-ins are kept, and used, on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "signed-in");
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(&auth, &backend)),
+        };
+        // A key in the environment does not replace the sign-in. Only this
+        // test reads or writes CODEX_API_KEY.
+        // SAFETY: as above; nothing else in this binary touches it.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CODEX_API_KEY", "sk-from-the-environment");
+        }
+        let (out, _) = run_codex_atom(
+            &Classify,
+            &Note {
+                text: "Export crashes on é.".into(),
+            },
+            &rt,
+        )
+        .await
+        .expect("runs on the sign-in");
+        assert_eq!(out.category, "bug");
+        assert_eq!(model.calls(), 1);
+        assert_eq!(model.paths(), ["/backend-api/codex/responses"]);
+        let headers = &model.headers()[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            header("authorization"),
+            Some("Bearer synthetic-access-token")
+        );
+        assert_eq!(header("chatgpt-account-id"), Some("account-1"));
+        // Everything the thread asked of the backend: the model, and nothing
+        // that reaches the account's apps, connectors or plugins.
+        eprintln!("every request: {:?}", model.every_request());
+        assert_eq!(model.every_request(), expected_backend_requests());
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+        }
+    });
+}
+
+/// A stale sign-in is refreshed at its own issuer, here the test backend,
+/// before the thread uses it: nothing reaches OpenAI's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stale_sign_in_is_refreshed_at_the_test_issuer() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "stale-sign-in");
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in_at(&auth, &backend, 0)),
+        };
+        // The fake has no token endpoint, so the refresh fails; whether the
+        // turn then runs on the old token is Codex's to decide.
+        let _ = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let asked = model.every_request();
+        assert!(
+            asked.contains(&("POST".to_owned(), "/oauth/token".to_owned())),
+            "{asked:?}"
+        );
+    });
+}
+
+/// Codex's login restrictions hold for the sign-in when a thread starts: a
+/// workspace other than the sign-in's, or API keys only, refuse it before
+/// any model call.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
+    on_codex_runtime(async {
+        for (tag, config, said) in [
+            (
+                "workspace",
+                "forced_chatgpt_workspace_id = \"another-workspace\"\n",
+                "allow ChatGPT workspace(s) another-workspace only",
+            ),
+            (
+                "method",
+                "forced_login_method = \"api\"\n",
+                "do not allow a chatgpt sign-in",
+            ),
+        ] {
+            let model = FakeModel::start(Vec::new()).await.expect("fake model");
+            let mut rt = runtime(&model, &format!("restricted-{tag}"));
+            std::fs::write(rt.codex_home.join("config.toml"), config).expect("config");
+            let backend = model.base_url().replace("/v1", "/backend-api");
+            let auth = rt.codex_home.with_file_name("auth");
+            rt.endpoint = ModelEndpoint {
+                base_url: "unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(signed_in(&auth, &backend)),
+            };
+            let refused = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+                .await
+                .expect_err("refused");
+            assert!(refused.to_string().contains(said), "{tag}: {refused}");
+            assert_eq!(model.calls(), 0, "{tag}");
+        }
+    });
+}
+
+/// The requests a signed-in thread makes of the Codex backend, in order.
+fn expected_backend_requests() -> Vec<(String, String)> {
+    // The model catalog, then the turn.
+    [
+        ("GET", "/backend-api/codex/models"),
+        ("POST", "/backend-api/codex/responses"),
+    ]
+    .into_iter()
+    .map(|(m, p)| (m.to_owned(), p.to_owned()))
+    .collect()
+}
+
+#[test]
+fn a_lite_atom_says_a_sign_in_is_not_for_it() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let codex = runtime(&model, "lite-signed-in");
+        let auth = codex.codex_home.with_file_name("auth");
+        let endpoint = ModelEndpoint {
+            base_url: model.base_url(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(
+                &auth,
+                &model.base_url().replace("/v1", "/backend-api"),
+            )),
+        };
+        let lite = crate::lite::LiteRuntime::new(endpoint, AtomConfig::default());
+        let refused = run_lite_atom(
+            &Patch,
+            &Note {
+                text: "Export crashes.".into(),
+            },
+            &lite,
+        )
+        .await
+        .expect_err("refused");
+        let said = refused.to_string();
+        assert!(said.contains("serves Codex atoms only"), "{said}");
+        assert!(said.contains("ATOMIC_MODEL_BASE_URL"), "{said}");
+        assert_eq!(model.calls(), 0);
     });
 }
 
@@ -2488,6 +2828,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
                     backend,
                     None,
                     &artifacts,
+                    &crate::usage::Metering::none(),
                 )
                 .await
             });
@@ -2572,6 +2913,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
             step_id: "total".into(),
         };
         let input = json!({"cents": [1]});
+        let meter = crate::usage::Metering::none();
         let run = || {
             run_exec(
                 &a,
@@ -2581,6 +2923,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &artifacts,
+                &meter,
             )
         };
         let held = hold();
@@ -2819,6 +3162,7 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
                 backend,
                 None,
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await;
         });

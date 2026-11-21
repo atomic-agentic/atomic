@@ -155,7 +155,47 @@ pub fn binding_origin(
 pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
-pub(crate) const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
+pub(crate) const STEP: &[&str] = &[
+    "atom", "gate", "after", "with", "origins", "worktree", "review",
+];
+/// The fields of an atom step's `review`.
+pub(crate) const REVIEW: &[&str] = &["reviewer", "with", "rounds"];
+/// The most repair rounds a review may give its author.
+pub const MAX_REVIEW_ROUNDS: u64 = 5;
+/// The verdicts a reviewer may give, as atomic's examples name them:
+/// `approve` accepts the output; `request_changes` and `revise` ask the
+/// author for a repair round; `reject`, `escalate` and
+/// `insufficient_context` leave the decision to a person.
+pub const VERDICTS: [&str; 6] = [
+    "approve",
+    "request_changes",
+    "revise",
+    "reject",
+    "escalate",
+    "insufficient_context",
+];
+
+/// What a reviewer's verdict asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The output is accepted.
+    Approve,
+    /// The author gets a repair round, if any are left.
+    Changes,
+    /// A person decides.
+    Person,
+}
+
+impl Verdict {
+    /// What `verdict` asks for; one atomic does not know is for a person.
+    pub fn of(verdict: &str) -> Self {
+        match verdict {
+            "approve" => Self::Approve,
+            "request_changes" | "revise" => Self::Changes,
+            _ => Self::Person,
+        }
+    }
+}
 pub(crate) const GATE: &[&str] = &[
     "title",
     "ask",
@@ -166,7 +206,7 @@ pub(crate) const GATE: &[&str] = &[
     "on_timeout",
     "approvers",
 ];
-const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "review", "retry"];
+const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "retry"];
 
 /// Load the workflow at `file`, checking it against `atoms` (by name).
 pub fn load(
@@ -298,6 +338,18 @@ pub fn load(
     let mut after: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (id, step) in steps {
         let sp = format!("/steps/{id}");
+        // atomic names a step's durable operations after it (`<id>.turn`,
+        // `<id>.review.<n>`, `<id>.repair.<n>`): a dot would let one
+        // step's names be another's.
+        if id.contains('.') {
+            return Err(fail(
+                &sp,
+                format!(
+                    "step `{id}` has a dot in its name; name steps with letters, digits, `-` \
+                     and `_`"
+                ),
+            ));
+        }
         let Value::Object(s) = step else {
             return Err(fail(&sp, "a step is a mapping".into()));
         };
@@ -326,6 +378,12 @@ pub fn load(
                 ));
             }
             (None, None) => return Err(fail(&sp, "a step needs `atom` or `gate`".into())),
+            (None, Some(_)) if s.contains_key("review") => {
+                return Err(fail(
+                    &format!("{sp}/review"),
+                    "`review` belongs to an atom step: a gate is decided by a person".into(),
+                ));
+            }
             _ => {}
         }
         let deps = match s.get("after") {
@@ -593,6 +651,27 @@ pub fn load(
                         format!("atom `{atom_name}` has no compiled output contract"),
                     )
                 })?;
+            if let Some(review) = s.get("review") {
+                check_review(
+                    review,
+                    &format!("{sp}/review"),
+                    Reviewed {
+                        name: atom_name,
+                        atom,
+                        output: &out,
+                        worktree: s.get("worktree").and_then(Value::as_bool) == Some(true),
+                    },
+                    atoms,
+                    &scope,
+                    &Roots {
+                        input: &input,
+                        steps: &steps_schema,
+                    },
+                    &kinds,
+                    &mut warnings,
+                    &fail,
+                )?;
+            }
             step_schemas.insert(
                 id.clone(),
                 json!({"type": "object", "properties": {"output": out, "metadata": {"type": "object"}}, "additionalProperties": false}),
@@ -797,6 +876,301 @@ pub fn load(
     })
 }
 
+/// The step a review is on: its atom, by name, the schema of its output and
+/// whether it runs in a worktree.
+struct Reviewed<'a> {
+    name: &'a str,
+    atom: &'a Atom,
+    output: &'a Value,
+    worktree: bool,
+}
+
+/// The schemas a step's expressions read from.
+struct Roots<'a> {
+    input: &'a Value,
+    steps: &'a Value,
+}
+
+/// The schema of what a reviewer sees as `candidate`: the output under
+/// review, and for a worktree step its `metadata.commit`.
+pub fn candidate_schema(output: &Value, worktree: bool) -> Value {
+    let mut properties = Map::new();
+    properties.insert("output".into(), output.clone());
+    if worktree {
+        properties.insert(
+            "metadata".into(),
+            json!({"type": "object", "properties": {"commit": {"type": "string"}}}),
+        );
+    }
+    json!({"type": "object", "properties": properties, "additionalProperties": false})
+}
+
+/// The origin a review binding's `source` carries: what it reads of the
+/// step's scope, as [`binding_origin`] has it, and anything of `candidate`
+/// as external, since the candidate is the author's output on data that may
+/// itself be external.
+pub fn review_origin(
+    source: &str,
+    kinds: &BTreeMap<String, String>,
+) -> Result<&'static str, String> {
+    binding_origin(source, kinds)
+}
+
+/// Check an atom step's `review` (at `rp`): a lite or codex reviewer, not
+/// the author, whose output is a verdict; a `with` that maps the reviewer's
+/// input, typed and no less trusted than the reviewer accepts, from what
+/// the step sees and the `candidate` under review; and how many repair
+/// rounds the author gets, none for an author that accepts more trusted
+/// input than a reviewer's findings are.
+#[allow(clippy::too_many_arguments)]
+fn check_review(
+    review: &Value,
+    rp: &str,
+    reviewed: Reviewed<'_>,
+    atoms: &BTreeMap<String, Atom>,
+    scope: &Scope,
+    roots: &Roots<'_>,
+    kinds: &BTreeMap<String, String>,
+    warnings: &mut Vec<String>,
+    fail: &dyn Fn(&str, String) -> WorkflowError,
+) -> Result<(), WorkflowError> {
+    let author_name = reviewed.name;
+    let Value::Object(r) = review else {
+        return Err(fail(
+            rp,
+            "`review` is a mapping: `reviewer`, `with` and `rounds`".into(),
+        ));
+    };
+    for key in r.keys() {
+        if !REVIEW.contains(&key.as_str()) {
+            return Err(fail(
+                &format!("{rp}/{key}"),
+                format!(
+                    "unknown review field `{key}`; a review's fields are {}",
+                    REVIEW.join(", ")
+                ),
+            ));
+        }
+    }
+    if reviewed.atom.kind == "exec" {
+        return Err(fail(
+            rp,
+            format!(
+                "`{author_name}` is an exec atom, and a review's repair rounds run the author \
+                 again with the review, which a command cannot read; review a model atom"
+            ),
+        ));
+    }
+    let name = r
+        .get("reviewer")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail(&format!("{rp}/reviewer"), "`reviewer` names an atom".into()))?;
+    if name == author_name {
+        return Err(fail(
+            &format!("{rp}/reviewer"),
+            format!("`{name}` would review its own output; name another atom as the reviewer"),
+        ));
+    }
+    let reviewer = atoms.get(name).ok_or_else(|| {
+        let near = crate::names::nearest(name, atoms.keys().map(String::as_str));
+        fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "no atom named `{name}`{}",
+                near.map(|n| format!("; did you mean {n}?"))
+                    .unwrap_or_default()
+            ),
+        )
+    })?;
+    if !matches!(reviewer.kind.as_str(), "lite" | "codex") {
+        return Err(fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "`{name}` is a {} atom; a reviewer is a lite or codex atom",
+                reviewer.kind
+            ),
+        ));
+    }
+    let verdict = reviewer.program.contracts.get("Output").ok_or_else(|| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!("atom `{name}` has no compiled output contract"),
+        )
+    })?;
+    is_verdict(verdict).map_err(|why| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "`{name}`'s output is not a verdict: {why}. A reviewer outputs `verdict`, one \
+                 of {}, with `approve` among them; the rest of its output (findings, a \
+                 reason) is handed to the author with a request for changes",
+                VERDICTS.join(", ")
+            ),
+        )
+    })?;
+    let rounds = match r.get("rounds") {
+        None => 1,
+        Some(n) => n
+            .as_u64()
+            .filter(|n| *n <= MAX_REVIEW_ROUNDS)
+            .ok_or_else(|| {
+                fail(
+                    &format!("{rp}/rounds"),
+                    format!("`rounds` is a whole number from 0 to {MAX_REVIEW_ROUNDS}"),
+                )
+            })?,
+    };
+    // The reviewer's input, from what the step sees and the candidate.
+    let candidate = candidate_schema(reviewed.output, reviewed.worktree);
+    let scope = scope.clone().with("candidate", &candidate);
+    let target = reviewer.program.contracts.get("Input").ok_or_else(|| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!("atom `{name}` has no compiled input contract"),
+        )
+    })?;
+    let fields = target
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let with = match r.get("with") {
+        None => Map::new(),
+        Some(Value::Object(w)) => w.clone(),
+        Some(_) => {
+            return Err(fail(
+                &format!("{rp}/with"),
+                "`with` maps the reviewer's input fields to CEL expressions".into(),
+            ));
+        }
+    };
+    let accepts = |atom: &Atom| {
+        atom.frontmatter
+            .get("trust")
+            .and_then(Value::as_str)
+            .unwrap_or("external")
+            .to_owned()
+    };
+    let reviewer_accepts = accepts(reviewer);
+    // What the reviewer's findings carry: a model's output on what it read.
+    let mut findings = "agent";
+    for (field, e) in &with {
+        let wp = format!("{rp}/with/{field}");
+        let Some(field_schema) = fields.get(field) else {
+            let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+            return Err(fail(
+                &wp,
+                format!(
+                    "atom `{name}` has no input field `{field}` (fields: {})",
+                    known.join(", ")
+                ),
+            ));
+        };
+        let source = e
+            .as_str()
+            .ok_or_else(|| fail(&wp, "a mapping is a CEL expression in a string".into()))?;
+        expr::parse(source)
+            .and_then(|p| p.check(&scope))
+            .map_err(|e| fail(&wp, e.to_string()))?;
+        let from = path_schema_in(
+            source,
+            &[
+                ("input", roots.input),
+                ("steps", roots.steps),
+                ("candidate", &candidate),
+            ],
+        );
+        match fits(from.as_ref(), field_schema) {
+            Fit::Yes => {}
+            Fit::No(why) => {
+                return Err(fail(
+                    &wp,
+                    format!("`{source}` cannot fit `{name}`'s input field `{field}`: {why}"),
+                ));
+            }
+            Fit::Unknown => {
+                warnings.push(format!("{wp}: could not prove `{source}` fits `{field}`"))
+            }
+        }
+        let origin = review_origin(source, kinds).map_err(|m| fail(&wp, m))?;
+        if trust_rank(origin) < trust_rank(&reviewer_accepts) {
+            return Err(fail(
+                &wp,
+                format!(
+                    "`{source}` is {origin} data, and reviewer `{name}` accepts \
+                     {reviewer_accepts} input at most (`trust: '{reviewer_accepts}'`); a \
+                     candidate under review is external data"
+                ),
+            ));
+        }
+        if trust_rank(origin) < trust_rank(findings) {
+            findings = origin;
+        }
+    }
+    for required in target
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !with.contains_key(required) {
+            return Err(fail(
+                &format!("{rp}/with"),
+                format!(
+                    "atom `{name}` requires input field `{required}`, which `with` does not bind"
+                ),
+            ));
+        }
+    }
+    // A repair round hands the author the reviewer's findings: no more
+    // trusted than what the reviewer read.
+    let author_accepts = accepts(reviewed.atom);
+    if rounds > 0 && trust_rank(findings) < trust_rank(&author_accepts) {
+        return Err(fail(
+            &format!("{rp}/rounds"),
+            format!(
+                "a repair round hands `{author_name}` the reviewer's findings, which are \
+                 {findings} data, and it accepts {author_accepts} input at most \
+                 (`trust: '{author_accepts}'`); set `rounds: 0`, so a person decides on a \
+                 rejection, or review it with what it can take"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `contract` is a reviewer's verdict: an object requiring
+/// `verdict`, a string among [`VERDICTS`] that may be `approve`.
+pub fn is_verdict(contract: &Value) -> Result<(), String> {
+    let props = contract
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or("it is not an object with properties")?;
+    let required = contract
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|r| r.iter().any(|f| f == "verdict"));
+    if !required {
+        return Err("it does not require `verdict`".into());
+    }
+    let choices = props
+        .get("verdict")
+        .and_then(|v| v.get("enum"))
+        .and_then(Value::as_array)
+        .filter(|c| !c.is_empty())
+        .ok_or("`verdict` is not an enum")?;
+    for c in choices {
+        if !c.as_str().is_some_and(|c| VERDICTS.contains(&c)) {
+            return Err(format!("`verdict` allows {c}"));
+        }
+    }
+    if !choices.iter().any(|c| c == "approve") {
+        return Err("`verdict` cannot be `approve`".into());
+    }
+    Ok(())
+}
+
 /// Steps in an order respecting `after`, or a step on a cycle.
 /// A question gate's `answer` as the JSON Schema an answer must fit: a list
 /// of choices is shorthand for an `enum` of them; a mapping is a schema.
@@ -893,6 +1267,11 @@ pub(crate) fn inline(
 
 /// The schema of `source` when it is a plain path from `input` or `steps`.
 fn path_schema(source: &str, input: &Value, steps: &Value) -> Option<Value> {
+    path_schema_in(source, &[("input", input), ("steps", steps)])
+}
+
+/// [`path_schema`] over the named `roots`.
+fn path_schema_in(source: &str, roots: &[(&str, &Value)]) -> Option<Value> {
     let source = source.trim();
     if !source
         .chars()
@@ -901,11 +1280,11 @@ fn path_schema(source: &str, input: &Value, steps: &Value) -> Option<Value> {
         return None;
     }
     let mut parts = source.split('.');
-    let mut cur = match parts.next()? {
-        "input" => input.clone(),
-        "steps" => steps.clone(),
-        _ => return None,
-    };
+    let root = parts.next()?;
+    let mut cur = roots
+        .iter()
+        .find(|(name, _)| *name == root)
+        .map(|(_, schema)| (*schema).clone())?;
     for p in parts {
         cur = cur.get("properties")?.get(p)?.clone();
     }

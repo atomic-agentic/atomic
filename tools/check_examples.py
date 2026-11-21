@@ -348,7 +348,8 @@ def check_project(top):
                 # A case for an atom with code may supply `prepared`: the values
                 # prepare() would return. The eval then does not run prepare().
                 has_code = deno_exec.CODE in fm
-                require(set(ev) - {"prepared"} == {"input", "expect"}, f"{eval_path}: unknown eval field")
+                require(set(ev) - {"prepared", "origin"} == {"input", "expect"}, f"{eval_path}: unknown eval field")
+                require(ev.get("origin", "external") in ("external", "agent", "team"), f"{eval_path}: `origin` is external, agent or team")
                 require(("prepared" in ev) == has_code, f"{eval_path}: catalog cases give `prepared` exactly when the atom has code")
                 if has_code:
                     sample = Path(str(project / "fixtures" / name / eval_path.stem) + ".prepared.json")

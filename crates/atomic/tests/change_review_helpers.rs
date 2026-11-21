@@ -192,6 +192,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
         base_url: base_url.to_owned(),
         model: "synthetic".into(),
         api_key_env: None,
+        sign_in: None,
     };
     Arc::new(Runtimes {
         codex: CodexRuntime {
@@ -208,6 +209,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }

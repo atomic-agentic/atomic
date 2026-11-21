@@ -1,0 +1,673 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Signing in to a ChatGPT plan, through Codex's own login, for Codex atoms.
+//!
+//! A developer who signs in with `atomic model login` runs Codex atoms on
+//! their plan with no API key set. The sign-in is the developer's own, for
+//! local use: atomic keeps it once per user, apart from every project, as it
+//! keeps the operator credential (see [`crate::credential`]):
+//!
+//! - in the OS keyring by default, through Codex's keyring storage;
+//! - with `ATOMIC_CREDENTIAL_STORE=file`, in `codex-auth/` in the
+//!   credential directory, readable by its owner only;
+//! - on Linux only, where atomic has verified that atoms' sandboxes cannot
+//!   reach it; elsewhere sign-in is refused.
+//!
+//! Codex atoms' sandboxed commands never see it: the credential directory is
+//! denied to their sandbox, their commands cannot use the kernel keyrings or
+//! reach the Secret Service, and Codex sends the token to the model backend
+//! from atomic's own process. Exec atoms' commands run under the same sandbox
+//! and are kept from it alike. A signed-in thread has none of Codex's ChatGPT
+//! connectors, plugins or hosted tools (see `crate::codex`), so the token
+//! reaches the model and nothing else. Lite atoms call a model API directly
+//! and are not covered: they need an endpoint and, if it asks for one, a
+//! key.
+//!
+//! A model endpoint someone configured comes first; with none, the sign-in
+//! comes before what atomic detects (`OPENAI_API_KEY`, a local Ollama).
+//! The sign-in is personal: a shared store or `atomic serve` never uses it
+//! (the caller refuses it there). Codex's managed login restrictions
+//! (`forced_login_method`, `forced_chatgpt_workspace_id`, and the managed
+//! `allowed_login_methods` and `allowed_chatgpt_workspaces`) hold for it, on
+//! login and when a thread starts.
+
+use crate::credential::{CredentialError, STORE_VAR};
+use codex_core_api::{AuthCredentialsStoreMode, AuthKeyringBackendKind};
+use codex_protocol::config_types::ForcedLoginMethod;
+use std::path::{Path, PathBuf};
+
+/// Where a sign-in is kept, and how Codex atoms use it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignIn {
+    auth_home: PathBuf,
+    store: AuthCredentialsStoreMode,
+    backend: Option<String>,
+    issuer: Option<String>,
+}
+
+/// Who is signed in, without any token. Its `Debug` masks the email.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Account {
+    /// How: `chatgpt`, or `api key` for a key saved by a login.
+    pub mode: String,
+    /// The account's email, if the sign-in says. Never shown as it is:
+    /// [`mask_email`] it first.
+    pub email: Option<String>,
+    /// The ChatGPT plan, if the sign-in says.
+    pub plan: Option<String>,
+    /// Where it is kept: the OS keyring or the credential file store.
+    pub store: String,
+    /// The ChatGPT workspace it belongs to, for the managed restrictions.
+    workspace: Option<String>,
+}
+
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("mode", &self.mode)
+            .field("email", &self.email.as_deref().map(mask_email))
+            .field("plan", &self.plan)
+            .field("store", &self.store)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `email` with all of its local part but the first character hidden, as a
+/// new string built from those parts: `d***@example.com`. Masking a masked
+/// email gives it back.
+pub fn mask_email(email: &str) -> String {
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return "***".to_owned();
+    };
+    let mut shown = String::with_capacity(domain.len() + 5);
+    if let Some(first) = local.chars().next() {
+        shown.push(first);
+    }
+    shown.push_str("***@");
+    shown.push_str(domain);
+    shown
+}
+
+/// What a logout forgot.
+#[derive(Debug)]
+pub struct Forgotten {
+    /// Whether there was a copy in the credential file store.
+    pub file: bool,
+    /// Whether there was a copy in the OS keyring, or why it could not be
+    /// checked.
+    pub keyring: Result<bool, String>,
+}
+
+/// A resolved setting as `atomic config --explain` lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Explained {
+    /// The setting's value, safe to print.
+    pub value: String,
+    /// Where it came from.
+    pub source: String,
+}
+
+/// Why there is no sign-in to use or keep.
+#[derive(Debug, thiserror::Error)]
+pub enum SignInError {
+    /// Not on a platform where atoms' reach to it has been verified.
+    #[error(
+        "a ChatGPT sign-in is kept only on Linux, where atomic has verified that atoms' \
+         sandboxes cannot reach it; on {0} configure a model endpoint and API key instead"
+    )]
+    Unprotected(&'static str),
+    /// The store could not be chosen or opened.
+    #[error(transparent)]
+    Store(#[from] CredentialError),
+    /// Codex's managed login restrictions on this machine refuse it.
+    #[error("{0}")]
+    Restricted(String),
+}
+
+const KEYRING: AuthKeyringBackendKind = AuthKeyringBackendKind::Direct;
+
+/// Refused when `dir` is inside the checkout holding `project`: a file
+/// there is one the repository could have supplied.
+fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignInError> {
+    let Some(project) = project else {
+        return Ok(());
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let (here, project) = (real(dir), real(project));
+    match project.ancestors().find(|d| d.join(".git").exists()) {
+        Some(checkout) if here.starts_with(checkout) => {
+            Err(SignInError::Store(CredentialError::File(format!(
+                "{} is inside the checkout holding the project, at {}, so the repository could \
+                 have supplied it; point ATOMIC_HOME outside it",
+                dir.display(),
+                checkout.display()
+            ))))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
+pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
+
+/// Refused unless sign-ins may be kept on this platform.
+pub fn protected() -> Result<(), SignInError> {
+    protected_on(std::env::consts::OS)
+}
+
+fn protected_on(os: &'static str) -> Result<(), SignInError> {
+    if os == "linux" {
+        Ok(())
+    } else {
+        Err(SignInError::Unprotected(os))
+    }
+}
+
+impl SignIn {
+    /// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses is, without
+    /// creating anything: outside every state directory and, when there is
+    /// one, outside and not above `project`, as the operator credential's
+    /// file store is, and outside the checkout holding it, which the
+    /// project's own files could reach. Outside any project (as from the
+    /// home directory, above the store) there is no project to keep it apart
+    /// from.
+    pub fn located(project: Option<&Path>) -> Result<Self, SignInError> {
+        protected()?;
+        let dir = crate::state::credentials_dir()
+            .map_err(|e| CredentialError::File(e.to_string()))?
+            .join("codex-auth");
+        crate::credential::placed_apart(&dir, project)?;
+        outside_the_checkout(&dir, project)?;
+        // One spelling, so the keyring entry Codex keys by it is the same
+        // however the directory is reached.
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let store = match std::env::var(STORE_VAR).ok().filter(|v| !v.is_empty()) {
+            None => AuthCredentialsStoreMode::Keyring,
+            Some(v) if v == "keyring" => AuthCredentialsStoreMode::Keyring,
+            Some(v) if v == "file" => AuthCredentialsStoreMode::File,
+            Some(other) => return Err(CredentialError::UnknownStore(other).into()),
+        };
+        Ok(Self {
+            auth_home: dir,
+            store,
+            backend: None,
+            issuer: None,
+        })
+    }
+
+    /// The sign-in store `ATOMIC_CREDENTIAL_STORE` chooses, as
+    /// [`SignIn::located`] finds it, its directory created readable by its
+    /// owner only. Refused off Linux.
+    pub fn configured(project: Option<&Path>) -> Result<Self, SignInError> {
+        let located = Self::located(project)?;
+        crate::state::private_dir(&located.auth_home)
+            .map_err(|e| CredentialError::File(e.to_string()))?;
+        let auth_home = std::fs::canonicalize(&located.auth_home).unwrap_or(located.auth_home);
+        Ok(Self {
+            auth_home,
+            ..located
+        })
+    }
+
+    /// A sign-in kept in files under `dir`, for tests.
+    #[cfg(any(test, feature = "fake-model"))]
+    pub fn in_files(dir: &Path) -> Self {
+        Self {
+            auth_home: dir.to_owned(),
+            store: AuthCredentialsStoreMode::File,
+            backend: None,
+            issuer: None,
+        }
+    }
+
+    /// For tests: every ChatGPT route at `backend` (such as
+    /// `http://127.0.0.1:<port>/backend-api`) instead of ChatGPT's.
+    #[cfg(any(test, feature = "fake-model"))]
+    pub fn with_backend(mut self, backend: &str) -> Self {
+        self.backend = Some(backend.trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// For tests: log in at `issuer` instead of OpenAI's.
+    #[cfg(any(test, feature = "fake-model"))]
+    pub fn with_issuer(mut self, issuer: &str) -> Self {
+        self.issuer = Some(issuer.trim_end_matches('/').to_owned());
+        self
+    }
+
+    /// The directory Codex keys its storage by.
+    pub fn auth_home(&self) -> &Path {
+        &self.auth_home
+    }
+
+    /// The backend tests point the sign-in at, if any.
+    pub(crate) fn backend(&self) -> Option<&str> {
+        self.backend.as_deref()
+    }
+
+    pub(crate) fn store(&self) -> AuthCredentialsStoreMode {
+        self.store
+    }
+
+    /// Where the sign-in is kept, for a person: never a token.
+    pub fn store_name(&self) -> &'static str {
+        match self.store {
+            AuthCredentialsStoreMode::File => "the credential file store",
+            _ => "the OS keyring",
+        }
+    }
+
+    /// Who is signed in, if anyone.
+    pub fn account(&self) -> anyhow::Result<Option<Account>> {
+        protected()?;
+        let auth = codex_login::load_auth_dot_json(&self.auth_home, self.store, KEYRING)?;
+        let store = self.store_name().to_owned();
+        Ok(auth.and_then(|a| {
+            if let Some(tokens) = &a.tokens {
+                return Some(Account {
+                    mode: "chatgpt".into(),
+                    email: tokens.id_token.email.clone(),
+                    plan: tokens.id_token.get_chatgpt_plan_type(),
+                    store: store.clone(),
+                    workspace: tokens.id_token.chatgpt_account_id.clone(),
+                });
+            }
+            a.openai_api_key.as_ref().map(|_| Account {
+                mode: "api key".into(),
+                email: None,
+                plan: None,
+                store: store.clone(),
+                workspace: None,
+            })
+        }))
+    }
+
+    /// Refused unless `policy`, Codex's login restrictions as a thread's
+    /// configuration resolves them, allows the kept sign-in: its login
+    /// method, and for ChatGPT its workspace.
+    pub(crate) fn allowed_by(&self, policy: &codex_login::AuthConfig) -> anyhow::Result<()> {
+        let Some(account) = self.account()? else {
+            return Ok(());
+        };
+        let method = if account.mode == "chatgpt" {
+            ForcedLoginMethod::Chatgpt
+        } else {
+            ForcedLoginMethod::Api
+        };
+        if !policy.is_login_method_allowed(method) {
+            return Err(SignInError::Restricted(format!(
+                "Codex's login restrictions on this machine do not allow a {} sign-in; configure \
+                 a model endpoint, or sign in as they allow",
+                account.mode
+            ))
+            .into());
+        }
+        if method == ForcedLoginMethod::Chatgpt
+            && let Some(workspaces) = policy.effective_chatgpt_workspaces()
+            && !account
+                .workspace
+                .as_ref()
+                .is_some_and(|w| workspaces.contains(w))
+        {
+            return Err(SignInError::Restricted(format!(
+                "Codex's login restrictions on this machine allow ChatGPT workspace(s) {} only, \
+                 and the sign-in belongs to another; sign in again with `atomic model login`",
+                workspaces.join(", ")
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
+    /// What `atomic config --explain` shows for model access from this
+    /// sign-in, if anyone is signed in: how and where, never a token or an
+    /// email. Model access from a configured endpoint takes precedence (see
+    /// the engine's endpoint selection).
+    pub fn explain(&self) -> Option<Explained> {
+        let account = self.account().ok().flatten()?;
+        let value = match account.plan {
+            Some(plan) => format!("signed in with ChatGPT ({plan} plan), for Codex atoms"),
+            None => format!("signed in with {}, for Codex atoms", account.mode),
+        };
+        Some(Explained {
+            value,
+            source: format!("atomic model login, kept in {}", self.store_name()),
+        })
+    }
+
+    /// Sign in in a browser, or with a device code on a machine with none
+    /// at hand, and keep the sign-in. The keyring is checked first, so a
+    /// machine without one is told so before any browser flow.
+    pub async fn login(&self, device: bool) -> anyhow::Result<()> {
+        protected()?;
+        // Codex's login restrictions, as its own login applies them: the
+        // method first, then the workspaces the issuer must sign in to.
+        let policy = crate::codex::auth_policy(&self.auth_home).await?;
+        if !policy.is_login_method_allowed(ForcedLoginMethod::Chatgpt) {
+            return Err(SignInError::Restricted(
+                "Codex's login restrictions on this machine do not allow a ChatGPT sign-in; \
+                 configure a model endpoint and API key instead"
+                    .into(),
+            )
+            .into());
+        }
+        if self.store != AuthCredentialsStoreMode::File {
+            keyring_usable()?;
+        }
+        let mut options = codex_login::ServerOptions::new(
+            self.auth_home.clone(),
+            codex_login::CLIENT_ID.to_owned(),
+            policy.effective_chatgpt_workspaces(),
+            self.store,
+            KEYRING,
+            policy.auth_route_config.clone(),
+        );
+        if let Some(issuer) = &self.issuer {
+            options.issuer = issuer.clone();
+            options.open_browser = false;
+            options.port = 0;
+        }
+        if device {
+            codex_login::run_device_code_login(options).await?;
+        } else {
+            let server = codex_login::run_login_server(options)?;
+            // Redacted as every log line is; the address carries no secret
+            // (see the test below), so it reaches the person whole.
+            crate::log_line!(
+                "Sign in in your browser. If it did not open, go to:\n\n  {}\n",
+                server.auth_url
+            );
+            #[cfg(any(test, feature = "fake-model"))]
+            if let Some(hook) = LOGIN_STARTED.get() {
+                hook(&server.auth_url, server.actual_port);
+            }
+            server.block_until_done().await?;
+        }
+        Ok(())
+    }
+
+    /// Revoke the sign-in's tokens where the issuer allows, and forget every
+    /// copy of it, in the credential file store and in the OS keyring,
+    /// whichever store `ATOMIC_CREDENTIAL_STORE` now chooses and even when
+    /// revoking fails. Says what it found in each.
+    pub async fn logout(&self) -> anyhow::Result<Forgotten> {
+        protected()?;
+        let route = crate::codex::auth_policy(&self.auth_home)
+            .await?
+            .auth_route_config;
+        // The file first: forgetting the keyring's copy removes a file copy
+        // too, which would then be counted as the keyring's.
+        let file = codex_login::logout_with_revoke(
+            &self.auth_home,
+            AuthCredentialsStoreMode::File,
+            KEYRING,
+            &route,
+        )
+        .await?;
+        let keyring = codex_login::logout_with_revoke(
+            &self.auth_home,
+            AuthCredentialsStoreMode::Keyring,
+            KEYRING,
+            &route,
+        )
+        .await
+        .map_err(|e| e.to_string());
+        Ok(Forgotten { file, keyring })
+    }
+
+    /// The keyring backend Codex's storage uses for it.
+    pub(crate) fn keyring_kind(&self) -> AuthKeyringBackendKind {
+        KEYRING
+    }
+}
+
+/// For tests: told the login URL and port once the login server listens.
+#[cfg(any(test, feature = "fake-model"))]
+#[allow(clippy::type_complexity)]
+pub static LOGIN_STARTED: std::sync::OnceLock<Box<dyn Fn(&str, u16) + Send + Sync>> =
+    std::sync::OnceLock::new();
+
+/// Whether the OS keyring takes, gives back and forgets a value, so a
+/// missing or broken one is reported before a browser flow that could not
+/// be kept.
+fn keyring_usable() -> Result<(), CredentialError> {
+    use crate::credential::SecretStore;
+    let probe = format!("probe:{}", std::process::id());
+    let store = crate::credential::OsKeyring;
+    store.save(&probe, "probe")?;
+    let read = store.load(&probe);
+    let deleted = store.delete(&probe);
+    match (read, deleted) {
+        (Ok(Some(v)), Ok(_)) if v == "probe" => Ok(()),
+        (_, Err(e)) => Err(CredentialError::Keyring(format!(
+            "it kept a test value ({probe}) and would not forget it: {e}"
+        ))),
+        (Err(e), _) => Err(e),
+        (Ok(_), _) => Err(CredentialError::Keyring(
+            "it did not give back a test value it took".into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Sign-ins are kept on Linux only: off it, these are refused before
+    // they look.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explain_names_how_and_where_and_no_secret() {
+        let dir = std::env::temp_dir().join(format!("atomic-signin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let sign_in = SignIn::in_files(&dir);
+        assert_eq!(sign_in.explain(), None, "no one is signed in");
+        std::fs::write(
+            dir.join("auth.json"),
+            r#"{"OPENAI_API_KEY": "sk-not-a-real-key"}"#,
+        )
+        .expect("auth.json");
+        let explained = sign_in.explain().expect("signed in");
+        assert_eq!(explained.value, "signed in with api key, for Codex atoms");
+        assert_eq!(
+            explained.source,
+            "atomic model login, kept in the credential file store"
+        );
+        assert!(!format!("{explained:?}").contains("sk-not"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_email_is_shown_masked() {
+        assert_eq!(mask_email("dev@example.invalid"), "d***@example.invalid");
+        assert_eq!(mask_email("a.b@c@example.com"), "a***@example.com");
+        assert_eq!(mask_email("@example.com"), "***@example.com");
+        assert_eq!(mask_email("no-at-sign"), "***");
+        assert_eq!(mask_email("d***@example.invalid"), "d***@example.invalid");
+    }
+
+    /// A test issuer on loopback: it hands out a sign-in for `account` at
+    /// its token endpoint and records the request line of everything it is
+    /// asked.
+    async fn issuer(account: &'static str) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let issuer = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("issuer");
+        let port = issuer.local_addr().expect("addr").port();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = issuer.accept().await {
+                let mut request = vec![0u8; 16 * 1024];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..n]).into_owned();
+                let line = text.lines().next().unwrap_or_default().to_owned();
+                log.lock().expect("log").push(line.clone());
+                let token = line.starts_with("POST /oauth/token");
+                let body = if token {
+                    serde_json::json!({
+                        "id_token": crate::testing::fake_id_token("dev@example.invalid", account),
+                        "access_token": "issued-access-token",
+                        "refresh_token": "issued-refresh-token",
+                    })
+                    .to_string()
+                } else {
+                    "{}".to_owned()
+                };
+                let status = if token { "200 OK" } else { "404 Not Found" };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        (port, seen)
+    }
+
+    fn auth_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomic-login-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    /// Log in at the test issuer on `port`, with this test as the browser:
+    /// it reads the state from the authorize URL and comes back to the
+    /// login server's callback with a code.
+    /// The addresses browser logins were started at, as Codex built them.
+    static LOGIN_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    async fn browser_login(sign_in: &SignIn) -> anyhow::Result<()> {
+        static STARTED: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, u16)>>> =
+            std::sync::Mutex::new(None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        *STARTED.lock().expect("hook") = Some(tx);
+        let _ = LOGIN_STARTED.set(Box::new(|url: &str, port: u16| {
+            LOGIN_URLS.lock().expect("urls").push(url.to_owned());
+            if let Some(tx) = STARTED.lock().expect("hook").as_ref() {
+                let _ = tx.send((url.to_owned(), port));
+            }
+        }));
+        let browser = std::thread::spawn(move || {
+            let Ok((url, port)) = rx.recv_timeout(std::time::Duration::from_secs(60)) else {
+                return None;
+            };
+            let state = url
+                .split(['?', '&'])
+                .find_map(|p| p.strip_prefix("state="))
+                .expect("a state")
+                .to_owned();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            Some(runtime.block_on(async {
+                reqwest::Client::new()
+                    .get(format!(
+                        "http://127.0.0.1:{port}/auth/callback?code=the-code&state={state}"
+                    ))
+                    .send()
+                    .await
+                    .map(|r| r.status())
+            }))
+        });
+        let outcome = sign_in.login(false).await;
+        *STARTED.lock().expect("hook") = None;
+        let _ = browser.join();
+        outcome
+    }
+
+    /// `atomic model login`'s browser flow, end to end against a test
+    /// issuer: the sign-in it keeps is the issuer's, and no request leaves
+    /// the machine. Then Codex's login restrictions: a workspace the issuer
+    /// does not sign in to keeps nothing, and a machine that allows only
+    /// API keys refuses before the issuer is asked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn login_keeps_the_sign_in_the_issuer_gives_as_codex_restrictions_allow() {
+        crate::testing::on_codex_runtime(async {
+            let (port, seen) = issuer("account-1").await;
+            let at = format!("http://127.0.0.1:{port}");
+            let dir = auth_dir("allowed");
+            let sign_in = SignIn::in_files(&dir).with_issuer(&at);
+            browser_login(&sign_in).await.expect("logged in");
+            // The address the person is shown, as Codex builds it, comes
+            // through atomic's redaction whole.
+            let url = LOGIN_URLS
+                .lock()
+                .expect("urls")
+                .last()
+                .cloned()
+                .expect("a login address");
+            assert!(url.contains("api.connectors.read"), "{url}");
+            assert!(url.contains("code_challenge="), "{url}");
+            assert_eq!(
+                crate::redact::bounded(&url, crate::redact::MAX_TEXT),
+                url,
+                "redaction changed the address to sign in at"
+            );
+            let account = sign_in.account().expect("account").expect("signed in");
+            assert_eq!(account.mode, "chatgpt");
+            assert_eq!(account.email.as_deref(), Some("dev@example.invalid"));
+            let kept = std::fs::read_to_string(dir.join("auth.json")).expect("kept");
+            assert!(kept.contains("issued-access-token"));
+            assert!(
+                seen.lock()
+                    .expect("log")
+                    .iter()
+                    .any(|l| l.starts_with("POST /oauth/token")),
+                "the code was exchanged at the test issuer: {seen:?}"
+            );
+
+            // Restricted to another workspace: the issuer's sign-in is not
+            // kept.
+            let dir = auth_dir("workspace");
+            std::fs::write(
+                dir.join("config.toml"),
+                "forced_chatgpt_workspace_id = \"another-workspace\"\n",
+            )
+            .expect("config");
+            let sign_in = SignIn::in_files(&dir).with_issuer(&at);
+            let refused = browser_login(&sign_in).await;
+            assert!(refused.is_err(), "{refused:?}");
+            assert!(
+                !dir.join("auth.json").exists(),
+                "a refused sign-in was kept"
+            );
+
+            // API keys only: refused before any browser or issuer.
+            let dir = auth_dir("method");
+            std::fs::write(dir.join("config.toml"), "forced_login_method = \"api\"\n")
+                .expect("config");
+            seen.lock().expect("log").clear();
+            let refused = browser_login(&SignIn::in_files(&dir).with_issuer(&at))
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                refused.contains("do not allow a ChatGPT sign-in"),
+                "{refused}"
+            );
+            assert!(seen.lock().expect("log").is_empty(), "{seen:?}");
+            for tag in ["allowed", "workspace", "method"] {
+                let _ = std::fs::remove_dir_all(auth_dir(tag));
+            }
+        });
+    }
+
+    #[test]
+    fn sign_in_is_refused_off_linux_with_its_own_message() {
+        assert!(protected_on("linux").is_ok());
+        for os in ["macos", "windows"] {
+            let refused = protected_on(os).expect_err("refused").to_string();
+            assert!(
+                refused.contains("ChatGPT sign-in is kept only on Linux"),
+                "{refused}"
+            );
+            assert!(refused.contains(os), "{refused}");
+        }
+    }
+}
