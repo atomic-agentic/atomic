@@ -203,6 +203,13 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     // where it is kept or refused there: never taken for absent.
     let closed = f.outside.join("closed-home");
     std::fs::create_dir_all(closed.join("credentials/codex-auth")).unwrap();
+    let inside_closed = f.dir.join("closed-inside");
+    std::fs::create_dir_all(inside_closed.join("credentials/codex-auth")).unwrap();
+    // Opened again however the test ends, so nothing it leaves is stuck.
+    let _reopened = Reopened(vec![
+        closed.join("credentials"),
+        inside_closed.join("credentials"),
+    ]);
     let mode = |m: u32| {
         std::fs::set_permissions(
             closed.join("credentials"),
@@ -212,7 +219,6 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     };
     mode(0o000);
     if std::fs::read_dir(closed.join("credentials")).is_ok() {
-        mode(0o700);
         eprintln!(
             "SKIPPED the unreadable-directory cases: this test runs as a user mode 000 does \
              not keep out (root)"
@@ -224,8 +230,6 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
     assert!(t.contains("denied (os error 13)"), "{t}");
     std::fs::create_dir_all(f.dir.join(".git")).unwrap();
-    let inside_closed = f.dir.join("closed-inside");
-    std::fs::create_dir_all(inside_closed.join("credentials/codex-auth")).unwrap();
     std::fs::set_permissions(
         inside_closed.join("credentials"),
         std::os::unix::fs::PermissionsExt::from_mode(0o000),
@@ -235,12 +239,17 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     let t = refused(&[("ATOMIC_HOME", inside_home.as_str())]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
     assert!(t.contains("inside the checkout holding the project"), "{t}");
-    for dir in [&closed, &inside_closed] {
-        std::fs::set_permissions(
-            dir.join("credentials"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o700),
-        )
-        .unwrap();
+}
+
+/// Directories made readable again by their owner when dropped.
+struct Reopened(Vec<std::path::PathBuf>);
+
+impl Drop for Reopened {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ =
+                std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        }
     }
 }
 
