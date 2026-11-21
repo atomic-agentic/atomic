@@ -670,25 +670,65 @@ pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 /// [`checkouts_holding`], for the user `me` (`None` where files have no
-/// owner to compare). A `.git` another user owns, such as one planted in
-/// `/tmp` above every project there, still makes its directory a checkout
-/// that holds the project, but its link is neither followed nor refused:
-/// what it says is that user's, and no project under it should fail for it.
+/// owner to compare).
+///
+/// A `.git` that is there, or that cannot be looked at, makes its directory
+/// a checkout. What a `.git` links to may refuse the project only when it is
+/// this user's own and no hard link another user could have made to a file
+/// of theirs. Any other `.git`, such as one planted in `/tmp` above every
+/// project there, is still followed when it is a regular file that reads as
+/// a worktree's link, so a real worktree written by another user (under
+/// `sudo`, or seen through a user namespace) still holds the project in its
+/// main checkout; but nothing wrong with it refuses anything. The trade-off:
+/// a well-formed plant that names a directory with a `.git` makes that
+/// directory count as a checkout too, refusing a sign-in or a configuration
+/// kept there.
 fn checkouts_holding_as(dir: &Path, me: Option<u32>) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
+    for checkout in dir.ancestors().filter(|d| present(&d.join(".git"))) {
         found.push(checkout.to_owned());
         let git = checkout.join(".git");
-        if !owned_by(&git, me) {
-            continue;
-        }
-        if let Some(main) = main_checkout(&git)?
+        let main = if answerable(&git, me) {
+            main_checkout(&git)?
+        } else if std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_file()) {
+            main_checkout(&git).unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(main) = main
             && !found.contains(&main)
         {
             found.push(main);
         }
     }
     Ok(found)
+}
+
+/// Whether there is something at `path`: anything but a lookup that finds
+/// nothing, so one this user cannot make counts.
+fn present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whether what the `.git` at `git` says may refuse the project: it is
+/// `me`'s own, and not a file with other hard links, which another user
+/// could have made to a file of `me`'s.
+fn answerable(git: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        owned_by(git, me)
+            && std::fs::symlink_metadata(git)
+                .is_ok_and(|meta| !(meta.is_file() && meta.nlink() > 1))
+    }
+    #[cfg(not(unix))]
+    owned_by(git, me)
 }
 
 /// Whether `path` itself, not what a link there leads to, is owned by `me`;
@@ -1239,6 +1279,70 @@ mod tests {
         assert!(held.contains(&dir), "{held:?}");
         let refused = checkouts_holding_as(&project, Some(me)).expect_err("read, and refused");
         assert!(refused.contains("is not a regular file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another user's `.git` that is a worktree's link, well formed, is
+    /// still followed to its main checkout, which then holds the project;
+    /// one of theirs that is malformed refuses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_worktree_link_is_followed_and_a_malformed_one_ignored() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).expect("main");
+        std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(dir.join("wt/.git"), format!("gitdir: {}\n", gitdir.display()))
+            .expect(".git");
+        let project = dir.join("wt/project");
+        let other = Some(effective_uid().wrapping_add(1));
+        let held = checkouts_holding_as(&project, other).expect("read");
+        assert!(
+            held.contains(&std::fs::canonicalize(&main).expect("main")),
+            "another user's worktree lost its main checkout: {held:?}"
+        );
+        std::fs::write(gitdir.join("commondir"), "x".repeat(5000)).expect("commondir");
+        let held = checkouts_holding_as(&project, other).expect("refuses nothing");
+        assert!(held.contains(&dir.join("wt")), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.git` that is a hard link to a file of this user's, which another
+    /// user could make where links are not protected, refuses nothing, and
+    /// one this user cannot look at still counts as a checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_git_refuses_nothing_and_one_out_of_reach_still_counts() {
+        let dir = std::env::temp_dir().join(format!("atomic-linked-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::fs::write(dir.join("mine"), "x".repeat(5000)).expect("a file of mine");
+        std::fs::hard_link(dir.join("mine"), dir.join(".git")).expect("hard link");
+        let me = Some(effective_uid());
+        let held = checkouts_holding_as(&dir.join("project"), me).expect("refuses nothing");
+        assert!(held.contains(&dir), "{held:?}");
+        // Out of reach: a directory this user cannot look in.
+        let closed = dir.join("closed");
+        std::fs::create_dir_all(closed.join("inner/project")).expect("closed");
+        std::fs::create_dir_all(closed.join("inner/.git")).expect(".git");
+        let mode = |m: u32| {
+            std::fs::set_permissions(
+                closed.join("inner"),
+                std::os::unix::fs::PermissionsExt::from_mode(m),
+            )
+            .expect("mode")
+        };
+        mode(0o000);
+        if std::fs::read_dir(closed.join("inner")).is_ok() {
+            mode(0o700);
+            eprintln!("SKIPPED the out-of-reach case: running as a user mode 000 does not keep out");
+        } else {
+            assert!(present(&closed.join("inner/.git")), "taken for absent");
+            mode(0o700);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1,1 +1,1 @@
-signin-foreign-git|crates/atomic-core/src/state.rs|        if !owned_by(&git, me) {|        if false /*CONTROL_OFF*/ && !owned_by(&git, me) {|-p atomic-agentic-core --lib state::tests::another_users_git_above_a_project_is_a_checkout_and_is_not_read
+signin-foreign-git|crates/atomic-core/src/state.rs|        let main = if answerable(&git, me) {|        let main = if true /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib state::tests::another_users_git_above_a_project_is_a_checkout_and_is_not_read
