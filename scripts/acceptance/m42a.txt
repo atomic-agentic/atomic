@@ -8,19 +8,22 @@
 # cannot watch the two agents turn a one-sentence task into an atom, nor run
 # `atomic eval` against a model. What it checks instead: `atomic setup` puts the
 # pack where each agent looks in a fresh repository (so both could use it), the
-# pack installed is the one this binary builds, and the worked example the skill
+# files it installs are the pack this binary builds and the repository's copy
+# of the pack matches it, and the worked example the skill
 # teaches is a working atom that passes `atomic check` and renders, with eval
 # cases that are well-formed and hold against the example. By hand, with both
 # agents signed in, each is given a one-sentence task in a fresh repository and
 # `atomic check` and `atomic eval` are run on what it wrote, unedited.
 atomic setup::tests::claude_gets_its_own_skills_directory_and_claude_md
 atomic setup::tests::codex_gets_the_cross_tool_skills_directory_and_agents_md
+atomic setup::tests::installed_files_are_the_pack
 atomic skills::tests::checked_in_pack_matches_the_binary
 atomic skills::tests::the_worked_example_checks_renders_and_its_cases_hold
-pending: needs signed-in Claude Code and Codex making model calls, and `atomic eval` run against a model; CI has no provider and no network
+pending: needs signed-in Claude Code and Codex making model calls, and `atomic eval` run against a model; the tests use no provider and no network
 
 ## The skill passes Agent Skills validation.
-# The pack's SKILL.md files pass the specification check, and the check refuses
-# what the specification refuses, so the passing means something.
+# The pack's SKILL.md files pass atomic's own implementation of the Agent
+# Skills specification's rules, and that check refuses what the specification
+# refuses, so the passing means something. It is not the reference validator.
 atomic skills::tests::the_pack_validates_against_the_agent_skills_specification
 atomic skills::tests::the_specification_check_refuses_what_the_specification_refuses
