@@ -1139,7 +1139,7 @@ mod tests {
             install(Agent::Codex, &root).expect("installed");
             std::fs::write(skill_dir(&root, Agent::Codex).join(MANIFEST), &text)
                 .expect("write the impostor");
-            let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+            let error = format!("{:#}", install(Agent::Codex, &root).expect_err("refused"));
             assert!(
                 error.contains(&format!("{MANIFEST} {says}")),
                 "{what}: {error}"
@@ -1241,7 +1241,7 @@ mod tests {
             skill_dir(&root, Agent::Codex).join("evil\nrm -rf ~"),
         )
         .expect("link");
-        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        let error = format!("{:#}", install(Agent::Codex, &root).expect_err("refused"));
         assert!(
             error.contains(".agents/skills/atomic-create-atom/evil\\nrm -rf ~ is a symbolic link"),
             "{error}"
@@ -1267,7 +1267,7 @@ mod tests {
             )
             .expect("write");
         }
-        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        let error = format!("{:#}", install(Agent::Codex, &root).expect_err("refused"));
         assert!(
             error.ends_with("remove what is named and run `atomic setup` again"),
             "the advice was cut: {error}"
@@ -1303,7 +1303,7 @@ mod tests {
         #[allow(unsafe_code)]
         let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
         assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
-        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        let error = format!("{:#}", install(Agent::Codex, &root).expect_err("refused"));
         assert!(
             error.contains(".agents/skills/atomic-create-atom/SKILL.md is not a plain file"),
             "{error}"
