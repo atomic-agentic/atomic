@@ -313,7 +313,13 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
     let f = fixture("inputs");
     let patch = f
         .store
-        .put(&mut &b"the patch"[..], provenance())
+        .put(
+            &mut &b"the patch"[..],
+            Provenance {
+                media_type: "text/x-diff".into(),
+                ..provenance()
+            },
+        )
         .expect("put")
         .artifact;
     let other = f
@@ -322,7 +328,7 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
         .expect("put")
         .artifact;
     let input = json!({"patch": patch.to_string(), "note": other.to_string()});
-    let given = referenced(&contract(), &input, &f.store);
+    let given = referenced(&contract(), &input, &f.store).expect("referenced");
     assert_eq!(given, vec![patch.clone()], "only the typed reference");
     f.exchange.mount(&f.store, &given).expect("mounted");
     let copy = f.exchange.inputs().join(patch.digest());
@@ -847,6 +853,49 @@ fn a_sweep_racing_a_slow_gather_keeps_the_gathered_files() {
     assert_eq!(sweeping.sweep().removed.len(), 2);
 }
 
+/// Two commands, each in a workspace of its own, that hand over the same
+/// bytes leave one stored copy, referenced by both.
+#[test]
+fn two_commands_handing_over_the_same_bytes_leave_one_copy() {
+    let f = fixture("same-bytes");
+    let other = f.dir.join("other-scratch");
+    std::fs::create_dir_all(&other).expect("scratch");
+    let second = Exchange::new(Box::new(
+        atomic_exec::exchange::LocalExchange::create(&other).expect("exchange"),
+    ));
+    let bytes = b"--- a\n+++ b\n+the same\n";
+    f.write("change.diff", bytes);
+    std::fs::write(second.outputs().join("mine.diff"), bytes).expect("write");
+    let mut first_output = json!({"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}});
+    let mut second_output = json!({"patch": {"$file": "mine.diff", "mediaType": "text/x-diff"}});
+    f.gather(&mut first_output).expect("first");
+    second
+        .gather(
+            &f.store,
+            &f.store,
+            &mut second_output,
+            &contract(),
+            &validate,
+            &Provenance {
+                step: Some("again".into()),
+                ..provenance()
+            },
+            Limits::default(),
+        )
+        .expect("second");
+    assert_eq!(first_output["patch"], second_output["patch"]);
+    assert_eq!(first_output["patch"], json!(reference_of(bytes)));
+    assert_eq!(f.blobs(), 1, "the same bytes were stored twice");
+    assert_eq!(f.staged(), 0);
+    // One copy, with a manifest for each step that handed it over.
+    let artifact: ArtifactRef = first_output["patch"]
+        .as_str()
+        .expect("a reference")
+        .parse()
+        .expect("parses");
+    assert_eq!(f.store.manifests(&artifact).expect("manifests").len(), 2);
+}
+
 /// An exchange that fails every give with invalid data of its own.
 struct Refusing;
 
@@ -888,4 +937,87 @@ fn an_exchanges_own_failure_is_not_a_damaged_blob() {
         .mount(&f.store, std::slice::from_ref(&patch))
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Io { .. }), "{e:?}");
+}
+
+/// A store that sweeps itself as each input is about to be read, as a
+/// sweep that does not see the input's reference (a run's input not yet
+/// recorded, say) would, keeping nothing it was told of and nothing recent.
+struct SweepingOnOpen<'a> {
+    inner: &'a LocalStore,
+}
+
+impl ArtifactStore for SweepingOnOpen<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        Sweeping { inner: self.inner }.sweep();
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A sweep that lands while a command's inputs are copied in, and does not
+/// see the reference to them, keeps them: the mount holds each input until
+/// every copy is made. Once the mount is done, a sweep removes them.
+#[test]
+fn a_sweep_racing_a_mount_keeps_the_inputs() {
+    let f = fixture("mount-race");
+    let patch = f
+        .store
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance())
+        .expect("put")
+        .artifact;
+    let other = f
+        .store
+        .put(&mut &b"another input"[..], provenance())
+        .expect("put")
+        .artifact;
+    f.exchange
+        .mount(
+            &SweepingOnOpen { inner: &f.store },
+            &[patch.clone(), other.clone()],
+        )
+        .expect("mounted while swept");
+    for given in [&patch, &other] {
+        assert!(f.store.contains(given).expect("contains"), "{given} swept");
+        assert!(f.exchange.inputs().join(given.digest()).is_file());
+    }
+    let swept = Sweeping { inner: &f.store }.sweep();
+    assert_eq!(swept.removed.len(), 2, "{swept:?}");
+}
+
+/// An input that references an artifact the store does not hold is refused,
+/// never given without it.
+#[test]
+fn an_input_referencing_a_missing_artifact_is_refused() {
+    let f = fixture("missing-input");
+    let missing = ArtifactRef::from_digest(&"d".repeat(64)).expect("digest");
+    let input = json!({"patch": missing.to_string()});
+    let e = referenced(&contract(), &input, &f.store).expect_err("refused");
+    assert!(
+        matches!(&e, atomic_schema::artifact::ArtifactCheckError::Missing { text, .. } if *text == missing.to_string()),
+        "{e}"
+    );
 }

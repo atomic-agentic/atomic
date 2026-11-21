@@ -534,6 +534,12 @@ fn program(path: &Path) -> bool {
 /// a directory the thread may write, where a command could rename it out
 /// from under its denial.
 ///
+/// Each is denied too wherever else the mount table shows it, such as a
+/// home bound at a second path (see [`crate::mounts`]); nothing runs when
+/// the table cannot be read, or when such a place would cover what the
+/// thread needs or lies two or more levels inside a directory it may
+/// write.
+///
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
@@ -627,6 +633,7 @@ fn denied_paths(
             links.len()
         )));
     }
+    let link_count = links.len();
     denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -711,6 +718,42 @@ fn denied_paths(
         }
         all.push(path);
     }
+    // The same places wherever else they are mounted, such as a home bound
+    // at a second path or the host's files under /run/host: denied there
+    // too, or nothing runs (see `crate::mounts`).
+    // And Codex's home, whose databases a pattern denies (see below).
+    let home = [codex_home.to_owned()];
+    let found =
+        crate::mounts::second_mounts(&[&all, &home]).map_err(|e| refuse(format!("{e:#}")))?;
+    let (aliases, home_aliases) = (&found[0], &found[1]);
+    // One cap for both, as both go to the sandbox helper in one argument.
+    let second = aliases.len() + home_aliases.len();
+    if link_count + second > MAX_LINK_TARGETS {
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {link_count} links to files elsewhere and \
+             are mounted at {second} other places, more than the {MAX_LINK_TARGETS} atomic \
+             denies besides the places themselves"
+        )));
+    }
+    for alias in aliases.iter().chain(home_aliases) {
+        if let Some(needed) = covers(alias) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, and holds {}, which \
+                 they need, so atomic cannot deny it there",
+                alias.display(),
+                needed.display()
+            )));
+        }
+        if two_deep(alias, &writable) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, two or more levels \
+                 inside a directory they may write, so a command could move it out from under \
+                 its denial; mount it elsewhere",
+                alias.display()
+            )));
+        }
+    }
+    all.extend(aliases.iter().cloned());
     // A path inside another denied path is denied with it, and the sandbox
     // cannot mount a denial inside one: such as the credential store inside
     // the person's own configuration directory.
@@ -721,8 +764,21 @@ fn denied_paths(
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
-    let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    // And so at each second mount of Codex's home.
+    let mut globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    for alias in home_aliases {
+        globs.push(format!("{}/*.sqlite*", alias.display()));
+    }
     Ok((all, globs))
+}
+
+/// Whether `path` lies two or more levels inside a directory of `within`,
+/// where a command that may write it could rename a directory above `path`.
+fn two_deep(path: &Path, within: &[PathBuf]) -> bool {
+    within.iter().any(|w| {
+        path.strip_prefix(w)
+            .is_ok_and(|rest| rest.components().count() >= 2)
+    })
 }
 
 /// What Codex reads from its home at start: `.env` sets variables in
@@ -969,6 +1025,17 @@ fn harden() {
     }
 }
 
+/// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
+/// runs arrive on its stdin with their environments, and a confined one's
+/// with its proxy token, so no process of the same user may read its memory
+/// or the /proc files that show it, such as `environ` and `mem`, unless it
+/// has `CAP_SYS_PTRACE` over the runner's user namespace; its `cmdline` and
+/// `stat` stay readable. Call it first, before the request is read.
+pub fn harden_runner() {
+    // The runner holds commands' environments, proxy tokens among them.
+    codex_process_hardening::pre_main_hardening();
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -1120,7 +1187,16 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
 /// runs off the kernel keyrings, or exit: with them in reach the command
-/// could read what they hold, or plant a key.
+/// could read what they hold, or plant a key. The outer stage, which stays
+/// outside the sandbox while the command runs and was started with the
+/// command's proxy token in its environment, is also made non-dumpable, so
+/// that from then on no process of the same user without `CAP_SYS_PTRACE`
+/// over its user namespace can read that environment through /proc; between
+/// its exec and this prologue, a few milliseconds, one can. Exec resets
+/// it: where the outer stage has no mounts of its own to manage it execs
+/// bubblewrap itself, by which time Codex's helper has taken the token out
+/// of its environment, and the bridges it forked first keep the token,
+/// non-dumpable.
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1137,7 +1213,28 @@ fn keep_sandbox_off_keyrings() {
             );
             std::process::exit(1);
         }
+        if !inner && let Err(e) = not_dumpable() {
+            crate::log_line!(
+                "atomic: cannot make the sandbox helper, which holds the command's proxy \
+                 token, non-dumpable: {e}"
+            );
+            std::process::exit(1);
+        }
     }
+}
+
+/// Make this process non-dumpable: its memory and the /proc files that show
+/// it, its environment among them, become unreadable to other processes of
+/// its user without `CAP_SYS_PTRACE` over its user namespace; its `cmdline`
+/// and `stat` stay readable.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn not_dumpable() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes an integer and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Confines an exec atom's command under Codex's Linux sandbox helper, as a
@@ -1149,6 +1246,34 @@ fn keep_sandbox_off_keyrings() {
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
 /// The command still runs with exactly its environment, in its directory.
+#[cfg_attr(
+    not(feature = "exec-loopback-tests"),
+    doc = r#"
+Only a build with the `exec-loopback-tests` feature, for the sandbox suites,
+can let a command reach this machine's loopback interface. (rustdoc does not
+check the error code of a `compile_fail` test; the twin below, which runs
+with the feature, pins that this fails for want of the method.)
+
+```compile_fail,E0599
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
+#[cfg_attr(
+    feature = "exec-loopback-tests",
+    doc = r#"
+With the `exec-loopback-tests` feature, for the sandbox suites, a command
+may reach this machine's loopback interface:
+
+```
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
     helper: PathBuf,
@@ -1180,8 +1305,10 @@ impl ExecSandbox {
     }
 
     /// The same confinement, letting a command name `addrs`, loopback
-    /// addresses that atomic's policy refuses, as hosts. For tests that
-    /// serve on this machine; atomic never calls it.
+    /// addresses that atomic's policy refuses, as hosts, on any port. For
+    /// tests that serve on this machine; atomic never calls it, and only a
+    /// build with the `exec-loopback-tests` feature has it.
+    #[cfg(feature = "exec-loopback-tests")]
     #[doc(hidden)]
     pub fn reaching_loopback_for_tests(mut self, addrs: Vec<String>) -> Self {
         self.loopback_for_tests = addrs
@@ -1241,13 +1368,23 @@ impl ExecSandbox {
 
 impl atomic_exec::Confine for ExecSandbox {
     /// As [`confine_held`](atomic_exec::Confine::confine_held), for a
-    /// command that declares no network: one that does needs its proxy
-    /// held while it runs, which this drops.
+    /// command that declares no network. One that does needs its proxy
+    /// held while it runs, which this would drop before the command
+    /// started, so it is refused.
     fn confine(
         &self,
         command: &atomic_exec::Command,
         tmp: &Path,
     ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        let declares_hosts = !command.network.is_empty();
+        if declares_hosts {
+            return Err(atomic_exec::ExecError::Start {
+                program: command.program.clone(),
+                message: "it declares hosts, so its proxy must be held while it runs; \
+                          confine it with confine_held"
+                    .into(),
+            });
+        }
         self.confine_held(command, tmp).map(|(command, _)| command)
     }
 
@@ -1336,6 +1473,10 @@ impl atomic_exec::Confine for ExecSandbox {
                 .filter(|(k, v)| !command.env.iter().any(|(ck, cv)| ck == k && cv == v))
                 .collect();
             added.sort();
+            // The helper's outer stage already drops the proxy token from
+            // its environment before it starts the sandbox, so the command
+            // never inherits it (the sandbox suite's token test checks
+            // that); unsetting it here too keeps it out should that change.
             clear = [
                 "TMPDIR",
                 "PATH",
@@ -2914,6 +3055,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
+        let dir = scratch("second-mounts");
+        let codex = dir.join("codex");
+        for d in [&codex, &dir.join("home/.aws")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![dir.join("home/.aws")],
+        };
+        let real = std::fs::canonicalize(&dir).expect("real");
+        let rel = real.strip_prefix("/").expect("absolute");
+        // The whole filesystem bound again at `at`.
+        let bound = |at: &str| {
+            format!("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 / {at} rw - ext4 /dev/sda1 rw\n")
+        };
+        let refused = |table: String, cwd: Option<&Path>, writable: &[PathBuf]| {
+            let _table = crate::mounts::with_table(table.as_bytes());
+            denied_paths(&private, &codex, cwd, writable)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        // Bound where nothing needs it: denied there too, with Codex's
+        // databases.
+        {
+            let _table = crate::mounts::with_table(bound("/again").as_bytes());
+            let (denied, globs) = denied_paths(&private, &codex, None, &[]).expect("denied");
+            assert!(
+                denied.contains(&Path::new("/again").join(rel).join("home/.aws")),
+                "{denied:?}"
+            );
+            assert!(
+                globs.contains(&format!("/again/{}/codex/*.sqlite*", rel.display())),
+                "{globs:?}"
+            );
+        }
+        // Where its second mount would cover the thread's directory.
+        let cwd = Path::new("/again").join(rel).join("home/.aws/work");
+        let message = refused(bound("/again"), Some(&cwd), &[]);
+        assert!(
+            message.contains("is a second mount") && message.contains("which they need"),
+            "{message}"
+        );
+        // Where it lies two levels inside a directory the thread may write.
+        let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
+        assert!(
+            message.contains("is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Codex's home bound two levels inside a writable directory: its
+        // databases' pattern there is held to the same checks.
+        let codex_real = std::fs::canonicalize(&codex).expect("real");
+        let message = refused(
+            format!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /w/a/b rw - ext4 /dev/sda1 rw\n",
+                codex_real.display()
+            ),
+            None,
+            &[PathBuf::from("/w")],
+        );
+        assert!(
+            message.contains("/w/a/b is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Too many second mounts of Codex's home alone: they count too.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!(
+                "{} 1 8:1 {} /h{i} rw - ext4 /dev/sda1 rw\n",
+                i + 2,
+                codex_real.display()
+            ));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
+        // Too many second mounts to deny.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!("{} 1 8:1 / /m{i} rw - ext4 /dev/sda1 rw\n", i + 2));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
         let dir = scratch("covering");
         let home = dir.join("home");
@@ -3428,6 +3657,39 @@ mod tests {
             );
         }
         assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// A command that declares hosts is confined only with its proxy held:
+    /// `confine`, which would drop the proxy before the command starts,
+    /// refuses it, and `confine_held` routes it to the proxy and hands back
+    /// the hold.
+    #[test]
+    fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-held");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("a helper");
+        let command = atomic_exec::Command {
+            program: "sh".into(),
+            cwd: state.clone(),
+            network: vec!["allowed.invalid".into()],
+            ..Default::default()
+        };
+        let error = sandbox
+            .confine(&command, &state)
+            .expect_err("its proxy would stop before it starts");
+        assert!(error.to_string().contains("confine_held"), "{error}");
+        let (confined, held) = sandbox.confine_held(&command, &state).expect("confined");
+        assert!(held.is_some(), "the proxy is held");
+        assert!(
+            confined.args.iter().any(|a| a == "--managed-network"),
+            "{:?}",
+            confined.args
+        );
     }
 
     /// However many projects the atomic home holds, their private state is
