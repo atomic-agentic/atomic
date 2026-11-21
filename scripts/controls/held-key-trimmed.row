@@ -1,0 +1,1 @@
+held-key-trimmed|crates/atomic-core/src/redact.rs|    [whole.as_str(), trimmed]|    [whole.as_str(), whole.as_str()] /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_padded_held_credential_key_is_hidden

@@ -1,0 +1,1 @@
+block-keeps-tabs|crates/atomic-core/src/terminal.rs|['\n', '\t'].contains(&c)|['\n'].contains(&c) /*CONTROL_OFF*/|-p atomic-agentic --bin atomic shown::tests::a_block_keeps_its_lines_and_tabs_and_escapes_the_rest
