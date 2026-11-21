@@ -19,10 +19,14 @@
 //! The project's atoms are exec atoms, so no model is called. The prompt
 //! runs on a pseudo-terminal a small driver opens; the credential is in the
 //! opt-in file store, since the test machine has no OS keyring. Linux only,
-//! where credentials are kept.
+//! where credentials are kept, and, since exec atoms' commands run under
+//! Codex's sandbox, with the `sandbox-tests` feature; with the feature on, a
+//! sandbox that cannot start fails the tests.
 
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #![allow(clippy::unwrap_used)]
+
+mod support;
 
 use atomic_core::testing::on_codex_runtime;
 use atomic_durable::Durare;
@@ -394,6 +398,7 @@ fn text(o: &Output) -> String {
 
 #[test]
 fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
+    support::require_sandbox();
     let p = Project::new("approve");
     p.enroll();
     let out = p.at_terminal(
@@ -430,6 +435,7 @@ fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
 
 #[test]
 fn a_reply_is_taken_however_late_the_prompt_reads_on_after_showing() {
+    support::require_sandbox();
     let p = Project::new("late");
     p.enroll();
     // atomic held up between writing the prompt and reading on, as a busy
@@ -457,6 +463,7 @@ fn a_reply_is_taken_however_late_the_prompt_reads_on_after_showing() {
 
 #[test]
 fn without_a_terminal_the_run_waits_for_a_decision_from_another() {
+    support::require_sandbox();
     use std::io::BufRead;
     let p = Project::new("no-tty");
     p.enroll();
@@ -499,6 +506,7 @@ fn without_a_terminal_the_run_waits_for_a_decision_from_another() {
 
 #[test]
 fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_remembers_it() {
+    support::require_sandbox();
     let p = Project::new("question");
     p.enroll();
     let out = p.at_terminal(
@@ -539,6 +547,7 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
 
 #[test]
 fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
+    support::require_sandbox();
     let p = Project::new("refused");
     p.enroll();
     let run = p.spawn(&[
@@ -585,6 +594,7 @@ fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
 
 #[test]
 fn a_question_nobody_answers_in_time_resumes_with_its_default_and_remembers_it() {
+    support::require_sandbox();
     let p = Project::new("timed");
     p.enroll();
     let out = p.at_terminal(
@@ -623,6 +633,7 @@ fn a_question_nobody_answers_in_time_resumes_with_its_default_and_remembers_it()
 
 #[test]
 fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
+    support::require_sandbox();
     let p = Project::new("ahead");
     p.enroll();
     // Two replies at once, at the first gate: the second must not decide
@@ -670,6 +681,7 @@ fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
 
 #[test]
 fn an_exec_command_cannot_type_into_the_prompt() {
+    support::require_sandbox();
     let p = Project::new("inject");
     p.enroll();
     // In the run's caches, which a confined command may write, and which
@@ -702,6 +714,7 @@ const KEY_START: &str = "-----BEGIN PRIVATE KEY-----";
 
 #[test]
 fn the_start_of_a_private_key_in_a_gate_hides_nothing_else_it_shows() {
+    support::require_sandbox();
     let p = Project::new("keyed");
     p.enroll();
     let data = json!({ "text": KEY_START }).to_string();
@@ -770,6 +783,7 @@ fn the_start_of_a_private_key_in_a_gate_hides_nothing_else_it_shows() {
 
 #[test]
 fn without_a_terminal_the_start_of_a_private_key_in_a_title_hides_how_to_decide_nothing() {
+    support::require_sandbox();
     use std::io::BufRead;
     let p = Project::new("keyed-no-tty");
     p.enroll();
@@ -799,9 +813,11 @@ fn without_a_terminal_the_start_of_a_private_key_in_a_title_hides_how_to_decide_
 
 #[test]
 fn a_hostile_title_reaches_the_terminal_escaped() {
+    support::require_sandbox();
     let p = Project::new("hostile");
     p.enroll();
-    let data = json!({"text": "\u{1b}]0;owned\u{7}\u{1b}[2J\u{202e}gpj.exe"}).to_string();
+    let text_in = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{7f}\u{9b}31m\u{202e}gpj.exe";
+    let data = json!({ "text": text_in }).to_string();
     let run = p.spawn(&["run", "approval", "--run-id", "hostile", "--data", &data]);
     let until = Instant::now() + Duration::from_secs(60);
     let listed = loop {
@@ -819,10 +835,21 @@ fn a_hostile_title_reaches_the_terminal_escaped() {
         "{raw:?}"
     );
     assert!(raw.contains("\\u{001b}]0;owned"), "{raw}");
+    // The JSON form too: every unsafe character escaped, and the title
+    // still reads back whole.
+    let listed = p.atomic(&["gates", "list", "--json"]);
+    let raw = String::from_utf8_lossy(&listed.stdout).into_owned();
+    for c in ['\u{1b}', '\u{7}', '\u{7f}', '\u{9b}', '\u{202e}'] {
+        assert!(!raw.contains(c), "{c:?} reached the terminal: {raw:?}");
+    }
+    let gates: Value = serde_json::from_str(&raw).expect("JSON");
+    let title = gates[0]["title"].as_str().unwrap_or_default();
+    assert!(title.ends_with(text_in), "{title:?}");
 }
 
 #[test]
 fn without_standard_error_on_the_terminal_or_in_the_background_it_does_not_prompt() {
+    support::require_sandbox();
     let p = Project::new("not-here");
     p.enroll();
     let errors = p.dir.join("stderr.txt");
