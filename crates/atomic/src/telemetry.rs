@@ -23,9 +23,10 @@
 //!
 //! A step or run that fails ends its span with the failure's class and a short
 //! reason, not the failure whole: what a model call that failed in that step
-//! said of its own cause (for a lite atom, a provider's status and the type of
-//! error it named, none of its body; for a Codex atom, its redacted and bounded
-//! error line, which can quote the provider), or, when nothing so near a model call failed, the
+//! said of its own cause (for a lite atom's call the provider answered with an
+//! error status, that status and the type of error it named, none of its body;
+//! for any other failed call, a Codex atom's included, its redacted and bounded
+//! error line, which can quote the provider or the model), or, when nothing so near a model call failed, the
 //! failure's message cut short (see [`mark_failed`]). A step notes on a handle
 //! of its own, which the run takes up only when that step failed. The whole
 //! failure stays in the run's stored error, where a person reads it.
