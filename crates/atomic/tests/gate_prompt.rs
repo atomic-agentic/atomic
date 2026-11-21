@@ -14,7 +14,8 @@
 //!   which the store records and the feedback log remembers;
 //! - replies typed ahead, or before anything is shown, decide no gate, and
 //!   an exec command cannot type into the prompt (it has no terminal);
-//! - a hostile title reaches the terminal escaped.
+//! - a hostile title reaches the terminal escaped, in `atomic gates list`
+//!   and at the prompt.
 //!
 //! The project's atoms are exec atoms, so no model is called. The prompt
 //! runs on a pseudo-terminal a small driver opens; the credential is in the
@@ -41,8 +42,17 @@ const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 /// Run a command on a pseudo-terminal, its controlling terminal, and type
 /// `answers` (a JSON list) into it, one each time it shows a prompt; with
 /// `DRIVER_EARLY`, type that line first, before anything is shown. Print
-/// what it wrote and exit as it exited; after `DRIVER_DEADLINE` seconds
-/// (90 by default) kill it.
+/// what it wrote and exit as it exited.
+///
+/// When it stops: a test says what it waits for with `DRIVER_STOP_AFTER`
+/// (that many prompts answered) or `DRIVER_STOP_MARKER` (that written), and
+/// the driver stops once it has happened and the terminal has written
+/// nothing for `DRIVER_QUIET` seconds, so the run's answer to it has been
+/// written and read too. A test that waits for a run to *stay* waiting is
+/// then bounded by what the run does, not by a deadline a busy machine
+/// could miss. With neither, it stops when the command ends.
+/// `DRIVER_DEADLINE` seconds (90 by default) is the backstop that catches a
+/// run which never gets that far.
 const DRIVER: &str = r#"
 import json, os, pty, select, subprocess, sys, time
 answers = json.loads(sys.argv[1])
@@ -78,6 +88,16 @@ if os.environ.get("DRIVER_EARLY"):
 seen, out = 0, b""
 # A run that never prompts fails rather than hangs.
 deadline = time.time() + float(os.environ.get("DRIVER_DEADLINE", "90"))
+# What the test waits for, once the run is up: this many prompts answered,
+# or this written. 0 / empty waits for the command to end instead.
+stop_after = int(os.environ.get("DRIVER_STOP_AFTER", "0"))
+stop_marker = os.environ.get("DRIVER_STOP_MARKER", "").encode()
+# Stop once that has happened and the terminal has written nothing for this
+# many seconds: whatever the run was going to write in answer has been
+# written, and read, so a test that waits for the run to still be waiting
+# waits for the thing, not for the clock.
+quiet = float(os.environ.get("DRIVER_QUIET", "0"))
+last = time.time()
 markers = (b"comment if you like > ", b"(/reject to refuse) > ")
 # Each prompt counts once, by its count of markers so far.
 while True:
@@ -90,11 +110,19 @@ while True:
         if not data:
             break
         out += data
+        last = time.time()
         prompts = sum(out.count(m) for m in markers)
         while seen < prompts and seen < len(answers):
             os.write(master, answers[seen].encode() + b"\n")
             seen += 1
     elif p.poll() is not None:
+        break
+    seen_enough = bool(stop_after) and seen >= stop_after
+    if stop_marker and stop_marker in out:
+        seen_enough = True
+    if seen_enough and time.time() - last >= quiet:
+        p.kill()
+        out += b"\n[driver: stopped]\n"
         break
     if time.time() > deadline:
         p.kill()
@@ -662,7 +690,14 @@ fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
             r#"{"text": "v6"}"#,
         ],
         &["a looked\na deployed"],
-        &[("DRIVER_DEADLINE", "12")],
+        // Both replies go to the first prompt, so the driver stops once that
+        // one is answered and the terminal has been quiet long enough for
+        // the second to decide the second gate, were it going to.
+        &[
+            ("DRIVER_STOP_AFTER", "1"),
+            ("DRIVER_QUIET", "3"),
+            ("DRIVER_DEADLINE", "60"),
+        ],
     );
     let t = text(&out);
     assert!(t.contains("gate ahead:look: approved by local:dev"), "{t}");
@@ -685,7 +720,16 @@ fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
             r#"{"text": "v7"}"#,
         ],
         &[],
-        &[("DRIVER_EARLY", "a"), ("DRIVER_DEADLINE", "10")],
+        // The line typed ahead is the one reply the prompt is answered with,
+        // so the driver stops once that is answered and the terminal has
+        // been quiet long enough for it to decide the gate, were it going
+        // to.
+        &[
+            ("DRIVER_EARLY", "a"),
+            ("DRIVER_STOP_AFTER", "1"),
+            ("DRIVER_QUIET", "3"),
+            ("DRIVER_DEADLINE", "60"),
+        ],
     );
     let t = text(&out);
     assert!(t.contains("gate early:pick is waiting for you"), "{t}");
@@ -704,7 +748,14 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     let out = p.at_terminal_with(
         &["run", "injected", "--run-id", "typed-in", "--data", &data],
         &[],
-        &[("DRIVER_DEADLINE", "12")],
+        // The prompt shows, and the command left behind has its three
+        // seconds before it would type: once the terminal has been quiet
+        // for longer than that, whatever it could do has been done.
+        &[
+            ("DRIVER_STOP_MARKER", "is waiting for you"),
+            ("DRIVER_QUIET", "4"),
+            ("DRIVER_DEADLINE", "60"),
+        ],
     );
     let t = text(&out);
     assert!(t.contains("gate typed-in:deploy is waiting for you"), "{t}");
@@ -856,6 +907,67 @@ fn a_hostile_title_reaches_the_terminal_escaped() {
     let gates: Value = serde_json::from_str(&raw).expect("JSON");
     let title = gates[0]["title"].as_str().unwrap_or_default();
     assert!(title.ends_with(text_in), "{title:?}");
+}
+
+/// Characters that must never reach a terminal as they are: ESC, BEL, DEL,
+/// the C1 controls, and Unicode's zero-width, bidirectional and byte-order
+/// controls. Written out here, and not taken from what atomic escapes, so a
+/// character atomic forgets cannot pass the test by being forgotten.
+fn unsafe_on_a_terminal(c: char) -> bool {
+    matches!(c, '\u{1b}' | '\u{7}' | '\u{7f}' | '\u{feff}')
+        || ('\u{80}'..='\u{9f}').contains(&c)
+        || ('\u{200b}'..='\u{200f}').contains(&c)
+        || ('\u{202a}'..='\u{202e}').contains(&c)
+        || ('\u{2060}'..='\u{2069}').contains(&c)
+        || ('\u{fff9}'..='\u{fffb}').contains(&c)
+}
+
+#[test]
+fn a_hostile_title_at_the_prompt_reaches_the_terminal_escaped() {
+    support::require_sandbox();
+    let p = Project::new("hostile-prompt");
+    p.enroll();
+    let text_in = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{7f}\u{9b}31m\u{202e}gpj.exe";
+    let data = json!({ "text": text_in }).to_string();
+    let out = p.at_terminal_with(
+        &[
+            "run",
+            "approval",
+            "--run-id",
+            "hostile-prompt",
+            "--data",
+            &data,
+        ],
+        &["a"],
+        &[("DRIVER_DEADLINE", "60")],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        t.contains("gate hostile-prompt:pick is waiting for you"),
+        "the prompt did not show: {t}"
+    );
+    // The title is there, as text: the escape it holds reads as what it is.
+    assert!(t.contains("\\u{001b}]0;owned"), "the title: {t}");
+    assert!(
+        t.contains("gate hostile-prompt:pick: approved by local:dev"),
+        "the prompt did not decide the gate: {t}"
+    );
+    // Everything the prompt wrote, up to the decision that answers it. The
+    // run's own result after it is the person's data, which atomic prints
+    // as it is.
+    let prompt = t
+        .split("gate hostile-prompt:pick: approved")
+        .next()
+        .unwrap_or_default();
+    let raw: Vec<char> = prompt
+        .chars()
+        .filter(|c| unsafe_on_a_terminal(*c))
+        .collect();
+    assert!(
+        raw.is_empty(),
+        "{raw:?} reached the terminal from the prompt: {prompt:?}"
+    );
 }
 
 #[test]
