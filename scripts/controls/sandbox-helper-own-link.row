@@ -1,0 +1,1 @@
+sandbox-helper-own-link|crates/atomic-core/src/codex.rs|            paths.codex_linux_sandbox_exe = Some(helper);|            let _ = helper;|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test run_cli --test shell_env -- a_helper_run_by_name_is_never_found_along_path a_turns_command_runs_under_an_old_bubblewrap_and_never_a_planted_helper

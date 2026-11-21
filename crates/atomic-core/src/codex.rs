@@ -778,7 +778,12 @@ fn denied_paths(
     let mut own = Vec::new();
     for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
-            own.extend(children(&entry, &arg0));
+            // Codex's links, and atomic's own link to itself under the
+            // helper's name, which every sandbox runs; they stay readable.
+            let helpers = children(&entry, &arg0)
+                .into_iter()
+                .filter(|p| not_the_helpers_link(p));
+            own.extend(helpers);
         } else {
             own.push(entry);
         }
@@ -1292,10 +1297,79 @@ where
     }
     scrub_overrides();
     let links = hold_helper_links(codex_home);
-    arg0_dispatch_or_else(move |paths| {
+    #[cfg(target_os = "linux")]
+    let helper = own_helper_link(codex_home);
+    arg0_dispatch_or_else(move |mut paths| {
         drop(links);
+        // Codex's sandbox runs atomic's own link to itself as its helper,
+        // which every bubblewrap can run by its path; without one, Codex's.
+        #[cfg(target_os = "linux")]
+        if let Some(helper) = helper {
+            paths.codex_linux_sandbox_exe = Some(helper);
+        }
         main_fn(CodexPaths(paths))
     })
+}
+
+/// Whether `path`, in a Codex home's `tmp/`, is anything but the directory
+/// of atomic's own link to itself, which every sandbox must run.
+/// `scripts/controls/sandbox-helper-link-readable.row` switches this off.
+fn not_the_helpers_link(path: &Path) -> bool {
+    path.file_name() != Some(HELPER_DIR.as_ref())
+}
+
+/// The directory below a Codex home's `tmp/` where atomic keeps its own
+/// link to itself under the Linux sandbox helper's name.
+const HELPER_DIR: &str = "atomic-helper";
+
+/// atomic's own link to this executable under the Linux sandbox helper's
+/// name, `<codex_home>/tmp/atomic-helper/<key>/codex-linux-sandbox`, made
+/// or mended now, while this process has one thread: `None` when it cannot
+/// be.
+///
+/// Codex runs it as the helper, by that absolute path, for every turn's and
+/// exec atom's command. A bubblewrap without `--argv0` runs the helper's
+/// inner stage by the name its outer stage was started under, and this one
+/// is a path it can run inside the sandbox, never a name it looks for along
+/// PATH. The directory is readable by every sandbox and writable by none:
+/// atoms' commands never write the Codex home, and this directory, like
+/// Codex's own links, is left out of what is denied them (see
+/// [`denied_paths`]). `<key>` names this executable, so processes of two
+/// builds sharing a Codex home never run each other's.
+#[cfg(target_os = "linux")]
+fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
+    use sha2::Digest as _;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+    let exe = std::env::current_exe().ok()?;
+    let key = sha2::Sha256::digest(exe.as_os_str().as_bytes());
+    let key: String = key[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let dir = codex_home.join("tmp").join(HELPER_DIR).join(key);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    let link = dir.join("codex-linux-sandbox");
+    if std::fs::read_link(&link).is_ok_and(|to| to == exe) {
+        return Some(link);
+    }
+    // Made beside it and renamed over it, so another process never finds
+    // it half made, and one leading elsewhere is replaced.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = dir.join(format!(
+        ".codex-linux-sandbox.{}.{nanos}",
+        std::process::id()
+    ));
+    std::os::unix::fs::symlink(&exe, &temp).ok()?;
+    if std::fs::rename(&temp, &link).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return None;
+    }
+    Some(link)
 }
 
 /// How long one atomic process waits for another to finish making Codex's

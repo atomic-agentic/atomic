@@ -3433,10 +3433,10 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
 }
 
 /// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
-/// the helper's inner stage by the name it was started under, a program a
-/// command put on `PATH` under the helper's name is never run in its place:
-/// the name is a path that cannot exist, so the run fails at once instead,
-/// saying the helper could not be set up.
+/// the helper's inner stage by the name it was started under, an exec atom's
+/// command still runs: Codex runs atomic's own link to itself as the
+/// helper, by its absolute path, and a program a command put on `PATH`
+/// under the helper's name is never run in the inner stage's place.
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
@@ -3458,15 +3458,20 @@ fn a_helper_run_by_name_is_never_found_along_path() {
     };
     // A bubblewrap from before `--argv0`: it runs what follows `--` as it
     // is named, looking a bare name up along PATH.
+    let bwrap_ran = dir.join("bwrap-ran");
     script(
         &dir.join("bwrap/bwrap"),
-        "#!/bin/sh\n\
-         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
-         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-         shift\n\
-         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
-         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
-         exit 1\n",
+        &format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+             touch '{}'\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+             shift\n\
+             if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+             echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+             exit 1\n",
+            bwrap_ran.display()
+        ),
     );
     let ran = dir.join("planted-ran");
     script(
@@ -3487,16 +3492,13 @@ fn a_helper_run_by_name_is_never_found_along_path() {
         "",
     );
     assert!(!ran.exists(), "the planted program ran: {}", text(&out));
-    assert!(!out.status.success(), "{}", text(&out));
-    let said = String::from_utf8_lossy(&out.stderr);
     assert!(
-        said.contains(
-            "Codex's Linux sandbox helper could not be set up: what ran in its place was not \
-             the helper (a trial command exited with code 1: bwrap: execvp \
-             /dev/null/codex-linux-sandbox: Not a directory)"
-        ),
-        "{said}"
+        bwrap_ran.exists(),
+        "the old bubblewrap never ran: {}",
+        text(&out)
     );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir), 1, "the command ran once");
 }
 
 /// `atomic run` confines an exec atom's command: through the engine as it

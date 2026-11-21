@@ -1,0 +1,1 @@
+sandbox-helper-link-readable|crates/atomic-core/src/codex.rs|    path.file_name() != Some(HELPER_DIR.as_ref())|    !HELPER_DIR.is_empty()|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test shell_env the_helpers_link_is_out_of_every_commands_reach
