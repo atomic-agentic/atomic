@@ -13,7 +13,12 @@
 //!
 //! - `OPENAI_API_KEY`: when it is set, OpenAI's API is the model endpoint, and
 //!   `OPENAI_API_KEY` the variable its key is read from. Its value is never
-//!   read here, shown or sent anywhere.
+//!   read here, shown or sent anywhere. `OPENAI_BASE_URL`, as OpenAI's own
+//!   SDKs read it, names another endpoint for the key: read from the
+//!   person's environment only, since it decides where the key is sent, and
+//!   used only when it is `https`, or `http` to a loopback IP address, with
+//!   no credential, query or fragment in it; otherwise nothing is detected,
+//!   and a command that would send the key refuses to start.
 //! - A local Ollama: when no key is set, one request, `GET /api/tags`, to
 //!   Ollama's default address on the loopback interface, and nowhere else.
 //!   When it answers, it is the endpoint, with the first model it lists.
@@ -36,6 +41,9 @@ use std::time::{Duration, Instant};
 
 /// OpenAI's API, when `OPENAI_API_KEY` is set.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+/// Names another base URL for `OPENAI_API_KEY`'s endpoint, as OpenAI's SDKs
+/// read it. Only a variable of the person's sets it: no file does.
+pub const OPENAI_BASE_URL_VARIABLE: &str = "OPENAI_BASE_URL";
 /// The model atomic uses on OpenAI's API when none is set.
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5-mini";
 /// Where a local Ollama listens by default.
@@ -222,6 +230,11 @@ pub struct Resolved {
     /// Why the sign-in could not be read, when it was looked for and could
     /// not be: said, never taken for "signed out".
     pub sign_in_unreadable: Option<String>,
+    /// Why the person's `OPENAI_BASE_URL` is not used for `OPENAI_API_KEY`,
+    /// when it is not fit to send the key to: no endpoint is detected, and a
+    /// run that calls a model refuses to start, while a command that sends
+    /// no key, such as `atomic check`, carries on.
+    pub refused_endpoint: Option<String>,
 }
 
 /// What looking for the person's sign-in found: the sign-in, if someone is
@@ -525,10 +538,35 @@ pub fn resolve(
     }
 
     // Detection, for what nothing set, when no one is signed in.
+    let other_openai = set((around.env)(OPENAI_BASE_URL_VARIABLE));
+    let mut other_openai_used = false;
+    let mut refused_endpoint = None;
     if unset(&sources, "model.base_url") && sign_in.is_none() {
-        if set((around.env)("OPENAI_API_KEY")).is_some() {
-            let why = "OPENAI_API_KEY is set".to_owned();
-            settings.model.base_url = Some(OPENAI_BASE_URL.into());
+        if set((around.env)("OPENAI_API_KEY")).is_some()
+            && let Err(why) = other_openai
+                .as_deref()
+                .map_or(Ok(()), |u| openai_base_url(u).map(drop))
+        {
+            // Not fit for the key: nothing is detected, and only a command
+            // that would send it refuses to start.
+            other_openai_used = true;
+            notes.push(why.clone());
+            refused_endpoint = Some(why);
+        } else if set((around.env)("OPENAI_API_KEY")).is_some() {
+            // The key goes where the person's own OPENAI_BASE_URL says, as
+            // OpenAI's SDKs send it, once that is seen to be fit for a key.
+            let (base_url, why) = match &other_openai {
+                Some(url) => (
+                    url.clone(),
+                    format!("OPENAI_API_KEY and {OPENAI_BASE_URL_VARIABLE} are set"),
+                ),
+                None => (
+                    OPENAI_BASE_URL.to_owned(),
+                    "OPENAI_API_KEY is set".to_owned(),
+                ),
+            };
+            other_openai_used = other_openai.is_some();
+            settings.model.base_url = Some(base_url);
             sources.insert("model.base_url".into(), Source::Detected(why.clone()));
             if unset(&sources, "model.api_key_env") {
                 settings.model.api_key_env = Some("OPENAI_API_KEY".into());
@@ -538,7 +576,11 @@ pub fn resolve(
                 settings.model.name = Some(OPENAI_DEFAULT_MODEL.into());
                 sources.insert(
                     "model.name".into(),
-                    Source::Detected(format!("{why}: atomic's default model on OpenAI's API")),
+                    Source::Detected(if other_openai_used {
+                        format!("{why}: atomic's default model for an OpenAI API key")
+                    } else {
+                        format!("{why}: atomic's default model on OpenAI's API")
+                    }),
                 );
             }
         } else {
@@ -586,6 +628,12 @@ pub fn resolve(
             }
         }
     }
+    if other_openai.is_some() && !other_openai_used {
+        notes.push(format!(
+            "{OPENAI_BASE_URL_VARIABLE} is set and not used: atomic reads it only to send \
+             OPENAI_API_KEY there, when the key is set and no model endpoint is set or signed in"
+        ));
+    }
     Ok(Resolved {
         settings,
         sources,
@@ -594,6 +642,7 @@ pub fn resolve(
         withheld_key,
         sign_in,
         sign_in_unreadable,
+        refused_endpoint,
     })
 }
 
@@ -627,6 +676,41 @@ fn users_base_url(user: Option<&Path>) -> Option<String> {
         .pointer("/model/base_url")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Whether `url`, the person's `OPENAI_BASE_URL`, is fit to send
+/// `OPENAI_API_KEY` to: a URL, `https`, or `http` only to a loopback IP
+/// address written as one, such as a local proxy's, and with no user,
+/// password, query or fragment, which a log or a proxy could keep. Why not,
+/// when it is not.
+fn openai_base_url(url: &str) -> Result<(), String> {
+    let refuse = |why: &str| {
+        format!(
+            "{OPENAI_BASE_URL_VARIABLE} {why}, and it decides where atomic sends \
+             OPENAI_API_KEY, so the key is sent nowhere: give an https URL, such as \
+             https://host/v1, or http to 127.0.0.1 or [::1], or unset it"
+        )
+    };
+    let parsed = url::Url::parse(url).map_err(|_| refuse("does not read as a URL"))?;
+    if has_credential(&parsed) {
+        return Err(refuse("carries a user, password, query or fragment"));
+    }
+    if parsed.fragment().is_some() {
+        return Err(refuse("carries a user, password, query or fragment"));
+    }
+    let loopback = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        "http" => Err(refuse(
+            "is http to an address that is not this machine's loopback",
+        )),
+        _ => Err(refuse("is neither https nor http")),
+    }
 }
 
 /// Whether `url` carries a credential: a user name or password, which may
@@ -959,9 +1043,22 @@ impl Resolved {
             Source::File { path, .. } => self.user.as_deref() != Some(path.as_path()),
             _ => false,
         };
+        // A key, and where it goes, is said too.
+        let key = m.api_key_env.as_deref().map_or_else(String::new, |key| {
+            let host = url::Url::parse(base_url)
+                .ok()
+                .and_then(|u| {
+                    u.host_str().map(|h| match u.port() {
+                        Some(port) => format!("{h}:{port}"),
+                        None => h.to_owned(),
+                    })
+                })
+                .unwrap_or_else(|| mask_url(base_url));
+            format!("; {key} is sent to {host}")
+        });
         announced.then(|| {
             format!(
-                "atomic: model {name} at {} ({}); `atomic config --explain` says why",
+                "atomic: model {name} at {} ({}){key}; `atomic config --explain` says why",
                 mask_url(base_url),
                 describe(source)
             )

@@ -1119,6 +1119,7 @@ fn child_in(
         // No model endpoint from this machine: no Ollama, no key.
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         // None of the developer's own configuration.
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::null())
@@ -5451,6 +5452,7 @@ fn spawned_child(dir: &Path, url: &str, role: &str, run: &str) -> std::process::
         .env(ENV_URL, url)
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env_remove("ATOMIC_FAILPOINT")
         .stdin(std::process::Stdio::null())

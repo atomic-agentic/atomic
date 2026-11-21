@@ -16,7 +16,9 @@ run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
 run_cli with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why
 run_cli with_only_an_api_key_explain_names_openai_and_never_the_key
 atomic settings::tests::every_setting_has_a_source_and_the_manifest_keys_are_not_settings
-pending: only the Ollama case is run end to end. With `OPENAI_API_KEY` as the only thing set, detection names api.openai.com, which tests never reach, so that case is shown by `config --explain` alone and no `init` and `run` is made with it; a test would point the key's detection at the fake model, as `ATOMIC_DETECT_OLLAMA_ADDR` points the Ollama one.
+# The API-key case end to end: the key with its base URL, OPENAI_BASE_URL
+# as OpenAI's SDKs read it, pointing at the fake model.
+run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 
 ## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
 # The turn works in a worktree of the fixture's snapshot, never in the

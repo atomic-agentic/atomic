@@ -91,8 +91,21 @@ What no layer sets, atomic looks for, and says so as `detected:` in
 
 | Found | Sets |
 | --- | --- |
-| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
+| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), or to the URL `OPENAI_BASE_URL` names when that is set too, `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
 | Ollama answers on this machine, at `127.0.0.1:11434` | the model endpoint to `http://127.0.0.1:11434/v1`, and `model.name` to the first model it lists unless one is set |
+
+`OPENAI_BASE_URL` is read as OpenAI's SDKs read it, and only from your
+environment: no file, the project's or your own, sets it, since it decides
+where the key is sent. So whatever sets your environment decides where the
+key goes, a shell profile or a tool that loads variables for a directory,
+such as direnv or a `.env` loader, among them. It must be an `https` URL, or
+`http` to a loopback IP address (`127.0.0.1` or `[::1]`; a name such as
+`localhost` is refused), with no user, password, query or fragment in it.
+Anything else detects no endpoint: a command that would send the key stops
+and says why, and one that sends none, such as `atomic check`, carries on.
+It is used only with `OPENAI_API_KEY`, when detection runs; otherwise it is
+said to be set and not used. `--explain` names both variables as the
+source, and a run says that the key is sent, and to which host.
 
 The key's value is never read for detection. Looking for Ollama is one
 `GET /api/tags` to the loopback address, which must answer within a second, and

@@ -195,6 +195,7 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
         .env("USER", "dev")
         .env_remove("ATOMIC_MODEL_API_KEY_ENV")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .env_remove("CODEX_HOME")
         .env_remove("ATOMIC_DATABASE_URL")
         // Nothing listens on the discard port, so detection never finds a
