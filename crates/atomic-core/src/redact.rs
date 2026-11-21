@@ -1462,32 +1462,66 @@ fn redact_string(string: &mut String, nested: usize) {
 }
 
 /// Whether text redaction, which made `texted` of the JSON `written`, broke
-/// JSON held in a string inside it: fewer of its strings read as JSON, at
-/// any depth that [`redact_string`] opens, so the rules that read names and
-/// pairs there no longer can. `nested` is the depth `written` is read at.
+/// JSON held in a string inside it, so the rules that read names and pairs
+/// there no longer can: some string that reads as JSON as written, at a
+/// depth [`redact_string`] opens, is not one at the same place after (see
+/// [`kept_json`]). `nested` is the depth `written` is read at.
 fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
-    serde_json::from_str::<Value>(written).is_ok_and(|written| {
-        json_in_strings(&written, nested + 1) > json_in_strings(texted, nested + 1)
-    })
+    serde_json::from_str::<Value>(written)
+        .is_ok_and(|written| !kept_json(&written, texted, nested + 1))
 }
 
-/// How many strings in `value`, read at depth `nested`, read as JSON that
-/// [`redact_string`] opens, counting those inside them in turn.
-fn json_in_strings(value: &Value, nested: usize) -> usize {
-    match value {
-        Value::String(string)
-            if nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) =>
-        {
-            serde_json::from_str::<Value>(string)
-                .map_or(0, |inner| 1 + json_in_strings(&inner, nested + 1))
-        }
-        Value::Array(items) => items.iter().map(|item| json_in_strings(item, nested)).sum(),
-        Value::Object(fields) => fields
-            .values()
-            .map(|field| json_in_strings(field, nested))
-            .sum(),
-        _ => 0,
+/// Whether every string in `written`, read at depth `nested`, that reads as
+/// JSON is still a string that reads as JSON at the same place in `texted`,
+/// the same keys and indices, and so in turn for what it holds. Where it
+/// cannot be told, a key gone, a list grown or shrunk, or a value of
+/// another type, a place holding JSON counts as broken; one hidden whole
+/// counts as kept, as it shows nothing. JSON that reads as
+/// JSON only after text redaction counts for nothing, so it cannot make up
+/// for JSON broken beside it.
+fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
+    match (written, texted) {
+        (Value::String(string), _) => match opened_json(string, nested) {
+            None => true,
+            Some(written) => texted.as_str().is_some_and(|texted| {
+                texted == REDACTED
+                    || opened_json(texted, nested)
+                        .is_some_and(|texted| kept_json(&written, &texted, nested + 1))
+            }),
+        },
+        // Hidden whole, it shows nothing to read.
+        (_, Value::String(texted)) if texted == REDACTED => true,
+        (Value::Array(written), Value::Array(texted)) if written.len() == texted.len() => written
+            .iter()
+            .zip(texted)
+            .all(|(written, texted)| kept_json(written, texted, nested)),
+        (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
+            texted.get(key).map_or_else(
+                || !holds_json(field, nested),
+                |texted| kept_json(field, texted, nested),
+            )
+        }),
+        (written, _) => !holds_json(written, nested),
     }
+}
+
+/// Whether `value`, read at depth `nested`, holds a string that reads as
+/// JSON that [`redact_string`] opens.
+fn holds_json(value: &Value, nested: usize) -> bool {
+    match value {
+        Value::String(string) => opened_json(string, nested).is_some(),
+        Value::Array(items) => items.iter().any(|item| holds_json(item, nested)),
+        Value::Object(fields) => fields.values().any(|field| holds_json(field, nested)),
+        _ => false,
+    }
+}
+
+/// `string` parsed, when it reads as JSON that [`redact_string`] opens at
+/// depth `nested`.
+fn opened_json(string: &str, nested: usize) -> Option<Value> {
+    (nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']))
+        .then(|| serde_json::from_str(string).ok())
+        .flatten()
 }
 
 /// Redact what a value held under a name of this strength holds, keeping

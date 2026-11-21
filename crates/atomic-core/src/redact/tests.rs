@@ -2335,6 +2335,37 @@ fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
     }
 }
 
+/// JSON that text redaction mends beside JSON it breaks does not make up
+/// for it: a string that does not read as JSON as written, a bad escape
+/// in a URL's password say, can read as JSON once text redaction hides the
+/// password, and the JSON broken beside it is still hidden whole.
+#[test]
+fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let mended = r#"{"u":"https://user:pa\qss@host/"}"#;
+    let mended = Value::String(mended.to_owned());
+    let held = |s: &str| Value::String(format!("{{\"body\": {}}}", Value::String(s.to_owned())));
+    let doc = format!(
+        "{{\"body\": {}, \"b0\": {mended}, \"b1\": {mended}}}",
+        held(&inner)
+    );
+    for parent in ["body", "key", "token"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "under {parent}: the header's value showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "under {parent}: a second pass changed it");
+    }
+}
+
 /// Text still changing when the readings run out is hidden whole.
 #[test]
 fn text_still_changing_at_the_bound_is_hidden_whole() {
