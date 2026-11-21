@@ -257,8 +257,8 @@ CI runs it on Linux, in a job of its own ("Crash suite").
 
 ## Continuous integration
 
-CI (`.github/workflows/ci.yml`) runs on every push to main and every pull
-request, on Linux. The checks that need no Rust build run in small jobs of
+CI (`.github/workflows/ci.yml`) runs on every push to main, every pull
+request and every merge group of the merge queue, on Linux. The checks that need no Rust build run in small jobs of
 their own. The Rust checks run in parallel jobs, so a pull request waits for
 the slowest one rather than for all of them in turn:
 
@@ -275,10 +275,10 @@ A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
 requests too, and nothing in CI waits for it.
 
-Main is merged through a merge queue. A pull request whose checks pass joins
-the queue, which runs CI again on the pull request merged onto main and its
-other queued pull requests (the `merge_group` event), and merges it only if
-those checks pass. So what reaches main has passed CI as it is merged, and a
+Main is merged through a merge queue. Once a pull request's checks pass, it
+can be added to the queue, which runs CI again on the pull request merged onto
+main and the pull requests queued ahead of it (the `merge_group` event), and
+merges it only if those checks pass. So what reaches main has passed CI as it is merged, and a
 pull request is not held back by changes elsewhere on main. CodeQL is not one of
 the queue's checks.
 
