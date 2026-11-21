@@ -1147,6 +1147,13 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
         return true;
     }
     let first = args.next().unwrap_or_default();
+    // Codex's Linux sandbox helper run as this executable under its own
+    // name, as Codex runs it when it could not make its link to atomic
+    // under the helper's name (see [`run_as_linux_sandbox`]).
+    #[cfg(target_os = "linux")]
+    if first == LINUX_SANDBOX_ARG1 {
+        return true;
+    }
     // Exactly the first arguments Codex's dispatch at the pinned revision
     // answers to (arg0, apply-patch, the exec-server's helpers, the pty
     // setup, the Windows sandboxes).
@@ -1165,6 +1172,10 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if !invoked_as_linux_sandbox() && linux_sandbox_args() {
+        return Err(run_as_linux_sandbox());
+    }
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
@@ -1574,7 +1585,14 @@ impl atomic_exec::Confine for ExecSandbox {
                 // stops the run; anything else, such as a full disk under the
                 // helper's registry of mount points, may pass, and the run
                 // waits.
-                if sandbox_refused(&stderr) {
+                if not_the_helper(&stderr) {
+                    Err(atomic_exec::ExecError::Unconfinable {
+                        message: format!(
+                            "Codex's Linux sandbox helper could not be set up: it ran \
+                             atomic's own command line in the helper's place ({why})"
+                        ),
+                    })
+                } else if sandbox_refused(&stderr) {
                     Err(refuse(why))
                 } else {
                     Err(atomic_exec::ExecError::Unavailable {
@@ -1591,6 +1609,15 @@ impl atomic_exec::Confine for ExecSandbox {
             }),
         }
     }
+}
+
+/// Whether a sandbox trial that failed with `stderr` failed because what
+/// ran in the helper's place was atomic's own command line, which refuses
+/// the helper's arguments: a trial run again would only fail again.
+pub(crate) fn not_the_helper(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.starts_with("Usage: atomic "))
 }
 
 /// Whether a sandbox trial that failed with `stderr` failed because this
@@ -1771,6 +1798,41 @@ fn scrub(mut remove: impl FnMut(&str)) {
     for name in OVERRIDES {
         remove(name);
     }
+}
+
+/// The first argument Codex gives its Linux sandbox helper, at the pinned
+/// revision, for both of its stages.
+#[cfg(target_os = "linux")]
+const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
+
+/// Whether this process was given the Linux sandbox helper's arguments.
+#[cfg(target_os = "linux")]
+fn linux_sandbox_args() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(LINUX_SANDBOX_ARG1.as_ref())
+}
+
+/// Run this executable again, with the same arguments, under the Linux
+/// sandbox helper's name, which Codex's dispatch and atomic's own helper
+/// entry know it by. Codex runs atomic itself as its helper when it could
+/// not make its link to atomic under that name, such as when another
+/// atomic process sweeping the same Codex home took the directory away as
+/// it was being made; it warns that it "could not create PATH aliases".
+/// Returns only why the executable could not be run.
+#[cfg(target_os = "linux")]
+fn run_as_linux_sandbox() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return anyhow::Error::new(e).context("find atomic's own executable"),
+    };
+    let error = std::process::Command::new(&exe)
+        .arg0("codex-linux-sandbox")
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::Error::new(error).context(format!(
+        "run {} as Codex's Linux sandbox helper",
+        exe.display()
+    ))
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -4108,6 +4170,12 @@ mod tests {
         ] {
             assert!(is_helper(args(helper).into_iter()), "{helper:?}");
         }
+        // The Linux sandbox helper by its arguments, as Codex runs atomic
+        // itself when it could not link to it under the helper's name.
+        #[cfg(target_os = "linux")]
+        assert!(is_helper(
+            args(&["/opt/atomic", "--sandbox-policy-cwd", "/x", "--", "true"]).into_iter()
+        ));
         for not in [
             &["atomic", "run", "x"][..],
             &["atomic", "--codex-run-as-anything"][..],
@@ -4500,6 +4568,23 @@ mod tests {
             // The second call carries the failed tool call's result.
             assert!(model.requests()[1].to_string().contains("call_synthetic"));
         });
+    }
+
+    /// A trial whose helper turned out to be atomic's own command line, which
+    /// refuses the helper's arguments, is told apart from a sandbox that
+    /// failed.
+    #[test]
+    fn a_trial_run_by_atomics_command_line_is_not_the_helper() {
+        assert!(not_the_helper(
+            "error: unexpected argument '--sandbox-policy-cwd' found\n\n\
+             Usage: atomic [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+        ));
+        for other in [
+            "",
+            "bwrap: Can't make directory /tmp/x: No space left on device",
+        ] {
+            assert!(!not_the_helper(other), "{other}");
+        }
     }
 
     /// A sandbox trial stops the run only for what the machine repeats until
