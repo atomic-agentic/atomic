@@ -47,7 +47,7 @@ use codex_network_proxy::{
     NetworkProxyState, PreparedManagedNetwork,
 };
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -290,43 +290,18 @@ fn checked(own: BTreeSet<IpAddr>) -> anyhow::Result<BTreeSet<IpAddr>> {
 /// Every address the interfaces of this process's network namespace have
 /// now: this machine's, as far as the proxy can tell. A container's or a
 /// virtual machine's addresses on another namespace are not among them.
-#[allow(unsafe_code)]
 fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills `list` with a list that is freed below with
-    // freeifaddrs, and only read before then.
-    if unsafe { libc::getifaddrs(&mut list) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("list this machine's network addresses");
-    }
-    let mut own = BTreeSet::new();
-    let mut entry = list;
-    while !entry.is_null() {
-        // SAFETY: `entry` is a node of the list getifaddrs returned, and an
-        // address it points at is a sockaddr of the family it names.
-        unsafe {
-            let addr = (*entry).ifa_addr;
-            if !addr.is_null() {
-                match i32::from((*addr).sa_family) {
-                    libc::AF_INET => {
-                        let sin = &*addr.cast::<libc::sockaddr_in>();
-                        own.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
-                            sin.sin_addr.s_addr,
-                        ))));
-                    }
-                    libc::AF_INET6 => {
-                        let sin6 = &*addr.cast::<libc::sockaddr_in6>();
-                        own.insert(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
-                    }
-                    _ => {}
-                }
+    let interfaces = nix::ifaddrs::getifaddrs().context("list this machine's network addresses")?;
+    Ok(interfaces
+        .filter_map(|interface| interface.address)
+        .filter_map(|address| {
+            if let Some(v4) = address.as_sockaddr_in() {
+                Some(IpAddr::V4(v4.ip()))
+            } else {
+                address.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
             }
-            entry = (*entry).ifa_next;
-        }
-    }
-    // SAFETY: `list` came from getifaddrs and is not used after this.
-    unsafe { libc::freeifaddrs(list) };
-    Ok(own)
+        })
+        .collect())
 }
 
 /// The most connections the sandbox helper's bridge opens to a command's
@@ -966,7 +941,10 @@ mod tests {
     #[test]
     fn this_machines_addresses_come_from_its_interfaces() {
         let own = own_addresses().expect("addresses");
-        assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
+        assert!(
+            own.contains(&IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "{own:?}"
+        );
         let denied = denied_addresses(&own);
         assert!(denied.contains(&"127.0.0.1".to_owned()), "{denied:?}");
         assert!(checked(BTreeSet::new()).is_err());

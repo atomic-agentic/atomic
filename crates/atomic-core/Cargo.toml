@@ -39,6 +39,7 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 getrandom = { workspace = true }
 libc = { workspace = true }
+nix = { workspace = true }
 psl = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
