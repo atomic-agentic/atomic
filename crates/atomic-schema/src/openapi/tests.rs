@@ -10,14 +10,24 @@ fn yaml(text: &str) -> Value {
 }
 
 /// What a response that names exactly one media type keeps: that schema,
-/// under the media type as the spec wrote it.
+/// under the media type as the spec wrote it, and no other media type beside
+/// it.
 fn one(media: &str, schema: Value) -> ResponseBody {
-    ResponseBody::Json([(media.to_owned(), schema)].into_iter().collect())
+    ResponseBody::Json {
+        schemas: [(media.to_owned(), schema)].into_iter().collect(),
+        declared_media: Vec::new(),
+    }
 }
 
-/// The media types a response declares schemas under, as it keeps them.
-fn declared_media(body: &ResponseBody) -> Vec<&str> {
+/// The media types a response keeps a schema under, as it keeps them.
+fn kept_media(body: &ResponseBody) -> Vec<&str> {
     body.schemas().map(|(media, _)| media.as_str()).collect()
+}
+
+/// The other media types a response declares, the ones it keeps no schema for,
+/// as it keeps them.
+fn unkept_media(body: &ResponseBody) -> &[String] {
+    body.declared_media()
 }
 
 /// What a tool's `output` describes, one item per schema it says a reply may
@@ -596,6 +606,165 @@ paths:
     );
 }
 
+// Where a response declares a schema under more than one wildcard, the most
+// specific declared key governs. `application/*` says its body is of one group
+// and `*/*` says it is of any, so the closer promise is the `application/*`
+// one — which is not what sorting the media types by name says, since `*/*`
+// sorts first. A specific JSON media type still beats both wildcards, and a
+// response declaring only `*/*` is still held to that one.
+#[test]
+fn the_most_specific_wildcard_declared_governs_a_response() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Wildcards, version: "1" }
+paths:
+  /both:
+    get:
+      operationId: both
+      responses:
+        "200":
+          description: a schema under each wildcard
+          content:
+            "*/*": { schema: { type: string } }
+            "application/*": { schema: { type: object, required: [narrow] } }
+  /spelled:
+    get:
+      operationId: spelled
+      responses:
+        "200":
+          description: the same two, written with parameters and the other way round
+          content:
+            "application/*; charset=utf-8": { schema: { type: object, required: [narrow] } }
+            "*/*": { schema: { type: string } }
+  /staronly:
+    get:
+      operationId: staronly
+      responses:
+        "200": { description: any body, content: { "*/*": { schema: { type: string } } } }
+  /jsontoo:
+    get:
+      operationId: jsontoo
+      responses:
+        "200":
+          description: a json media type beside both wildcards
+          content:
+            "*/*": { schema: { type: string } }
+            "application/*": { schema: { type: object, required: [narrow] } }
+            application/json: { schema: { type: object, required: [specific] } }
+"##,
+    ))
+    .expect("spec");
+    let op = |name: &str| {
+        ops.iter()
+            .find(|op| op.name == name)
+            .unwrap_or_else(|| panic!("no operation named `{name}`"))
+    };
+    let narrow = json!({ "type": "object", "required": ["narrow"] });
+    assert_eq!(
+        kept_media(kept(op("both"), "200")),
+        ["application/*"],
+        "`application/*` is the more specific of the two, though `*/*` sorts first"
+    );
+    assert_eq!(
+        kept(op("both"), "200").schema(),
+        Some(&narrow),
+        "and the schema under it is the one the response is held to"
+    );
+    assert_eq!(
+        kept(op("both"), "200").declared_media(),
+        Vec::<String>::new(),
+        "the wildcard it passed over names a schema, so it is not among the \
+         media types declared with no schema"
+    );
+    assert_eq!(
+        kept_media(kept(op("spelled"), "200")),
+        ["application/*; charset=utf-8"],
+        "the same, however the more specific one is spelled or written"
+    );
+    assert_eq!(
+        kept_media(kept(op("staronly"), "200")),
+        ["*/*"],
+        "where only `*/*` is declared it governs its own response"
+    );
+    assert_eq!(
+        kept_media(kept(op("jsontoo"), "200")),
+        ["application/json"],
+        "and a specific JSON media type beats both wildcards, as it always did"
+    );
+}
+
+// A `content` map declares bodies it keeps no schema for: media types that name
+// no schema, and media types atomic reads no body from at all. They are declared
+// all the same, and the executor cannot tell a reply naming one of them from a
+// reply naming a media type the response never mentions without being told — the
+// first is a body the spec declares and describes no shape for, and another media
+// type's schema, a wildcard's above all, is not its contract.
+#[test]
+fn a_response_keeps_the_media_types_it_declares_that_keep_no_schema() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Declared, version: "1" }
+paths:
+  /mixed:
+    get:
+      operationId: mixed
+      responses:
+        "200":
+          description: plain text with nothing beside it, and any body with a schema
+          content:
+            text/plain: {}
+            "application/*; charset=utf-8": { schema: { type: object } }
+        "201":
+          description: a json media type with no schema, and one with
+          content:
+            application/json: {}
+            application/problem+json: { schema: { type: object } }
+        "202":
+          description: two media types, each naming a schema of its own
+          content:
+            text/plain: { schema: { type: string } }
+            application/json: { schema: { type: object } }
+        "203":
+          description: media types that name no schema, only
+          content:
+            text/plain: {}
+            "application/*": {}
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    assert_eq!(
+        kept_media(kept(op, "200")),
+        ["application/*; charset=utf-8"],
+        "the only schema it declares"
+    );
+    assert_eq!(
+        unkept_media(kept(op, "200")),
+        ["text/plain"],
+        "the media type it declares with no schema, as the spec writes it"
+    );
+    assert_eq!(
+        unkept_media(kept(op, "201")),
+        ["application/json"],
+        "a JSON media type with no `schema` is declared too"
+    );
+    assert_eq!(
+        unkept_media(kept(op, "202")),
+        ["text/plain"],
+        "and so is one whose schema atomic never reads, because it reads no \
+         body of that media type"
+    );
+    // A response that keeps no schema at all keeps no list either: nothing
+    // describes any of its replies' shapes, so the executor holds none of them
+    // to anything and never has to tell one declared media type from another.
+    assert_eq!(*kept(op, "203"), ResponseBody::NoJsonSchema);
+    assert_eq!(
+        kept(op, "203").declared_media(),
+        Vec::<String>::new(),
+        "and it says so"
+    );
+}
+
 // A response may declare the shape of its body under more than one JSON media
 // type — what it returns normally and the `problem+json` its failures carry,
 // say. Every schema it declares is kept, under the media type as the spec
@@ -640,6 +809,10 @@ paths:
     post:
       operationId: echoThing
       requestBody: { required: true, content: { "text/vnd.acme.echo+json": { schema: { type: object } } } }
+  /ack:
+    post:
+      operationId: sendAck
+      requestBody: { required: true, content: { "application/vnd.acme.ack+json": { schema: { type: object } } } }
 components:
   schemas:
     Thing: { type: object, required: [thing], properties: { thing: { type: string } } }
@@ -650,7 +823,7 @@ components:
     let op = ops.iter().find(|op| op.name == "thing").expect("the get");
     let thing = kept(op, "200");
     assert_eq!(
-        declared_media(thing),
+        kept_media(thing),
         [
             "application/json",
             "application/problem+json",
@@ -693,14 +866,14 @@ components:
     // beside it is kept, and the wildcard stays preempted by any JSON media
     // type that names a schema.
     assert_eq!(
-        declared_media(kept(op, "201")),
+        kept_media(kept(op, "201")),
         ["application/vnd.acme.ack+json"],
         "the only schema it declares"
     );
     // The media type is kept as written, so a spec that spells the same type
     // two ways keeps both, in the order the executor walks them.
     assert_eq!(
-        declared_media(kept(op, "202")),
+        kept_media(kept(op, "202")),
         [
             "Application/JSON; charset=utf-8",
             "application/problem+json"
@@ -710,18 +883,36 @@ components:
     // A response whose only JSON media type names no schema still declares a
     // body nothing describes.
     assert_eq!(*kept(op, "203"), ResponseBody::NoJsonSchema);
-    // A `+json` type is a JSON media type whichever tree it sits under, so a
-    // request body declared under one is one atomic can send: the operation
-    // stays callable, with that schema as its `body`.
+    // A `+json` type is a JSON media type for a reply whichever tree it sits
+    // under, which is what kept the `text/vnd.acme.echo+json` schema above. A
+    // request body is read more narrowly: atomic sends every one as
+    // `application/json`, so a body declared only under a `+json` type of the
+    // `text/` tree is one it would send as something the spec never declared,
+    // and the operation stays unsupported with no `body` in its input. A `+json`
+    // type of the `application/` tree is one it sends within that family, so
+    // that operation stays callable with the schema as its `body`.
     let echo = ops
         .iter()
         .find(|op| op.name == "echoThing")
         .expect("the post");
-    assert_eq!(echo.unsupported, None);
-    assert_eq!(
-        echo.input["properties"]["body"],
-        json!({ "type": "object" })
+    assert!(
+        echo.unsupported
+            .as_deref()
+            .is_some_and(|why| why.contains("text/vnd.acme.echo+json")),
+        "{:?}",
+        echo.unsupported
     );
+    assert!(
+        echo.input["properties"].get("body").is_none(),
+        "{}",
+        echo.input
+    );
+    let ack = ops
+        .iter()
+        .find(|op| op.name == "sendAck")
+        .expect("the other post");
+    assert_eq!(ack.unsupported, None);
+    assert_eq!(ack.input["properties"]["body"], json!({ "type": "object" }));
 }
 
 // atomic never reads the body of a reply that is not a success, so a failure

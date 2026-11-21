@@ -592,7 +592,9 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             // `$defs`, which is listed too.
             let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
             for body in tool.responses.values().flatten() {
-                schemas.extend(body.schemas().map(|(_media, schema)| schema));
+                for (_media, schema) in body.schemas() {
+                    schemas.push(schema);
+                }
             }
             for schema in schemas {
                 atomic_schema::registry::Registry::new()

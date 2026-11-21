@@ -11,21 +11,29 @@
 //! resolved in place, so a 3.0 and a 3.1 spec of one API give the same tools.
 //!
 //! As OpenAPI requires, header parameters named `Accept`, `Content-Type` or
-//! `Authorization` are ignored: the executor sets those itself. Request and
-//! response bodies are read from a JSON media type (`application/json`,
-//! with parameters or not, or a `+json` type). An operation whose required
-//! body has no JSON media type is kept, marked [`Operation::unsupported`].
+//! `Authorization` are ignored: the executor sets those itself. An operation
+//! whose required request body is declared under no media type atomic may send
+//! is kept all the same, marked [`Operation::unsupported`].
 //!
-//! A response is held to a schema the same way, and additionally to the
-//! schema of a wildcard media type (`*/*`, `application/*`) when no JSON
-//! media type names one: such a response declares a body that may be JSON,
-//! so atomic reads it as JSON and checks it. Every JSON media type that
-//! names a schema is kept for a response, not only one of them, because a
-//! reply says which of them it is by its `Content-Type`. A request body
-//! keeps only the first, which changes nothing about it: atomic sends one
-//! JSON body under one JSON media type, never under a wildcard, so a request
-//! body declared only under a wildcard still leaves a required body
-//! unsupported.
+//! A response body is read as JSON from a JSON media type (`application/json`,
+//! with parameters or not, or a `+json` type of any tree). A response is held
+//! to a schema the same way, and additionally to the schema of a wildcard
+//! media type (`*/*`, `application/*`) when no JSON media type names one: such
+//! a response declares a body that may be JSON, so atomic reads it as JSON and
+//! checks it. Every JSON media type that names a schema is kept for a
+//! response, not only one of them, because a reply says which of them it is by
+//! its `Content-Type`. Of several wildcards the most specific declared one
+//! governs — `application/*` before `*/*` — because the narrower promise is
+//! the one the spec meant for the bodies it covers.
+//!
+//! A request body is read more narrowly, because atomic sends every request
+//! body as `application/json`: only that media type, or a `+json` type of the
+//! `application/` tree, stands as one atomic can send, and it keeps only the
+//! first of those, which changes nothing about it. A `+json` type of another
+//! tree (`text/vnd.acme.echo+json`) describes a reply but not a body atomic
+//! may send, so a required body declared only under one leaves the operation
+//! [`Operation::unsupported`]. A wildcard describes no body atomic may send
+//! either, so a request body declared only under a wildcard does the same.
 //!
 //! Each response a success can be checked against says which of three things
 //! it declares about its body — no `content` map at all, a `content` map with
@@ -70,12 +78,23 @@ pub enum ResponseBody {
     NoJsonSchema,
     /// It declares one or more schemas, each under a media type its body may
     /// arrive with: under one or more JSON media types, or, where no JSON
-    /// media type names a schema at all, under one wildcard media type. Every
-    /// media type that names a schema is kept, keyed by how the spec writes
-    /// it, because a reply says which of them it is by its `Content-Type`,
-    /// and what atomic does when the reply names none of them is the
-    /// executor's to decide.
-    Json(std::collections::BTreeMap<String, Value>),
+    /// media type names a schema at all, under its most specific wildcard
+    /// media type. Every media type that names a schema is kept, keyed by how
+    /// the spec writes it, because a reply says which of them it is by its
+    /// `Content-Type`, and what atomic does when the reply names none of them
+    /// is the executor's to decide.
+    Json {
+        /// Each schema it declares, keyed by the media type its body may
+        /// arrive with, as the `content` map writes it.
+        schemas: std::collections::BTreeMap<String, Value>,
+        /// The other media types the same `content` map declares, as it writes
+        /// them, in sorted order: those that name no schema, and those atomic
+        /// reads no body from. They are declared, and they say nothing about a
+        /// shape atomic holds a reply to — a reply whose `Content-Type` names
+        /// one is not governed by another media type's schema, least of all a
+        /// wildcard written beside them.
+        declared_media: Vec<String>,
+    },
 }
 
 impl ResponseBody {
@@ -85,7 +104,7 @@ impl ResponseBody {
     /// them its `Content-Type` names, see [`ResponseBody::schemas`].
     pub fn schema(&self) -> Option<&Value> {
         match self {
-            ResponseBody::Json(schemas) => schemas.values().next(),
+            ResponseBody::Json { schemas, .. } => schemas.values().next(),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
     }
@@ -95,18 +114,30 @@ impl ResponseBody {
     /// declares none to check a body against.
     pub fn schemas(&self) -> impl Iterator<Item = (&String, &Value)> {
         match self {
-            ResponseBody::Json(schemas) => Some(schemas.iter()),
+            ResponseBody::Json { schemas, .. } => Some(schemas.iter()),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
         .into_iter()
         .flatten()
     }
 
+    /// The media types its `content` map declares that keep no schema of their
+    /// own, as it writes them. Empty for a response that declares no `content`
+    /// map or no schema at all; otherwise the declared media types
+    /// [`ResponseBody::schemas`] leaves out — the ones a reply may name while
+    /// nothing describes a shape atomic holds it to.
+    pub fn declared_media(&self) -> &[String] {
+        match self {
+            ResponseBody::Json { declared_media, .. } => declared_media,
+            ResponseBody::NoBody | ResponseBody::NoJsonSchema => &[],
+        }
+    }
+
     /// Every schema to change in place, when there are any;
     /// [`ResponseBody::schema`] borrows the first read-only.
     fn schemas_mut(&mut self) -> impl Iterator<Item = &mut Value> {
         match self {
-            ResponseBody::Json(schemas) => Some(schemas.values_mut()),
+            ResponseBody::Json { schemas, .. } => Some(schemas.values_mut()),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
         .into_iter()
@@ -260,13 +291,27 @@ fn styles_for(place: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether `media` is a JSON media type: `application/json`, with or without
-/// parameters, or a structured `+json` type of any tree (`application/`,
-/// `text/`, vendor or standards-prefixed trees alike), which is what RFC 6839
-/// says a `+json` suffix means.
+/// Whether `media` names a body atomic reads as JSON in a reply:
+/// `application/json`, with or without parameters, or a structured `+json`
+/// type of any tree (`application/`, `text/`, vendor or standards-prefixed
+/// trees alike), which is what RFC 6839 says a `+json` suffix means. A
+/// request body is read by the narrower `is_json_request_media`, because
+/// atomic sends one as `application/json` and nothing else.
 pub fn is_json_media(media: &str) -> bool {
     let essence = media_essence(media);
     essence == "application/json" || (essence.contains('/') && essence.ends_with("+json"))
+}
+
+/// Whether `media` names a request body atomic can send: `application/json`,
+/// with or without parameters, or a `+json` type of the `application/` tree.
+/// The executor gives every request body `Content-Type: application/json`, so
+/// a `+json` type of another tree — `text/vnd.acme.echo+json` — names a body
+/// atomic would send as something the spec did not declare, and is left to
+/// [`Operation::unsupported`].
+fn is_json_request_media(media: &str) -> bool {
+    let essence = media_essence(media);
+    let application_tree = essence.starts_with("application/");
+    essence == "application/json" || (application_tree && essence.ends_with("+json"))
 }
 
 /// A media type with its parameters dropped and its case folded, as media
@@ -284,7 +329,11 @@ pub fn media_essence(media: &str) -> String {
 /// parameters or not. Neither names JSON, but each says its body is anything
 /// of the group it stands for, and a schema written under one says which part
 /// of that the API returns — so a body under one is read as JSON, which is
-/// what `response_content` does when no JSON media type names a schema.
+/// what `response_content` does when no JSON media type names a schema. A
+/// schema declared only under a wildcard still governs a reply of a media type
+/// the response never names; the reply it does not govern is one naming a
+/// media type the response names while keeping no schema for it, see
+/// [`ResponseBody::declared_media`].
 fn is_wildcard_media(media: &str) -> bool {
     let essence = media_essence(media);
     essence == "*/*" || essence == "application/*"
@@ -337,34 +386,75 @@ fn declared_body(response: &Value) -> ResponseBody {
     let Some(content) = response.get("content") else {
         return ResponseBody::NoBody;
     };
-    match response_content(content) {
-        schemas if schemas.is_empty() => ResponseBody::NoJsonSchema,
-        schemas => ResponseBody::Json(schemas),
+    let declared = response_content(content);
+    if declared.schemas.is_empty() {
+        return ResponseBody::NoJsonSchema;
+    }
+    ResponseBody::Json {
+        schemas: declared.schemas,
+        declared_media: declared.declared_media,
     }
 }
 
-/// The schemas a response's body is held to under a `content` map: every JSON
-/// media type's, as `json_schemas` keeps them, which a wildcard never
-/// overrides; else the first wildcard media type's that names a schema, so
-/// that a response declaring a schema only under `*/*` or `application/*`
-/// holds its body to it. A content map with neither declares a body of a
-/// shape nothing describes.
-fn response_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
-    let schemas = json_schemas(content);
+/// What one response's `content` map declares: the schemas a reply is held
+/// to, and the media types it declares that keep no schema of their own.
+struct Declared {
+    schemas: std::collections::BTreeMap<String, Value>,
+    declared_media: Vec<String>,
+}
+
+/// What a response's body is held to under a `content` map: every JSON media
+/// type's schema, as `json_schemas` keeps them, which a wildcard never
+/// overrides; else the schema of the most specific wildcard media type that
+/// names one, so that a response declaring a schema only under `*/*` or
+/// `application/*` holds its body to it. A content map with neither declares
+/// a body of a shape nothing describes. Either way the media types that name
+/// no schema are kept along with them, because they are declared all the same.
+fn response_content(content: &Value) -> Declared {
+    let mut schemas = json_schemas(content);
     if schemas.is_empty() {
-        return wildcard_content(content);
+        schemas = wildcard_content(content);
     }
-    schemas
+    Declared {
+        schemas,
+        declared_media: media_with_no_kept_schema(content),
+    }
 }
 
-/// The schema under a `content` map's first JSON media type, if any — which
-/// is what a request body is held to, since atomic sends one JSON body under
-/// one JSON media type. `None` when the first one names no `schema`, even
-/// where a later one does, which is what leaves such a request body
-/// unsupported.
+/// The media types a `content` map declares that keep no schema for atomic:
+/// those whose entry names no schema, and those atomic reads no body from at
+/// all (`text/plain`, whatever it names). Wildcards are never among them — no
+/// reply names one, and a wildcard is the schema kept for exactly the media
+/// types the map does not name. A reply whose `Content-Type` names one of these
+/// is a reply the spec describes without describing a shape for it, which is
+/// not the same as a reply the spec never mentions: the executor decides what
+/// to hold each of them to.
+fn media_with_no_kept_schema(content: &Value) -> Vec<String> {
+    let Some(content) = content.as_object() else {
+        return Vec::new();
+    };
+    let mut media: Vec<String> = content
+        .iter()
+        .filter(|(media, entry)| {
+            !is_wildcard_media(media) && (!is_json_media(media) || entry.get("schema").is_none())
+        })
+        .map(|(media, _)| (*media).clone())
+        .collect();
+    media.sort();
+    media
+}
+
+/// The schema under a `content` map's first JSON request media type, if any —
+/// which is what a request body is held to, since atomic sends one JSON body
+/// as `application/json` and nothing else. `None` when the first one names no
+/// `schema`, even where a later one does, which is what leaves such a request
+/// body unsupported.
 fn json_content(content: &Value) -> Option<&Value> {
     let content = content.as_object()?;
-    let mut keys: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
+    let mut keys: Vec<&String> = content
+        .keys()
+        .filter(|k| is_json_request_media(k))
+        .collect();
     keys.sort();
     keys.first().and_then(|k| content[k.as_str()].get("schema"))
 }
@@ -389,8 +479,29 @@ fn json_schemas(content: &Value) -> std::collections::BTreeMap<String, Value> {
         .collect()
 }
 
-/// The schema under a `content` map's first wildcard media type that names
-/// one, if any, the media types in sorted order, keyed by that media type.
+/// How specific one wildcard media type is, for picking which of several a
+/// response's body is held to: `application/*` says the body is of one group,
+/// `*/*` says it is of any, so a schema written under the first is the closer
+/// promise. The smaller the rank, the closer. `None` for a media type that is
+/// no wildcard at all.
+fn wildcard_rank(media: &str) -> Option<u8> {
+    let essence = media_essence(media);
+    let application_group = essence == "application/*";
+    if application_group {
+        Some(0)
+    } else if essence == "*/*" {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// The schema under the most specific wildcard media type in a `content` map
+/// that names one, keyed by that media type as the map writes it. Sorted by
+/// name alone, `*/*` comes before `application/*`, which is the loosest order:
+/// the wildcards are ranked by how specific they are, so a map declaring a
+/// schema under both holds its body to the `application/*` one. Where two
+/// wildcards rank the same, the media type as written decides.
 fn wildcard_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
     let mut out = std::collections::BTreeMap::new();
     let Some(content) = content.as_object() else {
@@ -398,6 +509,7 @@ fn wildcard_content(content: &Value) -> std::collections::BTreeMap<String, Value
     };
     let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k)).collect();
     keys.sort();
+    keys.sort_by_key(|k| wildcard_rank(k).unwrap_or(u8::MAX));
     if let Some((key, schema)) = keys
         .iter()
         .find_map(|k| content[k.as_str()].get("schema").map(|s| ((*k).clone(), s)))

@@ -1,0 +1,1 @@
+json-schemas-kept|crates/atomic-schema/src/openapi.rs|    types.sort();|    types.sort(); types.truncate(1);|-p atomic-agentic-schema -p atomic-agentic-core --lib -- openapi::tests::every_json_media_types_schema_is_kept_for_a_response http_tools::tests::a_reply_is_checked_against_the_schema_its_content_type_names

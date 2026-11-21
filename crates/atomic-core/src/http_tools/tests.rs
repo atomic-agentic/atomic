@@ -477,6 +477,43 @@ paths:
             application/json: { schema: { type: object, required: [thing], properties: { thing: { type: string } } } }
             application/problem+json: { schema: { type: object, required: [title], properties: { title: { type: string } } } }
             "application/*": { schema: { type: object, required: [never_governs] } }
+  /declared:
+    get:
+      operationId: declared
+      responses:
+        "200":
+          description: a thing, or the plain text a server falls back to
+          content:
+            application/json: { schema: { type: object, required: [thing], properties: { thing: { type: string } } } }
+            text/plain: {}
+        "201":
+          description: any application body, or the same plain text
+          content:
+            "application/*": { schema: { type: object, required: [thing] } }
+            text/plain: {}
+  /unkept:
+    get:
+      operationId: unkept
+      responses:
+        "200":
+          description: a thing, or the same thing spelled out in plain text, each with its schema
+          content:
+            application/json: { schema: { type: object, required: [thing], properties: { thing: { type: string } } } }
+            text/plain: { schema: { type: string } }
+  /wildcardtext:
+    get:
+      operationId: wildcardtext
+      responses:
+        "200": { description: any application body, content: { "application/*": { schema: { type: object, required: [thing] } } } }
+  /twoschema:
+    get:
+      operationId: twoschema
+      responses:
+        "200":
+          description: two shapes, and a server that names a third
+          content:
+            application/json: { schema: { type: object, required: [thing] } }
+            application/problem+json: { schema: { type: object, required: [title] } }
   /wildopen:
     get:
       operationId: wildopen
@@ -1132,4 +1169,205 @@ async fn a_reply_is_checked_against_the_schema_its_content_type_names() {
         !said.contains("application/*") && !said.contains("anything"),
         "the wildcard was said or the body echoed: {said}"
     );
+}
+
+// A response may declare two bodies and describe the shape of only one of
+// them: the thing it returns as JSON, and the plain text a server falls back
+// to. A reply that names the media type declared with nothing beside it is not
+// held to the other media type's schema — a wildcard's beside it most of all —
+// because the spec declared that body and said nothing of its shape. It is
+// refused, and what is said names the media types the response declares, none
+// of them the body. A reply naming a media type the response never mentions is
+// a different reply: it keeps falling to the response's only schema, declared
+// under a wildcard or not, and a reply naming the media type that does have a
+// schema is held to it as it always was.
+#[tokio::test]
+async fn a_reply_naming_a_declared_media_type_with_no_schema_is_refused() {
+    const TEXT_PLAIN: &str = "content-type: text/plain\r\n";
+    const JSON: &str = "content-type: application/json\r\n";
+    let (host, _) = server_at(vec![
+        // `/declared`: the media type it declares with no schema, under its
+        // `200` (a JSON media type beside it) and its `201` (a wildcard).
+        (200, TEXT_PLAIN, r#"{"thing": "x"}"#),
+        (201, TEXT_PLAIN, r#"{"thing": "x"}"#),
+        // `/declared` again, naming the media type it does give a schema.
+        (200, JSON, r#"{"thing": "x"}"#),
+        // `/wildcardtext`: one schema under a wildcard, no other media type.
+        (200, JSON, r#"{"thing": "x"}"#),
+        (200, TEXT_PLAIN, r#"{"thing": "x"}"#),
+        (200, JSON, r#"{"nope": 1}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    for (status, says) in [
+        (200u16, "it declares application/json, text/plain"),
+        (201, "it declares application/*, text/plain"),
+    ] {
+        let error = tools
+            .call("declared", &args)
+            .await
+            .expect_err("a reply naming a media type declared with no schema");
+        let key = status.to_string();
+        assert!(
+            matches!(&error, CallError::Response { status: got, response, .. }
+                if *got == status && response == &key),
+            "{error}"
+        );
+        let said = error.to_string();
+        assert!(
+            said.contains("its reply is `text/plain`, which its response declares no schema for"),
+            "{said}"
+        );
+        assert!(said.contains(says), "the media types it declares: {said}");
+        assert!(!said.contains("thing"), "the body was echoed: {said}");
+    }
+    // The same operation naming the media type it did describe is checked
+    // against that schema, refusal of the other reply notwithstanding.
+    assert_eq!(
+        tools
+            .call("declared", &args)
+            .await
+            .expect("the media type it declares a schema for"),
+        json!({ "thing": "x" })
+    );
+    // Where no media type is declared beside the wildcard, every reply falls to
+    // its schema: the one naming a type the spec never mentions as much as the
+    // one naming none, and each is held to it, fit or not.
+    assert_eq!(
+        tools
+            .call("wildcardtext", &args)
+            .await
+            .expect("`application/json` is not declared, and is checked"),
+        json!({ "thing": "x" })
+    );
+    assert_eq!(
+        tools
+            .call("wildcardtext", &args)
+            .await
+            .expect("`text/plain` is not declared either, and is checked"),
+        json!({ "thing": "x" })
+    );
+    let error = tools
+        .call("wildcardtext", &args)
+        .await
+        .expect_err("and held to it, not passed through");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("\"thing\" is a required property"),
+        "{error}"
+    );
+}
+
+// A media type the response declares with a schema atomic reads no body from —
+// `text/plain`, whatever it names — is declared just as much as one named with
+// no schema at all, and atomic holds no reply of it to another media type's
+// schema. The spec says what the body is; it does not say it is JSON, and the
+// schema beside it is for the JSON one.
+#[tokio::test]
+async fn a_reply_naming_a_media_type_atomic_reads_no_body_from_is_refused() {
+    const TEXT_PLAIN: &str = "content-type: text/plain\r\n";
+    const JSON: &str = "content-type: application/json\r\n";
+    let (host, _) = server_at(vec![
+        (200, TEXT_PLAIN, r#"{"thing": "x"}"#),
+        (200, JSON, r#"{"thing": "x"}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    let error = tools
+        .call("unkept", &args)
+        .await
+        .expect_err("a reply naming the media type atomic reads no body from");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    let said = error.to_string();
+    assert!(
+        said.contains("its reply is `text/plain`, which its response declares no schema for"),
+        "{said}"
+    );
+    assert!(
+        said.contains("it declares application/json, text/plain"),
+        "the media types it declares: {said}"
+    );
+    assert!(!said.contains("thing"), "the body was echoed: {said}");
+    // The other reply of the same operation is held to its own schema, which
+    // the plain text one has nothing to say about.
+    assert_eq!(
+        tools
+            .call("unkept", &args)
+            .await
+            .expect("`application/json` keeps its own schema"),
+        json!({ "thing": "x" })
+    );
+}
+
+// A refusal on the media type says what came back, and no more. What atomic
+// names is the media type the reply wrote with its parameters dropped, so a
+// `Content-Type` padded out with parameters contributes its type alone, and one
+// whose own subtype runs past `MEDIA_ECHO_LIMIT` bytes is echoed cut short —
+// never whole, and never the body beside it. Both replies name a media type the
+// response declares no schema for, of the two it declares.
+#[tokio::test]
+async fn a_long_content_type_is_echoed_cut_short() {
+    // A media type of its own and four parameters; then a subtype long enough
+    // that the media type alone passes `MEDIA_ECHO_LIMIT`.
+    const PARAMS: &str = "content-type: application/vnd.acme.echo+json; charset=x; \
+                          charset=x; charset=x; charset=x\r\n";
+    const LONG: &str = "content-type: application/vnd.acme.\
+                        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa+json\r\n";
+    let (host, _) = server_at(vec![
+        (200, PARAMS, r#"{"anything": 1}"#),
+        (200, LONG, r#"{"anything": 1}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    // Parameters are dropped before the media type is named, however many
+    // there are: what is said is the type, and none of what padded it.
+    let says = "which its response declares no schema for; \
+                it declares application/json, application/problem+json";
+    let error = tools
+        .call("twoschema", &args)
+        .await
+        .expect_err("a reply naming a media type it declares no schema for");
+    let said = error.to_string();
+    assert!(
+        said.contains("its reply is `application/vnd.acme.echo+json`"),
+        "{said}"
+    );
+    assert!(said.contains(says), "{said}");
+    assert!(
+        !said.contains("charset"),
+        "the parameters were echoed: {said}"
+    );
+    assert!(!said.contains("anything"), "the body was echoed: {said}");
+    // A media type longer than the limit on its own is echoed as far as the
+    // limit, marked short, and never whole.
+    let error = tools
+        .call("twoschema", &args)
+        .await
+        .expect_err("a reply naming a media type too long to echo");
+    let said = error.to_string();
+    let whole = &LONG["content-type: ".len()..LONG.len() - "\r\n".len()];
+    assert!(
+        whole.len() > MEDIA_ECHO_LIMIT,
+        "the test's media type is not long: {} bytes",
+        whole.len()
+    );
+    assert!(
+        said.contains(&format!("its reply is `{}…", &whole[..MEDIA_ECHO_LIMIT])),
+        "the echo is not the first {MEDIA_ECHO_LIMIT} bytes of it: {said}"
+    );
+    assert!(said.contains(says), "{said}");
+    assert!(!said.contains(whole), "the whole type was echoed: {said}");
+    assert!(!said.contains("anything"), "the body was echoed: {said}");
 }
