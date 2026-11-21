@@ -99,7 +99,10 @@ pub fn proxied_key(base_url: &str, var: &dyn Fn(&str) -> Option<String>) -> Opti
         .find(|name| set(name).is_some())?;
     let exempt = var("NO_PROXY")
         .or_else(|| var("no_proxy"))
-        .is_some_and(|list| list.split(',').any(|entry| no_proxy_covers(entry.trim(), &host)));
+        .is_some_and(|list| {
+            list.split(',')
+                .any(|entry| no_proxy_covers(entry.trim(), &host))
+        });
     if exempt {
         return None;
     }

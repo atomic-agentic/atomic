@@ -978,6 +978,8 @@ fn a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused() {
         "http://[::1]:4000/v1",
         "http://127.0.0.2:4000/v1",
         "http://localhost.:4000/v1",
+        "http://0.0.0.0:4000/v1",
+        "http://[::ffff:127.0.0.1]:4000/v1",
     ] {
         assert!(proxied_key(base, &env(proxied)).is_some(), "{base}");
     }
@@ -1005,8 +1007,11 @@ fn a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused() {
     ] {
         for name in ["NO_PROXY", "no_proxy"] {
             let pairs: &'static [(&'static str, &'static str)] = Box::leak(
-                vec![("HTTP_PROXY", "http://proxy.example:3128"), (name, no_proxy)]
-                    .into_boxed_slice(),
+                vec![
+                    ("HTTP_PROXY", "http://proxy.example:3128"),
+                    (name, no_proxy),
+                ]
+                .into_boxed_slice(),
             );
             assert_eq!(
                 proxied_key(base, &env(pairs)).is_none(),

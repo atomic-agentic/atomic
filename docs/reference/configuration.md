@@ -205,6 +205,19 @@ or unspecified address or `localhost`, is reached directly, never through a
 proxy that `HTTP_PROXY` or `ALL_PROXY` names, which would see the key in
 cleartext. Any other endpoint uses the proxies the environment names.
 
+A Codex atom calls through Codex's own client, which atomic cannot tell to skip
+a proxy or to refuse a redirect. When a key would go to an endpoint on this
+machine over plain `http` and `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or
+`all_proxy` names a proxy that no `NO_PROXY` entry exempts the host from, the
+atom's turn is refused before anything is sent, naming the variable. Add the
+host to `NO_PROXY` (for example `NO_PROXY=127.0.0.1`) or use an `https`
+endpoint. The entry must name the host as the URL does: `localhost` does not
+exempt `127.0.0.1`, `*` exempts names but not addresses, and `NO_PROXY`, when it
+is set at all, hides `no_proxy`. Redirects stay open: Codex's client follows
+one, so an `https` endpoint that redirects to `http` on the same host and port
+receives the key again in cleartext. Point a Codex atom only at an endpoint you
+trust not to redirect.
+
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
 as [models](../models.md) describes. The names are settled and appear in the
