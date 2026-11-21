@@ -840,8 +840,13 @@ async fn a_project_sees_and_decides_only_its_own_gates_and_runs(database: crate:
     assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
     assert!(redeliver(&mine).await.expect("redeliver") >= 1);
     assert!(outcome(&mine, &run).await.expect("finishes").approved());
-    mine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
-    theirs.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

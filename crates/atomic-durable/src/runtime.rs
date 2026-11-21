@@ -1307,7 +1307,10 @@ impl Durare {
     /// project's run is, to this one, no run at all. A run for no project is
     /// seen only by a runtime for none.
     pub async fn own_run_record(&self, id: &str) -> Result<Option<RunRecord>> {
-        let (run, project) = (id.to_owned(), self.project.as_deref().unwrap_or_default().to_owned());
+        let (run, project) = (
+            id.to_owned(),
+            self.project.as_deref().unwrap_or_default().to_owned(),
+        );
         let own = self
             .reads
             .read(move |mut tx| {

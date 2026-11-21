@@ -1227,7 +1227,9 @@ pub async fn pinned_evidence<R: DurableRuntime>(rt: &R) -> Result<Vec<String>> {
                 let rows = tx
                     .query_all(&format!("SELECT {COLUMNS} FROM {GATES}"), &[])
                     .await?;
-                rows.iter().map(gate_from_row).collect::<Result<Vec<Gate>>>()
+                rows.iter()
+                    .map(gate_from_row)
+                    .collect::<Result<Vec<Gate>>>()
             })
         })
         .await?

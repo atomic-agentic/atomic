@@ -6078,12 +6078,20 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
             .await
             .expect("child");
         assert!(listed.status.success(), "{}", text(&listed));
-        assert_eq!(stdout_json(&listed), json!([]), "another project's gate is listed");
+        assert_eq!(
+            stdout_json(&listed),
+            json!([]),
+            "another project's gate is listed"
+        );
         let approved = in_other(vec!["gates".into(), "approve".into(), g.id.clone()])
             .await
             .expect("child");
         assert!(!approved.status.success(), "{}", text(&approved));
-        assert!(text(&approved).contains(&format!("no gate {}", g.id)), "{}", text(&approved));
+        assert!(
+            text(&approved).contains(&format!("no gate {}", g.id)),
+            "{}",
+            text(&approved)
+        );
         let shown = in_other(vec![
             "--json".into(),
             "runs".into(),
@@ -6093,9 +6101,19 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
         .await
         .expect("child");
         assert!(!shown.status.success(), "{}", text(&shown));
-        assert_eq!(stdout_json(&shown)["error"]["kind"], "run.not_found", "{}", text(&shown));
+        assert_eq!(
+            stdout_json(&shown)["error"]["kind"],
+            "run.not_found",
+            "{}",
+            text(&shown)
+        );
         assert!(
-            gate::find(&rt, &g.id).await.expect("find").expect("still there").resolution.is_none(),
+            gate::find(&rt, &g.id)
+                .await
+                .expect("find")
+                .expect("still there")
+                .resolution
+                .is_none(),
             "another project decided the gate"
         );
 
