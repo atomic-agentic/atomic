@@ -74,11 +74,14 @@ Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
-says so once, waits and tries again for a bounded time (about 7.4 minutes with
-the store's 30-second wait: 11 tries and the pauses between them), then stops
-and is run again. Each stop spends one
-of durare's recoveries of the run, and once they run out the run waits for
-`atomic runs resume`.
+as it pins its definitions or gives an exec atom's command the artifacts its
+input references, says so (a pin once a run, an exec step once each time it
+waits), waits and tries again for a bounded time (about 7.4 minutes with the
+store's 30-second wait: 11 tries and the pauses between them), then stops,
+recording nothing and running nothing, and is run again. Each stop spends one of durare's recoveries of the run, and once they
+run out the run waits for `atomic runs resume`. The files a command hands over
+are stored after it has run: a store held then is waited out a few times, and
+past that the step's outcome is unknown, as after a crash there.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

@@ -313,7 +313,13 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
     let f = fixture("inputs");
     let patch = f
         .store
-        .put(&mut &b"the patch"[..], provenance())
+        .put(
+            &mut &b"the patch"[..],
+            Provenance {
+                media_type: "text/x-diff".into(),
+                ..provenance()
+            },
+        )
         .expect("put")
         .artifact;
     let other = f
@@ -322,7 +328,7 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
         .expect("put")
         .artifact;
     let input = json!({"patch": patch.to_string(), "note": other.to_string()});
-    let given = referenced(&contract(), &input, &f.store);
+    let given = referenced(&contract(), &input, &f.store).expect("referenced");
     assert_eq!(given, vec![patch.clone()], "only the typed reference");
     f.exchange.mount(&f.store, &given).expect("mounted");
     let copy = f.exchange.inputs().join(patch.digest());
@@ -945,14 +951,6 @@ fn a_sweep_racing_a_mount_keeps_the_inputs() {
         .put(&mut &b"another input"[..], provenance())
         .expect("put")
         .artifact;
-    for blob in [&patch, &other] {
-        let d = blob.digest();
-        std::fs::File::open(f.dir.join("store/blobs/sha256").join(&d[..2]).join(&d[2..]))
-            .and_then(|b| {
-                b.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
-            })
-            .expect("backdate");
-    }
     f.exchange
         .mount(
             &SweepingOnOpen { inner: &f.store },
@@ -965,4 +963,18 @@ fn a_sweep_racing_a_mount_keeps_the_inputs() {
     }
     let swept = Sweeping { inner: &f.store }.sweep();
     assert_eq!(swept.removed.len(), 2, "{swept:?}");
+}
+
+/// An input that references an artifact the store does not hold is refused,
+/// never given without it.
+#[test]
+fn an_input_referencing_a_missing_artifact_is_refused() {
+    let f = fixture("missing-input");
+    let missing = ArtifactRef::from_digest(&"d".repeat(64)).expect("digest");
+    let input = json!({"patch": missing.to_string()});
+    let e = referenced(&contract(), &input, &f.store).expect_err("refused");
+    assert!(
+        matches!(&e, atomic_schema::artifact::ArtifactCheckError::Missing { text, .. } if *text == missing.to_string()),
+        "{e}"
+    );
 }

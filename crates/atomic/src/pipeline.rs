@@ -723,9 +723,10 @@ fn failed(message: String) -> DurableError {
 /// run again: each try waits as long as the store waits for its lock, and
 /// the wait between tries doubles up to that long. With the store's 30 s,
 /// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
-/// between them) before it spends one of durare's recoveries.
-const LOCKED_RETRIES: u32 = 10;
-const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// between them) before it spends one of durare's recoveries. An exec
+/// step giving its command its inputs waits the same.
+const LOCKED_RETRIES: u32 = atomic_core::runtime::STORE_HELD_RETRIES;
+const LOCKED_BACKOFF: std::time::Duration = atomic_core::runtime::STORE_HELD_BACKOFF;
 
 /// How many times this process has found the artifact store held elsewhere
 /// for each run, try by try.
@@ -1481,6 +1482,7 @@ async fn turn<C: WorkflowContext>(
             step_id: t.name.clone(),
         };
         let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+        let (giving, artifacts) = (atom_input.clone(), runtimes.codex.artifacts.clone());
         // The run's own build caches, with a Cargo target of the turn's own.
         let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
@@ -1489,13 +1491,25 @@ async fn turn<C: WorkflowContext>(
             (attempt::begin(ctx, &attempt_step).await?, None)
         } else {
             attempt::begin_with(ctx, &attempt_step, move || async move {
-                let opened = atomic_core::runtime::open_exec_workspace(
+                let mut opened = atomic_core::runtime::open_exec_workspace(
                     &opening,
                     &who,
                     backend,
                     exec_caches.as_ref(),
                 )
                 .await;
+                // Its inputs are given here, before the attempt is recorded:
+                // a store held too long then stops the step with nothing
+                // run and nothing recorded, and the run is run again.
+                if let (Ok(workspace), Ok(compiled)) =
+                    (&opened, compile::compile(&opening, &Registry::new()))
+                    && let Err(e) = atomic_core::runtime::give_exec_inputs(
+                        &opening, &compiled, &giving, workspace, &artifacts,
+                    )
+                    .await
+                {
+                    opened = Err(e);
+                }
                 crate::workflows::settled(opened, &place, true).await
             })
             .await?

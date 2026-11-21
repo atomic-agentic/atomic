@@ -45,7 +45,9 @@
 //!
 //! A store can also [`hold`](ArtifactStore::hold) content: a sweep keeps
 //! it, however old, while the [`Hold`] is kept and the store that took it
-//! is open. A gather holds each file it stores until its step has recorded
+//! is open. A hold is taken under the store's shared lock, as a write is, so
+//! it waits for a sweep in progress and can fail with
+//! [`ArtifactError::Locked`]. A gather holds each file it stores until its step has recorded
 //! the reference, so a sweep between the two never removes it, however long
 //! the step takes to get there. A hold is a file in `artifact-held/<owner>/`
 //! beside the owners; a dead store's holds go with its staging files.
@@ -185,6 +187,12 @@ pub trait ArtifactStore {
 
     /// Every manifest recorded for the content, in a stable order.
     fn manifests(&self, artifact: &ArtifactRef) -> Result<Vec<Manifest>, ArtifactError>;
+
+    /// How long a write, a hold or a sweep waits for the store's lock before
+    /// it fails with [`ArtifactError::Locked`].
+    fn lock_wait(&self) -> std::time::Duration {
+        LOCK_WAIT
+    }
 }
 
 /// Content [`ArtifactStore::stage`] read aside, not yet stored. Dropped
@@ -916,7 +924,7 @@ impl LocalStore {
     /// lock while it runs, so a write waits for it and another sweep runs
     /// after it; content a write kept or added is then as recent as that
     /// write. What it keeps is the caller's to say: a sweep keeps nothing
-    /// another caller needs unless that is in `keep` or recent.
+    /// another caller needs unless that is in `keep`, held or recent.
     pub fn sweep(
         &self,
         keep: &BTreeSet<ArtifactRef>,
@@ -924,9 +932,9 @@ impl LocalStore {
         read_at: std::time::SystemTime,
     ) -> Result<Swept, ArtifactError> {
         let _lock = StoreLock::take(&self.lock, true, self.lock_wait)?;
-        // Who is open, and what they hold, before any blob is judged: a
-        // hold taken after this is taken before its content is committed,
-        // and a commit waits for this sweep.
+        // Who is open, and what they hold, before any blob is judged: a hold
+        // is written under the store's shared lock, so none is taken while
+        // this sweep runs.
         let now = std::time::SystemTime::now();
         let (live, dead) = live_owners(self.owners(), STAGING_GRACE, now);
         let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;
@@ -1004,6 +1012,10 @@ impl LocalStore {
 }
 
 impl ArtifactStore for LocalStore {
+    fn lock_wait(&self) -> std::time::Duration {
+        self.lock_wait
+    }
+
     fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError> {
         // Stream to staging while hashing; committing moves it into place
         // under its digest. A sweep leaves it while this store is open.
