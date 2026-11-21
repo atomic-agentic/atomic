@@ -210,6 +210,10 @@ jobs:
           target-cache: test
           backends: "true"
       - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
+        # The runner's /tmp belongs to this job alone, so a test may create
+        # and remove entries there (turn_workspace.rs).
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
         run: scripts/test-shards.py run ${{ matrix.shard }}
 
   # The crash suite: every failpoint, triggered in turn, against real

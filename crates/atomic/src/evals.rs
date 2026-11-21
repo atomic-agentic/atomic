@@ -311,6 +311,13 @@ pub async fn run(
     // sign-in only for a live eval, since a replay reads no credential.
     let live = source != Source::Recorded && needs_model;
     let resolved = crate::engine::settings(&state, &args.engine, live)?;
+    // A case waits for the execution backend no longer than a run would.
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
     // needs no key, so none is read. A live eval calls the endpoint as a
@@ -370,6 +377,8 @@ pub async fn run(
                 &budgets,
                 &Budget::default(),
                 &[(atom.name.as_str(), &atom.budget, model.as_str())],
+                // An eval meters its model calls only.
+                &[],
             )
             .map_err(|(_, e)| {
                 Failure::new(
@@ -390,11 +399,19 @@ pub async fn run(
         std::process::id()
     );
 
+    // Every chosen atom's cases, loaded before the first atom runs: a case
+    // the load refuses, such as one its atom does not trust, stops the eval
+    // before any call, command or spend.
+    let loaded = chosen
+        .atoms
+        .iter()
+        .map(|(atom, settings, _)| eval::load_cases(atom, settings))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let mut reports = Vec::new();
     let mut tallies = Vec::new();
     let mut spent = Vec::new();
-    for (atom, settings, select) in &chosen.atoms {
-        let cases = eval::load_cases(atom, settings)?;
+    for ((atom, settings, select), cases) in chosen.atoms.iter().zip(loaded) {
         let cassette = match (calls_model(atom), source) {
             (false, _) | (true, Source::Live) => None,
             (true, recorded) => Some(
@@ -754,6 +771,7 @@ fn runtimes(
         },
         lite,
         exec: exec.clone(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }

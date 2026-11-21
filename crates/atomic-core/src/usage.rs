@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Metering model calls.
+//! Metering model calls, and an exec atom's command.
 //!
 //! Every model call an atom makes, the first turn and any repair turn alike,
-//! passes through a [`Meter`]: [`Meter::admit`] before the call is
+//! and every exec atom's command (a [`Call`] that is [`Call::work`]), passes
+//! through a [`Meter`]: [`Meter::admit`] before the call is
 //! dispatched, and [`Meter::settle`] once, after it, with what the provider
 //! reported. A meter that refuses admission stops the atom before the call
 //! goes out, with [`Exhausted`]; the atom's run fails with
@@ -53,7 +54,14 @@ pub struct Call {
     /// several provider requests and run tools between them: it reserves
     /// the atom's remaining active time, not one request's.
     pub turn: bool,
+    /// Whether it is not a model call but other active work, such as an exec
+    /// atom's command: it uses no tokens and costs nothing, and, like a
+    /// turn, reserves the active time left and is cut off when it runs out.
+    pub work: bool,
 }
+
+/// The model name active work that is not a model call is accounted under.
+pub const WORK_MODEL: &str = "(command)";
 
 /// What an admitted call may use: the runtime holds the call to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -377,5 +385,30 @@ pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("error.message", message.as_str());
     if let Some(status) = status {
         span.record("http.response.status_code", i64::from(status));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call's time is its own limit, or its default when that is shorter
+    /// or it has none.
+    #[test]
+    fn a_limits_time_is_the_shorter_of_its_own_and_the_default() {
+        let five = Duration::from_secs(300);
+        let limit = |time: Option<Duration>| Limit {
+            output_tokens: None,
+            time,
+        };
+        assert_eq!(limit(None).time_within(five), five);
+        assert_eq!(
+            limit(Some(Duration::from_millis(700))).time_within(five),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            limit(Some(Duration::from_secs(3600))).time_within(five),
+            five
+        );
     }
 }

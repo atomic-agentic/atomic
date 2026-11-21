@@ -200,6 +200,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             Arc::new(atomic_exec::LocalBackend::default()),
                             None,
                             &runtime::Artifacts::none(),
+                            &atomic_core::usage::Metering::none(),
                         ))
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
                     assert_eq!(out, golden, "{what}: the command's output");
@@ -486,6 +487,7 @@ fn the_drift_check_sees_inputs_prepared_values_and_jsonl_rows() {
         expect: vec!["true".into()],
         case: Value::Null,
         prepared,
+        origin: "external".into(),
     };
     let write = |name: &str, text: &str| std::fs::write(fixtures.join(name), text).expect("write");
     write("one.input.json", r#"{"text": "a"}"#);

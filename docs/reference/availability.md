@@ -91,7 +91,15 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. The local backend is the only one with a Codex shell, and
+on stderr that it waits, and the run goes on once there is room. With the
+`backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
+waits at most that long: `atomic run` and
+`atomic runs resume` then stop with exit code 75, the run unfinished and nothing
+recorded, for `atomic runs resume` to continue, and `atomic serve` sets the
+step aside and keeps trying, at most 30 seconds apart, so the run goes on once
+there is room. A signal ends a wait at once, and a workspace that opens as the
+process stops is closed again before anything runs in it. The
+local backend is the only one with a Codex shell, and
 it states that its workspaces are durable. A backend that states anything else,
 or a value atomic does not recognize, is treated as ephemeral, and a workflow
 with a `worktree: true` step is refused on it before anything runs.
@@ -137,7 +145,9 @@ directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
 `KUBECONFIG`, put them), and the file or directory of yours that a link
 among them points at, up to four directory levels inside a denied directory;
-the kernel keyrings; the network; and sockets. Cargo's own configuration is
+the kernel keyrings; the network, unless an exec atom declares the hosts it
+reaches, and then all but those, which it reaches through atomic's proxy; and
+sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A link to something outside your own
 files, such as a history file linked to `/dev/null`, is left alone, and a
