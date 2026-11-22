@@ -1636,9 +1636,14 @@ fn redact_string(string: &mut String, nested: usize) {
     {
         // JSON that text redaction broke deeper in, in a string it holds:
         // hidden whole for the same reason.
-        if let Some(written) = &written
-            && broke_json_within(written, &inner, nested)
-        {
+        // One that read as JSON as written only without building a value
+        // cannot be compared place by place, and is hidden whole too.
+        let unreadable = opened && written.is_none();
+        let broke = match &written {
+            Some(written) => broke_json_within(written, &inner, nested),
+            None => false,
+        };
+        if unreadable || broke {
             *string = REDACTED.to_owned();
             return;
         }
@@ -1722,6 +1727,12 @@ fn reads_pairs_as_written() -> bool {
 #[cfg(not(test))]
 const fn reads_pairs_as_written() -> bool {
     true
+}
+
+/// Whether `text` reads as JSON, built into no value (`IgnoredAny`): a
+/// lone surrogate escape or nesting past serde_json's depth limit read too.
+fn reads_as_json(text: &str) -> bool {
+    serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
 /// Whether text redaction, which made `texted` of the JSON `written`, broke
@@ -1919,6 +1930,13 @@ fn open_held_json(string: &mut String, nested: usize) {
     if let Some(as_written) = &written
         && broke_json_within(as_written, &inner, nested)
     {
+        *string = REDACTED.to_owned();
+        return;
+    }
+    // Read as JSON as written only without building a value, a lone
+    // surrogate say: it cannot be compared place by place, so it is hidden
+    // whole.
+    if texted != *string && written.is_none() && reads_as_json(string) {
         *string = REDACTED.to_owned();
         return;
     }

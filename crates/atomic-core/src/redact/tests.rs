@@ -3076,3 +3076,41 @@ fn a_pair_whose_value_redacts_to_its_secret_settles_in_one_pass() {
         assert_eq!(twice, once, "case {case}: a second pass changed it");
     }
 }
+
+/// JSON that reads as JSON as written only without building a value, a
+/// lone surrogate escape inside text that redaction hides, where the
+/// redacted JSON builds one: it cannot be compared place by place, so it
+/// is hidden whole, under an ordinary name and under a hint.
+#[test]
+fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
+    let pair = r#""key":"DB_PASSWORD","value":"hunter2hunter2""#;
+    let held = format!(r#"{{"p":"password=\ud800qq","a":"{SAMPLE}",{pair}}}"#);
+    for parent in ["args", "key"] {
+        let mut out = json!({ parent: held.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2hunter2"),
+            "under {parent}: the pair's value showed"
+        );
+    }
+    // The same lead before JSON whose header deeper in text redaction
+    // breaks.
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let wrapped = format!("{{\"body\": {}}}", Value::String(inner));
+    let doc = format!(
+        r#"{{"p":"password=\ud800qq", "body": {}}}"#,
+        Value::String(wrapped)
+    );
+    for parent in ["body", "key"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "under {parent}: the header's value showed"
+        );
+    }
+}
