@@ -1,0 +1,1 @@
+toolset-no-redirect|crates/atomic-core/src/http_tools.rs|            .redirect(reqwest::redirect::Policy::none())|            .redirect(reqwest::redirect::Policy::limited(10))|-p atomic-agentic-core --test toolset_client a_toolset_call_keeps_its_credential_off_proxies_and_redirects

@@ -337,7 +337,10 @@ async fn try_sandboxed(
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
-            writable_roots: vec![state.to_owned()],
+            // By its real path: a writable directory given through a link,
+            // as the system's temporary directory is on some machines, with
+            // a denied place inside it, would be refused.
+            writable_roots: vec![std::fs::canonicalize(state).unwrap()],
             ..TurnSpec::default()
         },
     )
@@ -766,14 +769,31 @@ fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
 
         // A park, and the allowance that parked it, as a run leaves them;
         // and the operator's credential, enrolled, in the file store.
-        let rt = Durare::sqlite(&private.join("atomic.db")).await.unwrap();
-        rt.control_transaction(|mut tx| {
+        // The project's key, as atomic opens its store: the directory's name,
+        // with no manifest, and the state id.
+        let of = format!("project/{id}");
+        let rt = Durare::open(
+            &atomic_durable::Database::Sqlite(private.join("atomic.db")),
+            None,
+            atomic_app::pipeline::LAYOUT_VERSION,
+            &of,
+        )
+        .await
+        .unwrap();
+        rt.control_transaction(move |mut tx| {
+            let of = of.clone();
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
                      VALUES ('parked-run:3', 'parked-run', 'draft.park', \
                      'the allowance run:parked-run has no room', 1)",
                     &[],
+                )
+                .await?;
+                // The project's, as its run records it.
+                tx.execute(
+                    "INSERT INTO atomic_park_projects (park_id, project) VALUES ('parked-run:3', ?)",
+                    &[atomic_durable::Param::Text(of)],
                 )
                 .await?;
                 tx.execute(

@@ -72,9 +72,14 @@ fn whole(value: f64, flag: &str) -> anyhow::Result<i64> {
 
 pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<()> {
     let database = crate::engine::database(state)?;
-    let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
-        .await
-        .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
+    let rt = Durare::open(
+        &database,
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &crate::engine::store_project(state)?,
+    )
+    .await
+    .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
     match command {
         ParksCommand::List => {
             for park in release::waiting(&rt).await? {

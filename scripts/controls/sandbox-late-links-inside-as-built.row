@@ -1,0 +1,1 @@
+sandbox-late-links-inside-as-built|crates/atomic-core/src/codex.rs|    let inside = as_built(&places);|    let inside: Vec<PathBuf> = places.iter().map(std::fs::canonicalize).filter_map(Result::ok).collect(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_place_linked_to_a_never_denied_directory_covers_nothing

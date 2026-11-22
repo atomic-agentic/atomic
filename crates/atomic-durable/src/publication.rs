@@ -262,6 +262,10 @@ pub struct Park {
     /// The allowance that had no room, when the refusal named one.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The project the run parked for, as its runtime was opened with; `None`
+    /// for one opened for no project.
+    #[serde(default)]
+    pub project: Option<String>,
     /// When, in milliseconds since the Unix epoch.
     pub parked_at: i64,
 }
@@ -413,6 +417,7 @@ async fn park<C: WorkflowContext>(
         step: step.clone(),
         reason,
         scope,
+        project: ctx.project().map(str::to_owned),
         parked_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
@@ -438,6 +443,14 @@ async fn park<C: WorkflowContext>(
                     "INSERT INTO atomic_park_scopes (park_id, scope) VALUES (?, ?) \
                      ON CONFLICT (park_id) DO NOTHING",
                     &[Param::Text(row.id.clone()), Param::Text(scope.clone())],
+                )
+                .await?;
+            }
+            if let Some(project) = &row.project {
+                tx.execute(
+                    "INSERT INTO atomic_park_projects (park_id, project) VALUES (?, ?) \
+                     ON CONFLICT (park_id) DO NOTHING",
+                    &[Param::Text(row.id.clone()), Param::Text(project.clone())],
                 )
                 .await?;
             }
@@ -471,11 +484,24 @@ pub(crate) async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()
     .await
 }
 
-/// Every park with the allowance that refused it, if it named one: what
-/// [`park_from`] reads, as `p` for further conditions.
+/// Every park with the allowance that refused it, if it named one, and the
+/// project it is for: what [`park_from`] reads, as `p` for further
+/// conditions.
 pub(crate) const PARKS: &str = "SELECT p.park_id AS park_id, p.run AS run, p.step AS step, \
-     p.reason AS reason, s.scope AS scope, p.parked_at AS parked_at FROM atomic_parks p \
-     LEFT JOIN atomic_park_scopes s ON s.park_id = p.park_id";
+     p.reason AS reason, s.scope AS scope, pp.project AS project, p.parked_at AS parked_at \
+     FROM atomic_parks p LEFT JOIN atomic_park_scopes s ON s.park_id = p.park_id \
+     LEFT JOIN atomic_park_projects pp ON pp.park_id = p.park_id";
+
+/// The condition on a [`PARKS`] row that it is for the project its one
+/// parameter, [`project_param`], names: on a store several projects share,
+/// no project lists or acts on another's parks.
+pub(crate) const FOR_PROJECT: &str = "COALESCE(pp.project, '') = ?";
+
+/// The parameter [`FOR_PROJECT`] takes for runtime `project`: a park for no
+/// project is seen only by a runtime for none.
+pub(crate) fn project_param(project: Option<&str>) -> Param {
+    Param::Text(project.unwrap_or_default().to_owned())
+}
 
 /// A park from a row of [`PARKS`].
 pub(crate) fn park_from(r: &crate::runtime::Row) -> Result<Park> {
@@ -485,20 +511,23 @@ pub(crate) fn park_from(r: &crate::runtime::Row) -> Result<Park> {
         step: r.text("step")?,
         reason: r.text("reason")?,
         scope: r.text_opt("scope")?,
+        project: r.text_opt("project")?,
         parked_at: r.int("parked_at")?,
     })
 }
 
-/// The parks recorded for run `run`, oldest first.
+/// The parks recorded for run `run` of `rt`'s project, oldest first.
 pub async fn parks<R: DurableRuntime>(rt: &R, run: &str) -> Result<Vec<Park>> {
-    let run = run.to_owned();
+    let (run, project) = (run.to_owned(), project_param(rt.project()));
     rt.control_transaction(move |mut tx| {
-        let run = run.clone();
+        let (run, project) = (run.clone(), project.clone());
         Box::pin(async move {
             let rows = tx
                 .query_all(
-                    &format!("{PARKS} WHERE p.run = ? ORDER BY p.parked_at, p.park_id"),
-                    &[Param::Text(run)],
+                    &format!(
+                        "{PARKS} WHERE p.run = ? AND {FOR_PROJECT} ORDER BY p.parked_at, p.park_id"
+                    ),
+                    &[Param::Text(run), project],
                 )
                 .await?;
             rows.iter().map(park_from).collect()

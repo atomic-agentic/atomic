@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::publication::{Proposal, Published, run_atom_at};
-use crate::runtime::{DurableError, Durare, RunStatus};
+use crate::runtime::{DEFAULT_VERSION, Database, DurableError, Durare, DurareContext, RunStatus};
 use crate::usage::Caps;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -651,6 +651,7 @@ fn a_repeated_release_says_whether_its_run_was_woken_again() {
         reason: "no room".into(),
         parked_at: 1,
         scope: None,
+        project: None,
     };
     let woken = ReleaseError::AlreadyReleased {
         park: Box::new(park.clone()),
@@ -673,4 +674,246 @@ fn a_repeated_release_says_whether_its_run_was_woken_again() {
         "{said}"
     );
     assert!(said.contains("atomic runs resume run-1"), "{said}");
+}
+
+/// Two projects sharing one store, each on a runtime of its own, and a
+/// runtime for no project: each lists, reads and releases only its own
+/// project's parks, and a release of another project's park is refused as a
+/// park it has not got, releasing nothing.
+async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, None, DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    assert!(
+        Durare::open(&database, None, DEFAULT_VERSION, " ")
+            .await
+            .is_err(),
+        "a store opened for no project"
+    );
+    let mut mine = open("project-a").await;
+    let theirs = open("project-b").await;
+    // A run of project A parks, as runs park.
+    mine.register("parks", move |ctx: DurareContext, (): ()| async move {
+        run_atom_at(
+            &ctx,
+            "plan",
+            move |info| async move {
+                Err::<Proposal, _>(DurableError::Parked {
+                    reason: "no room".into(),
+                    scope: Some(format!("run:{}", info.workflow_id)),
+                })
+            },
+            Vec::new(),
+        )
+        .await
+    });
+    mine.launch().await.expect("launch");
+    let run = unique("projects");
+    allowance(&mine, &format!("run:{run}"), 100).await;
+    mine.start("parks", &run, ()).await.expect("start");
+    // The park as recorded, whoever's it is, and the project recorded with
+    // it.
+    let recorded = |run: String| {
+        let rt = &mine;
+        async move {
+            rt.control_transaction(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move {
+                    match tx
+                        .query_opt(
+                            "SELECT p.park_id AS park_id, pp.project AS project \
+                             FROM atomic_parks p LEFT JOIN atomic_park_projects pp \
+                             ON pp.park_id = p.park_id WHERE p.run = ?",
+                            &[Param::Text(run)],
+                        )
+                        .await?
+                    {
+                        Some(r) => Ok(Some((r.text("park_id")?, r.text_opt("project")?))),
+                        None => Ok(None),
+                    }
+                })
+            })
+            .await
+            .expect("the park")
+        }
+    };
+    let started = Instant::now();
+    let (id, project) = loop {
+        if let Some(found) = recorded(run.clone()).await {
+            break found;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the run never parked"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(project.as_deref(), Some("project-a"), "the park's project");
+    let park = waiting(&mine)
+        .await
+        .expect("waiting")
+        .into_iter()
+        .find(|p| p.id == id)
+        .expect("project A lists its park");
+    // A park recorded for no project, as one recorded before parks had one.
+    let none = match &database {
+        Database::Sqlite(path) => Durare::sqlite(path).await.expect("engine"),
+        Database::Postgres { url, schema } => Durare::postgres(url, schema).await.expect("engine"),
+    };
+    let unowned = bare_park(&none, &unique("unowned"), 100).await;
+
+    let ids = |parks: Vec<Park>| parks.into_iter().map(|p| p.id).collect::<Vec<_>>();
+    assert!(
+        ids(waiting(&mine).await.expect("waiting")).contains(&park.id)
+            && !ids(waiting(&mine).await.expect("waiting")).contains(&unowned)
+    );
+    assert!(ids(waiting(&theirs).await.expect("waiting")).is_empty());
+    assert_eq!(
+        ids(waiting(&none).await.expect("waiting")),
+        vec![unowned.clone()]
+    );
+    assert!(
+        super::park(&theirs, &park.id)
+            .await
+            .expect("park")
+            .is_none()
+    );
+    assert!(
+        crate::publication::parks(&theirs, &run)
+            .await
+            .expect("parks")
+            .is_empty()
+    );
+
+    // Project B's operator cannot release it, and nothing is recorded.
+    let operator = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&theirs, &operator)
+        .await
+        .expect("enroll");
+    let refused = release_park(&theirs, &operator, command(&park.id, "b-release", None))
+        .await
+        .expect_err("another project's park");
+    assert!(
+        matches!(&refused, ReleaseError::NoSuchPark(id) if *id == park.id),
+        "{refused}"
+    );
+    assert!(!is_released(&mine, &park.id).await.expect("released?"));
+    assert!(
+        release_park(&mine, &operator, command(&unowned, "a-unowned", None))
+            .await
+            .is_err_and(|e| matches!(e, ReleaseError::NoSuchPark(_))),
+        "a park for no project is no project's"
+    );
+    // Project A's can.
+    release_park(&mine, &operator, command(&park.id, "a-release", None))
+        .await
+        .expect("released");
+    assert!(is_released(&mine, &park.id).await.expect("released?"));
+    assert!(
+        !is_released(&theirs, &park.id).await.expect("released?"),
+        "project B saw another project's release"
+    );
+    // A replay of A's command by B is no replay of B's: it releases nothing
+    // and says the park is not there.
+    let replayed = release_park(&theirs, &operator, command(&park.id, "a-release", None))
+        .await
+        .expect_err("another project's command");
+    assert!(
+        matches!(&replayed, ReleaseError::NoSuchPark(id) if *id == park.id),
+        "{replayed}"
+    );
+    // The released park's run still runs: only A redelivers its wake-up.
+    assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
+    assert_eq!(redeliver(&mine).await.expect("redeliver"), 1);
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// A SQLite store is one project's own: a park recorded there before parks
+/// had a project, or under an older name of the project's (`<old
+/// name>/<state id>`, as before its manifest was renamed), becomes the
+/// project's when the store is opened for it. One recorded for another key
+/// is left as it is. A key that is empty or holds a control character
+/// opens nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_store_adopts_its_parks_without_a_project() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_adopt")));
+    let database = Database::Sqlite(path.clone());
+    for bad in ["", " ", "notes/a\0b", "notes/a\nb"] {
+        assert!(
+            Durare::open(&database, None, DEFAULT_VERSION, bad)
+                .await
+                .is_err(),
+            "{bad:?} opened a store"
+        );
+    }
+    let before = Durare::sqlite(&path).await.expect("engine");
+    let unowned = bare_park(&before, &unique("before"), 100).await;
+    let keyed = |run: String, key: &'static str| {
+        let rt = &before;
+        async move {
+            let park = bare_park(rt, &run, 100).await;
+            let id = park.clone();
+            rt.control_transaction(move |mut tx| {
+                let id = id.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO atomic_park_projects (park_id, project) VALUES (?, ?)",
+                        &[Param::Text(id), Param::Text(key.into())],
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            })
+            .await
+            .expect("keyed");
+            park
+        }
+    };
+    let renamed = keyed(unique("renamed"), "old-name/the-project-0123").await;
+    let foreign = keyed(unique("foreign"), "notes/another-project-4567").await;
+    let mine = Durare::open(&database, None, DEFAULT_VERSION, "notes/the-project-0123")
+        .await
+        .expect("engine");
+    let mut ids: Vec<String> = waiting(&mine)
+        .await
+        .expect("waiting")
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    ids.sort();
+    let mut adopted = vec![unowned, renamed];
+    adopted.sort();
+    assert_eq!(ids, adopted, "the project's own parks, and no other");
+    assert!(
+        !ids.contains(&foreign),
+        "another project's park was adopted"
+    );
+    assert!(
+        waiting(&before).await.expect("waiting").is_empty(),
+        "still no project's"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_releases_only_its_own_parks_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_projects")));
+    a_project_sees_and_releases_only_its_own_parks(Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_releases_only_its_own_parks_on_postgres() {
+    let schema = crate::testing::schema("release_projects").await;
+    a_project_sees_and_releases_only_its_own_parks(Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
 }
