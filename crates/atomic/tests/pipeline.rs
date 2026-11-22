@@ -25,8 +25,8 @@
 #![recursion_limit = "512"]
 
 use atomic_app::pipeline::{
-    PIPELINE, Pinned, Pipeline, PipelineRun, REPLAY, SNAPSHOT_MEDIA_TYPE, Services, Step,
-    pin_budgets, prepare, register_pipeline, replay_of,
+    PIPELINE, Pinned, Pipeline, PipelineRun, ProjectWorktrees, REPLAY, SNAPSHOT_MEDIA_TYPE,
+    Services, Step, pin_budgets, prepare, register_pipeline, replay_of,
 };
 use atomic_core::artifact::{ArtifactRef, ArtifactStore, LocalStore};
 use atomic_core::budget::{BudgetSettings, CallBound, Price};
@@ -35,7 +35,6 @@ use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
-use atomic_core::worktree::Worktrees;
 use atomic_core::{AtomConfig, atom, workflow};
 use atomic_durable::gate::{self, DecisionCommand, Deployment, GateFilter, Principal, Verdict};
 use atomic_durable::usage::Caps;
@@ -506,20 +505,31 @@ async fn engine_built_with(
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    // A project in a git repository gets worktrees for its worktree steps.
+    // What the project offers its worktree steps, which is what an embedder
+    // of the pipeline gives: `atomic` itself always says it makes none, and
+    // asks git only inside the fixture a run is bound to. A project in no
+    // repository is said as that and never stops a run that needs no worktree.
+    // git searches upward from the directory it is asked about, so it is asked
+    // only of a project holding a repository of its own: asked beside one, a
+    // scratch directory sitting inside some unrelated repository would have
+    // worktrees and refs made there.
     let project = dir.join("project");
-    let (runtimes, worktrees) = if project.join(".git").exists() {
-        let repo = Git::find()
-            .expect("git")
-            .discover(&project)
-            .expect("repository");
-        (
-            runtimes_on(dir, &project, base_url, model),
-            Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
-        )
+    let owns_a_repository = project.join(".git").exists();
+    let worktrees = if owns_a_repository {
+        ProjectWorktrees::at(&project, dir.join("state/worktrees"))
     } else {
-        (runtimes_on(dir, &dir.join("cwd"), base_url, model), None)
+        ProjectWorktrees::FixtureOnly
     };
+    let runtimes = runtimes_on(
+        dir,
+        &if owns_a_repository {
+            project
+        } else {
+            dir.join("cwd")
+        },
+        base_url,
+        model,
+    );
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();

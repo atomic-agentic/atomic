@@ -87,9 +87,20 @@ container: each run labels its own with a token of its own
 (`org.atomic-agentic.dev-run`), and nothing else on the host is touched. The
 test Postgres stays up, since every run shares it. A run started with
 `ATOMIC_DEV_DETACHED=1`, as for `nohup scripts/dev.sh … &`, outlives the
-process that started it, as does one the system's first process starts.
+process that started it, as does one the system's first process starts. The
+watcher knows dev.sh and its parent by when each started as well as by its
+process id (on Linux the kernel's start time, which stepping the clock does
+not move), and checks dev.sh is still the process it started just before it
+signals it, so a process that took its number is not signalled, short of
+one ending and its number being taken in the moment between the check and
+the signal. A watcher that cannot start stops the run (exit 1) with a
+message saying so.
 `scripts/dev-sh-test.sh` runs on the host, with docker or podman, and checks
-each of these; it exits 75 at once while `ATOMIC_DEV_WAIT_LOCK` exists.
+each of these, with another run's container kept through every stop; it exits
+75 at once while `ATOMIC_DEV_WAIT_LOCK` exists. Its runs reach the engine
+through a shim that labels each container they make with the test's own
+token and lists and removes only those, and refuses every other engine
+command, so the test touches no container it did not start.
 
 ## The test database
 
@@ -316,6 +327,10 @@ scripts/dev.sh cargo build --release --locked -p atomic-agentic
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release/atomic
 ```
 
+It works in a new directory under `target/` and removes it at the end;
+`--keep <dir>` works in `<dir>` and keeps it, but not under `/tmp` or
+`$TMPDIR`, where atomic refuses an atom's scratch.
+
 ## The crash suite
 
 atomic's crash tests kill the process at named failpoints. A failpoint is
@@ -458,12 +473,20 @@ A release starts from a tag `v<version>` whose version equals the
    `THIRD-PARTY-NOTICES.md` into a deterministic `.tar.gz`;
 3. writes each binary's CycloneDX SBOM, which records the binary's SHA-256 and
    lists every fork at its pinned revision;
-4. attaches the archives, the SBOMs and a `SHA256SUMS` file to a draft GitHub
-   release, which a maintainer reviews and publishes.
+4. signs each archive and each SBOM with Sigstore, keyless, under the
+   workflow's own GitHub identity, writing a `<file>.sigstore.json` bundle
+   beside it, then verifies every bundle with `cosign verify-blob` against
+   that identity, so a signing step that fails or signs as anyone else fails
+   the run;
+5. attaches the archives, the SBOMs, their bundles and a `SHA256SUMS` file to
+   a draft GitHub release, which a maintainer reviews and publishes.
 
-A manual run of the workflow on any branch does
-steps 1 to 3 and keeps the results as workflow artifacts. To package a build
-locally:
+Only the signing job can request the OIDC token that signs; the build jobs
+cannot. A manual run of the workflow on any branch does steps 1 to 4 and keeps
+the results as workflow artifacts; its signatures name that branch, not a tag,
+so they never pass the check a user runs on a release download
+([verifying a download](getting-started/installation.md#verifying-a-download)).
+To package a build locally:
 
 ```bash
 scripts/dev.sh cargo build --release --locked -p atomic-agentic --target x86_64-unknown-linux-gnu

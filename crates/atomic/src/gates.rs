@@ -265,12 +265,15 @@ pub(crate) async fn decide_as_operator(
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
-        atomic_core::log_line!(
-            "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
-             atomic runs resume {} delivers it",
-            found.run,
-            found.run
-        );
+        atomic_core::redact::Line::new()
+            .plain("warning: the decision is recorded, but waking run ")
+            .shown(&found.run)
+            .plain(" failed: ")
+            .redacted(&e.to_string())
+            .plain("; atomic serve or atomic runs resume ")
+            .shown(&found.run)
+            .plain(" delivers it")
+            .log();
     }
     // A park released while its run was down is delivered here too.
     if let Err(e) = atomic_durable::release::redeliver(rt).await {

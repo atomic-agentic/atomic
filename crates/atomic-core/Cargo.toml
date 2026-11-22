@@ -37,6 +37,8 @@ ignore = { workspace = true }
 jsonschema = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

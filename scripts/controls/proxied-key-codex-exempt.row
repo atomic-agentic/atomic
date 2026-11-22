@@ -1,0 +1,1 @@
+proxied-key-codex-exempt|crates/atomic-core/src/lite.rs|            Some((from, _)) if !exempt => named(from),|            Some((from, _)) => named(from),|-p atomic-agentic-core --lib --features fake-model a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused

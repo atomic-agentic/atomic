@@ -1,0 +1,1 @@
+scalar-bool-words|tools/yaml_scalar.py|    if text.lower() in YAML_11_BOOLS:|    if False and text.lower() in YAML_11_BOOLS:|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does
