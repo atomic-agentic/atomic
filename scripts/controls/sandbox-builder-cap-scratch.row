@@ -1,0 +1,1 @@
+sandbox-builder-cap-scratch|crates/atomic-core/src/codex.rs|    as_commands_see.extend(also.iter().cloned());|    let _ = also; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model the_builder_counts_the_scratch_it_will_deny_as_each_command_does
