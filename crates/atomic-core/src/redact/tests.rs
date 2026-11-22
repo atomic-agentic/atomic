@@ -3046,28 +3046,31 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
     );
 }
 
-/// An excerpt of a JSON document that gives a key twice is written from
-/// the parse, which kept the last value, so the earlier one is left out
-/// rather than shown as written; a second excerpt changes nothing.
+/// An excerpt of a JSON document that gives a key twice is hidden whole:
+/// the parse kept only the last value, so what the rest says of it cannot
+/// be told, as a pair whose `key` or `name` was given twice, the secret's
+/// name first and a harmless one after, at the top or in a list; a second
+/// excerpt changes nothing.
 #[test]
-fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
+fn an_excerpt_of_json_that_gives_a_key_twice_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
-    for (case, (doc, expected)) in [
-        (
-            format!("{{\"h\": {pair}, \"h\": 1}}"),
-            "{\"h\":1}".to_owned(),
+    for (case, doc) in [
+        format!("{{\"h\": {pair}, \"h\": 1}}"),
+        "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
+        format!("{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\", \"key\": \"note\"}}"),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\", \"name\": \"x\"}}"),
+        format!(
+            "{{\"header\": \"Authorization\", \"value\": \"Bearer {key}\", \"header\": \"x\"}}"
         ),
-        (
-            "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
-            "{\"h\":\"ok\",\"i\":[2]}".to_owned(),
-        ),
+        format!("{{\"h\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\", \"name\": \"x\"}}]}}"),
+        format!("[{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\", \"key\": \"note\"}}]"),
     ]
     .into_iter()
     .enumerate()
     {
         let shown = excerpt(&doc, 4096);
-        assert!(shown == expected, "case {case}: not written from the parse");
+        assert!(shown == REDACTED, "case {case}: not hidden whole");
         assert_eq!(
             excerpt(&shown, 4096),
             shown,

@@ -1636,11 +1636,13 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            // A document that gives a key twice is written from the parse,
-            // which kept only the last value: the others, which no rule
-            // read, are left out (see [`gives_a_key_twice`]).
+            // A document that gives a key twice is hidden whole, as JSON
+            // in a string is (see [`gives_a_key_twice`]): the parse kept
+            // only the last value, so what the rest says of it, as a pair
+            // whose `key` was given twice, `DB_PASSWORD` and then `note`,
+            // cannot be told from what was read.
             if gives_a_key_twice(trimmed) {
-                Some(doc.to_string())
+                Some(REDACTED.to_owned())
             } else {
                 (doc != before).then(|| doc.to_string())
             }
