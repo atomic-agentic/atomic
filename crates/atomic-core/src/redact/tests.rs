@@ -3042,7 +3042,7 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
     value(&mut once);
     assert_eq!(
         once,
-        json!({ "body": format!("{{\"h\":{{\"name\":\"X-Api-Key\",\"value\":\"{REDACTED}\"}},\"i\":1}}") })
+        json!({ "body": format!("{{\"h\": {{\"name\": \"X-Api-Key\", \"value\": \"{REDACTED}\"}}, \"i\": 1}}") })
     );
 }
 
@@ -3085,4 +3085,101 @@ fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
         !excerpt(&renamed, 4096).contains(&key[4..]),
         "the renamed key's value showed"
     );
+}
+
+/// A name and value pair in JSON that does not parse as it stands is read
+/// as text: cut short, after a byte-order mark, a zero-width space, an XSSI
+/// guard, `data: ` or a word, or in a JSON string literal, a header's value
+/// or a secret's is hidden, name or value first, held zero to six strings
+/// deep under an ordinary name and under hints, and a second pass changes
+/// nothing; a pair that holds no secret is kept.
+#[test]
+fn a_name_and_value_pair_that_does_not_parse_is_read_as_text() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let first = format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key\"}}");
+    let secret = format!("{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\"}}");
+    let mut shapes = Vec::new();
+    for doc in [&pair, &first, &secret] {
+        // Cut after the closing quote, and, name first, inside the value.
+        if doc != &first {
+            shapes.push(doc[..doc.len() - 2].to_owned());
+        }
+        shapes.extend([
+            doc[..doc.len() - 1].to_owned(),
+            format!("\u{feff}{doc}"),
+            format!("\u{200b}{doc}"),
+            format!(")]}}'\n{doc}"),
+            format!("data: {doc}"),
+            format!("body {doc}"),
+            Value::String(doc.clone()).to_string(),
+        ]);
+    }
+    for (shape, deep) in shapes.iter().enumerate() {
+        let mut held = deep.clone();
+        for depth in 0..=6 {
+            for parent in ["body", "msg", "note", "key", "token"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "shape {shape}, depth {depth}, under {parent}: the pair's value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert!(
+                    again == out,
+                    "shape {shape}, depth {depth}, under {parent}: a second pass changed it"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+        assert!(
+            !text(deep).contains(&key[4..]),
+            "shape {shape}: text showed it"
+        );
+    }
+    // Cut by the bound on what is redacted in one piece.
+    let long = format!("{pair}{}", " ".repeat(MAX_TEXT));
+    let mut out = json!({ "note": long[..pair.len() - 1].to_owned() + &" x".repeat(MAX_TEXT / 2) });
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&key[4..]),
+        "the cut long string showed it"
+    );
+    // Pairs that hold no secret, and the text around a hidden one, are kept.
+    assert_kept(&[
+        "{\"name\": \"Content-Type\", \"value\": \"application/json\"",
+        "data: {\"name\": \"x\", \"value\": \"y\"}",
+        "{\"key\": \"cache\", \"value\": \"v1-deps\"",
+    ]);
+    assert_eq!(
+        text(&format!("data: {pair} tail")),
+        format!("data: {{\"name\": \"X-Api-Key\", \"value\": \"{REDACTED}\"}} tail")
+    );
+    assert_eq!(
+        text(&format!("x {first}")),
+        format!("x {{\"value\": \"{REDACTED}\", \"name\": \"X-Api-Key\"}}")
+    );
+}
+
+/// Reading pairs as text takes linear steps, however many values open and
+/// never close at their depth: at sixteen times the size, under 32 times
+/// the steps.
+#[test]
+fn reading_pairs_as_text_takes_linear_steps() {
+    for (case, unit) in [
+        "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
+        "\"value\": \\\\\\\"x \"",
+        "{\"name\": \"a\", \"value\": \"b\"} ",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (small, large) = (steps_of(&unit.repeat(500)), steps_of(&unit.repeat(8_000)));
+        assert!(
+            large < 32 * small,
+            "case {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
 }

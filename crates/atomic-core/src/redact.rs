@@ -313,6 +313,22 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
+/// A name and value pair written as JSON text, its quotes escaped to any
+/// depth, name first: `"name": "X-Api-Key", "value": "`, or with `key` or
+/// `header` for `name`, up to the value's opening quote, whose backslashes
+/// are the second group.
+static PAIR_NAME_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r#"\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*"\s*,\s*\\*"value\\*"\s*:\s*(\\*)""#,
+    )
+});
+/// The same pair, value first: `"value": "`, up to its opening quote.
+static PAIR_VALUE_OPEN: LazyLock<Regex> = LazyLock::new(|| regex(r#"\\*"value\\*"\s*:\s*(\\*)""#));
+/// What follows a value given first, from its closing quote: `", "name":
+/// "X-Api-Key"`.
+static PAIR_NAME_AFTER: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r#"^\\*"\s*,\s*\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*""#)
+});
 /// A URL's password, to the last `@` before its host.
 static URL_PASSWORD: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/'"]+)(@)"#));
@@ -1375,6 +1391,71 @@ fn read_strength(name: &str, written: bool) -> Strength {
     surest
 }
 
+/// Hide the secret of each name and value pair written as JSON text,
+/// `{"name": "X-Api-Key", "value": "…"}` with its quotes escaped to any
+/// depth, name or value first, judged as the JSON rule judges such a pair
+/// (see [`header_pair`]). The JSON rule reads only JSON that parses; this
+/// reads one that is cut, follows other text or sits in a string literal.
+/// A value given after its name whose closing quote, with as many
+/// backslashes as its opening one, is not found before the line ends is
+/// cut, and judged and hidden to the end of the line. Linear: a value is
+/// scanned once, and a scan that finds no closing quote at its depth on a
+/// line leaves no later value at that depth on the line to scan, since that
+/// value's own opening quote would have closed it.
+fn pairs(input: &str) -> Option<String> {
+    let line_end = |from: usize| input[from..].find('\n').map_or(input.len(), |i| from + i);
+    let holds = |name: &str, value: &str| {
+        let value = value.replace('\\', "");
+        pair_holds_secret(name, &Value::String(value), true)
+    };
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while let Some(c) = PAIR_NAME_FIRST.captures_at(input, at) {
+        let from = c.get(0).map_or(at, |m| m.end());
+        let level = c.get(2).map_or(0, |m| m.len());
+        let to = quoted_len(&input[from..], b'"', level)
+            .map_or_else(|| line_end(from), |len| from + len);
+        let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
+        if holds(&c[1], value) {
+            hidden.push((from, to));
+        }
+        at = to.max(from);
+    }
+    at = 0;
+    while let Some(c) = PAIR_VALUE_OPEN.captures_at(input, at) {
+        let from = c.get(0).map_or(at, |m| m.end());
+        let level = c.get(1).map_or(0, |m| m.len());
+        at = from;
+        let Some(len) = quoted_len(&input[from..], b'"', level) else {
+            continue;
+        };
+        if let Some(n) = PAIR_NAME_AFTER.captures(&input[from + len..])
+            && holds(&n[1], &input[from..from + len])
+        {
+            hidden.push((from, from + len));
+        }
+        at = from + len;
+    }
+    if hidden.is_empty() {
+        return None;
+    }
+    hidden.sort_unstable();
+    let mut out = String::new();
+    let mut copied = 0;
+    for (from, to) in hidden {
+        if to <= copied {
+            continue;
+        }
+        if from >= copied {
+            out.push_str(&input[copied..from]);
+            out.push_str(REDACTED);
+        }
+        copied = to;
+    }
+    out.push_str(&input[copied..]);
+    (out != input).then_some(out)
+}
+
 /// One reading of `input` by every text rule (see [`text`]).
 fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
@@ -1412,6 +1493,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
+    if let Some(replaced) = pairs(&output) {
+        output = Cow::Owned(replaced);
+    }
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }
