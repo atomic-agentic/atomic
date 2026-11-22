@@ -7,7 +7,7 @@
 //! atom's code inside the project, answers every import from a lockfile the project
 //! holds, and refuses what it cannot see or cannot read. `yaml_scalar.py` is
 //! `crates/atomic-schema/src/yaml.rs`'s scalar classifier ported to Python, which
-//! is what `tools/check_examples.py` reads every schema value and key through.
+//! is what `tools/check_examples.py` reads every YAML schema value and key through.
 //! Their guards are Python, and a control that cannot be switched off and seen to
 //! bite is not a control anyone has checked. So this runs their suites,
 //! `tools/deno_exec_test.py` and `tools/yaml_scalar_test.py`, in a language both
@@ -16,8 +16,10 @@
 //! the checker and show that a test catches it. CI runs the same scripts as steps
 //! of their own; this is what makes their cases visible to cargo.
 //!
-//! The suites are inert -- JSON, TypeScript-shaped text and plain scalars, under a
-//! temporary directory. They need no provider, no network and no test database.
+//! The suites are inert: JSON and TypeScript-shaped text, which `deno_exec_test.py`
+//! lays out in a temporary directory of its own, and plain scalars, which
+//! `yaml_scalar_test.py` never writes to disk at all. They need no provider, no
+//! network and no test database.
 //! python3 is what runs them, as it is in the development container and on a CI
 //! runner; where that is missing this fails, as every suite that cannot reach what
 //! it tests does, rather than passing for want of an interpreter. Neither suite

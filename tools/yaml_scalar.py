@@ -14,23 +14,26 @@ asked, and `core_scalar` answers one of three things about it:
   * REFUSED -- a spelling the loader will not take, with what the versions read
                differently and what to write instead.
 
-`tools/check_examples.py` reads every schema file through this, so an example whose
-sidecar spells a value the way atomic's loader refuses is refused here too, and one
-spelled `0o17` or `1e3` is read as the number the loader reads rather than the string
-PyYAML resolves. The rules are read in the order the loader reads them: the null and
-boolean words, then the words only YAML 1.1 reads as a boolean, then its integers,
-then its floats, then the numbers only YAML 1.1 reads, then what JSON cannot hold.
+`tools/check_examples.py` reads every schema sidecar's plain values and keys through
+this -- its `.schema.yaml` files; a `.schema.json` sidecar goes through `read_json`,
+which reads no YAML at all -- so an example whose sidecar spells a value the way
+atomic's loader refuses is refused here too, and one spelled `0o17` or `1e3` is read
+as the number the loader reads rather than the string PyYAML resolves. The rules are
+read in the order the loader reads them: the null and boolean words, then the words
+only YAML 1.1 reads as a boolean, then its integers, then its floats, then the
+numbers only YAML 1.1 reads, then what JSON cannot hold.
 
 `one_version_integer` and `canonical_integer_key` sit here beside the classifier
 because they read the same shapes: the first is what `core_scalar` refuses as YAML
 1.1's alone, and the second is what a plain key must be for the loader to take it as
-its own text.
+its own text. `schema_scalar` asks the classifier on behalf of the checker's
+constructor, and adds the one thing only the library knows: the tag it resolved.
 
 Only `str` and `re` are used, so this runs in the development image, where the YAML
 library that reads the catalog is not installed. Where that library resolves a text
-to something this module has no answer for -- an ISO date, which YAML 1.1 resolves
-as a timestamp and the core schema reads as a string -- the checker refuses the text
-rather than read it as this module's answer, because a checker that quietly re-types
+to a tag whose value this module has no answer for -- an ISO date, which YAML 1.1
+resolves as a timestamp and the core schema reads as a string -- the text is refused
+rather than read as this module's answer, because a checker that quietly re-types
 what the library resolved has decided nothing.
 
     python3 tools/yaml_scalar_test.py
@@ -93,6 +96,28 @@ INF_NAN = (
     ".NaN",
     ".NAN",
 )
+
+# The tags a YAML library's resolver gives a plain scalar, as `schema_scalar` asks
+# them below. `STR_TAG` is both the string tag and the resolver's default, so it is
+# what a plain scalar nothing resolved gets -- `0o17` and `1e3` -- and what every
+# quoted scalar gets. The other four are what the core schema reads as a null, a
+# boolean or a number, which is what `core_scalar` answers their text for.
+STR_TAG = "tag:yaml.org,2002:str"
+NULL_TAG = "tag:yaml.org,2002:null"
+BOOL_TAG = "tag:yaml.org,2002:bool"
+INT_TAG = "tag:yaml.org,2002:int"
+FLOAT_TAG = "tag:yaml.org,2002:float"
+SCALAR_TAGS = (NULL_TAG, BOOL_TAG, INT_TAG, FLOAT_TAG, STR_TAG)
+# The tags a resolver gives that no rule here has an answer for, because the core
+# schema reads their text as a string: the timestamp an ISO date gets, and the two
+# keys `<<` and `=`. The loader has no timestamp type at all and reads all three as
+# strings, so refusing them is stricter than the loader -- which is the point: a
+# checker that read a date as the string the core schema gives would be agreeing
+# with a library that had just made a date of it.
+TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
+MERGE_TAG = "tag:yaml.org,2002:merge"
+VALUE_TAG = "tag:yaml.org,2002:value"
+UNREAD_TAGS = (TIMESTAMP_TAG, MERGE_TAG, VALUE_TAG)
 
 # What a signed 64-bit integer holds, and a signed 128-bit one. A decimal past
 # 64 bits is still an integer to JSON and the loader keeps its digits, which
@@ -249,9 +274,10 @@ def core_int(text):
                 ),
             )
         # Any decimal is a number, however many digits, as JSON reads it. Python
-        # holds the digits exactly, which is what PyYAML has always done here; past
-        # signed and unsigned 64 bits the loader has no number that exact and reads
-        # a float, which is the one place its answer and this one differ by type.
+        # holds the digits exactly, which is what PyYAML has always done here, and
+        # the loader keeps them exactly too -- its JSON numbers are read with a
+        # precision that holds any decimal -- so its answer and this one differ
+        # nowhere by type, and only a base marker can make a refusal of digits.
         # Such a decimal is no key either way, because a key must be a number whose
         # digits are its own text -- see `canonical_integer_key`. And `every` said
         # the body is not empty and is all decimal digits, so this parse cannot
@@ -557,6 +583,38 @@ def core_scalar(text):
     if text in INF_NAN:
         return REFUSED, no_json(text)
     return TEXT, None
+
+
+def schema_scalar(style, tag, text):
+    """What the schema loader returns for a scalar written in `style` and read as
+    `tag`, or why it refuses it.
+
+    `style` is None for a plain scalar and the marker it was written with
+    otherwise -- `"`, `'`, `|` or `>` -- and a scalar written with any of those is
+    its own text to every YAML version, so it is answered before anything is
+    asked. `core_scalar` answers a plain scalar from its text alone, which is all
+    the loader has; the tag is what the library that read the file made of the
+    same text, and the two have to agree before the answer means anything. A plain
+    scalar read as a tag outside `SCALAR_TAGS` is refused with the tag named, so a
+    library that resolves some new shape cannot hand the checker a value the loader
+    never reads.
+
+    Returns `(TEXT, the text)`, `(VALUE, the value)` or `(REFUSED, the Refusal)`:
+    `core_scalar`'s three answers, with the text itself where `core_scalar` says
+    only that it is a string.
+    """
+    if style is not None:
+        return TEXT, text
+    if tag not in SCALAR_TAGS:
+        return REFUSED, Refusal(
+            f"unquoted {quoted(text)} resolves to {tag}, which is no scalar the schema loader "
+            f"reads",
+            f"quote it ({quoted(text)})",
+        )
+    kind, answer = core_scalar(text)
+    if kind == REFUSED:
+        return REFUSED, answer
+    return (VALUE, answer) if kind == VALUE else (TEXT, text)
 
 
 def one_version_integer(spelling):

@@ -25,6 +25,12 @@ together. What that file pins for values -- the leading zero, the sign on either
 side of a base marker, the numbers only YAML 1.1 reads, what JSON cannot hold, the
 base integer past 64 bits and the core schema's scalars -- is what is asserted here.
 
+`the_schema_loader_tags` asserts the other half of what the checker asks: given how
+a scalar was written and the tag the library resolved it to, what its constructor
+returns or refuses. That is the decision the checker makes for every value in every
+sidecar, and it is the one thing here that can be tested without the library,
+because the style, the tag and the text are all just strings.
+
 Nothing here needs the YAML library that reads the catalog, so this runs in the
 development image:
 
@@ -336,6 +342,119 @@ def what_json_cannot_hold():
         refused(spelling, *no_json(spelling))
 
 
+def loader_case(style, tag, text, want):
+    """One scalar as the checker's constructor sees it, and what it must give back.
+
+    `want` is `(VALUE, the value)`, `(TEXT, the text)` or `(REFUSED, the reason, the
+    fix)`. The style, the tag and the text are what the node carries, so the tag is
+    part of the case rather than something chosen behind the rule's back: a case
+    that says the text is `0200` and the tag is `int` is what PyYAML hands the
+    constructor for `a: 0200`, and a refusal that stopped refusing fails the case
+    instead of reporting one fewer check.
+    """
+    global cases
+    cases += 1
+    kind, answer = core.schema_scalar(style, tag, text)
+    if want[0] == REFUSED:
+        if kind != REFUSED:
+            failures.append(
+                f"{text!r} written {style} as {tag}: read as {kind} {answer!r}, "
+                f"must be refused ({want[1]!r})"
+            )
+            return
+        if answer.as_value() != f"{want[1]}; {want[2]}":
+            failures.append(
+                f"{text!r} written {style} as {tag}: refused as {answer.as_value()!r}, "
+                f"must be {want[1]!r}; {want[2]!r}"
+            )
+        return
+    if kind != want[0] or type(answer) is not type(want[1]) or answer != want[1]:
+        failures.append(
+            f"{text!r} written {style} as {tag}: read as {answer!r} "
+            f"({type(answer).__name__}), must be {want[1]!r} ({type(want[1]).__name__})"
+        )
+
+
+def the_schema_loader_tags():
+    """What the constructor answers for each tag a resolver gives a plain scalar.
+
+    `tools/check_examples.py` hands `schema_scalar` the style, the tag and the text
+    of every scalar in every sidecar, so this asks the same three things: the five
+    tags the core schema reads a null, a boolean, a number or a string by, the tags
+    no schema loader has a reading for, and a scalar written with a marker, which is
+    its own text whatever its text would otherwise have been read as.
+    """
+    for style, tag, text, want in (
+        # What each tag reads as, on the text that tag is resolved from.
+        (None, core.NULL_TAG, "null", (VALUE, None)),
+        (None, core.NULL_TAG, "~", (VALUE, None)),
+        (None, core.BOOL_TAG, "true", (VALUE, True)),
+        (None, core.BOOL_TAG, "False", (VALUE, False)),
+        (None, core.INT_TAG, "200", (VALUE, 200)),
+        (None, core.INT_TAG, "-3", (VALUE, -3)),
+        (None, core.FLOAT_TAG, "1.5", (VALUE, 1.5)),
+        (None, core.STR_TAG, "review", (TEXT, "review")),
+        # The default tag is the string tag, and it is what a plain scalar nothing
+        # resolved gets: the loader reads a number where YAML 1.1 read a string, so
+        # these must come back as the numbers, not the text.
+        (None, core.STR_TAG, "0o17", (VALUE, 15)),
+        (None, core.STR_TAG, "1e3", (VALUE, 1000.0)),
+        # A spelling the loader refuses is refused through its tag too, with the
+        # reason and the fix the loader gives. These are the four shapes the tags
+        # carry: an integer PyYAML resolved that no version agrees on, a float JSON
+        # cannot hold, and the boolean words only YAML 1.1 reads.
+        (
+            None,
+            core.INT_TAG,
+            "0200",
+            (
+                REFUSED,
+                *leading_zero(
+                    "0200", "128", 'write 200, or 0o200 for octal, or quote it ("0200")'
+                ),
+            ),
+        ),
+        (None, core.INT_TAG, "12:30", (REFUSED, *one_version("12:30", "750"))),
+        (None, core.FLOAT_TAG, ".inf", (REFUSED, *no_json(".inf"))),
+        (None, core.BOOL_TAG, "yes", (
+            REFUSED,
+            'unquoted "yes" is a boolean in YAML 1.1 and a string in YAML 1.2',
+            'write true or false for a boolean, or quote it ("yes") for the string',
+        )),
+        # The tags no schema loader has a reading for, each on the text it is
+        # resolved from, refused with the tag named so that an author sees what was
+        # refused. atomic's loader reads all three texts as strings; this is the
+        # stricter side of the mirror, and the only one that can name a date.
+        (None, core.TIMESTAMP_TAG, "2026-11-21", (
+            REFUSED,
+            'unquoted "2026-11-21" resolves to tag:yaml.org,2002:timestamp, which is no '
+            "scalar the schema loader reads",
+            'quote it ("2026-11-21")',
+        )),
+        (None, core.MERGE_TAG, "<<", (
+            REFUSED,
+            'unquoted "<<" resolves to tag:yaml.org,2002:merge, which is no scalar the '
+            "schema loader reads",
+            'quote it ("<<")',
+        )),
+        (None, core.VALUE_TAG, "=", (
+            REFUSED,
+            'unquoted "=" resolves to tag:yaml.org,2002:value, which is no scalar the '
+            "schema loader reads",
+            'quote it ("=")',
+        )),
+        # Quoted or blocked, a scalar is its own text to every version, whatever
+        # its text would have been read as: the refused spellings above and the
+        # re-read ones are the strings here, and no rule touches them.
+        ('"', core.STR_TAG, "200", (TEXT, "200")),
+        ('"', core.STR_TAG, "0200", (TEXT, "0200")),
+        ('"', core.STR_TAG, "1e3", (TEXT, "1e3")),
+        ("'", core.STR_TAG, "2026-11-21", (TEXT, "2026-11-21")),
+        ("|", core.STR_TAG, "0200\n", (TEXT, "0200\n")),
+    ):
+        loader_case(style, tag, text, want)
+
+
 def rule(what, got, want, why):
     """One answer from a rule this port holds for the checker's key path."""
     global cases
@@ -408,6 +527,7 @@ def main() -> int:
     signs_around_a_base_marker()
     numbers_only_yaml_11_reads()
     what_json_cannot_hold()
+    the_schema_loader_tags()
     the_key_rule()
     if failures:
         # Each failed case on a line of its own, starting with FAIL, which is how
@@ -419,7 +539,7 @@ def main() -> int:
         return 1
     print(
         f"PASS scalar mirror: {cases} plain scalars read, refused or left as text "
-        f"as atomic's loader reads them"
+        f"as atomic's loader reads them, by tag as the catalog checker reads them"
     )
     return 0
 

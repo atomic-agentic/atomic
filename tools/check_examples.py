@@ -37,9 +37,10 @@ class UniqueKeysLoader(yaml.SafeLoader):
 # name, all of them a port of a rule in crates/atomic-schema/src/yaml.rs. That
 # loader classifies a plain scalar by its own text, and `yaml_scalar` is the same
 # classifier: `core_scalar` answers what it reads a text as or why it refuses it,
-# and this file asks it for a value's text and for a key's. It lives in its own
-# module because it needs no third-party library, so `yaml_scalar_test.py` can
-# check it where the library that reads the catalog is not installed.
+# `schema_scalar` puts the tag the library resolved beside that answer for a value,
+# and the key path below asks the same rules for a key's text. The module needs no
+# third-party library, so `yaml_scalar_test.py` can check it where the library that
+# reads the catalog is not installed.
 #
 # PyYAML, which reads the catalog here, resolves scalars the way YAML 1.1 does, so
 # nothing here can depend on what PyYAML constructs: `0o17` is the string "0o17" to
@@ -60,11 +61,14 @@ def mapping_key(loader, key_node, deep):
     it reads `200:` as the integer 200, `0200:` as an octal, 128, `08:` as a
     string, `0o17:` as a string and `12:30:` as the integer 750.
 
-    A key the loader reads as neither a string nor a number -- `true:`, `null:`
-    -- is left as PyYAML constructs it, because `json_model` is what reports
-    those here. A float, like `1.5:` or `1e3:`, is refused with the integers: the
-    loader reads a number and refuses the key, and PyYAML reads `1e3` as the
-    string "1e3" and would let it through.
+    A key the loader reads as neither a string nor a number -- `true:`, `null:` --
+    is constructed as written and comes back a bool or a null: `strict_scalar`
+    makes it so in a schema file, where it answers every plain scalar, and PyYAML's
+    own constructor elsewhere. It is `json_model` that reports it here, as no key a
+    JSON document can hold; atomic's loader refuses such a key itself. A float,
+    like `1.5:` or `1e3:`, is refused with the integers: the loader reads a number
+    and refuses the key, and PyYAML reads `1e3` as the string "1e3" and would let
+    it through.
     """
     spelling = key_node.value
     if key_node.style is None:
@@ -132,48 +136,65 @@ def strict_scalar(loader, node):
     1.1 reads where the loader refuses the spelling, `-0x1F`, `1_000` and `12:30`
     as the integers YAML 1.1 reads where the loader reads strings, `.inf` as an
     infinity JSON has no form for, and `0o17` and `1e3` as strings where the
-    loader reads 15 and 1000.0. So the text is asked instead, of `yaml_scalar`,
-    the module that holds the loader's rules and that the key rule above reads
-    from too: a spelling the loader refuses is refused here with its reason and
-    its fix, and what the core schema reads is what comes back. Only `true` and
-    `false` are booleans, as the loader has it, because `yes`, `no`, `on` and
-    `off` are among what it refuses.
+    loader reads 15 and 1000.0. So how the scalar was written, the tag PyYAML
+    resolved and the text are asked together, of `yaml_scalar.schema_scalar` -- the
+    module that holds the loader's rules and that the key rule above reads from
+    too: a spelling the loader refuses is refused here with its reason and its fix,
+    and what the core schema reads is what comes back. Only `true` and `false` are
+    booleans, as the loader has it, because `yes`, `no`, `on` and `off` are among
+    what it refuses.
 
-    A quoted scalar is its own text to every version, so it needs no rule. A
-    plain one PyYAML resolved to something the port has no answer for -- a
-    `2026-11-21`, which YAML 1.1 resolves as a timestamp and the core schema
-    reads as a string -- is refused outright, because nothing is registered for
-    the tag it resolved: the catalog holds no such value, and reading one as a
-    string here while the library made a date of it would be the same quiet
-    disagreement this rule exists to stop.
+    A quoted scalar is its own text to every version, so `schema_scalar` answers it
+    before it asks anything. A plain one PyYAML resolved to a tag whose value this
+    has no answer for -- a `2026-11-21`, which YAML 1.1 resolves as a timestamp and
+    the core schema reads as a string -- never reaches here: SafeLoader's
+    constructor for the timestamp tag is popped off this loader, so PyYAML raises
+    that it has no constructor for the tag rather than build a date no JSON
+    document can hold. A scalar that does reach this with a tag outside the five is
+    refused by `schema_scalar` the same way, named by the tag.
     """
-    if node.style is not None:
-        return node.value
-    kind, answer = yaml_scalar.core_scalar(node.value)
-    require(
-        kind != yaml_scalar.REFUSED,
-        f"{node.value!r} value at line {node.start_mark.line + 1} is not one atomic's loader "
-        f"reads: {answer.as_value()}",
-    )
-    if kind == yaml_scalar.TEXT:
-        return node.value
+    kind, answer = yaml_scalar.schema_scalar(node.style, node.tag, node.value)
+    if kind == yaml_scalar.REFUSED:
+        raise ValueError(
+            f"{node.value!r} value at line {node.start_mark.line + 1} is not one atomic's "
+            f"loader reads: {answer.as_value()}"
+        )
     return answer
 
 
-# Every tag PyYAML's resolver can give a plain scalar. A constructor on the
-# default tag alone would never see the ones PyYAML resolved on its own, which is
-# exactly the set this has to read: `0200`, `1_000` and `12:30` as integers,
-# `.inf` as a float, `yes` as a boolean and `~` as a null. The default scalar tag
-# is `tag:yaml.org,2002:str` itself, which is what a plain scalar nothing resolved
+# The tags PyYAML's resolver can give a plain scalar that the core schema reads a
+# null, a boolean, a number or a string by. A constructor on the default tag alone
+# would never see the ones PyYAML resolved on its own, which is exactly the set
+# this has to read: `0200`, `1_000` and `12:30` as integers, `.inf` as a float,
+# `yes` as a boolean and `~` as a null. The default scalar tag is
+# `tag:yaml.org,2002:str` itself, which is what a plain scalar nothing resolved
 # gets -- `0o17` and `1e3` -- and what every quoted scalar gets.
-for _tag in (
-    yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG,
-    "tag:yaml.org,2002:null",
-    "tag:yaml.org,2002:bool",
-    "tag:yaml.org,2002:int",
-    "tag:yaml.org,2002:float",
-):
+#
+# Three more tags the resolver can give a plain scalar are left unregistered, and
+# what happens to each is a refusal: the timestamp, which is what a plain
+# `2026-11-21` gets, and which SafeLoader would otherwise construct a
+# `datetime.date` for; and the merge (`<<`) and value (`=`) keys, which PyYAML
+# resolves only where they are written plainly. All three are strings to the core
+# schema and to atomic's loader, so refusing them is stricter than the loader: the
+# catalog has no use for a plain date, and `a: =` and `a: <<` are refused here with
+# PyYAML's own "could not determine a constructor" error, which names the tag.
+if yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG != yaml_scalar.STR_TAG:
+    raise ValueError(
+        f"PyYAML's default scalar tag is "
+        f"{yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG!r}, which is not what yaml_scalar "
+        f"reads a plain string as; the constructor below would never see a plain scalar"
+    )
+for _tag in yaml_scalar.SCALAR_TAGS:
     SchemaLoader.add_constructor(_tag, strict_scalar)
+# SafeLoader's own constructors are shared by reference until a subclass adds one
+# of its own, and it has a constructor for the timestamp tag: it builds a
+# `datetime.date` for a plain `2026-11-21`, which atomic's loader has no type for
+# at all. Work on a copy, so that SafeLoader and the loader above -- which read the
+# manifests and the eval cases -- keep their dates, and drop that one constructor
+# here, so a plain date is refused by name instead of reaching `json_model` as an
+# object no JSON document can hold.
+SchemaLoader.yaml_constructors = dict(SchemaLoader.yaml_constructors)
+SchemaLoader.yaml_constructors.pop(yaml_scalar.TIMESTAMP_TAG, None)
 
 
 def json_model(value, path):
@@ -649,8 +670,10 @@ def check_yaml_loader_mirror():
         ("1.5: a\n", "is a number, so the key would be renamed to it"),
         # 1e3 is a float to JSON and to the core schema and a string to PyYAML.
         ("1e3: a\n", "is a number, so the key would be renamed to it"),
-        # Past what a 64-bit integer holds the loader reads a float, where
-        # PyYAML, with Python's integers, reads the digits as an integer.
+        # Past what a 64-bit integer holds the loader still reads the digits as a
+        # number, and refuses the key because a key must be a number whose digits
+        # are its own text; PyYAML reads the same digits as an integer, so the key
+        # would come through as one.
         (
             "99999999999999999999: a\n",
             "is a number, so the key would be renamed to it",
@@ -858,22 +881,60 @@ def check_yaml_value_mirror():
     ):
         read_as(f'"{spelling}"', spelling)
         checks += 1
-    # A plain value PyYAML resolves to something the core schema has no reading
-    # for -- a date, which YAML 1.1 calls a timestamp and the core schema reads as
-    # a string -- is refused by name rather than read as a string here while the
-    # library makes a date of it. The refusal comes from no constructor being
-    # registered for that tag, so it is a YAML error and not this file's, and it
-    # has to name what it refused.
+    # A plain date -- what YAML 1.1 calls a timestamp and the core schema reads as
+    # a string -- is refused rather than read as a string here while the library
+    # makes a date of it. SafeLoader's constructor for that tag is popped off the
+    # schema loader, so nothing is left to construct it: PyYAML's own error names
+    # the tag it could not construct, and that is what the case asserts, not merely
+    # that some YAML error came out. That nothing is registered for any tag no rule
+    # here reads is asserted first, so a refusal that came from somewhere else reads
+    # as a failure.
+    for tag in yaml_scalar.UNREAD_TAGS:
+        require(
+            tag not in SchemaLoader.yaml_constructors,
+            f"a schema file has a constructor for {tag}, so a scalar the resolver gives that "
+            f"tag would be read as whatever the library makes of it",
+        )
+        checks += 1
+    # And popped from a copy: the loaders that read the manifests and the eval cases
+    # read a plain date as a date still, which is what `check_decision_dates` below
+    # compares.
+    for reads, where_read in ((yaml.safe_load, "SafeLoader"), (read_yaml, "the catalog loader")):
+        date = reads("a: 2026-11-21\n")["a"]
+        require(
+            isinstance(date, datetime.date),
+            f"a plain date read with {where_read} is {date!r}, which must still be a date",
+        )
+        checks += 1
+    no_constructor = f"could not determine a constructor for the tag '{yaml_scalar.TIMESTAMP_TAG}'"
     try:
         read_schema_text("a: 2026-11-21\n", where)
     except yaml.YAMLError as exc:
+        said = str(exc)
         require(
-            "timestamp" in str(exc),
-            f"a plain date was refused for {exc}, which does not say which tag it refused",
+            no_constructor in said,
+            f"a plain date was refused for {said!r}, which does not say {no_constructor!r}",
         )
         checks += 1
     else:
         raise ValueError(f"{where}: a: 2026-11-21 was read; a plain date must be refused")
+    # The two tags no rule here reads besides the timestamp -- the value (`=`) and
+    # the merge (`<<`) keys -- are refused the same way, on the text each is
+    # resolved from. atomic's loader reads both texts as strings, so this is
+    # stricter than the loader, and the catalog writes neither.
+    for spelling in ("=", "<<"):
+        try:
+            read_schema_text(f"a: {spelling}\n", where)
+        except yaml.YAMLError as exc:
+            said = str(exc)
+            require(
+                "could not determine a constructor for the tag" in said,
+                f"a plain {spelling} was refused for {said!r}, which does not say it could "
+                f"not construct the tag",
+            )
+            checks += 1
+        else:
+            raise ValueError(f"{where}: a: {spelling} was read; it must be refused")
     return checks
 
 
