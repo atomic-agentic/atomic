@@ -406,22 +406,34 @@ fn named_path(file: &str, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result
 /// The bytes of the credential configuration at `path`, followed through
 /// links as its SDK follows them, read without waiting, as opening a fifo
 /// would, and no further than [`CONFIG_BYTES_MAX`]: `None` when it is not
-/// there, and an error for anything else that keeps it from being read
-/// whole.
+/// there, or is a device, as `/dev/null` is when a variable names it to
+/// turn the configuration off, which is never opened; and an error for
+/// anything else that keeps it from being read whole.
 fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read as _;
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
-    let file = match open.open(path) {
-        Ok(file) => file,
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => format!("this user may not read it: {e}"),
+        _ => e.to_string(),
+    };
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
         // Only a file that is not there names nothing: any other error
         // refuses. `scripts/controls/workload-config-not-there.row` switches
         // this off.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(unreadable(e)),
     };
+    // `scripts/controls/workload-config-device.row` switches this off.
+    let device = is_device(&meta);
+    if device {
+        return Ok(None);
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).map_err(unreadable)?;
+    // What was opened, which may not be what was looked at.
     let meta = file.metadata().map_err(|e| e.to_string())?;
     // `scripts/controls/workload-config-plain.row` switches this off.
     let plain = meta.is_file();
@@ -436,6 +448,20 @@ fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
         return Err(format!("it holds more than {CONFIG_BYTES_MAX} bytes"));
     }
     Ok(Some(bytes))
+}
+
+/// Whether `meta` is a device's: a character or a block device.
+fn is_device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        meta.file_type().is_char_device() || meta.file_type().is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
 }
 
 /// The token files the Google credentials file at `config` names, each
@@ -535,8 +561,8 @@ fn aws_profile_token_files(
     let refused = |why: String| {
         format!(
             "{} could not be read as an AWS configuration file ({why}), so a web identity \
-             token file its profiles name could not be denied to atoms' commands; fix it or \
-             move it",
+             token file it names could not be denied to atoms' commands; make it a file this \
+             user can read, or move it",
             config.display()
         )
     };
@@ -546,23 +572,43 @@ fn aws_profile_token_files(
     let text = String::from_utf8(bytes).map_err(|_| refused("it is not UTF-8 text".into()))?;
     let mut out = Vec::new();
     for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
+        // A key ends at `=` or, as Python's configuration parser reads it,
+        // at `:`, whichever comes first.
+        // `scripts/controls/aws-profile-colon.row` switches this off.
+        let Some(at) = line.find(['=', ':']) else {
             continue;
         };
-        let value = value.trim();
+        let (key, value) = (&line[..at], line[at + 1..].trim());
         if !key.trim().eq_ignore_ascii_case("web_identity_token_file") || value.is_empty() {
             continue;
         }
-        let mut files = vec![named_path(value, here).map_err(refused)?];
-        if let Some(rest) = value.strip_prefix("~/") {
-            files.extend(homes.iter().map(|home| home.join(rest)));
-        }
-        for file in files {
-            out.extend(projected_volume(file.clone()));
-            out.push(file);
+        // Some SDKs end a value at a `#` or `;` after white space, as a
+        // comment, and others keep it: both readings are denied.
+        // `scripts/controls/aws-profile-comment.row` switches this off.
+        let comment = comment_start(value);
+        let mut values = vec![value];
+        values.extend(comment.map(|at| value[..at].trim_end()).filter(|v| !v.is_empty()));
+        for value in values {
+            let mut files = vec![named_path(value, here).map_err(refused)?];
+            if let Some(rest) = value.strip_prefix("~/") {
+                files.extend(homes.iter().map(|home| home.join(rest)));
+            }
+            for file in files {
+                out.extend(projected_volume(file.clone()));
+                out.push(file);
+            }
         }
     }
     Ok(out)
+}
+
+/// Where a comment starts in a configuration value, as the SDKs that allow
+/// one read it: at the first `#` or `;` that follows white space.
+fn comment_start(value: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .find(|&(at, c)| matches!(c, '#' | ';') && value[..at].ends_with(char::is_whitespace))
+        .map(|(at, _)| at)
 }
 
 /// The home directories whose credential places are denied, as `env` reads
@@ -4848,7 +4894,13 @@ mod tests {
         .expect("config");
         std::fs::write(
             dir.join("moved-config"),
-            "[profile other]\n  Web_Identity_Token_File=~/tokens/web\n",
+            format!(
+                "[profile other]\n  Web_Identity_Token_File=~/tokens/web\n\
+                 [profile colon]\nweb_identity_token_file: {d}/colon-token\n\
+                 [profile commented]\nWEB_IDENTITY_TOKEN_FILE = {d}/commented-token  # eks\n\
+                 [profile both]\nweb_identity_token_file\t:\t{d}/both-token ;note\n",
+                d = dir.display()
+            ),
         )
         .expect("moved");
         let (home_s, moved) = (home.display().to_string(), dir.join("moved-config"));
@@ -4866,6 +4918,10 @@ mod tests {
             volume.clone(),
             volume.join("token"),
             home.join("tokens/web"),
+            dir.join("colon-token"),
+            dir.join("commented-token"),
+            dir.join("commented-token  # eks"),
+            dir.join("both-token"),
         ] {
             assert!(places.contains(&file), "{}: {places:?}", file.display());
         }
@@ -4920,6 +4976,23 @@ mod tests {
         assert_eq!(
             google_token_files(&dir.join("missing"), &here),
             Ok(Vec::new())
+        );
+        // A device, as /dev/null is when a variable turns a configuration
+        // off, names nothing and is not opened.
+        let null = Path::new("/dev/null");
+        assert_eq!(aws_profile_token_files(null, &[], &here), Ok(Vec::new()));
+        assert_eq!(google_token_files(null, &here), Ok(Vec::new()));
+        // One this user may not read is refused, saying so.
+        std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
+        std::fs::set_permissions(
+            dir.join("theirs"),
+            std::os::unix::fs::PermissionsExt::from_mode(0),
+        )
+        .expect("mode");
+        assert!(
+            aws("theirs").contains("this user may not read it"),
+            "{}",
+            aws("theirs")
         );
         std::fs::write(dir.join("broken.json"), "{\"credential_source\": ").expect("broken");
         assert!(

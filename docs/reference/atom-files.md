@@ -441,8 +441,9 @@ token files are denied too:
   default credentials gcloud writes: an external account's source file, the
   file its executable keeps a token in, and those of the credentials an
   impersonated account is configured with;
-- the `web_identity_token_file` any profile in your AWS configuration or
-  credentials file names;
+- every `web_identity_token_file` setting in your AWS configuration and
+  credentials files, written with `=` or `:`, both with and without a `#` or
+  `;` comment after it;
 - the whole projected volume when such a file is in one Kubernetes mounts,
   found through any links that lead to it, so the token it rotates in next
   is denied as well;
@@ -452,17 +453,20 @@ token files are denied too:
   `/var/run/secrets/kubernetes.io/serviceaccount`, and Azure workload
   identity's `/var/run/secrets/azure/tokens`.
 
-A configuration atomic reads for the token files it names, and cannot read
-whole (one that is not a plain file, is larger than any such file is, or is
-not JSON or text), stops the run with a message naming it, rather than
-leaving a token it may name readable. An ordinary token file is denied by its path each
-time a command starts, so one replaced there is denied to the next command.
-A token given as a value rather than a file, such as
+A configuration atomic reads for the token files it names stops the run,
+with a message naming it, when it cannot be read whole, rather than leaving a
+token it may name readable: when it cannot be opened (this user may not read
+it, say), is not a plain file, is larger than any such file is, is not JSON
+or text, or gives a field that names a file a value that is not text. One
+that is not there, or is a device, as `/dev/null` is when a variable turns a
+configuration off, names nothing. An ordinary token file is denied by its
+path each time a command starts, so one replaced there is denied to the next
+command. A token given as a value rather than a file, such as
 `AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
 only a few core variables and those its atom declares, and the credential
 endpoints AWS serves on link-local and unique-local addresses are out of its
-reach, since a command reaches no private or local address. A link among them, up to four
-directory levels inside a denied directory, is denied as what it
+reach, since a command reaches no private or local address. A link among
+them, up to four directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
