@@ -952,16 +952,21 @@ fn denied_paths(
     // The sandbox finds the denials inside a writable directory by the
     // spelling it is given that directory under: one given through a link
     // would not keep a denial inside it, under its real spelling, in force.
+    let codex = real_spelling(codex_home);
     for (named, root) in given.iter().zip(&roots) {
         if named.as_path() == root.as_path() {
             continue;
         }
-        let codex = real_spelling(codex_home);
-        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
+        // Codex's home, whose databases a pattern denies, is weighed with the
+        // places listed. The files planted in it at start are listed as well,
+        // so this is defence in depth for a home that holds them.
+        // `scripts/controls/deny-linked-codex-home.row` switches this off.
+        let mut weighed = all.iter().chain([&codex]);
+        if let Some(place) = weighed.find(|p| p.starts_with(root)) {
             return Err(refuse(format!(
                 "{} is inside {}, which atoms' commands may write, named {} through a link, so \
-                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
-                 their real paths, with no link above them",
+                 its denial would not hold; point ATOMIC_HOME (or XDG_DATA_HOME, or HOME) and \
+                 the project at their real paths, with no link above them",
                 place.display(),
                 root.display(),
                 named.display()
@@ -1779,6 +1784,20 @@ fn deny_links_made_since_the_list() {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         // Started again once already: what it adds is its last chance.
         let again_already = take_env(RELISTED).is_some();
+        // Started again, it must not have been handed the proxy token in its
+        // environment: the token goes to the helper only on a socket, read
+        // after this walk, so a token here means it was read before a start
+        // again put it in the environment of a process that was dumpable
+        // until its first step. The command does not run.
+        if again_already
+            && std::env::var_os(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY).is_some()
+        {
+            crate::log_line!(
+                "atomic: the sandbox helper was started again with the proxy token in its \
+                 environment, where another process could have read it; the command does not run"
+            );
+            std::process::exit(1);
+        }
         let carried = take_env(PLACES);
         let places = match carried.as_ref().map(|v| {
             v.to_str()
@@ -2289,6 +2308,10 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// command its own `TMPDIR`.
 fn as_any_helper() {
     helper_not_dumpable();
+    // The walk may start the helper again, so it comes before the token is
+    // read: read first, the token would pass through `exec` in the
+    // environment of a process that is dumpable until its first step, which
+    // the walk then refuses.
     deny_links_made_since_the_list();
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
