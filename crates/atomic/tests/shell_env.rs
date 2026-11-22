@@ -1106,7 +1106,10 @@ fn a_linked_secret_marked_executable_stays_denied() {
 
 /// `atomic run`, started with descriptors left open (a pipe, a file, a
 /// socket, one at a high number), runs a turn whose shell holds none of
-/// them.
+/// them. Codex starts a turn's commands on a pseudo-terminal of their own,
+/// closing what they would inherit, so this holds even without atomic's
+/// own sweeps (`inherited_fds` tests those); it is here so that it stays
+/// true.
 #[test]
 fn a_turns_shell_holds_none_of_the_descriptors_atomic_was_started_with() {
     support::require_sandbox();
