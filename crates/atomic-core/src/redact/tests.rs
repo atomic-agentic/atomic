@@ -3709,7 +3709,8 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
 /// as written too, two and three levels deep.
 #[test]
 fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
-    let pair = json!({"env": [{"key": "DB_PASSWORD", "note": 1, "value": "hunter2 x"}]}).to_string();
+    let pair =
+        json!({"env": [{"key": "DB_PASSWORD", "note": 1, "value": "hunter2 x"}]}).to_string();
     let two = json!({"body": pair}).to_string();
     let three = json!({"body": two.clone()}).to_string();
     for (depth, doc) in [
