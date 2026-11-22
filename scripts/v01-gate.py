@@ -543,9 +543,11 @@ def scenario(s, fake):
     final = decided[0]
     decision = (final.get("resolution") or {}).get("decided") or {}
     s.check("within the original gate deadline",
-            # A gate recorded without its deadline fails this check rather
-            # than reaching the time comparisons after it, which need both.
+            # A gate recorded without its deadline or its opening time fails
+            # this check rather than reaching the time comparisons after it,
+            # which need both.
             final["deadline"] is not None
+            and final["opened_at"] is not None
             and (final["id"], final["opened_at"], final["deadline"])
             == (gate["id"], gate["opened_at"], gate["deadline"])
             and decision.get("verdict") == "approve"
@@ -610,6 +612,16 @@ def main():
             "directory, where atomic refuses an atom's scratch; work in a directory "
             "elsewhere, named with --keep or in a checkout that is not under it")
         return 2
+    # A --keep directory is made here and nowhere else, so it must not exist
+    # yet: the scenario would write its project/, home/, logs/ and atomic-home/
+    # among what is already there, and a store already under atomic-home/ would
+    # be read as the run's own.
+    if args.keep:
+        try:
+            os.makedirs(work)
+        except OSError as e:
+            say(f"v01-gate: no directory to work in: {e}")
+            return 2
     fake = Fake()
     s = Scenario(atomic, work)
     try:
