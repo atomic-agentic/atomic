@@ -2275,14 +2275,17 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
     // error on main too: only its first word is taken for the value.)
     // Under a header's own name and under longer names that end in one, as
     // the header rule finds it there.
-    for header in ["proxy-authorization", "X-Authorization", "http.proxy-authorization"] {
+    for header in [
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+    ] {
         for _ in 0..8 {
             let secret = planted.secret();
             let log = format!("{header}: Permission denied (os error 13) {secret}");
             let nested = format!("open {header} : Permission denied (os error 13) :{secret}");
             let line = serde_json::json!({"log": log});
-            let args =
-                serde_json::json!({"args": serde_json::json!({"log": nested}).to_string()});
+            let args = serde_json::json!({"args": serde_json::json!({"log": nested}).to_string()});
             let mut read = args.clone();
             value(&mut read);
             let readings = [
