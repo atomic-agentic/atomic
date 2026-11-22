@@ -316,6 +316,10 @@ scripts/dev.sh cargo build --release --locked -p atomic-agentic
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release/atomic
 ```
 
+It works in a new directory under `target/` and removes it at the end;
+`--keep <dir>` works in `<dir>` and keeps it, but not under `/tmp` or
+`$TMPDIR`, where atomic refuses an atom's scratch.
+
 ## The crash suite
 
 atomic's crash tests kill the process at named failpoints. A failpoint is
