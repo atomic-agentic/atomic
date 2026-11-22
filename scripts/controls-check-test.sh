@@ -26,7 +26,8 @@ fail() {
 # replaces what was saved with a state from before the commit, `rebuild` says
 # in rebuild.log how each file it edits stands against the binaries this run
 # built, `kill` kills the script outright, `hang` waits, with the control off,
-# until it is stopped, and `spaces` names a failed test as a doctest is named.
+# until it is stopped, `spaces` names a failed test as a doctest is named, and
+# `nobuild` fails to build with the control off, in colour unless told not to.
 # It notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
@@ -84,6 +85,17 @@ rebuild)
     ;;
 kill) kill -KILL "${PPID}"; exit 0 ;;
 hang) : >cargo-started; exec sleep 300 ;;
+nobuild)
+    # With the control off nothing builds, and cargo says so as it does under
+    # CARGO_TERM_COLOR=always, in colour, unless it is told --color never.
+    if off; then
+        case " $* " in
+        *" --color never "*) echo 'error: could not compile `atomic-agentic-core` (lib) due to 1 previous error' ;;
+        *) printf '\033[1m\033[91merror\033[0m: could not compile `atomic-agentic-core` (lib) due to 1 previous error\n' ;;
+        esac
+        exit 101
+    fi
+    ;;
 esac
 # The tests the arguments name, after `--` or as positional filters, each
 # in a test binary of its own, run in order as cargo runs them: without
@@ -104,7 +116,7 @@ for a in "$@"; do
     case "${a}" in
     --) after=1 skip=0 ;;
     --no-fail-fast) no_fail_fast=1 ;;
-    -p | --package | --features | --test | --bin | --example) skip=1 ;;
+    -p | --package | --features | --test | --bin | --example | --color) skip=1 ;;
     -*) ;;
     *) names+=("${a}") ;;
     esac
@@ -244,6 +256,15 @@ run blind git-dir
 [ "${code}" -ne 0 ] && grep -q "FAIL git-dir: its test passed with the control off" <<<"${out}" ||
     fail "blind: exit ${code}: ${out}"
 untouched || fail "blind: the source is left modified"
+
+# A control whose removal breaks the build fails the check as one that does
+# not build, though cargo prints its errors in colour (CARGO_TERM_COLOR=always,
+# as CI sets it): the script asks cargo for plain text.
+repo="$(fresh)"
+run nobuild git-dir
+[ "${code}" -ne 0 ] && grep -q "FAIL git-dir: with the control off the code does not build" <<<"${out}" ||
+    fail "nobuild: exit ${code}: ${out}"
+untouched || fail "nobuild: the source is left modified"
 
 # A control whose tests do not all fail with it off fails the check.
 repo="$(fresh)"
