@@ -1,0 +1,1 @@
+gate-evidence-digested|crates/atomic-durable/src/gate.rs|        &json!({"title": title, "show": show, "evidence": evidence}),|        &json!({"title": title, "show": show, "evidence": evidence.get(..0)}),|-p atomic-agentic-durable --lib gate::tests::sqlite::changed_evidence_cannot_reuse_an_approval

@@ -19,8 +19,15 @@
 //! be trusted to say which directory each such mount shows; one on any
 //! filesystem but a local one ([`local`]) mounted more than once whose root
 //! the kernel shows as lost (`<path>//deleted`); and one there now whose
-//! second place, on such a filesystem, is missing or is another file or
-//! directory, since the table's roots there can be stale. A mount whose
+//! second place, on such a filesystem, is missing, is another file or
+//! directory, or is a link (which is not followed), or which, or whose
+//! part a second place shows, cannot be looked at for a reason other than
+//! not being there, since the table's roots there can be stale. A mount of
+//! part of a denied place is checked against that part. On any filesystem,
+//! it refuses when another mount of it is the same directory as a denied
+//! place, or as one above it on the place's own mount, and the table did
+//! not give that second place ([`shown_unlisted`]): its root went stale
+//! with nothing to say so. A mount whose
 //! root is not a path, such as a namespace file (`net:[4026531840]`), shows
 //! no directory, and is never a second place.
 //!
@@ -34,7 +41,8 @@
 //!   own;
 //! - a mount made after the list is built, such as one an automount
 //!   (`autofs`) makes when a path under it is first used, even from inside
-//!   the sandbox, which sees the host's new mounts;
+//!   the sandbox, which sees the host's new mounts, until the table is read
+//!   again: the sandbox helper reads it again as each command starts;
 //! - the same remote directory, or one inside another, mounted twice as
 //!   two filesystems, each with a device of its own, such as 9p; NFS with
 //!   `nosharecache`, or with mount options that differ, which give each
@@ -44,10 +52,12 @@
 //!   nor refused;
 //! - a stale root on a filesystem that is not local, for a place not there
 //!   yet: its second place is only checked against it once it is;
-//! - a stale root that makes a second mount look unrelated to a denied
-//!   place, on any filesystem, such as a bound overlay directory whose lower
-//!   directory was renamed beneath it: only the second places the table
-//!   gives are checked.
+//! - a stale root that makes a mount of a directory inside a denied place
+//!   look unrelated to it: mounts are checked against the place and the
+//!   directories above it, not each one below it; and a stale root of the
+//!   place's own mount, which makes a second mount of a directory above
+//!   that root look unrelated: the directories checked stop at the place's
+//!   own mount point.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -205,21 +215,6 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// The mount at the top of the stack `mount` heads at its own mount point:
-/// the one mounted on it there, and on that, and so on.
-fn top<'a>(mounts: &'a [Mount], mut mount: &'a Mount) -> &'a Mount {
-    for _ in 0..mounts.len() {
-        match mounts
-            .iter()
-            .find(|m| m.at == mount.at && m.parent == mount.id && m.id != mount.id)
-        {
-            Some(above) => mount = above,
-            None => break,
-        }
-    }
-    mount
-}
-
 /// The IDs of `mounts`.
 fn ids(mounts: &[Mount]) -> std::collections::HashSet<u64> {
     mounts.iter().map(|m| m.id).collect()
@@ -233,23 +228,87 @@ fn root_of<'a>(mounts: &'a [Mount], ids: &std::collections::HashSet<u64>) -> Opt
         .find(|m| m.at == Path::new("/") && (m.parent == m.id || !ids.contains(&m.parent)))
 }
 
-/// The mount `path` is in, as this process sees it: from the root mount,
-/// down the mounts on each directory of the path, each the top of its stack.
-fn mount_of<'a>(
-    mounts: &'a [Mount],
-    listed: &std::collections::HashSet<u64>,
-    path: &Path,
-) -> Option<&'a Mount> {
-    let root = root_of(mounts, listed)?;
-    let mut here = top(mounts, root);
-    let mut at = PathBuf::from("/");
-    for part in path.components().skip(1) {
-        at.push(part);
-        if let Some(child) = mounts.iter().find(|m| m.at == at && m.parent == here.id) {
-            here = top(mounts, child);
+/// A mount table indexed once for each read of it: each mount by the mount
+/// it is on and where, and each filesystem's mounts, so that what a path is
+/// on and where else that is mounted are found by its depth, not by the
+/// table's length.
+struct Index<'a> {
+    /// The root mount, when the table has one.
+    root: Option<&'a Mount>,
+    /// Each mount by the ID of the mount it is on and where it is.
+    on: std::collections::HashMap<(u64, &'a Path), &'a Mount>,
+    /// Each filesystem's mounts, by device.
+    by_device: std::collections::HashMap<&'a str, Vec<&'a Mount>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(mounts: &'a [Mount]) -> Self {
+        let listed = ids(mounts);
+        let mut on = std::collections::HashMap::new();
+        let mut by_device: std::collections::HashMap<&str, Vec<&Mount>> =
+            std::collections::HashMap::new();
+        for m in mounts {
+            // A root that is its own parent, as an initramfs's is, is on
+            // nothing: what is mounted on it at `/` is above it, as the
+            // kernel shows it to a process. Two on one place on one mount:
+            // the first listed is the one on it, and `top` climbs from it to
+            // the other, mounted on it in turn.
+            if m.parent == m.id {
+                by_device.entry(m.device.as_str()).or_default().push(m);
+                continue;
+            }
+            on.entry((m.parent, m.at.as_path())).or_insert(m);
+            by_device.entry(m.device.as_str()).or_default().push(m);
+        }
+        Self {
+            root: root_of(mounts, &listed),
+            on,
+            by_device,
         }
     }
-    Some(here)
+
+    /// The mount at the top of the stack `mount` heads at its own mount
+    /// point: the one mounted on it there, and on that, and so on.
+    fn top(&self, mut mount: &'a Mount) -> &'a Mount {
+        for _ in 0..=self.on.len() {
+            match self.on.get(&(mount.id, mount.at.as_path())) {
+                Some(above) if above.id != mount.id => mount = above,
+                _ => break,
+            }
+        }
+        mount
+    }
+
+    /// The mount `path` is in, as [`mount_of`] finds it.
+    fn mount_of(&self, path: &Path) -> Option<&'a Mount> {
+        let mut here = self.top(self.root?);
+        let mut at = PathBuf::from("/");
+        for part in path.components().skip(1) {
+            at.push(part);
+            if let Some(child) = self.on.get(&(here.id, at.as_path())) {
+                here = self.top(child);
+            }
+        }
+        Some(here)
+    }
+
+    /// The other mounts of `home`'s filesystem.
+    fn same(&self, home: &Mount) -> Vec<&'a Mount> {
+        self.by_device
+            .get(home.device.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|m| m.id != home.id)
+            .collect()
+    }
+}
+
+/// The mount `path` is in, as this process sees it: from the root mount,
+/// down the mounts on each directory of the path, each the top of its stack.
+#[cfg(test)]
+fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
+    Index::new(mounts).mount_of(path)
 }
 
 /// Every other place `mounts` shows `path`, which is absolute with no link
@@ -257,22 +316,19 @@ fn mount_of<'a>(
 /// holds it, the same file or directory there; and each such mount whose
 /// directory lies inside it, whole.
 fn aliases_of(
-    mounts: &[Mount],
-    listed: &std::collections::HashSet<u64>,
+    index: &Index<'_>,
     path: &Path,
     out: &mut Vec<PathBuf>,
+    points: &mut Points,
 ) -> anyhow::Result<()> {
-    let Some(home) = mount_of(mounts, listed, path) else {
+    let Some(home) = index.mount_of(path) else {
         bail!(
             "{} is under no mount in the mount table, so atomic cannot tell where else it is \
              mounted",
             path.display()
         );
     };
-    let same: Vec<&Mount> = mounts
-        .iter()
-        .filter(|m| m.device == home.device && m.id != home.id)
-        .collect();
+    let same = index.same(home);
     let Some(first) = same.first() else {
         return Ok(());
     };
@@ -305,45 +361,372 @@ fn aliases_of(
             first.at.display()
         );
     }
-    let (Some(root), Ok(rel)) = (&home.root, path.strip_prefix(&home.at)) else {
+    let start = out.len();
+    if let (Some(root), Ok(rel)) = (&home.root, path.strip_prefix(&home.at)) {
+        let inside = root.join(rel);
+        for other in same.iter().copied() {
+            let Some(other_root) = &other.root else {
+                continue;
+            };
+            // The second place, and what it shows of the place: the place itself,
+            // or, for a mount of part of it, that part.
+            let (alias, shows) = if let Ok(below) = inside.strip_prefix(other_root) {
+                if below.as_os_str().is_empty() {
+                    (other.at.clone(), path.to_owned())
+                } else {
+                    (other.at.join(below), path.to_owned())
+                }
+            } else if let Ok(part) = other_root.strip_prefix(&inside) {
+                (other.at.clone(), path.join(part))
+            } else {
+                continue;
+            };
+            if alias == path {
+                continue;
+            }
+            // Off a local filesystem, a root may be stale with nothing in the
+            // table to say so: an ancestor of it lost, or renamed on the server
+            // and not checked again yet. Where the place is there, its second
+            // place must be the same file or directory as what it shows. Where
+            // what it shows is not there, it is denied unchecked: a stale root
+            // then denies more, never less.
+            if !local(&home.kind) {
+                same_file(&shows, &alias)?;
+            }
+            out.push(alias);
+        }
+    }
+    // What the table's roots say, checked against the directories the
+    // mounts are of.
+    shown_unlisted(home, &same, path, &out[start..], points)?;
+    Ok(())
+}
+
+/// What each mount point shows, looked at once for each read of the table:
+/// the file it is, or `None` when it is not there or out of reach.
+type Points = std::collections::HashMap<PathBuf, Option<(u64, u64)>>;
+
+/// Refused when another mount of `home`'s filesystem, of `same`, shows
+/// `path` with nothing in the table to say so: its mount point is the same
+/// directory as `path` or one above it on `home`, and the table did not
+/// yield that second place among `found`. A root can go stale with no
+/// marker, as an overlay's does once a lower directory under a bound one is
+/// renamed, or a remote filesystem's when a directory above it is renamed
+/// on the server; the second mount then looks unrelated to the place. A
+/// mount point that is not there shows nothing, and nor does one behind a
+/// directory this user may not search that is someone else's, by a uid the
+/// user cannot map ([`out_of_reach`]); behind any other, it is refused. A
+/// place, or a directory above it, that cannot be looked at for any reason
+/// but not being there refuses too: what it shows cannot be checked.
+#[cfg(unix)]
+fn shown_unlisted(
+    home: &Mount,
+    same: &[&Mount],
+    path: &Path,
+    found: &[PathBuf],
+    points: &mut Points,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(rel) = path.strip_prefix(&home.at) else {
         return Ok(());
     };
-    let inside = root.join(rel);
-    for other in same {
-        let Some(other_root) = &other.root else {
-            continue;
-        };
-        // The second place, and what it shows of the place: the place itself,
-        // or, for a mount of part of it, that part.
-        let (alias, shows) = if let Ok(below) = inside.strip_prefix(other_root) {
-            if below.as_os_str().is_empty() {
-                (other.at.clone(), path.to_owned())
-            } else {
-                (other.at.join(below), path.to_owned())
+    // The place and each directory above it on its home mount, as the
+    // file each is, with what of the place lies below it.
+    let mut chain = vec![home.at.clone()];
+    for part in rel.components() {
+        let next = chain[chain.len() - 1].join(part);
+        chain.push(next);
+    }
+    let mut above = Vec::new();
+    for dir in &chain {
+        match std::fs::symlink_metadata(dir) {
+            Ok(m) => {
+                let below = path.strip_prefix(dir).unwrap_or(Path::new("")).to_owned();
+                above.push(((m.dev(), m.ino()), dir, below));
             }
-        } else if let Ok(part) = other_root.strip_prefix(&inside) {
-            (other.at.clone(), path.join(part))
-        } else {
+            Err(e) if not_there(&e) => break,
+            Err(e) => bail!(
+                "{} cannot be looked at ({e}), so atomic cannot check which other mounts show \
+                 {}; it cannot deny it at each",
+                dir.display(),
+                path.display()
+            ),
+        }
+    }
+    for other in same {
+        let shown = match points.get(&other.at) {
+            Some(shown) => *shown,
+            None => {
+                let shown = match std::fs::symlink_metadata(&other.at) {
+                    Ok(m) => Some((m.dev(), m.ino())),
+                    Err(e) if not_there(&e) => None,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            && out_of_reach(&other.at) =>
+                    {
+                        None
+                    }
+                    Err(e) => bail!(
+                        "the mount at {} cannot be looked at ({e}), so atomic cannot check \
+                         whether it shows {}; it cannot deny it at each",
+                        other.at.display(),
+                        path.display()
+                    ),
+                };
+                points.insert(other.at.clone(), shown);
+                shown
+            }
+        };
+        let Some(shown) = shown else {
             continue;
         };
-        if alias == path {
-            continue;
+        for (id, dir, below) in &above {
+            if shown != *id {
+                continue;
+            }
+            let alias = if below.as_os_str().is_empty() {
+                other.at.clone()
+            } else {
+                other.at.join(below)
+            };
+            if alias == path || found.contains(&alias) {
+                continue;
+            }
+            bail!(
+                "the mount at {} shows {}, though its root in the mount table ({}) names no path \
+                 to it there: the root is stale, or names another link to the same file; atomic \
+                 cannot deny {} at each",
+                other.at.display(),
+                dir.display(),
+                other
+                    .root
+                    .as_deref()
+                    .map_or_else(|| "none".to_owned(), |r| r.display().to_string()),
+                path.display()
+            );
         }
-        // Off a local filesystem, a root may be stale with nothing in the
-        // table to say so: an ancestor of it lost, or renamed on the server
-        // and not checked again yet. Where the place is there, its second
-        // place must be the same file or directory as what it shows.
-        if !local(&home.kind) {
-            same_file(&shows, &alias)?;
-        }
-        out.push(alias);
     }
     Ok(())
 }
 
-/// Whether `alias` is the same file or directory as `path`, when `path` is
-/// there, neither followed through a link: refused when `alias` is not
-/// there, or is another, or either cannot be looked at.
+#[cfg(not(unix))]
+fn shown_unlisted(
+    _: &Mount,
+    _: &[&Mount],
+    _: &Path,
+    _: &[PathBuf],
+    _: &mut Points,
+) -> anyhow::Result<()> {
+    Ok(())
+}
+
+/// Whether `path`, which this user may not look at, is out of reach of any
+/// command run as this user too: the directory above it that refuses the
+/// search is someone else's, by a uid the user cannot map. One of the
+/// user's own refuses only by its mode, which a command can step around
+/// from a user namespace of its own, where the user is root over what it
+/// owns (`unshare -r`); and so, through the user's subordinate uids
+/// (`/etc/subuid`, as rootless containers use them), can one the user may
+/// have given one of those. The caller then refuses.
+#[cfg(unix)]
+fn out_of_reach(path: &Path) -> bool {
+    let Some(owner) = search_refused_by(path) else {
+        return false;
+    };
+    if owner == this_uid() {
+        return false;
+    }
+    !mappable(owner)
+}
+
+/// Whether this user may map `uid` into a user namespace of its own: it is
+/// in one of the user's ranges in `/etc/subuid`, named by the user's name
+/// or uid, or by any name when the user has none in the password database.
+/// A file there that cannot be read or is not one such counts every uid as
+/// mappable; with none, the user maps only itself, unless the system takes
+/// subordinate uids from elsewhere ([`subids_elsewhere`]).
+#[cfg(unix)]
+fn mappable(uid: u32) -> bool {
+    let text = match subuid_file() {
+        Ok(text) => text,
+        // With no file, ranges may still come from a directory service.
+        Err(std::io::ErrorKind::NotFound) => return subids_elsewhere(),
+        Err(_) => return true,
+    };
+    let me = this_uid();
+    let name = crate::state::passwd_name(me);
+    let ranges: Option<Vec<(String, u64, u64)>> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|line| {
+            let mut fields = line.split(':');
+            let (who, start, count) = (fields.next()?, fields.next()?, fields.next()?);
+            if fields.next().is_some() {
+                return None;
+            }
+            Some((who.to_owned(), start.parse().ok()?, count.parse().ok()?))
+        })
+        .collect();
+    let Some(ranges) = ranges else {
+        return true;
+    };
+    ranges.iter().any(|(who, start, count)| {
+        let named = match &name {
+            Some(name) => who == name,
+            // No name to match by: any name may be the user's.
+            None => who.parse::<u32>().is_err(),
+        };
+        let mine = *who == me.to_string() || named;
+        mine && (*start..start.saturating_add(*count)).contains(&u64::from(uid))
+    })
+}
+
+/// Whether the system takes subordinate uids from somewhere but files, as
+/// with `subid: sss` in `/etc/nsswitch.conf` (SSSD, FreeIPA): then what
+/// this user may map is not known here, and every uid counts as mappable.
+/// A file that cannot be read counts so too; with none, or no such line,
+/// only `/etc/subuid` is read.
+#[cfg(unix)]
+fn subids_elsewhere() -> bool {
+    let text = match nsswitch_file() {
+        Ok(text) => text,
+        Err(std::io::ErrorKind::NotFound) => return false,
+        Err(_) => return true,
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter_map(|l| l.strip_prefix("subid:"))
+        .flat_map(str::split_whitespace)
+        .any(not_files)
+}
+
+/// Whether an `nsswitch.conf` source is other than `files`; an action in
+/// brackets is none.
+#[cfg(unix)]
+fn not_files(source: &str) -> bool {
+    !source.starts_with('[') && source != "files"
+}
+
+/// What `/etc/nsswitch.conf` holds, or, in a test, what [`with_nsswitch`]
+/// stands in.
+#[cfg(unix)]
+fn nsswitch_file() -> Result<String, std::io::ErrorKind> {
+    #[cfg(test)]
+    if let Some(given) = NSSWITCH.with(|s| s.borrow().clone()) {
+        return given;
+    }
+    std::fs::read_to_string("/etc/nsswitch.conf").map_err(|e| e.kind())
+}
+
+/// What `/etc/subuid` holds, or, in a test, what [`with_subuid`] stands in.
+#[cfg(unix)]
+fn subuid_file() -> Result<String, std::io::ErrorKind> {
+    #[cfg(test)]
+    if let Some(given) = SUBUID.with(|s| s.borrow().clone()) {
+        return given;
+    }
+    std::fs::read_to_string("/etc/subuid").map_err(|e| e.kind())
+}
+
+/// The owner of the directory above `path` that does not let this user
+/// search it, found from the root down; `None` when looking fails for any
+/// other reason, or nothing refuses.
+#[cfg(unix)]
+fn search_refused_by(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let mut down: Vec<&Path> = path.ancestors().collect();
+    down.reverse();
+    for pair in down.windows(2) {
+        match std::fs::symlink_metadata(pair[1]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return std::fs::symlink_metadata(pair[0]).ok().map(|m| m.uid());
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// This process's user, or, in a test, the one [`with_uid`] stands in.
+#[cfg(unix)]
+fn this_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = UID.with(std::cell::Cell::get) {
+        return uid;
+    }
+    crate::state::effective_uid()
+}
+
+#[cfg(test)]
+thread_local! {
+    static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static SUBUID: std::cell::RefCell<Option<Result<String, std::io::ErrorKind>>> =
+        const { std::cell::RefCell::new(None) };
+    static NSSWITCH: std::cell::RefCell<Option<Result<String, std::io::ErrorKind>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Have [`nsswitch_file`] answer `given` on this thread until what it
+/// returns is dropped.
+#[cfg(test)]
+pub(crate) fn with_nsswitch(given: Result<&str, std::io::ErrorKind>) -> NsswitchGuard {
+    NsswitchGuard(NSSWITCH.with(|s| s.replace(Some(given.map(str::to_owned)))))
+}
+
+/// Puts back what [`nsswitch_file`] answered before [`with_nsswitch`] when
+/// dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct NsswitchGuard(Option<Result<String, std::io::ErrorKind>>);
+
+#[cfg(test)]
+impl Drop for NsswitchGuard {
+    fn drop(&mut self) {
+        NSSWITCH.with(|s| *s.borrow_mut() = self.0.take());
+    }
+}
+
+/// Have [`this_uid`] answer `uid` on this thread until what it returns is
+/// dropped: a test's way to make its own directory someone else's.
+#[cfg(test)]
+pub(crate) fn with_uid(uid: u32) -> UidGuard {
+    UidGuard(UID.with(|u| u.replace(Some(uid))))
+}
+
+/// Puts back what [`this_uid`] answered before [`with_uid`] when dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct UidGuard(Option<u32>);
+
+#[cfg(test)]
+impl Drop for UidGuard {
+    fn drop(&mut self) {
+        UID.with(|u| u.set(self.0));
+    }
+}
+
+/// Have [`subuid_file`] answer `given` on this thread until what it returns
+/// is dropped: the file's text, or the error reading it gave.
+#[cfg(test)]
+pub(crate) fn with_subuid(given: Result<&str, std::io::ErrorKind>) -> SubuidGuard {
+    SubuidGuard(SUBUID.with(|s| s.replace(Some(given.map(str::to_owned)))))
+}
+
+/// Puts back what [`subuid_file`] answered before [`with_subuid`] when
+/// dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct SubuidGuard(Option<Result<String, std::io::ErrorKind>>);
+
+#[cfg(test)]
+impl Drop for SubuidGuard {
+    fn drop(&mut self) {
+        SUBUID.with(|s| *s.borrow_mut() = self.0.take());
+    }
+}
+
 /// Whether looking at a path failed because nothing is there.
 #[cfg(unix)]
 fn not_there(e: &std::io::Error) -> bool {
@@ -353,6 +736,12 @@ fn not_there(e: &std::io::Error) -> bool {
     )
 }
 
+/// Whether `alias` is the same file or directory as `path`, when `path` is
+/// there, neither followed through a link: refused when `alias` is not
+/// there, or is another, or either cannot be looked at. Where `path` is not
+/// there, nothing is checked and `alias` is denied as it is: so a mount of a
+/// part the place does not hold, perhaps from a stale root, is denied too,
+/// which denies more, never less.
 fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -399,17 +788,28 @@ fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
 /// paths with no link in them, and each filesystem mounted inside one.
+#[cfg(test)]
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    let listed = ids(mounts);
+    aliases_in(&Index::new(mounts), mounts, denied, &mut Points::new())
+}
+
+/// [`aliases`], in a table already indexed, with what the mount points show
+/// kept in `points`.
+fn aliases_in(
+    index: &Index<'_>,
+    mounts: &[Mount],
+    denied: &[PathBuf],
+    points: &mut Points,
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for path in denied {
-        aliases_of(mounts, &listed, path, &mut out)?;
+        aliases_of(index, path, &mut out, points)?;
         // What is mounted inside a denied directory is hidden there too.
         for inner in mounts
             .iter()
             .filter(|m| m.at != *path && m.at.starts_with(path))
         {
-            aliases_of(mounts, &listed, &inner.at, &mut out)?;
+            aliases_of(index, &inner.at, &mut out, points)?;
         }
     }
     out.sort();
@@ -497,11 +897,13 @@ pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>>
         return Ok(groups.iter().map(|_| Vec::new()).collect());
     };
     let mounts = parse(&table)?;
+    let index = Index::new(&mounts);
+    let mut points = Points::new();
     groups
         .iter()
         .map(|group| {
             let real: Vec<PathBuf> = group.iter().map(|p| real(p)).collect();
-            aliases(&mounts, &real)
+            aliases_in(&index, &mounts, &real, &mut points)
         })
         .collect()
 }

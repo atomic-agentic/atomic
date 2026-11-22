@@ -92,14 +92,19 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
     // The store the project's runs use: its SQLite database, or PostgreSQL
     // when ATOMIC_DATABASE_URL names one.
     let database = crate::engine::database(state)?;
-    let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
-        .await
-        .with_context(|| {
-            format!(
-                "open the gate store at {}",
-                crate::engine::describe(&database)
-            )
-        })?;
+    let rt = Durare::open(
+        &database,
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &crate::engine::store_project(state)?,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "open the gate store at {}",
+            crate::engine::describe(&database)
+        )
+    })?;
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,
@@ -175,18 +180,13 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
             Some(gate::Resolution::Defaulted { answer, .. }) => {
                 format!("silence selected {}", shown::value(answer))
             }
-            Some(gate::Resolution::Decided(d)) => match &d.answer {
-                Some(a) => format!(
-                    "answered {} by {}",
-                    shown::value(a),
-                    shown::line(d.by.as_str())
-                ),
-                None => format!(
-                    "{} by {}",
-                    format!("{:?}", d.verdict).to_lowercase(),
-                    shown::line(d.by.as_str())
-                ),
-            },
+            Some(gate::Resolution::Decided(d)) => {
+                let by = shown::line(d.by.as_str());
+                match &d.answer {
+                    Some(a) => format!("answered {} by {by}", shown::value(a)),
+                    None => format!("{} by {by}", format!("{:?}", d.verdict).to_lowercase()),
+                }
+            }
         };
         println!(
             "{}  {}  [{state}]",
@@ -265,12 +265,19 @@ pub(crate) async fn decide_as_operator(
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
-        atomic_core::log_line!(
-            "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
-             atomic runs resume {} delivers it",
-            found.run,
-            found.run
-        );
+        atomic_core::redact::Line::new()
+            .plain("warning: the decision is recorded, but waking run ")
+            .shown(&found.run)
+            .plain(" failed: ")
+            .redacted(&e.to_string())
+            .plain("; atomic serve or atomic runs resume ")
+            .shown(&found.run)
+            .plain(" delivers it")
+            .log();
+    }
+    // A park released while its run was down is delivered here too.
+    if let Err(e) = atomic_durable::release::redeliver(rt).await {
+        atomic_core::log_line!("warning: waking runs whose parks were released failed: {e}");
     }
     Ok(decision)
 }
@@ -283,9 +290,9 @@ async fn decide(
     verdict: Verdict,
     answer: Option<String>,
 ) -> anyhow::Result<()> {
-    let found = gate::find(rt, gate_id)
-        .await?
-        .with_context(|| format!("no gate {}", shown::line(gate_id)))?;
+    // Raw: an error is redacted, then escaped, where it is reported.
+    let missing = format!("no gate {gate_id}");
+    let found = gate::find(rt, gate_id).await?.context(missing)?;
     // Read as the prompt reads it.
     let answer = answer.map(|text| match &found.question {
         Some(q) => shown::answer(q, &text),
@@ -310,7 +317,7 @@ async fn decide(
         "{} {what} by {} ({})",
         shown::line(&found.id),
         shown::line(decision.by.as_str()),
-        decision.command
+        shown::line(&decision.command)
     );
     Ok(())
 }

@@ -87,9 +87,20 @@ container: each run labels its own with a token of its own
 (`org.atomic-agentic.dev-run`), and nothing else on the host is touched. The
 test Postgres stays up, since every run shares it. A run started with
 `ATOMIC_DEV_DETACHED=1`, as for `nohup scripts/dev.sh … &`, outlives the
-process that started it, as does one the system's first process starts.
+process that started it, as does one the system's first process starts. The
+watcher knows dev.sh and its parent by when each started as well as by its
+process id (on Linux the kernel's start time, which stepping the clock does
+not move), and checks dev.sh is still the process it started just before it
+signals it, so a process that took its number is not signalled, short of
+one ending and its number being taken in the moment between the check and
+the signal. A watcher that cannot start stops the run (exit 1) with a
+message saying so.
 `scripts/dev-sh-test.sh` runs on the host, with docker or podman, and checks
-each of these; it exits 75 at once while `ATOMIC_DEV_WAIT_LOCK` exists.
+each of these, with another run's container kept through every stop; it exits
+75 at once while `ATOMIC_DEV_WAIT_LOCK` exists. Its runs reach the engine
+through a shim that labels each container they make with the test's own
+token and lists and removes only those, and refuses every other engine
+command, so the test touches no container it did not start.
 
 ## The test database
 
@@ -189,10 +200,18 @@ of `/tmp`, and its denial of atomic's private state, to turns and to exec
 atoms' commands; the confinement of exec atoms' commands itself; and their
 network: none unless declared, and through the proxy only the declared hosts,
 on ports 80 and 443, never through another proxy, with the declaration checked
-when the atom loads and again before the command runs; and the artifact store's
+when the atom loads and again before the command runs, and loopback reachable
+only in a build with the test-only `exec-loopback-tests` feature; the runner
+process, `atomic runner`, hardened against same-user reads of its memory
+whether it is named first or after global flags, and given only `PATH` from
+the control plane's environment; the sandbox helper's outer stage, which
+holds a confined command's proxy token, made non-dumpable; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded; and that an exec atom's files move only through its
-workspace's backend), it
+turn is recorded, and what a run's input names from every sweep until the input
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
+that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -267,8 +286,12 @@ states a marker opens a block, and only a block holds clauses, so what is
 written under a line that opens none, or under a deeper heading that states
 none, is read as nothing. Each such line is refused with its line number:
 outside a block, every line that leads with a spelling of `accept` and ends in
-a colon, however it is wrapped or spelt (`Acceptance:`, `__Acceptance:__`,
-`**Acceptence:**`, `- **Acceptance, files and data:**`); within a block, every
+a colon, however that word is spelt, and however it is wrapped in markdown
+punctuation (`-`, `_`, `*`, `~`, `>` and `#`, with spaces), which may carry one
+bullet's mark in front of the word (`- `, `* `, `+ `, or a number, then `.` or
+`)`, then a space), as in `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+`- **Acceptance, files and data:**` and `1. **Acceptance, files and data:**`;
+within a block, every
 line that begins `**Acceptance` and is not a marker; and under a deeper
 heading, every bullet, of whatever shape. A clause carried onto its next line
 is read as one clause only when that line is indented by at least two spaces
@@ -284,6 +307,29 @@ clause its tests do not yet show in full is marked `pending:` with the reason,
 and the verdict names it. The Postgres and sandbox tests it lists need their
 backends, as in the test jobs, hence `ATOMIC_DEV_SANDBOX=on`.
 `scripts/acceptance-test.sh` (in CI) tests the check itself.
+
+### The v0.1 scenario
+
+`scripts/v01-gate.py` runs the v0.1 release's own scenario on a built binary
+and prints a transcript of it. It runs the order-report example's workflow and
+kills it twice with SIGKILL: once in the middle of a step, while the lite atom's
+model call is in flight, and once while the run waits at its gate. It recovers
+the run with `atomic runs resume` and approves the gate from a second
+invocation, then runs `atomic eval`. From what the store recorded, it checks
+that the run finished under the id it started with, that no completed step ran
+again, that the run stayed within the budget caps it started with and that the
+gate kept its deadline. A fake model on a loopback port answers every call and
+counts the calls, so it needs no provider and no network; exec atoms run in the
+sandbox, hence `ATOMIC_DEV_SANDBOX=on`:
+
+```bash
+scripts/dev.sh cargo build --release --locked -p atomic-agentic
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release/atomic
+```
+
+It works in a new directory under `target/` and removes it at the end;
+`--keep <dir>` works in `<dir>` and keeps it, but not under `/tmp` or
+`$TMPDIR`, where atomic refuses an atom's scratch.
 
 ## The crash suite
 
@@ -341,7 +387,7 @@ in turn:
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
 | Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a, M39a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
-| Build, lockfile and SBOM | `cargo build`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
+| Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
@@ -466,6 +512,14 @@ milestone suites pass at the candidate. Given a tag, or `latest` for Codex's
 latest release, it applies that candidate itself on any branch. To finish a
 bump, commit the `Cargo.lock` the workflow uploads, account for what
 `scripts/lock-check.sh` reports, and follow the other steps the script prints.
+
+atomic knows Codex's Linux sandbox helper by how Codex starts it, and a bump
+that changes that changes what atomic recognises as the helper. Check, in the
+candidate's `sandboxing` and `linux-sandbox` crates, that the helper's first
+arguments are still `--sandbox-policy-cwd`, alone or after
+`--inherit-pid-namespace`, and that the helper is still started under the
+name `codex-linux-sandbox`. Then update `LINUX_SANDBOX_ARG1` and
+`INHERIT_PID_NAMESPACE` in `crates/atomic-core/src/codex.rs` to match.
 
 `scripts/milestone-tests.sh` also runs locally:
 

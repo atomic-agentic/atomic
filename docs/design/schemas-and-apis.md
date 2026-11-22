@@ -85,9 +85,10 @@ independent of whichever Rust crate a caller uses to derive schemas.
 Importing an OpenAPI document gives a project a toolset (M15).
 
 - **One tool per operation.** The tool's input joins the path, query and header
-  parameters with the request body. Its output comes from the success response.
-  OpenAPI 3.1 already uses JSON Schema 2020-12; documents in the 3.0 dialect,
-  with keywords such as `nullable`, are translated first.
+  parameters with the request body. Its output is what its success responses
+  describe: one schema where they agree, `anyOf` of the distinct ones where
+  they differ. OpenAPI 3.1 already uses JSON Schema 2020-12; documents in the
+  3.0 dialect, with keywords such as `nullable`, are translated first.
 - **atomic sends the request.** A built-in HTTP executor performs every call. It
   takes credentials from secrets granted to that atom, only reaches base URLs the
   network policy allows, and applies rate limits and retries. Nothing the model

@@ -1,0 +1,1 @@
+run-stop-admission|crates/atomic/src/runs.rs|            halt.store(true, std::sync::atomic::Ordering::SeqCst);|            /*CONTROL_OFF*/|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test run_cli a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing

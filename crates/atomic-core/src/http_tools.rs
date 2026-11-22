@@ -19,11 +19,32 @@
 //! a 429 or a 5xx; others are sent once. Responses are bounded. A success
 //! is checked against the response the operation declares for its status
 //! (its own code, else its range, else `default`): its schema, if it has
-//! one. A success with a status the operation declares no response for,
-//! when it declares any, is refused; it was answered, so it is not sent
-//! again.
+//! one, and no body at all only where that response declares no `content`
+//! at all, as a `204` does. A schema declared only under a wildcard media
+//! type (`*/*`, `application/*`) counts as one, so such a response's body is
+//! read as JSON and has to fit it. Where that response declares schemas under
+//! several media types, the one its reply's `Content-Type` names governs —
+//! type and subtype compared case-insensitively, parameters such as `charset`
+//! ignored. A reply naming a media type that same response declares while
+//! keeping no schema for it is refused: its body is declared and nothing
+//! describes its shape, so another media type's schema — a wildcard's most of
+//! all — is not its contract. A reply whose `Content-Type` names none of them is held to
+//! the response's only schema where it has exactly one, which is what reaches a
+//! reply naming no media type at all and a reply of a media type the response
+//! never mentions, and refused where it has several, since nothing then says
+//! which governs. Every refusal names the media types the response declares,
+//! and none echoes the body; a media type longer than `MEDIA_ECHO_LIMIT` bytes
+//! is echoed cut short. A response that declares `content`
+//! atomic gets no schema from — a `text/plain` media type, a wildcard with no
+//! `schema`, or a JSON media type with no `schema` — declares a body whose
+//! shape nothing describes, so it is passed through unchecked. Because
+//! `default` is selected by every success no code or range declares, a
+//! contentless `default` refuses an undeclared success that comes back with
+//! a body; that is the restrictive reading, and it is deliberate. A success
+//! with a status the operation declares no response for, when it declares
+//! any, is refused; it was answered, so it is not sent again.
 
-use atomic_schema::openapi::Operation;
+use atomic_schema::openapi::{Operation, ResponseBody, media_essence};
 use reqwest::Url;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -100,7 +121,16 @@ pub enum CallError {
         /// What failed.
         message: String,
     },
-    /// The response breaks the schema the operation declares for its status.
+    /// The response breaks the contract the operation declares for its
+    /// status: it does not fit that response's schema, it carries a body
+    /// where that response declares no `content` at all, or its
+    /// `Content-Type` names a media type that response declares while keeping
+    /// no schema for it, or matches none of the schemas it declares when it
+    /// declares several. A response that declares content with no JSON schema to
+    /// check against is not a violation of it; its body is passed through
+    /// unchecked. The server answered, so the request was made and answered: for
+    /// a method that is not idempotent the call is done, even though its reply
+    /// was refused, and atomic does not send it again.
     #[error(
         "`{operation}` returned {status}, which does not fit its response `{response}`: {errors}"
     )]
@@ -134,6 +164,129 @@ fn redacted(headers: &[(String, String)]) -> Vec<String> {
         .iter()
         .map(|(name, _)| format!("{}: ***", name.to_ascii_lowercase()))
         .collect()
+}
+
+/// Whether a body carries nothing where the selected response declares no
+/// content: no bytes, or JSON's own whitespace only. A reply told to carry
+/// nothing may still frame an empty one, and whitespace carries nothing, so
+/// both read as no result. Form feed is not JSON whitespace, so a body of it
+/// is not blank here, and stays the parse failure it has always been.
+fn is_blank_body(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// The media type a reply names in its `Content-Type`, as
+/// [`media_essence`] compares media types: parameters dropped, case folded.
+/// `None` when it names no `Content-Type`, names one holding bytes atomic
+/// cannot read as text, or names an empty one — a reply that does not say
+/// what it is cannot be matched to a declared media type, which is how a
+/// reply naming none is treated.
+fn content_type_of(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(media_essence)
+        .filter(|essence| !essence.is_empty())
+}
+
+/// How many bytes of a media type an error may echo. A reply's
+/// `Content-Type` is the server's and a server can write one as long as it
+/// likes; naming what came back does not need the whole of it.
+const MEDIA_ECHO_LIMIT: usize = 100;
+
+/// `media` as an error echoes it: whole when it fits [`MEDIA_ECHO_LIMIT`]
+/// bytes, and otherwise that many bytes of it and an ellipsis. The cut steps
+/// back to a character boundary rather than split one.
+fn echo_media(media: &str) -> String {
+    if media.len() <= MEDIA_ECHO_LIMIT {
+        return media.to_owned();
+    }
+    let mut cut = MEDIA_ECHO_LIMIT;
+    while !media.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &media[..cut])
+}
+
+/// What to say when a reply names a media type its response declares no
+/// schema for: the media types the response declares, which is every media
+/// type its `content` map holds — each schema it keeps, and each media type
+/// beside them that keeps none — never the body.
+fn no_schema_declared(
+    media: Option<&str>,
+    schemas: &BTreeMap<String, Value>,
+    unkept: &[String],
+) -> String {
+    let mut types: Vec<&str> = schemas.keys().map(String::as_str).collect();
+    types.extend(unkept.iter().map(String::as_str));
+    types.sort_unstable();
+    types.dedup();
+    format!(
+        "{}, which its response declares no schema for; it declares {}",
+        match media {
+            Some(media) => format!("its reply is `{}`", echo_media(media)),
+            None => "its reply names no media type".to_owned(),
+        },
+        types.join(", ")
+    )
+}
+
+/// The schema a reply's body is held to, of the schemas its response declares
+/// (`declared`, each keyed by the media type the spec writes), the media types
+/// that same response declares while keeping no schema for them (`unkept`, as
+/// the spec writes them — see [`atomic_schema::openapi::ResponseBody::declared_media`])
+/// and the media type the reply named (`media`, `None` when it named none). The
+/// one declared under the reply's own media type governs it, media types compared
+/// by [`media_essence`]: type and subtype case-insensitively, parameters such as
+/// `charset` ignored; where a spec declares one media type twice, spelled two
+/// ways, the first of the two in the map's order is the one matched.
+///
+/// A reply naming a media type the response declares and keeps no schema for is
+/// refused there, whatever the count: that body is declared and no shape is
+/// described for it, so another media type's schema — a wildcard's beside it
+/// most of all — is not its contract. Every other reply the response leaves
+/// unmatched falls to its only schema, where it has exactly one, however the
+/// reply is typed: that is what holds a reply naming no media type, and a reply
+/// of a media type the response never mentions, to a schema declared under a
+/// wildcard. Where several schemas are declared and none is the reply's,
+/// nothing says which governs it, so it is refused too, and what the `Err` says
+/// names the media types the response declares. A reply of some other media
+/// type is held to no schema of its own: a response with one schema keeps
+/// having its body checked, as it always did.
+fn schema_declared<'a>(
+    declared: &'a BTreeMap<String, Value>,
+    unkept: &[String],
+    media: Option<&str>,
+) -> Result<&'a Value, String> {
+    let wanted = media.map(media_essence);
+    if let Some((_, schema)) = declared
+        .iter()
+        .find(|(key, _)| Some(media_essence(key)) == wanted)
+    {
+        return Ok(schema);
+    }
+    // The reply names a media type this response declares and keeps no schema
+    // for: it declares that body and says nothing of its shape, so the schema
+    // of another of its media types is not the contract for it.
+    let names_media_without_a_schema =
+        wanted.is_some_and(|wanted| unkept.iter().any(|media| media_essence(media) == wanted));
+    if names_media_without_a_schema {
+        return Err(no_schema_declared(media, declared, unkept));
+    }
+    // Nothing matched by name. Exactly one declared schema still governs the
+    // reply, however it is typed — several declare nothing about which would,
+    // and a response with none is the caller's pass-through, not this choice.
+    // A schema under a wildcard reaches a reply of any media type the response
+    // leaves unnamed, which is what the wildcard stands for; the reply refused
+    // above named a media type the response does name and keeps no schema for.
+    let mut schemas = declared.iter();
+    let (Some((_, only)), None) = (schemas.next(), schemas.next()) else {
+        return Err(no_schema_declared(media, declared, unkept));
+    };
+    Ok(only)
 }
 
 impl std::fmt::Debug for HttpToolset {
@@ -505,11 +658,17 @@ impl HttpToolset {
             message,
         };
         // Redirects are not followed: the next host would not be checked.
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| transport(e.to_string()))?;
+            .timeout(self.timeout);
+        // A service on this machine over plain http is reached directly: a
+        // proxy that HTTP_PROXY or ALL_PROXY names would see the toolset's
+        // credential in cleartext. Anything else uses the proxies the
+        // environment names.
+        if crate::lite::http_loopback(url.as_str()) {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().map_err(|e| transport(e.to_string()))?;
         let safe = matches!(
             method,
             reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::OPTIONS
@@ -535,15 +694,53 @@ impl HttpToolset {
                 }
             };
             let status = response.status();
+            // Which of the schemas the response declares governs the body is
+            // the reply's `Content-Type` to say, and that header goes with the
+            // response once its body is read.
+            let content_type = content_type_of(&response);
             let bytes = read_bounded(response).await.map_err(&transport)?;
             if status.is_success() {
-                let value = if bytes.is_empty() {
+                let code = status.as_u16();
+                let declared = self
+                    .operations
+                    .get(name)
+                    .and_then(|operation| operation.response(code));
+                // Only a response that declares no `content` at all declares
+                // no body: a `204`, or a `200` written with only a
+                // description. Anything that carries something with it
+                // breaks the contract, and is refused as such before it is
+                // parsed. A response that declares content atomic has no
+                // JSON schema for declares a body too, of a shape nothing
+                // describes, so what comes back is not held against it.
+                let mut nothing_declared = false;
+                if let Some((key, ResponseBody::NoBody)) = declared {
+                    nothing_declared = true;
+                    if !is_blank_body(&bytes) {
+                        return Err(CallError::Response {
+                            operation: name.to_owned(),
+                            status: code,
+                            response: key.to_owned(),
+                            errors: format!(
+                                "its response declares no body, and {} bytes were returned",
+                                bytes.len()
+                            ),
+                        });
+                    }
+                }
+                // An empty body is read as `null`. Reaching here with no
+                // content declared, the body is blank, and blank is no
+                // result either: the reply was told to carry nothing. Where
+                // a body was declared — a JSON schema, or a media type
+                // atomic does not read — only no bytes at all read as null;
+                // whitespace is not JSON, and stays the transport failure it
+                // has always been.
+                let value = if bytes.is_empty() || nothing_declared {
                     Value::Null
                 } else {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| transport(format!("the response is not JSON: {e}")))?
                 };
-                return self.check_response(name, status.as_u16(), value);
+                return self.check_response(name, code, content_type.as_deref(), value);
             }
             let error = CallError::Status {
                 operation: name.to_owned(),
@@ -560,20 +757,44 @@ impl HttpToolset {
 }
 
 impl HttpToolset {
-    /// `value`, the body of a success with `status`, if it fits the schema
-    /// the operation declares for that status (see
-    /// [`atomic_schema::openapi::Operation::response`]), or the operation
-    /// declares none to fit: a response it declares with no JSON body, such
-    /// as a `204`, has nothing to check, and an operation that declares no
-    /// response at all takes any. A success whose status the operation does
-    /// not declare, when it declares others, is refused.
-    fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
+    /// `value`, the body of a reply whose `Content-Type` is `content_type`,
+    /// if it fits the schema the operation declares for that status (see
+    /// [`atomic_schema::openapi::Operation::response`]), of which the one the
+    /// reply's media type names governs (see [`schema_declared`]), or the
+    /// operation declares none to fit: a response that declares content with
+    /// no JSON schema declares a body nothing describes, so any body fits; a
+    /// response with no content at all, such as a `204`, has nothing to
+    /// check here, because its caller has already refused one that carried a
+    /// body; and an operation that declares no response at all takes any. A
+    /// reply is refused on its media type in two cases: it names a media type
+    /// its response declares while keeping no schema for it, or it matches none
+    /// of the several schemas that response declares. A success whose status the
+    /// operation does not declare, when it declares others, is refused.
+    fn check_response(
+        &self,
+        name: &str,
+        status: u16,
+        content_type: Option<&str>,
+        value: Value,
+    ) -> Result<Value, CallError> {
         let Some(operation) = self.operations.get(name) else {
             return Ok(value);
         };
-        let (key, schema) = match operation.response(status) {
-            Some((key, Some(schema))) => (key, schema),
-            Some((_, None)) => return Ok(value),
+        let (key, chosen) = match operation.response(status) {
+            Some((
+                key,
+                ResponseBody::Json {
+                    schemas,
+                    declared_media,
+                },
+            )) => (key, schema_declared(schemas, declared_media, content_type)),
+            // Declares a body, declares no schema to fit it: passed through.
+            Some((_, _)) => return Ok(value),
+            // Declares no response at all. The map is empty, which is what an
+            // operation whose `responses` held only extensions has too, since
+            // a key naming no status is no response. A failure's key is kept,
+            // so a map holding only those is not empty and its success is
+            // refused below, as every success no response covers is.
             None if operation.responses.is_empty() => return Ok(value),
             None => {
                 return Err(CallError::Undeclared {
@@ -588,6 +809,9 @@ impl HttpToolset {
             response: key.to_owned(),
             errors,
         };
+        // Said as the response violation it is, with the media types the
+        // response declares and none of the body.
+        let schema = chosen.map_err(response)?;
         let validator = atomic_schema::registry::Registry::new()
             .validator_for(schema)
             .map_err(|e| response(e.to_string()))?;

@@ -1,0 +1,1 @@
+toolset-all-schemas-compile|crates/atomic/src/main.rs|                for (_media, schema) in body.schemas() {|                for (_media, schema) in body.schemas().take(1) {|-p atomic-agentic --test examples atomic_check_reads_openapi_toolsets

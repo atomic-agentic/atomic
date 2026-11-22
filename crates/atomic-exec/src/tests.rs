@@ -15,6 +15,8 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
+        secret_env: Default::default(),
     })
 }
 
@@ -71,6 +73,8 @@ fn no_shell_expands_the_arguments() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect("runs");
     assert_eq!(done.stdout, b"$HOME;`id`");
@@ -90,6 +94,8 @@ fn a_missing_program_cannot_start() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
@@ -474,6 +480,61 @@ fn a_scratch_root_a_sandboxed_turn_could_write_is_refused() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// No writable root may lie at or in a directory a workspace's commands are
+/// denied, its backend's scratch root or another backend's it is told to
+/// deny, where Codex's sandbox would reopen it writable; nor may a denied
+/// directory lie in a writable root. A refused workspace makes nothing.
+#[test]
+fn a_writable_root_in_a_denied_directory_is_refused() {
+    let src = source("in-denied");
+    let own = backend("in-denied");
+    let sibling = own
+        .scratch_root()
+        .with_file_name(format!("sibling-in-denied-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    let local = own.clone().denying([sibling.clone()]);
+    let opening_with = |roots: Vec<PathBuf>| Open {
+        writable_roots: roots,
+        ..opening(&src, "fix", "a1")
+    };
+    for (root, says) in [
+        (sibling.join("x"), "which a workspace's commands are denied"),
+        // At the denied root itself, which it would also cover.
+        (sibling.clone(), "where a sandboxed turn may write"),
+        (
+            local.scratch_root().join("y"),
+            "which a workspace's commands are denied",
+        ),
+        (
+            sibling.parent().expect("parent").to_owned(),
+            "where a sandboxed turn may write",
+        ),
+    ] {
+        let error = local
+            .open(&opening_with(vec![root.clone()]))
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains(says),
+            "{}: {error}",
+            root.display()
+        );
+        assert!(
+            !sibling.exists(),
+            "{}: the sibling root was made",
+            root.display()
+        );
+    }
+    let opened = local
+        .open(&opening_with(vec![std::env::temp_dir()]))
+        .expect("opens");
+    assert!(opened.denied.contains(&sibling), "{:?}", opened.denied);
+    assert!(sibling.is_dir(), "the sibling root was not made");
+    local.close(&opened).expect("closes");
+    let _ = workspace::remove_tree(local.scratch_root());
+    let _ = std::fs::remove_dir_all(&sibling);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 /// Every workspace on a backend shares one private temporary directory,
 /// outside every attempt's scratch.
 #[test]
@@ -594,6 +655,8 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
+        secret_env: Default::default(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
@@ -844,4 +907,171 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
         started.elapsed()
     );
     assert_eq!(done.stdout, b"done");
+}
+
+/// A backend's own scratch root inside a directory it also denies is left to
+/// that one, but only when it truly lies there: one that is a link to
+/// somewhere else is not covered by the directory its link sits in, and is
+/// denied itself.
+#[cfg(unix)]
+#[test]
+fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/atomic-exec-tests")
+        .join(format!("outermost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (home, elsewhere) = (base.join("scratch"), base.join("elsewhere"));
+    std::fs::create_dir_all(home.join("p")).expect("home");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let inside = home.join("p/run");
+    std::fs::create_dir_all(&inside).expect("inside");
+    let linked = home.join("p/debug");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+    assert_eq!(
+        workspace::outermost(&[inside.clone(), home.clone()]),
+        vec![home.clone()],
+        "a root truly inside is left to the outer one"
+    );
+    assert_eq!(
+        workspace::outermost(&[linked.clone(), home.clone()]),
+        vec![linked.clone(), home.clone()],
+        "a root linked elsewhere is denied itself"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A scratch root no longer used is retired: dead attempts go, and the root
+/// with them once only its dot-entries are left. An attempt whose owner may
+/// still run, or an entry that does not say whose it is, keeps it.
+#[test]
+fn an_old_scratch_root_goes_only_once_nothing_live_is_in_it() {
+    let make = |tag: &str| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-exec-tests")
+            .join(format!("retire-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dead = root.join("fix-0123/999999999.1-a0");
+        std::fs::create_dir_all(&dead).expect("dead attempt");
+        std::fs::write(dead.join("secret"), "a dead turn's HOME").expect("secret");
+        std::fs::create_dir_all(root.join(".tmp")).expect("shared tmp");
+        root
+    };
+    let gone = make("dead");
+    assert!(
+        retire_scratch_root(&gone).expect("retired"),
+        "the root stayed"
+    );
+    assert!(!gone.exists());
+    assert!(
+        retire_scratch_root(&gone).expect("again"),
+        "a root already gone is retired"
+    );
+
+    let live = make("live");
+    let mine = live
+        .join("check-4567")
+        .join(tagged(std::process::id(), "a1"));
+    std::fs::create_dir_all(&mine).expect("live attempt");
+    assert!(!retire_scratch_root(&live).expect("kept"));
+    assert!(mine.exists(), "a live attempt's scratch went");
+    assert!(
+        !live.join("fix-0123/999999999.1-a0").exists(),
+        "the dead attempt beside it stayed"
+    );
+
+    let unknown = make("unknown");
+    std::fs::write(unknown.join("left-by-someone"), "x").expect("unknown entry");
+    assert!(!retire_scratch_root(&unknown).expect("kept"));
+    assert!(unknown.join("left-by-someone").exists());
+
+    let _ = std::fs::remove_dir_all(&live);
+    let _ = std::fs::remove_dir_all(&unknown);
+}
+
+/// A command's secret variables reach it on a Unix socket whose descriptor
+/// its environment names, and are never in its environment. The socket,
+/// unlike a pipe, cannot be reopened through /proc.
+#[test]
+fn secret_variables_reach_a_command_on_a_socket_and_never_its_environment() {
+    const PROBE: &str = r#"import errno, json, os, stat, sys
+fd = int(os.environ['ATOMIC_SECRET_ENV_FD'])
+try:
+    open('/proc/self/fd/%d' % fd, 'rb').read()
+    reopened = 'reopened'
+except OSError as e:
+    reopened = errno.errorcode.get(e.errno, str(e.errno))
+data = b''
+while True:
+    chunk = os.read(fd, 4096)
+    if not chunk:
+        break
+    data += chunk
+json.dump({
+    'k': os.environ.get('K'),
+    'value_in_env': any('the-secret-value' in v for v in os.environ.values()),
+    'socket': stat.S_ISSOCK(os.fstat(fd).st_mode),
+    'reopened': reopened,
+    'read': data.decode(),
+    'only': os.environ.get('ONLY'),
+}, sys.stdout)
+"#;
+    let done = LocalBackend::default()
+        .run(&Command {
+            program: "python3".into(),
+            args: vec!["-c".into(), PROBE.into()],
+            cwd: std::env::temp_dir(),
+            env: vec![("ONLY".into(), "this".into())],
+            time_limit: Duration::from_secs(10),
+            output_limit: 4096,
+            secret_env: SecretEnv(vec![("K".into(), "the-secret-value".into())]),
+            ..Command::default()
+        })
+        .expect("runs");
+    assert!(done.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let got: serde_json::Value = serde_json::from_slice(&done.stdout).expect("json");
+    assert_eq!(got["k"], serde_json::Value::Null, "{got}");
+    assert_eq!(got["value_in_env"], false, "{got}");
+    assert_eq!(got["only"], "this", "{got}");
+    assert_eq!(got["socket"], true, "{got}");
+    assert_eq!(got["read"], "K=the-secret-value\u{0}", "{got}");
+    #[cfg(target_os = "linux")]
+    assert_eq!(got["reopened"], "ENXIO", "{got}");
+    // Its Debug form names the variable and hides its value.
+    let shown = format!(
+        "{:?}",
+        SecretEnv(vec![("K".into(), "the-secret-value".into())])
+    );
+    assert_eq!(shown, r#"["K=<hidden>"]"#);
+}
+
+/// Secret variables cross as `KEY=VALUE` entries each ended by NUL: a name
+/// that is empty or holds `=` or NUL, or a value that holds NUL, cannot be
+/// sent, and what is read must end with its terminator.
+#[test]
+fn secret_variables_cross_only_as_well_formed_entries() {
+    let one = SecretEnv(vec![("K".into(), "v=w".into())]);
+    let bytes = one.encode().expect("encodes");
+    assert_eq!(bytes, b"K=v=w\0");
+    assert_eq!(SecretEnv::decode(&bytes).expect("decodes"), one);
+    assert_eq!(SecretEnv::decode(b"").expect("none"), SecretEnv::default());
+    for bad in [("", "v"), ("K=", "v"), ("K\0", "v"), ("K", "v\0")] {
+        let bad = SecretEnv(vec![(bad.0.into(), bad.1.into())]);
+        assert!(bad.encode().is_err(), "{bad:?}");
+    }
+    assert!(SecretEnv::decode(b"K=v").is_err(), "no terminator");
+    assert!(SecretEnv::decode(b"K=v\0\0").is_err(), "an empty entry");
+    assert!(SecretEnv::decode(b"Kv\0").is_err(), "no `=`");
+}
+
+/// A secret socket's descriptor must be past the standard three, and a
+/// socket, on every Unix.
+#[cfg(unix)]
+#[test]
+fn a_secret_socket_is_past_the_standard_three_and_a_socket() {
+    assert!(!process::above_stdio(&2));
+    assert!(!process::above_stdio(&-1));
+    assert!(process::above_stdio(&3));
+    assert!(process::is_socket_mode(libc::S_IFSOCK | 0o600));
+    assert!(!process::is_socket_mode(libc::S_IFIFO | 0o600));
+    assert!(!process::is_socket_mode(libc::S_IFREG | 0o600));
 }

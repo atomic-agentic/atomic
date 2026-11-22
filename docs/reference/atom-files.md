@@ -51,10 +51,13 @@ atomic's environment.
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
-`private/`, the current project's Codex records, the credential and key
-directories) and the places in your home directory where credentials are
+`private/`, every project's Codex records among it, the credential and key
+directories), the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
-[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
+[configuration](#configuration)), and every other attempt's scratch
+directory in the atomic home's `scratch/`, of this project or another, live
+or not, whether a turn's, another exec step's or that of `atomic debug
+codex-prompt` or `atomic debug probe`. It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
@@ -81,7 +84,10 @@ longer find through `HOME`; it cannot set `HOME`, `ZDOTDIR`, `TMPDIR` or
 `ATOMIC_TURN_TMPDIR`, nor a variable the dynamic loader reads (`LD_*`,
 `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code into the
 sandbox helper, nor one that makes a shell run a file or command as it starts
-(`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
+(`BASH_ENV`, `ENV`, `PROMPT_COMMAND`). Neither kind can set
+`ATOMIC_SANDBOX_PLACES` or `ATOMIC_SANDBOX_RELISTED`, which atomic uses to
+hand the sandbox helper the places a command's deny list was made with, and
+to mark a helper started again with more denied.
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
 bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
@@ -151,8 +157,8 @@ is not, the copies are only marked read-only, and changing one changes only
 the copy. Handing files over is supported on Linux and macOS; on Windows an
 output that names a file is refused.
 
-Both directories are inside the command's scratch directory, in the project's
-state directory, and go when the step ends; what a killed process left is
+Both directories are inside the command's scratch directory, in the atomic
+home's `scratch/`, and go when the step ends; what a killed process left is
 removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
 `ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
@@ -174,7 +180,8 @@ export const config = {
 ```
 
 `network.allow` lists DNS names, each a name with at least two labels or `*.`
-and such a name for its subdomains, up to 32 of them. `network: false`, or no
+and such a name for its subdomains, as far as the Public Suffix List allows
+(see below), up to 32 of them. `network: false`, or no
 `network` at all, means none. On Linux the command then gets a network of its
 own whose only way out is a proxy atomic runs for it, which forwards a request
 only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
@@ -192,6 +199,25 @@ process and no other user's process can use the proxy, unless it has
 process of your own user that runs outside any sandbox is not kept out: it
 can enter the command's namespaces and use the sandbox's own route to the
 proxy. Once the command ends, its token admits no new connection.
+
+Each command that declares hosts is admitted against a budget of open files:
+its sandbox keeps at most 128 connections to the proxy open at once, and
+atomic reserves two open files for each (the command's and one upstream) and a
+few to spare, and the commands that declare hosts may reserve no more than
+half of atomic's limit on open files between them. When they need more room,
+atomic first raises its own limit as far as the hard limit allows, up to
+65536, and the commands it starts afterwards inherit that; a command that
+would still pass it does not start, and says so, and its step fails rather
+than waits. To run more of them at once, raise atomic's hard limit on open
+files, or start it with a higher soft limit. The budget holds while the hosts
+a command reaches answer and close as they should; it is not a limit the proxy
+enforces. The proxy answers an HTTPS `CONNECT` before it dials and sets no
+time limit of its own on the dial (the kernel's connect timeout still
+applies), may dial more than one of a host's addresses for one connection,
+keeps a connection's files for a while after the command has dropped it, and
+keeps a tunnel open until the host closes it, so a command that keeps opening
+and abandoning connections to a host that never answers can take more than its
+share, and can leave atomic short of open files.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
@@ -219,9 +245,10 @@ proxy that refuses it.
 Know what a listed host can get:
 
 - **Anything the command can read.** It can send a listed host whatever it
-  reads, which is the project and most of the filesystem, including files such
-  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
-  is denied to it.
+  reads, which is the project and most of the filesystem. What is denied to it,
+  atomic's private state and, on Linux, the places where credentials are kept,
+  such as `~/.ssh` and `~/.aws`, is listed under
+  [configuration](#configuration); anything else it can read, it can send.
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
@@ -229,12 +256,20 @@ Know what a listed host can get:
   Public Suffix List, its ICANN section (`co.uk`) and its private one, where
   each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
   is refused when the atom loads if the name under it is on the list, or if
-  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  a wildcard rule on the list makes the names just below it suffixes
+  (`*.run.app`, `*.kawasaki.jp`); an exception to such a rule is one site, so
+  `*.city.kawasaki.jp` loads. That refuses
   `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
   others: name the exact hosts instead. A wildcard above a listed name, such
   as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
   it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
-  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  someone else's site under `s3.amazonaws.com`. A plain HTTP request refused
+  this way carries the reason `crosses_public_suffix`, not `not_allowed`. An
+  HTTPS `CONNECT` is refused with a line of text that does not name the
+  reason: for this one it is the proxy's generic "Request blocked by network
+  policy.", not the "Domain not in allowlist." an unlisted host gets, so
+  `sts.us-east-1.amazonaws.com` under `*.amazonaws.com` is refused without
+  saying why. List it exactly to reach it. A wildcard under a name you
   hold, such as `*.example.com`, still reaches whatever is served under it,
   and a shared host missing from the list is not caught. List exact names
   where you can.
@@ -398,8 +433,43 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as what it
+variables, `KUBECONFIG`, `CLOUDSDK_CONFIG` and others) put them. Workload
+token files are denied too:
+
+- the files `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE` and
+  `GOOGLE_APPLICATION_CREDENTIALS` name, one named relative to atomic's
+  working directory as the SDKs read it;
+- the token files Google's credentials name, there or in the application
+  default credentials gcloud writes: an external account's source file, the
+  file its executable keeps a token in, and those of the credentials an
+  impersonated account is configured with;
+- every `web_identity_token_file` setting in your AWS configuration and
+  credentials files, written with `=` or `:`, both with and without a `#` or
+  `;` comment after it;
+- the whole projected volume when such a file is in one Kubernetes mounts,
+  found through any links that lead to it, so the token it rotates in next
+  is denied as well;
+- the usual token directories, whether or not anything names them: EKS's
+  `/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+  `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, the pod's own
+  `/var/run/secrets/kubernetes.io/serviceaccount`, and Azure workload
+  identity's `/var/run/secrets/azure/tokens`.
+
+A configuration atomic reads for the token files it names stops the run,
+with a message naming it, when it cannot be read whole, rather than leaving a
+token it may name readable: when it cannot be opened (this user may not read
+it, say), is not a plain file, is larger than any such file is, is not JSON
+or text, or gives a field that names a file a value that is not text. One
+that is not there, or is a device, as `/dev/null` is when a variable turns a
+configuration off, names nothing. An ordinary token file is denied by its
+path each time a command starts, so one replaced there is denied to the next
+command. A token given as a value rather than a file, such as
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
+only a few core variables and those its atom declares, and the credential
+endpoints AWS serves on link-local and unique-local addresses are out of its
+reach, since a command reaches no private or local address. A link among
+them, up to four directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
@@ -427,35 +497,81 @@ any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
 overlay) mounted more than once whose root the kernel shows as lost, as
 when a FUSE server is away or another Ceph client renamed the directory;
 or when, on such a filesystem, the place is there and its second place is
-missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
-virtiofs and other mounts are followed as local ones are. The
-links followed and the second mounts found together come to at most 512;
+missing, is another file or directory, or is a link, which is not
+followed, or the place, or the part of it a second mount shows, cannot be
+looked at for a reason other than not being there. A second mount of part
+of a place is checked against that part. On any filesystem, nothing runs
+when another of its mounts is the same directory as a denied place, or as
+a directory above it on the mount the place is under, and the mount
+table's root for it does not say so: the root has gone stale with nothing
+to mark it, as an overlay's does when a lower directory under a bound
+overlay directory is renamed. A mount point that is not there is passed
+over, and so is one behind a directory you may not search that someone
+else owns, by a uid you cannot map (`/etc/subuid`, or any uid when
+`/etc/nsswitch.conf` takes subordinate uids from a directory service);
+behind one of your own, or of a uid you may map, which a command could
+step around from a user namespace of its own, nothing runs, and nor does
+it for a denied place that cannot be looked at. Otherwise FUSE
+(`fuse.*`), 9p, virtiofs and other mounts are followed as local ones are.
+The links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
 inside another, mounted twice as two filesystems, each with a device of its
 own, such as with 9p, NFS with `nosharecache` or with mount options that
 differ (each gets a superblock of its own), Ceph (one per server path), two
 SMB sessions or two FUSE daemons, neither of which is denied for the other;
 a stale root, off a local filesystem, for a place that is not there yet,
-and one, on any filesystem, that makes a second mount look unrelated to a
-denied place, such as a bound overlay directory whose lower directory was
-renamed beneath it;
+and one, on any filesystem, that makes a mount of a directory inside a
+denied place look unrelated to it, or, being the root of the place's own
+mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
-mount made after the list, or a root that goes stale after it, such as a
-mount an automount makes when a path is
-first used, even from inside the sandbox, which sees the host's new mounts
-until the next turn. A turn does
+mount made while a command runs, or a root that goes stale after the
+list, such as a mount an automount makes when a path is first used, even
+from inside the sandbox, which sees the host's new mounts: it is not
+denied to the command that runs then. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
-a command could move the directory above it away from its denial. The model
+a command could move the directory above it away from its denial. Nor
+does it start when a denied place is named through a link inside a
+directory it may write, which a command could point elsewhere; when a
+denied place lies in a directory it may write that it is given through a
+link, rather than by its real path; or when a token file is named relative
+while atomic's own working directory is unknown. Each place is denied under
+its real path, which denies it under every spelling. Nor does it start
+when a denied place is a link atomic cannot resolve for a reason other
+than leading nowhere yet, such as a link to itself or into a directory you
+may not search: remove the link, or point it at something atomic can
+reach. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
-denied only to later commands, and a link made after the list is not
-followed until the next turn. Credentials kept anywhere else are not
-covered.
+denied only to later commands, and so is what a link made later inside a
+denied place points at, which each command looks for again as it starts,
+in the places the list was made with, and denies at its second mounts too,
+and so is a second mount of what the list denies made since it was built,
+or of Codex's home, whose databases are denied there too, as each command
+reads the mount table again; a command whose new link or new second mount
+leads somewhere atomic would refuse to deny, or whose denied place has
+become a link atomic cannot resolve for a reason other than leading
+nowhere, does not start. As each command starts, the links up to four
+levels inside the places that lead outside them to something atomic would
+deny, old and new, each target counted once, together with the second
+mounts of what the new ones point at, of everything the list denies (its
+own second mounts among them, so each pair is counted from both sides) and
+of Codex's home, come to at most 512; past that, the command does not
+start, and the list is counted the same way when the turn starts.
+A link or a mount made in the moment between that look and the sandbox's
+start, or while a long-lived command, such as a turn's unified-exec
+session, keeps running, is followed only from the next command. The file operations Codex
+makes for a turn itself, such as applying a patch, go through a helper that
+is not handed the places: it walks the list's own entries instead, so for
+them a place that was already a link when the list was made is not
+followed again: not when it has been pointed elsewhere since, not when it
+led nowhere then and leads somewhere now, and not for new links inside it
+when it leads to a directory atomic never denies. Credentials kept
+anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,

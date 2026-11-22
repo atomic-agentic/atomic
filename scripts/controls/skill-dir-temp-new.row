@@ -1,0 +1,1 @@
+skill-dir-temp-new|crates/atomic/src/setup.rs|    const NEW_NOT_THROUGH_A_LINK: [libc::c_int; 2] = [libc::O_EXCL, libc::O_NOFOLLOW];|    const NEW_NOT_THROUGH_A_LINK: [libc::c_int; 2] = [libc::O_TRUNC, 0];|-p atomic-agentic --bin atomic -- a_temporary_is_never_made_through_a_link_at_its_name

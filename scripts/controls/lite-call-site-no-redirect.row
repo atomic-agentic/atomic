@@ -1,0 +1,1 @@
+lite-call-site-no-redirect|crates/atomic-core/src/lite.rs|    let client = model_client(&runtime.endpoint.base_url, runtime.timeout)?;|    let client = reqwest::Client::builder().timeout(runtime.timeout).build()?;|-p atomic-agentic-core --lib --features fake-model a_lite_atoms_endpoint_that_redirects_is_not_followed

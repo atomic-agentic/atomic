@@ -1,0 +1,1 @@
+checkout-state-walk|crates/atomic/tests/fixture_cli.rs|Err(e) => panic!("cannot list {} to compare it: {e}", at.display()),|Err(_) => continue, // CONTROL_OFF: a directory that cannot be listed is skipped|-p atomic-agentic --features atomic-agentic/sandbox-tests --test fixture_cli -- the_state_a_checkout_is_compared_by_sees_what_git_does_not

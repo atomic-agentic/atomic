@@ -1,0 +1,1 @@
+signin-failed-login-keeps|crates/atomic-core/src/signin.rs|        if outcome.is_err() && self.made {|        if outcome.is_err() {|-p atomic-agentic-core --lib signin::tests::a_failed_login_keeps_a_directory_it_did_not_make

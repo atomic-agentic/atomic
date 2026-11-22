@@ -1,0 +1,1 @@
+signin-made-retry|crates/atomic-core/src/signin.rs|                Ok(()) => existed = Some(false),|                Ok(()) => existed = Some(true), /*CONTROL_OFF*/|-p atomic-agentic-core --lib signin::tests::a_directory_removed_while_it_is_found_is_made_and_known_to_be

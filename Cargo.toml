@@ -66,6 +66,8 @@ sha2 = "0.10"
 hmac = "0.12.1"
 getrandom = "0.3.4"
 libc = "0.2.186"
+# getifaddrs, at a version already in the lockfile.
+nix = { version = "0.29", features = ["net"] }
 # The Public Suffix List, at the version Codex locks.
 psl = "2.1.184"
 # The filter that keeps a sandboxed command off the kernel keyrings; Codex's version.

@@ -119,20 +119,34 @@ pub(crate) async fn settled<T>(
         // (`atomic_core::runtime::keep_trying_past_the_limit`).
         Err(AtomError::NoRoom(why)) => {
             atomic_core::log_line!("atomic: {why}");
-            atomic_core::log_line!(
-                "atomic: {place} stays unfinished, with nothing recorded; continue it with \
-                 `atomic runs resume` once the execution backend has room"
-            );
+            atomic_core::redact::Line::new()
+                .plain("atomic: ")
+                .shown(place)
+                .plain(
+                    " stays unfinished, with nothing recorded; continue it with `atomic runs \
+                     resume` once there is room: on the execution backend, or on the disk for \
+                     the run's build caches or the step's worktree directory",
+                )
+                .log();
             // Whatever else this process started ends first.
             atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(NO_ROOM_EXIT);
         }
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
-            atomic_core::log_line!("atomic serve: {place}: {why}");
-            atomic_core::log_line!(
-                "atomic serve: {place} stays unfinished, with nothing recorded, until atomic \
-                 serve is started where the sandbox can start; other runs go on"
-            );
+            atomic_core::redact::Line::new()
+                .plain("atomic serve: ")
+                .shown(place)
+                .plain(": ")
+                .redacted(&why)
+                .log();
+            atomic_core::redact::Line::new()
+                .plain("atomic serve: ")
+                .shown(place)
+                .plain(
+                    " stays unfinished, with nothing recorded, until atomic serve is started \
+                     where the sandbox can start; other runs go on",
+                )
+                .log();
             if counted {
                 crate::pipeline::set_aside();
             }
@@ -151,7 +165,10 @@ pub(crate) async fn settled<T>(
 /// `atomic serve` from reaching the arm here that stops the process.
 pub fn atom_failure(e: AtomError) -> DurableError {
     match e {
-        AtomError::Budget(why) => DurableError::Parked(why),
+        AtomError::Budget(refusal) => DurableError::Parked {
+            reason: refusal.reason,
+            scope: refusal.scope,
+        },
         // Nothing ran, and nothing will on this machine until it is fixed:
         // the process stops, recording nothing, and the run waits to be
         // resumed where atoms' commands can be confined.
@@ -171,7 +188,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
             atomic_core::log_line!("atomic: {why}");
             atomic_core::log_line!(
                 "atomic: stopping without recording an outcome; continue the run with `atomic \
-                 runs resume` once the execution backend has room"
+                 runs resume` once there is room: on the execution backend, or on the disk for \
+                 the run's build caches or the step's worktree directory"
             );
             // Whatever else this process started ends first.
             atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));

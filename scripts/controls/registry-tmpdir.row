@@ -1,0 +1,1 @@
+registry-tmpdir|crates/atomic-core/src/codex.rs|        std::env::set_var("TMPDIR", tmp);|        let _ = tmp;|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test shell_env a_turns_patches_keep_their_sandbox_registry_with_its_commands

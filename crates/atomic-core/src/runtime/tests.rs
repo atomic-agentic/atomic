@@ -81,6 +81,12 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
     }
 }
 
+/// The backend for this module's Codex turns, which run without Codex's
+/// sandbox helper, so nothing may be denied to them: see `denying_nothing`.
+fn helperless() -> atomic_exec::Backend {
+    crate::testing::denying_nothing(Default::default())
+}
+
 /// Both runtimes, on the same fake model.
 fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     let codex = runtime(model, tag);
@@ -88,7 +94,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     Runtimes {
         codex,
         lite,
-        backend: Default::default(),
+        backend: helperless(),
         exec_meter: Default::default(),
         clock: None,
     }
@@ -111,7 +117,7 @@ fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
                 text: "Export crashes on é.".into(),
             },
             &rt,
-            &Default::default(),
+            &helperless(),
         )
         .await
         .expect("runs");
@@ -163,14 +169,7 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
                     .await
                     .expect("fake model");
             let rt = runtime(&model, "bad");
-            match run_codex_atom(
-                &Classify,
-                &Note { text: "n".into() },
-                &rt,
-                &Default::default(),
-            )
-            .await
-            {
+            match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await {
                 Err(AtomError::Schema {
                     message,
                     answer: got,
@@ -189,14 +188,7 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
             .await
             .expect("fake model");
         let rt = runtime(&model, "invalid");
-        match run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        {
+        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await {
             Err(AtomError::Validation(_)) => {}
             other => panic!(
                 "expected a validation error after {} model calls, got {other:?}",
@@ -217,14 +209,9 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "repair-ok");
-        let (out, meta) = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        .expect("repaired");
+        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+            .await
+            .expect("repaired");
         assert_eq!(out.category, "question");
         assert_eq!((model.calls(), meta.turns), (2, 2));
         assert_eq!(meta.total_tokens, 4, "two calls of 2 tokens each");
@@ -247,14 +234,7 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "repair-fails");
-        match run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        {
+        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await {
             Err(AtomError::Schema { answer, .. }) => assert_eq!(answer, "still not json"),
             other => panic!("expected a schema error, got {other:?}"),
         }
@@ -617,7 +597,7 @@ fn compiler_failures_never_spend_a_repair_call() {
                 .await
                 .expect("fake model");
             let rt = runtime(&model, "compiler-infrastructure");
-            let exec = atomic_exec::Backend::default();
+            let exec = helperless();
             let backend = Backend::Codex(&rt, &exec);
             let contract = json!({"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}});
             let validator = jsonschema::validator_for(&contract).expect("schema");
@@ -984,14 +964,9 @@ fn an_answer_that_is_one_fenced_json_block_is_read_as_its_contents() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "fenced");
-        let (out, meta) = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        .expect("accepted");
+        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+            .await
+            .expect("accepted");
         assert_eq!(out.category, "bug");
         assert_eq!((model.calls(), meta.turns), (1, 1), "no repair turn");
     });
@@ -1006,14 +981,9 @@ fn a_codex_atom_off_openai_states_its_schema_in_its_instructions() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "schema-in-prompt");
-        run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        .expect("runs");
+        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+            .await
+            .expect("runs");
         let request = model.requests()[0].to_string();
         assert!(
             request.contains("follows this JSON Schema"),
@@ -1333,8 +1303,32 @@ fn exec_declarations_are_checked_at_load() {
             "set by atomic",
         ),
         (
+            "kind: 'codex', env: { ATOMIC_SECRET_ENV_FD: '3' }",
+            "set by atomic",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SECRET_ENV_FD: '3' }",
+            "set by atomic",
+        ),
+        (
             "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_TURN_TMPDIR: '/x' }",
             "set by atomic",
+        ),
+        (
+            "kind: 'codex', env: { ATOMIC_SANDBOX_RELISTED: '1' }",
+            "marks Codex's sandbox helper",
+        ),
+        (
+            "kind: 'codex', env: { ATOMIC_SANDBOX_PLACES: '[]' }",
+            "carries the places its sandbox denies",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SANDBOX_PLACES: '[]' }",
+            "carries the places its sandbox denies",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SANDBOX_RELISTED: '1' }",
+            "marks Codex's sandbox helper",
         ),
         (
             "kind: 'exec', exec: { command: ['x'] }, env: { HOME: '/x' }",
@@ -1524,6 +1518,12 @@ impl Recording {
     fn backend(&self) -> atomic_exec::Backend {
         atomic_exec::Backend::connect(self.clone()).expect("connects")
     }
+
+    /// The backend for Codex turns, which run here without Codex's sandbox
+    /// helper, so nothing may be denied to them: see `denying_nothing`.
+    fn turn_backend(&self) -> atomic_exec::Backend {
+        crate::testing::denying_nothing(self.backend())
+    }
 }
 
 impl ExecutionBackend for Recording {
@@ -1620,7 +1620,7 @@ fn every_kind_of_atom_runs_through_its_execution_backend() {
 
         let codex = Recording::default();
         let rt = runtime(&model, "seam-codex");
-        let backend = codex.backend();
+        let backend = codex.turn_backend();
         run_codex_atom(&Classify, &note, &rt, &backend)
             .await
             .expect("runs");
@@ -1691,7 +1691,7 @@ fn a_run_whose_workspace_cannot_be_opened_sends_and_runs_nothing() {
         };
 
         let rt = runtime(&model, "seam-refuse");
-        let backend = refusing.backend();
+        let backend = refusing.turn_backend();
         let r = run_codex_atom(&Classify, &note, &rt, &backend).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no room on this backend")),
@@ -1743,7 +1743,7 @@ fn a_failed_run_closes_its_workspace() {
         .expect("fake model");
         let codex = Recording::default();
         let rt = runtime(&model, "seam-fail");
-        let backend = codex.backend();
+        let backend = codex.turn_backend();
         let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await;
         assert!(matches!(&r, Err(AtomError::Schema { .. })), "{r:?}");
         assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
@@ -1782,7 +1782,7 @@ fn a_codex_atom_whose_workspace_has_no_shell_sends_nothing() {
             ..Recording::default()
         };
         let rt = runtime(&model, "seam-no-shell");
-        let backend = shell_less.backend();
+        let backend = shell_less.turn_backend();
         let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no shell")),
@@ -1810,7 +1810,7 @@ fn an_unavailable_workspace_is_waited_for() {
             ..Recording::default()
         };
         let rt = runtime(&model, "seam-busy");
-        let backend = busy.backend();
+        let backend = busy.turn_backend();
         run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend)
             .await
             .expect("runs once the backend has room");
@@ -1823,7 +1823,7 @@ fn an_unavailable_workspace_is_waited_for() {
             unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             ..Recording::default()
         };
-        let backend = full.backend();
+        let backend = full.turn_backend();
         let waiting = tokio::spawn(async move {
             run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await
         });
@@ -1837,6 +1837,78 @@ fn an_unavailable_workspace_is_waited_for() {
         waiting.abort();
         assert!(waiting.await.expect_err("stopped").is_cancelled());
         assert_eq!(model.calls(), 1, "nothing more was sent");
+    });
+}
+
+/// An exec step's build caches are made in each attempt to open its
+/// workspace, as the backend's room is waited for: caches the disk is too
+/// full for wait, opening nothing meanwhile, and caches that cannot be made
+/// for another reason fail the step at once.
+#[test]
+fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
+    use std::sync::atomic::AtomicUsize;
+    on_codex_runtime(async {
+        let (dir, a, _) = exec_project("exec-room", TOTAL, "");
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        // The backend has no room twice: the caches are there for the try
+        // that opens.
+        let busy = Recording {
+            unavailable: Arc::new(AtomicUsize::new(2)),
+            ..Recording::default()
+        };
+        let caches = crate::worktree::Caches::new(dir.join("state/cache/run-1-ab"));
+        let guard = open_exec_workspace(&a, &identity, busy.backend().shared(), Some(&caches))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(busy.calls(), ["open total"; 3]);
+        assert!(caches.dir().is_dir());
+        guard.close().await;
+
+        // The disk is full for the first two tries at making them: the step
+        // waits, and the backend is asked only once they are made.
+        let full = crate::worktree::Caches::new(dir.join("state/cache/run-2-cd"));
+        crate::worktree::FAIL_FOR_TESTS.lock().expect("fail").push((
+            full.dir().to_owned(),
+            std::io::ErrorKind::StorageFull,
+            2,
+        ));
+        let room = Recording::default();
+        let guard = open_exec_workspace(&a, &identity, room.backend().shared(), Some(&full))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(room.calls(), ["open total"]);
+        assert!(full.dir().is_dir());
+        assert!(
+            crate::worktree::FAIL_FOR_TESTS
+                .lock()
+                .expect("fail")
+                .iter()
+                .any(|(d, _, left)| d == full.dir() && *left == 0),
+            "it waited through both"
+        );
+        guard.close().await;
+
+        // Caches that cannot be made for another reason, under a file: the
+        // step fails at once, and nothing is opened.
+        std::fs::write(dir.join("file"), "").expect("file");
+        let never = Recording::default();
+        let refused = open_exec_workspace(
+            &a,
+            &identity,
+            never.backend().shared(),
+            Some(&crate::worktree::Caches::new(dir.join("file/run-1"))),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(AtomError::Runtime(m)) if m.contains("the run's build caches") && m.contains("Not a directory")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(never.calls().is_empty(), "{:?}", never.calls());
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
@@ -1867,7 +1939,7 @@ fn a_run_that_panics_closes_its_workspace() {
             .expect("fake model");
         let recorded = Recording::default();
         let rt = runtime(&model, "seam-panic");
-        let backend = recorded.backend();
+        let backend = recorded.turn_backend();
         let r = contained(async move {
             run_codex_atom(&Panics, &Note { text: "n".into() }, &rt, &backend).await
         })
@@ -1981,7 +2053,7 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
             .expect("fake model");
         let recorded = Recording::default();
         let mut all = runtimes(&model, "codex-env");
-        all.backend = recorded.backend();
+        all.backend = recorded.turn_backend();
         run_declarative(
             &a,
             &compiled,
@@ -2069,6 +2141,39 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
             ),
             "a failure that may pass waits"
         );
+        // A helper that is not the helper, as when Codex ran atomic itself in
+        // its place, or bubblewrap could not run it by its name, fails the run
+        // at once rather than waiting for a sandbox that never starts.
+        for (name, says) in [
+            (
+                "atomic-itself",
+                "error: unexpected argument '--sandbox-policy-cwd' found",
+            ),
+            (
+                "no-argv0",
+                "bwrap: execvp codex-linux-sandbox: No such file or directory",
+            ),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ncat >&2 <<'SAID'\n{says}\nSAID\nexit 2\n"),
+            )
+            .expect("helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let other = CodexPaths::with_helpers(path.clone(), path);
+            let other = ExecSandbox::new(&other, StateGuard::NoProjectState, root.join("codex"))
+                .expect("a helper");
+            assert!(
+                matches!(
+                    atomic_exec::Confine::check(&other, &tmp),
+                    Err(atomic_exec::ExecError::Unconfinable { ref message })
+                        if message.contains("Codex's Linux sandbox helper could not be set up")
+                ),
+                "{name}: a helper that is not the helper waited"
+            );
+        }
         let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
             .expect("a helper");
         let backend = atomic_exec::Backend::connect(
@@ -2267,27 +2372,16 @@ fn an_answer_cel_cannot_read_is_repaired() {
             .await
             .expect("fake model");
         let rt = runtime(&model, "cel-repair");
-        let (out, _) = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await
-        .expect("repaired");
+        let (out, _) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+            .await
+            .expect("repaired");
         assert_eq!(out.line, Some(1));
         assert_eq!(model.calls(), 2, "one repair");
         let model = FakeModel::start(vec![wedging.clone(), wedging])
             .await
             .expect("fake model");
         let rt = runtime(&model, "cel-repair-fails");
-        let r = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await;
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await;
         assert!(
             matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
             "{r:?}"
@@ -2320,13 +2414,7 @@ fn a_typed_contract_that_cannot_be_checked_is_refused_before_the_model() {
     on_codex_runtime(async {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = runtime(&model, "hidden");
-        let r = run_codex_atom(
-            &Hidden,
-            &Note { text: "n".into() },
-            &rt,
-            &Default::default(),
-        )
-        .await;
+        let r = run_codex_atom(&Hidden, &Note { text: "n".into() }, &rt, &helperless()).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(message)) if message.contains("contains")),
             "{r:?}"
@@ -2453,7 +2541,7 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
                 text: "Export crashes on é.".into(),
             },
             &rt,
-            &atomic_exec::Backend::default(),
+            &helperless(),
         )
         .await
         .expect("runs on the sign-in");
@@ -2506,13 +2594,7 @@ fn a_stale_sign_in_is_refreshed_at_the_test_issuer() {
         };
         // The fake has no token endpoint, so the refresh fails; whether the
         // turn then runs on the old token is Codex's to decide.
-        let _ = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &atomic_exec::Backend::default(),
-        )
-        .await;
+        let _ = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await;
         let asked = model.every_request();
         assert!(
             asked.contains(&("POST".to_owned(), "/oauth/token".to_owned())),
@@ -2551,14 +2633,9 @@ fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
                 api_key_env: None,
                 sign_in: Some(signed_in(&auth, &backend)),
             };
-            let refused = run_codex_atom(
-                &Classify,
-                &Note { text: "n".into() },
-                &rt,
-                &atomic_exec::Backend::default(),
-            )
-            .await
-            .expect_err("refused");
+            let refused = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+                .await
+                .expect_err("refused");
             assert!(refused.to_string().contains(said), "{tag}: {refused}");
             assert_eq!(model.calls(), 0, "{tag}");
         }
@@ -2690,6 +2767,7 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
         sandbox: WorkspaceWrite,
         writable_roots: vec![dir.join("caches")],
         env: [("RUSTUP_HOME".to_owned(), rustup.display().to_string())].into(),
+        denied: Vec::new(),
     };
     let mut spec = TurnSpec::default();
     turn_in(&workspace(&dir.join("toolchains")), &mut spec).expect("toolchains apart");
@@ -2732,7 +2810,8 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
 // ATOMIC_TURN_TMPDIR while Codex's helper keeps the backend's shared
 // directory for its registry; elsewhere directly, with no handoff variable
 // left for the command to see. The shared directory is never a turn's
-// writable root, and a Linux turn without one is refused.
+// writable root, and a Linux turn without one, or with one but no scratch
+// directory to make its own in, is refused.
 #[test]
 fn a_turns_tmpdir_is_its_own_on_every_platform() {
     let base = std::env::temp_dir().join(format!("atomic-turn-tmpdir-{}", std::process::id()));
@@ -2742,6 +2821,7 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     std::fs::create_dir_all(&shared).expect("shared");
     let mut declared = std::collections::BTreeMap::new();
     declared.insert(codex::TURN_TMPDIR.to_owned(), "/elsewhere".to_owned());
+    declared.insert(atomic_exec::SECRET_ENV_FD.to_owned(), "3".to_owned());
     let workspace = Workspace {
         label: "t".into(),
         root: Some(base.clone()),
@@ -2762,9 +2842,15 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     };
 
     let linux = built(true, &workspace).expect("linux");
+    for spec in [&linux, &built(false, &workspace).expect("elsewhere")] {
+        assert!(
+            !spec.env.contains_key(atomic_exec::SECRET_ENV_FD),
+            "a turn names no secret socket: {:?}",
+            spec.env
+        );
+    }
     assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
     assert_eq!(linux.env[codex::TURN_TMPDIR], own);
-    assert!(!linux.writable_roots.contains(&shared));
 
     let other = built(false, &workspace).expect("elsewhere");
     assert_eq!(other.env["TMPDIR"], own);
@@ -2773,7 +2859,18 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
         "{:?}",
         other.env
     );
-    assert!(!other.writable_roots.contains(&shared));
+    // Nor does the turn's whole setup make the shared directory writable.
+    let mut whole = TurnSpec::default();
+    let shelled = Workspace {
+        shell: atomic_exec::Shell::Local,
+        ..workspace.clone()
+    };
+    turn_in(&shelled, &mut whole).expect("set up");
+    assert!(
+        !whole.writable_roots.contains(&shared),
+        "{:?}",
+        whole.writable_roots
+    );
 
     assert!(std::path::Path::new(&own).is_dir(), "{own} was not made");
     let without = Workspace {
@@ -2786,6 +2883,22 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     assert_eq!(
         built(false, &without).expect("elsewhere").env["TMPDIR"],
         own
+    );
+    // A shared directory with no scratch directory would leave the command
+    // the shared one.
+    let unscratched = Workspace {
+        scratch: None,
+        ..workspace.clone()
+    };
+    assert!(
+        matches!(built(true, &unscratched), Err(AtomError::Runtime(m)) if m.contains("no scratch directory")),
+        "a Linux turn with a shared directory and no scratch runs"
+    );
+    assert!(
+        !built(false, &unscratched)
+            .expect("elsewhere")
+            .env
+            .contains_key("TMPDIR")
     );
     let _ = std::fs::remove_dir_all(&base);
 }

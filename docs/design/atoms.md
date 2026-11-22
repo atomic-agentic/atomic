@@ -104,12 +104,10 @@ The format follows a few choices:
   TypeScript-shaped subset; workflow mappings, gate titles and eval assertions
   use CEL. JSON Schema is the runtime contract throughout.
 - **Prompt sections stay text.** Lowercase element tags such as `<rubric>` are
-  prompt structure the model reads; section tags must balance and an unbalanced
-  one fails the load, and the `<data-…>` prefix is reserved for atomic's value
-  wrappers. The renderer does not enforce that balance yet, so an unbalanced
-  tag renders and moves text around; the gap is a defect against
-  [M11](milestones.md#m11-declarative-atoms), whose acceptance list keeps "An
-  unbalanced section tag fails the load."
+  prompt structure the model reads; section tags must balance, in the atom and
+  its components and inside expressions, and an unbalanced one fails the load,
+  naming its line ([M11](milestones.md#m11-declarative-atoms)). The `<data-…>`
+  prefix is reserved for atomic's value wrappers.
 - **Schemas are YAML by default (M11).** Sidecar schemas sit beside the atom
   file; a compact form is accepted for simple shapes. YAML is restricted to what
   JSON can express.

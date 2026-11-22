@@ -1,0 +1,1 @@
+sandbox-helper-not-atomic|crates/atomic-core/src/codex.rs|    line.contains("unexpected argument '--sandbox-policy-cwd'")|    !line.is_empty() && false // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_trial_run_by_atomics_command_line_is_not_the_helper

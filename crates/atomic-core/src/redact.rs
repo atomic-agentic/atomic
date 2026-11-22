@@ -534,6 +534,10 @@ fn step(n: usize) {
     let _ = n;
 }
 
+/// ESC as atomic's terminal escaping and Rust's `{:?}` write it, so text
+/// escaped before it is redacted hides no token either.
+const BRACED_ESC: &[&str] = &["\\u{1b}", "\\u{001b}", "\\u{1B}", "\\u{001B}"];
+
 /// How long the terminal escape sequence starting `rest` is, if one does: a
 /// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
 /// introducer of a title, link or clipboard write (`ESC]`), or a character
@@ -545,6 +549,7 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
         "\x1b", "\\u001b", "\\u001B", "\\x1b", "\\x1B", "\\e", "\\033",
     ]
     .iter()
+    .chain(BRACED_ESC)
     .find(|i| rest.starts_with(**i))?;
     let body = &rest[introducer.len()..];
     let bytes = body.as_bytes();
@@ -1057,6 +1062,26 @@ fn assigned(input: &str) -> Option<String> {
         let Some((value_from, mut value_to)) = value_after(input, start) else {
             continue;
         };
+        // What the operating system said of the path before it, as Rust
+        // writes it, `Permission denied (os error 13)`: no secret, whatever
+        // the path's last name is. Only a bare value set off by a blank, as
+        // `path: Permission denied` is: a quoted one runs to its closing
+        // quote, and whatever follows the error in it is the value's; and
+        // one written hard against its name, `passwd:Permission denied …`,
+        // or inside `Some(`, is no error message's shape. The byte after the
+        // separator is tested itself, since `value_start` skips `Some(` too.
+        // Never under a name a header's name ends, as the header rule finds
+        // one, such as `proxy-authorization` or `X-Authorization`: what a
+        // header holds is a credential, however it reads, and a later pass
+        // over the same text, such as a JSON string's own, takes what this
+        // one hid as the header's credential and hides the rest with it.
+        let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
+        let header = ends_in_header(&input[name_start..name_end]);
+        let bare = value_from == start && set_off && !header;
+        if bare && is_os_error(&input[value_from..]) {
+            at = at.max(value_to);
+            continue;
+        }
         // `authorization=Bearer abc`: the scheme and its credential.
         let value = &input[value_from..value_to];
         if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
@@ -1081,6 +1106,50 @@ fn assigned(input: &str) -> Option<String> {
     }
     out.push_str(&input[copied..]);
     Some(out)
+}
+
+/// What the operating system says of a failed file or socket operation, as
+/// Rust's `io::Error` writes it: one of these words, then ` (os error N)`.
+/// Only these exact words, so nothing else that ends in such a suffix is
+/// taken for one.
+const OS_ERRORS: &[&str] = &[
+    "Permission denied",
+    "Operation not permitted",
+    "No such file or directory",
+    "Not a directory",
+    "Is a directory",
+    "File exists",
+    "Directory not empty",
+    "Read-only file system",
+    "Too many levels of symbolic links",
+    "No space left on device",
+    "Device or resource busy",
+    "Resource busy",
+    "Text file busy",
+    "Input/output error",
+    "Bad file descriptor",
+    "Invalid argument",
+    "No such device or address",
+    "File name too long",
+    "Resource temporarily unavailable",
+    "Connection refused",
+];
+
+/// Whether `byte` is a space or a tab.
+fn is_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
+fn is_os_error(text: &str) -> bool {
+    OS_ERRORS.iter().any(|words| {
+        text.strip_prefix(words)
+            .and_then(|rest| rest.strip_prefix(" (os error "))
+            .is_some_and(|rest| {
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                digits > 0 && rest.as_bytes().get(digits) == Some(&b')')
+            })
+    })
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
@@ -1121,9 +1190,78 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// Replaces secrets in text. Linear in the length of `input`; callers
-/// with text of unknown length bound it first (see [`excerpt`]).
+/// How many readings [`text`] takes at most: a reading can leave what
+/// another rule reads as a secret only once a first rule has redacted
+/// around it, as a header after an assignment's marker. Most text settles
+/// in one or two; text still changing at the last, such as a header before
+/// a long run of backslashed chunks that a reading takes one at a time, is
+/// hidden whole.
+const TEXT_PASSES: usize = 4;
+
+/// Replaces secrets in text, read again until a reading changes nothing,
+/// so redacting the result again changes nothing; text still changing
+/// after [`TEXT_PASSES`] readings is hidden whole, since what a further
+/// reading would hide cannot be told. Linear in the length of `input`;
+/// callers with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
+    let mut output = match text_once(input) {
+        Cow::Owned(once) if once != input => once,
+        _ => return Cow::Borrowed(input),
+    };
+    for _ in 1..text_passes() {
+        let again = text_once(&output).into_owned();
+        if again == output {
+            return Cow::Owned(output);
+        }
+        output = again;
+    }
+    if text_once(&output) == output.as_str() {
+        Cow::Owned(output)
+    } else {
+        Cow::Owned(REDACTED.to_owned())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many readings [`text`] takes at most on this thread, for tests
+    /// that try a lower bound.
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(TEXT_PASSES) };
+}
+
+#[cfg(test)]
+fn text_passes() -> usize {
+    PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn text_passes() -> usize {
+    TEXT_PASSES
+}
+
+/// How surely `name` names a secret in every reading [`text`] makes of it,
+/// and as written too when `written`, the surest taken: a later reading
+/// can hide what made an earlier one name a secret.
+fn read_strength(name: &str, written: bool) -> Strength {
+    let mut surest = if written {
+        name_strength(name)
+    } else {
+        Strength::None
+    };
+    let mut reading = name.to_owned();
+    for _ in 0..=text_passes() {
+        let next = text_once(&reading).into_owned();
+        if next == reading {
+            break;
+        }
+        surest = surer(surest, name_strength(&next));
+        reading = next;
+    }
+    surest
+}
+
+/// One reading of `input` by every text rule (see [`text`]).
+fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
@@ -1347,10 +1485,19 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    // Whether the string read as JSON before text redaction touched it.
+    let was_json = |s: &str| {
+        nested < MAX_NESTED_JSON
+            && s.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+    };
+    let mut opened = false;
+    let mut written = String::new();
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
-        *string = redacted;
+        opened = redacted != *string && was_json(string);
+        written = std::mem::replace(string, redacted);
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
     // can hide where a secret starts, and a secret-named field is only clear
@@ -1359,12 +1506,86 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // JSON that text redaction broke deeper in, in a string it holds:
+        // hidden whole for the same reason.
+        if opened && broke_json_within(&written, &inner, nested) {
+            *string = REDACTED.to_owned();
+            return;
+        }
         let before = inner.clone();
         redact_nested(&mut inner, nested + 1);
         if inner != before {
             *string = inner.to_string();
         }
+    } else if opened {
+        // JSON that text redaction broke: the rules that read its names
+        // and pairs cannot read it, and text redaction alone may leave
+        // their secrets, so it is hidden whole.
+        *string = REDACTED.to_owned();
     }
+}
+
+/// Whether text redaction, which made `texted` of the JSON `written`, broke
+/// JSON held in a string inside it, so the rules that read names and pairs
+/// there no longer can: some string that reads as JSON as written, at a
+/// depth [`redact_string`] opens, is not one at the same place after (see
+/// [`kept_json`]). `nested` is the depth `written` is read at.
+fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
+    serde_json::from_str::<Value>(written)
+        .is_ok_and(|written| !kept_json(&written, texted, nested + 1))
+}
+
+/// Whether every string in `written`, read at depth `nested`, that reads as
+/// JSON is still a string that reads as JSON at the same place in `texted`,
+/// the same keys and indices, and so in turn for what it holds. Where it
+/// cannot be told, a key gone, a list grown or shrunk, or a value of
+/// another type, a place holding JSON counts as broken; one hidden whole
+/// counts as kept, as it shows nothing. JSON that reads as
+/// JSON only after text redaction counts for nothing, so it cannot make up
+/// for JSON broken beside it.
+fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
+    match (written, texted) {
+        (Value::String(string), _) => match opened_json(string, nested) {
+            None => true,
+            Some(written) => texted.as_str().is_some_and(|texted| {
+                texted == REDACTED
+                    || opened_json(texted, nested)
+                        .is_some_and(|texted| kept_json(&written, &texted, nested + 1))
+            }),
+        },
+        // Hidden whole, it shows nothing to read.
+        (_, Value::String(texted)) if texted == REDACTED => true,
+        (Value::Array(written), Value::Array(texted)) if written.len() == texted.len() => written
+            .iter()
+            .zip(texted)
+            .all(|(written, texted)| kept_json(written, texted, nested)),
+        (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
+            texted.get(key).map_or_else(
+                || !holds_json(field, nested),
+                |texted| kept_json(field, texted, nested),
+            )
+        }),
+        (written, _) => !holds_json(written, nested),
+    }
+}
+
+/// Whether `value`, read at depth `nested`, holds a string that reads as
+/// JSON that [`redact_string`] opens.
+fn holds_json(value: &Value, nested: usize) -> bool {
+    match value {
+        Value::String(string) => opened_json(string, nested).is_some(),
+        Value::Array(items) => items.iter().any(|item| holds_json(item, nested)),
+        Value::Object(fields) => fields.values().any(|field| holds_json(field, nested)),
+        _ => false,
+    }
+}
+
+/// `string` parsed, when it reads as JSON that [`redact_string`] opens at
+/// depth `nested`.
+fn opened_json(string: &str, nested: usize) -> Option<Value> {
+    (nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']))
+        .then(|| serde_json::from_str(string).ok())
+        .flatten()
 }
 
 /// Redact what a value held under a name of this strength holds, keeping
@@ -1379,7 +1600,7 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => redact_string(string, nested),
+        Value::String(string) => redact_held_string(strength, string, nested, true),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
@@ -1398,8 +1619,8 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
                 let name = renamed
                     .get(key)
                     .map_or_else(|| base_name(key), |r| base_name(&r.original));
-                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
+                if let Some(header) = header_named(name)
+                    && field.as_str().is_some_and(|v| is_header_secret(header, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
@@ -1411,10 +1632,131 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
                     strength
                 };
                 redact_held(held, field, nested);
+                hide_header_secret(name, field);
             }
         }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
+}
+
+/// Hide `field`, under `name`, if it is a header's secret as redacted: what
+/// redaction made of it, rewritten JSON say, can read as one where it did
+/// not before, and a second pass would hide it.
+fn hide_header_secret(name: &str, field: &mut Value) {
+    if !as_main()
+        && let Some(header) = header_named(name)
+        && field.as_str().is_some_and(|v| is_header_secret(header, v))
+    {
+        *field = Value::String(REDACTED.into());
+    }
+}
+
+/// A string held under a name of this strength, which does not read as its
+/// secret whole: redacted as any string is, and JSON in it, under a hint,
+/// opened and redacted as held (see [`open_held_json`]). One that is
+/// rewritten is read again as a second pass would read it (`settle`), and
+/// hidden whole if that would change it, so redacting again changes
+/// nothing.
+fn redact_held_string(strength: Strength, string: &mut String, nested: usize, settle: bool) {
+    if is_secret_value(strength, string) {
+        *string = REDACTED.into();
+        return;
+    }
+    let rewritten = strength == Strength::Weak && open_held_json(string, nested);
+    redact_string(string, nested);
+    if rewritten && settle {
+        let mut again = string.clone();
+        redact_held_string(strength, &mut again, nested, false);
+        if again != *string {
+            *string = REDACTED.into();
+        }
+    }
+}
+
+/// JSON held in a string under a hint, such as `{"key": "{\"note\": …}"}`:
+/// redacted as text, then opened and redacted as any JSON in a string is
+/// and then as held, so a value that looks like a credential inside is
+/// hidden as it would be in a real object under that name. It is written
+/// back only when the opened JSON hid something, pretty if it came so, so a
+/// string with nothing more to hide is left to be redacted as any string
+/// is; one that text redaction grows past [`MAX_TEXT`] is hidden whole.
+/// Whether it was rewritten.
+fn open_held_json(string: &mut String, nested: usize) -> bool {
+    if as_main()
+        || nested >= MAX_NESTED_JSON
+        || string.len() > MAX_TEXT
+        || !string.trim_start().starts_with(['{', '['])
+    {
+        return false;
+    }
+    // Redacted as text first, as it is unopened: what that finds in the
+    // string as written, an escaped `\/` before a token say, stays hidden
+    // once the JSON is written back without the escape. Text that no
+    // longer reads as JSON is left to [`redact_string`], which hides JSON
+    // that text redaction broke whole.
+    let texted = text(string);
+    let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
+        return false;
+    };
+    // JSON in a string it holds that text redaction broke: hidden whole,
+    // as [`redact_string`] hides it.
+    if texted != *string && broke_json_within(string, &inner, nested) {
+        *string = REDACTED.to_owned();
+        return true;
+    }
+    // Grown past the bound, a second pass would cut it: hidden whole now.
+    if texted.len() > MAX_TEXT {
+        *string = REDACTED.to_owned();
+        return true;
+    }
+    let before = inner.clone();
+    // As any JSON in a string is, which reads names and pairs as they are
+    // written, and then as held, so it is never read less closely than it
+    // would be unopened.
+    redact_nested(&mut inner, nested + 1);
+    redact_held(Strength::Weak, &mut inner, nested + 1);
+    if inner == before {
+        return false;
+    }
+    // Written as it came, pretty or compact. What would read as a
+    // credential whole, as compact JSON can, or grow past the bound, a
+    // second pass would hide: [`redact_held_string`] hides it now.
+    *string = if string.contains('\n') {
+        serde_json::to_string_pretty(&inner).unwrap_or_default()
+    } else {
+        inner.to_string()
+    };
+    true
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread redacts as atomic did before held JSON was
+    /// opened and dotted header names read, for tests that compare the two.
+    static AS_MAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread redacts as before (see `AS_MAIN`); never outside
+/// tests.
+#[cfg(test)]
+fn as_main() -> bool {
+    AS_MAIN.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn as_main() -> bool {
+    false
+}
+
+/// The header `name` names, if any: the name itself, or its last dotted
+/// segment, as in `http.request.header.authorization`.
+fn header_named(name: &str) -> Option<&str> {
+    let last = if as_main() {
+        name
+    } else {
+        name.rsplit('.').next().unwrap_or(name)
+    };
+    [name, last].into_iter().find(|n| is_header_name(n))
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1477,18 +1819,19 @@ fn base_name(key: &str) -> &str {
 
 /// How surely the field at `key` holds a secret: what its name says (see
 /// [`name_strength`]), number and all, so a second pass reads it as this
-/// one does; for a key renamed, the surer of that and what its new name
-/// said before it was numbered, and, under a secret's name (`held`), what
-/// its original key said and what it said redacted as text too, so a
-/// secret's name redacted, or hidden whole, is still one there.
+/// one does; for a key renamed, the surest of that, of what its new name
+/// said before it was numbered, and of every reading text redaction makes
+/// of its original key (see [`read_strength`]), so a later reading cannot
+/// weaken what an earlier one said; and, under a secret's name (`held`),
+/// of the original key as written too, so a secret's name redacted, or
+/// hidden whole, is still one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     let whole = name_strength(key);
     match renamed.get(key) {
-        Some(r) if held => surer(
-            surer(whole, name_strength(&text(&r.original))),
-            surer(name_strength(&r.original), name_strength(&r.name)),
+        Some(r) => surer(
+            surer(whole, read_strength(&r.original, held)),
+            name_strength(&r.name),
         ),
-        Some(r) => surer(whole, name_strength(&r.name)),
         None => whole,
     }
 }
@@ -1603,6 +1946,26 @@ fn key_looks_like_credential(key: &str) -> bool {
         && looks_like_credential(key)
 }
 
+/// Whether `name` is one of [`HEADERS`], in any case.
+fn is_header_name(name: &str) -> bool {
+    HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether `name` ends, in any case, with one of [`HEADERS`] that starts at
+/// a word boundary, as the header rule finds a header's name inside a longer
+/// one: `X-Authorization`, `http.proxy-authorization`, not `Xauthorization`.
+fn ends_in_header(name: &str) -> bool {
+    HEADERS.iter().any(|h| {
+        let Some(at) = name.len().checked_sub(h.len()) else {
+            return false;
+        };
+        let word_before = name.as_bytes()[..at]
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(h) && !word_before
+    })
+}
+
 /// Header names whose values are credentials.
 const HEADERS: &[&str] = &[
     "authorization",
@@ -1622,8 +1985,15 @@ fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
     let Some(secret) = secret.as_str() else {
         return false;
     };
-    if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
-        return is_header_secret(name, secret);
+    if let Some(header) = header_named(name) {
+        if is_header_secret(header, secret) {
+            return true;
+        }
+        // A header by its own name is judged as a header alone; one only
+        // by its last dotted segment is read by its name too.
+        if header.len() == name.len() {
+            return false;
+        }
     }
     match strength(name) {
         Strength::Strong if explicit => is_secret_value(Strength::Strong, secret),
@@ -1694,8 +2064,8 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     .get(key)
                     .map_or_else(|| base_name(key), |r| r.original.as_str());
                 // A header's value, such as `"Authorization": "Bearer …"`.
-                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
+                if let Some(header) = header_named(name)
+                    && field.as_str().is_some_and(|v| is_header_secret(header, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
@@ -1704,6 +2074,7 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }
+                hide_header_secret(name, field);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -1715,8 +2086,37 @@ pub fn value(value: &mut Value) {
     redact_nested(value, 0);
 }
 
-/// Write one log line to stderr, redacted, bounded to [`MAX_TEXT`]
-/// characters and then made safe for a terminal. atomic's own log lines go
+/// Tell the person where to sign in: Codex's authorize address for
+/// `atomic model login`, written as it is. It holds no secret (a client id,
+/// where to come back to, and a random state and PKCE challenge, which are
+/// public), but a random value can look like a token, and redacting one
+/// would break the login. Anything but such an address, on loopback or over
+/// HTTPS with no user or password in it, is redacted as any line is. Either
+/// is then made safe for a terminal, as every log line is.
+pub fn log_sign_in_address(address: &str) {
+    eprintln!("{}", sign_in_line(address));
+}
+
+/// What [`log_sign_in_address`] writes for `address`.
+pub(crate) fn sign_in_line(address: &str) -> String {
+    let authorize = url::Url::parse(address).is_ok_and(|u| {
+        let local = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        (u.scheme() == "https" || (u.scheme() == "http" && local))
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/oauth/authorize"
+    });
+    let line = format!("Sign in in your browser. If it did not open, go to:\n\n  {address}\n");
+    let line = if authorize && line.chars().count() <= MAX_TEXT {
+        line
+    } else {
+        bounded(&line, MAX_TEXT)
+    };
+    crate::terminal::block(&line)
+}
+
+/// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
+/// characters, and then made safe for a terminal, which can lengthen it. atomic's own log lines go
 /// through this, never straight to `eprintln!`: what they name, a run's id
 /// or a principal, and what they quote can come from a caller or a model.
 pub fn log(line: impl AsRef<str>) {
@@ -1754,20 +2154,30 @@ impl Line {
     }
 
     /// Text that is safe to show as it is: a name a person or a workflow
-    /// chose (a run's id, a gate's), escaped for the terminal, or a value
-    /// redacted already, such as by [`value`] or [`bounded`].
+    /// chose, such as a run's id, or a value redacted already, such as by
+    /// [`value`] or [`bounded`]. It needs no escaping first: the whole line
+    /// is made safe for a terminal when it is written.
     pub fn shown(mut self, text: &str) -> Self {
         self.text.push_str(text);
         self
     }
 
-    /// What it writes: its text, bounded to [`MAX_TEXT`] characters and
-    /// safe for a terminal, whatever a part of it missed.
+    /// Text that may hold a secret, such as an error or what a model or a
+    /// command said: redacted on its own, so nothing in it changes how the
+    /// names beside it are shown.
+    pub fn redacted(mut self, value: &str) -> Self {
+        self.text.push_str(&text(value));
+        self
+    }
+
+    /// What it writes: its text, bounded to [`MAX_TEXT`] characters, then
+    /// made safe for a terminal, whatever a part of it missed, which can
+    /// lengthen it.
     fn written(&self) -> String {
         crate::terminal::block(&cut(&self.text, MAX_TEXT))
     }
 
-    /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
+    /// Write it to stderr, as [`Line::written`] gives it.
     pub fn log(self) {
         eprintln!("{}", self.written());
     }
