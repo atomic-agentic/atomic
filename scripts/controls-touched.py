@@ -17,8 +17,11 @@ guarding test can stop it failing; or changes anything under the row's
 test code that crate's targets share (crates/<c>/tests/support/, fixtures/
 and the like: a directory there that is no one target's), or a shared test
 helper outside tests/ that scripts/controls-shared.txt lists for the row (by
-its --test target, a feature it turns on or a package it builds). The rows
-are read from HEAD's tree, not the working tree, and the changes are git's
+its --test target, a feature it turns on or a package it builds). Before
+these rules, the change is expanded by one level of literal Rust includers
+at the base and head. A literal tests/... path in an integration target owns
+that data directory; all named owners are kept, and unowned data retains
+the crate-wide shared-test fallback. The rows are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
 It fails, printing why, rather than leave out a row it cannot read: a row file
@@ -44,6 +47,7 @@ import argparse
 import functools
 import os
 import posixpath
+import re
 import subprocess
 import sys
 
@@ -247,16 +251,177 @@ def test_targets(args):
     return [before[i + 1] for i, a in enumerate(before[:-1]) if a == "--test"]
 
 
-def shared_test_crates(base, head, changed):
+def rust_literals(path, text):
+    """Literal spans outside Rust comments and character literals.
+
+    This is a lexical scan, not a Rust parser: only literal include paths and
+    literal tests/... data paths are followed. Dynamic paths remain sweep-only.
+    Comments are blanked without changing offsets, so a comment cannot claim
+    ownership and comments between a macro and its argument are harmless.
+    """
+    code, literals, i = list(text), [], 0
+    character = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\\n])'")
+    while i < len(text):
+        start = i
+        if text.startswith("//", i):
+            i = text.find("\n", i)
+            if i < 0:
+                i = len(text)
+            code[start:i] = " " * (i - start)
+            continue
+        if text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < len(text) and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise Refused(f"{path} has an unterminated Rust comment")
+            code[start:i] = " " * (i - start)
+            continue
+        if text[i] == "'":
+            matched = character.match(text, i)
+            if matched:
+                i = matched.end()
+                continue
+        if text[i] == "r":
+            quote = i + 1
+            while quote < len(text) and text[quote] == "#":
+                quote += 1
+            if quote < len(text) and text[quote] == '"':
+                hashes = text[i + 1 : quote]
+                end = text.find('"' + hashes, quote + 1)
+                if end < 0:
+                    raise Refused(f"{path} has an unterminated raw Rust string")
+                i = end + 1 + len(hashes)
+                literals.append((start, i, text[quote + 1 : end], True))
+                continue
+        if text[i] == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            if i >= len(text):
+                raise Refused(f"{path} has an unterminated Rust string")
+            literals.append((start, i + 1, text[start + 1 : i], False))
+            i += 1
+            continue
+        i += 1
+    return "".join(code), literals
+
+
+def literal_path(source, text, raw):
+    """Decode a Rust path literal; an unreadable path is never guessed."""
+    if raw:
+        value = text
+    else:
+        chars, i = [], 0
+        escapes = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+        while i < len(text):
+            if text[i] != "\\":
+                chars.append(text[i])
+                i += 1
+                continue
+            i += 1
+            if i >= len(text):
+                raise Refused(f"{source} has an incomplete Rust path escape")
+            escape = text[i]
+            i += 1
+            if escape in escapes:
+                chars.append(escapes[escape])
+            elif escape == "x" and re.fullmatch(r"[0-7][0-9A-Fa-f]", text[i : i + 2]):
+                chars.append(chr(int(text[i : i + 2], 16)))
+                i += 2
+            elif escape == "u" and i < len(text) and text[i] == "{":
+                end = text.find("}", i + 1)
+                digits = text[i + 1 : end].replace("_", "") if end >= 0 else ""
+                if not re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                    raise Refused(f"{source} has an invalid Unicode Rust path escape")
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    raise Refused(f"{source} has an invalid Unicode Rust path escape")
+                chars.append(chr(point))
+                i = end + 1
+            elif escape in "\r\n":
+                while i < len(text) and text[i] in " \t\r\n":
+                    i += 1
+            else:
+                raise Refused(f"{source} has an unsupported Rust path escape")
+        value = "".join(chars)
+    if "\0" in value:
+        raise Refused(f"{source} has a NUL in a Rust path")
+    return value
+
+
+def in_tree(path):
+    return not posixpath.isabs(path) and path != ".." and not path.startswith("../")
+
+
+@functools.lru_cache(maxsize=None)
+def source_references(commit):
+    """One level of literal includers and integration targets naming data.
+
+    Resolve includes from the source file's own directory, not a basename
+    match elsewhere in the tree. A named tests/... data directory is owned
+    by every integration target that names it; ambiguous owners are all kept.
+    """
+    included, data = {}, []
+    prefix = re.compile(r"(?:\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*|#\s*\[\s*path\s*=\s*)$")
+    for entry in filter(None, git("ls-tree", "-r", "-z", commit).split(b"\0")):
+        meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
+        if not name.endswith(".rs"):
+            continue
+        source = text_of(commit, regular(commit, name, meta.split(" ")[0]))
+        code, literals = rust_literals(name, source)
+        parts = name.split("/")
+        target = (
+            len(parts) == 4 and parts[0] == "crates" and parts[2] == "tests"
+        ) or (
+            len(parts) == 5 and parts[0] == "crates" and parts[2] == "tests" and parts[4] == "main.rs"
+        )
+        previous = 0
+        for start, end, literal, raw in literals:
+            # Disjoint prefixes keep this linear even in large generated
+            # source files with many literals. No include starts inside a
+            # preceding literal.
+            before, previous = code[previous:start], end
+            if prefix.search(before):
+                path = posixpath.normpath(posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw)))
+                if in_tree(path):
+                    included.setdefault(path, set()).add(name)
+            if target and literal.startswith("tests/"):
+                path = posixpath.normpath(posixpath.join(*parts[:2], literal_path(name, literal, raw)))
+                if in_tree(path):
+                    data.append((path, name))
+    return included, data
+
+
+def references_to(path, references):
+    included, data = references
+    owners = set(included.get(path, ()))
+    for directory, target in data:
+        if path == directory or path.startswith(directory + "/"):
+            owners.add(target)
+    return owners
+
+
+def shared_test_crates(base, head, changed, references):
     """The crates whose shared test code the change touches: a file under
     crates/<c>/tests/ that belongs to no one test target, such as one in
     tests/support/ or tests/fixtures/, or a file there that is not Rust. A
     directory tests/<d>/ belongs to the target <d> when tests/<d>.rs or
-    tests/<d>/main.rs is there, at the base or at the head."""
+    tests/<d>/main.rs is there, at the base or at the head. Literal include
+    and data references give a path to its named readers first."""
     crates = set()
     for path in changed:
         parts = path.split("/")
         if len(parts) < 4 or parts[0] != "crates" or parts[2] != "tests":
+            continue
+        # Explicit includers/data readers own this path. With no known
+        # reader, retain the conservative crate-wide shared-data fallback.
+        if any(references_to(path, refs) for refs in references):
             continue
         tests = "/".join(parts[:3])
         if len(parts) == 4:
@@ -390,6 +555,11 @@ def touched(base, head, every=False):
             if path
         }
         gone = deleted(base, head, changed, rows)
+        references = [source_references(commit) for commit in (base, head)] if changed else []
+        # Expand exactly one level from the original change, at both ends.
+        # A removed include still belongs to the source that formerly read it.
+        included = {owner for path in changed for refs in references for owner in references_to(path, refs)}
+        changed |= included
         # Each changed file's text at the base and at the head, so a change to a
         # guarding test, or its removal, selects the row that names it.
         contents = []
@@ -397,7 +567,7 @@ def touched(base, head, every=False):
             for commit in (base, head):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
-        shared = shared_test_crates(base, head, changed)
+        shared = shared_test_crates(base, head, changed, references)
         helpers = [words for path, words in shared_helpers(head).items() if path in changed]
         # A row taken off the list of rows CI does not run is run.
         released = listed(base) - set(local)

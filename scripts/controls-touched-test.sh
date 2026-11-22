@@ -348,6 +348,167 @@ commit
 run
 expect "a change to a target's own directory" "f"
 
+# Literal Rust includes select the source that consumes the changed bytes.
+include_fixture() {
+    fresh
+    mkdir -p crates/k/src/mounts
+    printf '%s\n' "$1" >crates/k/src/mounts/tests.rs
+    printf 'before\n' >crates/k/src/mounts/host.mountinfo
+    echo 'e|src/other.rs|fn other|fn nothing|-p k --lib -- include_guard' >scripts/controls/e.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+for kind in include_bytes include_str include; do
+    include_fixture "fn include_guard() { ${kind}!(\"host.mountinfo\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    expect "${kind} data selects the guarding includer" "e"
+done
+include_fixture 'fn include_guard() { include_bytes!(r##"host.mountinfo"##); }'
+printf '\377after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+expect "raw Rust path and binary included bytes" "e"
+
+fresh
+mkdir -p crates/k/tests/model_auth
+printf 'fn model_auth_test() {}\n' >crates/k/tests/model_auth.rs
+printf '#[path = "model_auth/fixture.rs"]\nmod fixture;\n' >crates/k/tests/model_auth_sandbox.rs
+printf 'pub fn fixture() {}\n' >crates/k/tests/model_auth/fixture.rs
+printf 'm|src/other.rs|fn other|fn a|-p k --test model_auth -- model_auth_test\n' >scripts/controls/m.row
+printf 'n|src/other.rs|fn other|fn b|-p k --test model_auth_sandbox -- sandbox_test\n' >scripts/controls/n.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn fixture() { 1; }\n' >crates/k/tests/model_auth/fixture.rs
+commit
+run
+expect "path-included helper selects both integration targets" "$(printf 'm\nn')"
+
+# A library includes data under tests/: that is not shared integration data.
+fresh
+mkdir -p crates/k/src crates/k/tests/typescript
+printf 'fn include_guard() { include_str!("../tests/typescript/projection.json"); }\n' >crates/k/src/typescript.rs
+printf 'fn main() {}\n' >crates/k/tests/t.rs
+printf '{}\n' >crates/k/tests/typescript/projection.json
+echo 'e|src/other.rs|fn other|fn a|-p k --lib -- include_guard' >scripts/controls/e.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf '{"new": true}\n' >crates/k/tests/typescript/projection.json
+commit
+run
+expect "library's included test data selects library rows only" "e"
+
+# Resolve from the includer's directory, not from a matching basename.
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+mkdir -p crates/k/src/elsewhere
+printf 'fn unrelated_guard() { include_str!("host.mountinfo"); }\n' >crates/k/src/elsewhere/tests.rs
+printf 'elsewhere\n' >crates/k/src/elsewhere/host.mountinfo
+echo 'z|src/other.rs|fn other|fn z|-p k --lib -- unrelated_guard' >scripts/controls/z.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+expect "equal included basenames do not confuse ownership" "e"
+off includers 'changed |= included' 'pass'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with includer expansion off, included data still selected: ${OUT}"
+unset SCRIPT
+
+# Rust escaped path spellings resolve to the same tracked file.
+for path in 'host\x2emountinfo' 'host\u{2e}mountinfo'; do
+    include_fixture "fn include_guard() { include_str!(\"${path}\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    expect "escaped Rust path ${path}" "e"
+done
+
+owned_data_fixture() {
+    shared_fixture
+    mkdir -p crates/k/tests/coding-tasks/tasks crates/k/tests/fixtures/project
+    printf 'fn main() { std::path::Path::new("tests/coding-tasks/tasks"); }\n' >crates/k/tests/coding_tasks.rs
+    printf 'fn main() { std::path::Path::new("tests/fixtures/project"); }\n' >crates/k/tests/t.rs
+    printf 'data\n' >crates/k/tests/coding-tasks/tasks/input.txt
+    printf 'data\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+owned_data_fixture
+printf 'new\n' >crates/k/tests/coding-tasks/tasks/input.txt
+commit
+run
+expect "directory read by a target with no rows selects no unrelated rows" ""
+owned_data_fixture
+printf 'new\n' >crates/k/tests/fixtures/project/input.txt
+commit
+run
+expect "fixture directory selects the target that names it" "c"
+off data-readers 'if target and literal.startswith("tests/"):' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with named data readers off, shared fallback was not retained: ${OUT}"
+unset SCRIPT
+off data-ownership 'if any(references_to(path, refs) for refs in references):' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with data ownership off, shared fallback was not retained: ${OUT}"
+unset SCRIPT
+owned_data_fixture
+printf 'fn main() { std::path::Path::new("tests/fixtures/project"); }\n' >crates/k/tests/u/main.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'new\n' >crates/k/tests/fixtures/project/input.txt
+commit
+run
+expect "a directory shared by two named targets selects both" "$(printf 'c\nf')"
+
+# Comments cannot turn shared data into one target's private data.
+for comment in '// "tests/fixtures/project"' '/* outer /* "tests/fixtures/project" */ end */'; do
+    shared_fixture
+    mkdir -p crates/k/tests/fixtures/project
+    printf '%s\nfn main() {}\n' "${comment}" >crates/k/tests/t.rs
+    printf 'before\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf 'after\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    run
+    expect "a Rust comment does not claim a data directory" "$(printf 'c\nf')"
+    if [[ "${comment}" == //* ]]; then
+        off comment 'if text.startswith("//", i):' 'if False:'
+    else
+        off comment 'if text.startswith("/*", i):
+            depth, i = 1, i + 2' 'if False:
+            depth, i = 1, i + 2'
+    fi
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = c ] || fail "with comment exclusion off, comment did not expose false ownership: ${OUT} (${ERR})"
+    unset SCRIPT
+done
+
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+ln -s loop.rs crates/k/src/loop.rs
+commit
+run
+refused "a looping Rust source cannot silently lose its includers" "crates/k/src/loop.rs is a link that does not end"
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+printf '\377\n' >crates/k/src/mounts/tests.rs
+commit
+run
+refused "non-UTF-8 Rust source refuses dependency discovery" "is not UTF-8"
+for path in 'host\q.mountinfo' 'host\u{D800}.mountinfo' 'host\u{110000}.mountinfo'; do
+    include_fixture "fn include_guard() { include_str!(\"${path}\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    refused "an undecodable Rust include path is not guessed" "Rust path escape"
+done
+include_fixture 'fn include_guard() { include_str!("host\0mountinfo"); }'
+printf 'after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+refused "a NUL in an include path is refused" "has a NUL in a Rust path"
+
 # Every row, for a full sweep.
 fresh
 code=0
