@@ -1,1 +1,1 @@
-signin-logout-both-stores|crates/atomic-core/src/signin.rs|            AuthCredentialsStoreMode::File,|            { const ATOMIC_CONTROL_REMOVED: AuthCredentialsStoreMode = AuthCredentialsStoreMode::Keyring; ATOMIC_CONTROL_REMOVED },|-p atomic-agentic --test model_auth logout_forgets_the_file_copy_whichever_store_is_chosen
+signin-logout-both-stores|crates/atomic-core/src/signin.rs|            AuthCredentialsStoreMode::File,|            AuthCredentialsStoreMode::Keyring,|-p atomic-agentic --test model_auth logout_forgets_the_file_copy_whichever_store_is_chosen

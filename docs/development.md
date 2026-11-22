@@ -246,19 +246,19 @@ why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
 
-A row's replacement must say nothing the live code already writes in the file it
-names, or what switching the control off would write cannot be told from the
-control. Where switching off picks a value the file uses elsewhere, write it
-through a binding no live code names —
-`const ATOMIC_CONTROL_REMOVED: &str = HOST_REFUSED; ATOMIC_CONTROL_REMOVED`, as
-the `exec-network-suffix-reason` row does. That is what
-`python3 scripts/controls-on.py` checks, and CI runs it on the commit it checks
-out, where `controls-check.sh` cannot run: it fails a tree in which a row's
-switch text is not in its file exactly once, or in which what that row's
-replacement writes is in its file at all, naming the row either way. It reads the
-row files by the same rules as the script, so a row that cannot be read is
+`python3 scripts/controls-on.py` asks of every row whether its file holds the
+control rather than what switching the row off writes, and CI runs it on the
+commit it checks out, where `controls-check.sh` cannot run: a rebuild per control
+is why the script is run by hand and this is not. A row whose replacement does
+not hold its own switch text takes that text out of the file when it switches the
+control off — whatever the replacement is, even a value the file says elsewhere —
+so for those rows the check requires the switch text to be in the file exactly
+once. A row whose replacement does hold its own switch text leaves that text
+where the row points, so for those the check requires the replacement not to be
+in the file at all. A row that fails either is named. The script reads the row
+files by the same rules as `controls-check.sh`, so a row that cannot be read is
 refused there too rather than left unchecked, and
-`scripts/controls-check-test.sh` tests it with fixtures it commits.
+`scripts/controls-check-test.sh` tests both with fixtures it commits.
 
 ## Milestone acceptance
 

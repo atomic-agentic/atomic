@@ -13,26 +13,24 @@ So for each row under scripts/controls/, this reads the file the row names and
 requires that
 
   * the row's switch text appears there exactly once, and
-  * the row's replacement text does not appear there at all.
+  * where the row's replacement holds that switch text, the replacement does not
+    appear there at all.
 
 Together those say the control is where the row says it is, and is the control
-rather than what switching it off writes. Neither rule covers the other: a file
-whose control has moved carries neither text and fails on the count alone, while
-a file whose control has been switched off by a replacement that holds its own
-switch text still carries the switch text once and is caught by the replacement
-alone. A row whose replacement is empty deletes its switch text, so it writes
-nothing to look for and only the count applies to it; that rule alone says the
-switch is where it points. The replacement is asked of the file first, because
-where the file holds what switching off writes that is what is wrong with it,
-whether or not its switch text is still there too; and where a row names a file
-that cannot be read, neither rule can be asked and the row is refused as what
-could not be read, never as a control that is simply absent.
-
-Because of the second rule, a row's replacement must say nothing live code
-already writes at its site. Where switching off picks another value that the
-code uses elsewhere, write it through a binding no live code has a name for, as
-`const ATOMIC_CONTROL_REMOVED: T = THE_OTHER_VALUE; ATOMIC_CONTROL_REMOVED`;
-docs/development.md says the same.
+rather than what switching it off writes. Which of the two says it depends on the
+row: switching off takes the switch text out of the file whenever the
+replacement does not hold it, so for such a row the count is what reports a
+control committed off, and its replacement is not asked of the file at all --
+asking it would refuse a row whose replacement is a word the file has good cause
+to say elsewhere, which is a row that cannot be fixed without moving the control,
+not a tree with a control off. Where a replacement does hold its own switch text,
+switching off leaves that text in place and the count cannot see the difference,
+so there the replacement is what is asked: the file holding what switching off
+writes is the control off. A row whose replacement is empty deletes its switch
+text and writes nothing to look for, so only the count applies to it; that rule
+alone says the switch is where it points. Where a row names a file that cannot be
+read, neither rule can be asked and the row is refused as what could not be read,
+never as a control that is simply absent.
 
 Every row file is read the way scripts/controls-check.sh reads it, and the same
 malformed files are refused: a row read wrongly is a control that goes unchecked
@@ -204,11 +202,17 @@ def main():
                 "control"
             )
             continue
-        if replacement and replacement in source:
+        # A row whose replacement holds its own switch text leaves that text in
+        # the file when it switches the control off, so the count below cannot
+        # see the difference and this is what can. For every other row switching
+        # off takes the switch text out, the count reports it, and asking this
+        # rule as well would refuse a row over a replacement that is a word the
+        # file has good cause to say elsewhere.
+        if switch in replacement and replacement in source:
             problems.append(
                 f"{kind}: what switching it off writes is in {rel}, so this tree holds "
                 "the control switched off. Put the control back, or give the row a "
-                "replacement no live code writes in that file"
+                "replacement that does not hold its own switch text"
             )
             continue
         found = source.count(switch)

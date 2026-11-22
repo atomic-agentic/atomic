@@ -1,1 +1,1 @@
-signin-address-terminal|crates/atomic-core/src/redact.rs|    crate::terminal::block(&line)|    { let atomic_control_removed = line; atomic_control_removed }|-p atomic-agentic-core --lib redact::tests::the_address_to_sign_in_at_is_written_whole_and_nothing_else_is
+signin-address-terminal|crates/atomic-core/src/redact.rs|    crate::terminal::block(&line)|    line|-p atomic-agentic-core --lib redact::tests::the_address_to_sign_in_at_is_written_whole_and_nothing_else_is

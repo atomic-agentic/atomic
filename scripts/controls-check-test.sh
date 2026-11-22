@@ -786,26 +786,44 @@ printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
 switch_off "${gh_row}" "${repo}/${gh_file}"
 commit
 run_on
-[ "${code}" -eq 1 ] && grep -q "^FAIL git-hardening: " <<<"${out}" ||
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: its switch text is not in ${gh_file}, so the control is not the one this row switches off" <<<"${out}" ||
     fail "control committed off: exit ${code}: ${out}"
-grep -q "so this tree holds the control switched off" <<<"${out}" ||
-    fail "control committed off: it does not say the control is off: ${out}"
 grep -q "1 row(s) name a control that is not on in this tree" <<<"${out}" ||
     fail "control committed off: it does not count what it refused: ${out}"
 
-# A row whose replacement text is live in its file already, from a change that
-# has nothing to do with the control: the check refuses the row, because what
-# switching off writes can no longer be told from what the control writes. This
-# is why a row's replacement must say nothing live code already writes there.
+# A row whose replacement is a word its file says elsewhere, which is what most
+# rows are: switching that off takes the switch text with it, so the count is
+# what reports it. Such a row passes with the control on and is named when the
+# commit holds it off.
 repo="$(fresh)"
-printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
-printf '%s\n' '        for setting in HARDENING.iter().take(0) {' >>"${repo}/${gh_file}"
+atr_row="$(cat "${repo}/scripts/controls/aws-token-relative.row")"
+run_on
+[ "${code}" -eq 0 ] || fail "a common replacement, on: exit ${code}: ${out}"
+switch_off "${atr_row}" "${repo}/crates/atomic-core/src/codex.rs"
 commit
 run_on
-[ "${code}" -eq 1 ] && grep -q "^FAIL git-hardening: " <<<"${out}" ||
-    fail "a replacement live in the file: exit ${code}: ${out}"
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL aws-token-relative: its switch text is not in crates/atomic-core/src/codex.rs" <<<"${out}" ||
+    fail "a common replacement, off: exit ${code}: ${out}"
+
+# A row whose replacement holds its own switch text: switching that off leaves
+# the switch where the count looks for it, so the count cannot tell the tree
+# off from on and the replacement is what can. The row is allowed with the
+# control on, and named once the commit holds it off.
+repo="$(fresh)"
+be_row='braced-esc|crates/atomic-core/src/redact.rs|    .chain(BRACED_ESC)|    .chain(BRACED_ESC) /*CONTROL_OFF*/|guard'
+printf '%s\n' "${be_row}" >"${repo}/scripts/controls/braced-esc.row"
+commit
+run_on
+[ "${code}" -eq 0 ] || fail "a replacement holding its switch, on: exit ${code}: ${out}"
+switch_off "${be_row}" "${repo}/crates/atomic-core/src/redact.rs"
+commit
+run_on
+[ "${code}" -eq 1 ] && grep -q "^FAIL braced-esc: " <<<"${out}" ||
+    fail "a replacement holding its switch, off: exit ${code}: ${out}"
 grep -q "so this tree holds the control switched off" <<<"${out}" ||
-    fail "a replacement live in the file: it does not say the control is off: ${out}"
+    fail "a replacement holding its switch, off: it does not say the control is off: ${out}"
 
 # A switch that is no longer there: the code moved, so the row points at
 # nothing and the control it names is unchecked.
@@ -1028,10 +1046,13 @@ run_on
 #   except UnicodeDecodeError, on the source        the file a row names is not
 #                                                   text
 #   if not switch                                   a row switching nothing
-#   if replacement and replacement in source        a control committed off, a
-#                                                   replacement live in its file,
-#                                                   and two controls off at once
-#   if found == 0                                   the switch moved
+#   if switch in replacement and                    a replacement holding its own
+#       replacement in source                       switch text, committed off
+#   if found == 0                                   the switch moved, a control
+#                                                   committed off, that control
+#                                                   with a replacement its file
+#                                                   says elsewhere, and two
+#                                                   controls off at once
 #   if found > 1                                    the switch meets twice
 #   checked += 1, and the ok line                   the count of what was read
 #   run_on's cd "${repo}"                           the cases ask the copy
