@@ -5,13 +5,17 @@
 # Rust, so this is an advanced setup; leave default setup off, since the two
 # cannot both upload. Rust is extracted from source (build mode "none"), so no
 # build runs here. Actions are pinned by commit SHA.
+#
+# It scans main (each push, a weekly run and a run started by hand), not each
+# pull request: CI's runners are shared, and a scan per push to every open
+# pull request kept the merge queue's own checks waiting. An alert therefore
+# appears after its change merges; fix it on main, never dismiss it.
 
 name: CodeQL
 
 on:
   push:
     branches: [main]
-  pull_request:
   schedule:
     - cron: "23 5 * * 1"
   workflow_dispatch:
