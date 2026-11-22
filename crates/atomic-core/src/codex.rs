@@ -720,6 +720,18 @@ fn denied_paths(
     cwd: Option<&Path>,
     writable: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    denied_paths_with(private, codex_home, cwd, writable, &[])
+}
+
+/// [`denied_paths`], with `also` denied besides by [`deny_also`]: not in the
+/// list, but counted in its cap as each command counts them.
+fn denied_paths_with(
+    private: &PrivateState,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
+) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let given = writable;
     let mut roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
@@ -1027,13 +1039,16 @@ fn denied_paths(
     }
     // The cap again, counted as each command's sandbox helper counts it
     // (see `late_targets`): the second mounts of all the list denies, its
-    // second mounts among them, and of each directory whose databases it
-    // denies; so a list a thread starts with does not refuse its commands.
+    // second mounts among them and what `deny_also` will deny besides (the
+    // backend's scratch directories), and of each directory whose databases
+    // it denies; so a list a thread starts with does not refuse its commands.
     let homes: Vec<PathBuf> = std::iter::once(home_spelled)
         .chain(home_aliases.iter().cloned())
         .collect();
-    let counted =
-        crate::mounts::second_mounts(&[&all, &homes]).map_err(|e| refuse(format!("{e:#}")))?;
+    let mut as_commands_see = all.clone();
+    as_commands_see.extend(also.iter().cloned());
+    let counted = crate::mounts::second_mounts(&[&as_commands_see, &homes])
+        .map_err(|e| refuse(format!("{e:#}")))?;
     let (mounted, home_mounts) = (counted[0].len(), counted[1].len());
     let as_commands_count = link_count + mounted + home_mounts;
     if as_commands_count > MAX_LINK_TARGETS {
@@ -1390,6 +1405,20 @@ pub(crate) fn permission_profile(
     cwd: Option<&Path>,
     writable: &[PathBuf],
 ) -> anyhow::Result<PermissionProfile> {
+    permission_profile_with(sandbox, guard, codex_home, cwd, writable, &[])
+}
+
+/// [`permission_profile`], for a profile that [`deny_also`] will deny
+/// `also` in as well: counted toward the cap as each command's sandbox
+/// helper will count them, though denied by `deny_also`.
+pub(crate) fn permission_profile_with(
+    sandbox: crate::typed::Sandbox,
+    guard: &StateGuard,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
+) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
     };
@@ -1431,7 +1460,7 @@ pub(crate) fn permission_profile(
             FileSystemAccessMode::Read,
         ));
     }
-    let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
+    let (paths, globs) = denied_paths_with(private, codex_home, cwd, writable, also)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
             .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
@@ -3550,7 +3579,7 @@ where
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
         Constrained::allow_any(deny_also(
-            permission_profile(
+            permission_profile_with(
                 spec.sandbox,
                 guard,
                 codex_home,
@@ -3563,6 +3592,7 @@ where
                         roots
                     }
                 },
+                &spec.denied,
             )?,
             &spec.denied,
         )?),
@@ -5744,6 +5774,34 @@ mod tests {
                 "{} is a second mount of what this command is denied, two or more levels inside",
                 work.join("a/b/.aws").display()
             )),
+            "{refused}"
+        );
+    }
+
+    /// What the profile will deny besides the list, the backend's scratch
+    /// directories, counts toward the cap as each command counts it.
+    #[cfg(unix)]
+    #[test]
+    fn the_builder_counts_the_scratch_it_will_deny_as_each_command_does() {
+        let dir = Scratch::new("builder-cap-scratch");
+        let codex = dir.0.join("codex");
+        let scratch = dir.0.join("scratch");
+        for d in [&codex, &scratch] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: Vec::new(),
+        };
+        let _table = crate::mounts::with_table(&binds_of(&scratch, MAX_LINK_TARGETS + 1));
+        assert!(denied_paths(&private, &codex, None, &[]).is_ok());
+        let refused =
+            denied_paths_with(&private, &codex, None, &[], std::slice::from_ref(&scratch))
+                .expect_err("refused")
+                .to_string();
+        assert!(
+            refused.contains("with 513 second mounts of what they deny, counted from each side"),
             "{refused}"
         );
     }
