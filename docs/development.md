@@ -267,7 +267,11 @@ target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it changes; and,
 when it changes test code a crate's targets share (`tests/support/`,
 `tests/fixtures/` or any other directory under `crates/<c>/tests/` that is
 no one target's, or a file there that is not Rust), every row whose
-`--test` target is in that crate. The script fails on a row file it cannot
+`--test` target is in that crate; and, when it changes a test helper outside
+`tests/` that `scripts/controls-shared.txt` lists (the fake model in
+`crates/atomic-core/src/testing.rs`, the Postgres test schema in
+`crates/atomic-durable/src/testing.rs`), every row the list says it serves:
+each with a `--test` target, or each whose features turn on the one named. The script fails on a row file it cannot
 read, and on a row file deleted while its switch's text is still in some
 file, rows aside, that no other row switches it in: a control whose code
 remains, renamed or moved included, keeps its row.

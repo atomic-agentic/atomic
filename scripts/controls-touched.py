@@ -15,7 +15,9 @@ of each, read as scripts/controls-check.sh reads them), since a change to the
 guarding test can stop it failing; or changes anything under the row's
 `--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/, or any
 test code that crate's targets share (crates/<c>/tests/support/, fixtures/
-and the like: a directory there that is no one target's). The rows
+and the like: a directory there that is no one target's), or a shared test
+helper outside tests/ that scripts/controls-shared.txt lists for the row (by
+its --test target or a feature it turns on). The rows
 are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
@@ -47,6 +49,7 @@ import sys
 
 ROWS = "scripts/controls"
 LOCAL = "scripts/controls-local.txt"
+SHARED = "scripts/controls-shared.txt"
 
 
 class Refused(Exception):
@@ -245,6 +248,55 @@ def shared_test_crates(base, head, changed):
     return crates
 
 
+def shared_helpers(head):
+    """The test helpers outside crates/<c>/tests/ that scripts/controls-shared.txt
+    lists, each with the rows it serves: `--test` for every row with a --test
+    target, `feature=<name>` for every row whose --features carry <name>. A
+    line the script cannot read, or a helper that is not there, is refused:
+    a stale line would select nothing."""
+    if not exists(head, SHARED):
+        return {}
+    helpers = {}
+    for n, line in enumerate(text_of(head, SHARED).splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, colon, serves = line.partition(":")
+        path, words = posixpath.normpath(path.strip()), serves.split()
+        if not colon or not path or not words:
+            raise Refused(f"{SHARED}:{n}: '{line}' is not '<path>: <--test or feature=<name>> ...'")
+        for word in words:
+            if word != "--test" and not (word.startswith("feature=") and len(word) > len("feature=")):
+                raise Refused(f"{SHARED}:{n}: '{word}' is neither --test nor feature=<name>")
+        if not exists(head, path):
+            raise Refused(f"{SHARED}:{n}: names {path}, which is not there")
+        helpers.setdefault(path, set()).update(words)
+    return helpers
+
+
+def features(args):
+    """The features a row's cargo arguments turn on, each by its own name."""
+    words = args.split()
+    before = words[: words.index("--")] if "--" in words else words
+    named = set()
+    for i, a in enumerate(before):
+        value = None
+        if a == "--features" and i + 1 < len(before):
+            value = before[i + 1]
+        elif a.startswith("--features="):
+            value = a[len("--features=") :]
+        for feature in (value or "").replace(",", " ").split():
+            named.add(feature.rsplit("/", 1)[-1])
+    return named
+
+
+def serves(row, words):
+    """Whether a helper serving `words` serves the row."""
+    if "--test" in words and test_targets(row["args"]):
+        return True
+    return any(word[len("feature=") :] in features(row["args"]) for word in words if word.startswith("feature="))
+
+
 def selects(row, changed, contents, shared, head):
     """Whether a change touches the row: its row file, its file, a file that
     names one of its tests (at the base or the head), its --test target, or
@@ -288,12 +340,15 @@ def touched(base, head, every=False):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
         shared = shared_test_crates(base, head, changed)
+        helpers = [words for path, words in shared_helpers(head).items() if path in changed]
         # A row taken off the list of rows CI does not run is run.
         released = listed(base) - set(local)
         names = sorted(
             name
             for name, row in rows.items()
-            if name in released or selects(row, changed, contents, shared, head)
+            if name in released
+            or selects(row, changed, contents, shared, head)
+            or any(serves(row, words) for words in helpers)
         )
     run = [rows[n] for n in names if n not in local]
     return run, [(n, local[n]) for n in names if n in local], gone
