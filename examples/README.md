@@ -67,8 +67,9 @@ and runs Python exec fixtures. It invokes the shipped Astro compiler for parsing
 mandatory schema-derived TypeScript checks, prompt rendering and typed output
 validators. Generated direct declaration imports resolve in VS Code. Example 08
 uses local components and slots; example 09 reuses full schemas explicitly across
-variants. JSONL cases are checked line by line. Pinned Deno 2.9.8 must be on PATH
-or selected with `ATOMIC_DENO`; runtime Node/npm is not required.
+variants. JSONL cases are checked line by line. Its Astro checks run on
+the compiler built into atomic: build atomic first (`cargo build`), or set
+`ATOMIC_BIN` to an atomic binary; Deno and runtime Node/npm are not required.
 It regenerates the workflow diagrams committed under an `atomic:diagram` marker in
 examples 02 and 05, in the default and risk views, and fails when a committed
 copy differs. It validates example 10's `decisions` block and compares its review

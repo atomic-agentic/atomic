@@ -574,7 +574,8 @@ may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
 a command could move the directory above it away from its denial. Nor
 does it start when a denied place is named through a link inside a
-directory it may write, which a command could point elsewhere; when a
+directory it may write, which a command could point elsewhere, or is
+itself a link inside one, which a command could remove; when a
 denied place lies in a directory it may write that it is given through a
 link, rather than by its real path; or when a token file is named relative
 while atomic's own working directory is unknown. Each place is denied under

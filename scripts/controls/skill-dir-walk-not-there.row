@@ -1,0 +1,1 @@
+skill-dir-walk-not-there|crates/atomic/src/setup.rs|                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !make => return Ok(None),|                Err(_) if !make => return Ok(None),|-p atomic-agentic --bin atomic -- the_check_walk_refuses_every_error_but_not_there

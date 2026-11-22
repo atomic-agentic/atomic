@@ -1,0 +1,1 @@
+compiler-environment-cleared|crates/atomic-core/src/compiler_process.rs|.env_clear()|.env_remove("ATOMIC_CONTROL_OFF")|-p atomic-agentic-core --lib -- compiler_process::tests::the_environment_is_cleared
