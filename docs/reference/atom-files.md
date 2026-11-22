@@ -527,7 +527,13 @@ where a command could put a file there for what reads the place to find;
 passes through a link in such a directory, which a command could point
 elsewhere, or climbs back out of one with `..`, where a command could make
 what it climbs out of a link; or leads where atomic cannot tell: point the
-link elsewhere, or make what it leads to first. The model chooses the
+link elsewhere, or make what it leads to first. The same walk holds a
+denied place that is a link leading somewhere now, whose chain may not
+pass through such a link either, and each link found inside a denied
+place, which may not lead nowhere yet into a directory the turn may write
+either; a link inside the place itself is hidden from commands, and so
+cannot be pointed elsewhere. A directory the turn may write counts as such
+wherever else it is mounted. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a

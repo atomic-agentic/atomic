@@ -722,11 +722,18 @@ fn denied_paths(
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let given = writable;
-    let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let mut roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
+    let state = real(&private.state_dir);
+    // The same directories wherever else they are mounted, such as a bind of
+    // the working directory: a command may write them there too.
+    let seen_again = crate::mounts::second_mounts(&[&roots, std::slice::from_ref(&state)])
+        .map_err(|e| anyhow::Error::new(DenyRefused(format!("{e:#}"))))?;
+    roots.extend(seen_again[0].iter().cloned());
     let mut writable = roots.clone();
-    writable.push(real(&private.state_dir));
+    writable.push(state);
+    writable.extend(seen_again[1].iter().cloned());
     let mut needed = writable.clone();
     needed.extend(cwd.map(real));
     needed.push(real(codex_home));
@@ -784,6 +791,14 @@ fn denied_paths(
     let mut links = Vec::new();
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
+    }
+    // A link inside a place, walked as the kernel walks it: one whose chain
+    // runs through a link a command may point, or that leads nowhere yet into
+    // what the thread may write, refuses the thread.
+    for link in &links {
+        if let Some(refused) = link_planted(link, &writable, &places) {
+            return Err(refused);
+        }
     }
     // Only the links that lead somewhere a denial is needed count against
     // the cap.
@@ -857,9 +872,16 @@ fn denied_paths(
                 std::fs::canonicalize(&path).ok()
             } else {
                 match resolved(&path) {
-                    Ok(Some(target)) => Some(target),
+                    Ok(Some(target)) => {
+                        // Its own chain, which a command may repoint where
+                        // it runs through what the thread may write.
+                        if let Some(refused) = rewritable_chain(&path, &writable, &places) {
+                            return Err(refused);
+                        }
+                        Some(target)
+                    }
                     Ok(None) => {
-                        if let Some(refused) = dangling_into(&path, &writable) {
+                        if let Some(refused) = dangling_into(&path, &writable, &places) {
                             return Err(refused);
                         }
                         None
@@ -1043,17 +1065,24 @@ const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
 /// The databases Codex keeps in its home, as a pattern inside it.
 const SQLITE_FILES: &str = "*.sqlite*";
 
-/// Why a denied place that is a link leading nowhere yet cannot be left as
-/// it is. Its path is walked as the kernel walks it, a directory at a time,
-/// each link on the way followed where it is: it is refused when a link on
-/// the way lies in one of `writable`, where a command could point it
-/// elsewhere; when where it would lead, from the first thing that is not
-/// there on, lies in one of `writable`, where a command could put a file
-/// for what reads the place to find; or when it cannot be told. `None` when
-/// it leads elsewhere.
-fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
+/// Where [`walk_link`] found a link leads.
+enum Landing {
+    /// There now, as what it resolves to.
+    There(PathBuf),
+    /// Not there yet: where it would be once something is made there.
+    NotYet(PathBuf),
+}
+
+/// Walk `path`, a link, as the kernel walks it, a directory at a time, each
+/// link on the way followed where it is, and say where it leads. Refused
+/// when a link on the way lies in one of `writable`, where a command could
+/// point it elsewhere; when it climbs back out of one of them with `..`,
+/// where a command could make what it climbs out of a link; or when where
+/// it leads cannot be told. What lies inside a denied place of `masked` is
+/// hidden from every command, and no link or directory there can be changed.
+fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::Result<Landing> {
     use std::path::Component;
-    let refuse = |why: String| Some(anyhow::Error::new(DenyRefused(why)));
+    let refuse = |why: String| Err(anyhow::Error::new(DenyRefused(why)));
     // What is walked so far, every link in it followed, and what is left.
     let mut done = PathBuf::from("/");
     let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
@@ -1069,7 +1098,7 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
         if part == ".." {
             // Up out of a directory a command may write: what it holds,
             // that this climbs back out of, a command can make a link.
-            if let Some(root) = inside_of(writable, &done) {
+            if let Some(root) = changeable(writable, masked, &done) {
                 return refuse(format!(
                     "{} leads by way of {}, and climbs back out of it, in {}, which atoms' \
                      commands may write, so a command could make it a link that leads \
@@ -1101,16 +1130,8 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
                         next.display()
                     ));
                 }
-                let lands: PathBuf = rest.iter().fold(next, |p, part| p.join(part));
-                let root = inside_of(writable, &lands)?;
-                return refuse(format!(
-                    "{} is a link to {}, which is not there yet and lies in {}, which atoms' \
-                     commands may write, so a command could put a file there for what reads {} \
-                     to find; point the link elsewhere, or make what it leads to first",
-                    path.display(),
-                    lands.display(),
-                    root.display(),
-                    path.display()
+                return Ok(Landing::NotYet(
+                    rest.iter().fold(next, |p, part| p.join(part)),
                 ));
             }
             Err(e) => {
@@ -1128,7 +1149,7 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
         }
         // A link on the way: one a command may point elsewhere decides
         // where the place leads, whatever it points at now.
-        if let Some(root) = inside_of(writable, &next) {
+        if let Some(root) = changeable(writable, masked, &next) {
             return refuse(format!(
                 "{} leads by way of {}, a link in {}, which atoms' commands may write, so a \
                  command could point it elsewhere; point {} past it",
@@ -1167,14 +1188,83 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
             rest.push_front(part.as_os_str().to_owned());
         }
     }
-    // All there after all, as when it was made a moment ago.
-    let root = inside_of(writable, &done)?;
-    refuse(format!(
-        "{} leads to {}, in {}, which atoms' commands may write; point the link elsewhere",
+    Ok(Landing::There(done))
+}
+
+/// Why a denied place that is a link leading nowhere yet cannot be left as
+/// it is ([`walk_link`]): a link on the way a command may point, or where it
+/// would lead lies in one of `writable`, where a command could put a file for
+/// what reads the place to find. `None` when it leads elsewhere.
+fn dangling_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        // There after all, as when it was made a moment ago.
+        Ok(Landing::There(lands)) => {
+            let root = inside_of(writable, &lands)?;
+            return Some(anyhow::Error::new(DenyRefused(format!(
+                "{} leads to {}, in {}, which atoms' commands may write; point the link \
+                 elsewhere",
+                path.display(),
+                lands.display(),
+                root.display()
+            ))));
+        }
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{} is a link to {}, which is not there yet and lies in {}, which atoms' commands may \
+         write, so a command could put a file there for what reads {} to find; point the link \
+         elsewhere, or make what it leads to first",
         path.display(),
-        done.display(),
-        root.display()
-    ))
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
+/// Why a link that leads somewhere now cannot be denied as what it points at
+/// ([`walk_link`]): a link on the way a command may point elsewhere, as for
+/// a place whose own chain runs through what the thread may write. `None`
+/// when its chain is the thread's to change nowhere.
+fn rewritable_chain(
+    path: &Path,
+    writable: &[PathBuf],
+    masked: &[PathBuf],
+) -> Option<anyhow::Error> {
+    walk_link(path, writable, masked).err()
+}
+
+/// Why a link found inside a denied place cannot be left as it is: its chain
+/// runs through a link a command may point elsewhere, or it leads nowhere
+/// yet into what the thread may write, where a command could put a file for
+/// what reads it to find ([`walk_link`]). `None` otherwise.
+fn link_planted(link: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(link, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        Ok(Landing::There(_)) => return None,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, inside a place denied to atoms' commands, is a link to {}, which is not there yet \
+         and lies in {}, which they may write, so a command could put a file there for what \
+         reads {} to find; point the link elsewhere, or make what it leads to first",
+        link.display(),
+        lands.display(),
+        root.display(),
+        link.display()
+    ))))
+}
+
+/// The first of `writable` that holds `path`, where a command may change it,
+/// unless a denied place of `masked` holds it too: the sandbox hides what is
+/// inside one, so no command can change it there.
+fn changeable<'a>(writable: &'a [PathBuf], masked: &[PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    if inside_of(masked, path).is_some() {
+        return None;
+    }
+    inside_of(writable, path)
 }
 
 /// The first of `dirs` that holds `path`, or is it.
@@ -1182,7 +1272,7 @@ fn inside_of<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
     dirs.iter().find(|d| path.starts_with(d))
 }
 
-/// The most links [`dangling_into`] follows, as the kernel does.
+/// The most links [`walk_link`] follows, as the kernel does.
 const LINK_HOPS: usize = 40;
 
 /// `path` with the links among the directories above it, and itself,
@@ -5967,10 +6057,12 @@ mod tests {
             message.contains("is a second mount") && message.contains("which they need"),
             "{message}"
         );
-        // Where it lies two levels inside a directory the thread may write.
+        // Where it lies two levels inside a directory the thread may write:
+        // the whole filesystem, bound there, is the thread's to write at `/`
+        // too, and so is the place.
         let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
         assert!(
-            message.contains("is a second mount") && message.contains("two or more levels"),
+            message.contains("home/.aws is inside /, which atoms' commands may write"),
             "{message}"
         );
         // Codex's home bound two levels inside a writable directory: its
@@ -6216,6 +6308,102 @@ mod tests {
         std::fs::remove_file(&aws).expect("unlink");
         std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
         denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    /// What a command could repoint refuses the thread: a place whose own
+    /// chain, there now, runs through a link in what the thread may write; a
+    /// link inside a place that does, or that leads nowhere yet into what
+    /// it may write; and a place that leads into a second mount of what it
+    /// may write, as much the thread's to write as the directory itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_or_a_link_in_one_a_command_could_repoint_refuses_the_thread() {
+        let dir = Scratch::new("place-chains");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let elsewhere = dir.0.join("elsewhere");
+        for d in [&home, &work, &codex, &elsewhere, &dir.0.join("state")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let writable = std::slice::from_ref(&work);
+        let refused = || {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // (b) The place, there now, through a link in what it may write.
+        std::fs::write(elsewhere.join("aws"), "[default]").expect("aws");
+        link(&elsewhere.join("aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                place.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // (a) A link inside the place, leading nowhere yet into what it may
+        // write, and one whose chain runs through a link there.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(&place).expect("dir");
+        let config = place.join("config");
+        link(&work.join("aws-config"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{}, inside a place denied to atoms' commands, is a link to {}, which is not \
+                 there yet and lies in {}",
+                config.display(),
+                work.join("aws-config").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        link(&work.join("hop"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                config.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        std::fs::remove_dir(&place).expect("rmdir");
+        drop(one);
+        // (c) Into a second mount of what it may write.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again rw - ext4 /dev/sda1 rw\n",
+            work.display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        link(Path::new("/again/aws"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to /again/aws, which is not there yet and lies in /again",
+                place.display()
+            )),
+            "{why}"
+        );
+        // A place whose chain stays out of what it may write: denied.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&elsewhere.join("aws"), &place);
+        assert_eq!(refused(), None);
     }
 
     /// A place that is a link leading nowhere yet refuses the thread when
