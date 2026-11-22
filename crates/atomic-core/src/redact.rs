@@ -1976,6 +1976,14 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return false;
     };
+    // Check the bytes the parse read before rewriting its value: parsing
+    // keeps only the last duplicate field, which can erase the name that
+    // classified another field as private. Text redaction can also make
+    // previously different names equal.
+    if gives_a_key_twice(&texted) {
+        *string = REDACTED.to_owned();
+        return true;
+    }
     // JSON in a string it holds that text redaction broke: hidden whole,
     // as [`redact_string`] hides it.
     if texted != *string && broke_json_within(string, &inner, nested) {

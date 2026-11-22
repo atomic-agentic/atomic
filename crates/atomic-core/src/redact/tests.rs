@@ -3213,6 +3213,56 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
     );
 }
 
+/// A held document is checked before a changed header causes its parsed
+/// value to be written back and loses the earlier names of repeated fields.
+#[test]
+fn held_json_duplicates_are_refused_before_normalization() {
+    let header = concat!("Qk9L", "x3sR2tY7uV8w");
+    let hidden = "sample-private-value";
+    let pair = format!(r#"{{"name":"X-Api-Key","value":"{header}"}}"#);
+    for (case, document) in [
+        format!(
+            "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"key\": \"note\"\n}}"
+        ),
+        format!(
+            "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"\\u006bey\": \"note\"\n}}"
+        ),
+        format!(
+            "{{\n  \"h\": {pair},\n  \"https://u:pw@h\": \"{hidden}\",\n  \"https://u:[REDACTED]@h\": \"kept\"\n}}"
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for parent in ["key", "token", "note"] {
+            let mut once = json!({ parent: document.clone() });
+            value(&mut once);
+            assert!(
+                !once.to_string().contains(hidden),
+                "case {case} under {parent}: repeated-field value remained"
+            );
+            assert!(
+                once[parent] == REDACTED,
+                "case {case} under {parent}: document was normalized before refusal"
+            );
+            let mut twice = once.clone();
+            value(&mut twice);
+            assert!(twice == once, "case {case} under {parent}: second pass changed it");
+        }
+    }
+    // A unique document still retains the ordinary value while its header
+    // is redacted. Refusal is specific to the repeated field names.
+    let document = format!("{{\n  \"h\": {pair},\n  \"value\": \"ordinary\"\n}}");
+    for parent in ["key", "token", "note"] {
+        let mut out = json!({ parent: document.clone() });
+        value(&mut out);
+        let held = out[parent].as_str().expect("held document");
+        let parsed: Value = serde_json::from_str(held).expect("unique JSON remains JSON");
+        assert_eq!(parsed["value"], "ordinary");
+        assert_eq!(parsed["h"]["value"], REDACTED);
+    }
+}
+
 /// An excerpt of a JSON document that gives a key twice is written from
 /// the parse, which kept the last value, so the earlier one is left out
 /// rather than shown as written; a second excerpt changes nothing.
