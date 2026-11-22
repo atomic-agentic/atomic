@@ -26,7 +26,12 @@ to say elsewhere, which is a row that cannot be fixed without moving the control
 not a tree with a control off. Where a replacement does hold its own switch text,
 switching off leaves that text in place and the count cannot see the difference,
 so there the replacement is what is asked: the file holding what switching off
-writes is the control off. A row whose replacement is empty deletes its switch
+writes is the control off. What is asked of the file there is the replacement as
+written and with all its whitespace taken out, because several statements a row
+puts on one line are not left there by rustfmt, which gives each a line of its
+own: the exact text is then gone from a tree that still holds the switch text
+exactly once, and only what is left when the layout is out of both says whether
+the statements are in the file. A row whose replacement is empty deletes its switch
 text and writes nothing to look for, so only the count applies to it; that rule
 alone says the switch is where it points. Where a row names a file that cannot be
 read, neither rule can be asked and the row is refused as what could not be read,
@@ -208,7 +213,17 @@ def main():
         # off takes the switch text out, the count reports it, and asking this
         # rule as well would refuse a row over a replacement that is a word the
         # file has good cause to say elsewhere.
-        if switch in replacement and replacement in source:
+        #
+        # Asked with the whitespace out of both as well as as written, because a
+        # replacement holding several statements on one line is not left there by
+        # rustfmt, which gives each a line of its own. The exact text is then gone
+        # from a tree that still holds the switch text exactly once, and what is
+        # left when the layout is out of both is the only thing that says the
+        # statements are in the file.
+        if switch in replacement and (
+            replacement in source
+            or "".join(replacement.split()) in "".join(source.split())
+        ):
             problems.append(
                 f"{kind}: what switching it off writes is in {rel}, so this tree holds "
                 "the control switched off. Put the control back, or give the row a "

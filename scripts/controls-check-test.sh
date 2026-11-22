@@ -778,6 +778,34 @@ open(path, "w", newline="").write(text.replace(old, new, 1))
 PY
 }
 
+# reflow ROW FILE: put each statement the row's replacement wrote onto a line of
+# its own, at the `; ` between them and at the replacement's own indentation,
+# which is what rustfmt does to a line holding several of them. The statements
+# and their order are what is left; only the layout changes. It fails the case
+# when the replacement is not the one place it claims, holds no `; ` to reflow
+# at, or would not leave the row's switch text as a line of the reflowed text --
+# a fixture that changed nothing, or changed the wrong thing, must not be left to
+# assert against a tree it never made.
+reflow() {
+    local row="$1" file="$2"
+    python3 - "${file}" "$(cut -d'|' -f3 <<<"${row}")" "$(cut -d'|' -f4 <<<"${row}")" <<'PY' || fail "reflow: ${file} is not reflowed"
+import sys
+
+path, switch, replacement = sys.argv[1:]
+text = open(path, newline="").read()
+if text.count(replacement) != 1:
+    sys.exit(f"{replacement!r} is not the one place it claims in {path}")
+indent = replacement[: len(replacement) - len(replacement.lstrip())]
+reflowed = replacement.replace("; ", ";\n" + indent)
+if reflowed == replacement:
+    sys.exit(f"{replacement!r} holds no '; ' to reflow at, so it tests nothing")
+if switch not in reflowed.split("\n"):
+    sys.exit(f"{switch!r} is not one whole line of the reflowed {reflowed!r}, so the "
+             "count would not stay blind to what this case is about")
+open(path, "w", newline="").write(text.replace(replacement, reflowed, 1))
+PY
+}
+
 # A control committed switched off: the commit holds what the row's replacement
 # writes where the control was, which is what a `git commit -a` taken while a
 # controls-check run was editing leaves behind. The row is named.
@@ -824,6 +852,27 @@ run_on
     fail "a replacement holding its switch, off: exit ${code}: ${out}"
 grep -q "so this tree holds the control switched off" <<<"${out}" ||
     fail "a replacement holding its switch, off: it does not say the control is off: ${out}"
+
+# The same rule when rustfmt has had its turn with the line. Most rows whose
+# replacement holds its own switch text write several statements on one line, and
+# rustfmt gives each a line of its own: the exact replacement text is then gone
+# from a tree that still holds the switch text exactly once, so the count is
+# silent and only what is left with the whitespace out of both says the
+# statements are in the file. This takes a real row of that shape, switches it
+# off, and reflows what was written at the `; ` between its statements the way
+# rustfmt would. One of the lines it makes is the switch text itself, byte for
+# byte, which is why the count stays silent and what is refused is the reflow.
+repo="$(fresh)"
+gf_row="$(cat "${repo}/scripts/controls/git-filters.row")"
+switch_off "${gf_row}" "${repo}/${gh_file}"
+reflow "${gf_row}" "${repo}/${gh_file}"
+commit
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-filters: what switching it off writes is in ${gh_file}" <<<"${out}" ||
+    fail "a replacement reflowed onto lines: exit ${code}: ${out}"
+grep -q "1 row(s) name a control that is not on in this tree" <<<"${out}" ||
+    fail "a replacement reflowed onto lines: it does not count what it refused: ${out}"
 
 # A switch that is no longer there: the code moved, so the row points at
 # nothing and the control it names is unchecked.
@@ -1046,8 +1095,10 @@ run_on
 #   except UnicodeDecodeError, on the source        the file a row names is not
 #                                                   text
 #   if not switch                                   a row switching nothing
-#   if switch in replacement and                    a replacement holding its own
-#       replacement in source                       switch text, committed off
+#   if switch in replacement and (                  a replacement holding its own
+#       replacement in source or                    switch text, committed off, and
+#       "".join(replacement.split())                the same control with its line
+#           in "".join(source.split()))             reflowed as rustfmt would
 #   if found == 0                                   the switch moved, a control
 #                                                   committed off, that control
 #                                                   with a replacement its file
