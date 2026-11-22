@@ -139,9 +139,19 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn can add, change or remove what a turn keeps in its
-temporary directory. Another turn of the project can still read it, by its path
-under the project's scratch directory: do not rely on it for secrets. (Codex's
+file runs and no other turn of the project can see, add, change or remove what
+a turn keeps in its `HOME` or temporary directory: every scratch directory of
+the project, those of `atomic run`, `atomic serve` and `atomic eval` and those
+of `atomic debug codex-prompt` and `atomic debug probe`, is denied to a turn's commands, apart from a
+`workspace-write` turn's own. A `read-only` turn, which may not write its own,
+cannot reach it at all, not even to list it. Other projects' scratch
+directories are not denied yet: a turn can read another project's live
+attempts by their path. Apart from macOS, whose own sandbox denies them, only
+Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
+them, so a process without it refuses the turn instead of running it. On
+macOS none of this is verified. An exec atom's
+command, which has a scratch directory of its own too, is not yet kept from
+the others' in the same way. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -187,13 +197,17 @@ reaches, and then all but those, which it reaches through atomic's proxy; and
 sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A command does not start when a denial
-would cover its working directory or a directory it may write, or when a
+would cover its working directory or a directory it may write, apart from its
+own scratch directory, which a denied scratch root covers and which is opened
+to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
 may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
-is denied only to the commands that start after it, and a link made after
-the list is not followed until the next turn or step. Credentials kept
+is denied only to the commands that start after it, and so is what a link
+made after the list inside a denied place points at: each command looks for
+such links again as it starts, and one made while a command runs is followed
+from the next. Credentials kept
 anywhere else are not covered. An
 exec atom's command may write only its scratch directory and its run's own
 build caches, which no other run's command may write, though one can still read them by their path, and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
@@ -202,7 +216,10 @@ any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
 draw on the terminal atomic runs in, whether through `/dev/tty`, the
 terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
-needs bubblewrap and unprivileged user namespaces there: where the sandbox
+needs bubblewrap and unprivileged user namespaces there; a bubblewrap older
+than 0.9, without `--argv0`, as Ubuntu 22.04 ships, works too, since Codex
+runs the sandbox helper through a link atomic keeps in its own state, by its
+path, which no command can write. Where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead sets that run
@@ -306,6 +323,20 @@ stays parked with its record kept in the store, and the work goes on only as a
 new run, started again with `atomic run`. Stop every atomic process that uses a
 shared store before upgrading it, so that none goes on recording parks without
 their project.
+Runs and their gates are kept apart the same way. Each run is recorded with its
+project as it starts, and on a shared store `atomic gates list`, `approve`,
+`reject` and `answer` see only the current project's runs' gates, and `atomic
+runs show` and `atomic runs resume` only its runs: another project's gate or
+run is refused as one that does not exist. Run ids stay unique across the whole
+store, so `atomic run` refuses an id another project has taken, saying only
+that it is taken. On a local SQLite store, runs are adopted as parks are: one
+recorded before atomic kept runs' projects, or under an older name of the
+project's, becomes the project's, so a rename strands no run at its gate. A run
+started on a shared store before atomic kept runs' projects is no project's:
+none of these commands shows it or its gates, so it cannot get past a gate it
+waits at; start it again as a new run with `atomic run`. A broken manifest stops
+these commands too, and leaves the runs and gates where they are until it is
+mended. A gate decision still comes only from a person's enrolled credential.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.

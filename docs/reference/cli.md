@@ -159,7 +159,7 @@ authentication](../getting-started/authentication.md).
 | Command or surface | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic gates enroll` | Enroll your operator credential for the project, from a terminal; `--replace` rotates it or replaces a lost one | v0.1 local, Linux |
-| `atomic gates list` | Inspect durable gates | v0.1 local |
+| `atomic gates list` | Inspect durable gates; on a shared store, only the project's runs' gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
 | `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |

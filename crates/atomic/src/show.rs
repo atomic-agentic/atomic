@@ -59,7 +59,7 @@ fn utc(ms: i64) -> String {
 
 /// Gather what the store has about `id` as one JSON document.
 async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
-    let Some(record) = rt.run_record(id).await? else {
+    let Some(record) = rt.own_run_record(id).await? else {
         return Ok(None);
     };
     let steps = rt.steps(id).await?;

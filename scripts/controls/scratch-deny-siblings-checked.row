@@ -1,0 +1,1 @@
+scratch-deny-siblings-checked|crates/atomic-exec/src/workspace.rs|    for root in &denied {|    for root in denied.iter().take(1) {|-p atomic-agentic-exec --lib a_writable_root_in_a_denied_directory_is_refused
