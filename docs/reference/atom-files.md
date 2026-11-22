@@ -538,7 +538,11 @@ directory it may write, which a command could point elsewhere; when a
 denied place lies in a directory it may write that it is given through a
 link, rather than by its real path; or when a token file is named relative
 while atomic's own working directory is unknown. Each place is denied under
-its real path, which denies it under every spelling. The model
+its real path, which denies it under every spelling. Nor does it start
+when a denied place is a link atomic cannot resolve for a reason other
+than leading nowhere yet, such as a link to itself or into a directory you
+may not search: remove the link, or point it at something atomic can
+reach. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
@@ -547,15 +551,16 @@ denied place points at, which each command looks for again as it starts,
 in the places the list was made with, and denies at its second mounts too,
 and so is a second mount of what the list denies made since it was built,
 or of Codex's home, whose databases are denied there too, as each command
-reads the mount table again; a command whose new link or
-new second mount leads somewhere atomic would refuse to deny does not
-start. As each command starts, the links up to four levels inside the
-places that lead outside them to something atomic would deny, old and new,
-each target counted once, together with the second mounts of what the new
-ones point at, of everything the list denies (its own second mounts among
-them, so each pair is counted from both sides) and of Codex's home, come to
-at most 512; past that, the command does not start, and the list is
-counted the same way when the turn starts.
+reads the mount table again; a command whose new link or new second mount
+leads somewhere atomic would refuse to deny, or whose denied place has
+become a link atomic cannot resolve for a reason other than leading
+nowhere, does not start. As each command starts, the links up to four
+levels inside the places that lead outside them to something atomic would
+deny, old and new, each target counted once, together with the second
+mounts of what the new ones point at, of everything the list denies (its
+own second mounts among them, so each pair is counted from both sides) and
+of Codex's home, come to at most 512; past that, the command does not
+start, and the list is counted the same way when the turn starts.
 A link or a mount made in the moment between that look and the sandbox's
 start, or while a long-lived command, such as a turn's unified-exec
 session, keeps running, is followed only from the next command. The file operations Codex
