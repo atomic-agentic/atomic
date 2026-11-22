@@ -512,7 +512,7 @@ impl ProjectState {
             for base in &bases {
                 let main = home.join(format!("{base}.sqlite"));
                 if database_in_use(&main) {
-                    eprintln!(
+                    crate::log_line!(
                         "atomic: {} is in use, so it stays in the Codex home until it is not",
                         main.display()
                     );
@@ -569,7 +569,7 @@ impl ProjectState {
         self.migrating(|| {
             for root in &roots {
                 if let Err(e) = atomic_exec::retire_scratch_root(root) {
-                    eprintln!(
+                    crate::log_line!(
                         "atomic: could not remove the old scratch directory {}: {e}",
                         root.display()
                     );
