@@ -2167,6 +2167,8 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
         format!("sh -c \"login --password {credential}\" now"),
         format!("sh -c 'login --token {credential}' now"),
         // Quotes escaped otherwise, or around a value that opens another.
+        format!("--api-key \\'login \\'--auth-token {credential}\\\\'\\'"),
+        format!("run sh --auth-token \\\"login \\\"--token {credential}\\\" now"),
         format!("--api-key \\'sh --api-key \"login [\\'--auth-token\\',\\'{credential}\\']\"\\'"),
         format!("sh --name \"login sh --secret 'login --token='{credential}''\""),
         format!("--pw \\\\\\\"\\\\\\\"--token \"{credential}\"\\\\\\\"\\\\\\\""),
@@ -2199,6 +2201,9 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
     // In JSON held in a string, one level deep and two.
     let inner = json!({"cmd": "deploy --password \"hunter2\""}).to_string();
     let wrapped = json!({"cmd": "sh -c \"login --password hunter2\""}).to_string();
+    // A weak flag's quoted list, whose escaped quotes read as more than a
+    // value: its backslashes alone are no secret, and stay.
+    let weak = json!({"cmd": "--token \"[\\'--pw\\',\\'hunter2\\']\""}).to_string();
     // An argument list beside a key only parsing finds, `pass\u0077ord`.
     let listed = r#"{"args":["--password","a"],"pass\u0077ord":"hunter2"}"#;
     for (depth, doc) in [
@@ -2209,6 +2214,8 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
             2,
             json!({"arguments": json!({"body": wrapped}).to_string()}),
         ),
+        (1, json!({"arguments": weak.clone()})),
+        (2, json!({"arguments": json!({"body": weak}).to_string()})),
         (1, json!({"arguments": listed})),
         (2, json!({"arguments": json!({"body": listed}).to_string()})),
     ] {
