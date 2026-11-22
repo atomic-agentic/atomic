@@ -1,0 +1,1 @@
+pair-settle-after-descent|crates/atomic-core/src/redact.rs|    settle_pair(value); // unheld|    // settle_pair(value); /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_pair_whose_value_redacts_to_its_secret_settles_in_one_pass

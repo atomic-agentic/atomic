@@ -37,6 +37,8 @@
 //! whether its sandbox is safe to suspend.
 
 pub mod exchange;
+#[cfg(unix)]
+pub mod inherited;
 pub mod process;
 pub mod quiescence;
 pub mod runner;

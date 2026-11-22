@@ -13,7 +13,11 @@ can move the switch's text or stop it biting; changes a file whose text, at
 BASE or at HEAD, holds the name of a test the row names (the last `::` part
 of each, read as scripts/controls-check.sh reads them), since a change to the
 guarding test can stop it failing; or changes anything under the row's
-`--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/. The rows
+`--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/, or any
+test code that crate's targets share (crates/<c>/tests/support/, fixtures/
+and the like: a directory there that is no one target's), or a shared test
+helper outside tests/ that scripts/controls-shared.txt lists for the row (by
+its --test target, a feature it turns on or a package it builds). The rows
 are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
@@ -37,6 +41,7 @@ build, then by name, and cut into N runs of nearly equal length.
 """
 
 import argparse
+import functools
 import os
 import posixpath
 import subprocess
@@ -44,6 +49,7 @@ import sys
 
 ROWS = "scripts/controls"
 LOCAL = "scripts/controls-local.txt"
+SHARED = "scripts/controls-shared.txt"
 
 
 class Refused(Exception):
@@ -57,6 +63,7 @@ def git(*args):
     return done.stdout
 
 
+@functools.lru_cache(maxsize=None)
 def exists(commit, path):
     done = subprocess.run(["git", "cat-file", "-e", f"{commit}:{path}"], capture_output=True)
     return done.returncode == 0
@@ -80,11 +87,36 @@ def parse(path, text):
     if len(fields) != 5:
         raise Refused(f"{path} has {len(fields) - 1} '|' separators, not the 4 between its five fields")
     name, file, switch, _, args = fields
+    if not name:
+        raise Refused(f"{path} names no control")
     if name != posixpath.basename(path)[: -len(".row")]:
         raise Refused(f"{path} names itself '{name}', which is not its file name")
     if not file or not switch:
         raise Refused(f"{path} names no file or no text to switch")
     return {"name": name, "file": posixpath.normpath(file), "switch": switch, "args": args}
+
+
+def regular(commit, path, mode):
+    """The path of the regular file a row file is, following links within the
+    tree as scripts/controls-check.sh's `[ -f ]` follows them; a link out of
+    the tree, to nothing, to a directory or in a loop is refused."""
+    seen = set()
+    while mode == "120000":
+        if path in seen or len(seen) >= 40:
+            raise Refused(f"{path} is a link that does not end")
+        seen.add(path)
+        target = git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="surrogateescape")
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+        if posixpath.isabs(target) or path.startswith("../") or path == "..":
+            raise Refused(f"{path} is reached by a link out of the repository, so it cannot be read from git")
+        listed = git("ls-tree", "-z", commit, "--", path).split(b"\0")[0].decode("utf-8", errors="replace")
+        meta, _, name = listed.partition("\t")
+        if name != path:
+            raise Refused(f"{path}, which a row file links to, is not in the tree")
+        mode = meta.split(" ")[0]
+    if mode not in ("100644", "100755"):
+        raise Refused(f"{path} is not a regular file")
+    return path
 
 
 def rows_at(commit):
@@ -95,13 +127,24 @@ def rows_at(commit):
         path = f"{ROWS}/{base}"
         if not base.endswith(".row"):
             raise Refused(f"{path} is not named <name>.row, so its control would never be read")
-        if meta.split(" ")[0] not in ("100644", "100755"):
-            raise Refused(f"{path} is not a regular file")
-        row = parse(path, text_of(commit, path))
+        row = parse(path, text_of(commit, regular(commit, path, meta.split(" ")[0])))
         rows[row["name"]] = row
     if not rows:
         raise Refused(f"{ROWS} holds no control at {commit}")
     return rows
+
+
+def listed(commit):
+    """The names scripts/controls-local.txt lists at a commit, read as
+    leniently as a list that may name rows since deleted must be."""
+    if commit is None or not exists(commit, LOCAL):
+        return set()
+    names = set()
+    for line in git("cat-file", "blob", f"{commit}:{LOCAL}").decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and ":" in line:
+            names.add(line.partition(":")[0].strip())
+    return names
 
 
 def local_rows(commit, rows):
@@ -157,7 +200,8 @@ def deleted(base, head, changed, rows):
             continue
         if exists(head, path) or not exists(base, path):
             continue
-        gone = parse(path, text_of(base, path))
+        mode = git("ls-tree", "-z", base, "--", path).decode("utf-8", errors="replace").split(" ")[0]
+        gone = parse(path, text_of(base, regular(base, path, mode)))
         files = holding(head, gone["switch"])
         holders = [(f, held[(f, gone["switch"])]) for f in files if (f, gone["switch"]) in held]
         unheld = [f for f in files if (f, gone["switch"]) not in held]
@@ -203,9 +247,118 @@ def test_targets(args):
     return [before[i + 1] for i, a in enumerate(before[:-1]) if a == "--test"]
 
 
-def selects(row, changed, contents):
+def shared_test_crates(base, head, changed):
+    """The crates whose shared test code the change touches: a file under
+    crates/<c>/tests/ that belongs to no one test target, such as one in
+    tests/support/ or tests/fixtures/, or a file there that is not Rust. A
+    directory tests/<d>/ belongs to the target <d> when tests/<d>.rs or
+    tests/<d>/main.rs is there, at the base or at the head."""
+    crates = set()
+    for path in changed:
+        parts = path.split("/")
+        if len(parts) < 4 or parts[0] != "crates" or parts[2] != "tests":
+            continue
+        tests = "/".join(parts[:3])
+        if len(parts) == 4:
+            if not parts[3].endswith(".rs"):
+                crates.add(parts[1])
+            continue
+        d = parts[3]
+        owned = any(
+            exists(commit, f"{tests}/{d}.rs") or exists(commit, f"{tests}/{d}/main.rs") for commit in (base, head)
+        )
+        if not owned:
+            crates.add(parts[1])
+    return crates
+
+
+def shared_helpers(head):
+    """The test helpers outside crates/<c>/tests/ that scripts/controls-shared.txt
+    lists, each with the rows it serves: `--test` for every row with a --test
+    target, `feature=<name>` for every row whose features turn <name> on
+    (--all-features turns every one on), `package=<name>` for every row that
+    builds that package (--workspace, or no package named, builds them all). A
+    line the script cannot read, or a helper that is not there, is refused:
+    a stale line would select nothing."""
+    if not exists(head, SHARED):
+        return {}
+    helpers = {}
+    for n, line in enumerate(text_of(head, SHARED).splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, colon, serves = line.partition(":")
+        path, words = posixpath.normpath(path.strip()), serves.split()
+        if not colon or not path or not words:
+            raise Refused(f"{SHARED}:{n}: '{line}' is not '<path>: <--test, feature=<name> or package=<name>> ...'")
+        for word in words:
+            kind, equals, value = word.partition("=")
+            if word != "--test" and not (equals and kind in ("feature", "package") and value):
+                raise Refused(f"{SHARED}:{n}: '{word}' is none of --test, feature=<name> and package=<name>")
+        if not exists(head, path):
+            raise Refused(f"{SHARED}:{n}: names {path}, which is not there")
+        helpers.setdefault(path, set()).update(words)
+    return helpers
+
+
+def features(args):
+    """The features a row's cargo arguments turn on, each by its own name,
+    and whether they turn on every feature (--all-features)."""
+    words = args.split()
+    before = words[: words.index("--")] if "--" in words else words
+    named, every = set(), False
+    for i, a in enumerate(before):
+        value = None
+        if a in ("--features", "-F") and i + 1 < len(before):
+            value = before[i + 1]
+        elif a.startswith("--features="):
+            value = a[len("--features=") :]
+        elif a.startswith("-F") and a != "-F":
+            value = a[2:].lstrip("=")
+        elif a == "--all-features":
+            every = True
+        for feature in (value or "").replace(",", " ").split():
+            named.add(feature.rsplit("/", 1)[-1])
+    return named, every
+
+
+def packages(args):
+    """The packages a row's cargo arguments build, or None for any of them
+    (--workspace, or no package named, which is the workspace's own)."""
+    words = args.split()
+    before = words[: words.index("--")] if "--" in words else words
+    named = set()
+    for i, a in enumerate(before):
+        if a == "--workspace" or a == "--all":
+            return None
+        if a in ("-p", "--package") and i + 1 < len(before):
+            named.add(before[i + 1])
+        elif a.startswith("--package="):
+            named.add(a[len("--package=") :])
+        elif a.startswith("-p") and a != "-p":
+            named.add(a[2:].lstrip("="))
+    return named or None
+
+
+def serves(row, words):
+    """Whether a helper serving `words` serves the row."""
+    if "--test" in words and test_targets(row["args"]):
+        return True
+    turned_on, every = features(row["args"])
+    for word in words:
+        if word.startswith("feature=") and (every or word[len("feature=") :] in turned_on):
+            return True
+    built = packages(row["args"])
+    for word in words:
+        if word.startswith("package=") and (built is None or word[len("package=") :] in built):
+            return True
+    return False
+
+
+def selects(row, changed, contents, shared, head):
     """Whether a change touches the row: its row file, its file, a file that
-    names one of its tests (at the base or the head), or its --test target."""
+    names one of its tests (at the base or the head), its --test target, or
+    the shared test code of a crate that holds that target."""
     if f"{ROWS}/{row['name']}.row" in changed or row["file"] in changed:
         return True
     tests = {name.rsplit("::", 1)[-1] for name in named_tests(row["args"])}
@@ -217,6 +370,9 @@ def selects(row, changed, contents):
             if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "tests":
                 if parts[3] == f"{target}.rs" or (parts[3] == target and len(parts) > 4):
                     return True
+        for crate in shared:
+            if exists(head, f"crates/{crate}/tests/{target}.rs") or exists(head, f"crates/{crate}/tests/{target}"):
+                return True
     return False
 
 
@@ -241,7 +397,17 @@ def touched(base, head, every=False):
             for commit in (base, head):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
-        names = sorted(name for name, row in rows.items() if selects(row, changed, contents))
+        shared = shared_test_crates(base, head, changed)
+        helpers = [words for path, words in shared_helpers(head).items() if path in changed]
+        # A row taken off the list of rows CI does not run is run.
+        released = listed(base) - set(local)
+        names = sorted(
+            name
+            for name, row in rows.items()
+            if name in released
+            or selects(row, changed, contents, shared, head)
+            or any(serves(row, words) for words in helpers)
+        )
     run = [rows[n] for n in names if n not in local]
     return run, [(n, local[n]) for n in names if n in local], gone
 

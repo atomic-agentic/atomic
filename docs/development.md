@@ -182,12 +182,13 @@ With the feature on, a sandbox that cannot start fails the tests, each with a
 message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
-commands, and stops before such a step without it, so the tests in
-`crates/atomic/tests/run_cli.rs` and `crates/atomic/tests/telemetry.rs` that
-run commands are behind the same feature there, each marked
-`// needs_sandbox`; the rest of those files runs in a plain `cargo test`. The
-sandbox check runs each marked test, as it runs every test of a file that is
-behind the feature as a whole.
+commands, and stops before such a step without it, so in the four files under
+`crates/atomic/tests/` that hold both kinds of test — `run_cli.rs`,
+`telemetry.rs`, `fixture_cli.rs` and `command_environment.rs` — every test
+that runs a command is behind the same feature, marked `// needs_sandbox`
+above its attributes; the rest of those files runs in a plain `cargo test`.
+The sandbox check runs each marked test, as it runs every test of a file that
+is behind the feature as a whole.
 
 ## Controls are tested by removing them
 
@@ -229,7 +230,15 @@ file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
 (in CI) tests that. It refuses to start while a file a selected control edits
 differs from HEAD, including a file git does not track or is told to assume
 unchanged, so commit or put back changes to those files first; changes to
-other files do not matter.
+other files do not matter. It also refuses to start while another run holds the
+tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
+the same files and each saves its own originals, so the one that finishes last
+would put back the other's switched-off source. That lock is closed before the
+run's cargo and its git are started, so neither a test that leaves a process
+behind nor a git that starts a fsmonitor daemon holds a finished run's lock.
+The lock frees itself when the run that took it ends, however it ends, so its
+file is never something to remove: removing it frees nothing and would let a
+third run lock a fresh file beside the one still held.
 
 Each control is one file under `scripts/controls/`, named `<name>.row` and
 holding one line:
@@ -253,7 +262,24 @@ different control, a file holding anything but one row, a second file naming a
 control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
-fails until it is updated.
+fails until it is updated. `scripts/controls-on.py` and
+`scripts/controls-touched.py` read row files by these same rules, and refuse a
+row that names no control; the second reads them from git's tree, so a row
+file that is a link must lead to a regular file inside the repository.
+
+`python3 scripts/controls-on.py` asks of every row whether its file holds the
+control rather than what switching the row off writes, and CI runs it on the
+commit it checks out, for every row at once: a rebuild per control is why
+`controls-check.sh` runs only the rows a pull request touches, and this needs
+no build. A row whose replacement does not hold its own switch text takes that
+text out of the file when it switches the control off — whatever the
+replacement is, even a value the file says elsewhere — so for those rows the check requires the switch text to be in the file exactly
+once. A row whose replacement does hold its own switch text leaves that text
+where the row points, so for those the check requires the replacement not to be
+in the file at all. A row that fails either is named. The script reads the row
+files by the same rules as `controls-check.sh`, so a row that cannot be read is
+refused there too rather than left unchecked, and
+`scripts/controls-check-test.sh` tests both with fixtures it commits.
 
 ### The Controls workflow
 
@@ -262,12 +288,30 @@ request touches, which `scripts/controls-touched.py <base> <head>` lists: each
 row whose row file it adds or changes; each row whose `file` it changes, since
 a code change can move a switch's text or stop it biting; each row naming a
 test whose name is in a file it changes, before or after the change, since a
-change to the guarding test can stop it failing; and each row whose
-`--test <t>` target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it
-changes. The script fails on a row file it cannot read, and on a row file
-deleted while its switch's text is still in some file, rows aside, that no
-other row switches it in: a control whose code remains, renamed or moved
-included, keeps its row.
+change to the guarding test can stop it failing; each row whose `--test <t>`
+target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it changes; and,
+when it changes test code a crate's targets share (`tests/support/`,
+`tests/fixtures/` or any other directory under `crates/<c>/tests/` that is
+no one target's, or a file there that is not Rust), every row whose
+`--test` target is in that crate; and, when it changes a test helper outside
+`tests/` that `scripts/controls-shared.txt` lists (the fake model in
+`crates/atomic-core/src/testing.rs`, the Postgres test schema in
+`crates/atomic-durable/src/testing.rs`), every row the list says it serves:
+each with a `--test` target, each whose features turn on the one named, or
+each that builds a package named, since a crate's own unit tests and those of
+the crates that turn its test features on compile the helper too. The script fails on a row file it cannot
+read, and on a row file deleted while its switch's text is still in some
+file, rows aside, that no other row switches it in: a control whose code
+remains, renamed or moved included, keeps its row.
+
+A few rows switch text that also appears in another file, such as
+`held: true,` or a `NotFound` arm, so deleting one of them can be refused for
+a copy that has nothing to do with it; the refusal names the files. Then take
+it in two pull requests: first change the row's switch to a longer stretch of
+its line that only its own file holds (`git grep -F` shows where text
+appears), and let that pull request's Controls run show the row still bites;
+then delete the row. Where no line of the control is unique, the owner
+decides whether to merge past the check.
 
 The "Touched controls" job cuts the rows into shards, one for every six rows
 and at most twelve; each shard, "Controls (i/n)", is set up as the test jobs
@@ -299,7 +343,8 @@ A row CI does not run, one a GitHub runner cannot run or one known to fail
 until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
 A pull request touching it, and every sweep, reports it as "not run in CI",
 with a warning, and leaves it to a local run; a pull request that changes the
-list gets a warning too, and should say why.
+list gets a warning too, and should say why, and a row it takes off the list
+is run.
 
 ## Milestone acceptance
 
@@ -377,8 +422,10 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release
 ```
 
 It works in a new directory under `target/` and removes it at the end;
-`--keep <dir>` works in `<dir>` and keeps it, but not under `/tmp` or
-`$TMPDIR`, where atomic refuses an atom's scratch.
+`--keep <dir>` works in a new `<dir>`, which must not exist yet, and keeps it.
+Neither works under `/tmp` or `$TMPDIR`, where atomic refuses an atom's
+scratch — including a checkout that lives there, whose `target/` is under it
+too.
 
 ## The crash suite
 
@@ -440,8 +487,9 @@ in turn:
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
-tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it. The Controls workflow runs the
+tests on macOS in one job. CodeQL runs in a workflow of its own, on main only
+(each push, weekly and by hand), so an alert shows up after its change merges;
+fix it on main. Nothing in CI waits for it. The Controls workflow runs the
 controls rows a pull request touches
 ([The Controls workflow](#the-controls-workflow)).
 
@@ -590,19 +638,29 @@ scripts/dev.sh scripts/milestone-tests.sh
 
 Declarative atoms use `.atom.astro`. The production compiler assets are bundled
 under `crates/atomic-core/assets` and included in the binary. Running atoms needs
-no npm install or project `node_modules`. The development image supplies pinned
-Deno 2.9.8; other builds can provision that host outside the source tree:
+no Deno, npm install or project `node_modules`: atomic starts itself as the
+compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
+embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
+environment, a 1 GiB V8 heap limit, operating-system limits of 2.5 GiB of
+writable memory (twice the heap, plus 512 MiB for what V8 keeps outside it:
+WebAssembly memories and ArrayBuffers among it), 32 seconds of CPU time and no
+core files (`compiler_host/limits.rs`), and the parent's 30-second limit. Its
+host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
+stderr for its console, its exit status, its own WASM, random bytes, SHA-256 and
+timers, and nothing else: no network, environment, filesystem or subprocess.
+atomic reads atom sources itself and sends them in the request, for loading as
+for rendering. Direct-run context checkpoints live outside the source tree.
 
-```sh
-python3 scripts/setup-deno.py /tmp/atomic-deno
-export ATOMIC_DENO=/tmp/atomic-deno/deno
-```
+A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
+it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's
+dev-dependencies turn it on) serve the child from a constructor that runs before
+`main`. Release builds never have it, and `scripts/release-package.sh` refuses a
+binary that does.
 
-The setup script verifies the platform archive against `deps/deno.json`. The worker
-checks its runtime version, clears inherited environment, and has no network, npm,
-write, FFI or subprocess grant, and reads only the compiler assets: atomic reads
-atom sources itself and sends them in the request, for loading as for rendering.
-Compiler cache and direct-run context checkpoints live outside the source tree.
+`tools/check_examples.py` runs its Astro checks on that same compiler: build atomic
+first, or set `ATOMIC_BIN` to an atomic binary. The development image still carries
+Deno, for developer tooling only: `authoring/src/production-controls.mjs`, a probe
+of the worker under Deno's own permissions, and the example code's own `deno test`.
 
 Contributors changing the interpreter or type checker rebuild the shipped assets:
 

@@ -610,7 +610,14 @@ fn spawn_child(dir: &Path, url: &str, run: &str, role: &str, caps: &str) -> std:
     spawn_child_with(dir, url, run, role, caps, "")
 }
 
+/// Where a child started by [`spawn_child_with`] writes what it prints to
+/// stderr, under its scratch directory, so that a test which finds the child
+/// gone can say what it said before it went.
+const CHILD_LOG: &str = "child.log";
+
 /// As [`spawn_child`], with time caps `times` (see [`ENV_TIMES`]), if any.
+/// The child's stderr goes to [`CHILD_LOG`] under `dir`, rewritten here, and
+/// its stdout is dropped.
 fn spawn_child_with(
     dir: &Path,
     url: &str,
@@ -620,6 +627,7 @@ fn spawn_child_with(
     times: &str,
 ) -> std::process::Child {
     let _ = std::fs::remove_file(dir.join("outcome"));
+    let log = std::fs::File::create(dir.join(CHILD_LOG)).expect("open the child's log");
     let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
     if !times.is_empty() {
         cmd.env(ENV_TIMES, times);
@@ -634,9 +642,21 @@ fn spawn_child_with(
         .env_remove("ATOMIC_FAILPOINT")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .spawn()
         .expect("start the child")
+}
+
+/// What the child left in [`CHILD_LOG`]: what it printed, including what it
+/// printed as it died. Says so when the log holds nothing or cannot be read,
+/// rather than going quiet on either.
+fn child_log(dir: &Path) -> String {
+    let path = dir.join(CHILD_LOG);
+    match std::fs::read_to_string(&path) {
+        Ok(log) if log.trim().is_empty() => format!("(nothing was written to {})", path.display()),
+        Ok(log) => log,
+        Err(e) => format!("(could not read {}: {e})", path.display()),
+    }
 }
 
 /// Run the child as `role` with time caps `times` to its end, and return
@@ -696,21 +716,58 @@ async fn child_until(
     }
 }
 
+/// Why the wait for a running turn's first heartbeat cannot end, as the test
+/// that waits reports it.
+enum Beat {
+    /// The run's database could not be opened, or did not answer what was
+    /// asked of it: its schema or state is not what the wait reads.
+    Database(sqlx::Error),
+    /// The ledger holds no attempt in `reserved` state, so there is no
+    /// running call left to record a heartbeat.
+    NoReservation,
+}
+
+impl std::fmt::Display for Beat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Beat::Database(e) => write!(f, "reading the run's database: {e}"),
+            Beat::NoReservation => write!(f, "the ledger holds no reserved attempt to beat"),
+        }
+    }
+}
+
 /// How long after its admission the running attempt's last heartbeat was
-/// recorded, in milliseconds, or 0 before it has one. A database that cannot
-/// be opened or queried is an error, not 0.
-async fn beat_after_admission(dir: &Path) -> Result<i64, sqlx::Error> {
-    let db =
-        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await?;
-    let seen: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
-        "SELECT MAX(h.seen_at - a.admitted_at) FROM atomic_usage_attempts a \
-         JOIN atomic_usage_heartbeats h ON h.request_id = a.request_id AND h.attempt = a.attempt \
-         WHERE a.state = 'reserved'",
-    )
-    .fetch_one(&db)
+/// recorded, in milliseconds, or 0 before it has one. Anything else is a
+/// reason no heartbeat will arrive: what the database said, or that it holds
+/// no reserved attempt at all.
+async fn beat_after_admission(dir: &Path) -> Result<i64, Beat> {
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display()))
+        .await
+        .map_err(Beat::Database)?;
+    let beat = async {
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_usage_attempts WHERE state = 'reserved'",
+        )
+        .fetch_one(&db)
+        .await
+        .map_err(Beat::Database)?;
+        if reserved == 0 {
+            return Err(Beat::NoReservation);
+        }
+        let seen: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(h.seen_at - a.admitted_at) FROM atomic_usage_attempts a \
+             JOIN atomic_usage_heartbeats h ON h.request_id = a.request_id AND h.attempt = a.attempt \
+             WHERE a.state = 'reserved'",
+        )
+        .fetch_one(&db)
+        .await
+        .map_err(Beat::Database)?;
+        // No row joined: the attempt has been admitted but has not beaten yet.
+        Ok(seen.unwrap_or(0))
+    }
     .await;
     db.close().await;
-    Ok(seen?.unwrap_or(0))
+    beat
 }
 
 async fn reader(dir: &Path) -> Durare {
@@ -908,11 +965,22 @@ fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
 #[test]
 fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
     on_codex_runtime(async {
-        // Scaled down: the review's turn reserves its atom's 6 s and beats
-        // every 600 ms. Killed at its first heartbeat, about 0.6 s in, and
-        // recovered after the 6 s have passed, the dead turn is charged the
-        // time it ran, up to a beat after its last heartbeat, and the review
-        // has the rest of its time, most of it, to run again.
+        // The one setting this test is scaled from: the atom's whole time cap
+        // in milliseconds, which the review's turn reserves. The child's
+        // `<call>,<atom>` minutes, the beat the wait below waits for and how
+        // long the run is left down all come from it. A turn beats every
+        // heartbeat_every of its reservation, first one beat after it is
+        // admitted; killed there, about a beat in, and recovered after the
+        // whole reservation has passed, the dead turn is charged the time it
+        // ran, up to a beat after its last heartbeat, and the review has the
+        // rest of its time, most of it, to run again.
+        const RESERVED: i64 = 6_000;
+        let times = format!(
+            "{:.6},{:.6}",
+            RESERVED as f64 / 600_000.0,
+            RESERVED as f64 / 60_000.0
+        );
+        let every = heartbeat_every(RESERVED);
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
             Reply::Delayed {
@@ -926,7 +994,7 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let dir = scratch("lapsed");
         let url = model.base_url();
         let caps = "10000,100000";
-        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.1");
+        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, &times);
         let until = Instant::now() + Duration::from_secs(60);
         while model.calls() < 2 {
             assert!(
@@ -937,28 +1005,41 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         }
         // Killed once its turn has recorded a heartbeat a beat or more after
         // admission, however slowly a loaded machine runs it: recovery
-        // charges it until a beat after that, at least two beats.
-        let every = heartbeat_every(6_000);
+        // charges it until a beat after that, at least two beats. Each turn
+        // of the wait says which of its own conditions ended it, rather than
+        // letting every cause surface as the timeout below: the child gone,
+        // with what it printed as it went; or a ledger that answers with an
+        // error, or holds no reserved attempt to beat.
         let beaten = Instant::now() + Duration::from_secs(60);
-        while beat_after_admission(&dir)
-            .await
-            .unwrap_or_else(|e| panic!("could not read the review's heartbeats: {e}"))
-            < every
-        {
-            if let Some(status) = process.try_wait().expect("check on the child") {
-                panic!("the child exited ({status}) before the review's turn recorded a heartbeat");
+        loop {
+            match process.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => panic!(
+                    "the child exited ({status}) before the review's turn recorded a heartbeat \
+                     a beat ({every} ms) after its admission; what it printed:\n{}",
+                    child_log(&dir)
+                ),
+                Err(e) => panic!("could not ask whether the child is still running: {e}"),
+            }
+            let beat = beat_after_admission(&dir)
+                .await
+                .unwrap_or_else(|e| panic!("the wait for the review's first heartbeat: {e}"));
+            if beat >= every {
+                break;
             }
             assert!(
                 Instant::now() < beaten,
-                "the review's turn never recorded a heartbeat"
+                "the review's turn recorded no heartbeat {every} ms or more after its admission \
+                 within 60 s, while its child ran and its attempt stayed reserved: its \
+                 heartbeat task never wrote one"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         process.kill().expect("kill the child");
         let _ = process.wait();
         // Down past the whole reservation.
-        tokio::time::sleep(Duration::from_secs(7)).await;
-        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.1")
+        tokio::time::sleep(Duration::from_millis(RESERVED as u64 + 1_000)).await;
+        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, &times)
             .await
             .expect("the recovered run");
         assert_eq!(seen, "finished");
@@ -966,7 +1047,10 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let review = attempts(&rt, "lapsed").await;
         let dead = &review[1];
         assert_eq!(dead.state, "reserved");
-        assert_eq!(dead.reserved.millis, 6_000, "{dead:?}");
+        assert_eq!(dead.reserved.millis, RESERVED, "{dead:?}");
+        // Well short of the whole reservation: the bound is a margin for what
+        // a loaded machine does to the gap between the wait ending and the
+        // kill, so it is not derived from the beat.
         assert!(
             dead.charged.millis < 4_000,
             "the downtime was not charged: {dead:?}"

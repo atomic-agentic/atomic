@@ -1,0 +1,1 @@
+held-json-unreadable-as-written|crates/atomic-core/src/redact.rs|    if texted != *string && written.is_none() && reads_as_json(string) {|    if false /*CONTROL_OFF*/ && texted != *string && written.is_none() && reads_as_json(string) {|-p atomic-agentic-core --lib redact::tests::json_readable_only_without_a_value_as_written_is_hidden_whole

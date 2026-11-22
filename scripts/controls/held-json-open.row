@@ -1,1 +1,1 @@
-held-json-open|crates/atomic-core/src/redact.rs|    let rewritten = strength == Strength::Weak && open_held_json(string, nested);|    let rewritten = false; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::json_held_in_a_string_under_a_hint_is_redacted_as_held
+held-json-open|crates/atomic-core/src/redact.rs|    if strength == Strength::Weak {|    if false /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::json_held_in_a_string_under_a_hint_is_redacted_as_held

@@ -63,6 +63,11 @@ jobs:
       - run: scripts/lock-check.sh
       # The V8 rule in lock-check against small lockfiles.
       - run: scripts/lock-check-test.sh
+      # Fails when a control is switched off in the commit: every row's switch
+      # text is in the file it names exactly once, and a replacement that holds
+      # its own switch text is not in that file at all, on the lines the row
+      # wrote it on or on any others.
+      - run: python3 scripts/controls-on.py
       # controls-check.sh restores the source it edits, and refuses what it
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
@@ -105,23 +110,32 @@ jobs:
           python3 scripts/check-authoring-assets.py
 
   # The example catalog against the proposed authoring contract, offline,
-  # until atomic's own loader checks the same files.
+  # until atomic's own loader checks the same files. Its Astro checks run on
+  # the compiler embedded in atomic, so it builds atomic first, from the test
+  # build's cache as the build job does.
   examples:
     name: Examples
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          target-cache: test
+      - name: Build atomic
+        run: cargo build --workspace --locked
       - name: Checker dependencies
         run: |
           python3 -m venv "${RUNNER_TEMP}/examples-venv"
           "${RUNNER_TEMP}/examples-venv/bin/pip" install --no-deps --require-hashes -r tools/requirements.txt
-      - name: Pinned Astro compiler host
-        run: |
-          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
-          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
+      # No Deno is installed: a check that needed one would fail here.
       - name: Check the examples
         working-directory: tools
-        run: '"${RUNNER_TEMP}/examples-venv/bin/python" check_examples.py'
+        env:
+          ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
+        run: |
+          if command -v deno; then echo "::error::a Deno is on PATH; these checks must pass without one"; exit 1; fi
+          "${RUNNER_TEMP}/examples-venv/bin/python" check_examples.py
 
   # deny.toml: a dependency with a disallowed licence, a banned crate or an
   # unlisted source fails CI.
@@ -323,6 +337,12 @@ jobs:
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
+      # The compiler entry `main` dispatches, which no test reaches (test
+      # binaries serve it before `main`), and no test-only dispatch in the
+      # plain build.
+      - name: The binary's own compiler entry
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: scripts/compiler-entry-check.sh target/debug/atomic
       # A compile-fail doctest checks that a test-only method is absent
       # without its feature, which the test shards' features turn on; it runs
       # only here, without them. The whole workspace is selected, as the
@@ -386,10 +406,6 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Pinned Astro compiler host
-        run: |
-          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
-          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
       # rustup installs the toolchain and components rust-toolchain.toml names.
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install

@@ -1,0 +1,1 @@
+retention-decision-absent-refuses|crates/atomic/src/retention.rs|mark_named(&store, &decision_names, &wait)|{ let _ = mark_named(&store, &decision_names, &wait); Ok::<(), anyhow::Error>(()) }|-p atomic-agentic --lib retention::tests::a_decision_naming_swept_content_is_refused_and_the_gate_stays_open

@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use git_repo::{git_in, git_state};
+
+mod git_repo;
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
 
@@ -685,26 +688,43 @@ fn atomic_as(
     }
 }
 
-/// `atomic` in the background, its stderr in `log`.
-fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path) -> Child {
-    spawn_as(Path::new(ATOMIC), dir, cwd, args, env, log)
-}
-
-/// [`spawn`], from the executable at `program`.
-fn spawn_as(
+/// `program` in the background from `cwd`, with a throwaway home and state:
+/// its stderr in `log` and, when `out` is given, its stdout in `out`, each
+/// created fresh; stdin and, without `out`, its stdout are null.
+fn spawn_streams(
     program: &Path,
     dir: &Path,
     cwd: &Path,
     args: &[&str],
     env: &[(&str, &str)],
     log: &Path,
+    out: Option<&Path>,
 ) -> Child {
-    command_as(program, dir, cwd, args, env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log).expect("log"))
-        .spawn()
-        .expect("start atomic")
+    let mut cmd = command_as(program, dir, cwd, args, env);
+    cmd.stdin(Stdio::null())
+        .stdout(match out {
+            Some(out) => Stdio::from(std::fs::File::create(out).expect("stdout")),
+            None => Stdio::null(),
+        })
+        .stderr(std::fs::File::create(log).expect("stderr"));
+    cmd.spawn().expect("start the command")
+}
+
+/// `atomic` in the background, its stderr in `log`.
+fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path) -> Child {
+    spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, None)
+}
+
+/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
+fn spawn_logged(
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    log: &Path,
+    out: &Path,
+) -> Child {
+    spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, Some(out))
 }
 
 fn text(out: &Output) -> String {
@@ -863,6 +883,12 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Run `run`'s first open gate, waiting for it while reading the run's
+/// status: a run that ends on the way says so at once, with the status it
+/// ended on, rather than the wait running out for a gate that could never
+/// open. A run still being admitted has no row yet — its admission line is
+/// printed before the row is written — and is waited for like any run that
+/// has not finished.
 async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
     let started = Instant::now();
     loop {
@@ -878,34 +904,6 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
         if let Some(g) = open.into_iter().next() {
             return g;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "{run} never opened a gate"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// [`open_gate`] while reading the run's status: a run that ends on the way
-/// says so at once, with the status it ended on, rather than the wait running
-/// out for a gate that could never open.
-async fn await_gate(rt: &Durare, run: &str) -> gate::Gate {
-    let started = Instant::now();
-    loop {
-        let open = gate::gates(
-            rt,
-            GateFilter {
-                open_only: true,
-                run: Some(run.to_owned()),
-            },
-        )
-        .await
-        .expect("gates");
-        if let Some(g) = open.into_iter().next() {
-            return g;
-        }
-        // No row yet is a run still being admitted: its admission line is
-        // printed before the row is written.
         let status = rt.status(run).await.expect("status");
         assert!(
             matches!(status, None | Some(RunStatus::Pending)),
@@ -958,12 +956,54 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
         }
         if started.elapsed() >= Duration::from_secs(120) {
             // Not left running after the test.
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(child);
             panic!("{what} did not exit");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Kill `child` and reap it, ignoring that it may have ended already: what a
+/// test that will not wait for a process any more owes it.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A process a test must not leave running: killed and reaped when this is
+/// dropped, which is what an assertion that fails between spawning a run and
+/// waiting for it does. A test that waits for its process on purpose carries
+/// this along with it: the wait reaps the process first, so the drop that
+/// follows finds nothing left to kill.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        kill_and_reap(&mut self.0);
+    }
+}
+
+/// Whether the process `pid` is there: a signal of none asks only whether it
+/// could be signalled. A process that was waited for is not there; one that
+/// was killed but never waited for is a zombie, which is.
+#[allow(unsafe_code)]
+fn still_running(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing; this only asks whether `pid` exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 // needs_sandbox
@@ -3294,13 +3334,14 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         // Killed after its last step first, so built-2 still has its caches
         // and count's tally there: the other build's server ran nothing
         // the killed run had.
-        let mut killed = spawn_as(
+        let mut killed = spawn_streams(
             &other,
             &dir,
             &project,
             &["serve"],
             &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
             &dir.join("serve-killed.log"),
+            None,
         );
         let status = tokio::task::spawn_blocking(move || wait_child(&mut killed, "serve"))
             .await
@@ -3312,13 +3353,14 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         );
         assert_eq!(model.calls(), 4, "each run's rank and summarize once");
         ran_once_live(&dir, 1);
-        let mut serve = spawn_as(
+        let mut serve = spawn_streams(
             &other,
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
+            None,
         );
         let rt = project_store(&state).await;
         let started = Instant::now();
@@ -6016,48 +6058,12 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     }
 }
 
-/// git in `dir`, as a person runs it, with an identity of its own.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=dev",
-            "-c",
-            "user.email=dev@example.com",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
 /// A commit of `file` with `text` in the repository at `dir`, returning it.
 fn commit_file(dir: &Path, file: &str, text: &str) -> String {
     std::fs::write(dir.join(file), text).expect("file");
     git_in(dir, &["add", file]);
     git_in(dir, &["commit", "-q", "-m", text]);
     git_in(dir, &["rev-parse", "HEAD"])
-}
-
-/// Everything git records about a repository's refs and worktrees.
-fn git_state(dir: &Path) -> String {
-    format!(
-        "{}\n{}",
-        git_in(dir, &["for-each-ref"]),
-        git_in(dir, &["worktree", "list", "--porcelain"])
-    )
-}
-
-/// What `git status` sees in the repository at `dir`: every change and every
-/// untracked file, which [`git_state`]'s refs and worktree list do not cover.
-fn git_status(dir: &Path) -> String {
-    git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
 }
 
 /// The coding example in the catalog, as written.
@@ -6091,18 +6097,38 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+/// A directory under the system's temporary directory, removed when this is
+/// dropped: a test that fails part-way leaves nothing behind there, which is
+/// where a directory the target directory cannot hold has to go.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A directory of the test's own outside every git repository, under the
 /// system's temporary directory: the target directory sits inside the
 /// checkout atomic is built from. Checked, so the test fails rather than run
-/// inside a repository if that ever changes.
-fn outside_repository(tag: &str) -> PathBuf {
+/// inside a repository if that ever changes. What it returns is removed when
+/// the test ends, however it ends.
+fn outside_repository(tag: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("atomic-run-cli-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
-    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    let outside = Scratch(std::fs::canonicalize(&dir).expect("canonical"));
     let inside = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&dir)
+        .current_dir(&*outside)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
@@ -6110,27 +6136,10 @@ fn outside_repository(tag: &str) -> PathBuf {
     assert!(
         !inside.status.success(),
         "{} is inside a git work tree: {}",
-        dir.display(),
+        outside.display(),
         text(&inside)
     );
-    dir
-}
-
-/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
-fn spawn_logged(
-    dir: &Path,
-    cwd: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-    log: &Path,
-    out: &Path,
-) -> Child {
-    command_as(Path::new(ATOMIC), dir, cwd, args, env)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(out).expect("stdout"))
-        .stderr(std::fs::File::create(log).expect("stderr"))
-        .spawn()
-        .expect("start atomic")
+    outside
 }
 
 /// A workflow whose second step changes code in a worktree, after a gate.
@@ -6301,16 +6310,24 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
         let rt = project_store(&state).await;
         for (tag, cwd, args) in &runs {
             let id = args[args.iter().position(|a| *a == "--run-id").expect("id") + 1];
-            let mut child = spawn(
+            // The run in the background, held so that nothing in this round
+            // can leave it running: the guard kills and reaps it when the
+            // round ends, which is what an assertion that fails before any
+            // wait for the run does.
+            let mut child = Reaped(spawn(
                 &dir,
                 cwd,
                 args,
                 &UNUSED_MODEL,
                 &dir.join(format!("{tag}.log")),
-            );
+            ));
+            let pid = child.id();
+            // Admitted, and stopped at its first gate, still waiting there.
             open_gate(&rt, id).await;
-            child.kill().expect("stop the run at its gate");
-            child.wait().expect("reap");
+            assert!(
+                child.try_wait().expect("wait").is_none(),
+                "{tag}: the run waits at its gate"
+            );
             let record = rt.run_record(id).await.expect("record").expect("run");
             let bound = &record.input["pipeline"]["fixture"];
             assert_eq!(bound["commit"], second, "{tag}: {bound}");
@@ -6325,11 +6342,50 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
                 snapshot.starts_with(&state),
                 "{tag}: the snapshot is atomic's own"
             );
+            drop(child);
+            assert!(
+                !still_running(pid),
+                "{tag}: the run the round dropped is killed and reaped (pid {pid})"
+            );
         }
-        // Neither the developer's checkout nor the fixture gained a ref or a
-        // worktree.
+        // Neither the developer's checkout nor the fixture gained a ref, a
+        // worktree or a configuration entry, changed a file or wrote a loose
+        // object.
         assert_eq!(git_state(&project), checkout, "the checkout is as it was");
         assert_eq!(git_state(&fixture), source, "the fixture is as it was");
+        // And that comparison is not vacuous: one change of each kind git_state
+        // reads is planted here, in turn, and the comparison notices each — a
+        // ref, a working-tree file, an entry in the fixture's own configuration,
+        // a loose object and a worktree registered with the fixture. Each is one
+        // thing a run that may only read a fixture must never leave behind.
+        git_in(&fixture, &["tag", "decoy-ref"]);
+        let with_ref = git_state(&fixture);
+        assert_ne!(with_ref, source, "a ref the fixture did not have");
+        std::fs::write(fixture.join("decoy.txt"), "x").expect("file");
+        let with_file = git_state(&fixture);
+        assert_ne!(
+            with_file, with_ref,
+            "a working-tree file the fixture did not have"
+        );
+        git_in(&fixture, &["config", "--local", "atomic.decoy", "1"]);
+        let with_config = git_state(&fixture);
+        assert_ne!(
+            with_config, with_file,
+            "an entry in the fixture's own configuration"
+        );
+        git_in(&fixture, &["hash-object", "-w", "decoy.txt"]);
+        let with_object = git_state(&fixture);
+        assert_ne!(
+            with_object, with_config,
+            "an object added to the fixture's store"
+        );
+        let linked = dir.join("decoy-worktree").to_string_lossy().into_owned();
+        git_in(&fixture, &["worktree", "add", "--detach", &linked, "HEAD"]);
+        assert_ne!(
+            git_state(&fixture),
+            with_object,
+            "a worktree registered with the fixture"
+        );
     });
 }
 
@@ -6378,9 +6434,13 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
         );
         let candidate = git_in(&fixture, &["rev-parse", "HEAD"]);
         git_in(&fixture, &["tag", "candidate"]);
-        git_in(&fixture, &["checkout", "-q", "--detach", &base]);
         assert_ne!(candidate, base, "the fixture's tip is not its baseline");
-        let source = format!("{}\n{}", git_state(&fixture), git_status(&fixture));
+        // The repository is left checked out on its tip, which is not the
+        // revision every run below is given: a run that resolved the
+        // repository's HEAD instead of the revision it was named would be
+        // refused or bind the candidate, and each of its assertions would say
+        // so.
+        let source = git_state(&fixture);
         // The example checks as written, from a directory outside it, which
         // is also where atomic writes the declarations its atoms import.
         let project_arg = project.to_string_lossy().into_owned();
@@ -6434,7 +6494,10 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
                 dir.join(format!("{tag}.log")),
                 dir.join(format!("{tag}.out")),
             );
-            let mut child = spawn_logged(
+            // The run in the background, held so that an assertion that
+            // fails before it is waited for still leaves nothing running.
+            let mut child = Reaped(spawn_streams(
+                Path::new(ATOMIC),
                 &dir,
                 &cwd,
                 &[
@@ -6454,8 +6517,8 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
                 ],
                 &with(&env, &[]),
                 &log,
-                &out,
-            );
+                Some(&out),
+            ));
             // Admitted from a directory that is neither the project nor the
             // fixture: the fixture found from there by a relative path, at
             // the revision it was given, pinned to its commit — which the
@@ -6474,19 +6537,19 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             // baseline into a snapshot of atomic's own leave the repository
             // as they found it.
             assert_eq!(
-                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                git_state(&fixture),
                 source,
                 "{tag}: binding the fixture leaves it as it was found"
             );
             // Planned, then stopped at the first gate, which shows the plan.
-            let g = await_gate(&rt, &id).await;
+            let g = open_gate(&rt, &id).await;
             assert_eq!(g.step, "approve-plan", "{tag}");
             assert_eq!(g.title, "Approve bounded plan", "{tag}");
             assert_eq!(g.show, plan, "{tag}");
             approve(&rt, &g).await;
             // Implemented in a worktree of the fixture's snapshot and
             // reviewed, then stopped at the second gate.
-            let g = await_gate(&rt, &id).await;
+            let g = open_gate(&rt, &id).await;
             assert_eq!(g.step, "accept-change", "{tag}");
             assert_eq!(
                 model.calls(),
@@ -6545,9 +6608,10 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             );
             pinned.push(bound["commit"].as_str().expect("commit").to_owned());
             // The fixture repository is exactly as it was: its refs, its
-            // worktrees and its working tree, every untracked file included.
+            // worktrees, its working tree with every untracked file, its own
+            // configuration and its objects.
             assert_eq!(
-                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                git_state(&fixture),
                 source,
                 "{tag}: the fixture repository is as it was"
             );
@@ -6561,11 +6625,12 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             "{pinned:?}: the same base commit every time"
         );
         assert_eq!(pinned[0], base, "{pinned:?}");
-        assert!(
-            pinned.iter().all(|c| c != &candidate),
-            "{pinned:?}: the pin is the named revision, not the tip"
+        let head = git_in(&fixture, &["rev-parse", "HEAD"]);
+        assert_eq!(head, candidate, "the fixture is still on its tip");
+        assert_ne!(
+            pinned[0], head,
+            "{pinned:?}: the pin is the revision the runs were given, not the fixture's HEAD"
         );
-        let _ = std::fs::remove_dir_all(&outside);
     });
 }
 
@@ -6879,8 +6944,7 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
             &log,
             &out_file,
         );
-        let g = match tokio::time::timeout(Duration::from_secs(60), await_gate(&rt, "ask-1")).await
-        {
+        let g = match tokio::time::timeout(Duration::from_secs(60), open_gate(&rt, "ask-1")).await {
             Ok(g) => g,
             Err(_) => panic!("{}", said("ask-1 never opened its gate")),
         };
@@ -7397,32 +7461,6 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     });
 }
 
-/// A spawned child process — `atomic` itself, or the shell that execs it —
-/// that is killed and reaped when this is dropped, if it has not ended by
-/// then: a test that fails part-way leaves nothing running behind it, and
-/// nothing holding its schema once the schema's guard drops it.
-struct Reaped(Child);
-
-impl std::ops::Deref for Reaped {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Reaped {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
-    }
-}
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// The environment of executor `name` on schema `schema`, with a state
 /// directory of its own, as on a host of its own.
 #[cfg(feature = "postgres-tests")]
@@ -7823,7 +7861,55 @@ fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
         &panic,
         "",
     );
+    // atomic run's own error report names it too, hint and all.
+    let reported = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        reported.contains("error: run rotate-secret:2026-11 stopped: atomic's own workflow code"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("failpoint pipeline:after:count"),
+        "{reported}"
+    );
+    assert!(!reported.contains("[REDACTED]"), "{reported}");
+    // And in JSON, for a second run under the same id.
+    let again = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!again.status.success(), "{}", text(&again));
+    let error = &stdout_json(&again)["error"];
+    assert_eq!(error["kind"], "run.exists", "{error}");
+    assert_eq!(
+        error["description"].as_str(),
+        Some(
+            "there is already a run rotate-secret:2026-11 in this project's store, and it is \
+             max_recovery_attempts_exceeded"
+        ),
+        "{error}"
+    );
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.ends_with("use `atomic runs resume rotate-secret:2026-11`")),
+        "{error}"
+    );
     let out = atomic(
         &dir,
         &project,
