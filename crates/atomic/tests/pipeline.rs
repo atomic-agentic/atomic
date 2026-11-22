@@ -188,6 +188,36 @@ fn try_load(
     prepare(&loaded, &atoms, &local()).map_err(|e| e.to_string())
 }
 
+/// Release `park` as the local operator, with their credential, raising
+/// `raise` first if given: the person's action, as `atomic` exposes it.
+async fn release_raising(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+    raise: Option<atomic_durable::release::Raise>,
+) -> Result<atomic_durable::release::Release, atomic_durable::release::ReleaseError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let me = atomic_durable::gate::HumanCredential::new(
+        atomic_durable::gate::Principal::local("dev"),
+        "the operator's secret",
+    );
+    let _ = atomic_durable::gate::enroll(rt, &me).await;
+    atomic_durable::release::release_park(
+        rt,
+        &me,
+        atomic_durable::release::ReleaseCommand {
+            command_id: format!(
+                "{}-{}",
+                park.id,
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            park: park.id.clone(),
+            raise,
+            comment: None,
+        },
+    )
+    .await
+}
+
 /// One developer on one machine.
 fn local() -> Deployment {
     Deployment::Local {
@@ -224,7 +254,9 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        backend: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: atomic_core::testing::denying_nothing(Default::default()),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -492,7 +524,8 @@ async fn engine_built_with(
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();
-            on.backend = backend;
+            // Its turns run without Codex's sandbox helper too.
+            on.backend = atomic_core::testing::denying_nothing(backend);
             Arc::new(on)
         }
         None => runtimes,
@@ -1163,6 +1196,7 @@ fn child_in(
         // No model endpoint from this machine: no Ollama, no key.
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         // None of the developer's own configuration.
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::null())
@@ -2618,6 +2652,7 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
             &atomic_durable::Database::Sqlite(dir.join("atomic.db")),
             None,
             "atomic.pipeline.other",
+            "the-project",
         )
         .await
         .expect("another layout's engine");
@@ -2808,19 +2843,20 @@ fn resumed_run_keeps_its_budgets(tag: &str, pinned: bool) {
         let rt = engine_on(&dir, &model.base_url(), later, "renamed").await;
         rt.recover().await.expect("recover");
         let park = nth_park(&rt, "pinned", 1).await;
-        rt.ledger()
-            .raise(
-                "run:pinned",
-                Caps {
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:pinned".to_owned(),
+                caps: Caps {
                     tokens: 10_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("pinned").await.expect("finishes");
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
         // The steps after the park ran on the model the run began with.
@@ -3686,19 +3722,20 @@ fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
             .and_then(|(_, rest)| rest.split_once(' '))
             .map(|(scope, _)| scope.to_owned())
             .expect("the refusing allowance");
-        rt.ledger()
-            .raise(
-                &scope,
-                Caps {
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: scope.clone(),
+                caps: Caps {
                     tokens: 10_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("fix-park").await.expect("finishes");
         assert_eq!(out, json!({"ok": true}));
         let turn = rt
@@ -6115,6 +6152,7 @@ fn spawned_child(dir: &Path, url: &str, role: &str, run: &str) -> std::process::
         .env(ENV_URL, url)
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env_remove("ATOMIC_FAILPOINT")
         .stdin(std::process::Stdio::null())
@@ -6406,6 +6444,7 @@ async fn spend_all_but(rt: &Durare, run: &str, left: i64) {
             reserve: charge,
             maximum: charge,
             turn: false,
+            longest: None,
         })
         .await
         .expect("admit");
@@ -6441,6 +6480,51 @@ async fn commands(rt: &Durare, run: &str) -> Vec<(String, String)> {
         .filter(|a| a.model == atomic_core::usage::WORK_MODEL)
         .map(|a| (a.request, a.state))
         .collect()
+}
+
+/// An exec atom's command reserves no more of its allowances than it can
+/// take: its own five minutes and its runner's thirty seconds of grace, not
+/// the half hour its atom has by default.
+#[test]
+fn an_exec_atoms_command_reserves_only_its_own_limit_and_its_runners_grace() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-longest");
+        let project = napping_project(&dir, "");
+        let pipeline = load(&project, "naps.workflow.yaml", &naps(false, ""));
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-longest",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 0}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt.result("naps-longest").await.expect("the naps finish");
+        let reserved: Vec<(i64, String)> = rt
+            .ledger()
+            .attempts("naps-longest")
+            .await
+            .expect("attempts")
+            .into_iter()
+            .filter(|a| a.model == atomic_core::usage::WORK_MODEL)
+            .map(|a| (a.reserved.millis, a.state))
+            .collect();
+        assert_eq!(
+            reserved,
+            vec![
+                (330_000, "settled".to_owned()),
+                (330_000, "settled".to_owned())
+            ]
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 /// An exec atom's command is held to its minutes cap: cut off when its
@@ -6607,19 +6691,21 @@ fn a_run_with_no_minutes_left_parks_before_the_next_command() {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = engine(&dir, &model.base_url()).await;
         assert_eq!(rt.recover().await.expect("recover"), 1, "the parked run");
-        rt.ledger()
-            .raise(
-                "run:naps-3",
-                Caps {
+        // An operator raises the run's minutes and releases the park.
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:naps-3".into(),
+                caps: Caps {
                     tokens: 0,
                     millis: 600_000,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("naps-3").await.expect("finishes");
         assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
         let ran = commands(&rt, "naps-3").await;
@@ -6661,19 +6747,21 @@ fn a_run_parked_before_its_next_command_finishes_in_the_same_process() {
         let park = nth_park(&rt, "naps-4", 1).await;
         assert!(park.step.starts_with("second"), "{}", park.step);
         assert_eq!(commands(&rt, "naps-4").await.len(), 1, "only the first ran");
-        rt.ledger()
-            .raise(
-                "run:naps-4",
-                Caps {
+        // An operator raises the run's minutes and releases the park.
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:naps-4".into(),
+                caps: Caps {
                     tokens: 0,
                     millis: 600_000,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("naps-4").await.expect("finishes");
         assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
         let ran = commands(&rt, "naps-4").await;

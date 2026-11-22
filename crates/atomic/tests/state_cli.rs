@@ -26,7 +26,16 @@
 //!   every command that starts a project's runs makes the same check before it
 //!   creates anything, because all of them come through one function;
 //! - a home beside it, `~/.config/atomic-state`, is accepted: the comparison
-//!   is by path components, not by string.
+//!   is by path components, not by string;
+//! - a `HOME` that is not absolute gives a state home that is not absolute
+//!   either — the platform's data directory under it — and such a home is
+//!   placed from the directory the command was run in before it is compared
+//!   with anything;
+//! - the configuration directory itself may be one whose name the operating
+//!   system gives as bytes that are not text: `atomic --json config --explain`
+//!   says a setting comes from the `config.yaml` in that directory, which is
+//!   the one directory this check, the denial of it to atoms' commands and the
+//!   settings a person reads are all made from.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -65,10 +74,68 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+/// The person's own configuration directory: a throwaway directory that is not
+/// inside any repository checkout, and that goes — with everything below it, a
+/// case that ends in a failed assertion included — when the case that asked for
+/// it ends.
+///
+/// The throwaway directories above are under the target directory, which is
+/// inside this checkout, and atomic refuses to read a person's own
+/// configuration that sits inside the checkout holding the project it is
+/// resolving for. A stand-in for that file has to live somewhere else.
+fn person_config(tag: &str) -> PersonConfig {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "atomic-state-cli-{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the person's directory");
+    let person = PersonConfig(std::fs::canonicalize(&dir).expect("the person's directory placed"));
+    assert!(
+        person.ancestors().all(|d| !d.join(".git").exists()),
+        "{} is inside a repository checkout, where atomic would refuse the \
+         person's own configuration",
+        person.display()
+    );
+    person
+}
+
+/// See [`person_config`].
+struct PersonConfig(PathBuf);
+
+impl std::ops::Deref for PersonConfig {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PersonConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `atomic args...` in `cwd`, as the operator `dev`, with the throwaway home
 /// under `dir` and nothing of the machine's own configuration or model
 /// endpoint.
 fn command(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, String)]) -> Command {
+    command_os(
+        dir,
+        cwd,
+        args,
+        &env.iter()
+            .map(|(name, value)| (*name, OsString::from(value)))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// [`command`], for an environment value that is not text: a path the operating
+/// system gives as bytes that are not valid UTF-8 is a path all the same, and
+/// `String` cannot carry one.
+fn command_os(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, OsString)]) -> Command {
     let mut c = Command::new(ATOMIC);
     c.args(args)
         .current_dir(cwd)
@@ -500,9 +567,10 @@ impl Side {
             }
             Side::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
-                 placed: it, or a directory above it, is missing, cannot be read, or is a link \
-                 that leads nowhere; until then atomic cannot tell whether its state would be \
-                 inside that directory"
+                 placed: it, or a directory above it, cannot be entered, passes through \
+                 something that is not a directory, is a link that leads nowhere, or cannot \
+                 otherwise be looked up; until then atomic cannot tell whether its state \
+                 would be inside that directory"
             }
         }
     }
@@ -696,4 +764,135 @@ fn a_relative_xdg_config_home_gives_way_to_home() {
     );
     assert!(state.is_dir(), "the state directory is missing: {t}");
     assert!(private.is_dir(), "the private directory is missing: {t}");
+}
+
+/// A `HOME` that is not absolute still gives the platform's data directory, so
+/// it gives a state home that is not absolute either — and a run places it from
+/// the directory the command was run in before it compares that home with
+/// anything. `crates/atomic-core/src/state.rs`'s
+/// `a_relative_state_directory_is_placed_from_the_working_directory` asks the
+/// same check directly, which is what `scripts/controls/state-home-placed.row`
+/// switches off and runs; this is the same control on the path a person takes,
+/// which `scripts/controls/state-home-placed-cli.row` switches off and runs —
+/// where the relative home is not spelled out but is what `dirs::data_dir`
+/// makes of a relative `HOME`, with no `ATOMIC_HOME` and no `XDG_DATA_HOME` set.
+#[test]
+fn a_relative_home_gives_a_state_directory_placed_from_the_working_directory() {
+    let dir = scratch("relative-home");
+    let project = dir.join("project");
+    // The configuration directory the state home is compared with: outside this
+    // checkout, and outside the state home. It has to be named by an absolute
+    // path for this test to ask anything of the placing at all — the password
+    // database is the only other thing that can name one, and a test may not
+    // depend on what it says about whoever runs it. With no configuration
+    // directory there is nothing to compare the state home with and the check
+    // never places it.
+    let person = person_config("relative-home");
+    let settings = person.join("settings");
+    std::fs::create_dir_all(settings.join("atomic")).expect("the configuration directory");
+    // The home is `home`, relative, and the command runs in `project`, so what
+    // the platform's data directory rule gives is `home/.local/share/atomic`
+    // read from there. Left unset: `ATOMIC_HOME`, which would be made absolute
+    // before the check ever saw it, and `XDG_DATA_HOME`, which that rule takes
+    // only as an absolute path and which the command's environment carries none
+    // of.
+    let base = project.join("home/.local/share/atomic");
+    let id = project_id(&dir, &project);
+    let (state, private) = state_and_private(&base, &id);
+    let out = command_os(
+        &dir,
+        &project,
+        &["debug", "state-dir"],
+        &[
+            ("HOME", OsString::from("home")),
+            ("XDG_CONFIG_HOME", settings.into_os_string()),
+        ],
+    )
+    .output()
+    .expect("start atomic");
+    let t = text(&out);
+    assert!(
+        out.status.success(),
+        "a run whose state home is placed from the working directory was refused: {t}"
+    );
+    // The state is there, below the directory the command was run in: that is
+    // the placed reading of the home the platform's rule gave, and it is the
+    // check that compares the home with the configuration directory that asks
+    // for it. A check handed the unresolved spelling refuses the run and creates
+    // nothing, which is what these two assertions then say. `debug state-dir`
+    // prints the spelling the platform's rule made, not a placed one, so the
+    // directories are what is asked here and not stdout.
+    assert!(state.is_dir(), "the state directory is missing: {t}");
+    assert!(private.is_dir(), "the private directory is missing: {t}");
+}
+
+/// `XDG_CONFIG_HOME` as the operating system gives it, and not as text.
+///
+/// A directory whose name is bytes that are not UTF-8 is a directory all the
+/// same, and the `config.yaml` in it is the file a person's settings come from.
+/// Settings, the denial of that directory to every atom's commands and the
+/// refusal of a state directory inside it are made from one resolution, which
+/// reads the variables as the operating system gives them; reading the variable
+/// as text sees nothing here, and would take the settings from
+/// `~/.config/atomic/config.yaml` — a directory no atom is denied — while the
+/// denial and the state check covered this one. What is pinned beside it, in
+/// `crates/atomic/src/settings/tests.rs`, is only the wiring — that a person's
+/// run asks the state's own resolution; here it is the command a person runs,
+/// whose output carries a path that is not text.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it() {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let dir = scratch("odd-bytes");
+    let project = dir.join("project");
+    // The person's own configuration directory cannot be under the throwaway
+    // directory, because that is inside this checkout and atomic refuses a
+    // person's own configuration inside the checkout holding the project. So it
+    // is a directory of its own, outside any repository, below a name ending in
+    // a byte that is not valid UTF-8: no text reading of `XDG_CONFIG_HOME` can
+    // name it, and the plain name it is built from is never made.
+    let person = person_config("odd-bytes");
+    let mut raw = person.join("xdg").into_os_string().into_vec();
+    raw.push(0xc3);
+    let xdg = PathBuf::from(OsStr::from_bytes(&raw));
+    let config = xdg.join("atomic");
+    std::fs::create_dir_all(&config).expect("the configuration directory of odd bytes");
+    std::fs::write(
+        config.join("config.yaml"),
+        "model:\n  name: from-a-directory-of-odd-bytes\n",
+    )
+    .expect("the person's own configuration");
+
+    let out = command_os(
+        &dir,
+        &project,
+        &["--json", "config", "--explain"],
+        &[("XDG_CONFIG_HOME", OsString::from(OsStr::from_bytes(&raw)))],
+    )
+    .output()
+    .expect("start atomic");
+    let t = text(&out);
+    assert!(out.status.success(), "the configuration was not read: {t}");
+    let doc = stdout_json(&out);
+    let row = doc["settings"]
+        .as_array()
+        .expect("the settings atomic printed")
+        .iter()
+        .find(|setting| setting["setting"] == "model.name")
+        .unwrap_or_else(|| panic!("atomic printed no model.name: {t}"));
+    // The person's own file, word for word — with the byte that is not text
+    // shown as U+FFFD, which is how atomic shows a path it cannot show as
+    // text, and what the JSON of it carries. A setting that came from
+    // anywhere else, a default above all, is the two readings parting.
+    let shown = format!("{}:2", config.join("config.yaml").display());
+    assert_eq!(
+        row["source"].as_str(),
+        Some(shown.as_str()),
+        "model.name did not come from the configuration directory of odd bytes: {row}\n{t}"
+    );
+    assert_eq!(
+        row["value"].as_str(),
+        Some("from-a-directory-of-odd-bytes"),
+        "model.name is not what that file holds: {row}\n{t}"
+    );
 }

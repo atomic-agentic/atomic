@@ -106,6 +106,7 @@ fn repository(dir: &Path, layout: &str) -> (PathBuf, String) {
         .env("XDG_CONFIG_HOME", dir.join("config"))
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .output()
         .expect("atomic check");
     assert!(

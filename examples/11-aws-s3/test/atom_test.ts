@@ -1,7 +1,7 @@
 // Runs the TypeScript block of atoms/summarize-report.atom.astro the way Atomic
 // is planned to run it. S3 is a local stand-in; nothing leaves this machine.
 //
-//   deno test -A --lock=deno.lock --frozen test/
+//   deno test -A --lock=deno.lock --frozen --cached-only test/
 import { check, runPrepare } from "./atom_host.ts";
 import { FakeS3 } from "./fake_s3.ts";
 

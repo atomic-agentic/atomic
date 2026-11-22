@@ -1,0 +1,1 @@
+signin-hard-linked-git|crates/atomic-core/src/state.rs|!(meta.is_file() && meta.nlink() > 1)|true /*CONTROL_OFF*/|-p atomic-agentic-core --lib state::tests::a_hard_linked_git_refuses_nothing_and_one_out_of_reach_still_counts

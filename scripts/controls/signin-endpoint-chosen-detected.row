@@ -1,0 +1,1 @@
+signin-endpoint-chosen-detected|crates/atomic/src/settings.rs|        let detected = matches!(source, Some(Source::Detected(_)));|        let detected = false; // CONTROL_OFF|-p atomic-agentic --bin atomic settings::tests::only_an_endpoint_someone_chose_comes_before_the_sign_in

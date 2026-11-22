@@ -1054,6 +1054,182 @@ pub fn run_in(
     stdin: &[u8],
     limits: Limits,
 ) -> Result<Completed, ExecError> {
+    let none = crate::SecretEnv::default();
+    run_in_with_secret(group, program, args, cwd, env, &none, stdin, limits)
+}
+
+/// A connected Unix socket holding `secret`'s entries, with its other end
+/// written and closed, which a child inherits; none for an empty one. A
+/// socket rather than a pipe: another process cannot reopen it through
+/// `/proc/<pid>/fd` before the child has protected itself.
+#[cfg(unix)]
+fn secret_socket(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+    use std::io::Write;
+    if secret.is_empty() {
+        return Ok(None);
+    }
+    let bytes = secret.encode().map_err(std::io::Error::other)?;
+    // A socket's buffer holds this much without a reader; the entries are a
+    // token or two, far less.
+    if bytes.len() > MAX_SECRET_BYTES {
+        return Err(std::io::Error::other(
+            "the secret variables are too long to hand over",
+        ));
+    }
+    // Both ends are close-on-exec; the child clears it on its own copy of
+    // the end it reads, which ends once the other end is shut down.
+    let (read, mut write) = std::os::unix::net::UnixStream::pair()?;
+    write.write_all(&bytes)?;
+    write.shutdown(std::net::Shutdown::Write)?;
+    drop(write);
+    Ok(Some(std::os::fd::OwnedFd::from(read)))
+}
+
+/// Whether this process can still be read through /proc by another of its
+/// user: on Linux, whether it is dumpable; elsewhere, never said to be.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn still_dumpable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_GET_DUMPABLE takes no pointer and touches no memory.
+        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Whether `mode`, as fstat gives it, is a socket's.
+#[cfg(unix)]
+pub(crate) fn is_socket_mode(mode: libc::mode_t) -> bool {
+    mode & libc::S_IFMT == libc::S_IFSOCK
+}
+
+/// Whether `fd` is past the standard three, as a handed socket must be.
+#[cfg(unix)]
+pub(crate) fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
+    *fd > 2
+}
+
+/// The most a secret socket holds: what the sender hands at most, and what
+/// the reader takes at most.
+#[cfg(unix)]
+const MAX_SECRET_BYTES: usize = 4096;
+
+/// Keep the open descriptor `fd` from the programs this process starts,
+/// when it is refused rather than read.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn keep_from_children(fd: std::os::fd::RawFd) {
+    // SAFETY: fcntl with F_SETFD takes an integer and touches no memory;
+    // on a descriptor that is not open it only fails.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+}
+
+/// The [`crate::SecretEnv`] this process was handed on the socket whose
+/// descriptor `fd` names, as [`run_in_with_secret`] hands it: read to its
+/// end, and closed. Refused when `fd` is not a number above 2 or not a
+/// socket, or the socket holds nothing, more than the sender ever hands, or
+/// what is not well formed, and on Linux while this process is still
+/// dumpable: it must first be hardened so that no other process of its user
+/// can read what it is about to hold. A descriptor it refuses is kept from
+/// the programs this process starts.
+///
+/// # Safety
+///
+/// `fd` must name a descriptor handed to this process for this alone: one
+/// nothing else in this process holds, uses or can be handed while this
+/// runs, since an open descriptor is taken as this process's own and closed.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    let fd: std::os::fd::RawFd = fd
+        .to_str()
+        .and_then(|fd| fd.parse().ok())
+        .filter(above_stdio)
+        .ok_or_else(|| invalid("its descriptor is not a number above 2".to_owned()))?;
+    if still_dumpable() {
+        keep_from_children(fd); // a process still dumpable
+        return Err(invalid(
+            "this process is still dumpable; it reads secret variables only once hardened"
+                .to_owned(),
+        ));
+    }
+    // Looked at before it is taken as this process's own: a descriptor that
+    // is not open must not be owned, or closing it would close another's.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes one stat into `stat`, and only reads `fd`.
+    if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so it wrote the whole stat.
+    let mode = unsafe { stat.assume_init() }.st_mode;
+    if !is_socket_mode(mode) {
+        keep_from_children(fd); // a descriptor that is not a socket
+        return Err(invalid("its descriptor is not a socket".to_owned()));
+    }
+    // SAFETY: the descriptor is open, and the caller handed it for this
+    // alone; it is read and closed here, once.
+    let socket = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut held = Vec::new();
+    socket
+        .take(MAX_SECRET_BYTES as u64 + 1)
+        .read_to_end(&mut held)?;
+    if held.len() > MAX_SECRET_BYTES {
+        return Err(invalid(format!(
+            "its socket holds more than the {MAX_SECRET_BYTES} bytes ever handed"
+        )));
+    }
+    // The control plane never hands an empty socket: one is no secret.
+    if held.is_empty() {
+        return Err(invalid("its socket holds nothing".to_owned()));
+    }
+    crate::SecretEnv::decode(&held).map_err(invalid)
+}
+
+/// The [`crate::SecretEnv`] this process was handed, if its environment
+/// names a socket in [`crate::SECRET_ENV_FD`] (see [`read_secret_socket`]);
+/// none if it names none. The variable is gone from its environment after.
+/// Only `atomic runner` calls it, before it starts any thread, and
+/// the descriptor the variable names is the one the control plane handed
+/// it: the contract [`read_secret_socket`] asks of its caller holds there,
+/// and nowhere this could be called from outside the crate.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
+    let Some(fd) = std::env::var_os(crate::SECRET_ENV_FD) else {
+        return Ok(crate::SecretEnv::default());
+    };
+    // SAFETY: called before this process starts any thread, so nothing
+    // reads the environment concurrently; the descriptor the variable names
+    // was handed to this process for this alone.
+    unsafe {
+        std::env::remove_var(crate::SECRET_ENV_FD);
+        read_secret_socket(&fd)
+    }
+}
+
+/// [`run_in`], with `secret` on a socket the child inherits, whose
+/// descriptor it finds in [`crate::SECRET_ENV_FD`]; the variables are never
+/// in its environment.
+#[allow(clippy::too_many_arguments)]
+pub fn run_in_with_secret(
+    group: Group,
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    secret: &crate::SecretEnv,
+    stdin: &[u8],
+    limits: Limits,
+) -> Result<Completed, ExecError> {
     let name = program.display().to_string();
     let mut command = std::process::Command::new(program);
     command
@@ -1065,6 +1241,39 @@ pub fn run_in(
         .stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    let secret_end = {
+        use std::os::fd::AsRawFd;
+        let socket = secret_socket(secret).map_err(|e| ExecError::Start {
+            program: name.clone(),
+            message: format!("hand it its secret variables: {e}"),
+        })?;
+        if let Some(socket) = &socket {
+            let fd = socket.as_raw_fd();
+            command.env(crate::SECRET_ENV_FD, fd.to_string());
+            // SAFETY: between fork and exec the closure makes one
+            // async-signal-safe call, fcntl, and allocates nothing.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                    // The child keeps its end across exec; this process
+                    // closes its own once the child has started.
+                    if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        socket
+    };
+    #[cfg(not(unix))]
+    if !secret.is_empty() {
+        return Err(ExecError::Start {
+            program: name,
+            message: "secret variables are handed on a socket only on Unix".into(),
+        });
     }
     #[cfg(unix)]
     {
@@ -1118,6 +1327,9 @@ pub fn run_in(
         program: name.clone(),
         message: e.to_string(),
     })?;
+    // The child has its own copy of the secret socket.
+    #[cfg(unix)]
+    drop(secret_end);
     // A process in this one's group is stopped with this process.
     let own = (group != Group::Inherit).then(|| child.id());
     running.extend(own);

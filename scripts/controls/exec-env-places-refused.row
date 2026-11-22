@@ -1,0 +1,1 @@
+exec-env-places-refused|crates/atomic-core/src/atom.rs|                if name == crate::codex::PLACES {|                if std::hint::black_box(false) && name == crate::codex::PLACES {|-p atomic-agentic-core --lib --features fake-model exec_declarations_are_checked_at_load

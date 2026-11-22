@@ -1,0 +1,1 @@
+run-project-adopt|crates/atomic-durable/src/runtime.rs|SELECT w.workflow_uuid, ? FROM workflow_status w WHERE NOT EXISTS|SELECT w.workflow_uuid, ? FROM workflow_status w WHERE 1 = 0 /*CONTROL_OFF*/ AND NOT EXISTS|-p atomic-agentic-durable --lib gate::tests::a_private_stores_old_runs_become_the_projects

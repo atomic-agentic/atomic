@@ -1,0 +1,1 @@
+state-home-placed-cli|crates/atomic-core/src/state.rs|    std::path::absolute(path).ok()|    Some(path.to_path_buf()) // CONTROL_OFF: the same placing, seen from the command a person runs|-p atomic-agentic --test state_cli -- a_relative_home_gives_a_state_directory_placed_from_the_working_directory

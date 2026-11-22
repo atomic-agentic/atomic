@@ -1,0 +1,1 @@
+deno-lock-body-shape|tools/deno_exec.py|    _require(isinstance(body, dict),|    _require(isinstance(body, dict) or True,|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read

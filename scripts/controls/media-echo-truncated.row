@@ -1,0 +1,1 @@
+media-echo-truncated|crates/atomic-core/src/http_tools.rs|    format!("{}…", &media[..cut])|    media.to_owned() /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- http_tools::tests::a_long_content_type_is_echoed_cut_short
