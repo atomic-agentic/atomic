@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use git_repo::{git_in, git_state};
+
+mod git_repo;
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
 
@@ -5923,49 +5926,12 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     }
 }
 
-/// git in `dir`, as a person runs it, with an identity of its own.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=dev",
-            "-c",
-            "user.email=dev@example.com",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
 /// A commit of `file` with `text` in the repository at `dir`, returning it.
 fn commit_file(dir: &Path, file: &str, text: &str) -> String {
     std::fs::write(dir.join(file), text).expect("file");
     git_in(dir, &["add", file]);
     git_in(dir, &["commit", "-q", "-m", text]);
     git_in(dir, &["rev-parse", "HEAD"])
-}
-
-/// What git records about the repository at `dir` that a run must not change:
-/// its refs, its worktrees, its working tree with every untracked file, its own
-/// configuration (`.git/config`, where a remote, a hook path or a filter driver
-/// would appear) and the counts and sizes of its objects. A test compares two
-/// of these, before a run and after it, to say the repository was left alone.
-fn git_state(dir: &Path) -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}",
-        git_in(dir, &["for-each-ref"]),
-        git_in(dir, &["worktree", "list", "--porcelain"]),
-        git_in(dir, &["status", "--porcelain", "--untracked-files=all"]),
-        git_in(dir, &["config", "--list", "--local"]),
-        git_in(dir, &["count-objects", "-v"]),
-    )
 }
 
 /// The coding example in the catalog, as written.
@@ -6250,13 +6216,15 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
                 "{tag}: the run the round dropped is killed and reaped (pid {pid})"
             );
         }
-        // Neither the developer's checkout nor the fixture gained a ref or a
-        // worktree, changed a file or wrote a loose object.
+        // Neither the developer's checkout nor the fixture gained a ref, a
+        // worktree or a configuration entry, changed a file or wrote a loose
+        // object.
         assert_eq!(git_state(&project), checkout, "the checkout is as it was");
         assert_eq!(git_state(&fixture), source, "the fixture is as it was");
-        // And that comparison is not vacuous: a ref, a working-tree file, an
-        // entry in the fixture's own configuration and a loose object each show
-        // in it, so the equality above says what it claims. Each of these is one
+        // And that comparison is not vacuous: one change of each kind git_state
+        // reads is planted here, in turn, and the comparison notices each — a
+        // ref, a working-tree file, an entry in the fixture's own configuration,
+        // a loose object and a worktree registered with the fixture. Each is one
         // thing a run that may only read a fixture must never leave behind.
         git_in(&fixture, &["tag", "decoy-ref"]);
         let with_ref = git_state(&fixture);
@@ -6274,10 +6242,17 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
             "an entry in the fixture's own configuration"
         );
         git_in(&fixture, &["hash-object", "-w", "decoy.txt"]);
+        let with_object = git_state(&fixture);
+        assert_ne!(
+            with_object, with_config,
+            "an object added to the fixture's store"
+        );
+        let linked = dir.join("decoy-worktree").to_string_lossy().into_owned();
+        git_in(&fixture, &["worktree", "add", "--detach", &linked, "HEAD"]);
         assert_ne!(
             git_state(&fixture),
-            with_config,
-            "an object added to the fixture's store"
+            with_object,
+            "a worktree registered with the fixture"
         );
     });
 }
@@ -6330,8 +6305,9 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
         assert_ne!(candidate, base, "the fixture's tip is not its baseline");
         // The repository is left checked out on its tip, which is not the
         // revision every run below is given: a run that resolved the
-        // repository's HEAD instead of the revision it was named would bind
-        // the candidate, and each of its assertions would say so.
+        // repository's HEAD instead of the revision it was named would be
+        // refused or bind the candidate, and each of its assertions would say
+        // so.
         let source = git_state(&fixture);
         // The example checks as written, from a directory outside it, which
         // is also where atomic writes the declarations its atoms import.

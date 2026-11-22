@@ -19,6 +19,9 @@
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+use git_repo::{git_in, git_state};
+
+mod git_repo;
 mod support;
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -39,44 +42,6 @@ fn text(out: &Output) -> String {
 /// `--json` output, read back as JSON.
 fn stdout_json(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(out)))
-}
-
-/// git in `dir`, as a person runs it.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=dev",
-            "-c",
-            "user.email=dev@example.com",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
-/// What git records about the repository at `dir` that a turn must not
-/// change: its refs, its worktrees, its working tree with every untracked
-/// file, its own configuration (`.git/config`, where a remote, a hook path or
-/// a filter driver would appear) and the counts and sizes of its objects. A
-/// test compares two of these, before a turn and after it, to say the
-/// repository was left alone.
-fn git_state(dir: &Path) -> String {
-    format!(
-        "{}\n{}\n{}\n{}\n{}",
-        git_in(dir, &["for-each-ref"]),
-        git_in(dir, &["worktree", "list", "--porcelain"]),
-        git_in(dir, &["status", "--porcelain", "--untracked-files=all"]),
-        git_in(dir, &["config", "--list", "--local"]),
-        git_in(dir, &["count-objects", "-v"]),
-    )
 }
 
 fn write(path: &Path, text: &str) {

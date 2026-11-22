@@ -30,12 +30,12 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 # checkout: the first compares the checkout that holds the project (its refs,
 # its worktree list, its working tree with every untracked file, its own
 # configuration and its objects) before and after, and the second compares the
-# fixture repository the same way when the project sits outside any repository.
-# The third gives its turn a file to
-# write and shows that file committed in the snapshot's worktree, never in the
-# checkout. The last two run a `workspace-write` Codex atom directly and as a
-# step with no `worktree: true`: both are refused `target.unsafe` before the
-# run starts, and the checkout is left as it was.
+# fixture repository the same way when the project sits outside any
+# repository. The third gives its turn a file to write and shows that file
+# committed in the snapshot's worktree, never in the checkout. The last two
+# run a `workspace-write` Codex atom directly and as a step with no
+# `worktree: true`: both are refused `target.unsafe` before the run starts,
+# and the checkout is left as it was.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
@@ -79,18 +79,20 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 ## Run from directories outside the project, the coding example pins the same base commit and leaves the source repository unchanged.
 # The first runs the coding workflow from the project and from an unrelated
 # directory with `--project` and a relative fixture path, and both runs are
-# bound to the same commit of the same fixture, which is then as it was — and,
-# because a comparison of two equal states proves nothing on its own, that test
-# then plants a ref, a file, an entry in the repository's configuration and an
-# object in the fixture, and shows the comparison notices each in turn.
-# The others run the turn where the project sits: outside any repository, and in
-# a subdirectory of the developer's checkout. The last runs the coding example
-# itself, from two directories outside the project, to completion: its fixture
-# stays checked out on its tip, which is not the revision the runs are given, so
-# what each pins is that revision and never the fixture's HEAD; and the fixture's
-# refs, its worktrees, its working tree with every untracked file, its own
-# configuration and its objects are compared once its baseline is bound and again
-# after the change is accepted.
+# bound to the same commit of the same fixture, which is then as it was —
+# and, because a comparison of two equal states proves nothing on its own,
+# that test then plants one change of each kind the comparison reads: a ref,
+# a file in the working tree, an entry in the repository's own configuration,
+# an object in its store and a worktree registered with it, and shows the
+# comparison noticing each in turn. The others run the turn where the project
+# sits: outside any repository, and in a subdirectory of the developer's
+# checkout. The last runs the coding example itself, from two directories
+# outside the project, to completion: its fixture stays checked out on its
+# tip, which is not the revision the runs are given, so what each pins is
+# that revision and never the fixture's HEAD; and the fixture's refs, its
+# worktrees, its working tree with every untracked file, its own
+# configuration and its objects are compared once its baseline is bound and
+# again after the change is accepted.
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
