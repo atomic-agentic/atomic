@@ -1,1 +1,1 @@
-run-id-checked|crates/atomic/src/main.rs|        && let Err(refused) = runs::check_run_id(id)|        && let Err(refused) = runs::check_run_id(id).and(Ok::<(), failure::Failure>(())) // CONTROL_OFF|-p atomic-agentic --test run_cli -- a_run_id_outside_its_characters_or_length_is_refused
+run-id-checked|crates/atomic/src/main.rs|        && let Err(refused) = runs::check_run_id(id)|        && let Err(refused) = runs::check_run_id(id).or(Ok::<(), failure::Failure>(())) // CONTROL_OFF|-p atomic-agentic --test run_cli -- a_run_id_outside_its_characters_or_length_is_refused
