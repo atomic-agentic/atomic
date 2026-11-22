@@ -249,17 +249,25 @@ pub(crate) async fn decide_as_operator(
             credential::fresh_secret()?.get(..32).unwrap_or_default()
         ),
     };
-    let decision = gate::decide(
-        rt,
-        &credential,
-        DecisionCommand {
-            command_id,
-            gate: found.id.clone(),
-            verdict,
-            comment,
-            proposal: proposal.unwrap_or_else(|| found.proposal.clone()),
-            answer,
-        },
+    // What the answer and the comment name is kept from a sweep until the
+    // decision, which a sweep reads, is recorded.
+    let store = atomic_core::artifact::LocalStore::for_project(state)
+        .context("the artifact store")?;
+    let command = DecisionCommand {
+        command_id,
+        gate: found.id.clone(),
+        verdict,
+        comment,
+        proposal: proposal.unwrap_or_else(|| found.proposal.clone()),
+        answer,
+    };
+    let (answer, comment) = (command.answer.clone(), command.comment.clone());
+    let decision = atomic_app::retention::deciding_keeping_named(
+        &store,
+        &found.id,
+        answer.as_ref(),
+        comment.as_deref(),
+        || async move { Ok(gate::decide(rt, &credential, command).await?) },
     )
     .await?;
     // The decision is recorded; waking the run is not part of it. Say so if

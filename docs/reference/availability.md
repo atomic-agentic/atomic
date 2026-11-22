@@ -101,10 +101,15 @@ contract does not allow there refuses it too (`input.invalid`); the first
 such field is the one named. A reference in free text is held if stored and
 otherwise left alone. Either way nothing is recorded.
 
-A sweep also keeps the content a question gate's answer names from the moment
-the answer is decided, before the run that asked wakes and records it, and the
-content its default or an answer the feedback log keeps names. A gate store
-the sweep cannot read fails the sweep, and nothing is removed.
+A sweep also keeps the content a gate's decision names, in a question's answer
+or an approval's comment, from the moment it is decided, before the run that
+asked wakes and records it, and anything else a gate or an entry of the
+feedback log names, such as a question's default. `atomic gates answer` and
+the other deciding commands hold what the decision names, and mark it as just
+written, while the decision is recorded, so a sweep that read the gate store
+just before keeps it too; a decision naming content a sweep removed meanwhile
+is refused, with nothing recorded. A gate store the sweep cannot read fails
+the sweep, and nothing is removed.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

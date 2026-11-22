@@ -1,1 +1,1 @@
-retention-answers-swept|crates/atomic/src/retention.rs|    found.extend(answered(store, rt).await?);|    let _ = answered;|-p atomic-agentic --test retention a_question_gates_answer_keeps_what_it_names_before_the_run_records_it
+retention-answers-swept|crates/atomic/src/retention.rs|    found.extend(answered(&present, rt).await?);|    let _ = answered;|-p atomic-agentic --test retention a_question_gates_answer_keeps_what_it_names_before_the_run_records_it

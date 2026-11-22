@@ -669,3 +669,69 @@ fn a_question_gates_answer_keeps_what_it_names_before_the_run_records_it() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// A decision made while a sweep is between its reading of the gate store
+/// and its delete keeps what the answer names: the sweep read the gate
+/// open, with no answer, but the decision marked the content it names as
+/// just written, so the sweep keeps it by its grace.
+#[test]
+fn an_answer_decided_while_a_sweep_reads_keeps_what_it_names() {
+    on_codex_runtime(async {
+        let dir = scratch("answer-window");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let chosen = put(&store, b"the file the person chose, long ago");
+        let loose = put(&store, b"nothing refers to this");
+        backdate(&dir.join("artifacts"));
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        rt.register("asking", |ctx: DurareContext, (): ()| async move {
+            let mut asked = spec(Vec::new())?;
+            asked.question = Some(gate::Question {
+                answer: json!({"type": "object"}),
+                remember: false,
+                default: None,
+            });
+            gate::gate(&ctx, "accept", asked).await
+        });
+        rt.launch().await.unwrap();
+        rt.start("asking", "window-run", ()).await.unwrap();
+        let g = opened(&rt, "window-run").await;
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let other = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+        gate::enroll(&other, &me).await.unwrap();
+
+        // The sweep reads what to keep while the gate is still open...
+        let kept = retention::read_kept(&store, &other, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(!kept.artifacts.contains(&chosen));
+        // ...the operator answers, naming content stored long before...
+        let answer = json!({"file": format!("sha256:{}", chosen.digest())});
+        let command = DecisionCommand {
+            command_id: "window".into(),
+            gate: g.id.clone(),
+            verdict: Verdict::Approve,
+            comment: None,
+            proposal: g.proposal.clone(),
+            answer: Some(answer.clone()),
+        };
+        retention::deciding_keeping_named(&store, &g.id, Some(&answer), None, || async move {
+            Ok(gate::decide(&other, &me, command).await?)
+        })
+        .await
+        .unwrap();
+        // ...and the sweep deletes, with a grace that covers what was just
+        // written.
+        let swept = store
+            .sweep(
+                &kept.artifacts,
+                Grace::at_least(Duration::from_secs(60)),
+                kept.read_at,
+            )
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        assert!(held(&store, &chosen), "the answer's content was swept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
