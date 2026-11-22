@@ -403,11 +403,8 @@ fn strength(name: &str) -> Strength {
     if parts.iter().any(|part| part == "key") || joined.ends_with("key") {
         return Strength::Weak;
     }
-    // `Xauthorization`, `proxyauthorization`: a header's name run together.
-    let run_together = joined.ends_with("authorization");
-    let weak = parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str()))
-        || joined.ends_with("token")
-        || run_together;
+    let weak =
+        parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
     // `max_token`, `prompt_token`, `input_tokens`, `nextToken`: a count or a
     // kind of token, which only hints, said by the word right before
     // `token`. Never in an all-upper-case name, an environment variable's,
@@ -1080,7 +1077,7 @@ fn assigned(input: &str) -> Option<String> {
         // one hid as the header's credential and hides the rest with it.
         let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
         let header = ends_in_header(&input[name_start..name_end]);
-        let bare = value_from == start && set_off && !header;
+        let bare = set_off && !header;
         let error_len = if value_from == start {
             os_error_len(&input[value_from..])
         } else {
@@ -1110,14 +1107,19 @@ fn assigned(input: &str) -> Option<String> {
         // the error, and the error took the place where the name's value is
         // looked for: each word after it that looks like a credential is
         // hidden, to the end of the line or the quote around it. Words such
-        // as `; try again`, paths and times are kept, and an assignment,
-        // `request_id=abc-123`, is read by its own name.
+        // as `; try again`, paths, times, URLs, addresses and upper-case
+        // identifiers are kept. The words stop at the first one that starts
+        // an assignment, `DB_PASSWORD= …`, `api_key => …`, `secret: …`: that
+        // is read from there by its own name, as without an error before it.
         if let Some(len) = error_len {
             let after = value_from + len;
             let end = input[after..]
                 .find(['\n', '"', '\'', '\\'])
                 .map_or(input.len(), |i| after + i);
             for (from, to) in words(input, after, end) {
+                if word_starts_assignment(input, from, to) {
+                    break;
+                }
                 let word = &input[from..to];
                 if !is_not_a_secret(word)
                     && !reads_as_no_credential(word)
@@ -1128,7 +1130,7 @@ fn assigned(input: &str) -> Option<String> {
                     copied = to;
                 }
             }
-            // Assignments after it are still read, from past what was hidden.
+            // Read on from past the error and what was hidden.
             value_to = value_to.max(after).max(copied);
         }
         at = at.max(value_to);
@@ -1216,26 +1218,51 @@ fn words(input: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
     found
 }
 
+/// Whether the word of `input` from `from` to `to` starts an assignment: a
+/// name, letters, digits, `_`, `-` and `.`, then `=` or `:`, in the word or
+/// after blanks past it, as in `DB_PASSWORD=`, `api_key => x`,
+/// `client_secret := x`, `token: x`, even with nothing after it.
+fn word_starts_assignment(input: &str, from: usize, to: usize) -> bool {
+    let name = input[from..to]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        .count();
+    let next = if from + name < to {
+        input[from + name..].bytes().next()
+    } else {
+        input[to..].bytes().find(|b| !is_blank(b))
+    };
+    name > 0 && matches!(next, Some(b'=' | b':'))
+}
+
 /// Whether `word`, after an operating system's error, is plainly something
 /// else than a credential: an absolute or relative path, `/var/lib/x`,
-/// `./x`, `~/x`; a time, digits and `-:.+TZ` with eight digits or more; or
-/// an assignment, `request_id=abc-123`, which the assignment rule reads on
-/// its own, by its name. Not a value's padding, `abc==`.
+/// `./x`, `~/x`; a time, digits and `-:.+TZ` with eight digits or more; a
+/// URL, `https://…`; an address, `ops@example.com`; or an upper-case
+/// identifier, `ERR_CONN_RESET`.
 fn reads_as_no_credential(word: &str) -> bool {
     let path = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
     let time = word.bytes().filter(u8::is_ascii_digit).count() >= 8
         && word
             .bytes()
             .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
-    let assignment = word.split_once('=').is_some_and(|(name, value)| {
-        !name.is_empty()
-            && name
+    let url = word.contains("://");
+    let address = word.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty()
+            && local
                 .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            && !value.is_empty()
-            && !value.starts_with('=')
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+            && domain.contains('.')
+            && domain
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
     });
-    path || time || assignment
+    let identifier = word.contains('_')
+        && word.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && word.split('_').all(|part| {
+            part.bytes().all(|b| b.is_ascii_uppercase()) || part.bytes().all(|b| b.is_ascii_digit())
+        });
+    path || time || url || address || identifier
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {

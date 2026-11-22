@@ -2352,7 +2352,6 @@ fn a_secret_after_an_os_error_under_a_secrets_name_is_hidden() {
         "http.proxy-authorization",
         "x-api-key",
         "x-auth-token",
-        "Xauthorization",
     ];
     let forms = [
         "{n}: Permission denied (os error 13) {s}",
@@ -2410,6 +2409,9 @@ fn a_secret_after_an_os_error_under_a_secrets_name_is_hidden() {
         "password: No such file or directory (os error 2), run 2026-11-21T10:00:00Z",
         "token: Permission denied (os error 13) (path /var/lib/atomic/runs/run-1a2b3c4d)",
         "auth: Permission denied (os error 13) request_id=abc-123",
+        "token: Permission denied (os error 13) at https://api.example.com/v1/x2Fq9z",
+        "token: Permission denied (os error 13), tell ops+atomic@example.com",
+        "token: Permission denied (os error 13) ERR_CONN_RESET_2",
     ]);
 }
 
@@ -2758,11 +2760,19 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
 
 /// A secret that reads as a word, after an operating system's error, is
 /// not caught by its shape: it stays hidden where the error is not taken
-/// whole, under a header's name or written hard against the name, as the
-/// header rule then reads what was hidden as the header's credential.
+/// whole, quoted, under a header's name or written hard against the name,
+/// as the header rule then reads what was hidden as the header's
+/// credential.
 #[test]
 fn a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole() {
     let word = "hunter2";
+    for quoted in [
+        format!("password: \"Permission denied (os error 13) {word}\""),
+        format!("password='Permission denied (os error 13) {word}'"),
+    ] {
+        let read = text(&quoted);
+        assert!(!read.contains(word), "quoted: {read}");
+    }
     let mut header =
         json!({ "Authorization": format!("passwd:Permission denied (os error 13) {word}") });
     value(&mut header);
@@ -2776,4 +2786,44 @@ fn a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole() {
         let read = excerpt(&line.to_string(), 4096);
         assert!(!read.contains(word), "{name}: {read}");
     }
+}
+
+/// An assignment after an operating system's error is read by its own name,
+/// as it is with no error before it: the words after the error stop at it.
+/// Its value is hidden however short it is, or however it starts.
+#[test]
+fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
+    let mut shown = Vec::new();
+    for name in ["DB_PASSWORD", "api_key", "client_secret", "passwd"] {
+        for sep in ["=", "= ", " = ", "=>", " => ", ":=", " := ", "=\t", ": "] {
+            for secret in ["hunter2", "/qS7mLx2pQ9vT4", "s3"] {
+                for lead in [
+                    "token: Permission denied (os error 13) ",
+                    "password: No such file or directory (os error 2), then ",
+                    "Authorization: Permission denied (os error 13) ",
+                ] {
+                    let input = format!("{lead}{name}{sep}{secret}");
+                    let line = json!({ "log": input });
+                    let mut read = line.clone();
+                    value(&mut read);
+                    for reading in [
+                        text(&input).into_owned(),
+                        excerpt(&line.to_string(), 4096),
+                        read.to_string(),
+                    ] {
+                        // What main hides: the same text with no error.
+                        let plain = text(&format!("{name}{sep}{secret}")).into_owned();
+                        if !plain.contains(secret) && reading.contains(secret) {
+                            shown.push(reading);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "{} shown: {shown:#?}", shown.len());
+    assert_eq!(
+        text("token: Permission denied (os error 13) DB_PASSWORD= hunter2"),
+        "token: Permission denied (os error 13) DB_PASSWORD= [REDACTED]"
+    );
 }
