@@ -100,9 +100,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 mod relay;
 
-pub use relay::{
-    CONNECT_TIMEOUT, DEFAULT_CONNECTIONS_PER_COMMAND, MAX_CONNECTIONS_PER_COMMAND, PENDING_FRAMES,
-};
+pub use relay::{CONNECT_TIMEOUT, DEFAULT_CONNECTIONS_PER_COMMAND, MAX_CONNECTIONS_PER_COMMAND};
 
 /// The most hosts one atom may declare.
 pub const MAX_HOSTS: usize = 32;
@@ -575,7 +573,7 @@ fn runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_name("atomic-network-proxy")
+        .thread_name(relay::RUNTIME_THREAD)
         .enable_all()
         .build()?;
     Ok(RUNTIME.get_or_init(|| rt))

@@ -50,20 +50,26 @@ pub const MAX_CONNECTIONS_PER_COMMAND: u32 = 128;
 /// long a connection's first request may go unanswered before it is closed.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a connection has to send its attribution frame, as Codex's
-/// proxy allows.
-const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a connection has to send its attribution frame. The sandbox
+/// helper's bridge writes it as soon as its connect returns: measured from
+/// accept to frame over some 78,000 of its connections, most took well
+/// under a millisecond and the slowest 0.66 s, on a loaded machine. This
+/// bounds how long a connection without a frame holds a descriptor in
+/// atomic; nothing bounds how many may be waiting at once, so a local
+/// process that opens connections to the relay faster than this closes
+/// them can still take atomic's descriptors, as it can through the proxy's
+/// own port, which waits for a first byte without a timeout.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Codex's attribution frame: this magic, a big-endian `u16` length and a
 /// token of at most [`MAX_TOKEN`] bytes.
 const FRAME_MAGIC: &[u8; 8] = b"\0CDXPXY1";
 const MAX_TOKEN: usize = 128;
 
-/// The most connections, across every relay in this process, whose frame
-/// is still being read. Only a process outside any sandbox can hold one
-/// open without a frame: a bridge sends its frame at once.
-pub const PENDING_FRAMES: usize = 128;
-static PENDING: Semaphore = Semaphore::const_new(PENDING_FRAMES);
+/// The name of the threads the relays run on. The end of a command waits
+/// for its connections to let go ([`Admission`]), which would hold up the
+/// relay it waits for if it ran on one of them.
+pub(super) const RUNTIME_THREAD: &str = "atomic-network-proxy";
 
 /// The relay's timeouts.
 #[derive(Clone, Copy, Debug)]
@@ -166,6 +172,13 @@ pub(super) struct Admission {
 /// How long the end of a command waits for its connections to let go,
 /// so that a command started right after it finds its room given back.
 /// One the proxy has not let go of by then keeps the room.
+///
+/// The wait sleeps the thread. An admission is held only in the lease
+/// [`super::Proxies::prepare`] returns, which a command holds until its
+/// `ExecutionBackend::run`, a blocking call made off the async runtime,
+/// returns; and a relay's own tasks hold the command they admit, never its
+/// admission. Should one still end on a relay's own thread, it does not
+/// wait, since the relay could not let go while it did.
 const RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 impl Drop for Admission {
@@ -176,6 +189,9 @@ impl Drop for Admission {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.token);
         drop(self.ended.take());
+        if std::thread::current().name() == Some(RUNTIME_THREAD) {
+            return;
+        }
         let started = std::time::Instant::now();
         while self.admitted.strong_count() > 0 && started.elapsed() < RELEASE_WAIT {
             std::thread::sleep(Duration::from_millis(5));
@@ -256,12 +272,7 @@ async fn accept(listener: TcpListener, shared: Arc<Shared>) {
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                // Too many connections without a frame yet: this one is
-                // closed.
-                let Ok(pending) = PENDING.try_acquire() else {
-                    continue;
-                };
-                tokio::spawn(serve(shared.clone(), stream, pending));
+                tokio::spawn(serve(shared.clone(), stream));
             }
             Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
@@ -269,15 +280,10 @@ async fn accept(listener: TcpListener, shared: Arc<Shared>) {
 }
 
 /// Relay one connection, or close it unrelayed.
-async fn serve(
-    shared: Arc<Shared>,
-    mut front: TcpStream,
-    pending: tokio::sync::SemaphorePermit<'static>,
-) {
+async fn serve(shared: Arc<Shared>, mut front: TcpStream) {
     let Ok(Ok(token)) = tokio::time::timeout(FRAME_TIMEOUT, read_frame(&mut front)).await else {
         return;
     };
-    drop(pending);
     let Some(admitted) = shared.admitted(&token) else {
         return;
     };
@@ -335,6 +341,9 @@ struct Exchange {
     /// When the client's first bytes went to the proxy.
     started: Option<Instant>,
     /// Since when the client has sent bytes the proxy has not answered.
+    /// Past a tunnel's first answer, the client's bytes are the upstream's
+    /// to answer, if at all (a TLS `close_notify` gets no reply), and start
+    /// no dial, so they owe nothing.
     owed: Option<Instant>,
     /// Whether the proxy has answered anything.
     answered: bool,
@@ -343,8 +352,11 @@ struct Exchange {
     refused: Option<bool>,
 }
 
-/// The statuses of a `CONNECT` the proxy tunnels.
+/// The statuses of a `CONNECT` the proxy tunnels, each [`STATUS_LEN`]
+/// bytes long.
 const STATUS: [&[u8]; 2] = [b"HTTP/1.1 200", b"HTTP/1.0 200"];
+const STATUS_LEN: usize = STATUS[0].len();
+const _: () = assert!(STATUS[1].len() == STATUS_LEN);
 
 /// The longest `CONNECT` answer read for its status.
 const MAX_ANSWER: usize = 16 << 10;
@@ -366,7 +378,10 @@ impl Exchange {
             }
             self.started = Some(now);
         }
-        self.owed.get_or_insert(now);
+        let tunnelled = self.first == Some(true) && self.refused == Some(false) && self.answered;
+        if !tunnelled {
+            self.owed.get_or_insert(now);
+        }
     }
 
     /// The proxy sent `bytes` toward the client.
@@ -375,7 +390,7 @@ impl Exchange {
         if let Some(answer) = self.answer.as_mut() {
             let seen = answer.len();
             answer.extend_from_slice(bytes);
-            if self.refused.is_none() && answer.len() >= STATUS.len() {
+            if self.refused.is_none() && answer.len() >= STATUS_LEN {
                 self.refused = Some(!STATUS.iter().any(|s| answer.starts_with(s)));
             }
             let from = seen.saturating_sub(3);

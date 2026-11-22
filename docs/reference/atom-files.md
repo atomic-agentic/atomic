@@ -202,7 +202,11 @@ process of your own user that runs outside any sandbox is not kept out: it
 can enter the command's namespaces and use the sandbox's own route to the
 relay. Once the command ends, its token admits no new connection. A
 connection the relay cannot tie to a running command is closed and never
-reaches the proxy.
+reaches the proxy, and so is one that has not sent its token within a
+second, which the sandbox's own connections do at once. Any process on
+this machine can still open connections to the relay faster than it closes
+them, and so take atomic's open files, as it can through the proxy's own
+port.
 
 A command may hold at most 64 connections through its proxy at once, or the
 number `exec.connections_per_command` sets, from 1 to 128 (see
@@ -213,7 +217,9 @@ the command has dropped it: the proxy answers an HTTPS `CONNECT` before it
 dials and keeps the connection until the dial ends, and the kernel gives up a
 dial to a host that never answers only after about two minutes. A request the
 proxy never answered also counts until that time has passed since it was
-sent, even if the proxy closed the connection sooner. So a command that keeps
+sent, even if the proxy closed the connection sooner. Once a tunnel's host has
+answered, what the command sends through it no longer counts this way, since
+the proxy dials nothing more for it. So a command that keeps
 opening and abandoning connections to a host that never answers holds its 64
 and is refused more until those dials end; it does not take other commands'
 room. A connection whose first request gets no answer within 10 seconds is
@@ -225,7 +231,8 @@ of it.
 
 Each command that declares hosts is admitted against a budget of open files:
 for each connection it may hold, atomic reserves five open files (the relay's
-two, the proxy's own and up to three dials the proxy makes at once for it),
+to the proxy, the proxy's own and up to three dials the proxy makes at once
+for it),
 one for each of the 128 connections its sandbox may open to the relay, and a
 few to spare, 464 for the default 64; and the commands that declare hosts may
 reserve no more than half of atomic's limit on open files between them. A

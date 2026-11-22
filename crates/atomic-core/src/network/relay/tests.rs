@@ -189,22 +189,17 @@ async fn an_unattributed_connection_never_reaches_the_proxy() {
     drop(running);
 }
 
-/// A tunnel whose upstream never answers past the proxy's `200` is closed
-/// at the timeout, and its permit is held until the proxy lets go of it
-/// and the dial it may have started has ended.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unanswered_tunnel_is_closed_at_the_timeout() {
-    let stand = Stand::start(Some(b"HTTP/1.1 200 Connection established\r\n\r\n")).await;
-    let relay = Relay::start(
-        stand.addr,
-        timeouts(Duration::from_secs(1), Duration::from_secs(2)),
-    )
-    .await
-    .expect("starts");
-    let _one = relay
+/// A relay whose one permit is taken by a `CONNECT` the stand-in answers
+/// with `200` and whose upstream never answers; with when it was sent.
+async fn an_unanswered_tunnel(stand: &Stand, linger: Duration) -> (Relay, Admission, Instant) {
+    let relay = Relay::start(stand.addr, timeouts(Duration::from_secs(1), linger))
+        .await
+        .expect("starts");
+    let one = relay
         .admit("relay-one".into(), "proxy-one".into(), 1, Box::new(()))
         .expect("admitted");
     let mut tunnel = open(relay.addr(), Some("relay-one")).await;
+    let sent = Instant::now();
     tunnel
         .write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n")
         .await
@@ -213,24 +208,116 @@ async fn an_unanswered_tunnel_is_closed_at_the_timeout() {
     let n = tunnel.read(&mut answer).await.expect("answered");
     assert!(answer[..n].starts_with(b"HTTP/1.1 200"));
     tunnel.write_all(b"client hello").await.expect("sent");
-    let started = Instant::now();
     assert!(
         closed(&mut tunnel, Duration::from_secs(5)).await,
         "closed at the timeout"
     );
-    assert!(started.elapsed() < Duration::from_secs(3));
-    // The proxy still holds it: the permit is held.
+    assert!(
+        sent.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        sent.elapsed()
+    );
+    (relay, one, sent)
+}
+
+/// Whether the relay refuses a further connection for `relay-one`, as it
+/// does with no permit free: closed at once, where one let through would
+/// be left open waiting for the stand-in's answer.
+async fn refused(relay: &Relay) -> bool {
     let mut more = open(relay.addr(), Some("relay-one")).await;
-    assert!(closed(&mut more, Duration::from_secs(2)).await);
+    closed(&mut more, Duration::from_secs(1)).await
+}
+
+/// A tunnel whose upstream never answers past the proxy's `200` is closed
+/// at the timeout, and its permit is held until the proxy lets go of it
+/// and the dial it may have started has ended: the linger since the
+/// request was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unanswered_tunnel_is_closed_at_the_timeout() {
+    let stand = Stand::start(Some(b"HTTP/1.1 200 Connection established\r\n\r\n")).await;
+    let linger = Duration::from_secs(4);
+    let (relay, _one, sent) = an_unanswered_tunnel(&stand, linger).await;
+    // The proxy still holds it: the permit is held.
+    assert!(refused(&relay).await, "held while the proxy holds it");
     stand.let_go();
-    // Once the proxy has let go and the linger since the request has passed.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // The proxy has let go, but the dial it may have started may still run.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(refused(&relay).await, "held for the linger");
+    assert!(sent.elapsed() < linger, "{:?}", sent.elapsed());
+    // Once the linger since the request has passed.
+    tokio::time::sleep_until(sent + linger + Duration::from_millis(500)).await;
     let mut again = open(relay.addr(), Some("relay-one")).await;
     again
         .write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n")
         .await
         .expect("sent");
     assert_eq!(stand.until(2).await, 2, "room again");
+}
+
+/// A tunnel closed at the timeout keeps its permit while the proxy holds
+/// the connection, even past the linger, and gives it back once the proxy
+/// lets go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tunnel_closed_at_the_timeout_is_held_while_the_proxy_holds_it() {
+    let stand = Stand::start(Some(b"HTTP/1.1 200 Connection established\r\n\r\n")).await;
+    let linger = Duration::from_millis(1500);
+    let (relay, _one, sent) = an_unanswered_tunnel(&stand, linger).await;
+    tokio::time::sleep_until(sent + linger + Duration::from_secs(1)).await;
+    assert!(refused(&relay).await, "held past the linger");
+    stand.let_go();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let _again = open(relay.addr(), Some("relay-one")).await;
+    assert_eq!(stand.until(2).await, 2, "room again once the proxy let go");
+}
+
+/// The end of a command waits for its connections to let go, except on a
+/// relay's own thread, where the relay could not let go while it waited.
+/// Each command here holds a connection for the linger, past the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_end_of_a_command_on_a_relays_thread_does_not_wait() {
+    let stand = Stand::start(None).await;
+    let relay = Relay::start(
+        stand.addr,
+        timeouts(Duration::from_secs(30), Duration::from_secs(30)),
+    )
+    .await
+    .expect("starts");
+    let mut waits = Vec::new();
+    for (n, thread) in [(1, "a-command"), (2, RUNTIME_THREAD)] {
+        let token = format!("relay-{n}");
+        let admission = relay
+            .admit(token.clone(), format!("proxy-{n}"), 1, Box::new(()))
+            .expect("admitted");
+        let mut stream = open(relay.addr(), Some(&token)).await;
+        stream
+            .write_all(b"GET http://example.com/ HTTP/1.1\r\n\r\n")
+            .await
+            .expect("sent");
+        assert_eq!(stand.until(n).await, n);
+        // Let the request reach the relay's count of what is owed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ended = std::thread::Builder::new()
+            .name(thread.to_owned())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                drop(admission);
+                started.elapsed()
+            })
+            .expect("thread");
+        let waited = tokio::task::spawn_blocking(move || ended.join().expect("ended"))
+            .await
+            .expect("joined");
+        waits.push(waited);
+    }
+    let (command, relays) = (waits[0], waits[1]);
+    assert!(
+        command >= RELEASE_WAIT,
+        "a command's thread waits: {command:?}"
+    );
+    assert!(
+        relays < RELEASE_WAIT / 2,
+        "a relay's thread does not: {relays:?}"
+    );
 }
 
 /// A proxy that does not accept the relay's dial in time: the relay gives
@@ -309,6 +396,57 @@ fn only_an_upstreams_bytes_answer_a_tunnel() {
     short.sent(b"CON", now);
     short.received(b"HTTP/1.1 200 OK\r\n\r\n");
     assert!(!short.answered);
+}
+
+/// A `200` whose first read is shorter than its status is still the
+/// tunnel's, not its answer.
+#[test]
+fn a_200_read_in_pieces_is_not_the_answer() {
+    let now = Instant::now();
+    for split in 1..STATUS_LEN {
+        let whole = b"HTTP/1.1 200 Connection established\r\n\r\n";
+        let mut tunnel = Exchange::default();
+        tunnel.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
+        tunnel.received(&whole[..split]);
+        tunnel.received(&whole[split..]);
+        assert_eq!(tunnel.refused, Some(false), "split at {split}");
+        assert!(
+            tunnel.owed.is_some() && !tunnel.answered,
+            "split at {split}: the 200 is not the answer"
+        );
+        assert!(tunnel.overdue(Duration::ZERO, now), "split at {split}");
+        tunnel.received(b"\x16\x03\x03");
+        assert!(tunnel.answered, "split at {split}: the upstream's is");
+    }
+}
+
+/// Once a tunnel's upstream has answered, what the client sends through
+/// it owes nothing: no dial follows it. A refused `CONNECT`'s connection,
+/// on which the proxy might still read a request, still owes.
+#[test]
+fn an_answered_tunnel_owes_nothing_more() {
+    let now = Instant::now();
+    let mut tunnel = Exchange::default();
+    tunnel.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
+    tunnel.received(b"HTTP/1.1 200 OK\r\n\r\n\x16\x03\x03");
+    assert!(tunnel.answered && tunnel.owed.is_none());
+    // A TLS close_notify, which no reply follows.
+    tunnel.sent(b"\x15\x03\x03\x00\x02\x01\x00", now);
+    assert!(tunnel.owed.is_none(), "the tunnel owes nothing");
+
+    let mut refused = Exchange::default();
+    refused.sent(b"CONNECT example.com:22 HTTP/1.1\r\n\r\n", now);
+    refused.received(b"HTTP/1.1 403 Forbidden\r\n\r\n");
+    assert!(refused.answered && refused.owed.is_none());
+    refused.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
+    assert!(refused.owed.is_some(), "a request after a refusal owes");
+
+    // Bytes sent before the upstream's first answer still owe.
+    let mut early = Exchange::default();
+    early.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
+    early.received(b"HTTP/1.1 200 OK\r\n\r\n");
+    early.sent(b"\x16\x03\x01", now);
+    assert!(early.owed.is_some(), "the client hello owes");
 }
 
 /// The kernel's connect timeout, from `tcp_syn_retries`: the most it may
