@@ -1710,7 +1710,8 @@ fn redact_string(string: &mut String, nested: usize) {
             let parsed = serde_json::from_str::<Value>(string);
             let read_any = serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok();
             opened = read_any;
-            original_duplicate_keys = read_any && gives_a_key_twice(string);
+            // The unreadable-original guard handles syntax that cannot build a Value.
+            original_duplicate_keys = parsed.is_ok() && gives_a_key_twice(string);
             written = parsed.ok();
         }
         *string = redacted;
@@ -2099,10 +2100,8 @@ fn open_held_json(string: &mut String, nested: usize) {
     // previously different names equal.
     // Equivalent escaped names can also become different raw-text names:
     // retain the original JSON's duplicate decision when text changed it.
-    // An originally invalid document may become valid after text redaction.
-    let originally_duplicated = texted != *string
-        && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
-        && gives_a_key_twice(string);
+    // The unreadable-original guard below handles syntax that cannot build a Value.
+    let originally_duplicated = written.is_some() && gives_a_key_twice(string);
     let held_duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
     if held_duplicate_keys {
         *string = REDACTED.to_owned();
