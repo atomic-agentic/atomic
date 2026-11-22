@@ -27,7 +27,7 @@ use atomic_durable::gate::{
 };
 use atomic_durable::{DurableError, DurableRuntime, Durare, DurareContext, WorkflowContext};
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -737,9 +737,9 @@ fn an_answer_decided_while_a_sweep_reads_keeps_what_it_names() {
 }
 
 /// A sweep keeps what every project's gates name, whichever project the
-/// sweeping runtime is for: here a project's run asks, an approval's
-/// comment and the answer name content, and a sweep through a runtime for
-/// no project, as this file's others are, keeps both.
+/// sweeping runtime is for. An open foreign gate names content that the
+/// run records and feedback do not. After the gate is answered, the sweep
+/// also keeps the content the answer and comment name.
 #[test]
 fn a_sweep_keeps_what_another_projects_gates_name() {
     on_codex_runtime(async {
@@ -747,6 +747,7 @@ fn a_sweep_keeps_what_another_projects_gates_name() {
         let store = LocalStore::open(dir.join("artifacts")).unwrap();
         let answered = put(&store, b"the file another project's person chose");
         let commented = put(&store, b"the file another project's comment names");
+        let gate_only = put(&store, b"the file named only in the foreign gate store");
         let loose = put(&store, b"nothing refers to this");
         let database = atomic_durable::Database::Sqlite(dir.join("atomic.db"));
         let mut theirs = Durare::open(
@@ -778,6 +779,60 @@ fn a_sweep_keeps_what_another_projects_gates_name() {
         )
         .await
         .unwrap();
+        // Opening a gate also checkpoints its initial metadata. Put this
+        // fixture in the gate store after the run has stopped so that scanning
+        // run checkpoints cannot protect it. Keep the proposal digest valid.
+        let show = json!({"file": format!("sha256:{}", gate_only.digest())});
+        let proposal = gate::proposal_digest(
+            &g.title,
+            &json!({"show": &show, "question": &g.question}),
+            &g.evidence,
+        );
+        {
+            use sqlx::Connection;
+            let mut c = sqlx::SqliteConnection::connect(&format!(
+                "sqlite://{}",
+                dir.join("atomic.db").display()
+            ))
+            .await
+            .unwrap();
+            let changed =
+                sqlx::query("UPDATE atomic_gates SET show = ?, proposal = ? WHERE gate_id = ?")
+                    .bind(show.to_string())
+                    .bind(proposal)
+                    .bind(&g.id)
+                    .execute(&mut c)
+                    .await
+                    .unwrap();
+            assert_eq!(changed.rows_affected(), 1);
+        }
+        let g = gate::find(&theirs, &g.id).await.unwrap().unwrap();
+        assert_eq!(g.show, show);
+        assert!(g.resolution.is_none());
+        let sweeper = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        assert!(
+            gate::gates(&sweeper, gate::GateFilter::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the sweeper's own project has no gates"
+        );
+        assert!(gate::feedback(&sweeper).await.unwrap().is_empty());
+        let present = HashSet::from([gate_only.digest().to_owned()]);
+        assert!(
+            retention::recorded(&present, &sweeper)
+                .await
+                .unwrap()
+                .is_empty(),
+            "run records must not keep the foreign gate's artifact"
+        );
+        assert!(
+            retention::referenced(&store, &sweeper)
+                .await
+                .unwrap()
+                .contains(&gate_only),
+            "the foreign open gate's artifact has no retained reference"
+        );
         let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
         gate::enroll(&theirs, &me).await.unwrap();
         gate::decide(
@@ -794,18 +849,14 @@ fn a_sweep_keeps_what_another_projects_gates_name() {
         )
         .await
         .unwrap();
-        let sweeper = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
-        assert!(
-            gate::gates(&sweeper, gate::GateFilter::default())
-                .await
-                .unwrap()
-                .is_empty(),
-            "the sweeper's own project has no gates"
-        );
         let swept = retention::sweep(&store, &sweeper, &BTreeSet::new(), Grace::none_for_tests())
             .await
             .unwrap();
         assert_eq!(swept.removed, [loose]);
+        assert!(
+            held(&store, &gate_only),
+            "the foreign gate's artifact was swept"
+        );
         assert!(
             held(&store, &answered),
             "another project's answer was swept"
