@@ -1380,8 +1380,11 @@ fn unclean_flag_values(input: &str) -> Option<String> {
     // How the last quote read so far is escaped, read on as the flags are.
     let mut quotes = LastQuote::default();
     for head in FLAG_HEAD.captures_iter(input) {
-        let Some(whole) = head.get(0) else { continue };
-        quotes.read_to(input, whole.start());
+        let (Some(whole), Some(flag)) = (head.get(0), head.get(1)) else {
+            continue;
+        };
+        // Up to the flag, the quote or space before it included.
+        quotes.read_to(input, flag.start());
         if whole.start() < last || strength(&head[1]) == Strength::None {
             continue;
         }
