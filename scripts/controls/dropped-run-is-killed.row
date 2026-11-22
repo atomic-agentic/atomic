@@ -1,0 +1,1 @@
+dropped-run-is-killed|crates/atomic/tests/run_cli.rs|        kill_and_reap(&mut self.0);|        // CONTROL_OFF: the run the test dropped keeps running|-p atomic-agentic --test run_cli -- a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout

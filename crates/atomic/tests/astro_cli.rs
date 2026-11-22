@@ -226,10 +226,11 @@ fn a_contextual_atom_in_the_home_directory_keeps_its_state_beneath_home() {
     assert!(first.contains("home-region"));
     let restored = success(fixture.run(&home, &args, "other-region"));
     assert!(restored.contains("home-region") && !restored.contains("other-region"));
-    // The compiler cache and the context key follow ATOMIC_HOME.
+    // The context key follows ATOMIC_HOME; the compiler, embedded in the
+    // binary, unpacks nothing.
     let atomic_home = home.join(".local/share/atomic");
-    assert!(atomic_home.join("cache/compiler").is_dir());
     assert!(atomic_home.join("keys/context.key").is_file());
+    assert!(!atomic_home.join("cache/compiler").exists());
     assert!(!home.join(".cache/atomic").exists());
 }
 

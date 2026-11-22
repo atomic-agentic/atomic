@@ -1,0 +1,1 @@
+run-renamed-chars-adopt|crates/atomic-durable/src/runtime.rs|                             AND substr(atomic_run_projects.project, -length(?)) = ?",|                             AND substr(atomic_run_projects.project, -length(CAST(? AS BLOB))) = ?", // CONTROL_OFF|-p atomic-agentic-durable --lib gate::tests::a_private_stores_renamed_runs_are_matched_by_characters

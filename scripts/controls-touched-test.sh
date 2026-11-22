@@ -437,7 +437,50 @@ fresh
 ln -s a.row scripts/controls/l.row
 commit
 run
-refused "a link among the rows" "scripts/controls/l.row is not a regular file"
+refused "a link to another control's row" "scripts/controls/l.row names itself 'a'"
+
+# A link is followed within the tree, as controls-check.sh's `[ -f ]` follows
+# it; one that leads nowhere readable is refused.
+fresh
+mkdir -p elsewhere
+echo 'l|src/one.rs|guard_a();|/*off*/|-p x --lib -- test_l' >elsewhere/l.row
+ln -s ../../elsewhere/l.row scripts/controls/l.row
+printf 'fn one() { guard_a(); guard_b(); } // moved\n' >src/one.rs
+commit
+run
+expect "a row file linked within the tree" "$(printf 'a\nb\nl')"
+
+fresh
+ln -s nowhere.row scripts/controls/l.row
+commit
+run
+refused "a link to nothing" "scripts/controls/nowhere.row, which a row file links to, is not in the tree"
+
+fresh
+ln -s l.row scripts/controls/l.row
+commit
+run
+refused "a link to itself" "scripts/controls/l.row is a link that does not end"
+
+fresh
+ln -s ../../../outside.row scripts/controls/l.row
+commit
+run
+refused "a link out of the repository" "is reached by a link out of the repository"
+
+fresh
+mkdir -p elsewhere/l.row
+echo x >elsewhere/l.row/x
+ln -s ../../elsewhere/l.row scripts/controls/l.row
+commit
+run
+refused "a link to a directory" "elsewhere/l.row is not a regular file"
+
+fresh
+printf '|src/one.rs|guard_a();|/*off*/|-p x\n' >scripts/controls/.row
+commit
+run
+refused "a row naming no control" "scripts/controls/.row names no control"
 
 fresh
 mkdir scripts/controls/d.row

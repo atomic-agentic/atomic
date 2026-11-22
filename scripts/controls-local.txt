@@ -10,6 +10,3 @@
 # rather than running it, so it stays a local duty: run it with
 # scripts/controls-check.sh as docs/development.md describes and quote its
 # result line. scripts/controls-touched.py refuses a line naming no row.
-
-exec-network-helper-undumpable: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed
-exec-network-token-prologue: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed

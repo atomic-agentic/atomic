@@ -1,0 +1,1 @@
+sandbox-late-link-place-in-writable|crates/atomic-core/src/codex.rs|            refuse_link_in_writable(place)?;|            let _ = &place;|-p atomic-agentic-core --lib --features fake-model -- a_place_that_became_a_link_inside_a_writable_root_refuses

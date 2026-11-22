@@ -101,6 +101,17 @@ contract does not allow there refuses it too (`input.invalid`); the first
 such field is the one named. A reference in free text is held if stored and
 otherwise left alone. Either way nothing is recorded.
 
+A sweep also keeps the content a gate's decision names, in a question's answer
+or an approval's comment, from the moment it is decided, before the run that
+asked wakes and records it, and anything else a gate or an entry of the
+feedback log names, such as a question's default, for every project's gates
+in the store, not only the project that sweeps. `atomic gates answer` and
+the other deciding commands hold what the decision names, and mark it as just
+written, while the decision is recorded, so a sweep that read the gate store
+just before keeps it too; a decision naming content a sweep removed meanwhile
+is refused, with nothing recorded. A gate store the sweep cannot read fails
+the sweep, and nothing is removed.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an
@@ -136,7 +147,20 @@ with a `worktree: true` step is refused on it before anything runs.
 
 A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
-atomic's own environment or its credentials. A turn's commands run with no
+atomic's own environment or its credentials. Nor does it get the descriptors
+whatever started atomic left open, such as a CI runner's pipes or a shell's,
+an editor's or an agent's files and sockets: on Unix, atomic marks every one
+past the standard three close-on-exec as it starts, and so does Codex's Linux
+sandbox helper before it starts a command, so a command holds only what atomic
+hands it. That includes descriptors handed to atomic on purpose, such as
+systemd's socket activation (`LISTEN_FDS`) or a `make` jobserver: none reaches
+a command, or another program atomic starts. On Linux, atomic uses
+`close_range`, or, on a kernel before 5.11, the list in `/proc/self/fd`; where
+it has neither, atomic does not start, and the helper does not start the
+command. Codex's process launcher also marks, as far as it can, what a turn's
+commands would inherit close-on-exec. On macOS atomic relies on
+the list in `/dev/fd`, which is not verified. Windows, where a process
+inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn, of the project or another project of the same
@@ -209,7 +233,10 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. What Codex records of a project's threads, its state databases and
+may write, or when a denied place is itself a link inside a directory it may
+write, which a command could remove to read what it points at; a place that
+has become such a link since the list was built stops the next command too.
+What Codex records of a project's threads, its state databases and
 its logs, is kept with the project's private state, in the atomic home's
 `private/`, which every project's commands are denied; its Codex home keeps
 no thread records, and its helper links are the only part a turn's shell
@@ -325,7 +352,9 @@ old one's commands no longer list or release. Two different projects that
 share both a name and a path, such as the same `/app` in two containers, are
 one project there: give them different names. A manifest that is there but
 cannot be read or is not valid stops these commands, rather than have them
-use another key. A local SQLite store is the project's own, so a park recorded
+use another key: so does an `atomic.yaml` that is a directory, a link to
+itself, to nothing or through a file, or one atomic may not look at, which
+is not taken for no manifest. A local SQLite store is the project's own, so a park recorded
 there before atomic kept parks' projects, or under an older name of the
 project's at the same path, becomes the project's when atomic opens the store:
 on one, a rename strands no parked run. On a shared PostgreSQL store

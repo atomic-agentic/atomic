@@ -87,11 +87,36 @@ def parse(path, text):
     if len(fields) != 5:
         raise Refused(f"{path} has {len(fields) - 1} '|' separators, not the 4 between its five fields")
     name, file, switch, _, args = fields
+    if not name:
+        raise Refused(f"{path} names no control")
     if name != posixpath.basename(path)[: -len(".row")]:
         raise Refused(f"{path} names itself '{name}', which is not its file name")
     if not file or not switch:
         raise Refused(f"{path} names no file or no text to switch")
     return {"name": name, "file": posixpath.normpath(file), "switch": switch, "args": args}
+
+
+def regular(commit, path, mode):
+    """The path of the regular file a row file is, following links within the
+    tree as scripts/controls-check.sh's `[ -f ]` follows them; a link out of
+    the tree, to nothing, to a directory or in a loop is refused."""
+    seen = set()
+    while mode == "120000":
+        if path in seen or len(seen) >= 40:
+            raise Refused(f"{path} is a link that does not end")
+        seen.add(path)
+        target = git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="surrogateescape")
+        path = posixpath.normpath(posixpath.join(posixpath.dirname(path), target))
+        if posixpath.isabs(target) or path.startswith("../") or path == "..":
+            raise Refused(f"{path} is reached by a link out of the repository, so it cannot be read from git")
+        listed = git("ls-tree", "-z", commit, "--", path).split(b"\0")[0].decode("utf-8", errors="replace")
+        meta, _, name = listed.partition("\t")
+        if name != path:
+            raise Refused(f"{path}, which a row file links to, is not in the tree")
+        mode = meta.split(" ")[0]
+    if mode not in ("100644", "100755"):
+        raise Refused(f"{path} is not a regular file")
+    return path
 
 
 def rows_at(commit):
@@ -102,9 +127,7 @@ def rows_at(commit):
         path = f"{ROWS}/{base}"
         if not base.endswith(".row"):
             raise Refused(f"{path} is not named <name>.row, so its control would never be read")
-        if meta.split(" ")[0] not in ("100644", "100755"):
-            raise Refused(f"{path} is not a regular file")
-        row = parse(path, text_of(commit, path))
+        row = parse(path, text_of(commit, regular(commit, path, meta.split(" ")[0])))
         rows[row["name"]] = row
     if not rows:
         raise Refused(f"{ROWS} holds no control at {commit}")
@@ -177,7 +200,8 @@ def deleted(base, head, changed, rows):
             continue
         if exists(head, path) or not exists(base, path):
             continue
-        gone = parse(path, text_of(base, path))
+        mode = git("ls-tree", "-z", base, "--", path).decode("utf-8", errors="replace").split(" ")[0]
+        gone = parse(path, text_of(base, regular(base, path, mode)))
         files = holding(head, gone["switch"])
         holders = [(f, held[(f, gone["switch"])]) for f in files if (f, gone["switch"]) in held]
         unheld = [f for f in files if (f, gone["switch"]) not in held]
