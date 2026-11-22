@@ -229,7 +229,15 @@ file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
 (in CI) tests that. It refuses to start while a file a selected control edits
 differs from HEAD, including a file git does not track or is told to assume
 unchanged, so commit or put back changes to those files first; changes to
-other files do not matter.
+other files do not matter. It also refuses to start while another run holds the
+tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
+the same files and each saves its own originals, so the one that finishes last
+would put back the other's switched-off source. That lock is closed before the
+run's cargo and its git are started, so neither a test that leaves a process
+behind nor a git that starts a fsmonitor daemon holds a finished run's lock.
+The lock frees itself when the run that took it ends, however it ends, so its
+file is never something to remove: removing it frees nothing and would let a
+third run lock a fresh file beside the one still held.
 
 Each control is one file under `scripts/controls/`, named `<name>.row` and
 holding one line:
@@ -253,7 +261,24 @@ different control, a file holding anything but one row, a second file naming a
 control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
-fails until it is updated.
+fails until it is updated. `scripts/controls-on.py` and
+`scripts/controls-touched.py` read row files by these same rules, and refuse a
+row that names no control; the second reads them from git's tree, so a row
+file that is a link must lead to a regular file inside the repository.
+
+`python3 scripts/controls-on.py` asks of every row whether its file holds the
+control rather than what switching the row off writes, and CI runs it on the
+commit it checks out, for every row at once: a rebuild per control is why
+`controls-check.sh` runs only the rows a pull request touches, and this needs
+no build. A row whose replacement does not hold its own switch text takes that
+text out of the file when it switches the control off — whatever the
+replacement is, even a value the file says elsewhere — so for those rows the check requires the switch text to be in the file exactly
+once. A row whose replacement does hold its own switch text leaves that text
+where the row points, so for those the check requires the replacement not to be
+in the file at all. A row that fails either is named. The script reads the row
+files by the same rules as `controls-check.sh`, so a row that cannot be read is
+refused there too rather than left unchecked, and
+`scripts/controls-check-test.sh` tests both with fixtures it commits.
 
 ### The Controls workflow
 
@@ -440,8 +465,9 @@ in turn:
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
-tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it. The Controls workflow runs the
+tests on macOS in one job. CodeQL runs in a workflow of its own, on main only
+(each push, weekly and by hand), so an alert shows up after its change merges;
+fix it on main. Nothing in CI waits for it. The Controls workflow runs the
 controls rows a pull request touches
 ([The Controls workflow](#the-controls-workflow)).
 

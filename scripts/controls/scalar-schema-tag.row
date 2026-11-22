@@ -1,0 +1,1 @@
+scalar-schema-tag|tools/yaml_scalar.py|    if tag not in SCALAR_TAGS:|    if False and tag not in SCALAR_TAGS:|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does

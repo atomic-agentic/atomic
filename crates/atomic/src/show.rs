@@ -9,7 +9,7 @@
 //! replayed them, and ran the rest itself.
 
 use crate::engine;
-use crate::failure::Failure;
+use crate::failure::{Failure, Said};
 use anyhow::Context;
 use atomic_app::pipeline::LAYOUT_VERSION;
 use atomic_durable::gate::{self, GateFilter};
@@ -273,14 +273,16 @@ pub async fn show(
     .await
     .with_context(|| format!("open the store at {}", engine::describe(&database)))?;
     let Some(doc) = gather(&rt, &args.run_id).await? else {
-        return Err(Failure::new(
+        return Err(Failure::named(
             "run.not_found",
-            format!(
-                "no run {} in this project's store ({})",
-                args.run_id,
+            Said::new().text("no run ").name(&args.run_id).text(format!(
+                " in this project's store ({})",
                 engine::describe(&database)
+            )),
+            Said::new().text(
+                "give the id `atomic run` printed, from the project that ran it (or pass \
+                 --project)",
             ),
-            "give the id `atomic run` printed, from the project that ran it (or pass --project)",
         )
         .into());
     };

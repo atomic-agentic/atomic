@@ -136,7 +136,20 @@ with a `worktree: true` step is refused on it before anything runs.
 
 A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
-atomic's own environment or its credentials. A turn's commands run with no
+atomic's own environment or its credentials. Nor does it get the descriptors
+whatever started atomic left open, such as a CI runner's pipes or a shell's,
+an editor's or an agent's files and sockets: on Unix, atomic marks every one
+past the standard three close-on-exec as it starts, and so does Codex's Linux
+sandbox helper before it starts a command, so a command holds only what atomic
+hands it. That includes descriptors handed to atomic on purpose, such as
+systemd's socket activation (`LISTEN_FDS`) or a `make` jobserver: none reaches
+a command, or another program atomic starts. On Linux, atomic uses
+`close_range`, or, on a kernel before 5.11, the list in `/proc/self/fd`; where
+it has neither, atomic does not start, and the helper does not start the
+command. Codex also starts a turn's commands on a pseudo-terminal of their own,
+closing, as far as it can, what they would inherit. On macOS atomic relies on
+the list in `/dev/fd`, which is not verified. Windows, where a process
+inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn, of the project or another project of the same
@@ -209,7 +222,10 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. What Codex records of a project's threads, its state databases and
+may write, or when a denied place is itself a link inside a directory it may
+write, which a command could remove to read what it points at; a place that
+has become such a link since the list was built stops the next command too.
+What Codex records of a project's threads, its state databases and
 its logs, is kept with the project's private state, in the atomic home's
 `private/`, which every project's commands are denied; its Codex home keeps
 no thread records, and its helper links are the only part a turn's shell
