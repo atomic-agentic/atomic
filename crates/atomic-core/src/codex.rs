@@ -1043,6 +1043,16 @@ fn denied_paths(
                 ))
             })
     };
+    let link_in_writable = |path: &Path, target: &Path, root: &Path| {
+        refuse(format!(
+            "{} is a link to {}, inside {}, which atoms' commands may write, so a command could \
+             remove it and then read what it points at by its own path; keep the file it points \
+             at in its place, or run with a working directory that does not hold the link",
+            path.display(),
+            target.display(),
+            root.display()
+        ))
+    };
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
@@ -1142,6 +1152,9 @@ fn denied_paths(
                     target.display(),
                     needed.display()
                 )));
+            }
+            if let Some(root) = writable_holding_link(&roots, &path) {
+                return Err(link_in_writable(&path, &target, root));
             }
             if let Some(refused) = movable(&path, &target, &writable) {
                 return Err(refused);
@@ -1326,6 +1339,19 @@ fn real_spelling(path: &Path) -> PathBuf {
             _ => return path.to_owned(),
         }
     }
+}
+
+/// The directory of `writable` that a denied place which is itself a link,
+/// at `link`, sits inside, at any depth. The sandbox mounts its denial on
+/// what the link points at, not on the link, so a command that may write
+/// there could remove the link, and once the list no longer finds it, read
+/// what it pointed at by its own path.
+fn writable_holding_link<'a>(writable: &'a [PathBuf], link: &Path) -> Option<&'a PathBuf> {
+    let at = match (link.parent(), link.file_name()) {
+        (Some(parent), Some(name)) => real_spelling(parent).join(name),
+        _ => link.to_owned(),
+    };
+    writable.iter().find(|w| at.starts_with(w))
 }
 
 /// The first of the directories above `path` that is a link inside one of
@@ -2485,6 +2511,19 @@ fn late_targets(
         }
         Ok(())
     };
+    // A denied place that is a link inside a directory the command may write,
+    // as when the list is built.
+    let refuse_link_in_writable = |link: &Path| -> anyhow::Result<()> {
+        if let Some(root) = writable_holding_link(&writable, link) {
+            bail!(DenyRefused(format!(
+                "{} is now a link inside {}, which this command may write, so it could remove \
+                 it and then read what it points at by its own path",
+                link.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
     let mut late = Late::default();
     // A denied entry that is now a link, however it is spelled: the list
     // never holds one, and the sandbox cannot mount on one. Its denial is
@@ -2494,6 +2533,7 @@ fn late_targets(
             continue;
         }
         late.replaced.push(entry.clone());
+        refuse_link_in_writable(entry)?;
         let Some(target) = resolved(entry)? else {
             continue;
         };
@@ -2516,6 +2556,7 @@ fn late_targets(
             // A place that is a link: refused when it leads to what the
             // command needs, whatever that is, or deep inside a directory it
             // may write, as when the list is built.
+            refuse_link_in_writable(place)?;
             let Some(target) = resolved(place)? else {
                 continue;
             };
@@ -4826,6 +4867,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_credential_place_that_is_a_link_inside_a_writable_root_is_refused() {
+        let dir = scratch("link-in-writable");
+        for sub in ["work", "elsewhere", "codex"] {
+            std::fs::create_dir_all(dir.join(sub)).expect("dir");
+        }
+        let dir = std::fs::canonicalize(&dir).expect("real");
+        std::fs::write(dir.join("elsewhere/kube"), "token").expect("kept");
+        let place = dir.join("work/kubeconfig");
+        let _ = std::fs::remove_file(&place);
+        std::os::unix::fs::symlink(dir.join("elsewhere/kube"), &place).expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![place.clone()],
+        };
+        let refused = denied_paths(&private, &dir.join("codex"), None, &[dir.join("work")])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link to {}, inside {}",
+                place.display(),
+                dir.join("elsewhere/kube").display(),
+                dir.join("work").display()
+            )),
+            "{refused}"
+        );
+        // Outside every writable root, the link is denied as what it points
+        // at, as before.
+        let (denied, _) = denied_paths(
+            &private,
+            &dir.join("codex"),
+            None,
+            &[dir.join("elsewhere-not")],
+        )
+        .expect("denied");
+        assert!(denied.contains(&dir.join("elsewhere/kube")), "{denied:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn the_file_behind_a_link_in_a_denied_directory_is_denied_too() {
         let dir = scratch("linked-deny");
         let config = dir.join("config/atomic");
@@ -5600,6 +5682,44 @@ mod tests {
                 && refused.contains("two or more levels"),
             "{refused}"
         );
+    }
+
+    /// A place that has become a link inside a directory the command may
+    /// write is refused when the helper walks again, whether the list denies
+    /// the place itself or carries it as a place.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_became_a_link_inside_a_writable_root_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("late-link-in-writable");
+        std::fs::create_dir_all(dir.join("work")).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        let kept = dir.join("elsewhere/kube");
+        std::fs::write(&kept, "token").expect("kept");
+        let place = dir.join("work/kubeconfig");
+        let _ = std::fs::remove_file(&place);
+        link(&kept, &place);
+        let work = [dir.join("work")];
+        let only = std::slice::from_ref(&place);
+        // Denied as the place itself.
+        let refused = late_link_targets(only, Some(only), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Carried as a place, the list denying what it pointed at.
+        let built = [std::fs::canonicalize(&kept).expect("real")];
+        let refused = late_link_targets(&built, Some(only), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Outside every directory it may write, the target replaces it.
+        assert!(late_link_targets(only, Some(only), &[], &[dir.join("elsewhere-not")]).is_ok());
     }
 
     /// What the late walk finds is denied once, the outer of nested ones

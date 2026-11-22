@@ -203,7 +203,10 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. Other projects'
+may write, or when a denied place is itself a link inside a directory it may
+write, which a command could remove to read what it points at; a place that
+has become such a link since the list was built stops the next command too.
+Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and so is what a link
