@@ -37,7 +37,7 @@
 # (scripts/v8-archive.sh) and read from ${ATOMIC_DEV_CACHE}/v8-mirror through RUSTY_V8_MIRROR.
 #
 # Exit codes: the command's own, or
-#   1    the V8 archive failed verification
+#   1    the V8 archive failed verification, or the watcher could not be started
 #   2    bad usage
 #   75   ATOMIC_DEV_WAIT_LOCK exists, or the disk is too full, so nothing was started
 #   124  the command hit ATOMIC_DEV_TIMEOUT
@@ -57,39 +57,57 @@ set -euo pipefail
 ENGINE="${ATOMIC_CONTAINER:-docker}"
 LABEL_KEY="org.atomic-agentic.dev-run"
 
-# Whether process $1 is there and not a zombie. ps sees a process whoever owns it, where kill -0
-# would fail for one this user may not signal.
+# When process $1 started, as ps prints it, or nothing when it is not there or ps fails.
+started_at() {
+    ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true
+}
+
+# Whether process $1 is there, not a zombie, and the one that started at $2: a process that took
+# its number since is not it. ps sees a process whoever owns it, where kill -0 would fail for one
+# this user may not signal. When ps says nothing, kill -0 decides, so a ps that fails does not
+# make a process that is there look gone.
 running() {
     local stat
-    stat="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+    stat="$(ps -o stat= -p "$1" 2>/dev/null)" || stat=""
     case "${stat}" in
-        '' | Z*) return 1 ;;
+        '')
+            kill -0 "$1" 2>/dev/null
+            return
+            ;;
+        Z*) return 1 ;;
     esac
+    [ -z "${2:-}" ] || [ "$(started_at "$1")" = "$2" ]
 }
 
-# Remove the containers labelled with token $1, if there are any.
+# Remove the containers labelled with token $1, if there are any, and wait a few seconds for
+# them to be gone: one the engine is already removing, as `--rm` does when the client is
+# stopped, is still listed until it is.
 remove_container() {
-    local ids
-    ids="$("${ENGINE}" ps -aq --filter "label=${LABEL_KEY}=$1" 2>/dev/null || true)"
-    [ -n "${ids}" ] || return 0
-    # shellcheck disable=SC2086
-    "${ENGINE}" rm -f ${ids} >/dev/null 2>&1 || true
+    local ids _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        ids="$("${ENGINE}" ps -aq --filter "label=${LABEL_KEY}=$1" 2>/dev/null || true)"
+        [ -n "${ids}" ] || return 0
+        # shellcheck disable=SC2086
+        "${ENGINE}" rm -f ${ids} >/dev/null 2>&1 || true
+        sleep 0.5
+    done
 }
 
-# The watcher, run as `dev.sh --watch-run TOKEN SCRIPT PARENT`, PARENT 0 for none: while the
-# script runs and its parent lives, wait; then stop the script, so its trap removes the
-# container and it says how it ended, and remove the container itself, again a little later,
-# in case a client was just starting one.
+# The watcher, run as `dev.sh --watch-run TOKEN SCRIPT SCRIPT_START PARENT PARENT_START`, PARENT 0
+# for none: while the script runs and its parent lives, each the process that started when it
+# says, wait; then stop the script, so its trap removes the container and it says how it ended,
+# and remove the container itself, again a little later, in case a client was just starting one.
 if [ "${1:-}" = "--watch-run" ]; then
     trap '' INT TERM HUP
-    token="$2" script="$3" parent="$4"
-    while running "${script}" && { [ "${parent}" = 0 ] || running "${parent}"; }; do
+    token="$2" script="$3" script_start="$4" parent="$5" parent_start="$6"
+    while running "${script}" "${script_start}" &&
+        { [ "${parent}" = 0 ] || running "${parent}" "${parent_start}"; }; do
         sleep 1
     done
-    if running "${script}"; then
+    if running "${script}" "${script_start}"; then
         kill -TERM "${script}" 2>/dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do
-            running "${script}" || break
+            running "${script}" "${script_start}" || break
             sleep 1
         done
     fi
@@ -135,29 +153,48 @@ NAME="atomic-dev-${TOKEN}"
 # The watcher starts before anything else, so a parent that dies during setup is seen too. It runs
 # in a session of its own and is not this script's child, so what kills this script's process
 # group or tree leaves it to remove the container.
+# Each process is known by when it started as well as by its number, which another may take.
 parent="${PPID}"
 if [ "${parent}" -le 1 ] || [ "${ATOMIC_DEV_DETACHED:-0}" = 1 ]; then
     parent=0
 fi
+watcher_failed() {
+    echo "scripts/dev.sh: the watcher that removes this run's container if this script is killed could not be started ($1), so nothing was started" >&2
+    exit 1
+}
+script_start="$(started_at "$$")"
+[ -n "${script_start}" ] || watcher_failed "ps could not say when this script started"
+parent_start=""
+if [ "${parent}" != 0 ]; then
+    parent_start="$(started_at "${parent}")"
+    [ -n "${parent_start}" ] || watcher_failed "ps could not say when the process that started this script started"
+fi
+watch=("${BASH}" "${BASH_SOURCE[0]}" --watch-run "${TOKEN}" "$$" "${script_start}" "${parent}" "${parent_start}")
 if command -v setsid >/dev/null 2>&1; then
-    setsid -f "${BASH}" "${BASH_SOURCE[0]}" --watch-run "${TOKEN}" "$$" "${parent}" \
-        </dev/null >/dev/null 2>&1
+    setsid -f "${watch[@]}" </dev/null >/dev/null 2>&1 || watcher_failed "setsid exited $?"
+elif command -v perl >/dev/null 2>&1; then
+    perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exec @ARGV' "${watch[@]}" \
+        </dev/null >/dev/null 2>&1 || watcher_failed "perl exited $?"
 else
-    perl -MPOSIX -e 'exit 0 if fork; POSIX::setsid(); exec @ARGV' \
-        "${BASH}" "${BASH_SOURCE[0]}" --watch-run "${TOKEN}" "$$" "${parent}" \
-        </dev/null >/dev/null 2>&1
+    watcher_failed "neither setsid nor perl is installed"
 fi
 
 # Stopped by a signal: end the client, giving it a moment, then remove the container, so it is
-# gone before this script exits. A signal before the client is known leaves the container, if
-# one is just starting, to the watcher.
-client=""
+# gone before this script exits. The client is the one started in the background below, even
+# when the signal comes before its number is noted, and never one already waited for, whose
+# number another process may have taken. A signal before the client starts leaves the container,
+# if one is just starting, to the watcher.
+client="" waited=0
 stopped() {
     trap '' INT TERM HUP
-    if [ -n "${client}" ]; then
-        kill "${client}" 2>/dev/null || true
+    local pid="${client}"
+    if [ -z "${pid}" ] && [ "${waited}" = 0 ]; then
+        pid="${!:-}"
+    fi
+    if [ -n "${pid}" ]; then
+        kill "${pid}" 2>/dev/null || true
         for _ in 1 2 3 4 5 6 7 8 9 10; do
-            kill -0 "${client}" 2>/dev/null || break
+            kill -0 "${pid}" 2>/dev/null || break
             sleep 0.2
         done
     fi
@@ -303,5 +340,7 @@ fi
 client=$!
 status=0
 wait "${client}" || status=$?
+# Waited for, so its number is no longer its own: a signal from here on signals no client.
+waited=1 client=""
 remove_container "${TOKEN}"
 exit "${status}"
