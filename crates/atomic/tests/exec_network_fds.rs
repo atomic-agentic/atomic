@@ -4,12 +4,13 @@
 //! that answers stays within its share of atomic's file descriptors. With
 //! atomic's limit on open files held at 1024, soft and hard, a command
 //! opens 300 tunnels through the proxy to a server on this machine that
-//! greets every connection and keeps it open. The relay in front of the
+//! greets every connection and keeps it open until its client closes it, as
+//! a host does. The relay in front of the
 //! proxy lets 64 of them through at once and closes the rest, so the proxy
 //! holds no more than the command's allowance, and that is within half of
 //! the limit. While it runs, a second command that declares hosts would
-//! pass that half, and does not start; once the first has ended, its room
-//! is free again. (A command that abandons connections to a port that never
+//! pass that half, and does not start; once the first has ended, and its
+//! tunnels closed as it exited, its room is free again. (A command that abandons connections to a port that never
 //! answers is `exec_network_syn_drop`'s.)
 //!
 //! Needs bubblewrap, unprivileged user namespaces and a network namespace
@@ -24,9 +25,11 @@ mod support;
 use atomic_core::codex::{CodexPaths, ExecSandbox, StateGuard};
 use atomic_core::network::DESCRIPTORS_PER_COMMAND;
 use atomic_exec::{Command, ExecutionBackend, LocalBackend};
-use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Opens 300 tunnels through the proxy to `target`, counts those the proxy
@@ -115,16 +118,23 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         .expect("opens");
 
     // A server that greets every connection it gets, so the relay sees the
-    // proxy's dial reached it, and keeps it.
+    // proxy's dial reached it, and keeps it until its client has closed it.
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let target = listener.local_addr().expect("address").to_string();
-    let held: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
+    let held = Arc::new(AtomicU64::new(0));
     {
         let held = held.clone();
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let _ = std::io::Write::write_all(&mut stream, b"hi");
-                held.lock().expect("held").push(stream);
+                held.fetch_add(1, Ordering::SeqCst);
+                let held = held.clone();
+                std::thread::spawn(move || {
+                    let _ = stream.write_all(b"hi");
+                    let mut buf = [0u8; 256];
+                    while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+                    drop(stream);
+                    held.fetch_sub(1, Ordering::SeqCst);
+                });
             }
         });
     }
@@ -171,7 +181,7 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
             .expect("a count");
         // Let the proxy's last connections settle before counting.
         std::thread::sleep(Duration::from_secs(1));
-        let servers = held.lock().expect("held").len() as u64;
+        let servers = held.load(Ordering::SeqCst);
         let proxy = open_descriptors()
             .saturating_sub(before)
             .saturating_sub(servers);
@@ -210,7 +220,8 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         );
     });
 
-    // Once it has ended, its room is free again.
+    // Once it has ended, and its tunnels closed as it exited, its room is
+    // free again.
     std::fs::remove_file(&ready).expect("ready");
     let again = local
         .run(&command(&done))

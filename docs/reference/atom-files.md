@@ -217,13 +217,18 @@ the command has dropped it: the proxy answers an HTTPS `CONNECT` before it
 dials and keeps the connection until the dial ends, and the kernel gives up a
 dial to a host that never answers only after about two minutes. A request the
 proxy never answered also counts until that time has passed since it was
-sent, even if the proxy closed the connection sooner. So does a connection
-atomic closes itself while the proxy still holds it, at the timeout below or
-because the command ended, counted from what the command last sent on it,
-unless it is a tunnel whose host has answered: atomic cannot tell from the
-proxy's answers alone whether a dial is still running for it. Once a tunnel's
-host has answered, what the command sends through it no longer counts, since
-the proxy dials nothing more for it. So a command that keeps opening and
+sent, even if the proxy closed the connection sooner. So does every
+connection atomic closes itself while the proxy still holds it, at the timeout
+below or because the command ended, counted from what the command last sent
+on it, even a tunnel whose host has answered: atomic cannot tell from the
+traffic it relays whether a dial is still running for it. When a command
+ends, atomic first gives its connections a fifth of a second to close on
+their own, so that one the command closed as it exited is not held; a
+connection still open after that, such as an HTTPS tunnel or an idle
+connection a client kept for reuse, keeps the command's room for about two
+minutes. Once a tunnel's host has answered, what the command sends through
+it no longer counts while the tunnel stays open, since the proxy dials
+nothing more for it. So a command that keeps opening and
 abandoning connections to a host that never answers holds its 64
 and is refused more until those dials end; it does not take other commands'
 room. A connection whose first request gets no answer within 10 seconds is

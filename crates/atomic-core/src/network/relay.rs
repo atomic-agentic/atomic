@@ -24,11 +24,12 @@
 //! connection, so its permit is held until the kernel would have given
 //! that dial up ([`Timeouts::linger`]), whether or not the command has
 //! ended; so is the command's room among the process's descriptors. So is
-//! a connection the relay closes itself, at the timeout below or because
-//! the command ended, while the proxy still holds it, counted from what the
-//! client last sent, unless it is a tunnel the upstream has answered: the
-//! relay cannot tell from what it reads whether a dial is running. A
-//! connection whose first request the proxy has not answered within
+//! every connection the relay closes itself, at the timeout below or
+//! because the command ended, while the proxy still holds it, counted from
+//! what the client last sent: the relay reads requests and answers only
+//! well enough to time them, which is no proof that no dial runs. A
+//! command's end first gives its connections [`CLOSE_GRACE`] to close on
+//! their own. A connection whose first request the proxy has not answered within
 //! [`CONNECT_TIMEOUT`] is closed: for a `CONNECT` tunnel, bytes past the
 //! proxy's `200` answer, which the upstream sends once the proxy's dial
 //! reached it; for a plain request, the first bytes of its response.
@@ -185,6 +186,14 @@ pub(super) struct Admission {
 /// wait, since the relay could not let go while it did.
 const RELEASE_WAIT: Duration = Duration::from_secs(1);
 
+/// How long the end of a command waits, before it closes the command's
+/// connections, for them to close on their own: time for a close the
+/// command made as it exited, or one the proxy makes for a connection the
+/// command left idle, to cross the relay. One closed in this time is held
+/// no longer than the proxy holds it; one still open after it is closed by
+/// the relay, and held for the linger since its client last sent.
+pub(super) const CLOSE_GRACE: Duration = Duration::from_millis(200);
+
 impl Drop for Admission {
     fn drop(&mut self) {
         self.shared
@@ -192,10 +201,15 @@ impl Drop for Admission {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.token);
-        drop(self.ended.take());
         if std::thread::current().name() == Some(RUNTIME_THREAD) {
+            drop(self.ended.take());
             return;
         }
+        let waited = std::time::Instant::now();
+        while self.admitted.strong_count() > 0 && waited.elapsed() < CLOSE_GRACE {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(self.ended.take());
         let started = std::time::Instant::now();
         while self.admitted.strong_count() > 0 && started.elapsed() < RELEASE_WAIT {
             std::thread::sleep(Duration::from_millis(5));
@@ -336,9 +350,20 @@ async fn read_frame(front: &mut TcpStream) -> std::io::Result<String> {
 /// What one spliced connection has shown about the proxy's dials.
 #[derive(Default)]
 struct Exchange {
+    /// The first request's first bytes, past any blank lines, until there
+    /// are enough of them to tell whether it is a `CONNECT`.
+    head: Vec<u8>,
+    /// Whether the first request is a `CONNECT`, once that is told.
+    first: Option<bool>,
     /// The proxy's answer to a `CONNECT`, while it is being read: no
     /// evidence of a dial, which starts after it.
     answer: Option<Vec<u8>>,
+    /// Whether that answer is to the first request, and so the first thing
+    /// the proxy sent.
+    answer_is_first: bool,
+    /// Whether the proxy tunnelled the first request: its whole answer was
+    /// a `200`.
+    tunnelling: bool,
     /// When the client's first bytes went to the proxy.
     started: Option<Instant>,
     /// When the client last sent anything.
@@ -350,13 +375,18 @@ struct Exchange {
     /// Whether the proxy's answer to the last `CONNECT` refused it, once
     /// its status has been read.
     refused: Option<bool>,
-    /// Whether the connection is a tunnel the upstream has answered: a
-    /// `CONNECT`, the proxy's `200`, then bytes past it. The client's bytes
-    /// through it are the upstream's to answer, if at all (a TLS
-    /// `close_notify` gets no reply), and start no dial, so they owe
-    /// nothing.
+    /// Whether the connection is a tunnel the upstream has answered: its
+    /// first request a `CONNECT`, the proxy's first bytes a `200` for it,
+    /// then bytes past that. The client's bytes through it are the
+    /// upstream's to answer, if at all (a TLS `close_notify` gets no reply),
+    /// and start no dial, so they owe nothing. Never told from a later
+    /// request, whose bytes the relay cannot tell from an earlier one's
+    /// body.
     tunnel: bool,
 }
+
+/// What opens a tunnel: the method, and the space after it.
+const CONNECT: &[u8] = b"CONNECT ";
 
 /// Where a request begins in `bytes`, past the blank lines a server skips
 /// before one; none when they hold nothing else.
@@ -381,26 +411,27 @@ impl Exchange {
         if self.tunnel {
             return;
         }
-        // With nothing owed, these bytes begin a request: the first, or one
-        // after the proxy answered the last, as on a connection kept alive.
-        // One sent before then, pipelined, is taken for part of the last,
-        // and its answer may be misread; that shortens only the answer
-        // timeout and the hold once the proxy has let go, never the hold
-        // when the relay closes the connection itself.
-        let begins = self.owed.is_none() && self.answer.is_none();
-        if begins {
+        if self.first.is_none() {
+            self.read_head(bytes);
+            if self.head.is_empty() {
+                // Blank lines alone begin no request.
+                return;
+            }
+        } else if self.owed.is_none() && self.answer.is_none() {
+            // With nothing owed, these bytes may begin another request, as
+            // on a connection kept alive: one that could be a `CONNECT` has
+            // its `200` read as no answer. Bytes that only look like one,
+            // in a body, cost a longer hold; one pipelined before the last
+            // was answered is taken for part of it, and its answer may be
+            // misread, which shortens only the hold once the proxy has let
+            // go. The hold when the relay closes the connection itself
+            // depends on none of this.
             let request = match request_start(bytes) {
                 Some(at) => &bytes[at..],
                 None => return,
             };
-            // A read shorter than the method that could still begin it
-            // counts as one: what that costs is a longer hold.
-            let connect = if request.len() >= 7 {
-                request.starts_with(b"CONNECT")
-            } else {
-                b"CONNECT".starts_with(request)
-            };
-            if connect {
+            let len = request.len().min(CONNECT.len());
+            if CONNECT[..len] == request[..len] {
                 self.answer = Some(Vec::new());
                 self.refused = None;
             }
@@ -408,9 +439,38 @@ impl Exchange {
         self.owed.get_or_insert(now);
     }
 
+    /// Read the first request's first bytes from `bytes`: once there are as
+    /// many as [`CONNECT`] holds, whether it is one is told, and a
+    /// `CONNECT`'s answer is read for its status.
+    fn read_head(&mut self, bytes: &[u8]) {
+        let at = match self.head.is_empty() {
+            true => request_start(bytes),
+            false => Some(0),
+        };
+        let Some(at) = at else {
+            return;
+        };
+        let more = &bytes[at..];
+        let take = (CONNECT.len() - self.head.len()).min(more.len());
+        self.head.extend_from_slice(&more[..take]);
+        if self.head.len() == CONNECT.len() {
+            let connect = self.head == CONNECT;
+            self.first = Some(connect);
+            if connect {
+                self.answer = Some(Vec::new());
+                self.answer_is_first = true;
+            }
+        }
+    }
+
     /// The proxy sent `bytes` toward the client.
     fn received(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
+        // An answer before the first request was long enough to tell is to
+        // one too short to name a host, so no dial.
+        if self.first.is_none() && !bytes.is_empty() {
+            self.first = Some(false);
+        }
         if let Some(answer) = self.answer.as_mut() {
             let seen = answer.len();
             answer.extend_from_slice(bytes);
@@ -424,6 +484,8 @@ impl Exchange {
                     // answer; otherwise only the upstream's bytes, after it,
                     // are. A status never read counts as a tunnel's.
                     let end = (from + at + 4).saturating_sub(seen).min(bytes.len());
+                    self.tunnelling = self.answer_is_first && self.refused == Some(false);
+                    self.answer_is_first = false;
                     rest = if self.refused == Some(true) {
                         bytes
                     } else {
@@ -443,8 +505,8 @@ impl Exchange {
         if !rest.is_empty() {
             self.owed = None;
             self.answered = true;
-            // Past a `CONNECT`'s `200`, these are the upstream's.
-            if self.refused == Some(false) {
+            // Past the first request's `200`, these are the upstream's.
+            if self.tunnelling {
                 self.tunnel = true;
             }
         }
@@ -456,13 +518,12 @@ impl Exchange {
     }
 
     /// Since when the connection's permit is held for a dial that may
-    /// still run: since the request the proxy left unanswered, if any; or,
-    /// when the relay `cut` the connection before the proxy let go of it,
-    /// since what the client last sent, unless the connection is a tunnel
-    /// the upstream has answered. What the relay reads of a request is
-    /// not proof that no dial runs for it.
+    /// still run: when the relay `cut` the connection before the proxy let
+    /// go of it, since what the client last sent, tunnel or not, since what
+    /// the relay reads of requests and answers is no proof that no dial
+    /// runs; otherwise since the request the proxy left unanswered, if any.
     fn held_since(&self, cut: bool) -> Option<Instant> {
-        if cut && !self.tunnel {
+        if cut {
             return self.last_sent;
         }
         self.owed

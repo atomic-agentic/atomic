@@ -78,10 +78,9 @@
 //! with no dial timeout of its own, and keeps the connection until that dial
 //! ends; and until the kernel's connect timeout has passed for a request
 //! the proxy never answered, since a dial it started may outlive the
-//! connection, and since the client last sent anything on a connection the
-//! relay closed itself, at its timeout or at the command's end, while the
-//! proxy held it, unless that was a tunnel its upstream had answered. A
-//! command that keeps opening and abandoning connections to a
+//! connection, and since the client last sent anything on any connection
+//! the relay closed itself, at its timeout or at the command's end, while
+//! the proxy held it. A command that keeps opening and abandoning connections to a
 //! host that never answers holds its limit and is refused more until those
 //! dials end. Two things stay outside the count: a name that resolves to
 //! several addresses may leave the proxy's dials to the others running

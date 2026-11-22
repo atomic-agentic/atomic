@@ -22,6 +22,17 @@ impl Stand {
     /// A stand-in that reads each connection's frame and, if `answer` is
     /// given, reads its first bytes and answers with it.
     async fn start(answer: Option<&'static [u8]>) -> Self {
+        Self::serving(answer, None).await
+    }
+
+    /// A stand-in that answers each connection's first bytes with
+    /// `answer`, then closes it `after` the relay has closed its side, as a
+    /// proxy closes a connection its client has left.
+    async fn closing(answer: &'static [u8], after: Duration) -> Self {
+        Self::serving(Some(answer), Some(after)).await
+    }
+
+    async fn serving(answer: Option<&'static [u8]>, closing: Option<Duration>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let addr = listener.local_addr().expect("address");
         let accepted: Kept = Arc::default();
@@ -43,6 +54,13 @@ impl Stand {
                         let mut buf = [0u8; 1024];
                         let _ = stream.read(&mut buf).await;
                         let _ = stream.write_all(answer).await;
+                    }
+                    if let Some(after) = closing {
+                        kept.lock().expect("kept").push((token, None));
+                        let mut buf = [0u8; 1024];
+                        while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                        tokio::time::sleep(after).await;
+                        return;
                     }
                     kept.lock().expect("kept").push((token, Some(stream)));
                 });
@@ -395,11 +413,89 @@ fn only_an_upstreams_bytes_answer_a_tunnel() {
     plain.sent(b"GET http://example.com/again HTTP/1.1\r\n\r\n", now);
     assert!(plain.owed.is_some(), "a second request is owed");
 
-    // A short first read that could begin a CONNECT is taken for one.
+    // An answer to a first request too short to tell names no host, so
+    // no dial: it is the answer.
     let mut short = Exchange::default();
-    short.sent(b"CON", now);
-    short.received(b"HTTP/1.1 200 OK\r\n\r\n");
-    assert!(!short.answered);
+    short.sent(b"CON\r\n\r\n", now);
+    short.received(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+    assert!(short.answered && short.owed.is_none() && !short.tunnel);
+}
+
+/// A first `CONNECT` read in pieces is told once enough of it has come:
+/// its `200` is not the answer, and the upstream's bytes make it a tunnel.
+#[test]
+fn a_connect_split_across_reads_is_a_tunnels() {
+    let now = Instant::now();
+    let mut split = Exchange::default();
+    split.sent(b"CONN", now);
+    split.sent(b"ECT example.com:443 HTTP/1.1\r\n\r\n", now);
+    split.received(b"HTTP/1.1 200 OK\r\n\r\n");
+    assert!(
+        split.owed.is_some() && !split.answered,
+        "the 200 is not the answer"
+    );
+    split.received(b"\x16\x03\x03");
+    assert!(split.tunnel, "the upstream's bytes make it a tunnel");
+}
+
+/// Only a first request that opens with `CONNECT` and its space is a
+/// tunnel's: a method that only begins with it is a plain request, read
+/// whole or in pieces, whose answer makes no tunnel.
+#[test]
+fn only_an_exact_connect_first_is_a_tunnel() {
+    let now = Instant::now();
+    for reads in [
+        &[&b"CONNECTX http://example.com/ HTTP/1.1\r\n\r\n"[..]][..],
+        &[
+            &b"C"[..],
+            &b"ONNECTX http://example.com/ HTTP/1.1\r\n\r\n"[..],
+        ][..],
+    ] {
+        let mut plain = Exchange::default();
+        for read in reads {
+            plain.sent(read, now);
+        }
+        plain.received(b"HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\nbody");
+        assert!(!plain.tunnel, "{} reads: no tunnel", reads.len());
+        plain.sent(b"\x15\x03\x03", now);
+        assert!(plain.owed.is_some(), "{} reads: still owes", reads.len());
+    }
+}
+
+/// A tunnel is never told from a later request: one sent as the body of a
+/// request the proxy answered with `100 Continue`, or after a response's
+/// headers, may have its answer forged by an upstream's body. Such a
+/// connection still owes what its client sends, and a cut holds it.
+#[test]
+fn a_tunnel_is_never_told_from_a_later_request() {
+    let now = Instant::now();
+    let later = now + Duration::from_secs(1);
+    let routes: [(&[u8], &[u8]); 2] = [
+        (
+            b"POST http://example.com/ HTTP/1.1\r\nexpect: 100-continue\r\n\
+              content-length: 64\r\n\r\n",
+            b"HTTP/1.1 100 Continue\r\n\r\n",
+        ),
+        (
+            b"GET http://example.com/ HTTP/1.1\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\n\r\n",
+        ),
+    ];
+    for (n, (request, first)) in routes.into_iter().enumerate() {
+        let mut forged = Exchange::default();
+        forged.sent(request, now);
+        forged.received(first);
+        forged.sent(b"CONNECT example.com:81 HTTP/1.1\r\n\r\n", later);
+        forged.received(b"HTTP/1.1 200 OK\r\n\r\nX");
+        assert!(!forged.tunnel, "route {n}: no tunnel");
+        assert_eq!(
+            forged.held_since(true),
+            Some(later),
+            "route {n}: a cut holds it"
+        );
+        forged.sent(b"\x15\x03\x03", later);
+        assert!(forged.owed.is_some(), "route {n}: still owes");
+    }
 }
 
 /// A `200` whose first read is shorter than its status is still the
@@ -479,10 +575,12 @@ fn a_connect_after_blank_lines_is_a_tunnels() {
     );
 }
 
-/// A `CONNECT` sent after an earlier request on a connection kept alive
-/// is a tunnel's too, as is one after a refused `CONNECT`.
+/// A `CONNECT` sent after an earlier request on a connection kept alive,
+/// or after a refused `CONNECT`, has its `200` read as no answer; but it
+/// never makes the connection a tunnel (see
+/// `a_tunnel_is_never_told_from_a_later_request`).
 #[test]
-fn a_connect_after_an_earlier_request_is_a_tunnels() {
+fn a_connect_after_an_earlier_request_waits_for_its_upstream() {
     let now = Instant::now();
     for (earlier, answer) in [
         (
@@ -505,13 +603,13 @@ fn a_connect_after_an_earlier_request_is_a_tunnels() {
             "the 200 is not the answer"
         );
         kept.received(b"\x16\x03\x03");
-        assert!(kept.owed.is_none() && kept.tunnel, "the upstream's is");
+        assert!(kept.owed.is_none() && !kept.tunnel, "the upstream's is");
     }
 }
 
 /// A connection the relay cuts is held since what the client last sent,
-/// whatever the proxy answered, unless it is a tunnel the upstream has
-/// answered; one the proxy let go of, only for a request left unanswered.
+/// whatever the proxy answered, even a tunnel the upstream has answered;
+/// one the proxy let go of, only for a request left unanswered.
 #[test]
 fn a_cut_connection_is_held_since_its_last_send() {
     let now = Instant::now();
@@ -528,7 +626,13 @@ fn a_cut_connection_is_held_since_its_last_send() {
     tunnel.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
     tunnel.received(b"HTTP/1.1 200 OK\r\n\r\n\x16\x03\x03");
     tunnel.sent(b"\x15\x03\x03", later);
-    assert_eq!(tunnel.held_since(true), None, "an answered tunnel");
+    assert!(tunnel.tunnel);
+    assert_eq!(
+        tunnel.held_since(false),
+        None,
+        "an answered tunnel owes nothing"
+    );
+    assert_eq!(tunnel.held_since(true), Some(later), "but a cut holds it");
 
     assert_eq!(Exchange::default().held_since(true), None, "nothing sent");
 }
@@ -576,6 +680,59 @@ async fn a_connection_cut_at_the_end_is_held_for_the_linger() {
     assert!(sent.elapsed() < linger, "{:?}", sent.elapsed());
     tokio::time::sleep_until(sent + linger + Duration::from_millis(500)).await;
     assert!(room.upgrade().is_none(), "room given back after it");
+}
+
+/// A connection whose client closed as its command ended is let go of by
+/// the proxy within the grace the end gives it, and so is not held: the
+/// command's room is given back at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_closed_as_the_command_ends_is_not_held() {
+    let stand = Stand::closing(
+        b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello",
+        Duration::from_millis(50),
+    )
+    .await;
+    let relay = Relay::start(
+        stand.addr,
+        timeouts(Duration::from_secs(10), Duration::from_secs(30)),
+    )
+    .await
+    .expect("starts");
+    let room = Arc::new(());
+    let one = relay
+        .admit(
+            "relay-one".into(),
+            "proxy-one".into(),
+            1,
+            Box::new(room.clone()),
+        )
+        .expect("admitted");
+    let mut client = open(relay.addr(), Some("relay-one")).await;
+    client
+        .write_all(b"GET http://example.com/ HTTP/1.1\r\n\r\n")
+        .await
+        .expect("sent");
+    let mut got = Vec::new();
+    while !got.ends_with(b"hello") {
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+            .await
+            .expect("in time")
+            .expect("answered");
+        assert!(n > 0, "the whole answer");
+        got.extend_from_slice(&buf[..n]);
+    }
+    let room = {
+        let weak = Arc::downgrade(&room);
+        drop(room);
+        weak
+    };
+    // The command exits, closing its connection, and its run returns.
+    drop(client);
+    tokio::task::spawn_blocking(move || drop(one))
+        .await
+        .expect("ended");
+    assert!(room.upgrade().is_none(), "room given back at the end");
 }
 
 /// The kernel's connect timeout, from `tcp_syn_retries`: the most it may
