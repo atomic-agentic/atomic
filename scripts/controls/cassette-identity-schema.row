@@ -1,0 +1,1 @@
+cassette-identity-schema|crates/atomic-core/src/cassette.rs|!VOLATILE.contains(&k.as_str())|!VOLATILE.contains(&k.as_str()) && k.as_str() != "response_format"|-p atomic-agentic --test eval_cli -- an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again

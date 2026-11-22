@@ -4131,6 +4131,21 @@ async fn new_config(
     cwd: &Path,
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
+    new_config_reading(endpoint, codex_home, cwd, arg0_paths, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+}
+
+/// [`new_config`], with the proxy variables a key's refusal reads from
+/// `var` rather than this process's environment.
+async fn new_config_reading(
+    endpoint: &ModelEndpoint,
+    codex_home: &Path,
+    cwd: &Path,
+    arg0_paths: Arg0DispatchPaths,
+    var: fn(&str) -> Option<String>,
+) -> anyhow::Result<Config> {
     let codex_home =
         AbsolutePathBuf::from_absolute_path(codex_home).context("resolve the Codex home")?;
     let cwd = AbsolutePathBuf::from_absolute_path(cwd).context("resolve the working directory")?;
@@ -4198,6 +4213,18 @@ async fn new_config(
         // provider, pointed at another base URL, with no OpenAI sign-in and
         // no websockets.
         None => {
+            // A key to an endpoint on this machine over plain http would go
+            // to a proxy in cleartext, and Codex's client cannot be told to
+            // skip proxies: the turn is refused, saying how to fix it.
+            // Elsewhere than Linux, or told to respect the system's proxy
+            // settings, Codex's client finds its proxy by other rules.
+            let rules =
+                crate::lite::ProxyRules::for_codex(cfg!(target_os = "linux"), respect_system_proxy);
+            if endpoint.api_key_env.is_some()
+                && let Some(why) = crate::lite::proxied_key(&endpoint.base_url, &var, rules)
+            {
+                anyhow::bail!(why);
+            }
             model_provider.name = "atomic endpoint".to_string();
             model_provider.base_url = Some(endpoint.base_url.clone());
             model_provider.env_key = endpoint.api_key_env.clone();
@@ -7146,6 +7173,100 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// A Codex atom's key to an endpoint on this machine over plain http, in
+    /// an environment that names no proxy and exempts nothing, with Codex's
+    /// `respect_system_proxy` feature off and on. On Linux, where the feature
+    /// finds no platform settings, the configuration is made either way.
+    /// Elsewhere the platform's settings may name a proxy atomic cannot read:
+    /// with the feature off the key is refused unless NO_PROXY exempts the
+    /// host, and with it on, where NO_PROXY changes nothing, it is refused
+    /// with the feature named.
+    #[test]
+    fn a_key_the_systems_proxy_settings_may_carry_is_refused_where_they_apply() {
+        on_codex_runtime(async {
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} is set in this test's environment"
+                );
+            }
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "synthetic".into(),
+                api_key_env: Some("PATH".into()),
+                sign_in: None,
+            };
+            let plain = scratch("home-no-system-proxy");
+            let default = new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default()).await;
+            let respecting = scratch("home-system-proxy");
+            std::fs::write(
+                respecting.join("config.toml"),
+                "[features]\nrespect_system_proxy = true\n",
+            )
+            .expect("config");
+            let respected = new_config(
+                &endpoint,
+                &respecting,
+                &respecting,
+                Arg0DispatchPaths::default(),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                default.expect("no proxy is named");
+                respected.expect("no proxy is named, and Linux has no platform settings");
+                // A proxy value only Codex's own resolver takes, with a space
+                // before it: reqwest's default reads it as none, and with the
+                // feature on Codex sends the key to it, so the key is refused.
+                let spaced = |name: &str| {
+                    (name == "HTTP_PROXY").then(|| " http://proxy.example:3128".to_owned())
+                };
+                new_config_reading(
+                    &endpoint,
+                    &plain,
+                    &plain,
+                    Arg0DispatchPaths::default(),
+                    spaced,
+                )
+                .await
+                .expect("reqwest's default takes no proxy from it");
+                let message = format!(
+                    "{:#}",
+                    new_config_reading(
+                        &endpoint,
+                        &respecting,
+                        &respecting,
+                        Arg0DispatchPaths::default(),
+                        spaced,
+                    )
+                    .await
+                    .expect_err("refused")
+                );
+                assert!(message.contains("HTTP_PROXY names a proxy"), "{message}");
+            } else {
+                let message = format!("{:#}", default.expect_err("refused"));
+                assert!(
+                    message.contains("the system's proxy settings")
+                        && message.contains(
+                            "set NO_PROXY to include 127.0.0.1, or use an https endpoint"
+                        ),
+                    "{message}"
+                );
+                let message = format!("{:#}", respected.expect_err("refused"));
+                assert!(
+                    message.contains("turn respect_system_proxy off, or use an https endpoint"),
+                    "{message}"
+                );
+            }
         });
     }
 
