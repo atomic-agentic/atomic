@@ -1582,8 +1582,11 @@ fn pairs(input: &str) -> Option<String> {
             // within the value or after it, where the text or the line
             // ends: `["X-Api-Key", "…"]`, not a list of three. One that
             // ends with the line just after its value is not a pair when
-            // the value reads as another name, words joined by `-` or `_`:
-            // `["X-Api-Key", "X-Request-Id"` is a list of names cut short.
+            // the value reads as a header's name: words joined by `-` or
+            // `_`, each a capital and then lower-case letters, or a name in
+            // [`HEADERS`]. `["X-Api-Key", "X-Request-Id"` is a list of names
+            // cut short; `["X-Api-Key", "correct-horse-battery-staple"` is
+            // a pair.
             let after = input[to..]
                 .trim_start_matches(['\\', '"', '\''])
                 .trim_start_matches([' ', '\t', '\r']);
@@ -1591,10 +1594,8 @@ fn pairs(input: &str) -> Option<String> {
             let closed = after.starts_with(']');
             let named = || {
                 let value = value.trim_matches('\\');
-                value.contains(['-', '_'])
-                    && value
-                        .split(['-', '_'])
-                        .all(|w| !w.is_empty() && is_wordlike(w))
+                is_header_name(value)
+                    || (value.contains(['-', '_']) && value.split(['-', '_']).all(capitalised))
             };
             let pair = explicit || len.is_none() || closed || (at_line_end(after) && !named());
             if pair && holds(&c[1], value, explicit) {
@@ -1646,11 +1647,32 @@ fn pairs(input: &str) -> Option<String> {
     (out != input).then_some(out)
 }
 
+/// Whether `word` is a capital and then lower-case letters, as each word
+/// of a header's name is written: `Request`, `X`, not `request` or `Zq9`.
+fn capitalised(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes[1..].iter().all(u8::is_ascii_lowercase)
+}
+
 /// Whether `after`, what follows a pair's value and its spaces, starts
-/// where its line ends. Only its first character is read, so a long line
-/// is not read again for each value on it.
+/// where its line ends. Only its first character is read, and counted as a
+/// step (see [`STEPS`]), so a long line is not read again for each value
+/// on it.
 fn at_line_end(after: &str) -> bool {
+    step(1);
     after.bytes().next().unwrap_or(b'\n') == b'\n'
+}
+
+/// [`at_line_end`] read to the end of the line, a step for each character
+/// it reads: what its control row switches in, so that the test of linear
+/// steps sees a long line read again for each value on it. Tests only.
+#[cfg(test)]
+#[allow(dead_code)]
+fn at_line_end_read_to_the_newline(after: &str) -> bool {
+    let line = after.find('\n').map_or(after, |end| &after[..end]);
+    step(line.len() + 1);
+    line.is_empty()
 }
 
 /// One reading of `input` by every text rule (see [`text`]).

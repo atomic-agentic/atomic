@@ -124,6 +124,11 @@ that is an object, an array or a long or escaped string, nor as a Python
 tuple or bytes. An object for a value under a name that only hints at a
 secret, such as `token`, is read for what it holds, not hidden whole, and
 a name given after its value that the text cuts short cannot be judged.
+An array cut off where its line or the text ends, just after its second
+item, is taken for a list of names cut short, not a pair, when that item
+reads as a header's name: a credential header's (`Authorization`), or
+words joined by `-` or `_`, each a capital followed by lower-case letters
+(`["X-Api-Key", "X-Request-Id"`).
 Redaction over-matches rather than under-matches, but it does let some
 things through: a short or word-like
 value after a name that only hints at a secret (`pass: 12`, `token: expired`),

@@ -3297,6 +3297,10 @@ fn reading_pairs_as_text_takes_linear_steps() {
         "{\"name\": \"X-Api-Key\", \"value\": {",
         "[\"X-Api-Key\", \"x ",
         "{'name': 'X-Api-Key', 'type': 'h', 'value': 'x'} ",
+        // Lists of three on one line: where the line ends is read from the
+        // character after each list's second item, not by reading the rest
+        // of the line for each, which would take some 256 times the steps.
+        "[\"X-Api-Key\", \"a\", \"b\"] ",
     ]
     .into_iter()
     .enumerate()
@@ -3305,40 +3309,6 @@ fn reading_pairs_as_text_takes_linear_steps() {
         assert!(
             large < 32 * small,
             "case {case}: {large} steps at sixteen times the size of {small}"
-        );
-    }
-}
-
-/// Pairs on one long line read as fast as the same pairs a line each, name
-/// first, as plain pairs and as lists of three: where a line ends is read
-/// from the character after a value, not found by reading the rest of the
-/// line for each value on it. Reading the rest of the line takes over ten
-/// times as long at two megabytes in a debug build (4.4 s against 0.4 s),
-/// and more the longer the line; the bound is four times. Timed, as the
-/// best of two runs each, since that read counts no steps.
-#[test]
-fn one_long_line_of_pairs_reads_as_fast_as_many_short_ones() {
-    let best = |input: &str| {
-        (0..2)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                let _ = text(input);
-                start.elapsed()
-            })
-            .min()
-            .expect("two runs")
-    };
-    let size = 2 * 1024 * 1024;
-    for unit in [
-        "{\"name\": \"X-Api-Key\", \"value\": \"abcdefghijklmnop\"} ",
-        "{\"name\": \"a\", \"value\": \"b\"} ",
-        "[\"X-Api-Key\", \"a\", \"b\"] ",
-    ] {
-        let line = best(&unit.repeat(size / unit.len() + 1));
-        let lines = best(&format!("{unit}\n").repeat(size / (unit.len() + 1) + 1));
-        assert!(
-            line < 4 * lines,
-            "{unit}: one line took {line:?}, a line each {lines:?}"
         );
     }
 }
@@ -3437,5 +3407,49 @@ fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
         "{\"name\": \"config\", \"value\": {\"retries\": 3}",
         "headers = [\"X-Api-Key\", \"X-Request-Id\"",
         "allowed = [\"X-Auth-Token\", \"Content_Type\"\nmore",
+    ]);
+}
+
+/// An array pair cut where its line or the text ends, just after its
+/// value, is a list of names cut short only when the value reads as a
+/// header's name, each word a capital and then lower-case letters
+/// (`X-Request-Id`, `Content_Type`) or one of the credential headers.
+/// Words in lower case, or groups of letters and digits, joined by `-` or
+/// `_` are a value, and hidden under a credential header's name, as text and in a
+/// string; a header's name after it is kept.
+#[test]
+fn a_listed_pair_cut_after_its_value_is_read_unless_the_value_is_a_header_name() {
+    let mut shown = Vec::new();
+    for name in ["X-Api-Key", "X-Auth-Token"] {
+        for secret in [
+            "correct-horse-battery-staple",
+            "Zq9-xK2-pL7-mN4-bV6",
+            "a1b_c2d_e3f_g4h",
+            "blue_whale_river",
+            "Zq9-Xk2-Pl7-Mn4-Bv6",
+        ] {
+            for line in [
+                format!("[\"{name}\", \"{secret}\""),
+                format!("[\"{name}\", \"{secret}\"\nmore"),
+            ] {
+                let mut held = json!({ "msg": line });
+                value(&mut held);
+                for (how, read) in [
+                    ("text", text(&line).into_owned()),
+                    ("held", held.to_string()),
+                ] {
+                    if read.contains(secret) {
+                        shown.push(format!("{how}: {read}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "shown: {shown:#?}");
+    assert_kept(&[
+        "[\"X-Auth-Token\", \"X-Request-Id\"",
+        "[\"X-Api-Key\", \"Content_Type\"\nmore",
+        "[\"X-Api-Key\", \"X-Auth-Token\"",
+        "[\"X-Api-Key\", \"authorization\"\nmore",
     ]);
 }

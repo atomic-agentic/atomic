@@ -1,0 +1,1 @@
+redact-pair-text-listed-named-capital|crates/atomic-core/src/redact.rs|    bytes.first().is_some_and(u8::is_ascii_uppercase)|    !bytes.is_empty() /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- redact::tests::a_listed_pair_cut_after_its_value_is_read_unless_the_value_is_a_header_name
