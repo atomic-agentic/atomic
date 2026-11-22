@@ -137,9 +137,11 @@ with a `worktree: true` step is refused on it before anything runs.
 A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
-login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
-attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn, of the project or another project of the same
+login shell; a `workspace-write` turn's `HOME` (and `ZDOTDIR`) is a private
+scratch directory of the attempt's own, a `read-only` turn's `HOME` is
+`/nonexistent`, so its shell starts without a word about a home it cannot
+read, and their `TMPDIR` is a directory inside the scratch directory, so no
+shell startup file runs and no other turn, of the project or another project of the same
 atomic home, can see, add, change
 or remove what a turn keeps in its `HOME` or temporary directory: every
 project's scratch directories, those of `atomic run`, `atomic serve` and
@@ -147,7 +149,7 @@ project's scratch directories, those of `atomic run`, `atomic serve` and
 probe`, are kept in the atomic home's `scratch/`, which is denied to a turn's
 commands whole, apart from a `workspace-write` turn's own directory. A
 `read-only` turn, which may not write its own, cannot reach it at all, not
-even to list it. Apart from macOS, whose own sandbox denies them, only
+even to list it, nor its `TMPDIR` or `CARGO_HOME` there. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
@@ -158,7 +160,7 @@ sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
 Maven's `~/.m2` and the like. Every Codex turn's `CARGO_HOME` is `.cargo` in the
-attempt's own home. A worktree step's turn, and an exec atom's command in a run, is also pointed at
+attempt's own scratch directory. A worktree step's turn, and an exec atom's command in a run, is also pointed at
 its run's own build caches, removed when the run ends, finished or failed, with
 a Cargo target directory for each worktree and each exec step, and at your rustup
 toolchains, read-only, through `RUSTUP_HOME` (see

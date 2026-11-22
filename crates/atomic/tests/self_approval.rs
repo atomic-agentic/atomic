@@ -659,10 +659,15 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 .join(state.file_name().unwrap())
                 .join("atomic.db");
             assert!(db.exists());
+            // What another turn left in the home's scratch.
+            let other = dir.join("home/scratch/project-other/debug/turn-0/1");
+            std::fs::create_dir_all(&other).unwrap();
+            std::fs::write(other.join("left"), "another turn's\n").unwrap();
             let command = format!(
                 "cat a.txt; echo read-exit=$?; head -c 15 {}; echo; \
-                 echo db-exit=$?",
-                db.display()
+                 echo db-exit=$?; cat {}; echo other-exit=$?; echo home=$HOME",
+                db.display(),
+                other.join("left").display()
             );
             let model = FakeModel::start(vec![
                 Reply::Tool {
@@ -705,6 +710,16 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 "argv0 {argv0}: the turn did not see the project: {output}"
             );
             assert!(!output.contains("SQLite format"), "{output}");
+            // Another turn's scratch stays out of reach, and the read-only
+            // turn's shell starts silently, at a HOME that does not exist.
+            assert!(
+                !output.contains("another turn's") && lines.contains(&"other-exit=1"),
+                "argv0 {argv0}: the turn read another turn's scratch: {output}"
+            );
+            assert!(
+                lines.contains(&"home=/nonexistent") && !output.contains(".bashrc"),
+                "argv0 {argv0}: the turn's shell did not start silently: {output}"
+            );
             let calls: String = std::fs::read_dir(&log)
                 .unwrap()
                 .map(|call| std::fs::read_to_string(call.unwrap().path()).unwrap() + "\n")
