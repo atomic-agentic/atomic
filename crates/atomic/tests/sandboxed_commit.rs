@@ -406,3 +406,61 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
         );
     });
 }
+
+/// Whether `dir` holds a file ending in `.sqlite`.
+fn holds_databases(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".sqlite"))
+}
+
+/// What Codex records of a project's threads, its state databases and its
+/// logs, goes with the project's private state, which every project's
+/// commands are denied by one entry: after a turn the project's records are
+/// there and not in its Codex home, and a turn cannot read another project's.
+#[test]
+fn codex_records_go_with_the_projects_private_state() {
+    on_codex_runtime(async {
+        let f = fixture("codex-records");
+        let state = f.dir.join("state");
+        let private = state.join("private");
+        // Another project's Codex records, where they now go.
+        let other = private.join("another-project/codex/state_5.sqlite");
+        std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+        std::fs::write(&other, "another project's records").unwrap();
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: private.clone(),
+            also: Vec::new(),
+        });
+        let command = format!("exec 2>&1; cat {}; echo records-exit=$?", other.display());
+        let output = sandboxed_with(
+            &f,
+            &f.project,
+            &command,
+            &guard,
+            TurnSpec {
+                sandbox: Sandbox::ReadOnly,
+                ..TurnSpec::default()
+            },
+        )
+        .await;
+        assert!(
+            !output.contains("another project's records") && output.contains("records-exit=1"),
+            "the turn read another project's Codex records: {output}"
+        );
+        // This project's, by its state directory's name.
+        let records = private.join("state/codex");
+        assert!(
+            holds_databases(&records),
+            "no Codex records in {}",
+            records.display()
+        );
+        assert!(
+            !holds_databases(&f.dir.join("codex-home")),
+            "Codex records are still kept in the Codex home"
+        );
+    });
+}

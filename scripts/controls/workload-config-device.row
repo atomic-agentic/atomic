@@ -1,0 +1,1 @@
+workload-config-device|crates/atomic-core/src/codex.rs|    let device = is_device(&meta);|    let device = false;|-p atomic-agentic-core --lib --features fake-model a_credential_configuration_that_cannot_be_read_whole_is_refused

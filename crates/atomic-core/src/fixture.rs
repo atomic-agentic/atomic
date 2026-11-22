@@ -46,12 +46,23 @@ pub struct FixtureBinding {
 /// Why a fixture could not be bound. Each is found before anything runs.
 #[derive(Debug, thiserror::Error)]
 pub enum FixtureError {
-    /// The path names no git repository.
+    /// The path names no git repository, or is a directory inside one.
     #[error("{path}: {why}")]
     Path {
         /// The path given.
         path: PathBuf,
         /// What is wrong with it.
+        why: String,
+    },
+    /// Nothing is known about the path, because git never got to answer: it
+    /// could not be started on that directory, was stopped, or printed what
+    /// atomic cannot read. Not the same news as [`FixtureError::Path`], which
+    /// is git's own refusal.
+    #[error("{path}: atomic cannot tell whether it is a git repository: {why}")]
+    Unreadable {
+        /// The path given.
+        path: PathBuf,
+        /// What failed before git answered.
         why: String,
     },
     /// The revision names no commit in the repository.
@@ -120,9 +131,21 @@ pub fn bind(
     }
     let source = std::fs::canonicalize(source).map_err(|e| path_error(&e.to_string()))?;
     let git = Git::find()?;
-    let checkout = git
-        .checkout_at(&source)
-        .map_err(|e| path_error(&format!("not a git repository: {e}")))?;
+    // Told apart by whether git got to answer at all, since that is the
+    // difference atomic can prove and the one the person can act on. git's
+    // own words are what is reported either way: it refuses a directory that
+    // holds no repository and one it cannot read alike, so atomic repeats
+    // what git said instead of calling both "not a git repository".
+    let checkout = git.checkout_at(&source).map_err(|e| {
+        if e.refused() {
+            path_error(&e.to_string())
+        } else {
+            FixtureError::Unreadable {
+                path: source.clone(),
+                why: e.to_string(),
+            }
+        }
+    })?;
     // The repository named, never one git finds above it.
     let named = match &checkout.top {
         Some(top) => std::fs::canonicalize(top).ok(),

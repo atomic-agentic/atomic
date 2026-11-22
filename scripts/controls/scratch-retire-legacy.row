@@ -1,0 +1,1 @@
+scratch-retire-legacy|crates/atomic-core/src/state.rs|        self.retire_legacy_scratch()?;|        let _ = Self::retire_legacy_scratch; // CONTROL_OFF|-p atomic-agentic-core --lib old_scratch_roots_are_denied_until_they_are_retired

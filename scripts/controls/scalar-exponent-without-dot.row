@@ -1,0 +1,1 @@
+scalar-exponent-without-dot|tools/yaml_scalar.py|    if not (mantissa_ok and exponent_ok and ("." in mantissa or exponent is not None)):|    if not (mantissa_ok and exponent_ok and ("." in mantissa or False)):|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does

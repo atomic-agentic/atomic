@@ -11,6 +11,12 @@
 # `atomic serve`, and both check the gate keeps its id, opened_at and
 # deadline; under serve it is approved with `atomic gates approve` from another
 # process, and `gates_cli` decides it from a second terminal's commands.
+# The `gate-open-once` control (scripts/controls/gate-open-once.row) is this
+# clause's step checkpoint: switched off it names the gate step's checkpoint
+# after the process that wrote it, so the run `serve` recovers re-opens its
+# gate and the gate store refuses a second row for the step's own id. That
+# test waits for its run to finish, and names a run that reads as failed on
+# the next round of its wait rather than after the minute it allows.
 gates sqlite_a_gate_survives_a_kill_and_is_approved_from_a_second_process
 gates postgres_a_gate_survives_a_kill_and_is_approved_from_a_second_process
 pipeline a_process_killed_at_a_gate_leaves_it_waiting_for_the_decision
