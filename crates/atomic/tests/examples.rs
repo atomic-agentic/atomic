@@ -440,6 +440,29 @@ fn atomic_check_reads_openapi_toolsets() {
         "{error}"
     );
     std::fs::remove_file(dir.join("toolsets/media.openapi.yaml")).expect("remove");
+    // A named success leaves the default response out of the output union,
+    // but the executor can still choose that default for another success
+    // status. Every media schema of that fallback must compile too; the
+    // union's compile cannot catch a broken second default media schema.
+    std::fs::write(
+        dir.join("toolsets/default-media.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: DefaultMedia, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: defaultMedia\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object } }\n        default:\n          description: fallback\n          content:\n            application/json: { schema: { type: object } }\n            application/problem+json: { schema: { type: object, properties: { title: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a second default media type's schema that does not compile passed"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("default-media.openapi.yaml")
+            && error.contains("operation `defaultMedia`")
+            && error.contains("schema (unregistered):")
+            && error.contains("12"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/default-media.openapi.yaml")).expect("remove");
     // A failure response is not one a reply is checked against, so nothing of
     // it is compiled: a `404` whose schema reaches for a component that is not
     // in the spec does not fail the check, and the operation beside it is
