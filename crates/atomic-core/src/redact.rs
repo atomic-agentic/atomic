@@ -1725,7 +1725,9 @@ fn redact_string(string: &mut String, nested: usize) {
         // into `https://u:[REDACTED]@h`): a parse keeps only the last
         // value, so the others are read by no rule that reads names and
         // pairs, and the string as it stands shows them. Hidden whole.
-        if gives_a_key_twice(string) || (opened && gives_a_key_twice(&written)) {
+        let original_duplicate_keys = opened && gives_a_key_twice(&written);
+        let duplicate_keys = gives_a_key_twice(string) || original_duplicate_keys;
+        if duplicate_keys {
             *string = REDACTED.to_owned();
             return;
         }
@@ -1986,7 +1988,8 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     let originally_duplicated = texted != *string
         && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
         && gives_a_key_twice(string);
-    if gives_a_key_twice(&texted) || originally_duplicated {
+    let duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
+    if duplicate_keys {
         *string = REDACTED.to_owned();
         return true;
     }
