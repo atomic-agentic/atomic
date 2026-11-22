@@ -1,1 +1,0 @@
-sandbox-link-place-in-writable|crates/atomic-core/src/codex.rs|            if let Some(root) = writable_holding_link(&roots, &path) {|            if let Some(root) = writable_holding_link(&[], &path) {|-p atomic-agentic-core --lib --features fake-model -- a_credential_place_that_is_a_link_inside_a_writable_root_is_refused
