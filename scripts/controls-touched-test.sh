@@ -282,6 +282,20 @@ expect "a local-only row is not run" "a"
 run --report
 expect "a local-only row is reported" "not run in CI b: needs a device the runner lacks"
 
+# A row taken off the list is run, though nothing else of it changed.
+fresh
+printf 'b: needs a device the runner lacks\n' >scripts/controls-local.txt
+commit
+BASE="$(git rev-parse HEAD)"
+printf '# none\n' >scripts/controls-local.txt
+commit
+run
+expect "a row taken off the local-only list" "b"
+off released 'if name in released or selects' 'if selects'
+run
+[ "${OUT}" = "" ] || fail "with the released-row rule off, a row taken off the list still ran: ${OUT}"
+unset SCRIPT
+
 fresh
 printf 'gone: no such row\n' >scripts/controls-local.txt
 commit

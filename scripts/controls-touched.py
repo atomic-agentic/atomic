@@ -108,6 +108,19 @@ def rows_at(commit):
     return rows
 
 
+def listed(commit):
+    """The names scripts/controls-local.txt lists at a commit, read as
+    leniently as a list that may name rows since deleted must be."""
+    if commit is None or not exists(commit, LOCAL):
+        return set()
+    names = set()
+    for line in git("cat-file", "blob", f"{commit}:{LOCAL}").decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and ":" in line:
+            names.add(line.partition(":")[0].strip())
+    return names
+
+
 def local_rows(commit, rows):
     """The rows a CI runner cannot run, by name, with each reason."""
     if not exists(commit, LOCAL):
@@ -275,7 +288,13 @@ def touched(base, head, every=False):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
         shared = shared_test_crates(base, head, changed)
-        names = sorted(name for name, row in rows.items() if selects(row, changed, contents, shared, head))
+        # A row taken off the list of rows CI does not run is run.
+        released = listed(base) - set(local)
+        names = sorted(
+            name
+            for name, row in rows.items()
+            if name in released or selects(row, changed, contents, shared, head)
+        )
     run = [rows[n] for n in names if n not in local]
     return run, [(n, local[n]) for n in names if n in local], gone
 

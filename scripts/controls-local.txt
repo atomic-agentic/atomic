@@ -13,4 +13,3 @@
 
 exec-network-helper-undumpable: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed
 exec-network-token-prologue: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed
-sandbox-second-mounts: its switch no longer bites, on a runner or locally; pending its re-point to the site that now guards it

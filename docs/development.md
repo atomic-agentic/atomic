@@ -311,7 +311,8 @@ A row CI does not run, one a GitHub runner cannot run or one known to fail
 until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
 A pull request touching it, and every sweep, reports it as "not run in CI",
 with a warning, and leaves it to a local run; a pull request that changes the
-list gets a warning too, and should say why.
+list gets a warning too, and should say why, and a row it takes off the list
+is run.
 
 ## Milestone acceptance
 
