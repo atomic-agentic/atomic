@@ -71,6 +71,9 @@ jobs:
       # controls-check.sh restores the source it edits, and refuses what it
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
+      # controls-touched.py, which picks the rows the Controls workflow runs,
+      # in throwaway repositories.
+      - run: scripts/controls-touched-test.sh
       - run: scripts/backends-check-audit-test.sh
       # acceptance.py fails on a listed test that failed or did not run.
       - run: scripts/acceptance-test.sh

@@ -18,6 +18,9 @@
 #
 #   ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 #
+# CI's Controls workflow runs it directly on its runners, set up as the test
+# jobs are, for the rows a pull request touches (scripts/controls-touched.py).
+#
 # It hashes files with git, so in a linked worktree the main checkout's .git
 # must be mounted too (ATOMIC_DEV_MOUNTS=<main checkout>/.git); without it
 # the script stops before editing anything.
