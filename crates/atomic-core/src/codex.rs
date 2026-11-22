@@ -848,7 +848,16 @@ fn denied_paths(
     for (i, path) in denied.into_iter().enumerate() {
         let found = i >= base;
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            // Nothing there yet: denied once it is.
+            // Nothing there yet: denied once it is. A place, but for
+            // atomic's own private state, that would be made in what the
+            // thread may write, or through a link there, refuses it: a
+            // command could make it for what reads it to find.
+            if !found
+                && i != 0
+                && let Some(refused) = missing_into(&path, &writable, &places)
+            {
+                return Err(refused);
+            }
             all.push(path);
             continue;
         };
@@ -1098,7 +1107,7 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
         if part == ".." {
             // Up out of a directory a command may write: what it holds,
             // that this climbs back out of, a command can make a link.
-            if let Some(root) = changeable(writable, masked, &done) {
+            if let Some(root) = climbing_out(writable, masked, &done) {
                 return refuse(format!(
                     "{} leads by way of {}, and climbs back out of it, in {}, which atoms' \
                      commands may write, so a command could make it a link that leads \
@@ -1150,6 +1159,15 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
         // A link on the way: one a command may point elsewhere decides
         // where the place leads, whatever it points at now.
         if let Some(root) = changeable(writable, masked, &next) {
+            if next == path {
+                return refuse(format!(
+                    "{} is a link in {}, which atoms' commands may write, so a command could \
+                     point it elsewhere or put something in its place; keep it elsewhere, or \
+                     run the project from a directory that does not hold it",
+                    path.display(),
+                    root.display()
+                ));
+            }
             return refuse(format!(
                 "{} leads by way of {}, a link in {}, which atoms' commands may write, so a \
                  command could point it elsewhere; point {} past it",
@@ -1223,6 +1241,27 @@ fn dangling_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Optio
     ))))
 }
 
+/// Why a denied place that is not there cannot be left so: its path, walked
+/// as [`walk_link`] walks it, would be made in one of `writable`, or runs
+/// through a link a command may point elsewhere, so a command could make it
+/// for what reads it to find. `None` when it would be made elsewhere.
+fn missing_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands) | Landing::There(lands)) => lands,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, which is not there yet, would be made at {}, in {}, which atoms' commands may \
+         write, so a command could make it for what reads {} to find; make it first, or run the \
+         project from a directory that does not hold it",
+        path.display(),
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
 /// Why a link that leads somewhere now cannot be denied as what it points at
 /// ([`walk_link`]): a link on the way a command may point elsewhere, as for
 /// a place whose own chain runs through what the thread may write. `None`
@@ -1265,6 +1304,16 @@ fn changeable<'a>(writable: &'a [PathBuf], masked: &[PathBuf], path: &Path) -> O
         return None;
     }
     inside_of(writable, path)
+}
+
+/// The first of `writable` that `dir` lies inside, not at, where a command
+/// may change what `..` from it climbs out of ([`changeable`]).
+fn climbing_out<'a>(
+    writable: &'a [PathBuf],
+    masked: &[PathBuf],
+    dir: &Path,
+) -> Option<&'a PathBuf> {
+    changeable(writable, masked, dir).filter(|root| dir != root.as_path())
 }
 
 /// The first of `dirs` that holds `path`, or is it.
@@ -6400,8 +6449,51 @@ mod tests {
             )),
             "{why}"
         );
-        // A place whose chain stays out of what it may write: denied.
+        drop(_table);
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // A place not there yet, under a directory that is a link into what
+        // it may write, leading nowhere yet.
         std::fs::remove_file(&place).expect("unlink");
+        let config = home.join(".config");
+        link(&work.join("cfg"), &config);
+        let gh = config.join("gh");
+        let listed = PrivateState {
+            also: vec![gh.clone()],
+            ..private.clone()
+        };
+        let why = denied_paths(&listed, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{}, which is not there yet, would be made at {}, in {}",
+                gh.display(),
+                work.join("cfg/gh").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // A place that is a link in what the thread may write, its target
+        // there now: a command could point it elsewhere.
+        link(&elsewhere.join("aws"), &work.join(".aws"));
+        let in_work = PrivateState {
+            also: vec![work.join(".aws")],
+            ..private.clone()
+        };
+        let why = denied_paths(&in_work, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{} is a link in {}, which atoms' commands may write",
+                work.join(".aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        drop(one);
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        // A place whose chain stays out of what it may write: denied.
         link(&elsewhere.join("aws"), &place);
         assert_eq!(refused(), None);
     }
@@ -7220,6 +7312,9 @@ mod tests {
         let state = state_scratch.0.clone();
         let scratch_dir = state.join("scratch/a1");
         std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        // A place there, as a place not there yet in what a command may
+        // write would refuse the list.
+        std::fs::create_dir_all(state.join("keys")).expect("keys");
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),

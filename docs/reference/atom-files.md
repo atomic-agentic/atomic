@@ -532,8 +532,13 @@ denied place that is a link leading somewhere now, whose chain may not
 pass through such a link either, and each link found inside a denied
 place, which may not lead nowhere yet into a directory the turn may write
 either; a link inside the place itself is hidden from commands, and so
-cannot be pointed elsewhere. A directory the turn may write counts as such
-wherever else it is mounted. The model chooses the
+cannot be pointed elsewhere. A denied place that is not there yet is
+walked the same way: where it would be made in a directory the turn may
+write, or through a link there, nothing runs, since a command could make
+it for whatever reads it to find. So a turn whose working directory is
+your home refuses while `~/.aws` or another such place is missing there:
+make it first, or run the project elsewhere. A directory the turn may
+write counts as such wherever else it is mounted. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a
