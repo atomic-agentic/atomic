@@ -1,1 +1,1 @@
-stranded-unknown-is-there|crates/atomic-core/src/state.rs|!matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound)|std::fs::symlink_metadata(p).is_ok()|-p atomic-agentic-core --lib -- credentials_left_at_an_older_atomics_place_are_not_hidden
+stranded-unknown-is-there|crates/atomic-core/src/state.rs|Err(e) => format!("which cannot be read ({e}), so it may still hold them"),|Err(_) => return Ok(()),|-p atomic-agentic-core --lib -- credentials_left_at_an_older_atomics_place_are_not_hidden

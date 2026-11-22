@@ -1,1 +1,1 @@
-stranded-keys-refused|crates/atomic-core/src/context.rs|        crate::state::refuse_stranded("checkpoint keys", &dir, legacy.as_deref())?;|        let _ = (&dir, legacy);|-p atomic-agentic-core --lib -- the_key_directory_is_placed_by_the_one_configuration_directory
+stranded-keys-refused|crates/atomic-core/src/context.rs|        crate::state::refuse_stranded("checkpoint keys", &dir, legacy.as_deref(), Some(KEY_FILE))?;|        let _ = (&dir, legacy);|-p atomic-agentic-core --lib -- a_checkpoint_is_refused_while_an_older_atomics_key_is_stranded

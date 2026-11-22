@@ -185,24 +185,24 @@ pub fn default_key_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// The file in the key directory that holds the checkpoint authentication
+/// key.
+const KEY_FILE: &str = "context.key";
+
 /// [`default_key_dir`], for reading or making the key: refused while an
 /// older atomic's key is stranded at its old place (see
 /// [`crate::state::refuse_stranded`]), where making a new one would leave
-/// the runs signed with the old one unable to resume.
-pub fn default_key_dir_in_use() -> Result<PathBuf, String> {
-    default_key_dir_beside(crate::state::legacy_config_dir().as_deref())
-}
-
-/// [`default_key_dir_in_use`], with `legacy` as the older atomic's
-/// configuration directory.
-fn default_key_dir_beside(legacy: Option<&Path>) -> Result<PathBuf, String> {
+/// the runs signed with the old one unable to resume. What the new place
+/// holds is the key file alone, so the empty directory the denial makes
+/// (see [`crate::codex::StateGuard`]) holds none.
+fn default_key_dir_in_use() -> Result<PathBuf, String> {
     let dir = default_key_dir()?;
     if crate::state::atomic_home()
         .map_err(|e| e.to_string())?
         .is_none()
     {
-        let legacy = legacy.map(|d| d.join("keys"));
-        crate::state::refuse_stranded("checkpoint keys", &dir, legacy.as_deref())?;
+        let legacy = crate::state::legacy_config_dir().map(|d| d.join("keys"));
+        crate::state::refuse_stranded("checkpoint keys", &dir, legacy.as_deref(), Some(KEY_FILE))?;
     }
     Ok(dir)
 }
@@ -214,7 +214,7 @@ fn authentication_key(program: &crate::astro::Program, key_dir: &Path) -> Result
     }
     private_dir(&dir)?;
     let dir = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
-    let key_file = dir.join("context.key");
+    let key_file = dir.join(KEY_FILE);
     if !key_file.exists() {
         let mut key = [0u8; 32];
         getrandom::fill(&mut key).map_err(|e| e.to_string())?;
@@ -227,9 +227,23 @@ fn authentication_key(program: &crate::astro::Program, key_dir: &Path) -> Result
     Ok(key)
 }
 
-/// Resolve public context only if this run has no existing checkpoint.
-/// Settings and environment are read lazily, after checking for a saved run.
+/// Resolve public context only if this run has no existing checkpoint,
+/// authenticated with the key in the default key directory (see
+/// [`default_key_dir`]), which is refused while an older atomic's key is
+/// stranded at its old place. Settings and environment are read lazily,
+/// after checking for a saved run.
 pub fn checkpoint(
+    atom: &Atom,
+    state_dir: &Path,
+    run_id: &str,
+    resolve: impl FnOnce() -> Result<(Value, Value, Option<String>, Value), String>,
+) -> Result<ContextSnapshot, String> {
+    let keys = default_key_dir_in_use()?;
+    checkpoint_with_key(atom, state_dir, &keys, run_id, resolve)
+}
+
+/// [`checkpoint`], with the key kept in `key_dir`.
+fn checkpoint_with_key(
     atom: &Atom,
     state_dir: &Path,
     key_dir: &Path,
@@ -483,11 +497,11 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         .expect("settings");
         settings["environment"] = json!({});
         let metadata = json!({"run":{"id":"context-run"},"step":{"id":"draft"},"project":{"id":"example","name":"Example"}});
-        let snapshot = checkpoint(&atom, &state, &keys, "context-run", || {
+        let snapshot = checkpoint_with_key(&atom, &state, &keys, "context-run", || {
             Ok((settings, metadata, Some("test".into()), json!({})))
         })
         .expect("checkpoint");
-        let restored = checkpoint(&atom, &state, &keys, "context-run", || {
+        let restored = checkpoint_with_key(&atom, &state, &keys, "context-run", || {
             panic!("must not read live settings or environment")
         })
         .expect("restore");
@@ -516,7 +530,7 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         let other_file = state.join(format!("{:x}.json", Sha256::digest(b"another-run")));
         std::fs::copy(&file, &other_file).expect("copy authentic checkpoint across runs");
         assert!(
-            checkpoint(&atom, &state, &keys, "another-run", || panic!(
+            checkpoint_with_key(&atom, &state, &keys, "another-run", || panic!(
                 "restore only"
             ))
             .expect_err("cross-run checkpoint")
@@ -565,7 +579,7 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         envelope["snapshot"]["digest"] = json!(digest);
         std::fs::write(&file, serde_json::to_vec(&envelope).expect("encode")).expect("tamper");
         assert!(
-            checkpoint(&atom, &state, &keys, "context-run", || panic!(
+            checkpoint_with_key(&atom, &state, &keys, "context-run", || panic!(
                 "restore only"
             ))
             .expect_err("tampered")
@@ -609,7 +623,7 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         let unreachable = || -> Result<(Value, Value, Option<String>, Value), String> {
             Err("resolution is not reached".into())
         };
-        let error = checkpoint(&atom, &state, &state.join("keys"), "run", unreachable)
+        let error = checkpoint_with_key(&atom, &state, &state.join("keys"), "run", unreachable)
             .expect_err("key inside the state directory");
         assert!(
             error.contains("not be kept with the checkpoints"),
@@ -628,7 +642,8 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         };
         // A visible folder in a standalone atom's directory is source.
         let visible = root.join("state/context");
-        let error = checkpoint(&atom, &visible, &keys, "run", unreachable).expect_err("visible");
+        let error =
+            checkpoint_with_key(&atom, &visible, &keys, "run", unreachable).expect_err("visible");
         assert!(error.contains("outside source"), "{error}");
         assert!(
             !root.join("state").exists(),
@@ -640,8 +655,9 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
             let link = root.with_extension("link-into-source");
             let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(&root, &link).expect("symlink");
-            let error = checkpoint(&atom, &link.join("new-state"), &keys, "run", unreachable)
-                .expect_err("symlinked");
+            let error =
+                checkpoint_with_key(&atom, &link.join("new-state"), &keys, "run", unreachable)
+                    .expect_err("symlinked");
             assert!(error.contains("outside source"), "{error}");
             assert!(
                 !root.join("new-state").exists(),
@@ -652,11 +668,12 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         // A hidden directory under a standalone root, as `~/.local/share` is
         // under a home-directory atom, is not source.
         let hidden = root.join(".local/share/atomic/context");
-        let error = checkpoint(&atom, &hidden, &keys, "run", unreachable).expect_err("unresolved");
+        let error =
+            checkpoint_with_key(&atom, &hidden, &keys, "run", unreachable).expect_err("unresolved");
         assert_eq!(error, "resolution is not reached");
         // In a project every directory under the root is source.
         std::fs::write(root.join("atomic.yaml"), "atomic: 1\nname: test\n").expect("manifest");
-        let error = checkpoint(&atom, &root.join(".state"), &keys, "run", unreachable)
+        let error = checkpoint_with_key(&atom, &root.join(".state"), &keys, "run", unreachable)
             .expect_err("project");
         assert!(error.contains("outside source"), "{error}");
         let _ = std::fs::remove_dir_all(&keys);
@@ -750,27 +767,79 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
             "`ATOMIC_HOME` did not keep the keys inside the home"
         );
         drop(_atomic);
-        // An older atomic's key at its old place, with nothing at the new
-        // one, refuses the new place rather than making another key.
-        let _home = crate::state::as_process(&scratch.0, &[("HOME", "/home")], None);
-        let legacy = scratch.0.join("legacy");
-        assert_eq!(
-            default_key_dir_beside(Some(&legacy)),
-            Ok(scratch.0.join("home/.config/atomic/keys")),
-            "nothing at the old place"
-        );
-        std::fs::create_dir_all(legacy.join("keys")).expect("the old place");
-        let why = default_key_dir_beside(Some(&legacy)).expect_err("stranded");
-        assert!(
-            why.contains(&legacy.join("keys").display().to_string()) && why.contains("move"),
-            "{why}"
-        );
-        drop(_home);
         let _none = crate::state::as_process(&scratch.0, &[("HOME", "rel-home")], None);
         let why = default_key_dir().expect_err("no absolute spelling of a home");
         assert!(
             why.starts_with("the home directory is unknown") && why.contains("set ATOMIC_HOME"),
             "not the unknown-home refusal for the key directory: {why}"
         );
+    }
+
+    /// A run's checkpoint is authenticated with the key in the default key
+    /// directory, and while an older atomic's key is still at its old place
+    /// and the new place holds none it is refused, naming both, rather than
+    /// signed with a new key — also once the denial has made the new
+    /// directory, empty, as every run with a Codex or exec atom does before
+    /// its first checkpoint. No key is made there; once the old key is moved
+    /// in, it is the one used.
+    #[test]
+    fn a_checkpoint_is_refused_while_an_older_atomics_key_is_stranded() {
+        let (root, atom) = contextual_atom();
+        let scratch = crate::state::TestScratch::new("stranded-key");
+        for dir in ["home", "legacy-config/atomic/keys", "project-state"] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let legacy = scratch.join("legacy-config/atomic/keys");
+        std::fs::write(legacy.join(KEY_FILE), [7u8; 32]).expect("the older atomic's key");
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home")],
+            None,
+            Some("legacy-config"),
+            Some("data"),
+        );
+        let _guard = crate::codex::StateGuard::deny_state_dir(scratch.join("project-state"))
+            .expect("the guard");
+        let new = scratch.join("home/.config/atomic/keys");
+        assert_eq!(
+            std::fs::read_dir(&new).map(|entries| entries.count()).ok(),
+            Some(0),
+            "the guard did not make the new key directory, empty"
+        );
+        let unreachable = || -> Result<(Value, Value, Option<String>, Value), String> {
+            Err("resolution is not reached".into())
+        };
+        let checkpoints = scratch.join("checkpoints");
+        let why = checkpoint(&atom, &checkpoints, "run", unreachable).expect_err("stranded");
+        assert_eq!(
+            why,
+            format!(
+                "checkpoint keys are kept in {new} now, which holds none of them, and an older \
+                 atomic kept them in {legacy}, which still holds them: move everything in \
+                 {legacy} into {new}, making {new} first if it does not exist, to keep using \
+                 them, or set ATOMIC_HOME to a directory that holds them in its `keys` directory",
+                new = new.display(),
+                legacy = legacy.display(),
+            )
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(new.join(KEY_FILE))
+                .err()
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound),
+            "a new key was made beside the stranded one"
+        );
+        std::fs::rename(legacy.join(KEY_FILE), new.join(KEY_FILE)).expect("moved");
+        let why = checkpoint(&atom, &checkpoints, "run", unreachable).expect_err("unresolved");
+        assert_eq!(
+            why, "resolution is not reached",
+            "the moved key was not used"
+        );
+        assert_eq!(
+            std::fs::read(new.join(KEY_FILE)).ok(),
+            Some(vec![7u8; 32]),
+            "the moved key was replaced"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
