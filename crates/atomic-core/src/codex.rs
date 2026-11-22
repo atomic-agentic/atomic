@@ -652,13 +652,10 @@ pub fn home_secrets(
         .collect();
     aws.extend(absolute("AWS_CONFIG_FILE"));
     aws.extend(absolute("AWS_SHARED_CREDENTIALS_FILE"));
+    let here = &std::env::current_dir;
     for config in &aws {
         // `scripts/controls/aws-profile-token.row` switches this off.
-        out.extend(aws_profile_token_files(
-            config,
-            &homes,
-            &std::env::current_dir,
-        )?);
+        out.extend(aws_profile_token_files(config, &homes, here)?);
     }
     let mut gcloud: Vec<PathBuf> = homes
         .iter()
