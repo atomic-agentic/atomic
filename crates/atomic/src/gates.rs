@@ -251,8 +251,8 @@ pub(crate) async fn decide_as_operator(
     };
     // What the answer and the comment name is kept from a sweep until the
     // decision, which a sweep reads, is recorded.
-    let store = atomic_core::artifact::LocalStore::for_project(state)
-        .context("the artifact store")?;
+    let store =
+        atomic_core::artifact::LocalStore::for_project(state).context("the artifact store")?;
     let command = DecisionCommand {
         command_id,
         gate: found.id.clone(),
