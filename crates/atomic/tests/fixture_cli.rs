@@ -210,6 +210,7 @@ async fn atomic(dir: &Path, cwd: &Path, args: &[&str], url: &str, env: &[(&str, 
             .env("ATOMIC_MODEL", "synthetic")
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             .env_remove("ATOMIC_DATABASE_URL")
             .env_remove("ATOMIC_FAILPOINT")
             .env_remove("CODEX_HOME");

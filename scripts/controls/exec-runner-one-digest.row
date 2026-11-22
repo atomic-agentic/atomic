@@ -1,0 +1,1 @@
+exec-runner-one-digest|crates/atomic-exec/src/runner.rs|    let [(_, digest)] = digest.as_slice() else {|    let Some((_, digest)) = digest.first() else {|-p atomic-agentic-exec --lib a_runner_refuses_a_request_its_secret_was_not_sent_with

@@ -1,0 +1,1 @@
+skill-dir-write-narrower|crates/atomic/src/setup.rs|        then & now|        { let _ = now; then } // CONTROL_OFF|-p atomic-agentic --bin atomic -- the_narrower_permissions_win_and_the_file_is_checked_before_the_pack

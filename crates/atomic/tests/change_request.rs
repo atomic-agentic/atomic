@@ -74,7 +74,9 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        backend: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: atomic_core::testing::denying_nothing(Default::default()),
         exec_meter: Default::default(),
         clock: None,
     })

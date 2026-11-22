@@ -213,16 +213,16 @@ M46.
 
 ## Risk tiers
 
-Each gate has a tier. On a low tier an AI verdict may approve. On a high tier,
-such as production deploys, authentication and permission code, or large
-refactors, an AI may only reject or escalate, and approving always takes a human
-credential. A tier can also demand that the person has authenticated again
-recently: in server mode, once server identity arrives (M27a), a decision whose
-token shows no fresh step-up is refused, and the strength of the authentication
-is stored with the decision. The
-audit log keeps every verdict together with the findings, the model that
-reviewed and the hash of its prompt. A later direction lets tiers follow an
-atom's track record; see [directions](directions.md).
+Each gate has a tier. On a low tier an AI verdict may approve. On a high
+tier, such as production deploys, authentication and permission code, or large
+refactors, an AI may only reject or escalate, and approving always takes a
+human credential. A tier can also demand that the person has authenticated
+again recently: in server mode, once server identity arrives (M27a), a
+decision whose token shows no fresh step-up is refused, and the strength of
+the authentication is stored with the decision. The audit log keeps every
+verdict together with the findings, the model that reviewed and the hash of
+its prompt. A later direction lets tiers follow an atom's track record; see
+[directions](directions.md).
 
 ## Approvals outside the terminal
 

@@ -1,0 +1,1 @@
+sandbox-helper-not-the-helper|crates/atomic-core/src/codex.rs|                if not_the_helper(&stderr) {|                if not_the_helper(&stderr) && false {|-p atomic-agentic-core --lib --features fake-model only_atoms_that_run_commands_need_the_sandbox

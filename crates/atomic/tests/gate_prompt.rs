@@ -340,6 +340,7 @@ impl Project {
             "ATOMIC_MODEL_API_KEY_ENV",
             "ATOMIC_RUNNER",
             "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
             "DATABASE_URL",
         ] {
             c.env_remove(name);
@@ -405,7 +406,7 @@ impl Project {
         let found = std::sync::Arc::new(std::sync::Mutex::new(None));
         let into = found.clone();
         on_codex_runtime(async move {
-            let rt = Durare::sqlite(&db).await.unwrap();
+            let rt = project_store(&db).await;
             *into.lock().unwrap() = gate::find(&rt, &id).await.unwrap();
         });
         found.lock().unwrap().take().expect("the gate")
@@ -433,6 +434,26 @@ impl Project {
             .join(state.file_name().expect("the project's id"))
             .join("atomic.db")
     }
+}
+
+/// The `gated` project's store at `db`, `<home>/private/<id>/atomic.db`,
+/// opened as atomic opens it, for that project: what it lists of gates and
+/// runs is the project's.
+async fn project_store(db: &Path) -> Durare {
+    let id = db
+        .parent()
+        .and_then(Path::file_name)
+        .expect("a project id")
+        .to_string_lossy()
+        .into_owned();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(db.to_owned()),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("gated/{id}"),
+    )
+    .await
+    .unwrap()
 }
 
 /// A run in the background, killed when dropped unless waited for.
@@ -498,7 +519,7 @@ fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
     assert!(t.contains("approved by local:dev"), "{t}");
     assert!(t.contains("got got v1"), "the workflow continued: {t}");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.store()).await.unwrap();
+        let rt = project_store(&p.store()).await;
         let g = gate::find(&rt, "at-prompt:pick").await.unwrap().unwrap();
         let Some(gate::Resolution::Decided(d)) = g.resolution else {
             panic!("{g:?}");
@@ -609,7 +630,7 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
         "the step after it got the typed answer: {t}"
     );
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.store()).await.unwrap();
+        let rt = project_store(&p.store()).await;
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(log.len(), 1, "{log:?}");
         assert_eq!(log[0].gate, "asked:pick");
@@ -656,7 +677,7 @@ fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("got stable"), "{}", text(&out));
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.store()).await.unwrap();
+        let rt = project_store(&p.store()).await;
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(
             log.len(),
@@ -698,7 +719,7 @@ fn a_question_nobody_answers_in_time_resumes_with_its_default_and_remembers_it()
     let listed = text(&p.atomic(&["gates", "list", "--all"]));
     assert!(listed.contains("silence selected beta"), "{listed}");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.store()).await.unwrap();
+        let rt = project_store(&p.store()).await;
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(log.len(), 1, "the remembered default: {log:?}");
         assert_eq!(log[0].answer, json!("beta"));

@@ -196,8 +196,11 @@ whether it is named first or after global flags, and given only `PATH` from
 the control plane's environment; the sandbox helper's outer stage, which
 holds a confined command's proxy token, made non-dumpable; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded; and that an exec atom's files move only through its
-workspace's backend), it
+turn is recorded, and what a run's input names from every sweep until the input
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
+that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -293,6 +296,25 @@ clause its tests do not yet show in full is marked `pending:` with the reason,
 and the verdict names it. The Postgres and sandbox tests it lists need their
 backends, as in the test jobs, hence `ATOMIC_DEV_SANDBOX=on`.
 `scripts/acceptance-test.sh` (in CI) tests the check itself.
+
+### The v0.1 scenario
+
+`scripts/v01-gate.py` runs the v0.1 release's own scenario on a built binary
+and prints a transcript of it. It runs the order-report example's workflow and
+kills it twice with SIGKILL: once in the middle of a step, while the lite atom's
+model call is in flight, and once while the run waits at its gate. It recovers
+the run with `atomic runs resume` and approves the gate from a second
+invocation, then runs `atomic eval`. From what the store recorded, it checks
+that the run finished under the id it started with, that no completed step ran
+again, that the run stayed within the budget caps it started with and that the
+gate kept its deadline. A fake model on a loopback port answers every call and
+counts the calls, so it needs no provider and no network; exec atoms run in the
+sandbox, hence `ATOMIC_DEV_SANDBOX=on`:
+
+```bash
+scripts/dev.sh cargo build --release --locked -p atomic-agentic
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release/atomic
+```
 
 ## The crash suite
 
@@ -475,6 +497,14 @@ milestone suites pass at the candidate. Given a tag, or `latest` for Codex's
 latest release, it applies that candidate itself on any branch. To finish a
 bump, commit the `Cargo.lock` the workflow uploads, account for what
 `scripts/lock-check.sh` reports, and follow the other steps the script prints.
+
+atomic knows Codex's Linux sandbox helper by how Codex starts it, and a bump
+that changes that changes what atomic recognises as the helper. Check, in the
+candidate's `sandboxing` and `linux-sandbox` crates, that the helper's first
+arguments are still `--sandbox-policy-cwd`, alone or after
+`--inherit-pid-namespace`, and that the helper is still started under the
+name `codex-linux-sandbox`. Then update `LINUX_SANDBOX_ARG1` and
+`INHERIT_PID_NAMESPACE` in `crates/atomic-core/src/codex.rs` to match.
 
 `scripts/milestone-tests.sh` also runs locally:
 

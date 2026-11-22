@@ -1,0 +1,1 @@
+gate-server-nogroup|crates/atomic-durable/src/gate/approvers.rs|                        return Err(ApproverError::NoGroup {|                        return Ok(Approvers(vec![]));                        Err::<(), _>(ApproverError::NoGroup {|-p atomic-agentic --test pipeline a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts

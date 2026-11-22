@@ -54,8 +54,13 @@ pub enum DurableError {
     /// for the next model call. An atom's author returns it, and the atom's
     /// turn parks the run instead of recording a failure (see
     /// [`crate::publication::execute_candidate`]).
-    #[error("parked: {0}")]
-    Parked(String),
+    #[error("parked: {reason}")]
+    Parked {
+        /// Why, for a person.
+        reason: String,
+        /// The allowance that had no room, when the refusal names one.
+        scope: Option<String>,
+    },
     /// Another execution of run `.0` recorded one of its steps first. This
     /// execution's state is behind the run's, so it stops, records nothing,
     /// and takes the outcome the winner records. The workflow context keeps
@@ -483,6 +488,10 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
     /// The workflow's id.
     fn workflow_id(&self) -> &str;
 
+    /// The project the workflow runs for, as its runtime was opened with
+    /// (see [`DurableRuntime::project`]).
+    fn project(&self) -> Option<&str>;
+
     /// Run `body` as a durable step: its output is recorded, and on replay
     /// it is returned without running `body` again. The body runs at least
     /// once: a crash after it returns and before its checkpoint commits runs
@@ -531,6 +540,13 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
 pub trait DurableRuntime: Send + Sync + Sized {
     /// The context workflow code receives.
     type Context: WorkflowContext;
+
+    /// The project this runtime serves, which several may share a store
+    /// with: what it records, such as a park, is the project's, and what it
+    /// lists or acts on is only the project's. `None` for a runtime opened
+    /// for no project, such as a test's, which sees only what was recorded
+    /// for none.
+    fn project(&self) -> Option<&str>;
 
     /// Register workflow `name`. Registration happens before
     /// [`launch`](Self::launch), in the same way in every process that may
@@ -665,7 +681,7 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
-        | DurableError::Parked(m) => durare::Error::app(m),
+        | DurableError::Parked { reason: m, .. } => durare::Error::app(m),
     }
 }
 
@@ -735,6 +751,8 @@ impl Checkpoint {
 pub struct DurareContext {
     engine: durare::DurableContext,
     reads: Reads,
+    /// The project its runtime serves.
+    project: Option<Arc<str>>,
     /// A workflow conflict any operation of this execution returned: once
     /// the execution has lost a race to record a step, its outcome is the
     /// conflict, whatever its workflow code goes on to return.
@@ -765,6 +783,10 @@ impl Lost {
 impl WorkflowContext for DurareContext {
     fn workflow_id(&self) -> &str {
         self.engine.workflow_id()
+    }
+
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
 
     fn step<T, F, Fut>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -1069,6 +1091,8 @@ pub struct Durare {
     /// The resume queues this engine takes runs from (see
     /// [`Durare::take_resumed_runs`]).
     resume_queues: std::collections::BTreeSet<String>,
+    /// The project it serves (see [`DurableRuntime::project`]).
+    project: Option<Arc<str>>,
 }
 
 impl Durare {
@@ -1104,7 +1128,162 @@ impl Durare {
     /// steps the registered workflows record, changed exactly when a run
     /// started under the old layout could not replay under the new one, so
     /// any build of the same layout continues the same runs.
-    pub async fn open(database: &Database, executor: Option<&str>, version: &str) -> Result<Self> {
+    ///
+    /// It serves `project`, the project's key, `<name>/<state id>` (see
+    /// [`DurableRuntime::project`]): on a store several projects share, it
+    /// records its parks as the project's and lists and releases no other
+    /// project's. A key that is empty or holds a control character is
+    /// refused.
+    pub async fn open(
+        database: &Database,
+        executor: Option<&str>,
+        version: &str,
+        project: &str,
+    ) -> Result<Self> {
+        if project.trim().is_empty() || project.chars().any(char::is_control) {
+            return Err(DurableError::Engine(format!(
+                "a store is opened for a project, and {project:?} names none"
+            )));
+        }
+        let mut rt = Self::open_for_none(database, executor, version).await?;
+        // A SQLite store is one project's own: a park recorded before parks
+        // had a project is its, and so is one recorded under another name
+        // of its own, `<old name>/<state id>`, as before its manifest was
+        // renamed; the same goes for its runs. Written only when there is
+        // one, so opening a store another process is writing to, as `atomic
+        // runs show` does, takes no write lock.
+        let id = project.rfind('/').map(|at| project[at..].to_owned());
+        if matches!(database, Database::Sqlite(_))
+            && rt.has_runs_to_adopt(project, id.as_deref()).await?
+        {
+            let (project, id) = (project.to_owned(), id.clone());
+            rt.control_transaction(move |mut tx| {
+                let (project, id) = (project.clone(), id.clone());
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO atomic_run_projects (run_id, project) \
+                         SELECT w.workflow_uuid, ? FROM workflow_status w WHERE NOT EXISTS \
+                         (SELECT 1 FROM atomic_run_projects rp WHERE rp.run_id = w.workflow_uuid)",
+                        &[Param::Text(project.clone())],
+                    )
+                    .await?;
+                    if let Some(suffix) = id {
+                        tx.execute(
+                            "UPDATE atomic_run_projects SET project = ? \
+                             WHERE project <> ? AND substr(project, -?) = ?",
+                            &[
+                                Param::Text(project.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(suffix.len()).unwrap_or(i64::MAX)),
+                                Param::Text(suffix),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        }
+        if matches!(database, Database::Sqlite(_))
+            && rt.has_parks_to_adopt(project, id.as_deref()).await?
+        {
+            let (project, id) = (project.to_owned(), id.clone());
+            rt.control_transaction(move |mut tx| {
+                let (project, id) = (project.clone(), id.clone());
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO atomic_park_projects (park_id, project) \
+                         SELECT p.park_id, ? FROM atomic_parks p WHERE NOT EXISTS \
+                         (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id)",
+                        &[Param::Text(project.clone())],
+                    )
+                    .await?;
+                    if let Some(id) = id {
+                        tx.execute(
+                            "UPDATE atomic_park_projects SET project = ? \
+                             WHERE project <> ? AND substr(project, -?) = ?",
+                            &[
+                                Param::Text(project.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id),
+                            ],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+        }
+        rt.project = Some(project.into());
+        Ok(rt)
+    }
+
+    /// Whether a run recorded for no project is in the store, or, with
+    /// `id` (`/<state id>`), one recorded for another key than `project`
+    /// ending in it: the same project under an older name.
+    async fn has_runs_to_adopt(&self, project: &str, id: Option<&str>) -> Result<bool> {
+        let (project, id) = (project.to_owned(), id.unwrap_or_default().to_owned());
+        self.reads
+            .read(move |mut tx| {
+                let (project, id) = (project.clone(), id.clone());
+                Box::pin(async move {
+                    Ok(tx
+                        .query_opt(
+                            "SELECT w.workflow_uuid AS id FROM workflow_status w \
+                             LEFT JOIN atomic_run_projects rp ON rp.run_id = w.workflow_uuid \
+                             WHERE rp.project IS NULL OR (? <> '' AND rp.project <> ? \
+                             AND substr(rp.project, -?) = ?) LIMIT 1",
+                            &[
+                                Param::Text(id.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id),
+                            ],
+                        )
+                        .await?
+                        .is_some())
+                })
+            })
+            .await
+    }
+
+    /// Whether a park recorded for no project is in the store, or, with
+    /// `id` (`/<state id>`), one recorded for another key than `project`
+    /// ending in it: the same project under an older name.
+    async fn has_parks_to_adopt(&self, project: &str, id: Option<&str>) -> Result<bool> {
+        let (project, id) = (project.to_owned(), id.unwrap_or_default().to_owned());
+        self.reads
+            .read(move |mut tx| {
+                let (project, id) = (project.clone(), id.clone());
+                Box::pin(async move {
+                    Ok(tx
+                        .query_opt(
+                            "SELECT p.park_id AS park_id FROM atomic_parks p \
+                             LEFT JOIN atomic_park_projects pp ON pp.park_id = p.park_id \
+                             WHERE pp.project IS NULL OR (? <> '' AND pp.project <> ? \
+                             AND substr(pp.project, -?) = ?) LIMIT 1",
+                            &[
+                                Param::Text(id.clone()),
+                                Param::Text(project),
+                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id),
+                            ],
+                        )
+                        .await?
+                        .is_some())
+                })
+            })
+            .await
+    }
+
+    async fn open_for_none(
+        database: &Database,
+        executor: Option<&str>,
+        version: &str,
+    ) -> Result<Self> {
         let executor =
             executor_identity(executor).map_err(|e| DurableError::Engine(e.to_string()))?;
         match database {
@@ -1177,7 +1356,69 @@ impl Durare {
         self.engine.app_version()
     }
 
-    /// Run `id`'s status, owner and version, or `None` if there is no such run.
+    /// Run `id`'s status, owner and version, if it is a run of this
+    /// runtime's project: on a store several projects share, another
+    /// project's run is, to this one, no run at all. A run for no project is
+    /// seen only by a runtime for none.
+    pub async fn own_run_record(&self, id: &str) -> Result<Option<RunRecord>> {
+        let (run, project) = (
+            id.to_owned(),
+            self.project.as_deref().unwrap_or_default().to_owned(),
+        );
+        let own = self
+            .reads
+            .read(move |mut tx| {
+                let (run, project) = (run.clone(), project.clone());
+                Box::pin(async move {
+                    let row = tx
+                        .query_opt(
+                            "SELECT project FROM atomic_run_projects WHERE run_id = ?",
+                            &[Param::Text(run)],
+                        )
+                        .await?;
+                    Ok(match row {
+                        Some(row) => row.text("project")? == project,
+                        None => project.is_empty(),
+                    })
+                })
+            })
+            .await?;
+        if !own {
+            return Ok(None);
+        }
+        self.run_record(id).await
+    }
+
+    /// Whether `id` is taken in the store by another project than this
+    /// runtime's: by a run of theirs, or by the record of one they began.
+    pub async fn run_id_taken_elsewhere(&self, id: &str) -> Result<bool> {
+        let (run, project) = (
+            id.to_owned(),
+            self.project.as_deref().unwrap_or_default().to_owned(),
+        );
+        let recorded: Option<String> = self
+            .reads
+            .read(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT project FROM atomic_run_projects WHERE run_id = ?",
+                        &[Param::Text(run)],
+                    )
+                    .await?
+                    .map(|row| row.text("project"))
+                    .transpose()
+                })
+            })
+            .await?;
+        Ok(match recorded {
+            Some(owner) => owner != project,
+            None => self.run_record(id).await?.is_some() && !project.is_empty(),
+        })
+    }
+
+    /// Run `id`'s status, owner and version, or `None` if there is no such
+    /// run, whichever project's it is: what a new run's id must not reuse.
     pub async fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
         let found = self
             .engine
@@ -1397,6 +1638,7 @@ impl Durare {
             reads,
             started: std::sync::Mutex::default(),
             resume_queues: Default::default(),
+            project: None,
         })
     }
 
@@ -1448,6 +1690,10 @@ impl Durare {
 impl DurableRuntime for Durare {
     type Context = DurareContext;
 
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     fn register<I, O, F, Fut>(&mut self, name: &str, workflow: F)
     where
         I: DeserializeOwned + Send + 'static,
@@ -1455,7 +1701,7 @@ impl DurableRuntime for Durare {
         F: Fn(Self::Context, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
-        let reads = self.reads.clone();
+        let (reads, project) = (self.reads.clone(), self.project.clone());
         self.engine
             .register(name, move |ctx: durare::DurableContext, input: I| {
                 let lost = Lost::default();
@@ -1463,6 +1709,7 @@ impl DurableRuntime for Durare {
                     DurareContext {
                         engine: ctx,
                         reads: reads.clone(),
+                        project: project.clone(),
                         lost: lost.clone(),
                     },
                     input,
@@ -1490,6 +1737,41 @@ impl DurableRuntime for Durare {
     {
         let (name, id) = (name.to_owned(), id.to_owned());
         async move {
+            // The run is its project's before it can be seen at all, so no
+            // other project ever sees it, even for a moment.
+            if let Some(project) = self.project.as_deref() {
+                let (run, project) = (id.clone(), project.to_owned());
+                self.control_transaction(move |mut tx| {
+                    let (run, project) = (run.clone(), project.clone());
+                    Box::pin(async move {
+                        tx.execute(
+                            "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, ?) \
+                             ON CONFLICT (run_id) DO NOTHING",
+                            &[Param::Text(run.clone()), Param::Text(project.clone())],
+                        )
+                        .await?;
+                        // Whoever recorded it first: a row another project
+                        // left, even with no run behind it, keeps the id
+                        // theirs.
+                        let recorded = tx
+                            .query_one(
+                                "SELECT project FROM atomic_run_projects WHERE run_id = ?",
+                                &[Param::Text(run.clone())],
+                            )
+                            .await?
+                            .text("project")?;
+                        if recorded == project {
+                            Ok(())
+                        } else {
+                            Err(DurableError::Failed(format!(
+                                "the run id {run} is taken in this store by another project; \
+                                 give another id"
+                            )))
+                        }
+                    })
+                })
+                .await?;
+            }
             let handle = self
                 .engine
                 .start::<_, Value>(&name, input, durare::WorkflowOptions::with_id(&id))

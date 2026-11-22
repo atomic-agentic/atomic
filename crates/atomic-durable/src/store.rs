@@ -168,6 +168,57 @@ const MIGRATIONS: &[Migration] = &[
             )",
         ],
     },
+    Migration {
+        version: 8,
+        // Releasing a park (see `release`): the release of each park, the
+        // allowance that refused each parked call, and the journal of every
+        // person's admin action, by command id.
+        sql: &[
+            "CREATE TABLE IF NOT EXISTS atomic_park_releases (
+                park_id TEXT PRIMARY KEY,
+                released_by TEXT NOT NULL,
+                released_at BIGINT NOT NULL,
+                command_id TEXT NOT NULL
+            )",
+            // The allowance that refused a parked call, as the refusal
+            // recorded it.
+            "CREATE TABLE IF NOT EXISTS atomic_park_scopes (
+                park_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS atomic_admin_actions (
+                command_id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                request TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                recorded_at BIGINT NOT NULL
+            )",
+        ],
+    },
+    Migration {
+        version: 9,
+        // The project each park is for, on a store several projects share
+        // (see `DurableRuntime::project`). A park recorded before has none,
+        // and only a runtime for no project sees it.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_park_projects (
+                park_id TEXT PRIMARY KEY,
+                project TEXT NOT NULL
+            )"],
+    },
+    Migration {
+        version: 10,
+        // The project each run is for, on a store several projects share,
+        // recorded as the run starts: a project shows and resumes only its
+        // own runs, and lists and decides only its own runs' gates. A run
+        // started before has none, and only a runtime for no project sees
+        // it.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_run_projects (
+                run_id TEXT PRIMARY KEY,
+                project TEXT NOT NULL
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands: its last

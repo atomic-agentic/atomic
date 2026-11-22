@@ -371,6 +371,17 @@ pub async fn run(
     // The engine treats a run id as an idempotency key: starting one that
     // exists would wait for that run, whatever it runs, instead of this one.
     // Checked under the lock, so no other local process starts it meanwhile.
+    // Taken by another project on a shared store: said with nothing of
+    // their run, which this project can neither read nor resume.
+    if engine.rt.run_id_taken_elsewhere(&run_id).await? {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "run.exists",
+            format!("the run id {run_id} is taken in this store by another project"),
+            "give a new id, or leave out --run-id for one",
+        )
+        .into());
+    }
     if let Some(existing) = engine.rt.run_record(&run_id).await? {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         let state = match existing.status {
@@ -409,7 +420,64 @@ pub async fn run(
             f.commit
         );
     }
-    engine.rt.start(PIPELINE, &run_id, run).await?;
+    // What its input names is kept from a sweep until the input is recorded;
+    // a field its contract types as an artifact must name stored content.
+    use atomic_app::retention::start_keeping_input as admit;
+    let typed = Some((run.pipeline.input.clone(), run.input.clone()));
+    // A signal while it waits for the store stops the wait, and admission
+    // ends there; one that comes once the run is recorded stops the run.
+    let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+    let told = halt.clone();
+    let (artifacts, rt) = (&engine.artifacts, &engine.rt);
+    let admission = admit(artifacts, rt, PIPELINE, &run_id, run, typed, told);
+    tokio::pin!(admission);
+    let mut signalled = None;
+    let admitted = tokio::select! {
+        admitted = &mut admission => admitted,
+        signal = signals.next() => {
+            halt.store(true, std::sync::atomic::Ordering::SeqCst);
+            signalled = Some(signal);
+            admission.await
+        }
+    };
+    if let (Ok(()), Some(signal)) = (&admitted, signalled) {
+        let shown = crate::shown::line(&run_id);
+        atomic_core::redact::Line::new()
+            .shown(&format!(
+                "atomic run: {signal}: run {shown} stays unfinished; continue it with \
+                 `atomic runs resume {shown}`"
+            ))
+            .log();
+        stop(&mut signals, "atomic run", Exit::Signalled).await
+    }
+    if let Err(e) = admitted {
+        let refused = e
+            .downcast_ref::<atomic_app::retention::InputRefused>()
+            .map(|r| match r {
+                atomic_app::retention::InputRefused::Absent(_) => Failure::new(
+                    "run.input_missing",
+                    r.to_string(),
+                    "store the content again, or name content the store holds, then start the run",
+                ),
+                atomic_app::retention::InputRefused::Locked(_) => Failure::new(
+                    "store.locked",
+                    r.to_string(),
+                    "let the sweep finish, or stop it, then start the run again",
+                ),
+                atomic_app::retention::InputRefused::Stopped => Failure::new(
+                    "run.stopped",
+                    r.to_string(),
+                    "nothing was recorded; start the run again",
+                ),
+                atomic_app::retention::InputRefused::Invalid(_) => Failure::new(
+                    "input.invalid",
+                    r.to_string(),
+                    "name content of the kind the workflow's input contract asks for",
+                ),
+            });
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(refused.map_or(e, Into::into));
+    }
     finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 
@@ -439,13 +507,16 @@ pub async fn resume(
     )
     .await?;
     let id = &args.run_id;
-    let record = engine.rt.run_record(id).await?;
+    let record = engine.rt.own_run_record(id).await?;
     match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
                 "run.not_found",
-                format!("no run {id} in this project's store ({})", engine.store),
+                format!(
+                    "no run {id} in this project's store ({})",
+                    engine.store_description
+                ),
                 "give the id `atomic run` printed, from the project that ran it (or pass \
                  --project)",
             )
@@ -541,8 +612,10 @@ pub async fn resume(
             atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
-            // A gate decided while the run was down may never have woken it.
+            // A gate decided, or a park released, while the run was down
+            // may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
+            atomic_durable::release::redeliver(&engine.rt).await?;
             finish(
                 &engine,
                 &state,
@@ -725,7 +798,7 @@ pub async fn serve(
     atomic_core::log_line!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),
-        engine.store,
+        engine.store_description,
         engine.rt.executor_id()
     );
     let parked = |records: Vec<atomic_durable::RunRecord>| -> std::collections::BTreeSet<String> {
@@ -744,8 +817,13 @@ pub async fn serve(
     engine.launch().await?;
     // The engine parks a run whose workflow code panicked, and one it has
     // recovered too often, instead of recovering it once more: name each,
-    // with its cause.
-    let now = parked(engine.rt.runs_in(PARKED).await?);
+    // with its cause. Only this project's: another's run is not named.
+    let mut now = Vec::new();
+    for id in parked(engine.rt.runs_in(PARKED).await?) {
+        if engine.rt.own_run_record(&id).await?.is_some() {
+            now.push(id);
+        }
+    }
     for id in &now {
         match atomic_app::panics::of(id) {
             // Whenever it panicked, in this process's recovery or an
@@ -763,8 +841,10 @@ pub async fn serve(
             ),
         }
     }
-    // A gate decided while its run was down may never have woken it.
+    // A gate decided, or a park released, while its run was down may never
+    // have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;
+    atomic_durable::release::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
     // their layout can continue them.
     let stranded: Vec<String> = engine
@@ -796,6 +876,9 @@ pub async fn serve(
             _ = tokio::time::sleep(REDELIVERY) => {
                 if let Err(e) = atomic_durable::gate::redeliver(&engine.rt).await {
                     atomic_core::log_line!("atomic serve: waking runs whose gates were decided: {e}");
+                }
+                if let Err(e) = atomic_durable::release::redeliver(&engine.rt).await {
+                    atomic_core::log_line!("atomic serve: waking runs whose parks were released: {e}");
                 }
             }
         }
