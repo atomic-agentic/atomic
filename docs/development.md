@@ -213,10 +213,13 @@ store does not hold, and waiting for the store's lock within one bounded wait
 that a stop signal ends; and
 that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
-puts the source back and requires the test to pass. Each control costs a rebuild, so it
-runs by hand rather than in CI:
+puts the source back and requires the test to pass. Each control costs a
+rebuild, so CI runs only the rows a pull request touches (see
+[The Controls workflow](#the-controls-workflow)). To run a row by hand, or all
+of them:
 
 ```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 ```
 
@@ -251,6 +254,52 @@ control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
+
+### The Controls workflow
+
+On every pull request, `.github/workflows/controls.yml` runs the rows the pull
+request touches, which `scripts/controls-touched.py <base> <head>` lists: each
+row whose row file it adds or changes; each row whose `file` it changes, since
+a code change can move a switch's text or stop it biting; each row naming a
+test whose name is in a file it changes, before or after the change, since a
+change to the guarding test can stop it failing; and each row whose
+`--test <t>` target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it
+changes. The script fails on a row file it cannot read, and on a row file
+deleted while its switch's text is still in some file, rows aside, that no
+other row switches it in: a control whose code remains, renamed or moved
+included, keeps its row.
+
+The "Touched controls" job cuts the rows into shards, one for every six rows
+and at most twelve; each shard, "Controls (i/n)", is set up as the test jobs
+are, sandbox and Postgres included, builds once and runs its rows in turn with
+`controls-check.sh`. A shard's summary holds one result line per row, the
+script's own:
+
+```
+ok run-keeps-input: its test fails with the control off and passes with it on
+FAIL serve-line-names: its test passed with the control off
+```
+
+A row that ends any other way, or runs past 45 minutes, gets a `FAIL` line
+too, as does each row a stopped shard did not reach, and a failing row's cargo
+output is kept as the shard's `controls-logs-<i>` artifact. "Controls" passes
+only when every touched row passed, and in seconds when none is touched. The
+"Touched controls" summary also lists each deleted row and why its deletion
+was allowed, and each touched row CI does not run, each with a warning on the
+pull request: check both.
+
+A merge group runs no rows: once "Controls" is a required check, a pull
+request joins the queue only after its rows passed. Every Sunday, and when
+started by hand (Actions > Controls > Run workflow), the workflow sweeps every
+row instead, in up to sixteen shards, so that what touches no row, such as
+changes that only break a row together or a lockfile or pin bump, is checked
+too.
+
+A row CI does not run, one a GitHub runner cannot run or one known to fail
+until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
+A pull request touching it, and every sweep, reports it as "not run in CI",
+with a warning, and leaves it to a local run; a pull request that changes the
+list gets a warning too, and should say why.
 
 ## Milestone acceptance
 
@@ -392,7 +441,9 @@ in turn:
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it.
+requests too, and nothing in CI waits for it. The Controls workflow runs the
+controls rows a pull request touches
+([The Controls workflow](#the-controls-workflow)).
 
 Main is merged through a merge queue. Once a pull request's checks pass, it can
 be added to the queue, which runs CI again on the pull request merged onto main
@@ -473,12 +524,20 @@ A release starts from a tag `v<version>` whose version equals the
    `THIRD-PARTY-NOTICES.md` into a deterministic `.tar.gz`;
 3. writes each binary's CycloneDX SBOM, which records the binary's SHA-256 and
    lists every fork at its pinned revision;
-4. attaches the archives, the SBOMs and a `SHA256SUMS` file to a draft GitHub
-   release, which a maintainer reviews and publishes.
+4. signs each archive and each SBOM with Sigstore, keyless, under the
+   workflow's own GitHub identity, writing a `<file>.sigstore.json` bundle
+   beside it, then verifies every bundle with `cosign verify-blob` against
+   that identity, so a signing step that fails or signs as anyone else fails
+   the run;
+5. attaches the archives, the SBOMs, their bundles and a `SHA256SUMS` file to
+   a draft GitHub release, which a maintainer reviews and publishes.
 
-A manual run of the workflow on any branch does
-steps 1 to 3 and keeps the results as workflow artifacts. To package a build
-locally:
+Only the signing job can request the OIDC token that signs; the build jobs
+cannot. A manual run of the workflow on any branch does steps 1 to 4 and keeps
+the results as workflow artifacts; its signatures name that branch, not a tag,
+so they never pass the check a user runs on a release download
+([verifying a download](getting-started/installation.md#verifying-a-download)).
+To package a build locally:
 
 ```bash
 scripts/dev.sh cargo build --release --locked -p atomic-agentic --target x86_64-unknown-linux-gnu
