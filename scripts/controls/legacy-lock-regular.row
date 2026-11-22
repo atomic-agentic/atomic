@@ -1,0 +1,1 @@
+legacy-lock-regular|crates/atomic-core/src/state.rs|if !regular {|if false && !regular { // CONTROL_OFF: nonregular lock admitted|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_nonregular_files_refuse_migration

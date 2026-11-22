@@ -1,0 +1,1 @@
+legacy-lock-metadata-errors|crates/atomic-core/src/state.rs|legacy_lock_regular(&file).map_err(std::fs::TryLockError::Error)?|legacy_lock_regular(&file).unwrap_or(true)|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_metadata_errors_refuse_migration
