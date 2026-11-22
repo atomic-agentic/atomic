@@ -1,0 +1,1 @@
+pairs-as-written|crates/atomic-core/src/redact.rs|            hide_where_hidden(&pairs, &mut inner);|            let _ = &pairs; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_pair_in_json_in_a_string_is_read_by_the_name_written
