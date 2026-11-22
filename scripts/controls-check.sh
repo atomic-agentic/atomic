@@ -305,8 +305,9 @@ run_cargo() {
     #
     # The lock's descriptor is closed for cargo and everything it starts: a
     # test that leaves a process behind would otherwise keep holding the tree
-    # after this run has exited.
-    cargo test --locked --no-fail-fast ${1} 9>&- >"${LOG}" 2>&1 &
+    # after this run has exited. Plain text, whatever CARGO_TERM_COLOR says,
+    # so the log reads as grepped.
+    cargo test --locked --no-fail-fast --color never ${1} 9>&- >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?
