@@ -1,0 +1,1 @@
+redact-pair-field-case|crates/atomic-core/src/redact.rs|        if key.eq_ignore_ascii_case(field) {|        if key == *field /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib -- redact::tests::a_parsed_pair_is_read_in_any_case_and_whatever_its_value

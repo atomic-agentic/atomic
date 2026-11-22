@@ -1,0 +1,1 @@
+redact-pair-more-than-string|crates/atomic-core/src/redact.rs|    let more = !secret.is_string() && !secret.is_null() && !secret.is_boolean();|    let more = false; /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- redact::tests::a_parsed_pair_is_read_in_any_case_and_whatever_its_value

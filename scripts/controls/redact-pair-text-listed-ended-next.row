@@ -1,0 +1,1 @@
+redact-pair-text-listed-ended-next|crates/atomic-core/src/redact.rs|    after.bytes().next().unwrap_or(b'\n') == b'\n'|    at_line_end_read_to_the_newline(after) /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- redact::tests::reading_pairs_as_text_takes_linear_steps

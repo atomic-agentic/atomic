@@ -249,7 +249,9 @@ const STOPWORDS: &[&str] = &[
 /// first (see [`excerpt`]), so a huge provider body or stderr costs little.
 pub const MAX_TEXT: usize = 64 * 1024;
 /// How deep JSON text inside JSON strings is opened. Each level doubles its
-/// escaping, and opening without a bound could overflow the stack.
+/// escaping, and opening without a bound could overflow the stack. Deeper,
+/// a string that starts as JSON does is hidden whole (see
+/// [`redact_string`]).
 const MAX_NESTED_JSON: usize = 4;
 
 /// Token formats of well-known providers: a prefix, and the least number of
@@ -346,6 +348,47 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
+/// A name and value pair written as JSON text, or as Python writes a
+/// dict, its quotes escaped to any depth, name first: `"name": "X-Api-Key",
+/// "value": "`, with `key`, `header` or `headerName` for `name` and
+/// `headerValue` for `value`, in any case (`Name`, `Value`), and up to
+/// four other fields between, up to the value's opening quote, whose
+/// backslashes are the second group and which the third is, or the bracket
+/// that opens a value of more than a string, the fourth.
+static PAIR_NAME_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"{PAIR_KEY}\s*:\s*\\*["']{PAIR_NAME_TEXT}\\*["'](?:\s*,\s*{PAIR_FIELD}){{0,4}}?\s*,\s*{PAIR_VALUE_KEY}\s*:\s*(?:(\\*)(["'])|([{{\[]))"#
+    ))
+});
+/// The same pair, value first: `"value": "`, up to its opening quote.
+static PAIR_VALUE_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| regex(&format!(r#"{PAIR_VALUE_KEY}\s*:\s*(\\*)(["'])"#)));
+/// What follows a value given first, from its closing quote: `", "name":
+/// "X-Api-Key"`, with up to four other fields between.
+static PAIR_NAME_AFTER: LazyLock<Regex> = LazyLock::new(|| regex(&pair_name_after(r#"\\*["']"#)));
+/// The same, with the name's closing quote cut off where the text ends.
+static PAIR_NAME_CUT: LazyLock<Regex> = LazyLock::new(|| regex(&pair_name_after(r"\z")));
+/// [`PAIR_NAME_AFTER`]'s pattern, with what ends the name.
+fn pair_name_after(end: &str) -> String {
+    format!(
+        r#"^\\*["']\s*,\s*(?:{PAIR_FIELD}\s*,\s*){{0,4}}?{PAIR_KEY}\s*:\s*\\*["']{PAIR_NAME_TEXT}{end}"#
+    )
+}
+/// A pair as an array, `["X-Api-Key", "`, up to its value's opening quote.
+static PAIR_LISTED: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"\[\s*\\*["']{PAIR_NAME_TEXT}\\*["']\s*,\s*(\\*)(["'])"#
+    ))
+});
+/// A field that names a pair, `"name"`, in any case.
+const PAIR_KEY: &str = r#"\\*["'](?i:name|key|header|headername)\\*["']"#;
+/// A pair's name, which may hold `\u` escapes, as the first group.
+const PAIR_NAME_TEXT: &str = r#"((?:[^"'\\\n]|\\+u[0-9a-fA-F]{4}){1,128})"#;
+/// The field that holds a pair's value, `"value"`, in any case.
+const PAIR_VALUE_KEY: &str = r#"\\*["'](?i:value|headervalue)\\*["']"#;
+/// Another field of a pair's object, between its name and value: a word,
+/// then a short string, number or word.
+const PAIR_FIELD: &str = r#"\\*["'][A-Za-z_][A-Za-z0-9_.-]{0,63}\\*["']\s*:\s*(?:\\*["'][^"'\\\n]{0,128}\\*["']|[A-Za-z0-9.+-]{1,32})"#;
 /// A URL's password, to the last `@` before its host.
 static URL_PASSWORD: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/'"]+)(@)"#));
@@ -2136,6 +2179,265 @@ fn read_strength(name: &str, written: bool) -> Strength {
     surest
 }
 
+/// How many depths of escaping [`pairs`] reads: the backslashes before a
+/// quote that JSON held in strings that many deep writes, 0, 1, 3, 7 and so
+/// on to 127.
+const PAIR_LEVELS: u32 = 8;
+
+/// Whether `backslashes` before a quote are as many as JSON held in strings
+/// writes, `2^depth - 1`, at a depth under [`PAIR_LEVELS`]. A quote at any
+/// other count opens no value [`pairs`] reads.
+fn escaped_as_json(backslashes: usize) -> bool {
+    (backslashes + 1).is_power_of_two() && backslashes < (1 << PAIR_LEVELS)
+}
+
+/// The length of a JSON string's value whose opening `quote` follows
+/// `level` backslashes, up to its closing quote: the first such quote after
+/// `level` and then any number of escaped backslashes, `2 × (level + 1)`
+/// each, so a value that ends in a backslash, `C:\\`, closes where it does;
+/// or `None` if the line ends first.
+fn pair_value_len(rest: &str, level: usize, quote: u8) -> Option<usize> {
+    let escaped = 2 * (level + 1);
+    let mut backslashes = 0;
+    for (i, b) in rest.bytes().enumerate() {
+        step(1);
+        match b {
+            b'\n' => return None,
+            b'\\' => backslashes += 1,
+            b if b == quote
+                && backslashes >= level
+                && (backslashes - level).is_multiple_of(escaped) =>
+            {
+                return Some(i - level);
+            }
+            _ => backslashes = 0,
+        }
+    }
+    None
+}
+
+/// The length of a pair's value of more than a string, an object or an
+/// array, from its opening bracket: to the bracket that closes it, counted
+/// outside quoted strings, or to the end of the line if none does.
+fn pair_nested_len(rest: &str) -> usize {
+    let mut depth = 0usize;
+    // The quote a string inside opened with and the backslashes before it:
+    // it closes as [`pair_value_len`] closes a value, so an escaped quote
+    // inside it, `"x\"}"`, does not.
+    let mut quoted: Option<(u8, usize)> = None;
+    let mut backslashes = 0;
+    for (i, b) in rest.bytes().enumerate() {
+        step(1);
+        match b {
+            b'\n' => return i,
+            b'\\' => {
+                backslashes += 1;
+                continue;
+            }
+            b'"' | b'\'' => match quoted {
+                Some((quote, level))
+                    if b == quote
+                        && backslashes >= level
+                        && (backslashes - level).is_multiple_of(2 * (level + 1)) =>
+                {
+                    quoted = None;
+                }
+                Some(_) => {}
+                None => quoted = Some((b, backslashes)),
+            },
+            b'{' | b'[' if quoted.is_none() => depth += 1,
+            b'}' | b']' if quoted.is_none() => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        backslashes = 0;
+    }
+    rest.len()
+}
+
+/// A pair's name as text writes it, its `\u` escapes read, however
+/// deeply their backslash is escaped: `X\u002dApi-Key` is `X-Api-Key`.
+fn pair_name(written: &str) -> Cow<'_, str> {
+    if !written.contains('\\') {
+        return Cow::Borrowed(written);
+    }
+    let mut name = String::new();
+    let mut rest = written;
+    while let Some(at) = rest.find('\\') {
+        name.push_str(&rest[..at]);
+        let escape = rest[at..].trim_start_matches('\\');
+        let run = rest.len() - at - escape.len();
+        step(run);
+        let code = escape
+            .strip_prefix('u')
+            .and_then(|hex| hex.get(..4))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32);
+        match code {
+            Some(c) => {
+                name.push(c);
+                rest = &escape[5..];
+            }
+            // Not an escape that reads, as `\\ud800` alone: the run of
+            // backslashes is kept as written, and read past once.
+            None => {
+                let past = at + run;
+                name.push_str(&rest[at..past]);
+                rest = &rest[past..];
+            }
+        }
+    }
+    name.push_str(rest);
+    Cow::Owned(name)
+}
+
+/// Hide the secret of each name and value pair written as JSON text,
+/// `{"name": "X-Api-Key", "value": "…"}` with its quotes escaped as JSON
+/// held in strings escapes them (see [`escaped_as_json`]), name or value
+/// first, judged as the JSON rule judges such a pair (see
+/// [`hide_pair_secret`]); or written as Python writes a dict, in single quotes;
+/// or as an array, `["X-Api-Key", "…"]`. The JSON rule reads only JSON
+/// that parses; this reads one that is cut, follows other text or sits in
+/// a string literal. A value given after its name whose closing quote is
+/// not found before the line ends is cut, and judged and hidden to the end
+/// of the line; one that is an object or an array is hidden to the bracket
+/// that closes it, when its name is a header's or a secret's. Linear: a
+/// value is scanned once, and only a later value's opening quote at the
+/// same depth closes an earlier one, so a scan that finds no closing quote
+/// leaves none at its depth to scan on that line; each character is read
+/// at most once for each depth and once more.
+fn pairs(input: &str) -> Option<String> {
+    let line_end = |from: usize| input[from..].find('\n').map_or(input.len(), |i| from + i);
+    let holds = |name: &str, value: &str, explicit: bool| {
+        let value = value.replace('\\', "");
+        pair_holds_secret(&pair_name(name), &Value::String(value), explicit)
+    };
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    // Name first: as an object, then as an array.
+    for (rule, explicit) in [(&*PAIR_NAME_FIRST, true), (&*PAIR_LISTED, false)] {
+        let mut at = 0;
+        while let Some(c) = rule.captures_at(input, at) {
+            let from = c.get(0).map_or(at, |m| m.end());
+            at = from;
+            if c.get(4).is_some() {
+                // An object or an array for a value, from its bracket,
+                // scanned only under a name it is hidden for, and then
+                // passed over; under another, what it holds is read on.
+                if pair_holds_more(&pair_name(&c[1])) {
+                    let to = from - 1 + pair_nested_len(&input[from - 1..]);
+                    hidden.push((from - 1, to));
+                    at = to.max(from);
+                }
+                continue;
+            }
+            let level = c.get(2).map_or(0, |m| m.len());
+            let quote = c.get(3).map_or(b'"', |m| m.as_str().as_bytes()[0]);
+            if !escaped_as_json(level) {
+                continue;
+            }
+            let len = pair_value_len(&input[from..], level, quote);
+            let to = len.map_or_else(|| line_end(from), |len| from + len);
+            // An array is a pair only when its value ends it, or is cut,
+            // within the value or after it, where the text or the line
+            // ends: `["X-Api-Key", "…"]`, not a list of three. One that
+            // ends with the line just after its value is not a pair when
+            // the value reads as a header's name: words joined by `-` or
+            // `_`, each a capital and then lower-case letters, or a name in
+            // [`HEADERS`]. `["X-Api-Key", "X-Request-Id"` is a list of names
+            // cut short; `["X-Api-Key", "correct-horse-battery-staple"` is
+            // a pair.
+            let after = input[to..]
+                .trim_start_matches(['\\', '"', '\''])
+                .trim_start_matches([' ', '\t', '\r']);
+            let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
+            let closed = after.starts_with(']');
+            let named = || {
+                let value = value.trim_matches('\\');
+                is_header_name(value)
+                    || (value.contains(['-', '_']) && value.split(['-', '_']).all(capitalised))
+            };
+            let pair = explicit || len.is_none() || closed || (at_line_end(after) && !named());
+            if pair && holds(&c[1], value, explicit) {
+                hidden.push((from, to));
+            }
+            at = to.max(from);
+        }
+    }
+    let mut at = 0;
+    while let Some(c) = PAIR_VALUE_OPEN.captures_at(input, at) {
+        let from = c.get(0).map_or(at, |m| m.end());
+        let level = c.get(1).map_or(0, |m| m.len());
+        let quote = c.get(2).map_or(b'"', |m| m.as_str().as_bytes()[0]);
+        at = from;
+        if !escaped_as_json(level) {
+            continue;
+        }
+        let Some(len) = pair_value_len(&input[from..], level, quote) else {
+            continue;
+        };
+        let rest = &input[from + len..];
+        let name = PAIR_NAME_AFTER
+            .captures(rest)
+            .or(PAIR_NAME_CUT.captures(rest));
+        if let Some(n) = name
+            && holds(&n[1], &input[from..from + len], true)
+        {
+            hidden.push((from, from + len));
+        }
+        at = from + len;
+    }
+    if hidden.is_empty() {
+        return None;
+    }
+    hidden.sort_unstable();
+    let mut out = String::new();
+    let mut copied = 0;
+    for (from, to) in hidden {
+        if to <= copied {
+            continue;
+        }
+        if from >= copied {
+            out.push_str(&input[copied..from]);
+            out.push_str(REDACTED);
+        }
+        copied = to;
+    }
+    out.push_str(&input[copied..]);
+    (out != input).then_some(out)
+}
+
+/// Whether `word` is a capital and then lower-case letters, as each word
+/// of a header's name is written: `Request`, `X`, not `request` or `Zq9`.
+fn capitalised(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes[1..].iter().all(u8::is_ascii_lowercase)
+}
+
+/// Whether `after`, what follows a pair's value and its spaces, starts
+/// where its line ends. Only its first character is read, and counted as a
+/// step (see [`STEPS`]), so a long line is not read again for each value
+/// on it.
+fn at_line_end(after: &str) -> bool {
+    step(1);
+    after.bytes().next().unwrap_or(b'\n') == b'\n'
+}
+
+/// [`at_line_end`] read to the end of the line, a step for each character
+/// it reads: what its control row switches in, so that the test of linear
+/// steps sees a long line read again for each value on it. Tests only.
+#[cfg(test)]
+#[allow(dead_code)]
+fn at_line_end_read_to_the_newline(after: &str) -> bool {
+    let line = after.find('\n').map_or(after, |end| &after[..end]);
+    step(line.len() + 1);
+    line.is_empty()
+}
+
 /// How many headers inside one another's values [`headers`] reads.
 const HEADERS_WITHIN: usize = 8;
 
@@ -2199,6 +2501,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
     }
     if let Some(hidden) = unclean_flag_values(&output) {
         output = Cow::Owned(hidden);
+    }
+    if let Some(replaced) = pairs(&output) {
+        output = Cow::Owned(replaced);
     }
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
@@ -2340,7 +2645,16 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            (doc != before).then(|| doc.to_string())
+            // A document that gives a key twice is hidden whole, as JSON
+            // in a string is (see [`gives_a_key_twice`]): the parse kept
+            // only the last value, so what the rest says of it, as a pair
+            // whose `key` was given twice, `DB_PASSWORD` and then `note`,
+            // cannot be told from what was read.
+            if gives_a_key_twice(trimmed) {
+                Some(REDACTED.to_owned())
+            } else {
+                (doc != before).then(|| doc.to_string())
+            }
         }
         _ => None,
     };
@@ -2398,6 +2712,7 @@ fn redact_string(string: &mut String, nested: usize) {
     // the name itself.
     let mut written: Option<Value> = None;
     let mut opened = false;
+    let mut original_duplicate_keys = false;
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string)
@@ -2409,9 +2724,21 @@ fn redact_string(string: &mut String, nested: usize) {
             let parsed = serde_json::from_str::<Value>(string);
             let read_any = serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok();
             opened = read_any;
+            original_duplicate_keys = read_any && gives_a_key_twice(string);
             written = parsed.ok();
         }
         *string = redacted;
+    }
+    // Past the depth JSON in a string is opened at, JSON cannot be read:
+    // the rules that read its names and pairs, as a header's name and
+    // value, never see it, and text redaction alone may leave their
+    // secrets. A string there that starts as JSON does once redacted as
+    // text, whether it parses or not, is hidden whole. It is read after
+    // text redaction, so one that redaction makes start so, `[REDACTED] …`,
+    // is hidden now rather than on a second pass.
+    if nested >= MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) {
+        *string = REDACTED.to_owned();
+        return;
     }
     let pairs = written
         .as_ref()
@@ -2424,6 +2751,16 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // An object that gives a key twice, as written or once text
+        // redaction renamed one key into another's name (`https://u:pw@h`
+        // into `https://u:[REDACTED]@h`): a parse keeps only the last
+        // value, so the others are read by no rule that reads names and
+        // pairs, and the string as it stands shows them. Hidden whole.
+        let duplicate_keys = gives_a_key_twice(string) || original_duplicate_keys;
+        if duplicate_keys {
+            *string = REDACTED.to_owned();
+            return;
+        }
         // JSON that text redaction broke deeper in, in a string it holds:
         // hidden whole for the same reason.
         // One that read as JSON as written only without building a value
@@ -2453,6 +2790,61 @@ fn redact_string(string: &mut String, nested: usize) {
         // their secrets, so it is hidden whole.
         *string = REDACTED.to_owned();
     }
+}
+
+/// Whether `json`, which reads as JSON, gives a key twice in one of its
+/// objects, keys read with their escapes undone (`"h"` and `"\u0068"` are
+/// one key). A parse keeps only the last value given a key. Anything that
+/// stops the check, which reads JSON as the parse did, counts as a key
+/// given twice.
+fn gives_a_key_twice(json: &str) -> bool {
+    use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+    /// JSON read only to find a key given twice, which fails the read.
+    struct Unique;
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+            json.deserialize_any(Unique)
+        }
+    }
+    impl<'de> Visitor<'de> for Unique {
+        type Value = Unique;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_unit<E>(self) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Unique, A::Error> {
+            while items.next_element::<Unique>()?.is_some() {}
+            Ok(Unique)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Unique, A::Error> {
+            let mut keys = std::collections::HashSet::new();
+            while let Some(key) = fields.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(A::Error::custom("a key given twice"));
+                }
+                fields.next_value::<Unique>()?;
+            }
+            Ok(Unique)
+        }
+    }
+    serde_json::from_str::<Unique>(json).is_err()
 }
 
 /// Hide each value of `into` that `hidden`, the same JSON redacted from
@@ -2592,9 +2984,7 @@ fn opened_json(string: &str, nested: usize) -> Option<Value> {
 /// strings that look like credentials.
 fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
     // The rules any value has: a name and value pair's secret.
-    if let Some(secret) = header_pair(value) {
-        *secret = Value::String(REDACTED.into());
-    }
+    hide_pair_secret(value);
     match value {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
@@ -2651,10 +3041,8 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
 /// second pass would read it: a value rewritten below, JSON held in a
 /// string say, can read as the pair's secret where it did not before.
 fn settle_pair(value: &mut Value) {
-    if reads_pairs_as_written()
-        && let Some(secret) = header_pair(value)
-    {
-        *secret = Value::String(REDACTED.into());
+    if reads_pairs_as_written() {
+        hide_pair_secret(value);
     }
 }
 
@@ -2715,6 +3103,21 @@ fn open_held_json(string: &mut String, nested: usize) {
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return;
     };
+    // Check the bytes the parse read before rewriting its value: parsing
+    // keeps only the last duplicate field, which can erase the name that
+    // classified another field as private. Text redaction can also make
+    // previously different names equal.
+    // Equivalent escaped names can also become different raw-text names:
+    // retain the original JSON's duplicate decision when text changed it.
+    // An originally invalid document may become valid after text redaction.
+    let originally_duplicated = texted != *string
+        && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
+        && gives_a_key_twice(string);
+    let held_duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
+    if held_duplicate_keys {
+        *string = REDACTED.to_owned();
+        return;
+    }
     // JSON in a string it holds that text redaction broke: hidden whole,
     // as [`redact_string`] hides it.
     if let Some(as_written) = &written
@@ -3033,28 +3436,71 @@ fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
     }
 }
 
-/// A header as a pair, `["Authorization", "..."]`, or as an object,
-/// `{"name": "Authorization", "value": "..."}`: the value, when it is the
-/// pair's secret.
-fn header_pair(value: &mut Value) -> Option<&mut Value> {
+/// Whether a pair named `name` holds a secret in a value of more than a
+/// string, such as an object, an array or a number: when it is a header's
+/// name, or a secret's, as `password` is.
+fn pair_holds_more(name: &str) -> bool {
+    header_named(name).is_some() || strength(name) == Strength::Strong
+}
+
+/// The fields of a pair's object that name it, `name`, `key`, `header` or
+/// `headerName`, and that hold its value, `value` or `headerValue`, in any
+/// case, as AWS writes `Name` and `Value`.
+const PAIR_NAME_FIELDS: &[&str] = &["name", "key", "header", "headerName"];
+const PAIR_VALUE_FIELDS: &[&str] = &["value", "headerValue"];
+
+/// Whether `key` is one of `fields`, in any case.
+fn is_pair_field(key: &str, fields: &[&str]) -> bool {
+    for field in fields {
+        if key.eq_ignore_ascii_case(field) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a pair's value, `secret`, is hidden under its name: a string as
+/// [`pair_holds_secret`] judges it, or a value of more than a string as
+/// [`pair_holds_more`] does.
+fn pair_value_hidden(name: &str, secret: &Value) -> bool {
+    // A value of more than a string: an object, an array or a number.
+    let more = !secret.is_string() && !secret.is_null() && !secret.is_boolean();
+    if more {
+        return pair_holds_more(name);
+    }
+    pair_holds_secret(name, secret, true)
+}
+
+/// Hide a header's or a secret's value given as a pair: as an array,
+/// `["Authorization", "..."]`, or as an object, `{"name": "Authorization",
+/// "value": "..."}`, its fields in any case (see [`PAIR_NAME_FIELDS`]). An
+/// object's value of more than a string is hidden whole under a name
+/// [`pair_holds_more`] reads so.
+fn hide_pair_secret(value: &mut Value) {
     match value {
-        Value::Array(items) if items.len() == 2 => {
-            let named = items[0]
-                .as_str()
-                .is_some_and(|name| pair_holds_secret(name, &items[1], false));
-            named.then(|| &mut items[1])
+        Value::Array(items)
+            if items.len() == 2
+                && items[0]
+                    .as_str()
+                    .is_some_and(|name| pair_holds_secret(name, &items[1], false)) =>
+        {
+            items[1] = Value::String(REDACTED.into());
         }
         Value::Object(fields) => {
-            let secret = fields.get("value")?;
-            let named = ["name", "key", "header"].iter().any(|field| {
-                fields
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| pair_holds_secret(name, secret, true))
-            });
-            if named { fields.get_mut("value") } else { None }
+            let names: Vec<String> = fields
+                .iter()
+                .filter(|(key, _)| is_pair_field(key, PAIR_NAME_FIELDS))
+                .filter_map(|(_, name)| name.as_str().map(str::to_owned))
+                .collect();
+            for (key, secret) in fields.iter_mut() {
+                if is_pair_field(key, PAIR_VALUE_FIELDS)
+                    && names.iter().any(|name| pair_value_hidden(name, secret))
+                {
+                    *secret = Value::String(REDACTED.into());
+                }
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -3074,9 +3520,7 @@ fn redact_flag_values(items: &mut [Value]) {
 }
 
 fn redact_nested(value: &mut Value, nested: usize) {
-    if let Some(secret) = header_pair(value) {
-        *secret = Value::String(REDACTED.into());
-    }
+    hide_pair_secret(value);
     match value {
         Value::String(string) => redact_string(string, nested),
         Value::Array(items) => {

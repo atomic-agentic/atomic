@@ -1,0 +1,1 @@
+redact-pair-value-first|crates/atomic-core/src/redact.rs|            hidden.push((from, from + len));|            let _ = len; // CONTROL_OFF|-p atomic-agentic-core --lib -- redact::tests::a_name_and_value_pair_that_does_not_parse_is_read_as_text
