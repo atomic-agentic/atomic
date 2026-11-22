@@ -3166,11 +3166,84 @@ fn a_name_and_value_pair_that_does_not_parse_is_read_as_text() {
     );
 }
 
+/// A pair's value that ends in a backslash closes where it does, at every
+/// depth of escaping, so what follows it is kept: the closing quote comes
+/// after the depth's own backslashes and the escaped backslash before them.
+#[test]
+fn a_pair_value_that_ends_in_a_backslash_closes_where_it_does() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, (input, kept)) in [
+        (
+            format!(r#"{{"name": "X-Api-Key", "value": "{key}\\"}} next=1 status=ok"#),
+            r#""} next=1 status=ok"#,
+        ),
+        (
+            format!(
+                r#"{{"msg": "{{\"name\": \"X-Api-Key\", \"value\": \"{key}\\\\\"}}", "level": "info", "ts": 1}}"#
+            ),
+            r#"\"}", "level": "info", "ts": 1}"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shown = text(&input);
+        assert!(!shown.contains(&key[4..]), "case {case}: the value showed");
+        assert!(shown.ends_with(kept), "case {case}: what follows the value was not kept");
+    }
+}
+
 /// Reading pairs as text takes linear steps, however many values open and
-/// never close at their depth: at sixteen times the size, under 32 times
-/// the steps.
+/// never close at their depth, at one depth or a ladder of them: at
+/// sixteen times the size, under 32 times the steps.
 #[test]
 fn reading_pairs_as_text_takes_linear_steps() {
+    // Values opening at each depth of escaping in turn, or at one
+    // backslash fewer each time, which no later one closes, since a value
+    // closes only after at least as many backslashes as it opened with.
+    let ladder = |bytes: usize, name_first: bool, real: bool| {
+        let mut line = String::new();
+        let top = (2.0 * bytes as f64).sqrt() as usize;
+        let mut i = 0usize;
+        while line.len() < bytes {
+            if name_first {
+                line.push_str("\"name\": \"X-Api-Key\", ");
+            }
+            let level = if real {
+                (1usize << (1 + i % 7)) - 1
+            } else {
+                top.saturating_sub(i).max(1)
+            };
+            line.push_str("\"value\": ");
+            line.push_str(&"\\".repeat(level));
+            line.push_str("\"x ");
+            i += 1;
+        }
+        line
+    };
+    for (case, (small, large)) in [
+        (
+            ladder(16 * 1024, false, true),
+            ladder(256 * 1024, false, true),
+        ),
+        (
+            ladder(16 * 1024, true, true),
+            ladder(256 * 1024, true, true),
+        ),
+        (
+            ladder(16 * 1024, false, false),
+            ladder(256 * 1024, false, false),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (small, large) = (steps_of(&small), steps_of(&large));
+        assert!(
+            large < 32 * small,
+            "ladder {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
     for (case, unit) in [
         "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
         "\"value\": \\\\\\\"x \"",
