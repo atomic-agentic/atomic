@@ -1464,8 +1464,11 @@ fn probe_within(addr: SocketAddr, within: Duration) -> Option<Vec<String>> {
     let mut stream = TcpStream::connect_timeout(&addr, left()?).ok()?;
     stream.set_write_timeout(left()).ok()?;
     // HTTP/1.0, so the answer comes whole and the connection closes after
-    // it; a chunked answer is decoded all the same.
-    write!(stream, "GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n").ok()?;
+    // it; a chunked answer is decoded all the same. Sent in one write, so a
+    // server that answers what its first read gets, and then closes with the
+    // rest unread, which resets the connection, has the whole request.
+    let request = format!("GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     let body = loop {

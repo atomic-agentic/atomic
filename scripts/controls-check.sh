@@ -18,6 +18,9 @@
 #
 #   ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 #
+# CI's Controls workflow runs it directly on its runners, set up as the test
+# jobs are, for the rows a pull request touches (scripts/controls-touched.py).
+#
 # It hashes files with git, so in a linked worktree the main checkout's .git
 # must be mounted too (ATOMIC_DEV_MOUNTS=<main checkout>/.git); without it
 # the script stops before editing anything.
@@ -259,7 +262,8 @@ run_cargo() {
     # shellcheck disable=SC2086
     # Every test binary runs, however an earlier one ends: a row may name
     # tests in several, and each must be seen to fail.
-    cargo test --locked --no-fail-fast ${1} >"${LOG}" 2>&1 &
+    # Plain text, whatever CARGO_TERM_COLOR says, so the log reads as grepped.
+    cargo test --locked --no-fail-fast --color never ${1} >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?
