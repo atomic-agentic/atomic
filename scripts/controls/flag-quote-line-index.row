@@ -1,1 +1,1 @@
-flag-quote-line-index|crates/atomic-core/src/redact.rs|b'\n' => latest.clear(),|b'\n' => {} /*CONTROL_OFF*/,|-p atomic-agentic-core --lib redact::tests::a_flag_quote_does_not_close_on_another_line
+flag-quote-line-index|crates/atomic-core/src/redact.rs|b'\n' => line += 1,|b'\n' => {} /*CONTROL_OFF*/,|-p atomic-agentic-core --lib redact::tests::a_flag_quote_does_not_close_on_another_line

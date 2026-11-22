@@ -1602,11 +1602,14 @@ impl<'a> QuotePrefixes<'a> {
         let mut latest = std::collections::HashMap::new();
         let mut next = std::collections::HashMap::new();
         let mut at = bytes.len();
+        // Generations avoid repeatedly clearing a map whose retained
+        // capacity came from one long line before many short ones.
+        let mut line = 0usize;
         while at > 0 {
             at -= 1;
             step(1);
             match bytes[at] {
-                b'\n' => latest.clear(),
+                b'\n' => line += 1,
                 quote @ (b'"' | b'\'') => {
                     let mut start = at;
                     while start > 0 && bytes[start - 1] == b'\\' {
@@ -1614,7 +1617,9 @@ impl<'a> QuotePrefixes<'a> {
                         step(1);
                     }
                     let level = at - start;
-                    if let Some(close) = latest.insert((quote, level), at) {
+                    if let Some((seen, close)) = latest.insert((quote, level), (line, at))
+                        && seen == line
+                    {
                         next.insert(at, close);
                     }
                     at = start;
