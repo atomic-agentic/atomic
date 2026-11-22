@@ -1464,11 +1464,9 @@ fn probe_within(addr: SocketAddr, within: Duration) -> Option<Vec<String>> {
     let mut stream = TcpStream::connect_timeout(&addr, left()?).ok()?;
     stream.set_write_timeout(left()).ok()?;
     // HTTP/1.0, so the answer comes whole and the connection closes after
-    // it; a chunked answer is decoded all the same. Sent in one write, so a
-    // server that answers what its first read gets, and then closes with the
-    // rest unread, which resets the connection, has the whole request.
+    // it; a chunked answer is decoded all the same.
     let request = format!("GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n");
-    stream.write_all(request.as_bytes()).ok()?;
+    write_request(&mut stream, request.as_bytes()).ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     let body = loop {
@@ -1499,6 +1497,16 @@ fn probe_within(addr: SocketAddr, within: Duration) -> Option<Vec<String>> {
             .filter_map(|m| m.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect(),
     )
+}
+
+/// The probe's `head`, put on `w` in exactly one write. Sent in one write, so
+/// a server that answers what its first read gets, and then closes with the
+/// rest unread, which resets the connection, has the whole request. That one
+/// call is the control, so it is said here rather than written at the call
+/// site: `settings::tests` counts the writes `write_request` makes and fails
+/// when the request goes out in pieces.
+fn write_request<W: Write>(w: &mut W, head: &[u8]) -> std::io::Result<()> {
+    w.write_all(head)
 }
 
 /// How much of an HTTP answer has arrived.

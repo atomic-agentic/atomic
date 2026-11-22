@@ -1,0 +1,1 @@
+probe-request-one-write|crates/atomic/src/settings.rs|    w.write_all(head)|    for line in String::from_utf8_lossy(head).split_inclusive('\n') { w.write_all(line.as_bytes())?; } Ok(()) // CONTROL_OFF: each request line goes out as its own write|-p atomic-agentic --bins -- --exact settings::tests::probe_puts_the_request_head_on_one_write
