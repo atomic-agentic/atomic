@@ -88,3 +88,13 @@ reason = "v8x 149.4.0-rc.4 (deno_v8's alternative backend, locked but never buil
 crate = "rustc-hash"
 version = "1.1.0"
 reason = "bindgen 0.70.1 requires ^1"
+
+[[exception]]
+crate = "url"
+version = "2.5.9"
+reason = "RUSTSEC-2026-0592: Url::origin overflows the stack on nested blob: URLs up to 2.5.8; 2.5.9 is the fix, within Codex's ^2 requirement; drop when Codex's lockfile has it"
+
+[[exception]]
+crate = "form_urlencoded"
+version = "1.2.3"
+reason = "url 2.5.9 requires ^1.2.3"
