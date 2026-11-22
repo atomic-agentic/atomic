@@ -590,19 +590,26 @@ scripts/dev.sh scripts/milestone-tests.sh
 
 Declarative atoms use `.atom.astro`. The production compiler assets are bundled
 under `crates/atomic-core/assets` and included in the binary. Running atoms needs
-no npm install or project `node_modules`. The development image supplies pinned
-Deno 2.9.8; other builds can provision that host outside the source tree:
+no Deno, npm install or project `node_modules`: atomic starts itself as the
+compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
+embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
+environment, a 1 GiB heap limit and the parent's 30-second limit, and its host
+(`compiler_host/host.js`) gives the worker the protocol's stdin and stdout, stderr
+for its console, its exit status, its own WASM, random bytes, SHA-256 and timers,
+and nothing else: no network, environment, filesystem or subprocess. atomic reads atom sources itself and sends them in the
+request, for loading as for rendering. Direct-run context checkpoints live outside
+the source tree.
 
-```sh
-python3 scripts/setup-deno.py /tmp/atomic-deno
-export ATOMIC_DENO=/tmp/atomic-deno/deno
-```
+A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
+it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's
+dev-dependencies turn it on) serve the child from a constructor that runs before
+`main`. Release builds never have it, and `scripts/release-package.sh` refuses a
+binary that does.
 
-The setup script verifies the platform archive against `deps/deno.json`. The worker
-checks its runtime version, clears inherited environment, and has no network, npm,
-write, FFI or subprocess grant, and reads only the compiler assets: atomic reads
-atom sources itself and sends them in the request, for loading as for rendering.
-Compiler cache and direct-run context checkpoints live outside the source tree.
+`tools/check_examples.py` runs its Astro checks on that same compiler: build atomic
+first, or set `ATOMIC_BIN` to an atomic binary. The development image still carries
+Deno, for developer tooling only: `authoring/src/production-controls.mjs`, a probe
+of the worker under Deno's own permissions, and the example code's own `deno test`.
 
 Contributors changing the interpreter or type checker rebuild the shipped assets:
 

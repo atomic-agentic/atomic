@@ -382,7 +382,6 @@ process environment does.
 | `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |
-| `ATOMIC_DENO` | the Deno that runs the Astro compiler, instead of the `deno` found on `PATH` |
 
 ## Keep credentials out of definitions
 

@@ -3,7 +3,8 @@
 //! The bounded child process that runs the bundled Astro compiler.
 //!
 //! This is not an execution backend. Runners sit behind `atomic_exec::ExecutionBackend`;
-//! the compiler is trusted host code that atomic starts itself, with the bounds
+//! the compiler is trusted host code that atomic starts itself (the atomic
+//! binary as its own child, see `compiler_host`), with the bounds
 //! the local backend applies: a cleared environment, a time limit and bounded
 //! input and output. Unlike a runner, it talks to the host while it works: it
 //! asks the host to run captured helpers, one line per call and reply.
@@ -43,7 +44,7 @@ pub(crate) fn run_interactive(
     use std::process::{Command, Stdio};
     let start = |message: String| {
         format!(
-            "cannot start the Astro compiler with {}: {message}; install Deno 2.9.8 or set ATOMIC_DENO",
+            "cannot start the Astro compiler with {}: {message}",
             program.display()
         )
     };

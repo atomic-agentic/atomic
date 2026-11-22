@@ -8,16 +8,17 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
-const WORKER: &[u8] = include_bytes!("../assets/worker.mjs");
-const WASM: &[u8] = include_bytes!("../assets/astro.wasm");
-#[cfg(test)]
-static ASSET_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// What a compile's result depends on: the worker, its WASM, the host it runs
+// on and the V8 that runs it.
 static COMPILER_HASH: LazyLock<String> = LazyLock::new(|| {
+    use crate::compiler_host::{HOST, WASM, WORKER};
     let mut digest = Sha256::new();
-    digest.update(WORKER);
+    digest.update(WORKER.as_bytes());
     digest.update(WASM);
+    digest.update(HOST.as_bytes());
+    digest.update(deno_core::v8::VERSION_STRING.as_bytes());
     format!("{:x}", digest.finalize())
 });
 
@@ -128,52 +129,6 @@ impl From<&str> for Diagnostic {
     }
 }
 
-/// Where the compiler assets are unpacked: under `ATOMIC_HOME` when it is set,
-/// as runtime state is, and otherwise in the user's cache directory.
-fn cache_dir() -> Result<PathBuf, String> {
-    let base = match std::env::var_os("ATOMIC_HOME").filter(|value| !value.is_empty()) {
-        Some(home) => PathBuf::from(home).join("cache"),
-        None => dirs::cache_dir()
-            .ok_or("no user cache directory for the Astro compiler; set ATOMIC_HOME")?
-            .join("atomic"),
-    };
-    Ok(base.join("compiler").join(COMPILER_HASH.as_str()))
-}
-
-fn assets() -> Result<PathBuf, String> {
-    let dir = cache_dir()?;
-    static INSTALLED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    let mut installed = INSTALLED
-        .lock()
-        .map_err(|_| "compiler cache lock poisoned")?;
-    if installed.contains(&dir) {
-        return Ok(dir);
-    }
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        format!(
-            "cannot create the compiler cache {}: {e}; set ATOMIC_HOME",
-            dir.display()
-        )
-    })?;
-    for (name, content) in [("worker.mjs", WORKER), ("astro.wasm", WASM)] {
-        let file = dir.join(name);
-        #[cfg(test)]
-        ASSET_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if std::fs::read(&file).ok().as_deref() != Some(content) {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let temp = dir.join(format!(
-                "{name}.{}-{}.tmp",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::write(&temp, content).map_err(|e| e.to_string())?;
-            std::fs::rename(temp, file).map_err(|e| e.to_string())?;
-        }
-    }
-    installed.push(dir.clone());
-    Ok(dir)
-}
-
 /// Keep bounded process and filesystem work off the asynchronous executor.
 pub(crate) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
@@ -220,39 +175,9 @@ fn safe_json(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), S
     Ok(())
 }
 
-/// The Deno that runs the compiler: `ATOMIC_DENO`, else `deno` on `PATH`.
-fn deno() -> PathBuf {
-    std::env::var_os("ATOMIC_DENO")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("PATH")
-                .and_then(|paths| {
-                    std::env::split_paths(&paths)
-                        .map(|dir| dir.join("deno"))
-                        .find(|file| file.is_file())
-                })
-                .unwrap_or_else(|| PathBuf::from("deno"))
-        })
-}
-
-/// The Deno arguments: no network, npm, config, environment, write, FFI or
-/// subprocess access, and reads limited to the compiler assets.
-fn deno_args(assets: &Path) -> Vec<String> {
-    vec![
-        "run".into(),
-        "--no-config".into(),
-        "--no-lock".into(),
-        "--no-remote".into(),
-        "--cached-only".into(),
-        "--no-npm".into(),
-        "--no-prompt".into(),
-        format!("--allow-read={}", assets.display()),
-        assets.join("worker.mjs").display().to_string(),
-    ]
-}
-
-/// Invoke the shipped compiler without network, environment, write, FFI or subprocess access.
+/// Invoke the shipped compiler, which atomic runs in a child of its own on
+/// its embedded V8, without network, environment, filesystem or subprocess
+/// access (see [`crate::compiler_host`]).
 pub fn worker(request: Value) -> Result<Value, String> {
     worker_located(request).map_err(|error| error.to_string())
 }
@@ -404,14 +329,13 @@ pub(crate) fn worker_with(
     clock: Option<(&StepClock, &str)>,
 ) -> Result<Value, Diagnostic> {
     safe_json(&request, 0, &mut 100_000)?;
-    let dir = assets()?;
     let root = request
         .get("root")
         .and_then(Value::as_str)
         .ok_or("missing compiler root")?;
-    // Only the trusted compiler assets are readable by Deno (see `deno_args`).
-    // Atom sources arrive as bounded messages, so even a standalone atom in
-    // the home directory grants no read access to it.
+    // The compiler reads no files (see `compiler_host`): atom sources arrive
+    // as bounded messages, so even a standalone atom in the home directory
+    // grants it no read access.
     if request.get("sources").is_none() {
         if request["action"] != "load" {
             return Err("compiler operation requires frozen sources".into());
@@ -504,16 +428,11 @@ pub(crate) fn worker_with(
     };
     let operation = operation.to_owned();
     let mut index = 0usize;
+    let command = crate::compiler_host::command()?;
     let output = crate::compiler_process::run_interactive(
-        &deno(),
-        &deno_args(&dir),
-        &[
-            (
-                "DENO_DIR".into(),
-                dir.join("deno-cache").display().to_string(),
-            ),
-            ("DENO_NO_UPDATE_CHECK".into(), "1".into()),
-        ],
+        &command.program,
+        &command.args,
+        &command.env,
         &bytes,
         crate::compiler_process::TIME_LIMIT,
         &mut |call: &Value| {
@@ -676,44 +595,11 @@ mod tests {
     }
 
     #[test]
-    fn compiler_assets_are_installed_once_per_process() {
-        let dir = assets().expect("install");
-        let first = ASSET_READS.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(assets().expect("reuse"), dir);
-        assert_eq!(
-            first,
-            ASSET_READS.load(std::sync::atomic::Ordering::Relaxed),
-            "cached assets must not be reread"
-        );
-    }
-
-    #[test]
-    fn deno_may_read_only_the_compiler_assets() {
-        let dir = Path::new("/cache/atomic/compiler/abc");
-        let args = deno_args(dir);
-        let grants: Vec<_> = args
-            .iter()
-            .filter(|arg| arg.starts_with("--allow"))
-            .collect();
-        assert_eq!(grants, ["--allow-read=/cache/atomic/compiler/abc"]);
-        for flag in [
-            "--no-remote",
-            "--no-npm",
-            "--no-config",
-            "--no-prompt",
-            "--cached-only",
-        ] {
-            assert!(args.iter().any(|arg| arg == flag), "{flag} is missing");
-        }
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg == "-A" || arg.starts_with("--unstable"))
-        );
-        assert_eq!(
-            args.last().map(String::as_str),
-            Some("/cache/atomic/compiler/abc/worker.mjs")
-        );
+    fn the_compiler_is_atomic_itself_with_no_environment() {
+        let command = crate::compiler_host::command().expect("command");
+        assert_eq!(command.program, std::env::current_exe().expect("exe"));
+        assert_eq!(command.args, [crate::compiler_host::CHILD_ARG]);
+        assert!(command.env.is_empty(), "{:?}", command.env);
     }
 
     #[test]

@@ -555,6 +555,7 @@ dependencies = [
  "codex-network-proxy",
  "codex-process-hardening",
  "codex-protocol",
+ "ctor",
  "deno_core",
  "dirs",
  "getrandom 0.3.4",

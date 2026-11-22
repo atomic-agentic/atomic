@@ -1,0 +1,390 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The compiler's host, tried from inside it: each probe is a module run in
+//! place of the worker, in the child atomic starts for a compile, with the
+//! same host, limits and protocol.
+use super::*;
+use crate::compiler_process::{TIME_LIMIT, run_interactive};
+use serde_json::{Value, json};
+use std::time::{Duration, Instant};
+
+/// The module a child runs instead of the worker; read only in this
+/// crate's test binary (see `test_dispatch`).
+pub(super) const PROBE_ENV: &str = "ATOMIC_COMPILER_TEST_PROBE";
+/// The child's heap limit in bytes, for the heap probe.
+pub(super) const HEAP_ENV: &str = "ATOMIC_COMPILER_TEST_HEAP";
+
+/// Runs `body`, an async function body, in a compiler child and returns
+/// what it returned, or the child's failure.
+fn probe_with(body: &str, env: &[(&str, String)], limit: Duration) -> Result<Value, String> {
+    // The Node modules the worker imports, imported as it imports them.
+    let module = format!(
+        "import * as fs from 'node:fs/promises'; import path from 'node:path';\n\
+         import {{ createHash }} from 'node:crypto'; import {{ fileURLToPath }} from 'node:url';\n\
+         const result = await (async () => {{ {body} }})();\n\
+         const line = new TextEncoder().encode(JSON.stringify({{ ok: result }}) + '\\n');\n\
+         let written = 0;\n\
+         while (written < line.length) written += Deno.stdout.writeSync(line.subarray(written));\n"
+    );
+    let mut command = command()?;
+    command.env.push((PROBE_ENV.to_owned(), module));
+    command
+        .env
+        .extend(env.iter().map(|(k, v)| ((*k).to_owned(), v.clone())));
+    let output = run_interactive(
+        &command.program,
+        &command.args,
+        &command.env,
+        b"{}",
+        limit,
+        &mut |_: &Value| panic!("no calls expected"),
+    )?;
+    let response: Value = serde_json::from_slice(&output).map_err(|e| e.to_string())?;
+    Ok(response["ok"].clone())
+}
+
+fn probe(body: &str) -> Result<Value, String> {
+    probe_with(body, &[], TIME_LIMIT)
+}
+
+/// `body` as an expression whose rejection or throw is the answer.
+fn refusal(expression: &str) -> String {
+    let body = format!(
+        "try {{ return {{ allowed: await (async () => {expression})() }}; }} \
+         catch (error) {{ return {{ refused: String(error?.message ?? error) }}; }}"
+    );
+    let value = probe(&body).expect("probe");
+    value["refused"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{expression} was allowed: {value}"))
+        .to_owned()
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "atomic-compiler-host-{name}-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+#[test]
+fn the_worker_runs_in_the_child_and_answers_a_request() {
+    let command = command().expect("command");
+    let output = run_interactive(
+        &command.program,
+        &command.args,
+        &command.env,
+        br#"{"protocol":1,"action":"nothing","file":"/p/a.atom.astro","root":"/p","sources":{}}"#,
+        TIME_LIMIT,
+        &mut |_: &Value| panic!("no calls expected"),
+    )
+    .expect("answer");
+    let response: Value = serde_json::from_slice(&output).expect("json");
+    // The worker started, read its request and refused it in its own words.
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert!(!message.is_empty(), "{response}");
+    assert!(
+        !message.contains("requires Deno"),
+        "the host is the Deno the worker expects: {message}"
+    );
+}
+
+#[test]
+fn the_worker_reads_its_own_wasm_and_no_other_file() {
+    assert_eq!(
+        probe("return (await Deno.readFile(new URL('./astro.wasm', import.meta.url))).length;"),
+        Ok(json!(WASM.len()))
+    );
+    let dir = scratch("read");
+    let file = dir.join("secret.txt");
+    std::fs::write(&file, "do-not-read").expect("file");
+    let path = file.to_str().expect("utf-8");
+    let refused = refusal(&format!(
+        "new TextDecoder().decode(await Deno.readFile({path:?}))"
+    ));
+    assert!(
+        refused.contains("it reads only its own WASM") && refused.contains(path),
+        "{refused}"
+    );
+    let refused = refusal(&format!(
+        "new TextDecoder().decode(await Deno.readFile('file://{path}'))"
+    ));
+    assert!(refused.contains("it reads only its own WASM"), "{refused}");
+    // The refusal is the host's, never the filesystem's: a file no one may
+    // read and a link to itself are refused the same way, with no error of
+    // their own (which root, reading the first, would not get).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = dir.join("locked.txt");
+        std::fs::write(&locked, "do-not-read").expect("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("mode");
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).expect("link to itself");
+        for target in [&locked, &looped] {
+            let target = target.to_str().expect("utf-8");
+            let refused = refusal(&format!("await Deno.readFile({target:?})"));
+            assert!(
+                refused.contains("it reads only its own WASM")
+                    && !refused.contains("denied")
+                    && !refused.contains("symbolic links"),
+                "{refused}"
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).expect("mode");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn node_fs_reads_and_writes_nothing() {
+    let dir = scratch("fs");
+    let file = dir.join("secret.txt");
+    std::fs::write(&file, "do-not-read").expect("file");
+    let path = file.to_str().expect("utf-8");
+    for (call, name) in [
+        (format!("fs.readFile({path:?}, 'utf8')"), "readFile"),
+        (format!("fs.realpath({path:?})"), "realpath"),
+        (
+            format!("fs.readdir({:?})", dir.to_str().expect("utf-8")),
+            "readdir",
+        ),
+        (
+            format!("fs.writeFile({path:?}.concat('.new'), 'x')"),
+            "writeFile",
+        ),
+    ] {
+        let body = format!(
+            "try {{ return {{ allowed: await {call} }}; }} \
+             catch (error) {{ return {{ refused: String(error.message) }}; }}"
+        );
+        let value = probe(&body).expect("probe");
+        let refused = value["refused"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{call}: {value}"));
+        assert!(
+            refused.contains(&format!("has no filesystem: {name}")),
+            "{call}: {refused}"
+        );
+    }
+    assert!(
+        !dir.join("secret.txt.new").exists(),
+        "a write reached the disk"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+// The worker imports these modules statically, as the probe does here.
+#[test]
+fn the_node_modules_the_worker_imports_do_no_io() {
+    let output = probe(
+        "return { \
+           hash: createHash('sha256').update('abc').digest('hex'), \
+           joined: path.join('/a', 'b', '../c'), \
+           relative: path.relative('/a/b', '/a/c/d.ts'), \
+           url: fileURLToPath('file:///a/b%20c'), \
+         };",
+    )
+    .expect("probe");
+    assert_eq!(
+        output,
+        json!({
+            "hash": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "joined": "/a/c",
+            "relative": "../c/d.ts",
+            "url": "/a/b c",
+        })
+    );
+    // There is no working directory to resolve against.
+    let refused = refusal("path.resolve('relative/file.ts')");
+    assert!(refused.contains("has no working directory"), "{refused}");
+    // A URL that is not a file is no path.
+    let refused = refusal("fileURLToPath('http://127.0.0.1/x')");
+    assert!(refused.contains("scheme file"), "{refused}");
+}
+
+#[test]
+fn fetch_reaches_no_network() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("address").port();
+    let refused = refusal(&format!(
+        "(await fetch('http://127.0.0.1:{port}/')).arrayBuffer()"
+    ));
+    assert!(
+        refused.contains("has no network") && refused.contains(&port.to_string()),
+        "{refused}"
+    );
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("the compiler connected: {other:?}"),
+    }
+}
+
+#[test]
+fn the_host_offers_no_environment_process_or_deno_internals() {
+    let output = probe(
+        "return { \
+           deno: Object.keys(Deno).sort(), \
+           bootstrap: typeof globalThis.__bootstrap, \
+           process: typeof globalThis.process, \
+           require: typeof globalThis.require, \
+         };",
+    )
+    .expect("probe");
+    assert_eq!(
+        output,
+        json!({
+            "deno": ["exit", "readFile", "stdin", "stdout", "version"],
+            "bootstrap": "undefined",
+            "process": "undefined",
+            "require": "undefined",
+        })
+    );
+}
+
+#[test]
+fn no_other_module_can_be_imported() {
+    let refused = refusal("import('node:child_process')");
+    assert!(refused.contains("imports nothing dynamically"), "{refused}");
+    let refused = refusal("import('node:path')");
+    assert!(refused.contains("imports nothing dynamically"), "{refused}");
+    // A static import of a module the host lacks fails the compile.
+    let mut command = command().expect("command");
+    command.env.push((
+        PROBE_ENV.to_owned(),
+        "import 'node:child_process';".to_owned(),
+    ));
+    let error = run_interactive(
+        &command.program,
+        &command.args,
+        &command.env,
+        b"{}",
+        TIME_LIMIT,
+        &mut |_: &Value| panic!("no calls expected"),
+    )
+    .expect_err("refused");
+    assert!(
+        error.contains("imports only its Node modules, not node:child_process"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_heap_blow_up_is_refused_at_the_limit() {
+    let heap = 64 * 1024 * 1024;
+    let started = Instant::now();
+    // Three times the limit, past what the limit grows to while a compile
+    // unwinds; a host without the limit would answer.
+    let error = probe_with(
+        &format!(
+            "const kept = []; let size = 0; \
+             while (size < {}) {{ kept.push(new Array(1 << 16).fill(size)); size += 8 << 16; }} \
+             return kept.length;",
+            3 * heap
+        ),
+        &[(HEAP_ENV, heap.to_string())],
+        TIME_LIMIT,
+    )
+    .expect_err("refused");
+    assert!(
+        error.contains("the Astro compiler exceeded its memory limit of 64 MiB"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_runaway_compile_is_killed_at_the_time_limit() {
+    let started = Instant::now();
+    // It would answer after eight seconds; the limit is one.
+    let error = probe_with(
+        "const end = Date.now() + 8000; while (Date.now() < end) {} return 'finished';",
+        &[],
+        Duration::from_secs(1),
+    )
+    .expect_err("killed");
+    assert!(
+        error.contains("the Astro compiler exceeded 1 seconds"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_wasm_runtime_has_its_clock_randomness_and_timers() {
+    let output = probe(
+        "const bytes = crypto.getRandomValues(new Uint8Array(32)); \
+         const waited = await new Promise((resolve) => setTimeout(resolve, 5, 'fired')); \
+         const cleared = setTimeout(() => { throw new Error('cleared timer ran'); }, 1); clearTimeout(cleared); \
+         return { random: bytes.some((b) => b !== 0), waited, now: typeof performance.now() };",
+    )
+    .expect("probe");
+    assert_eq!(
+        output,
+        json!({ "random": true, "waited": "fired", "now": "number" })
+    );
+}
+
+#[test]
+fn urls_resolve_as_the_worker_uses_them() {
+    let output = probe(
+        "return [ \
+           new URL('./astro.wasm', import.meta.url).href, \
+           new URL('../x/y.d.ts', 'atomic-compiler:///a/b/c.mjs').href, \
+           new URL('/z', 'https://h.test/a/b?q').href, \
+           new URL('file:///a/b').pathname, \
+         ];",
+    )
+    .expect("probe");
+    assert_eq!(
+        output,
+        json!([
+            "atomic-compiler:///astro.wasm",
+            "atomic-compiler:///a/x/y.d.ts",
+            "https://h.test/z",
+            "/a/b",
+        ])
+    );
+}
+
+// stdout is the protocol: console output, the Go runtime's included, goes
+// to stderr, where a crash reports it.
+#[test]
+fn console_output_stays_off_the_protocol() {
+    for method in ["log", "info", "warn", "error", "debug", "trace"] {
+        assert_eq!(
+            probe(&format!(
+                "console.{method}('not', {{ a: 1 }}); return '{method}';"
+            )),
+            Ok(json!(method))
+        );
+    }
+    let mut command = command().expect("command");
+    command.env.push((
+        PROBE_ENV.to_owned(),
+        "console.error('distinct-console-text'); throw new Error('stop');".to_owned(),
+    ));
+    let error = run_interactive(
+        &command.program,
+        &command.args,
+        &command.env,
+        b"{}",
+        TIME_LIMIT,
+        &mut |_: &Value| panic!("no calls expected"),
+    )
+    .expect_err("crash");
+    assert!(
+        error.contains("distinct-console-text") && error.contains("Error: stop"),
+        "{error}"
+    );
+}

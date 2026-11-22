@@ -1,0 +1,1 @@
+compiler-no-bootstrap|crates/atomic-core/src/compiler_host/host.js|delete globalThis.__bootstrap;|void 0;|-p atomic-agentic-core --lib -- compiler_host::tests::the_host_offers_no_environment_process_or_deno_internals
