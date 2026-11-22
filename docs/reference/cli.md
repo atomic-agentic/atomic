@@ -202,7 +202,7 @@ remain unspecified. Run recovery uses the v0.1 command above. The
 | --- | --- | --- |
 | `atomic dev` | Watch definitions and run affected checks/evals | v0.5 |
 | `atomic dev --otel` | Start the optional local observability setup with Jaeger or Langfuse | v0.5 / M44 |
-| `atomic eval <atom> --live` | Evaluate with live calls, metered under the atom's budget, and record each answer in the atom's cassettes | v0.1 |
+| `atomic eval <atom> --live` | Evaluate with live calls, metered under the atom's budget, and record each answer in the atom's cassettes. A Codex atom is the exception: cassettes do not stand in for its endpoint yet, so `atomic eval` runs it only with `--no-cassettes`, which records nothing. See [eval cases](eval-cases.md#cases-golden-fixtures-and-recordings) | v0.1 |
 | `atomic eval <atom> --compare <revision>` | Compare behavior, cost and output across definitions | v0.5 |
 | `atomic render <file.atom.astro> --input <file.json>` | Print developer/user prompt parts without a model; optional `--context-settings`, `--profile`, `--run-id`, `--step-id` | Implemented direct invocation |
 | `atomic eval <atom> --plan`, `atomic run <workflow> --plan` | Print the expected model calls and a cost range, then exit without calling a model | v0.5 |
@@ -254,9 +254,12 @@ atomic workflows show summarize-and-review --format mermaid > review-flow.mmd
 
 A view changes what each node shows, never the source, and no view depends on
 color. `atomic graph` has one view. The output is text, so it can be piped, committed or pasted into a pull request.
-`atomic check` fails when a generated diagram committed in a doc no longer
-matches its source. See [diagrams with Mermaid](../guides/diagrams.md) for
-examples of each output.
+None of this is built yet, and neither is the guard that would keep a committed
+diagram current: `atomic check` checks the project's atoms, workflows, toolset
+operations and configuration, and regenerates the editor declarations; it never
+compares a diagram committed in a doc with its source. Until the exporters
+arrive, keeping a committed diagram current is yours to check. See
+[diagrams with Mermaid](../guides/diagrams.md) for examples of each output.
 
 ## Serve and attach
 

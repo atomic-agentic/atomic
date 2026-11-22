@@ -32,9 +32,11 @@ fn unkept_media(body: &ResponseBody) -> &[String] {
 
 /// What a tool's `output` describes, one item per schema it says a reply may
 /// have: the schema itself where it says one, the distinct schemas of each
-/// success that declares one where it says several. The component schemas the
-/// output carries are dropped from each, being the same map everywhere and not
-/// part of what a schema describes.
+/// success that declares one where it says several. What a member carries to
+/// stand as a schema document of its own — the `$defs` its references reach
+/// into, and the `$id` that makes a reference inside it mean that member and
+/// not the union — is dropped from each, being nothing about the shape a schema
+/// describes. The tests that care about them say so of the `output` itself.
 fn described(output: Option<&Value>) -> Vec<Value> {
     let Some(output) = output else {
         return Vec::new();
@@ -43,6 +45,7 @@ fn described(output: Option<&Value>) -> Vec<Value> {
         let mut schema = schema.clone();
         if let Value::Object(map) = &mut schema {
             map.remove("$defs");
+            map.remove("$id");
         }
         schema
     };
@@ -460,9 +463,10 @@ paths:
 
 // What a response declares about its body comes in three kinds, and they
 // are not the same claim. Only a response with no `content` key says there
-// is no body to read; one whose content names no schema — a media type
-// atomic does not read, a wildcard with no `schema`, a JSON media type with
-// no `schema` — declares a body whose shape nothing describes. The two are
+// is no body to read; one whose content names no schema atomic reads a body
+// against — a media type atomic does not read, whether or not it names a
+// schema of its own, a wildcard with no `schema`, a JSON media type with
+// no `schema` — declares a body atomic has no schema to check. The two are
 // kept apart because only the first lets atomic refuse a body. A wildcard
 // that does name a schema is the response's own claim about its body, which
 // may be JSON, so it gives atomic one to check against.
@@ -697,7 +701,9 @@ paths:
 // no schema, and media types atomic reads no body from at all. They are declared
 // all the same, and the executor cannot tell a reply naming one of them from a
 // reply naming a media type the response never mentions without being told — the
-// first is a body the spec declares and describes no shape for, and another media
+// first is a body the spec declares and gives atomic no schema to check —
+// a `text/plain` of `type: string` is such a media type, its schema describing
+// a body atomic never reads — and another media
 // type's schema, a wildcard's above all, is not its contract.
 #[test]
 fn a_response_keeps_the_media_types_it_declares_that_keep_no_schema() {
@@ -770,10 +776,9 @@ paths:
 // say. Every schema it declares is kept, under the media type as the spec
 // writes it, because a reply says which of them it is by its `Content-Type`:
 // keeping only one would leave a reply of another declared type checked against
-// a schema nothing wrote for it. What one response contributes to the tool's
-// `output` is still the first in sorted order — the media type a reply naming
-// no `Content-Type` is held to — and a component schema reference resolves in
-// every one of them, not only in the first.
+// a schema nothing wrote for it. Every one of them describes the tool's output
+// too, because a reply may arrive as any of them, and a component schema
+// reference resolves in every one of them, not only in the first.
 #[test]
 fn every_json_media_types_schema_is_kept_for_a_response() {
     let ops = operations(&yaml(
@@ -848,19 +853,26 @@ components:
         !validator.is_valid(&json!({ "thing": "x" })),
         "the two schemas are the same schema"
     );
-    // Each success describes the output by the first media type it names one
-    // under, and the tool describes all three: a `200`'s Thing, the ack a `201`
-    // answers with, the boolean a `202` does. The `203` names no schema, so it
-    // describes nothing, and a `204` has no response to describe.
+    // Every media type of every success describes the output, in status order
+    // and then in the order the response names them: a `200` answers as its
+    // Thing, its problem or its echo, a `201` as its ack, a `202` as its
+    // boolean or its integer. The `203` names no schema, so it describes
+    // nothing, and the `application/*` of the `201` is preempted by the JSON
+    // media type beside it, so it describes nothing either.
     assert_eq!(
         described(op.output.as_ref()),
         vec![
             json!({ "$ref": "#/$defs/Thing" }),
+            json!({ "$ref": "#/$defs/Problem" }),
+            json!({ "type": "string" }),
             json!({ "type": "object" }),
             json!({ "type": "boolean" }),
+            json!({ "type": "integer" }),
         ],
         "{}",
-        op.output.as_ref().expect("a union of the successes")
+        op.output
+            .as_ref()
+            .expect("a union of every success's media")
     );
     // A JSON media type that names no schema adds nothing to keep; the one
     // beside it is kept, and the wildcard stays preempted by any JSON media
@@ -977,18 +989,29 @@ components:
         .expect("default compiles");
     assert!(validator.is_valid(&json!({ "title": "no such order" })));
     assert!(!validator.is_valid(&json!({ "order": "A-1" })));
-    // The output describes both, because a success is checked against both:
-    // its own `200` for a 200, `default` for any other success the spec gives
-    // no code for. What it does not describe is the `404`'s — that schema is
-    // not kept at all, broken or not.
+    // The output describes the `200` alone. A `default` describes what a reply
+    // may look like only while no success is named beside it; here the `200`
+    // names one, so the `default` is what this operation's *failures* fall back
+    // to — an error body, not a described reply — even though a success the
+    // spec gives no code for is still checked against it, as above. What it
+    // does not describe either is the `404`'s: that schema is not kept at all,
+    // broken or not.
     assert_eq!(
         described(op.output.as_ref()),
-        vec![
-            json!({ "$ref": "#/$defs/Order" }),
-            json!({ "$ref": "#/$defs/Problem" }),
-        ],
+        vec![json!({ "$ref": "#/$defs/Order" })],
         "{}",
-        op.output.as_ref().expect("a union of Order and default")
+        op.output
+            .as_ref()
+            .expect("the `200`'s schema, not a union with the `default`")
+    );
+    assert!(
+        op.output
+            .as_ref()
+            .expect("the `200`'s schema")
+            .get("anyOf")
+            .is_none(),
+        "one described schema stands as it is: {}",
+        op.output.as_ref().expect("one schema")
     );
     // A 3.0 failure schema is not converted either: what the 3.0 dialect
     // cannot convert stays out of the import, as long as it sits under a
@@ -1162,12 +1185,22 @@ paths:
     );
     // Two successes, two shapes: both describe the output, in status order,
     // and nothing else does — a third alternative would say a reply of a shape
-    // the spec never wrote is described too.
+    // the spec never wrote is described too. Each member is a document of its
+    // own, which is what `described` drops; the union holds nothing beside them.
     assert_eq!(
-        by("twoShapes").output,
-        Some(json!({ "anyOf": [result.clone(), ticket] })),
+        described(by("twoShapes").output.as_ref()),
+        vec![result.clone(), ticket.clone()],
         "{:?}",
         by("twoShapes").output
+    );
+    assert_eq!(
+        by("twoShapes")
+            .output
+            .as_ref()
+            .expect("a union")
+            .get("$defs"),
+        None,
+        "the union carries no `$defs` of its own"
     );
     // Two successes describing one shape: that schema, as it stands, not an
     // `anyOf` holding it once.
@@ -1188,11 +1221,14 @@ paths:
 }
 
 // The union is a schema like any other: it must compile, and what it accepts is
-// exactly one of the shapes the successes declare. A component schema reference
-// resolves inside a member of it — a member points at the document it sits in,
-// which is now the union, so the union carries the components beside its
-// members — while each member keeps its own copy, because what a reply is held
-// to is one member alone.
+// exactly one of the shapes the successes declare. Each member keeps the
+// components it references, and an `$id` stands as their base — one of atomic's
+// here, because the spec named none; a member the spec did name keeps that
+// name, which the last test in this file shows. Either way a reference written
+// inside a member means that member, never the union
+// it sits in, so the union holds no `$defs` for a member to reach by accident.
+// What a reply is held to is one member alone, where it is the whole document
+// already.
 #[test]
 fn the_union_of_component_schemas_validates_a_reply_of_either_shape() {
     let ops = operations(&yaml(
@@ -1225,16 +1261,19 @@ components:
         "Queued": { "type": "object", "required": ["ticket"], "properties": { "ticket": { "type": "integer" } } },
     });
     assert_eq!(
-        union["$defs"], components,
-        "the union carries the components its members reference"
-    );
-    assert_eq!(
         union["anyOf"],
         json!([
-            { "$ref": "#/$defs/Order", "$defs": components.clone() },
-            { "$ref": "#/$defs/Queued", "$defs": components },
+            { "$id": "urn:atomic:response:0", "$ref": "#/$defs/Order", "$defs": components.clone() },
+            { "$id": "urn:atomic:response:1", "$ref": "#/$defs/Queued", "$defs": components.clone() },
         ]),
-        "each member keeps its own copy too, being what a reply is held to alone"
+        "each member keeps its own copy of the components, and an id of its own \
+         to reference them from"
+    );
+    assert_eq!(
+        union.get("$defs"),
+        None,
+        "the union holds no components of its own, so a member that resolved a \
+         reference against the union rather than itself would not compile"
     );
     let validator = Registry::new()
         .validator_for(union)
@@ -1265,4 +1304,372 @@ components:
     };
     assert!(held(200), "a `200` body fits the `200`");
     assert!(!held(202), "the same body does not fit the `202`");
+}
+
+// A `default` describes what a reply may look like only when nothing names a
+// success beside it. OpenAPI falls back to it for any success the spec gives no
+// code for, so a spec that declares no success at all means its `default` as the
+// shape a success takes, and every media type it names one under describes the
+// output. Once the spec names a success — a code from `200` to `299`, or a `2XX`
+// range, either case — every success is covered by one of those, and the
+// `default` is what the spec's *failures* fall back to: an error body, which no
+// reply the tool describes carries. It is still the response a success no code
+// names is checked against, so what it declares is still converted, kept and
+// compiled all the same; it just describes nothing.
+#[test]
+fn a_default_describes_the_output_only_when_no_success_is_named() {
+    let spec = |responses: &str| {
+        let text = format!(
+            r##"openapi: 3.1.0
+info: {{ title: Shaded, version: "1" }}
+paths:
+  /thing:
+    get:
+      operationId: thing
+      responses:
+{responses}
+"##
+        );
+        operations(&yaml(&text)).expect("spec")
+    };
+    let named = |responses: &str| {
+        let ops = spec(responses);
+        let op = &ops[0];
+        (
+            described(op.output.as_ref()),
+            op.responses
+                .get("default")
+                .expect("the default is declared")
+                .as_ref()
+                .expect("and kept")
+                .schemas()
+                .map(|(media, _)| media.to_owned())
+                .collect::<Vec<String>>(),
+        )
+    };
+    // Nothing names a success, so the `default` is what every success takes,
+    // and both the media types it declares describe a reply.
+    let (said, medias) = named(
+        "        default:\n          description: the thing, or the problem\n          content:\n            application/json: { schema: { type: object } }\n            application/problem+json: { schema: { type: string } }\n",
+    );
+    assert_eq!(
+        said,
+        vec![json!({ "type": "object" }), json!({ "type": "string" })],
+        "the `default` is the whole output, media type by media type"
+    );
+    assert_eq!(medias, ["application/json", "application/problem+json"]);
+    // A code names a success, so the `default` — the error its failures carry —
+    // is out of what a reply may look like, though it stays kept for the success
+    // the spec gives no code for.
+    let (said, medias) = named(
+        "        \"200\":\n          description: the thing\n          content:\n            application/json: { schema: { type: object } }\n        default:\n          description: the problem it carries\n          content:\n            application/problem+json: { schema: { type: string } }\n",
+    );
+    assert_eq!(
+        said,
+        vec![json!({ "type": "object" })],
+        "the named `200` describes the output and the `default` does not"
+    );
+    assert_eq!(
+        medias,
+        ["application/problem+json"],
+        "and it is still kept, because a 201 is checked against it"
+    );
+    // A range names every success at once, which shades the `default` the same
+    // way, in either case.
+    for range in ["2XX", "2xx"] {
+        let (said, _) = named(&format!(
+            "        \"{range}\":\n          description: the thing\n          content:\n            application/json: {{ schema: {{ type: object }} }}\n        default:\n          description: the problem\n          content:\n            application/problem+json: {{ schema: {{ type: string }} }}\n"
+        ));
+        assert_eq!(
+            said,
+            vec![json!({ "type": "object" })],
+            "a `{range}` range covers every success, so the `default` describes nothing"
+        );
+    }
+    // A response key that is no success at all shades nothing: a `default`
+    // beside a bare `404` still describes what a success takes.
+    let (said, _) = named(
+        "        \"404\":\n          description: no such thing\n          content:\n            application/json: { schema: { type: number } }\n        default:\n          description: the thing\n          content:\n            application/json: { schema: { type: object } }\n",
+    );
+    assert_eq!(
+        said,
+        vec![json!({ "type": "object" })],
+        "a failure names no success, so the `default` still describes the reply"
+    );
+}
+
+// The union `output` is a document nothing else compiles a reply against, so it
+// cannot be the document its members' references resolve in: two responses whose
+// schemas define their own `$defs` under one name would each reach the other's,
+// and a member's `#` — the schema it is, which a recursive component uses — would
+// name the union. Each member is therefore given an `$id`, which makes it a
+// schema resource of its own, exactly the position it is in when the executor
+// holds one reply to one response's schema alone. The union holds no `$defs` of
+// its own, so a member that resolved a reference against the union instead of
+// itself would not compile at all.
+#[test]
+fn each_member_of_the_output_union_is_its_own_schema_document() {
+    // Two successes of one 3.1 spec, each declaring a `$defs` of its own under
+    // the same name, `Leaf`: a `200` requires a `thing`, a `202` a `ticket`.
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Inline, version: "1" }
+paths:
+  /thing:
+    get:
+      operationId: thing
+      responses:
+        "200":
+          description: a thing, defined beside the response that returns it
+          content:
+            application/json:
+              schema:
+                $ref: "#/$defs/Leaf"
+                $defs:
+                  Leaf: { type: object, required: [thing], properties: { thing: { type: string } } }
+        "202":
+          description: a ticket, defined the same way and under the same name
+          content:
+            application/json:
+              schema:
+                $ref: "#/$defs/Leaf"
+                $defs:
+                  Leaf: { type: object, required: [ticket], properties: { ticket: { type: integer } } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let union = op.output.as_ref().expect("a union of the two successes");
+    assert_eq!(
+        union.get("$defs"),
+        None,
+        "the union holds no `$defs`, so a member reaching for one finds itself or nothing"
+    );
+    let validator = Registry::new()
+        .validator_for(union)
+        .expect("the union of two inline `$defs` of one name compiles");
+    assert_eq!(
+        union["anyOf"]
+            .as_array()
+            .expect("members")
+            .iter()
+            .map(|member| member["$id"].as_str().expect("an id").to_owned())
+            .collect::<Vec<_>>(),
+        ["urn:atomic:response:0", "urn:atomic:response:1"],
+        "each member is a resource of its own, so neither reads the other's `$defs`"
+    );
+    assert!(
+        validator.is_valid(&json!({ "thing": "x" })),
+        "the `200`'s own `Leaf`"
+    );
+    assert!(
+        validator.is_valid(&json!({ "ticket": 7 })),
+        "the `202`'s own `Leaf`, of the same name"
+    );
+    // One member's `Leaf` is not the other's: each shape is accepted exactly
+    // once, and neither accepts the other's body.
+    let members = union["anyOf"].as_array().expect("two members");
+    let member = |index: usize| {
+        Registry::new()
+            .validator_for(&members[index])
+            .expect("the member compiles alone")
+    };
+    assert!(member(0).is_valid(&json!({ "thing": "x" })));
+    assert!(
+        !member(0).is_valid(&json!({ "ticket": 7 })),
+        "the `200` reads its own `Leaf`, not the `202`'s"
+    );
+    assert!(member(1).is_valid(&json!({ "ticket": 7 })));
+    assert!(
+        !member(1).is_valid(&json!({ "thing": "x" })),
+        "and the `202` reads its own"
+    );
+    // A member's `#` names that member, not the union. The `200`'s schema is
+    // recursive through `#`, and only a `child` that fits the `200` again fits
+    // it; were `#` the union, the `202`'s ticket would fit a `child` too.
+    let recursive = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Recursive, version: "1" }
+paths:
+  /tree:
+    get:
+      operationId: tree
+      responses:
+        "200":
+          description: a node, and under it the same node again
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Node" } }
+        "202":
+          description: a ticket instead
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Ticket" } }
+components:
+  schemas:
+    Node:
+      type: object
+      required: [node]
+      properties:
+        node: { type: string }
+        child: { $ref: "#" }
+      additionalProperties: false
+    Ticket: { type: object, required: [ticket], properties: { ticket: { type: integer } } }
+"##,
+    ))
+    .expect("spec");
+    let union = recursive[0].output.as_ref().expect("a union of both");
+    let validator = Registry::new()
+        .validator_for(union)
+        .expect("the union of a recursive member compiles");
+    assert!(
+        validator.is_valid(&json!({ "node": "a", "child": { "node": "b" } })),
+        "a child that is another node"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "node": "a", "child": { "ticket": 7 } })),
+        "a child is the same node again, never the other response's shape: {union}"
+    );
+    // What a reply is held to is one member alone, and it reads its own `$defs`
+    // there too, as it always did.
+    let held = |status: u16| {
+        let schema = op
+            .response(status)
+            .expect("a response")
+            .1
+            .schema()
+            .expect("a schema");
+        Registry::new()
+            .validator_for(schema)
+            .expect("the response's schema compiles alone")
+    };
+    assert!(held(200).is_valid(&json!({ "thing": "x" })));
+    assert!(!held(202).is_valid(&json!({ "thing": "x" })));
+}
+
+// A response schema that names itself is written that way so that it can point
+// at itself: a `$ref` of `https://example.com/node` inside the schema whose
+// `$id` is that is that member's own `#`. The union must not rename such a
+// member — its reference would then name a document nothing holds, and a
+// response schema that compiles every other way would stop compiling inside the
+// tool built from it — so a member keeps the name the spec gave it and takes a
+// `urn:atomic:response:…` only where it has none.
+#[test]
+fn a_member_of_the_union_keeps_the_id_the_spec_gave_it() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Node, version: "1" }
+paths:
+  /node:
+    get:
+      operationId: node
+      responses:
+        "200":
+          description: a node, which names itself and points at itself
+          content:
+            application/json:
+              schema:
+                $id: "https://example.com/node"
+                type: object
+                properties: { child: { $ref: "https://example.com/node" } }
+        "202":
+          description: a count, which names nothing
+          content:
+            application/json: { schema: { type: integer } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let member = op
+        .response(200)
+        .expect("a response")
+        .1
+        .schema()
+        .expect("a schema");
+    Registry::new()
+        .validator_for(member)
+        .expect("the member compiles alone, self-reference and all");
+    let union = op.output.as_ref().expect("a union of the two successes");
+    assert_eq!(
+        union["anyOf"],
+        json!([
+            {
+                "$id": "https://example.com/node",
+                "type": "object",
+                "properties": { "child": { "$ref": "https://example.com/node" } },
+            },
+            { "$id": "urn:atomic:response:1", "type": "integer" },
+        ]),
+        "the member the spec named keeps that name, and the one it named nothing \
+         takes an id of atomic's: {union}"
+    );
+    let validator = Registry::new()
+        .validator_for(union)
+        .expect("the union compiles, the self-reference naming the member it is in");
+    assert!(
+        validator.is_valid(&json!(7)),
+        "the shape a `202` answers with"
+    );
+    assert!(
+        validator.is_valid(&json!({ "child": { "child": {} } })),
+        "a node nested in a node nested in a node"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "child": 5 })),
+        "a `child` is the same node again, not anything at all: {union}"
+    );
+    // What a reply is held to is that member alone, which is the same document
+    // here and says the same thing about a nested node.
+    let held = Registry::new()
+        .validator_for(member)
+        .expect("the response's schema compiles alone");
+    assert!(held.is_valid(&json!({ "child": {} })));
+    assert!(!held.is_valid(&json!({ "child": 5 })));
+}
+
+// The union is compiled where no member is: a member that names its own
+// document resolves what it writes against that name, so a reference written
+// for whichever document it happens to be compiled into — a root-relative
+// `$ref: "/"`, with no scheme and no fragment — resolves when that member is
+// compiled on its own and does not resolve once it stands as a document of its
+// own. This is the one thing the union's own compile asks that no member's
+// does, and `atomic check` compiles the union, so it is said there.
+#[test]
+fn the_unions_own_compile_refuses_a_member_that_reaches_outside_itself() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Rooted, version: "1" }
+paths:
+  /thing:
+    get:
+      operationId: thing
+      responses:
+        "200":
+          description: a thing, reaching for a root nothing names
+          content:
+            application/json: { schema: { $ref: "/" } }
+        "202":
+          description: a count
+          content:
+            application/json: { schema: { type: string } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let member = op
+        .response(200)
+        .expect("a response")
+        .1
+        .schema()
+        .expect("a schema");
+    Registry::new()
+        .validator_for(member)
+        .expect("the member compiles alone, wherever it is asked to resolve `/`");
+    let union = op.output.as_ref().expect("a union of the two successes");
+    let error = Registry::new()
+        .validator_for(union)
+        .expect_err("the same reference does not resolve once the member names itself");
+    let said = error.to_string();
+    assert!(
+        said.contains("Failed to resolve '/'") && said.contains("urn:atomic:response:0"),
+        "the refusal should name the reference and the member's own base: {said}"
+    );
 }

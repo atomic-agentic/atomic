@@ -1,8 +1,13 @@
 # Developing atomic
 
 atomic builds and tests inside a development container, so a contributor needs
-only a container engine and git on the host. You do not need Rust, Postgres or
-any other tool installed locally.
+only a container engine, git and curl on the host. You do not need Rust,
+Postgres or any other tool installed locally to build and test atomic. curl is
+there because `scripts/dev.sh` fetches the pinned V8 archive on the host, before
+the container starts, on the first run whose cache does not already hold it
+([The prebuilt V8](#the-prebuilt-v8)). The one local tool beyond those is Node,
+and only the [Astro compiler](#astro-compiler) tooling needs it: rebuilding the
+shipped assets and running `authoring/`'s own tests and probes.
 
 ## The development container
 
@@ -63,6 +68,7 @@ change them:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
+| `ATOMIC_CONTAINER` | `docker` | The engine; `podman` is supported but less tested |
 | `ATOMIC_DEV_MEMORY` | `24g` | Memory limit |
 | `ATOMIC_DEV_CPUS` | `16` | CPU limit, also used as cargo's job count |
 | `ATOMIC_DEV_TIMEOUT` | `60m` | Time limit for the command |
@@ -73,7 +79,6 @@ change them:
 
 A debug build that includes Codex takes several gigabytes even with
 dependency debug info turned off, so keep that much space free.
-| `ATOMIC_CONTAINER` | `docker` | The engine; `podman` is supported but less tested |
 
 Exit code 124 means the command hit the time limit, and 137 usually means it
 hit the memory limit.
@@ -506,7 +511,7 @@ in turn:
 | Clippy | `cargo fmt --check`, and clippy with and without the test features |
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
-| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a, M39a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
+| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M42a, M12, M35a, M39a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
 | Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
@@ -682,11 +687,19 @@ dev-dependencies turn it on) serve the child from a constructor that runs before
 binary that does.
 
 `tools/check_examples.py` runs its Astro checks on that same compiler: build atomic
-first, or set `ATOMIC_BIN` to an atomic binary. The development image still carries
+first, or set `ATOMIC_BIN` to an atomic binary. It is a Python program of its own,
+needing `PyYAML`, `jsonschema` and `referencing`, which the development image does
+not carry: CI's Examples job installs them in a virtualenv with
+`pip install --no-deps --require-hashes -r tools/requirements.txt`, and runs the
+checker from there. The development image still carries
 Deno, for developer tooling only: `authoring/src/production-controls.mjs`, a probe
 of the worker under Deno's own permissions, and the example code's own `deno test`.
 
-Contributors changing the interpreter or type checker rebuild the shipped assets:
+Contributors changing the interpreter or type checker rebuild the shipped assets.
+The development image carries Deno but no Node or npm, so these run where Node is
+installed, not through `scripts/dev.sh`; CI's Astro compiler job installs, tests and
+builds in its pinned `node:24.21.0` container, and then fails if the rebuilt assets
+differ from the committed ones:
 
 ```sh
 cd authoring

@@ -112,8 +112,14 @@ atomic render atoms/summarize-note.atom.astro --input note.json
 
 `check` validates source, generated types, schemas and declared examples.
 `render` validates the input and prints developer/user prompt parts without a model
-call. The separate `atomic run` operator command and live eval runner remain
-planned; see [availability](../reference/availability.md).
+call. Running the atom is a separate command and does need a model endpoint:
+
+```sh
+atomic run summarize-note --input note.json
+```
+
+[availability](../reference/availability.md) says which model endpoints work today
+and what else in the operator CLI is still staged.
 
 ## 4. Add a quality check
 
@@ -128,11 +134,17 @@ expect:
   - "output.summary.contains('accented')"
 ```
 
-Once the live eval runner is available:
-
 ```sh
-atomic eval summarize-note
+atomic eval summarize-note --live   # call the model and record each answer
+atomic eval summarize-note          # replay the recordings, with no model call
 ```
+
+`--live` needs a model endpoint. A replay reaches no endpoint and reads no key, but
+each recording answers only the endpoint and model it was recorded for. So a replay
+needs that pair set, in `atomic.yaml` or in `ATOMIC_MODEL_BASE_URL` and
+`ATOMIC_MODEL`, and refuses without one. Recordings live in
+`evals/summarize-note/cassettes/`, and a case with no recording fails and says to
+record it. A replay is a historical check of recorded answers, never a live pass.
 
 These assertions are an introductory regression check. They do not establish
 that every possible summary is correct. Add cases based on real failures as you

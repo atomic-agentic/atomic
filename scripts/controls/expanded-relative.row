@@ -1,1 +1,1 @@
-expanded-relative|crates/atomic-core/src/codex.rs|    let relative = here().map_err(refused)?.join(&value);|    let relative = value.clone();|-p atomic-agentic-core --lib --features fake-model moved_configurations_are_found_as_their_tools_read_them
+expanded-relative|crates/atomic-core/src/codex.rs|        let relative = here().map_err(refused)?.join(&place);|        let relative = place.clone();|-p atomic-agentic-core --lib --features fake-model moved_configurations_are_found_as_their_tools_read_them

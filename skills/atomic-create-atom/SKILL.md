@@ -1,6 +1,6 @@
 ---
 name: atomic-create-atom
-description: Create, change or fix an atomic atom, a typed single-purpose agent written as an `.atom.astro` file with JSON Schema input and output, then check it with the atomic CLI until it is clean. Use when asked to write, add, scaffold or repair an atom or an `.atom.astro` file, or to turn a described task into an atomic agent.
+description: Create, change or fix an atomic atom, a typed single-purpose agent written as an `.atom.astro` file with JSON Schema input and output, then check it with the atomic CLI until it is clean and run its eval cases. Use when asked to write, add, scaffold or repair an atom or an `.atom.astro` file, or to turn a described task into an atomic agent.
 ---
 
 # Create an atom
@@ -41,17 +41,54 @@ Read these before writing, and again when a check fails:
 6. **Write eval cases**: at least two files in `evals/<name>/`, an ordinary
    case and an edge case such as a boundary or an instruction hidden in the
    data. Assert what the task requires, not exact wording.
-7. **Check.** Run `atomic check` from the project root. It stops at the first
-   problem and prints it as `file:line: path: message`. Fix the source and run
-   it again until it prints `checked … Astro atoms and … workflows`. Never edit
-   or suppress anything in `.atomic/types/`: every check regenerates it.
+7. **Check.** Run `atomic check --json` from the project root. It stops at the
+   first problem and prints one JSON object: `error.description` says what is
+   wrong, `error.action` says what to change, and `error.kind` names the kind.
+   Fix the source it names and run it again until it succeeds, printing
+   `checked` with how many atoms, workflows and toolset operations it read, and
+   any `warnings`. Never edit or suppress anything in `.atomic/types/`: every
+   check regenerates it.
 8. **Preview.** Save one case's input as `fixtures/<name>/<case>.input.json`
    and run `atomic render atoms/<name>.atom.astro --input fixtures/<name>/<case>.input.json`.
    No model is called. The `developer` part must hold your instructions and the
    `user` part the input values.
-9. **Report** the files you wrote, the last `atomic check` output and the eval
-   cases. This version of atomic has no eval runner yet: say that the cases
-   were written but not run against a model.
+9. **Eval.** Run `atomic eval <name>` from the project root. What it can run
+   depends on the kind you chose in step 2. What it will not run is named: in
+   plain output as `REFUSED <name>`, with its reason and what to do instead,
+   and in `atomic eval <name> --json` under `refused`:
+   - `lite`, with recordings beside the cases in `evals/<name>/cassettes/`:
+     each case's model call is answered from its recording and the run says
+     whether the atom's pass rate reaches its threshold. A replayed run is a
+     historical check of recorded answers, not a live pass. A replay is keyed
+     by the endpoint and model its recordings were made for, so those are
+     configured as a run would configure them, and it reads no key and sends
+     no call.
+   - `lite`, with a case that has no recording: that case fails and says to
+     record it with `atomic eval <name> --live`, which calls the model and
+     records each answer, so record only when the person has said which
+     endpoint and model to use and that a call is wanted.
+   - `codex`: refused as it stands, because cassettes do not yet record a
+     Codex thread's calls. `atomic eval <name> --no-cassettes` is the form
+     that runs it: it calls the model for every case and records nothing, so
+     it needs the same permission as recording, and the person's say-so that
+     the call is wanted. An atom with `sandbox: 'workspace-write'` is refused
+     whatever flags you give it, because it could write in the project's own
+     checkout: report that refusal and what it says for itself.
+   - `exec`: it runs the command for every case, in the project. It refuses a
+     command that declares no effects, because nothing tells it the command
+     only reads, and one that writes to an outside system, which eval never
+     runs. Declare `effects: { external: 'read-only' }` when the command only
+     reads, and cover an effectful command with code tests instead of eval
+     cases.
+   `--live` only says where model calls come from; it lifts no refusal.
+   `--skip-refused` prints a refusal as `SKIPPED` and runs that atom no more
+   than without it. Read the failing cases it names, then fix the atom, its
+   prompt or the case and run it again.
+10. **Report** the files you wrote, what the last `atomic check --json` and the
+    last `atomic eval <name>` answered, and what each means for the atom. Say
+    plainly whether the eval replayed recordings, recorded new ones, ran no
+    case, or refused the atom and with what reason, and never call a case
+    passing from your own reading of the prompt.
 
 ## Worked example
 
@@ -162,7 +199,15 @@ File `fixtures/extract-actions/two-actions.input.json`:
 {"notes": "Ana will send the budget by Friday. We agreed someone should book the room."}
 ```
 
-From the project root, `atomic check` prints `checked 1 Astro atoms and 0 workflows`.
+From the project root `atomic check --json` prints
+`{"checked":{"atoms":1,"workflows":0,"toolset_operations":0},"warnings":[]}`.
+Neither case has a recording yet: with the endpoint and model configured,
+`atomic eval extract-actions` fails both of them and says to record them with
+`atomic eval extract-actions --live`, which calls the model, and with no
+endpoint configured it says what it needs before it runs either. Once both are
+recorded, the same command without `--live` answers both cases off those two
+recordings, says its model calls are a historical check, and sends the endpoint
+no request at all.
 
 ## Rules that matter most
 

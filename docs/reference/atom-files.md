@@ -476,17 +476,26 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR` and others)
-put them; `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and
-`CLOUDSDK_CONFIG` are read as botocore and gcloud read them, so one under
-`~/` or `$HOME/`, or relative to atomic's working directory, is found too.
-Workload credentials are denied too:
+variables, `KUBECONFIG`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`,
+`CREDENTIALS_DIRECTORY` and others) put them. A few are read as their tools
+read them, a name relative to atomic's working directory included:
+`AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE` as botocore reads them,
+`$VAR` and `${VAR}` expanded from atomic's environment (one it does not
+hold is left as written) and then a leading `~`; `CLOUDSDK_CONFIG` and
+`AZURE_CONFIG_DIR` as written, as gcloud and the Azure CLI read them, and
+under your home too where they start `~/` (and, for `CLOUDSDK_CONFIG`,
+`$HOME/` or `${HOME}/`). Where atomic expands a leading `~`, it names both
+`$HOME` and the home the system records for your user, and one that names
+another user's home, such as `~bob/`, stops the run: name the path in full. Workload credentials are
+denied too:
 
 - the files `AWS_WEB_IDENTITY_TOKEN_FILE`,
   `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE`,
-  `AZURE_CLIENT_CERTIFICATE_PATH`, `GOOGLE_APPLICATION_CREDENTIALS` and
-  `GOOGLE_API_CERTIFICATE_CONFIG` name, one named relative to atomic's
-  working directory as the SDKs read it;
+  `AZURE_CLIENT_CERTIFICATE_PATH`, `GOOGLE_APPLICATION_CREDENTIALS`,
+  `GOOGLE_API_CERTIFICATE_CONFIG` and its fallback
+  `CLOUDSDK_CONTEXT_AWARE_CERTIFICATE_CONFIG_FILE_PATH` name, one named
+  relative to atomic's working directory as the SDKs read it, and the last
+  two with a leading `~` expanded, as google-auth expands it;
 - the token files Google's credentials name, there or in the application
   default credentials gcloud writes: an external account's source file, the
   file its executable keeps a token in, the certificate configuration of
@@ -494,7 +503,9 @@ Workload credentials are denied too:
   impersonated account is configured with;
 - the certificate and private key a Google certificate configuration
   names, in `GOOGLE_API_CERTIFICATE_CONFIG`'s file, gcloud's own
-  `certificate_config.json`, or one Google's credentials name;
+  `certificate_config.json`, or one Google's credentials name (its
+  `certificate_config_location` with a leading `~` expanded), each read as
+  written, as google-auth reads it;
 - every `web_identity_token_file` setting in your AWS configuration and
   credentials files, written with `=` or `:`, both with and without a `#` or
   `;` comment after it;
@@ -504,7 +515,12 @@ Workload credentials are denied too:
 - `/var/run/secrets` and `/run/secrets` whole, whether or not anything
   names them: where Kubernetes mounts the pod's own service account token,
   EKS's and Azure workload identity's, and projected tokens of any audience,
-  and where a container engine mounts the secrets it is given by name.
+  and where a container engine mounts the secrets it is given by name. On
+  RHEL, Podman also mounts the host's subscription entitlements under
+  `/run/secrets` in a container, so a command run there cannot install
+  packages from the entitled repositories;
+- `/run/credentials` whole, where systemd keeps each system service's
+  credentials, and the directory `CREDENTIALS_DIRECTORY` names.
 
 Not yet denied: a credential file gcloud is pointed at by its own
 settings (`CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`, a configuration's
