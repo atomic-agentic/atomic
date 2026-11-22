@@ -896,6 +896,77 @@ fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String>
     Ok(Some(text))
 }
 
+/// The directory an older atomic kept credentials and the checkpoint key
+/// in when `ATOMIC_HOME` was unset: `atomic` in the configuration directory
+/// `dirs` names. On macOS that is `~/Library/Application Support/atomic`
+/// (on Windows, under `%APPDATA%`), never [`user_config_dir`]; on Linux it
+/// is the same directory unless `HOME` is relative.
+pub fn legacy_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("atomic"))
+}
+
+/// The places under `legacy`, an older atomic's configuration directory
+/// (see [`legacy_config_dir`]), that held its credentials and checkpoint
+/// key, for denying to atoms' commands wherever they exist, `ATOMIC_HOME`
+/// set or not, as absolute paths (a relative `HOME` makes `legacy`
+/// relative, read from the working directory). One that cannot be told
+/// absent, for an error other than "not there", counts as there.
+pub fn legacy_secret_dirs(legacy: Option<&Path>) -> Vec<PathBuf> {
+    let Some(legacy) = legacy else {
+        return Vec::new();
+    };
+    ["credentials", "keys"]
+        .into_iter()
+        .map(|name| legacy.join(name))
+        .filter(|dir| {
+            !matches!(std::fs::symlink_metadata(dir), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        })
+        .map(|dir| std::path::absolute(&dir).unwrap_or(dir))
+        .collect()
+}
+
+/// Refuses to use `current`, where atomic keeps `what` now, while it is not
+/// there and `legacy`, where an older atomic kept it, is: using `current`
+/// would hide what is kept there (a credential would read as missing, a new
+/// checkpoint key would be made and the runs signed with the old one would
+/// no longer resume). The person moves it, which keeps what it holds, rather
+/// than atomic moving it unasked. A place that cannot be told absent, for
+/// an error other than "not there", counts as there.
+pub fn refuse_stranded(what: &str, current: &Path, legacy: Option<&Path>) -> Result<(), String> {
+    let Some(legacy) = legacy.filter(|l| *l != current) else {
+        return Ok(());
+    };
+    let there = |p: &Path| !matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    if there(legacy) && !there(current) {
+        return Err(format!(
+            "{what} are kept at {current} now, which does not exist, and an older atomic kept \
+             them at {legacy}, which does: move {legacy} to {current} to keep using them, or \
+             set ATOMIC_HOME to a directory holding them",
+            current = current.display(),
+            legacy = legacy.display(),
+        ));
+    }
+    Ok(())
+}
+
+/// [`credentials_dir`], for reading or writing what it holds: refused while
+/// an older atomic's credentials are stranded at its old place (see
+/// [`refuse_stranded`]). With `ATOMIC_HOME` set, the place has not moved.
+pub fn credentials_dir_in_use() -> Result<PathBuf, String> {
+    credentials_dir_beside(legacy_config_dir().as_deref())
+}
+
+/// [`credentials_dir_in_use`], with `legacy` as the older atomic's
+/// configuration directory.
+fn credentials_dir_beside(legacy: Option<&Path>) -> Result<PathBuf, String> {
+    let dir = credentials_dir().map_err(|e| e.to_string())?;
+    if atomic_home().map_err(|e| e.to_string())?.is_none() {
+        let legacy = legacy.map(|d| d.join("credentials"));
+        refuse_stranded("credentials", &dir, legacy.as_deref())?;
+    }
+    Ok(dir)
+}
+
 /// Where the opt-in file store keeps operator credentials (see
 /// [`crate::credential::FileSecrets`]): `$ATOMIC_HOME/credentials`, or
 /// `credentials` under [`user_config_dir`] — the same directory the
@@ -2580,6 +2651,95 @@ mod tests {
             ),
             "a state directory inside the password home was not refused by the check itself: \
              {outcome:?}"
+        );
+    }
+
+    /// An older atomic's credentials or keys at their old place, with
+    /// nothing at the new one, refuse the new place, naming both; once
+    /// moved, or where the places are one, or with nothing at the old one,
+    /// the new place is used. An old place that cannot be told absent (here,
+    /// under a file, "not a directory") counts as there.
+    #[test]
+    fn credentials_left_at_an_older_atomics_place_are_not_hidden() {
+        let scratch = setup(
+            "stranded",
+            &["home", "legacy/credentials", "legacy/keys", "file-parent"],
+            &[],
+        );
+        let current = scratch.join("home/.config/atomic/credentials");
+        let legacy = scratch.join("legacy/credentials");
+        let why = refuse_stranded("credentials", &current, Some(&legacy)).expect_err("stranded");
+        assert!(
+            why.contains(&current.display().to_string())
+                && why.contains(&legacy.display().to_string())
+                && why.contains("move"),
+            "{why}"
+        );
+        assert_eq!(
+            refuse_stranded("credentials", &legacy, Some(&legacy)),
+            Ok(())
+        );
+        let absent = scratch.join("legacy/none");
+        assert_eq!(
+            refuse_stranded("credentials", &current, Some(&absent)),
+            Ok(())
+        );
+        assert_eq!(refuse_stranded("credentials", &current, None), Ok(()));
+        let file = scratch.join("file-parent/plain");
+        std::fs::write(&file, "").expect("a file");
+        let under_file = file.join("credentials");
+        assert_eq!(
+            std::fs::symlink_metadata(&under_file)
+                .map_err(|e| e.kind())
+                .err(),
+            Some(std::io::ErrorKind::NotADirectory),
+            "the old place is not under a file here"
+        );
+        assert!(refuse_stranded("credentials", &current, Some(&under_file)).is_err());
+        std::fs::create_dir_all(&current).expect("moved");
+        assert_eq!(
+            refuse_stranded("credentials", &current, Some(&legacy)),
+            Ok(())
+        );
+
+        // Both old places are listed for the denial where they are, and one
+        // that cannot be told absent is listed too.
+        assert_eq!(
+            legacy_secret_dirs(Some(&scratch.join("legacy"))),
+            [
+                scratch.join("legacy/credentials"),
+                scratch.join("legacy/keys")
+            ]
+        );
+        assert_eq!(
+            legacy_secret_dirs(Some(&scratch.join("nowhere"))),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            legacy_secret_dirs(Some(&file)),
+            [file.join("credentials"), file.join("keys")]
+        );
+        assert_eq!(legacy_secret_dirs(None), Vec::<PathBuf>::new());
+
+        // The credential store refuses its place while the old one holds
+        // them, and only without `ATOMIC_HOME`, whose place never moved.
+        let _home = as_process(&scratch, &[("HOME", "/home")], None);
+        let why = credentials_dir_beside(Some(&scratch.join("legacy-home"))).map(|_| ());
+        assert_eq!(why, Ok(()), "nothing at the old place");
+        std::fs::create_dir_all(scratch.join("legacy-home/credentials")).expect("old place");
+        let new = scratch.join("home/.config/atomic/credentials");
+        let _ = std::fs::remove_dir_all(&new);
+        let why = credentials_dir_beside(Some(&scratch.join("legacy-home"))).expect_err("stranded");
+        assert!(why.contains(&new.display().to_string()), "{why}");
+        drop(_home);
+        let _atomic = as_process(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/home")],
+            None,
+        );
+        assert_eq!(
+            credentials_dir_beside(Some(&scratch.join("legacy-home"))),
+            Ok(scratch.join("home/credentials"))
         );
     }
 

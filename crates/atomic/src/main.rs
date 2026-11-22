@@ -782,7 +782,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         };
         Some(
             if args.run_id.is_some() {
-                context::default_key_dir().and_then(|keys| {
+                context::default_key_dir_in_use().and_then(|keys| {
                     context::checkpoint(&atom, &state.context_dir(), &keys, run_id, resolve)
                 })
             } else {

@@ -805,7 +805,11 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
     let error = stdout_json(&out)["error"].clone();
     let kind = error["kind"].as_str().unwrap_or("");
     let description = error["description"].as_str().unwrap_or("");
+    // Which home the password database gives is this machine's; the unit
+    // tests of the credential and key places pin that choice with a home
+    // they make up.
     if description.contains("the home directory is unknown") {
+        assert_eq!(kind, "error", "{t}");
         assert_eq!(description, refusal, "the refusal of the unknown home: {t}");
     } else {
         assert_eq!(kind, "model.signed_out", "{t}");

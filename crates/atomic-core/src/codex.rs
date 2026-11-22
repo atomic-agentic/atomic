@@ -455,6 +455,15 @@ impl StateGuard {
     /// The guard for a state directory at `state_dir`, with the atomic home's
     /// private state and the user-wide private directories as configured.
     pub fn deny_state_dir(state_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        Self::deny_state_dir_beside(state_dir, crate::state::legacy_config_dir().as_deref())
+    }
+
+    /// [`Self::deny_state_dir`], with `legacy` as the configuration
+    /// directory an older atomic kept credentials and keys in.
+    fn deny_state_dir_beside(
+        state_dir: impl Into<PathBuf>,
+        legacy: Option<&Path>,
+    ) -> anyhow::Result<Self> {
         let private = crate::state::base_dir()?.join("private");
         crate::state::private_dir(&private)?;
         let mut also = vec![crate::state::credentials_dir()?];
@@ -479,10 +488,15 @@ impl StateGuard {
         // the directory a state directory is refused for sitting inside is
         // denied outright. The entries from `dirs` are denied beside it: the
         // state directory `base_dir` falls back to, and the configuration
-        // directory `dirs` names — not always the same one, where `dirs`
-        // takes a relative spelling of `HOME` or `XDG_CONFIG_HOME` that
-        // `user_config_dir` gives way from, which is where an older atomic
-        // kept its credentials and keys.
+        // directory `dirs` names. That is not always the same one: on macOS
+        // (`~/Library/Application Support`) and Windows (`%APPDATA%`) it
+        // never is, and on Linux it differs only for a relative `HOME`,
+        // which `user_config_dir` gives way from (`dirs` ignores a relative
+        // `XDG_CONFIG_HOME` itself).
+        // An older atomic's credentials and checkpoint key, wherever they
+        // still are, `ATOMIC_HOME` set or not: on macOS and Windows that
+        // place was never the configuration directory above.
+        also.extend(crate::state::legacy_secret_dirs(legacy));
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1168,6 +1182,9 @@ fn refuse_uncovered_store(
     }
     let mut stores = vec![crate::state::base_dir()?, crate::state::credentials_dir()?];
     stores.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+    stores.extend(crate::state::legacy_secret_dirs(
+        crate::state::legacy_config_dir().as_deref(),
+    ));
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     for root in roots {
         let root = real(root);
@@ -4142,6 +4159,46 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older atomic's credentials and checkpoint key, kept in the
+    /// configuration directory `dirs` names (on macOS not the one atomic
+    /// uses now), are denied to atoms' commands wherever they still are,
+    /// with `ATOMIC_HOME` unset as with it set; with none there, nothing is
+    /// added for them.
+    #[test]
+    fn an_older_atomics_credentials_and_keys_are_denied_where_they_are() {
+        let scratch =
+            std::env::temp_dir().join(format!("atomic-legacy-denied-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        for dir in ["home", "legacy/credentials", "legacy/keys", "state"] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let scratch = std::fs::canonicalize(&scratch).expect("placed");
+        let also = |legacy: &Path| match StateGuard::deny_state_dir_beside(
+            scratch.join("state"),
+            Some(legacy),
+        )
+        .expect("a guard")
+        {
+            StateGuard::Deny(private) => private.also,
+            StateGuard::NoProjectState => panic!("no denial"),
+        };
+        let _home = crate::state::as_process(&scratch, &[("HOME", "/home")], None);
+        let denied = also(&scratch.join("legacy"));
+        for old in ["legacy/credentials", "legacy/keys"] {
+            assert!(
+                denied.contains(&scratch.join(old)),
+                "{old} is not denied: {denied:?}"
+            );
+        }
+        let none = also(&scratch.join("nowhere"));
+        assert!(
+            !none.iter().any(|d| d.starts_with(scratch.join("nowhere"))),
+            "{none:?}"
+        );
+        drop(_home);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
     use crate::testing::{FakeModel, Reply};
 
     #[cfg(unix)]

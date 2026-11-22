@@ -185,6 +185,28 @@ pub fn default_key_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// [`default_key_dir`], for reading or making the key: refused while an
+/// older atomic's key is stranded at its old place (see
+/// [`crate::state::refuse_stranded`]), where making a new one would leave
+/// the runs signed with the old one unable to resume.
+pub fn default_key_dir_in_use() -> Result<PathBuf, String> {
+    default_key_dir_beside(crate::state::legacy_config_dir().as_deref())
+}
+
+/// [`default_key_dir_in_use`], with `legacy` as the older atomic's
+/// configuration directory.
+fn default_key_dir_beside(legacy: Option<&Path>) -> Result<PathBuf, String> {
+    let dir = default_key_dir()?;
+    if crate::state::atomic_home()
+        .map_err(|e| e.to_string())?
+        .is_none()
+    {
+        let legacy = legacy.map(|d| d.join("keys"));
+        crate::state::refuse_stranded("checkpoint keys", &dir, legacy.as_deref())?;
+    }
+    Ok(dir)
+}
+
 fn authentication_key(program: &crate::astro::Program, key_dir: &Path) -> Result<Vec<u8>, String> {
     let dir = resolved(key_dir)?;
     if inside_source(&dir, program) {
@@ -728,6 +750,22 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
             "`ATOMIC_HOME` did not keep the keys inside the home"
         );
         drop(_atomic);
+        // An older atomic's key at its old place, with nothing at the new
+        // one, refuses the new place rather than making another key.
+        let _home = crate::state::as_process(&scratch.0, &[("HOME", "/home")], None);
+        let legacy = scratch.0.join("legacy");
+        assert_eq!(
+            default_key_dir_beside(Some(&legacy)),
+            Ok(scratch.0.join("home/.config/atomic/keys")),
+            "nothing at the old place"
+        );
+        std::fs::create_dir_all(legacy.join("keys")).expect("the old place");
+        let why = default_key_dir_beside(Some(&legacy)).expect_err("stranded");
+        assert!(
+            why.contains(&legacy.join("keys").display().to_string()) && why.contains("move"),
+            "{why}"
+        );
+        drop(_home);
         let _none = crate::state::as_process(&scratch.0, &[("HOME", "rel-home")], None);
         let why = default_key_dir().expect_err("no absolute spelling of a home");
         assert!(

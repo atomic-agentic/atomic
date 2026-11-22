@@ -163,9 +163,10 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
                 // directory is no remedy while no spelling of the home is
                 // absolute.
                 state::StateError::NoConfigDir => {
-                    "set HOME to an absolute directory, or point XDG_CONFIG_HOME at one, so \
-                     your own configuration directory can be placed; or set ATOMIC_HOME, which \
-                     keeps credentials under it instead"
+                    "set HOME to an absolute directory, so your own configuration directory \
+                     can be placed; pointing XDG_CONFIG_HOME at one is enough for `atomic \
+                     model` alone, since `atomic run` still needs an absolute HOME; or set \
+                     ATOMIC_HOME, which keeps credentials under it instead"
                         .into()
                 }
                 state::StateError::InUse { path, .. } => format!(

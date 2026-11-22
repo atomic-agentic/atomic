@@ -199,8 +199,8 @@ impl SignIn {
     /// from.
     pub fn located(project: Option<&Path>) -> Result<Self, SignInError> {
         protected()?;
-        let dir = crate::state::credentials_dir()
-            .map_err(|e| CredentialError::File(e.to_string()))?
+        let dir = crate::state::credentials_dir_in_use()
+            .map_err(CredentialError::File)?
             .join("codex-auth");
         // A link on the way that leads nowhere: making the directory would
         // fail, or make what it names, somewhere not checked here.

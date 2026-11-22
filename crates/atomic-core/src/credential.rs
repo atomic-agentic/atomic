@@ -326,8 +326,7 @@ pub fn configured_store(project: &Path) -> Result<Box<dyn SecretStore>, Credenti
         None => Ok(Box::new(OsKeyring)),
         Some(v) if v == "keyring" => Ok(Box::new(OsKeyring)),
         Some(v) if v == "file" => {
-            let dir = crate::state::credentials_dir()
-                .map_err(|e| CredentialError::File(e.to_string()))?;
+            let dir = crate::state::credentials_dir_in_use().map_err(CredentialError::File)?;
             Ok(Box::new(FileSecrets::open(&dir, project)?))
         }
         Some(other) => Err(CredentialError::UnknownStore(other)),
