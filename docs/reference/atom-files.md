@@ -51,12 +51,13 @@ atomic's environment.
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
-`private/`, the current project's Codex records, the credential and key
+`private/`, every project's Codex records among it, the credential and key
 directories), the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
-[configuration](#configuration)), and the scratch directories of the
-project's other attempts, live or not, whether a turn's, another exec
-step's or that of `atomic debug codex-prompt` or `atomic debug probe`. It can write only its own scratch directory (its `HOME`
+[configuration](#configuration)), and every other attempt's scratch
+directory in the atomic home's `scratch/`, of this project or another, live
+or not, whether a turn's, another exec step's or that of `atomic debug
+codex-prompt` or `atomic debug probe`. It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
@@ -156,8 +157,8 @@ is not, the copies are only marked read-only, and changing one changes only
 the copy. Handing files over is supported on Linux and macOS; on Windows an
 output that names a file is refused.
 
-Both directories are inside the command's scratch directory, in the project's
-state directory, and go when the step ends; what a killed process left is
+Both directories are inside the command's scratch directory, in the atomic
+home's `scratch/`, and go when the step ends; what a killed process left is
 removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
 `ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 

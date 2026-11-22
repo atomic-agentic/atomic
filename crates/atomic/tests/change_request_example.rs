@@ -21,7 +21,9 @@
 
 mod support;
 
-use atomic_app::pipeline::{PIPELINE, PipelineRun, Services, prepare, register_pipeline};
+use atomic_app::pipeline::{
+    PIPELINE, PipelineRun, ProjectWorktrees, Services, prepare, register_pipeline,
+};
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
 use atomic_core::git::Git;
@@ -211,7 +213,10 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             runtimes,
             store: LocalStore::open(dir.join("state/artifacts")).expect("artifact store"),
             deployment: local(),
-            worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
+            worktrees: ProjectWorktrees::Found(Arc::new(Worktrees::new(
+                repo,
+                dir.join("state/worktrees"),
+            ))),
             caches: None,
             budgets: Arc::default(),
             context: None,

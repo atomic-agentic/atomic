@@ -1,0 +1,1 @@
+worktrees-keep-git-refusal-from-ignorance|crates/atomic/src/pipeline.rs|                atomic_core::worktree::WorktreeError::Git(git) if git.refused() => {|                atomic_core::worktree::WorktreeError::Git(_) => {|-p atomic-agentic --lib -- a_project_with_no_worktrees_says_whether_git_refused_it_or_never_answered
