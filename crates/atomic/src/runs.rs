@@ -170,7 +170,7 @@ const RUN_ID_MAX: usize = 128;
 /// `atomic runs resume <id>` must not read it as a flag. The refusal does
 /// not repeat the id, which may be something pasted by mistake, such as a
 /// token.
-fn check_run_id(id: &str) -> Result<(), Failure> {
+pub fn check_run_id(id: &str) -> Result<(), Failure> {
     let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-');
     let fits = id.len() <= RUN_ID_MAX
         && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
@@ -357,11 +357,6 @@ pub async fn run(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
-    // Before anything is read or made: atomic's own lines show a run's id
-    // as it is.
-    if let Some(id) = &args.run_id {
-        check_run_id(id)?;
-    }
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
