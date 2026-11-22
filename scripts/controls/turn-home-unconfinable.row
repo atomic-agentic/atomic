@@ -1,1 +1,1 @@
-turn-home-unconfinable|crates/atomic-core/src/runtime.rs|    if let Some(there) = home {|    if let Some(there) = home.filter(|_| false) {|-p atomic-agentic-core --lib --features fake-model a_read_only_turn_does_not_start_while_its_home_is_there
+turn-home-unconfinable|crates/atomic-core/src/runtime.rs|    if let Some(there) = home {|    if let Some(there) = home.and(None::<&crate::codex::HomeThere>) {|-p atomic-agentic-core --lib --features fake-model a_read_only_turn_does_not_start_while_its_home_is_there

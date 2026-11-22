@@ -4147,7 +4147,8 @@ where
     // turn's is, runs only while it does not: refused before anything
     // reaches the model.
     // `scripts/controls/turn-home-absent.row` switches this off.
-    let home_held = spec.env.get("HOME").is_none_or(|home| home == SHELL_HOME);
+    let home = spec.env.get("HOME").map(String::as_str);
+    let home_held = home.unwrap_or(SHELL_HOME) == SHELL_HOME;
     if home_held {
         shell_home_absent().map_err(|why| anyhow::Error::new(HomeThere(why)))?;
     }
