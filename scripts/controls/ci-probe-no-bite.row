@@ -1,0 +1,1 @@
+ci-probe-no-bite|crates/atomic-schema/src/yaml.rs|//! The restricted YAML loader for atom frontmatter, workflows and schemas.|//! The restricted YAML loader.|-p atomic-agentic-schema --lib -- yaml::tests::a_leading_zero_integer_is_refused
