@@ -313,8 +313,8 @@ share both a name and a path, such as the same `/app` in two containers, are
 one project there: give them different names. A manifest that is there but
 cannot be read or is not valid stops these commands, rather than have them
 use another key: so does an `atomic.yaml` that is a directory, a link to
-itself or to nothing, or one atomic may not look at, which is not taken for
-no manifest. A local SQLite store is the project's own, so a park recorded
+itself, to nothing or through a file, or one atomic may not look at, which
+is not taken for no manifest. A local SQLite store is the project's own, so a park recorded
 there before atomic kept parks' projects, or under an older name of the
 project's at the same path, becomes the project's when atomic opens the store:
 on one, a rename strands no parked run. On a shared PostgreSQL store

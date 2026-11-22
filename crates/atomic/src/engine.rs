@@ -667,30 +667,42 @@ mod tests {
         );
 
         // A manifest that is there but cannot be looked at, or is not a file,
-        // is refused with its path: a link to itself, a link to nothing and
-        // a directory.
+        // is refused with its path: a link to itself, a link to nothing, a
+        // link through a file and a directory.
         let mut odd = Vec::new();
         #[cfg(unix)]
         {
             let looped = project("looped");
             std::os::unix::fs::symlink("atomic.yaml", looped.join("atomic.yaml")).expect("link");
-            odd.push(looped);
+            odd.push((looped.clone(), looped.join("atomic.yaml")));
             let dangling = project("dangling");
             std::os::unix::fs::symlink("gone.yaml", dangling.join("atomic.yaml")).expect("link");
-            odd.push(dangling);
+            odd.push((dangling.clone(), dangling.join("atomic.yaml")));
+            let through = project("through-a-file");
+            std::fs::write(through.join("README.md"), "a file").expect("file");
+            std::os::unix::fs::symlink("README.md/atomic.yaml", through.join("atomic.yaml"))
+                .expect("link");
+            odd.push((through.clone(), through.join("atomic.yaml")));
         }
         let directory = project("directory");
         std::fs::create_dir_all(directory.join(".atomic/atomic.yaml")).expect("directory");
-        odd.push(directory);
-        for dir in &odd {
+        odd.push((directory.clone(), directory.join(".atomic/atomic.yaml")));
+        for (dir, manifest) in &odd {
             let state = ProjectState::resolve(dir).expect("state");
             let refused = store_project(&state).expect_err("a manifest that cannot be used");
-            let shown = format!("{refused:#}");
-            assert!(shown.contains("read the project's manifest"), "{shown}");
-            assert!(shown.contains("atomic.yaml"), "{shown}");
+            assert!(
+                matches!(
+                    refused.downcast_ref::<atomic_core::project::ProjectError>(),
+                    Some(atomic_core::project::ProjectError::Read { path, .. }) if path == manifest
+                ),
+                "{refused:#}"
+            );
         }
 
-        for dir in [none, named, broken, both, plain].into_iter().chain(odd) {
+        for dir in [none, named, broken, both, plain]
+            .into_iter()
+            .chain(odd.into_iter().map(|(dir, _)| dir))
+        {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

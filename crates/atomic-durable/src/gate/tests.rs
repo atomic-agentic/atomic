@@ -1063,6 +1063,34 @@ async fn a_private_stores_old_runs_become_the_projects() {
         .expect("shutdown");
 }
 
+/// A renamed project's runs are matched by its id's characters, not its
+/// bytes: those of a project whose directory name is not ASCII are adopted
+/// too, with no run of no project in the store to adopt beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_stores_renamed_runs_are_matched_by_characters() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_adopt_utf8")));
+    let database = crate::Database::Sqlite(path);
+    let mut old = Durare::open(&database, None, crate::DEFAULT_VERSION, "old/projét-ü-0123")
+        .await
+        .expect("engine");
+    register(&mut old);
+    old.launch().await.expect("launch");
+    let (run, gate) = start_gated(&old, input(None)).await;
+    old.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    let opened = Durare::open(&database, None, crate::DEFAULT_VERSION, "notes/projét-ü-0123")
+        .await
+        .expect("engine");
+    assert!(
+        opened.own_run_record(&run).await.expect("record").is_some(),
+        "the renamed project's run"
+    );
+    assert!(find(&opened, &gate.id).await.expect("find").is_some());
+    opened
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 #[test]
 fn the_proposal_digest_ignores_key_order_and_sees_every_change() {
     let a = json!({"b": 1, "a": {"y": [1, 2], "x": null}});

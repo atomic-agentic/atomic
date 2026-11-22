@@ -1170,11 +1170,12 @@ impl Durare {
                     if let Some(suffix) = id {
                         tx.execute(
                             "UPDATE atomic_run_projects SET project = ? \
-                             WHERE project <> ? AND substr(project, -?) = ?",
+                             WHERE atomic_run_projects.project <> ? \
+                             AND substr(atomic_run_projects.project, -length(?)) = ?",
                             &[
                                 Param::Text(project.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(suffix.len()).unwrap_or(i64::MAX)),
+                                Param::Text(suffix.clone()),
                                 Param::Text(suffix),
                             ],
                         )
@@ -1235,11 +1236,11 @@ impl Durare {
                             "SELECT w.workflow_uuid AS id FROM workflow_status w \
                              LEFT JOIN atomic_run_projects rp ON rp.run_id = w.workflow_uuid \
                              WHERE rp.project IS NULL OR (? <> '' AND rp.project <> ? \
-                             AND substr(rp.project, -?) = ?) LIMIT 1",
+                             AND substr(rp.project, -length(?)) = ?) LIMIT 1",
                             &[
                                 Param::Text(id.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )

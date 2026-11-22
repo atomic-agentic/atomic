@@ -326,11 +326,11 @@ fn manifest_in(dir: &Path) -> Result<Option<PathBuf>, ProjectError> {
 }
 
 /// Whether a manifest is at `path`. Only nothing there (`NotFound`, or a
-/// parent that is not a directory) is no manifest. Anything else that is
-/// there but cannot be looked at or is not a file, such as a directory, a
-/// link to itself or to nothing, or one behind a directory it may not
-/// search, refuses with its path, so the walk does not go on to a parent's
-/// manifest in its place.
+/// parent that is not a directory, and no link at the path either) is no
+/// manifest. Anything else that is there but cannot be looked at or is not
+/// a file, such as a directory, a link to itself, to nothing or through a
+/// file, or one behind a directory it may not search, refuses with its
+/// path, so the walk does not go on to a parent's manifest in its place.
 fn is_manifest(path: &Path) -> Result<bool, ProjectError> {
     let refuse = |source| ProjectError::Read {
         path: path.to_owned(),
@@ -339,10 +339,14 @@ fn is_manifest(path: &Path) -> Result<bool, ProjectError> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => Ok(true),
         Ok(_) => Err(refuse(std::io::Error::other("it is not a file"))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
             match std::fs::symlink_metadata(path) {
-                // A link that leads nowhere.
+                // A link that leads nowhere, or through a file.
                 Ok(_) => Err(refuse(e)),
                 Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => Ok(false),
                 Err(gone) if gone.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
