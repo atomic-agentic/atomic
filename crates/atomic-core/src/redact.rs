@@ -1783,7 +1783,7 @@ fn redact_string(string: &mut String, nested: usize) {
 /// one key). A parse keeps only the last value given a key. Anything that
 /// stops the check, which reads JSON as the parse did, counts as a key
 /// given twice.
-fn gives_a_key_twice(json: &str) -> bool {
+pub(crate) fn gives_a_key_twice(json: &str) -> bool {
     use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
     /// JSON read only to find a key given twice, which fails the read.
     struct Unique;

@@ -199,6 +199,9 @@ endpoints whose URL holds credentials or a query. Before writing a recording,
 atomic applies its log redaction to the bodies and serializes JSON responses from
 the parsed value. The recording sets `redacted` to `true` if either body changed
 during that process. Lookup still uses the original, unredacted request identity.
+The cassette refuses JSON requests and responses with repeated object keys
+because their meaning can change during parsing. An ambiguous response produces
+an error during recording and leaves no new cassette.
 Replay evaluates the stored response with the normal schema and case assertions,
 so replacing a sensitive value can change an eval's result. Use synthetic values
 if your eval depends on the exact output. Older recordings can still replay and

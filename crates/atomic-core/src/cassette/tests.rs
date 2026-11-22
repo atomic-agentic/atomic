@@ -447,14 +447,13 @@ async fn a_non_json_body_uses_text_redaction() {
 }
 
 #[tokio::test]
-async fn a_shadowed_json_field_is_not_written_to_the_cassette() {
-    const SECRET_TAIL: &str = "api03-shadowedabcdefghijklmnop1234567890";
-    let body = format!(r#"{{"value":"sk\u002dant-{SECRET_TAIL}","value":"public"}}"#);
-    let root = root("shadowed-response");
+async fn a_repeated_classifier_cannot_leave_a_sensitive_response_value_in_a_cassette() {
+    let root = root("repeat-classifier-response");
     let tapes = root.join("tapes");
     let model = FakeModel::start(vec![Reply::Http {
         status: 200,
-        body: body.clone(),
+        body: r#"{"mock":{"key":"DB_PASSWORD","value":"plain fixture text","k\u0065y":"label"}}"#
+            .into(),
     }])
     .await
     .expect("fake model");
@@ -463,7 +462,74 @@ async fn a_shadowed_json_field_is_not_written_to_the_cassette() {
         .await
         .expect("recorder");
     let path = "/v1/chat/completions";
-    assert_eq!(post(&recorder, path, ASK, None).await, (200, body));
+    let (status, reply) = post(&recorder, path, ASK, None).await;
+    for entry in std::fs::read_dir(&tapes).expect("tapes") {
+        let fixture = std::fs::read_to_string(entry.expect("entry").path()).expect("fixture");
+        assert!(
+            !fixture.contains("plain fixture text"),
+            "the fixture stored the surviving sibling of a repeated classifier"
+        );
+    }
+    assert_eq!(status, 502);
+    assert!(reply.contains("response JSON contains a repeated object key"));
+    assert_eq!(recorder.tally().recorded, 0);
+    drop(recorder);
+
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    let (status, miss) = post(&player, path, ASK, None).await;
+    assert_eq!(status, 502);
+    assert!(miss.contains("no recording answers this request"));
+    assert_eq!(player.tally().missed, 1);
+    assert_eq!(model.calls(), 1);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
+async fn a_repeated_classifier_in_a_request_is_refused_in_both_modes() {
+    let root = root("repeat-classifier-request");
+    let tapes = root.join("tapes");
+    let model = FakeModel::start(vec![Reply::Text("answer".into())])
+        .await
+        .expect("fake model");
+    let upstream = model.base_url();
+    let path = "/v1/chat/completions";
+    let request = r#"{"model":"m","mock":{"key":"DB_PASSWORD","value":"plain fixture text","k\u0065y":"label"}}"#;
+    for mode in [Mode::Record, Mode::Replay] {
+        let cassette = Cassette::start(&tapes, &root, &upstream, mode)
+            .await
+            .expect("cassette");
+        let (status, reply) = post(&cassette, path, request, None).await;
+        assert_eq!(status, 400, "{mode:?}");
+        assert!(reply.contains("request JSON contains a repeated object key"));
+        assert_eq!(cassette.tally(), Tally::default());
+    }
+    assert_eq!(model.calls(), 0);
+    assert_eq!(std::fs::read_dir(&tapes).expect("tapes").count(), 0);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
+async fn a_repeated_classifier_inside_a_model_string_is_redacted_for_replay() {
+    let root = root("nested-repeat-classifier");
+    let tapes = root.join("tapes");
+    let model = FakeModel::start(vec![Reply::Text(
+        r#"{"key":"DB_PASSWORD","value":"plain fixture text","k\u0065y":"label"}"#.into(),
+    )])
+    .await
+    .expect("fake model");
+    let upstream = model.base_url();
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let path = "/v1/chat/completions";
+    let (status, body) = post(&recorder, path, ASK, None).await;
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("plain fixture text"),
+        "the live response was changed"
+    );
     drop(recorder);
 
     let key = identity(
@@ -474,18 +540,16 @@ async fn a_shadowed_json_field_is_not_written_to_the_cassette() {
     .0;
     let fixture = std::fs::read_to_string(file_for(&tapes, &key, 1)).expect("recording");
     assert!(
-        !fixture.contains(SECRET_TAIL),
-        "shadowed response field persisted in cassette"
+        !fixture.contains("plain fixture text"),
+        "the fixture stored the surviving sibling of a nested repeated classifier"
     );
     let recording: Recording = serde_json::from_str(&fixture).expect("recording JSON");
     assert!(recording.redacted);
     let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
         .await
         .expect("player");
-    assert_eq!(
-        post(&player, path, ASK, None).await,
-        (200, r#"{"value":"public"}"#.into())
-    );
+    assert_eq!(post(&player, path, ASK, None).await, (200, recording.body));
+    assert_eq!(player.tally().replayed, 1);
     assert_eq!(model.calls(), 1);
     std::fs::remove_dir_all(root).expect("remove test directory");
 }

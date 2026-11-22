@@ -26,6 +26,7 @@
 //! A recording holds redacted copies of the request and response bodies.
 //! The request identity still comes from the unredacted request. Replay
 //! serves the stored response, so redaction can change an eval's result.
+//! A repeated object key in a JSON request or recorded response is refused.
 //! Headers are excluded, and endpoint URLs with credentials or queries are
 //! refused. Review cassettes before committing them as fixtures.
 //!
@@ -470,12 +471,24 @@ async fn answer(
             format!("the cassette serves model calls, not {method} {path}"),
         );
     }
-    let Ok(request) = serde_json::from_slice::<Value>(body) else {
-        return failed(
+    let invalid_json = || {
+        failed(
             "400 Bad Request",
             "the cassette records JSON requests, and this body is not JSON".into(),
-        );
+        )
     };
+    let Ok(body_text) = std::str::from_utf8(body) else {
+        return invalid_json();
+    };
+    let Ok(request) = serde_json::from_str::<Value>(body_text) else {
+        return invalid_json();
+    };
+    if crate::redact::gives_a_key_twice(body_text) {
+        return failed(
+            "400 Bad Request",
+            "the request JSON contains a repeated object key".into(),
+        );
+    }
     let endpoint = &shared.endpoint;
     let (key, mut normalized) = identity(endpoint, path, &request);
     let occurrence = shared
@@ -585,7 +598,12 @@ async fn answer(
             if (200..300).contains(&status) {
                 let mut stored_request = normalized.clone();
                 crate::redact::value(&mut stored_request);
-                let stored_body = redact_response(&text);
+                let Some(stored_body) = redact_response(&text) else {
+                    return failed(
+                        "502 Bad Gateway",
+                        "the model response JSON contains a repeated object key; no cassette was written".into(),
+                    );
+                };
                 let recording = Recording {
                     endpoint: endpoint.clone(),
                     path: path.to_owned(),
@@ -612,14 +630,17 @@ async fn answer(
     }
 }
 
-fn redact_response(body: &str) -> Cow<'_, str> {
-    let Ok(mut json) = serde_json::from_str::<Value>(body) else {
-        return crate::redact::text(body);
+fn redact_response(response: &str) -> Option<Cow<'_, str>> {
+    let Ok(mut json) = serde_json::from_str::<Value>(response) else {
+        return Some(crate::redact::text(response));
     };
-    // Serialize from the inspected value. The original bytes can contain
-    // shadowed fields that the JSON parser discarded before redaction.
+    // Redaction needs the original classification as well as the value.
+    // Parsing an object with repeated keys may separate the two.
+    if crate::redact::gives_a_key_twice(response) {
+        return None;
+    }
     crate::redact::value(&mut json);
-    Cow::Owned(json.to_string())
+    Some(Cow::Owned(json.to_string()))
 }
 
 #[cfg(test)]
