@@ -263,8 +263,8 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
 
 /// A command that ends before a gate opens fails the wait for it, and the
 /// message that fails the test quotes what the last `atomic gates list`
-/// answered and says how many polls that took and how long the last one
-/// took: what a poll which stops answering is judged by.
+/// answered and says how many polls it made, when the one it quotes started
+/// and how long that took: what a poll which stops answering is judged by.
 #[test]
 fn a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for() {
     let dir = scratch("no-gate");
@@ -294,33 +294,43 @@ fn a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for() {
         "the last poll is not quoted: {why}"
     );
     let counted = why
-        .split(" poll(s), the last took ")
+        .split(" poll(s), the last started at ")
         .next()
         .and_then(|head| head.rsplit('(').next())
         .and_then(|polls| polls.parse::<usize>().ok())
         .expect("the message counts the polls it made");
     assert!(counted >= 1, "no poll counted: {why}");
     let took = why
-        .split(" poll(s), the last took ")
+        .split(" ms and took ")
         .nth(1)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|ms| ms.parse::<u128>().ok())
         .expect("the message says how long the last poll took");
     assert!(took > 0, "the last poll took no time at all: {why}");
+    // When the poll it quotes started, measured from when the wait began. The
+    // run ends at once, so the wait never gets near its 300 s bound: the poll it
+    // quotes started and finished well inside it.
+    let asked = last_poll_started(&why);
+    assert!(
+        asked + took < GATE_LIMIT.as_millis(),
+        "the poll it quotes is not one the wait asked and answered well inside its bound: {why}"
+    );
 }
 
-/// The wait for a gate ends at its own limit, and what it counts when it does
-/// is what its polls really did: a poll started with no time left on the wait
-/// is killed where it stands, and what it had printed by then is not the last
-/// thing said. The limit here is the wait's argument rather than
+/// The wait for a gate ends at its own limit, and what it reports when it does
+/// is what its polls really did: no poll is started once the wait has no time
+/// left to wait for an answer, so the last poll it asks is one it can still
+/// answer. Nothing opens a gate for the run here — it is a bare `sleep`, in a
+/// project that holds no run and so lists no gate — so what this test runs is
+/// the wait reaching its bound. The limit is the wait's argument rather than
 /// [`GATE_LIMIT`], so the test sits through seconds and not through minutes.
 #[test]
-fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
+fn a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish() {
     let dir = scratch("gate-limit");
     project(&dir);
     // A run that outlasts the wait, in the project a gate would open in, so
     // that nothing but the wait's own limit can end it: 400 s, against the
-    // wait's 3. It is `sleep` itself and not a shell asleep over it, because
+    // wait's 15. It is `sleep` itself and not a shell asleep over it, because
     // the wait ends the command it is handed and nothing that command forked
     // of its own.
     let mut child = Child::new(
@@ -333,9 +343,11 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
             .spawn()
             .unwrap(),
     );
-    // Longer than what the wait gives one poll, so that a poll is bounded by
-    // its own budget and never by the deadline landing mid-poll: the only way
-    // this wait kills a poll is a poll that does not answer.
+    // Longer than [`POLL_GRACE`], the time the wait must have left before it
+    // starts a poll, so that every poll is given at least that much to answer
+    // and none is cut down to the milliseconds left where the deadline happens
+    // to fall: the only way this wait kills a poll is a poll that does not
+    // answer.
     let limit = std::time::Duration::from_secs(15);
     let began = std::time::Instant::now();
     let why = failed_wait(|| {
@@ -344,8 +356,6 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
     let ended = began.elapsed();
     // Its own limit ended it, and not the run: `sleep` does not stop on its
     // own, and the other reason the wait gives is that the run ended first.
-    // The message may say how much longer a poll it had started was waited for,
-    // so this holds the two halves of the reason rather than its whole text.
     assert!(
         why.contains(&format!("no gate opened in {limit:?}")),
         "not the wait's own limit that ended it: {why}"
@@ -353,6 +363,14 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
     assert!(
         why.contains("so the run was killed"),
         "the wait did not say it ended the run: {why}"
+    );
+    // And it says the gap its own guard leaves, rather than letting a bound it
+    // sat through whole read as though it had asked the whole of it: no poll is
+    // asked inside the last [`POLL_GRACE`], so a gate that opened there is one
+    // this wait would never see.
+    assert!(
+        why.contains(&format!("(no poll started in the last {POLL_GRACE:?})")),
+        "the wait did not say which part of its bound it never polled: {why}"
     );
     // It came back at its limit: far past it would be waiting for a run that
     // sleeps on rather than ending it, and short of it is a wait that gave up
@@ -372,8 +390,9 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
     #[allow(unsafe_code)]
     let still_there = unsafe { libc::kill(pid, 0) } == 0;
     assert!(!still_there, "the run outlived the wait that ends it");
-    // What the message ends with: how many polls it made, how long the one it
-    // quotes took, and, when it had to kill one, how many.
+    // What the message ends with: how many polls it made, when the one it
+    // quotes started and how long it took, and, when it had to kill one, how
+    // many.
     let polls = why
         .split(" poll(s), ")
         .next()
@@ -381,24 +400,40 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
         .and_then(|polls| polls.parse::<usize>().ok())
         .expect("the message counts the polls it made");
     assert!(polls >= 2, "the wait stopped after {polls} poll: {why}");
+    // When the poll it quotes started, measured from when the wait began. The
+    // guard on starting a poll asks for [`POLL_GRACE`] still left of the bound,
+    // so no poll of this wait starts later than the bound minus that. This is
+    // the first thing the guard buys, and it holds every time: switching it off
+    // (`scripts/controls/telemetry-poll-not-started-late`) lets the wait start a
+    // poll while it is running out — usually inside its last few hundred
+    // milliseconds — and a poll started that late has no time left in which the
+    // wait could wait for its answer. Whether that poll is also counted as
+    // killed depends on whether the deadline arrives before the next 50 ms in
+    // which the wait looks at it, which is why the kill is the second assertion
+    // here and not the first.
+    let asked = last_poll_started(&why);
+    assert!(
+        asked + POLL_GRACE.as_millis() <= limit.as_millis(),
+        "the wait started its last poll {asked} ms after it began, which is later than a \
+         {limit:?} can still wait for a {POLL_GRACE:?} answer: {why}"
+    );
     let counted = why
         .rsplit("poll(s), ")
         .next()
         .and_then(|tail| tail.strip_suffix(')'))
         .expect("the message ends with how its polls went");
     let parts: Vec<&str> = counted.split(", ").collect();
-    let took = parts[0]
-        .strip_prefix("the last took ")
-        .and_then(|ms| ms.strip_suffix(" ms"))
+    let took = why
+        .split(" ms and took ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|ms| ms.parse::<u128>().ok())
         .expect("the count does not give the time of the poll it quoted");
     assert!(took > 0, "the poll it quoted took no time at all: {why}");
-    // Every poll of a wait whose command answers answered: none was killed,
-    // so the count says nothing beyond how long the poll it quotes took. This
-    // is what the deadline guard buys: switching it off
-    // (`scripts/controls/telemetry-poll-not-started-late`) makes the wait
-    // start one last poll it has no time left to wait for, which is killed
-    // where it stands and counted here.
+    // Every poll of a wait whose command answers answered: none was killed, so
+    // nothing follows the time that poll took. With the guard off the wait
+    // usually leaves a poll killed where it stands as well, and the count then
+    // says so.
     assert_eq!(parts.len(), 1, "the wait had to kill a poll: {why}");
     // What it quotes is a poll that answered: `gates list --json` answers
     // with a JSON array, and an empty one is what a project holds no gate

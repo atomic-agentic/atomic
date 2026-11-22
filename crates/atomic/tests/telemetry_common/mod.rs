@@ -780,8 +780,11 @@ const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// all: what bounds a poll that then runs past it is this, not the deadline,
 /// so a poll is killed for not answering rather than for the wait running out
 /// mid-poll. It is far more than `atomic gates list` takes and far less than
-/// [`POLL_LIMIT`].
-const POLL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+/// [`POLL_LIMIT`]. Because no poll starts inside the last of it, a gate that
+/// opens there is never seen, and the wait says that much when it fails;
+/// [`wait_for_gate_by`] refuses a `limit` shorter than this, which would start
+/// no poll at all.
+pub(crate) const POLL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
 /// `atomic gates list` shows, reading its output meanwhile, for no longer
@@ -799,23 +802,38 @@ pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
 ///
 /// Each poll is spawned and waited for with `try_wait`, under a
 /// [`POLL_LIMIT`] of its own that never runs past `limit`: one that stops
-/// answering is killed, reaped and tried again, and none starts once the
-/// deadline has passed. The message that then fails the test counts how many
-/// polls ran and how many of them had to be killed, and quotes what the last
-/// poll that answered said with how long that one took, or, if none
-/// answered, that none did. None of it quotes a killed poll, whose output
-/// stops where the kill landed and would hide the last real answer.
+/// answering is killed, reaped and tried again. None starts once the deadline
+/// has passed, and none starts inside the last [`POLL_GRACE`] of `limit`
+/// either, which is what lets a poll be bounded by its own budget rather than
+/// by where the deadline happens to fall. The cost of that is a gap at the
+/// end: a gate that opens in the last [`POLL_GRACE`] is never polled for, and
+/// the wait fails as one that never opened and says so. The message that then
+/// fails the test counts how many polls ran and how many of them had to be
+/// killed, and quotes what the last poll that answered said with when that one
+/// started and how long it took, or, if none answered, that none did. None of
+/// it quotes a killed poll, whose output stops where the kill landed and would
+/// hide the last real answer.
 ///
-/// `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll` runs
-/// this with a limit of seconds, longer than one poll is given, so that it
-/// reaches its deadline in seconds: it holds the count to what happened — more
-/// than one poll, none of them killed — and reads back as an answer what the
-/// message quotes. With the guard there switched off, the wait starts one more
-/// poll, one it has no time left to wait for, and that poll is killed where it
-/// stands; the test fails on the count.
+/// `a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish` runs this
+/// with a limit of seconds, longer than [`POLL_GRACE`], so that it reaches its
+/// deadline in seconds: it holds the count to what happened — more than one
+/// poll, none of them killed — holds when the message says the poll it quotes
+/// started to at most `limit - POLL_GRACE` after the wait began, and reads back
+/// as an answer what the message quotes. With the guard there switched off the
+/// wait starts a poll it has no time left to answer, which happens while less
+/// than [`POLL_GRACE`] is left and usually while only a few hundred
+/// milliseconds are; the start the message then gives is past what this limit
+/// can answer, and that is what fails the test. Whether that poll is also
+/// counted as killed depends on whether the deadline arrives before the next
+/// 50 ms in which the wait looks at it, so the test keeps the kill as its
+/// second assertion and not its first.
 /// `a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for` holds
-/// what the message quotes, and how long it says that took, to what a run
-/// that ends before its gate really did.
+/// what the message quotes, and when it says that poll started and how long it
+/// took, to what a run that ends before its gate really did.
+///
+/// A `limit` shorter than [`POLL_GRACE`] is refused outright: no poll could
+/// start inside it, so such a wait would sit to its deadline having asked
+/// nothing of the run and come back as though it had polled.
 ///
 /// [`POLL_LIMIT`] and [`GATE_LIMIT`] have no row under `scripts/controls/`:
 /// a row needs a test that fails with the control off, and nothing in the
@@ -832,15 +850,25 @@ pub(crate) fn wait_for_gate_by(
     child: &mut Child,
     limit: std::time::Duration,
 ) -> Drained {
+    // A bound shorter than a poll's grace is refused rather than sat through:
+    // the guard below is then never true, so the wait starts no poll, asks
+    // nothing of the run it waits for, and comes back at its deadline as though
+    // it had polled. Refused here, before the run is taken in hand.
+    if limit < POLL_GRACE {
+        panic!(
+            "a wait for a gate bounded by {limit:?} leaves less than the {POLL_GRACE:?} a poll \
+             needs to be started and answered inside it, so it would start no poll at all"
+        );
+    }
     let drained = Drained::of(child);
     let began = std::time::Instant::now();
     let deadline = began + limit;
     let mut polls = 0usize;
     let mut killed = 0usize;
-    // What the last poll that answered said, and how long that one took. A
-    // poll killed for not answering is kept out of here on purpose: what it
-    // printed is what it had got out before the kill, usually nothing.
-    let mut answered: Option<(Output, std::time::Duration)> = None;
+    // What the last poll that answered said, when it had started and how long
+    // it took. A poll killed for not answering is kept out of here on purpose:
+    // what it printed is what it had got out before the kill, usually nothing.
+    let mut answered: Option<Answered> = None;
     loop {
         // A poll starts only while the wait has a real budget left to wait
         // for one: a poll spawned with nothing left has no time to answer, is
@@ -848,14 +876,19 @@ pub(crate) fn wait_for_gate_by(
         // last thing the command said. Weighing the grace rather than the bare
         // deadline is also what leaves a poll killed only for not answering: a
         // poll started with [`POLL_GRACE`] left is bounded by that, not cut
-        // short where the deadline happens to fall. The deadline is weighed
-        // again below, so the wait ends there whether a poll ran or not.
-        // `scripts/controls/telemetry-poll-not-started-late` switches this
-        // off, and the wait then leaves one poll killed at birth, which
-        // `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll`
-        // fails on.
+        // short where the deadline happens to fall. What that costs is the gap
+        // at the end, which the failure message names: no poll is asked in the
+        // last [`POLL_GRACE`] of the wait, so a gate that opens there is not
+        // seen. The deadline is weighed again below, so the wait ends there
+        // whether a poll ran or not.
+        // `scripts/controls/telemetry-poll-not-started-late` switches this off,
+        // and the wait then starts a poll it has no time left to answer.
+        // `a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish` fails
+        // on when the message says that last poll started, which is later than
+        // this limit could ever wait for its answer.
         if std::time::Instant::now() + POLL_GRACE < deadline {
             let started = std::time::Instant::now();
+            let asked_at = started.duration_since(began);
             let mut poll = Child::new(
                 command(dir, model, &["gates", "list", "--json"], &[])
                     .stdout(Stdio::piped())
@@ -881,16 +914,20 @@ pub(crate) fn wait_for_gate_by(
                 killed += 1;
             }
             let listed = printed.wait(&mut poll);
-            // What a poll that answered said, and how long it took, kept
-            // apart from the count of killed ones: a killed poll's output
-            // stops where the kill landed, so it is never what the wait
-            // goes on to quote.
+            // What a poll that answered said, when it had started and how long
+            // it took, kept apart from the count of killed ones: a killed
+            // poll's output stops where the kill landed, so it is never what
+            // the wait goes on to quote.
             if !stuck {
-                answered = Some((listed, took));
+                answered = Some(Answered {
+                    listed,
+                    asked_at,
+                    took,
+                });
             }
             let open: Value = answered
                 .as_ref()
-                .map(|(listed, _)| serde_json::from_slice(&listed.stdout).unwrap_or(json!([])))
+                .map(|a| serde_json::from_slice(&a.listed.stdout).unwrap_or(json!([])))
                 .unwrap_or(json!([]));
             if open.as_array().is_some_and(|g| !g.is_empty()) {
                 return drained;
@@ -906,17 +943,20 @@ pub(crate) fn wait_for_gate_by(
                 Some(_) => "the run ended before its gate".to_owned(),
                 None => {
                     signal(child, "KILL");
-                    // A wait whose bound is shorter than what it gives one of
-                    // its polls ends on that poll's own bound, so it says how
-                    // long it sat rather than restating a bound it did not
-                    // keep to the millisecond.
-                    let sat = past.duration_since(began);
-                    let poll_gave = if limit < POLL_GRACE {
-                        format!(", and {} ms for the poll it had started", sat.as_millis())
+                    // What the poll guard above costs is said here, because it
+                    // is the likeliest reason a wait that ran its whole bound
+                    // saw no gate: a gate that opened inside the last
+                    // [`POLL_GRACE`] was never asked about. A wait that asked
+                    // nothing at all says that much instead.
+                    let gap = if polls == 0 {
+                        format!(
+                            " (no poll was asked: none starts in the last {POLL_GRACE:?} of a \
+                             wait)"
+                        )
                     } else {
-                        String::new()
+                        format!(" (no poll started in the last {POLL_GRACE:?})")
                     };
-                    format!("no gate opened in {limit:?}{poll_gave}, so the run was killed")
+                    format!("no gate opened in {limit:?}{gap}, so the run was killed")
                 }
             };
             let out = drained.wait(child);
@@ -931,18 +971,30 @@ pub(crate) fn wait_for_gate_by(
     }
 }
 
+/// What the wait for a gate keeps about the last poll that answered: what it
+/// printed, when it had started (from when the wait began) and how long it
+/// took. The start goes with the answer because the wait starts a poll only
+/// while it has [`POLL_GRACE`] left of its bound, and a test that reaches that
+/// bound needs the start to tell whether the poll quoted was asked inside it.
+struct Answered {
+    listed: Output,
+    asked_at: std::time::Duration,
+    took: std::time::Duration,
+}
+
 /// How the wait for a gate reports its polls: the last thing a poll actually
-/// answered and how long that one took, or that none answered, and separately
-/// how many polls it made and how many it had to kill.
-fn last_poll(
-    answered: &Option<(Output, std::time::Duration)>,
-    polls: usize,
-    killed: usize,
-) -> String {
+/// answered, when that one started and how long it took, or that none
+/// answered, and separately how many polls it made and how many it had to
+/// kill.
+fn last_poll(answered: &Option<Answered>, polls: usize, killed: usize) -> String {
     let counted = format!(
         "({polls} poll(s), {}{})",
         match answered {
-            Some((_, took)) => format!("the last took {} ms", took.as_millis()),
+            Some(a) => format!(
+                "the last started at {} ms and took {} ms",
+                a.asked_at.as_millis(),
+                a.took.as_millis()
+            ),
             None => "none answered".to_owned(),
         },
         if killed == 0 {
@@ -952,9 +1004,24 @@ fn last_poll(
         },
     );
     match answered {
-        Some((listed, _)) => format!("`atomic gates list` last said: {} {counted}", text(listed)),
+        Some(a) => format!(
+            "`atomic gates list` last said: {} {counted}",
+            text(&a.listed)
+        ),
         None => format!("no `atomic gates list` answered: {counted}"),
     }
+}
+
+/// How long after the wait began the message `why` failed with says the poll it
+/// quotes started. A message that leaves the start out, or puts something that
+/// is not a number where it belongs, fails the test that asked rather than being
+/// read as a zero.
+pub(crate) fn last_poll_started(why: &str) -> u128 {
+    why.split(" poll(s), the last started at ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|ms| ms.parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("the message does not say when its last poll started: {why}"))
 }
 
 /// The message `call` failed with; when it did not fail, or failed with
