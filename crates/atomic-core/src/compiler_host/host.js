@@ -22,7 +22,8 @@
   const refused = (what) => new Error(`the Astro compiler has no ${what}`);
 
   // deno_core's internals reach its built-in operations; the worker gets
-  // none of them. `Deno` is replaced below.
+  // none of them. `Deno` is replaced below; deno_core removes `__infra`
+  // itself once it has bootstrapped.
   delete globalThis.__bootstrap;
 
   const bytes = (input) => {

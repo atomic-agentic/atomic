@@ -184,6 +184,9 @@ pub(crate) fn run_interactive(
         let stderr = String::from_utf8_lossy(&stderr);
         let mut message = match status.code() {
             Some(code) => format!("the Astro compiler crashed (exit status: {code})"),
+            None if cpu_limit(&status) => {
+                "the Astro compiler exceeded its CPU time limit".to_owned()
+            }
             None => "the Astro compiler was stopped by a signal".to_owned(),
         };
         if !stderr.trim().is_empty() {
@@ -338,6 +341,20 @@ mod tests {
     fn an_oversized_response_is_refused() {
         let error = shell("head -c 8388609 /dev/zero", b"", TIME_LIMIT).expect_err("too large");
         assert!(error.contains("response limit"), "{error}");
+    }
+}
+
+/// Whether the worker was stopped by its CPU time limit (see `compiler_host`).
+fn cpu_limit(status: &std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal() == Some(libc::SIGXCPU)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        false
     }
 }
 

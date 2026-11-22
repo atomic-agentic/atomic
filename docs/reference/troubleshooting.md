@@ -114,10 +114,14 @@ endpoint. See
 `atomic check` and `atomic render` run Atomic's bundled Astro compiler in a
 child process of Atomic itself, on its embedded V8; no Deno is needed. A compile
 that runs past 30 seconds is stopped with `the Astro compiler exceeded 30
-seconds`, and one that outgrows its 1 GiB heap with `the Astro compiler
-exceeded its memory limit of 1024 MiB` in the error. A smaller component graph
-or simpler types bring an atom within them. A compiler that crashes is reported
-with what it wrote to stderr; report that as a bug.
+seconds`, and one that uses 32 seconds of CPU time with `the Astro compiler
+exceeded its CPU time limit`. One that outgrows its 1 GiB JavaScript heap, or
+2.5 GiB of memory in all (the heap, twice over while it unwinds, and 512 MiB
+outside it for V8, the parser's WebAssembly memory and buffers), fails, usually
+with `the Astro compiler exceeded its memory limit` in the error. Checking the whole
+example catalog needs about 800 MiB. A smaller component graph or simpler types
+bring an atom within these limits. A compiler that crashes is reported with what
+it wrote to stderr, and leaves no core file; report it as a bug.
 
 ## Deno cannot be downloaded
 

@@ -332,6 +332,12 @@ jobs:
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
+      # The compiler entry `main` dispatches, which no test reaches (test
+      # binaries serve it before `main`), and no test-only dispatch in the
+      # plain build.
+      - name: The binary's own compiler entry
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: scripts/compiler-entry-check.sh target/debug/atomic
       # A compile-fail doctest checks that a test-only method is absent
       # without its feature, which the test shards' features turn on; it runs
       # only here, without them. The whole workspace is selected, as the

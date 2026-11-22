@@ -1,0 +1,1 @@
+compiler-cpu-limit|crates/atomic-core/src/compiler_host/limits.rs|("CPU time", libc::RLIMIT_CPU, CPU_SECONDS, 1),|("CPU time", libc::RLIMIT_CPU, libc::RLIM_INFINITY as u64 + 0 * CPU_SECONDS, 1),|-p atomic-agentic-core --lib -- compiler_host::tests::a_compile_is_stopped_at_its_cpu_time_limit

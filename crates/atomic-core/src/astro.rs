@@ -11,14 +11,22 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 // What a compile's result depends on: the worker, its WASM, the host it runs
-// on and the V8 that runs it.
+// on (its JavaScript and its Rust) and the deno_core and V8 that run it.
 static COMPILER_HASH: LazyLock<String> = LazyLock::new(|| {
     use crate::compiler_host::{HOST, WASM, WORKER};
     let mut digest = Sha256::new();
-    digest.update(WORKER.as_bytes());
-    digest.update(WASM);
-    digest.update(HOST.as_bytes());
-    digest.update(deno_core::v8::VERSION_STRING.as_bytes());
+    for part in [
+        WORKER.as_bytes(),
+        WASM,
+        HOST.as_bytes(),
+        include_str!("compiler_host.rs").as_bytes(),
+        include_str!("compiler_host/limits.rs").as_bytes(),
+        crate::compiler_host::DENO_CORE.as_bytes(),
+        deno_core::v8::VERSION_STRING.as_bytes(),
+    ] {
+        digest.update(part);
+        digest.update([0]);
+    }
     format!("{:x}", digest.finalize())
 });
 

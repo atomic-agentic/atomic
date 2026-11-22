@@ -593,12 +593,15 @@ under `crates/atomic-core/assets` and included in the binary. Running atoms need
 no Deno, npm install or project `node_modules`: atomic starts itself as the
 compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
 embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
-environment, a 1 GiB heap limit and the parent's 30-second limit, and its host
-(`compiler_host/host.js`) gives the worker the protocol's stdin and stdout, stderr
-for its console, its exit status, its own WASM, random bytes, SHA-256 and timers,
-and nothing else: no network, environment, filesystem or subprocess. atomic reads atom sources itself and sends them in the
-request, for loading as for rendering. Direct-run context checkpoints live outside
-the source tree.
+environment, a 1 GiB V8 heap limit, operating-system limits of 2.5 GiB of
+writable memory (twice the heap, plus 512 MiB for what V8 keeps outside it:
+WebAssembly memories and ArrayBuffers among it), 32 seconds of CPU time and no
+core files (`compiler_host/limits.rs`), and the parent's 30-second limit. Its
+host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
+stderr for its console, its exit status, its own WASM, random bytes, SHA-256 and
+timers, and nothing else: no network, environment, filesystem or subprocess.
+atomic reads atom sources itself and sends them in the request, for loading as
+for rendering. Direct-run context checkpoints live outside the source tree.
 
 A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
 it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's

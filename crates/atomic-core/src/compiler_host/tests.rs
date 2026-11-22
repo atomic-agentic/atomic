@@ -228,6 +228,7 @@ fn the_host_offers_no_environment_process_or_deno_internals() {
         "return { \
            deno: Object.keys(Deno).sort(), \
            bootstrap: typeof globalThis.__bootstrap, \
+           infra: typeof globalThis.__infra, \
            process: typeof globalThis.process, \
            require: typeof globalThis.require, \
          };",
@@ -238,6 +239,7 @@ fn the_host_offers_no_environment_process_or_deno_internals() {
         json!({
             "deno": ["exit", "readFile", "stdin", "stdout", "version"],
             "bootstrap": "undefined",
+            "infra": "undefined",
             "process": "undefined",
             "require": "undefined",
         })
@@ -289,7 +291,7 @@ fn a_heap_blow_up_is_refused_at_the_limit() {
     )
     .expect_err("refused");
     assert!(
-        error.contains("the Astro compiler exceeded its memory limit of 64 MiB"),
+        error.contains("the Astro compiler exceeded its memory limit"),
         "{error}"
     );
     assert!(
@@ -386,5 +388,65 @@ fn console_output_stays_off_the_protocol() {
     assert!(
         error.contains("distinct-console-text") && error.contains("Error: stop"),
         "{error}"
+    );
+}
+
+// WebAssembly memories and ArrayBuffer contents are outside the V8 heap
+// limit; the child's memory limit bounds them. Neither is touched, so a host
+// without that limit would grant both without using the memory.
+#[test]
+fn memory_outside_the_heap_is_refused_past_the_limit() {
+    let heap = 64 * 1024 * 1024;
+    let limit = limits::memory_limit(heap);
+    assert_eq!(limit, limits::OUTSIDE_HEAP + 2 * heap as u64);
+    let env = [(HEAP_ENV, heap.to_string())];
+    let grow = |pages: u64| {
+        probe_with(
+            &format!(
+                "return new WebAssembly.Memory({{ initial: 1, maximum: 65536 }}).grow({pages});"
+            ),
+            &env,
+            TIME_LIMIT,
+        )
+    };
+    assert_eq!(grow(16), Ok(json!(1)));
+    // A memory grown past the limit: V8 fails the compile.
+    let error = grow(limit / 65536 + 1).expect_err("refused");
+    assert!(
+        error.contains("the Astro compiler exceeded its memory limit"),
+        "{error}"
+    );
+    // An ArrayBuffer past the limit: V8 fails the compile.
+    let error = probe_with(
+        &format!("return new Uint8Array({limit} + 1).length;"),
+        &env,
+        TIME_LIMIT,
+    )
+    .expect_err("refused");
+    assert!(
+        error.contains("the Astro compiler exceeded its memory limit"),
+        "{error}"
+    );
+}
+
+// CPU time over all of the child's threads is bounded too, below the wall
+// clock here so that the CPU limit is what stops it.
+#[test]
+fn a_compile_is_stopped_at_its_cpu_time_limit() {
+    let started = Instant::now();
+    let error = probe_with(
+        "for (;;) {}",
+        &[],
+        Duration::from_secs(limits::CPU_SECONDS + 20),
+    )
+    .expect_err("stopped");
+    assert!(
+        error.contains("the Astro compiler exceeded its CPU time limit"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(limits::CPU_SECONDS + 10),
+        "{:?}",
+        started.elapsed()
     );
 }

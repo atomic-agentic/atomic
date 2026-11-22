@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod limits;
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +38,9 @@ pub(crate) static WORKER: &str = include_str!("../assets/worker.mjs");
 pub(crate) static WASM: &[u8] = include_bytes!("../assets/astro.wasm");
 /// What the worker may use of Deno, Node and the web platform.
 pub(crate) const HOST: &str = include_str!("compiler_host/host.js");
+
+/// The `deno_core` release the compiler runs on (Cargo.toml pins it).
+pub(crate) const DENO_CORE: &str = "deno_core 0.413.0";
 
 /// The V8 heap one compile may use.
 pub(crate) const HEAP_LIMIT: usize = 1024 * 1024 * 1024;
@@ -66,7 +70,9 @@ pub fn serve() -> i32 {
 }
 
 fn serve_module(source: &str, heap_limit: usize) -> i32 {
-    let status = match run(source, heap_limit) {
+    let status = match limits::limit_self(limits::memory_limit(heap_limit))
+        .and_then(|()| run(source, heap_limit))
+    {
         Ok(()) => 0,
         Err(message) => {
             eprintln!("{message}");
@@ -87,8 +93,9 @@ fn serve_module(source: &str, heap_limit: usize) -> i32 {
 mod test_dispatch {
     use super::*;
 
-    /// release-package.sh refuses a binary holding this text.
-    static TEST_DISPATCH: &str = "ATOMIC_COMPILER_TEST_DISPATCH";
+    /// release-package.sh refuses a binary holding this text. It is split
+    /// here because this file's own text is in every binary (`COMPILER_HASH`).
+    static TEST_DISPATCH: &str = concat!("ATOMIC_COMPILER_", "TEST_DISPATCH");
 
     #[ctor::ctor(unsafe)]
     fn serve_in_a_test_binary() {
@@ -303,10 +310,7 @@ fn run(source: &str, heap_limit: usize) -> Result<(), String> {
     });
     let failed = |error: &dyn std::fmt::Display| {
         if exhausted.load(Ordering::Acquire) {
-            format!(
-                "the Astro compiler exceeded its memory limit of {} MiB",
-                heap_limit / (1024 * 1024)
-            )
+            "the Astro compiler exceeded its memory limit".to_owned()
         } else {
             format!("the Astro compiler failed: {error}")
         }
