@@ -1,0 +1,1 @@
+legacy-inventory-locked|crates/atomic-core/src/state.rs|let locked_legacy = legacy_layouts(&self.dir)?;|let locked_legacy = legacy; // CONTROL_OFF: stale inventory|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_inventory_is_rechecked_under_the_migration_lock

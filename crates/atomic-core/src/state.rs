@@ -331,10 +331,7 @@ impl ProjectState {
         private_dir(&self.private)?;
         self.move_codex_records()?;
         self.retire_legacy_scratch()?;
-        let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
-            .into_iter()
-            .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
-            .collect();
+        let legacy = legacy_layouts(&self.dir)?;
         if legacy.is_empty() {
             return Ok(());
         }
@@ -350,13 +347,16 @@ impl ProjectState {
             .truncate(false)
             .open(&lock_path)
             .map_err(fail(&lock_path))?;
+        #[cfg(test)]
+        legacy_inventory_ready();
         lock.lock().map_err(fail(&lock_path))?;
-        for dir in legacy {
+        let locked_legacy = legacy_layouts(&self.dir)?;
+        for dir in locked_legacy {
             // Both layouts at once: moving would lose one of them, and
             // ignoring the old one could hide the project's runs.
             for name in LEGACY {
                 let (old, current) = (dir.join(name), self.private.join(name));
-                if old.exists() && current.exists() {
+                if legacy_entry_present(&old)? && legacy_entry_present(&current)? {
                     return Err(StateError::Both { old, current });
                 }
             }
@@ -389,7 +389,7 @@ impl ProjectState {
             };
             for name in LEGACY {
                 let (old, new) = (dir.join(name), self.private.join(name));
-                if old.exists() {
+                if legacy_entry_present(&old)? {
                     std::fs::rename(&old, &new).map_err(fail(&new))?;
                 }
             }
@@ -763,6 +763,52 @@ pub enum LockError {
 /// What an older layout kept in the state directory, at its top or in its
 /// `private/`.
 const LEGACY: [&str; 4] = ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"];
+
+/// Only the filesystem saying an entry is absent counts as absent. A final
+/// link is an entry too: an old entry or destination must not be lost merely
+/// because the link's target is missing.
+fn legacy_entry_present(path: &Path) -> Result<bool, StateError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StateError::Create {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn legacy_layouts(state: &Path) -> Result<Vec<PathBuf>, StateError> {
+    let mut found = Vec::new();
+    for dir in [state.join("private"), state.to_owned()] {
+        let mut has_state = false;
+        for name in LEGACY {
+            has_state |= legacy_entry_present(&dir.join(name))?;
+        }
+        if has_state {
+            found.push(dir);
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+type InventoryReadyHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_INVENTORY_READY: std::cell::RefCell<Option<InventoryReadyHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn legacy_inventory_ready() {
+    let ready = LEGACY_INVENTORY_READY.with(|slot| slot.borrow_mut().take());
+    if let Some(ready) = ready {
+        ready();
+    }
+}
 
 /// Hold an existing, regular legacy execution lock until the returned file
 /// is dropped. Only a missing path is absent. Another holder, an unreadable
@@ -2726,6 +2772,133 @@ mod tests {
         std::fs::create_dir_all(old.join("context")).expect("old context");
         std::fs::write(old.join("context/kept"), "unmoved").expect("old state");
         (home, state, old)
+    }
+
+    #[test]
+    fn legacy_inventory_lookup_errors_refuse_creation() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-directory");
+        std::fs::remove_dir_all(&old).expect("remove old fixture");
+        std::fs::write(&old, "not a directory").expect("opaque old layout");
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("context"))
+                .expect_err("the lookup really fails")
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        match state.create().expect_err("an unknown layout must refuse") {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old.join("atomic.db"));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotADirectory);
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&old).expect("unchanged"),
+            "not a directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_loop_errors_refuse_creation() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-loop");
+        std::fs::remove_dir_all(&old).expect("remove old fixture");
+        std::os::unix::fs::symlink("private", &old).expect("old layout loop");
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("atomic.db"))
+                .expect_err("the parent loop really fails")
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        match state.create().expect_err("an unknown layout must refuse") {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old.join("atomic.db"));
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_keeps_an_existing_dangling_destination() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-destination");
+        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+        std::fs::create_dir_all(state.private_dir()).expect("new private directory");
+        std::os::unix::fs::symlink("missing", state.database()).expect("existing destination");
+        match state
+            .create()
+            .expect_err("an existing destination is not absent")
+        {
+            StateError::Both { old: from, current } => {
+                assert_eq!(from, old.join("atomic.db"));
+                assert_eq!(current, state.database());
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_link(state.database()).expect("link remains"),
+            Path::new("missing")
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join("atomic.db")).expect("source remains"),
+            "old database"
+        );
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_moves_an_existing_dangling_entry() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-entry");
+        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+        std::fs::remove_dir_all(old.join("context")).expect("replace old context");
+        std::os::unix::fs::symlink("missing", old.join("context")).expect("old entry");
+        state.create().expect("moves existing entries");
+        assert_eq!(
+            std::fs::read_link(state.context_dir()).expect("entry moved without following it"),
+            Path::new("missing")
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("context"))
+                .expect_err("no old entry left behind")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn legacy_inventory_is_rechecked_under_the_migration_lock() {
+        let (_home, state, _old) = legacy_lock_fixture("legacy-inventory-locked");
+        let held = std::fs::File::create(state.dir().join("migrate.lock")).expect("migration lock");
+        held.lock().expect("another migration holds the lock");
+        let (ready, before_lock) = std::sync::mpsc::sync_channel(0);
+        let work = state.clone();
+        let worker = std::thread::spawn(move || {
+            LEGACY_INVENTORY_READY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    ready.send(()).expect("preflight observed");
+                }));
+            });
+            work.create()
+        });
+        let reached = before_lock.recv_timeout(std::time::Duration::from_secs(10));
+        let arrived = std::fs::write(
+            state.dir().join("atomic.db"),
+            "arrived during another migration",
+        );
+        let released = held.unlock();
+        let migrated = worker.join();
+        reached.expect("the first inventory completed before waiting on the lock");
+        arrived.expect("another process left a legacy database");
+        released.expect("migration lock released");
+        migrated
+            .expect("migration thread")
+            .expect("migration succeeded");
+        assert_eq!(
+            std::fs::read_to_string(state.database()).expect("newly discovered database moved"),
+            "arrived during another migration"
+        );
     }
 
     fn legacy_context_is_unmoved(state: &ProjectState, old: &Path) {

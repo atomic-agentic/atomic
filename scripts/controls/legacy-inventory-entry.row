@@ -1,0 +1,1 @@
+legacy-inventory-entry|crates/atomic-core/src/state.rs|if legacy_entry_present(&old)? {|if old.exists() { // CONTROL_OFF: dangling entry left behind|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_inventory_moves_an_existing_dangling_entry

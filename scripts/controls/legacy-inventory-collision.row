@@ -1,0 +1,1 @@
+legacy-inventory-collision|crates/atomic-core/src/state.rs|if legacy_entry_present(&old)? && legacy_entry_present(&current)? {|if false && legacy_entry_present(&old)? && legacy_entry_present(&current)? { // CONTROL_OFF: destination overwritten|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_inventory_keeps_an_existing_dangling_destination

@@ -1,0 +1,1 @@
+legacy-inventory-errors|crates/atomic-core/src/state.rs|Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),|Err(_source) => Ok(false), // CONTROL_OFF: lookup errors read as absence|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_inventory_lookup_errors_refuse_creation
