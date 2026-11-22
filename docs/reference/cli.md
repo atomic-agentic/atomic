@@ -326,6 +326,13 @@ Each run is stamped with the layout of the durable steps atomic records, not
 with the build that started it, so a rebuilt or upgraded atomic with the same
 layout resumes and recovers it. A run of another layout is refused by
 `atomic runs resume` and listed by `atomic serve`, which leaves it as it is.
+
+On a PostgreSQL store several projects share, `atomic serve` lists, takes
+and recovers only its own project's runs. Give each project's processes an
+executor identity of their own: when an identity, set in user configuration
+for example, owns another project's unfinished run that recovery would
+take, `atomic serve` refuses to start rather than run that project's run in
+this one's code, and says how many such runs there are without naming them.
 Atomic refuses to start when the durable engine's own version variable
 (`DBOS__APPVERSION`) is set.
 
