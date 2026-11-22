@@ -5449,14 +5449,12 @@ mod tests {
         .expect("key number");
         assert!(
             certificates("key-number.json").contains("cert_configs.workload.key_path is not text"),
-            "{}",
-            certificates("key-number.json")
+            "key-number.json was not refused as expected"
         );
         std::fs::write(dir.join("configs-list.json"), r#"{"cert_configs": []}"#).expect("list");
         assert!(
             certificates("configs-list.json").contains("cert_configs is not an object"),
-            "{}",
-            certificates("configs-list.json")
+            "configs-list.json was not refused as expected"
         );
         std::fs::create_dir_all(dir.join("a-directory")).expect("dir");
         assert!(google("a-directory").contains("not a plain file"));
