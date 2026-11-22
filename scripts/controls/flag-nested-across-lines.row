@@ -1,1 +1,1 @@
-flag-nested-across-lines|crates/atomic-core/src/redact.rs|    Some(if hidden { lines } else { REDACTED.to_owned() })|    Some(lines) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::assignments_after_flags_keep_their_values_hidden
+flag-nested-across-lines|crates/atomic-core/src/redact.rs|    Some(if hidden { lines } else { REDACTED.to_owned() })|    Some(lines) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::quotes_ambiguous_only_across_lines_hide_the_text_whole

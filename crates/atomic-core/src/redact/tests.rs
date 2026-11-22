@@ -3253,6 +3253,10 @@ fn a_secret_flag_with_no_value_leaves_the_next_flag_readable() {
             "case {case}: the value showed"
         );
         assert!(out.contains("--password"), "case {case}: the flag went");
+        assert!(
+            out.contains(["--token=", "--api-key=", "--api_key="][case]),
+            "case {case}: the next flag's name went"
+        );
         let mut held = json!({"key": json!({"cmd": line}).to_string()});
         value(&mut held);
         assert!(
@@ -3274,6 +3278,42 @@ fn quotes_nested_ambiguously_hide_only_their_line() {
     assert_eq!(
         out,
         format!("first line stays\n{REDACTED}\nlast line stays\n")
+    );
+}
+
+/// When only the full text makes the quotes ambiguous, preserving each
+/// line separately would not enforce the whole-text refusal.
+#[test]
+fn quotes_ambiguous_only_across_lines_hide_the_text_whole() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let line = format!("--name\n\"login --auth-token \"{credential}\"");
+    assert_eq!(
+        text(&line),
+        REDACTED,
+        "cross-line ambiguity was not hidden whole"
+    );
+}
+
+/// One production reading stops an unclean flag value before the next
+/// assignment's name, so the following assignment rule still sees it.
+/// Later settlement readings may hide that name, but must keep its value
+/// hidden too.
+#[test]
+fn an_unclean_flag_read_keeps_the_assignment_name_for_the_next_rule() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let line = format!("echo \"--token [a, b] api_key= '{credential}'\"");
+    let once = text_once(&line);
+    assert!(
+        !once.contains(&credential[4..]),
+        "the assigned value showed in one reading"
+    );
+    assert!(
+        once.contains("api_key="),
+        "the assignment's name was hidden before its rule"
+    );
+    assert!(
+        !text(&line).contains(&credential[4..]),
+        "the assigned value showed after settlement"
     );
 }
 

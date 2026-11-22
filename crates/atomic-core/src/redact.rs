@@ -1187,7 +1187,8 @@ fn assigned_spans(input: &str, depth: usize) -> (Vec<(usize, usize)>, bool) {
             // A secret value whose quote never closes is bounded by the
             // same enclosing value as the ordinary read above. Keep looking
             // for inner assignments when it holds another separator.
-            if let Some((value_from, value_to)) = unclosed_value(scope, start)
+            if limit == input.len()
+                && let Some((value_from, value_to)) = unclosed_value(scope, start)
                 && !scope[value_from..value_to].contains(['=', ':'])
                 && is_secret_value(strength, &scope[value_from..value_to])
             {
