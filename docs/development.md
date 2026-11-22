@@ -215,7 +215,12 @@ file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
 (in CI) tests that. It refuses to start while a file a selected control edits
 differs from HEAD, including a file git does not track or is told to assume
 unchanged, so commit or put back changes to those files first; changes to
-other files do not matter.
+other files do not matter. It also refuses to start while another run holds the
+tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
+the same files and each saves its own originals, so the one that finishes last
+would put back the other's switched-off source. That lock is closed before cargo
+runs, so a test that leaves a process behind does not hold a finished run's
+lock.
 
 Each control is one file under `scripts/controls/`, named `<name>.row` and
 holding one line:
@@ -240,6 +245,20 @@ control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
+
+A row's replacement must say nothing the live code already writes in the file it
+names, or what switching the control off would write cannot be told from the
+control. Where switching off picks a value the file uses elsewhere, write it
+through a binding no live code names —
+`const ATOMIC_CONTROL_REMOVED: &str = HOST_REFUSED; ATOMIC_CONTROL_REMOVED`, as
+the `exec-network-suffix-reason` row does. That is what
+`python3 scripts/controls-on.py` checks, and CI runs it on the commit it checks
+out, where `controls-check.sh` cannot run: it fails a tree in which a row's
+switch text is not in its file exactly once, or in which what that row's
+replacement writes is in its file at all, naming the row either way. It reads the
+row files by the same rules as the script, so a row that cannot be read is
+refused there too rather than left unchecked, and
+`scripts/controls-check-test.sh` tests it with fixtures it commits.
 
 ## Milestone acceptance
 

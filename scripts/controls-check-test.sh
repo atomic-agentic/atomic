@@ -26,8 +26,10 @@ fail() {
 # replaces what was saved with a state from before the commit, `rebuild` says
 # in rebuild.log how each file it edits stands against the binaries this run
 # built, `kill` kills the script outright, `hang` waits, with the control off,
-# until it is stopped, and `spaces` names a failed test as a doctest is named.
-# It notes its arguments in cargo-args.
+# until it is stopped and notes the pid to stop in cargo-pid, `orphan` notes its
+# pid in orphan-pid and leaves a process behind that keeps whatever descriptors
+# cargo handed down, and `spaces` names a failed test as a doctest is named. It
+# notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
@@ -74,7 +76,25 @@ rebuild)
     fi
     ;;
 kill) kill -KILL "${PPID}"; exit 0 ;;
-hang) : >cargo-started; exec sleep 300 ;;
+hang)
+    # Its own pid before the file a case waits on: `exec` keeps the pid, so a
+    # case that stops the run can name the cargo it was waiting on.
+    echo "$$" >cargo-pid
+    : >cargo-started
+    exec sleep 300
+    ;;
+orphan)
+    # A process this run leaves behind, which keeps whatever descriptors cargo
+    # handed down; its pid is noted in orphan-pid so that the case asking for
+    # it can stop it. It is left once, because the same stand-in is called
+    # again after the control goes back. Nothing of its own is on any of its
+    # three standard descriptors, so it holds no writer open on anything the
+    # run opened, only what it inherited.
+    if [ ! -e orphan-pid ]; then
+        (exec sleep 300) </dev/null >/dev/null 2>&1 &
+        echo "$!" >orphan-pid
+    fi
+    ;;
 esac
 # The tests the arguments name, after `--` or as positional filters, each
 # in a test binary of its own, run in order as cargo runs them: without
@@ -183,6 +203,10 @@ fresh() {
     rm -rf "${repo}"
     mkdir -p "${repo}/scripts/controls"
     cp "${ROOT}/scripts/controls-check.sh" "${repo}/scripts/"
+    cp "${ROOT}/scripts/controls-on.py" "${repo}/scripts/"
+    # What the tree ignores, so that a run's own state under target/ is judged
+    # as it is in the real tree.
+    cp "${ROOT}/.gitignore" "${repo}/"
     cp "${ROOT}"/scripts/controls/*.row "${repo}/scripts/controls/"
     # Every file a control names.
     local file
@@ -212,6 +236,25 @@ run() {
 untouched() {
     [ -z "$(git -C "${repo}" status --porcelain -- crates)" ]
 }
+
+# run_on: ask scripts/controls-on.py about the copy; sets `code` and `out`. It
+# reads the tree its own file sits in, so the copy is what it judges.
+run_on() {
+    out="$(cd "${repo}" && python3 scripts/controls-on.py 2>&1)"
+    code=$?
+}
+
+# Every control is on in the tree these cases copy. CI asks the same question
+# of the tree it checks out; asked again here, because a control committed
+# switched off would leave every case below reading a disabled control's files
+# as a control on: the stand-in cargo weighs a control against HEAD, and a
+# committed one matches HEAD.
+if ! on_out="$(python3 "${ROOT}/scripts/controls-on.py" 2>&1)"; then
+    echo "FAIL a control is switched off in this tree, so every case below" \
+        "would weigh a disabled control against its own commit:" >&2
+    printf '%s\n' "${on_out}" >&2
+    exit 1
+fi
 
 # Every control fails its test when off and passes when on; nothing is left.
 repo="$(fresh)"
@@ -559,6 +602,92 @@ run honest git-hardening
 cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
 untouched || fail "after a kill: the saved original does not restore the file"
 
+# One run at a time in a tree. Two runs switch the same files, each saving its
+# own originals, and the one that finishes last puts back what it found, which
+# is the other's switched-off source. While one run holds the tree's lock, the
+# next refuses before it edits anything or asks cargo anything. The run that
+# holds it is asked to stop by the case, so it ends with its own exit.
+repo="$(fresh)"
+(cd "${repo}" && FAKE_CARGO=hang PATH="${WORK}/bin:${PATH}" exec scripts/controls-check.sh git-hardening) \
+    >/dev/null 2>&1 &
+holder=$!
+# Not a job of this shell: it is stopped outright below, and a job the shell
+# reports as killed reads to a reviewer like a failure of the suite.
+disown "${holder}"
+for _ in $(seq 1 100); do
+    [ -e "${repo}/cargo-started" ] && break
+    sleep 0.1
+done
+[ -e "${repo}/cargo-started" ] || fail "lock held: the first run never reached cargo"
+# The kernel holds what the first run took, so the second's refusal is the
+# lock and not a message it happens to print.
+if flock -n "${repo}/target/controls-check.lock" -c 'exit 0' 2>/dev/null; then
+    fail "lock held: target/controls-check.lock is free while the first run is inside cargo, so its refusal was not the lock"
+fi
+# The row the second run names edits redact.rs, a file the first run never
+# touches, so the refusal is for the lock and not for a dirty file. The first
+# run has git.rs switched off, which is its own doing and not this run's.
+run honest braced-esc
+[ "${code}" -eq 1 ] &&
+    grep -q "target/controls-check.lock is held by another scripts/controls-check.sh run in this tree" <<<"${out}" ||
+    fail "lock held: exit ${code}: ${out}"
+grep -q "nothing was edited" <<<"${out}" || fail "lock held: the refusal does not say nothing was edited: ${out}"
+[ -z "$(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)" ] ||
+    fail "lock held: the second run edited a file: $(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)"
+[ ! -e "${repo}/cargo-args" ] || fail "lock held: the second run asked cargo: $(cat "${repo}/cargo-args")"
+# The lock is the kernel's, so a run killed outright releases it and the next
+# starts. The kill finds the holder inside cargo, with its control switched off
+# and its originals saved, which is the state a lock must outlive.
+kill -KILL "${holder}" 2>/dev/null
+# What that run was waiting on is this case's to stop, too: a run killed
+# outright never gets to stop the cargo it was inside.
+kill -KILL "$(cat "${repo}/cargo-pid")" 2>/dev/null
+for _ in $(seq 1 100); do
+    kill -0 "${holder}" 2>/dev/null || break
+    sleep 0.1
+done
+git -C "${repo}" diff --quiet HEAD -- crates/atomic-core/src/git.rs &&
+    fail "killed holder: the first run was not mid-run when it was killed, so the next run proves nothing"
+cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
+rm -rf "${repo}/target/controls-check"
+run honest braced-esc
+[ "${code}" -eq 0 ] && grep -q "^ok braced-esc" <<<"${out}" ||
+    fail "after a killed holder: exit ${code}: ${out}"
+untouched || fail "after a killed holder: the source is left modified"
+# The lock file is not run state, so it does not trip the rule that refuses a
+# tree holding a run that did not finish.
+[ -e "${repo}/target/controls-check.lock" ] || fail "lock file: the lock is gone from target/"
+[ -z "$(git -C "${repo}" status --porcelain -- target)" ] ||
+    fail "lock file: the lock is not ignored: $(git -C "${repo}" status --porcelain -- target)"
+
+# A test that leaves a process behind must not leave the tree locked. Cargo and
+# everything it starts are given the lock's descriptor closed, so the run's exit
+# ends the lock; a descriptor handed down would keep it held until that process
+# ended on its own, which the next run reads as one still going.
+repo="$(fresh)"
+run orphan braced-esc
+[ "${code}" -eq 0 ] && grep -q "^ok braced-esc" <<<"${out}" || fail "orphan: exit ${code}: ${out}"
+untouched || fail "orphan: the source is left modified"
+orphan_pid="$(cat "${repo}/orphan-pid")"
+[ -n "${orphan_pid}" ] || fail "orphan: the stand-in noted no process left behind"
+run honest git-dir
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
+    fail "orphan left behind: exit ${code}: ${out}"
+# The process this case asked for is this case's to stop. What is asserted is
+# that the lock is free again, not that the process is gone: killed, it may
+# wait to be reaped by whoever adopted it, and a dead process holds no lock.
+kill -KILL "${orphan_pid}" 2>/dev/null
+free=1
+for _ in $(seq 1 100); do
+    if flock -n "${repo}/target/controls-check.lock" -c 'exit 0' 2>/dev/null; then
+        free=0
+        break
+    fi
+    sleep 0.1
+done
+[ "${free}" -eq 0 ] ||
+    fail "orphan left behind: pid ${orphan_pid} holds the lock even after it was killed"
+
 # What each case above is the control of, in scripts/controls-check.sh. A
 # control is tested by removing it: neutralise one line at a time and its case
 # fails.
@@ -583,6 +712,317 @@ untouched || fail "after a kill: the saved original does not restore the file"
 #   [ "${#selected[@]}" -eq 0 ] || ... exit 2       unknown names, the name of
 #                                                   a control whose file is
 #                                                   gone
+#   flock -n 9                                      the lock held
+#   9>&-                              in run_cargo  the orphan left behind, and
+#                                                   the killed holder's cargo
+#   command -v flock >/dev/null 2>&1 || die         refuses a run it cannot keep
+#                                                   apart from another; not
+#                                                   tested, because faking that
+#                                                   would hide git and cp too
+
+# scripts/controls-on.py: every control is on in the tree. CI runs it on the
+# commit it checks out, where controls-check.sh cannot run (a rebuild per
+# control), so a control committed switched off is caught here and not there.
+# Each case builds a fixture the way a checkout is: the file as committed, and
+# the row that says what switching the control off writes.
+
+# A tree with every control on passes, saying how many it read: a run that
+# found no control and said nothing would be the quiet way to lose them all.
+repo="$(fresh)"
+run_on
+[ "${code}" -eq 0 ] &&
+    grep -q "^ok: ${#CONTROL_ROWS[@]} controls are on in this tree$" <<<"${out}" ||
+    fail "controls on: exit ${code}: ${out}"
+
+# The row the cases about one control write, and the file it names. Its switch
+# and its replacement are unlike each other, and neither is a substring of the
+# other.
+gh_row='git-hardening|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|guard'
+gh_file=crates/atomic-core/src/git.rs
+
+# Commit what the copy holds, so the next case starts from a checked-in tree.
+commit() {
+    git -C "${repo}" add -A &&
+        git -C "${repo}" -c user.name=test -c user.email=test@example.invalid \
+            -c commit.gpgSign=false commit -qm committed
+}
+
+# switch_off ROW FILE: write the control off in FILE the way the row says, the
+# one place it claims. It fails the case when that place is not there, so a
+# fixture never asserts against a file it never changed.
+switch_off() {
+    local row="$1" file="$2" old new
+    IFS='|' read -r _ _ old new _ <<<"${row}"
+    python3 - "${file}" "${old}" "${new}" <<'PY' || fail "switch_off: ${file} is not switched off"
+import sys
+
+path, old, new = sys.argv[1:]
+text = open(path, newline="").read()
+if text.count(old) != 1:
+    sys.exit(f"{old!r} is not the one place it claims in {path}")
+open(path, "w", newline="").write(text.replace(old, new, 1))
+PY
+}
+
+# A control committed switched off: the commit holds what the row's replacement
+# writes where the control was, which is what a `git commit -a` taken while a
+# controls-check run was editing leaves behind. The row is named.
+repo="$(fresh)"
+printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+switch_off "${gh_row}" "${repo}/${gh_file}"
+commit
+run_on
+[ "${code}" -eq 1 ] && grep -q "^FAIL git-hardening: " <<<"${out}" ||
+    fail "control committed off: exit ${code}: ${out}"
+grep -q "so this tree holds the control switched off" <<<"${out}" ||
+    fail "control committed off: it does not say the control is off: ${out}"
+grep -q "1 row(s) name a control that is not on in this tree" <<<"${out}" ||
+    fail "control committed off: it does not count what it refused: ${out}"
+
+# A row whose replacement text is live in its file already, from a change that
+# has nothing to do with the control: the check refuses the row, because what
+# switching off writes can no longer be told from what the control writes. This
+# is why a row's replacement must say nothing live code already writes there.
+repo="$(fresh)"
+printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+printf '%s\n' '        for setting in HARDENING.iter().take(0) {' >>"${repo}/${gh_file}"
+commit
+run_on
+[ "${code}" -eq 1 ] && grep -q "^FAIL git-hardening: " <<<"${out}" ||
+    fail "a replacement live in the file: exit ${code}: ${out}"
+grep -q "so this tree holds the control switched off" <<<"${out}" ||
+    fail "a replacement live in the file: it does not say the control is off: ${out}"
+
+# A switch that is no longer there: the code moved, so the row points at
+# nothing and the control it names is unchecked.
+repo="$(fresh)"
+printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+sed -i 's|        for setting in HARDENING {|        for setting in HARDENING_MOVED {|' \
+    "${repo}/${gh_file}"
+commit
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: its switch text is not in ${gh_file}" <<<"${out}" ||
+    fail "the switch moved: exit ${code}: ${out}"
+
+# A switch that meets the file twice: which site the row switches is not fixed,
+# so the count is what is refused, not the absence.
+repo="$(fresh)"
+printf '%s\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+printf '%s\n' '        for setting in HARDENING {' >>"${repo}/${gh_file}"
+commit
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: its switch text appears 2 times in ${gh_file}, not once" <<<"${out}" ||
+    fail "the switch meets twice: exit ${code}: ${out}"
+
+# Everything it cannot read is a refusal, in the same shape and with the same
+# reasons as the rows rules in controls-check.sh, so that a control lost to a
+# malformed file or a lost file is never reported as one that is on.
+repo="$(fresh)"
+rm -rf "${repo}/scripts/controls"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "FAIL: ${repo}/scripts/controls is not there, so there is no control to check" <<<"${out}" ||
+    fail "controls-on the rows gone: exit ${code}: ${out}"
+
+repo="$(fresh)"
+rm -rf "${repo}/scripts/controls"
+: >"${repo}/scripts/controls"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "FAIL: ${repo}/scripts/controls is not a directory, so there is no control to check" <<<"${out}" ||
+    fail "controls-on the rows path is a file: exit ${code}: ${out}"
+
+repo="$(fresh)"
+rm -f "${repo}"/scripts/controls/*.row
+run_on
+[ "${code}" -eq 1 ] && grep -q "FAIL: ${repo}/scripts/controls holds no control" <<<"${out}" ||
+    fail "controls-on no row files: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row.txt"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row.txt is not named <name>.row, so its control would never be read" <<<"${out}" ||
+    fail "controls-on a row file named otherwise: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n%s\n' \
+    'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    'git-filters|crates/atomic-core/src/git.rs|c|d|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row holds 2 rows, not the one it must" <<<"${out}" ||
+    fail "controls-on two rows in a file: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a || b|c|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 6 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "controls-on a field holding a '|': exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 3 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "controls-on a row missing a field: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' '|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/git-hardening.row names no control" <<<"${out}" ||
+    fail "controls-on a row naming no control: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'another-name|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row names itself 'another-name', which is not its file name" <<<"${out}" ||
+    fail "controls-on a row named otherwise: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/zsecond.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "FAIL zsecond.row: scripts/controls/zsecond.row names the control 'git-hardening', which another row file already names" <<<"${out}" ||
+    fail "controls-on two rows naming one control: exit ${code}: ${out}"
+
+repo="$(fresh)"
+mkdir -p "${repo}/scripts/controls/sub.row"
+run_on
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/sub.row is not a regular file" <<<"${out}" ||
+    fail "controls-on a directory in the rows: exit ${code}: ${out}"
+
+repo="$(fresh)"
+ln -s now-where-it-points.row "${repo}/scripts/controls/dangling.row"
+run_on
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/dangling.row is not a regular file" <<<"${out}" ||
+    fail "controls-on a row that is a link to nothing: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf 'x\xffy\n' >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/git-hardening.row is not text" <<<"${out}" ||
+    fail "controls-on a row that is not text: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'under-a-file|crates/atomic-core/src/git.rs/under-a-file.rs|a|b|args' \
+    >"${repo}/scripts/controls/under-a-file.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL under-a-file: scripts/controls/under-a-file.row names crates/atomic-core/src/git.rs/under-a-file.rs, which is not a file and so holds no control" <<<"${out}" ||
+    fail "controls-on a row naming a path under a file: exit ${code}: ${out}"
+
+repo="$(fresh)"
+printf '%s\n' 'a-directory|crates/atomic-core/src|a|b|args' \
+    >"${repo}/scripts/controls/a-directory.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL a-directory: scripts/controls/a-directory.row names crates/atomic-core/src, which is a directory and so holds no control" <<<"${out}" ||
+    fail "controls-on a row naming a directory: exit ${code}: ${out}"
+
+repo="$(fresh)"
+rm -f "${repo}/${gh_file}"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: scripts/controls/git-hardening.row names ${gh_file}, which is not there" <<<"${out}" &&
+    grep -q "^FAIL git-dir: scripts/controls/git-dir.row names ${gh_file}, which is not there" <<<"${out}" ||
+    fail "controls-on the file a row names is gone: exit ${code}: ${out}"
+
+# A source that cannot be read is refused as unreadable, never as a control
+# that is merely absent, which is the difference between catching a control
+# switched off and saying nothing about one. A link to itself is what says so
+# here, because a mode that refuses reads is one the user running the check can
+# be above.
+repo="$(fresh)"
+rm -f "${repo}/${gh_file}"
+ln -s git.rs "${repo}/${gh_file}"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: scripts/controls/git-hardening.row names ${gh_file}, which cannot be read" <<<"${out}" ||
+    fail "controls-on the file a row names cannot be read: exit ${code}: ${out}"
+! grep -q "which is not there" <<<"${out}" ||
+    fail "controls-on the file a row names cannot be read: it is reported as absent: ${out}"
+
+repo="$(fresh)"
+printf '\xff\xfe\n' >"${repo}/${gh_file}"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: scripts/controls/git-hardening.row names ${gh_file}, which is not text" <<<"${out}" ||
+    fail "controls-on the file a row names is not text: exit ${code}: ${out}"
+
+# Two controls switched off in one commit are both named, so a message that
+# stops at the first would leave a reviewer to find the second by chance.
+repo="$(fresh)"
+switch_off "$(cat "${repo}/scripts/controls/git-hardening.row")" "${repo}/${gh_file}"
+switch_off "$(cat "${repo}/scripts/controls/braced-esc.row")" \
+    "${repo}/crates/atomic-core/src/redact.rs"
+commit
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL git-hardening: " <<<"${out}" &&
+    grep -q "^FAIL braced-esc: " <<<"${out}" &&
+    grep -q "2 row(s) name a control that is not on in this tree" <<<"${out}" ||
+    fail "controls-on two controls off: exit ${code}: ${out}"
+
+# A row that switches nothing switches no control.
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs||b|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row switches nothing, so nothing in ${gh_file} is its control" <<<"${out}" ||
+    fail "controls-on a row switching nothing: exit ${code}: ${out}"
+
+# What each case above is the control of, in scripts/controls-on.py. The last
+# two are this script's own: every case above asks the copy rather than this
+# tree, and a control committed off in this tree stops the run before any case.
+# Two handlers are not reached on their own, and both are of a shape another
+# case does reach: what cannot be listed (which needs a directory its reader can
+# be above), and a row file that cannot be opened (which is how the file a row
+# names is tested).
+#
+#   return None, ... is not there                   the rows directory is gone
+#   return None, ... is not a directory             the rows path is a file
+#   if not entries                                  no row files
+#   if not entry.is_file()                          a directory in the rows, and
+#                                                   a link to nothing
+#   if not entry.name.endswith(".row")              a row file named otherwise
+#   if name in by_name                              two rows naming one control
+#   if not name                                     a row naming no control
+#   name != entry.name[ :-len(".row")]              a row naming itself otherwise
+#   len(lines) != 2 or lines[1] != ""               two rows in one file
+#   len(fields) != 5                                a field holding a '|', and a
+#                                                   row missing a field
+#   except UnicodeDecodeError, on the row           a row that is not text
+#   except FileNotFoundError                        the file a row names is gone
+#   except NotADirectoryError                       a row naming a path under a
+#                                                   file
+#   except IsADirectoryError                        a row naming a directory
+#   except OSError                                  the file a row names is a
+#                                                   link to itself
+#   except UnicodeDecodeError, on the source        the file a row names is not
+#                                                   text
+#   if not switch                                   a row switching nothing
+#   if replacement and replacement in source        a control committed off, a
+#                                                   replacement live in its file,
+#                                                   and two controls off at once
+#   if found == 0                                   the switch moved
+#   if found > 1                                    the switch meets twice
+#   checked += 1, and the ok line                   the count of what was read
+#   run_on's cd "${repo}"                           the cases ask the copy
+#   if ! on_out="$(python3 ... controls-on.py ...)"  a control committed off in
+#                                                   this tree
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} controls-check test(s) failed" >&2
