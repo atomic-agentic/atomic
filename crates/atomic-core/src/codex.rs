@@ -5035,9 +5035,13 @@ mod tests {
         )
         .expect("homes");
         // Where Kubernetes and container engines mount secrets, whole.
-        let (var_run, run) = ("/var/run/secrets", "/run/secrets");
-        assert!(has(&secrets, var_run), "{secrets:?}");
-        assert!(has(&secrets, run), "{secrets:?}");
+        for root in ["/var/run/secrets", "/run/secrets"] {
+            assert!(
+                has(&secrets, root),
+                "{root} is not among the {} places",
+                secrets.len()
+            );
+        }
         for path in [
             "/cfg/gh",
             "/cfg/git/credentials",
@@ -5166,10 +5170,16 @@ mod tests {
             let found = token_files(&env, &here).expect("found");
             assert!(
                 found.contains(&dir.join(config)),
-                "the credentials: {found:?}"
+                "the credentials are not among the {} places",
+                found.len()
             );
             for file in &wanted {
-                assert!(found.contains(file), "{}: {found:?}", file.display());
+                assert!(
+                    found.contains(file),
+                    "{} is not among the {} places",
+                    file.display(),
+                    found.len()
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5227,8 +5237,9 @@ mod tests {
             for file in &wanted {
                 assert!(
                     found.contains(file),
-                    "{variable}: {}: {found:?}",
-                    file.display()
+                    "{variable}: {} is not among the {} places",
+                    file.display(),
+                    found.len()
                 );
             }
         }
@@ -5329,7 +5340,12 @@ mod tests {
             dir.join("commented-token  # eks"),
             dir.join("both-token"),
         ] {
-            assert!(places.contains(&file), "{}: {places:?}", file.display());
+            assert!(
+                places.contains(&file),
+                "{} is not among the {} places",
+                file.display(),
+                places.len()
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5363,8 +5379,13 @@ mod tests {
         let home_s = home.display().to_string();
         let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(&home_s));
         let places = home_secrets(&env, None).expect("homes");
-        assert!(places.contains(&dir.join("adc-token")), "{places:?}");
-        assert!(places.contains(&dir.join("default-key.pem")), "{places:?}");
+        for name in ["adc-token", "default-key.pem"] {
+            assert!(
+                places.contains(&dir.join(name)),
+                "{name} is not among the {} places",
+                places.len()
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
