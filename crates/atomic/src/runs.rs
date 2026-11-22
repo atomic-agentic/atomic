@@ -856,13 +856,13 @@ pub async fn serve(
     atomic_durable::gate::redeliver(&engine.rt).await?;
     atomic_durable::release::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
-    // their layout can continue them.
+    // their layout can continue them. Only this project's: another's run is
+    // not named.
     let stranded: Vec<String> = engine
         .rt
-        .unfinished()
+        .stranded()
         .await?
         .into_iter()
-        .filter(|r| r.executor == engine.rt.executor_id() && r.version != engine.rt.version())
         .map(|r| format!("{} (layout {})", r.id, r.version))
         .collect();
     if !stranded.is_empty() {
