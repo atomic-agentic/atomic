@@ -14,14 +14,13 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::state::ProjectState;
-use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
 use atomic_exec::runner::ProcessRunner;
@@ -530,9 +529,15 @@ pub async fn open(
         exec_meter: Default::default(),
         clock: None,
     });
-    // Never the developer's checkout: a run's worktree steps use the
-    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
-    let worktrees: Option<Arc<Worktrees>> = None;
+    // Never the developer's checkout: a run's worktree steps work in a
+    // worktree of the snapshot of the fixture the run is bound to (see
+    // `atomic_core::fixture`), and `atomic run` binds every run that changes
+    // code to one before it starts. So no repository of the project is offered
+    // here whatever git would say about it, and what git does say about it is
+    // asked where a run that names no fixture is refused, so that refusal can
+    // tell a project in no repository from one git could not read (see
+    // `runs::bind_fixture`).
+    let worktrees = ProjectWorktrees::FixtureOnly;
     let mut rt = Durare::open(
         &database,
         executor.as_deref(),

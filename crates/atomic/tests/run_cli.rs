@@ -6525,6 +6525,61 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             "fixture.path",
             "inside the git repository",
         );
+        // A repository atomic cannot read at all. git is never run on it, so
+        // nothing was learned about it, and the refusal says what stopped git
+        // from being asked instead of saying the repository is not there —
+        // news atomic does not have, and the opposite of what the person can
+        // act on. The mode goes back before anything is asserted, so a
+        // failing assert leaves nothing unreadable behind.
+        let blind = dir.join("blind");
+        std::fs::create_dir_all(&blind).expect("blind");
+        git_in(&blind, &["init", "-q"]);
+        let blind_base = commit_file(&blind, "price.txt", "125");
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("unreadable");
+        let data = json!({"base": blind_base, "task": "multiply"}).to_string();
+        let blind_arg = blind.to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "coding",
+                "--data",
+                &data,
+                "--fixture",
+                &blind_arg,
+                "--fixture-rev",
+                "HEAD",
+            ],
+            &UNUSED_MODEL,
+            "",
+        );
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("readable again");
+        assert!(!out.status.success(), "{blind_arg}: {}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.unreadable", "{blind_arg}: {error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("atomic cannot tell whether it is a git repository"),
+            "{description}"
+        );
+        assert!(
+            description.contains("Permission denied"),
+            "what stopped git is kept: {description}"
+        );
+        assert!(
+            !description.contains("not a git repository"),
+            "atomic never reports what it did not learn: {description}"
+        );
+        assert!(
+            error["action"]
+                .as_str()
+                .is_some_and(|a| a.contains("readable")),
+            "the action names what to change: {error}"
+        );
         // What atomic does not copy whole.
         let (submodule, _) = repo("submodule", &[]);
         git_in(
@@ -6616,6 +6671,127 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             .expect("record")
             .expect("run");
         assert_eq!(record.input["pipeline"]["fixture"]["commit"], own);
+    });
+}
+
+/// What was found about a project's repository is said where a worktree is
+/// asked for and nowhere else. A run that changes code and names no fixture
+/// is refused, and the refusal carries what git said about the project, since
+/// its worktree step is asking why there is none; a run that asks nothing of
+/// git about the project is not refused for what git said, so a project
+/// outside every repository runs its other steps.
+#[test]
+fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() {
+    on_codex_runtime(async {
+        // Where atomic keeps its own state is its usual place, since it
+        // refuses a scratch directory under the temporary directory; where
+        // the project is is outside every repository.
+        let dir = scratch("no-repository");
+        let outside = outside_repository("no-repository");
+        let project = project(&outside);
+        write_coding(&project);
+        // The same project's work, with nothing asked of a worktree: one
+        // durable step, a gate a person decides, and the run's input back.
+        std::fs::write(
+            project.join("workflows/ask.workflow.yaml"),
+            "atomic: 1\nname: ask\n\
+             input: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             output: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             steps:\n  check:\n    gate:\n      title: \"'Check the note ' + input.title\"\n\
+             \x20     show: input\n      timeout: 24h\n\
+             returns: input\n",
+        )
+        .expect("workflow");
+        let checked = atomic(&dir, &project, &["--json", "check"], &[], "");
+        assert!(checked.status.success(), "{}", text(&checked));
+        let base = "1111111111111111111111111111111111111111";
+        let data = json!({"base": base, "task": "multiply"}).to_string();
+
+        // Refused, with what was found about the project in the refusal: that
+        // git was asked about its directory and said no, in git's own words,
+        // which the person can act on — and not that git could not be asked,
+        // which would be the other news, and false here.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "coding", "--data", &data],
+            &UNUSED_MODEL,
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.required", "{error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("git refused the project's directory"),
+            "{description}"
+        );
+        assert!(
+            description.contains("not a git repository"),
+            "git's own words are kept: {description}"
+        );
+        assert!(
+            !description.contains("cannot tell"),
+            "nothing about this project was unreadable: {description}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("run run-"),
+            "no run started: {}",
+            text(&out)
+        );
+
+        // The workflow that needs no worktree runs on the same project: the
+        // gate's own mapping ran, the decision came from a human credential,
+        // and the run carried itself to its end and printed its result.
+        // Nothing was asked of git about the project, which is in no
+        // repository.
+        let state = state_dir(&dir, &project);
+        let rt = project_store(&state).await;
+        let log = dir.join("ask.log");
+        let out_file = dir.join("ask.json");
+        let said = |what: &str| {
+            format!(
+                "{what}\nstderr: {}\nstdout: {}",
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(&out_file).unwrap_or_default()
+            )
+        };
+        let mut child = spawn_logged(
+            &dir,
+            &project,
+            &[
+                "--json", "run", "ask", "--run-id", "ask-1", "--data", RANK_INPUT,
+            ],
+            &UNUSED_MODEL,
+            &log,
+            &out_file,
+        );
+        let g = match tokio::time::timeout(Duration::from_secs(60), await_gate(&rt, "ask-1")).await
+        {
+            Ok(g) => g,
+            Err(_) => panic!("{}", said("ask-1 never opened its gate")),
+        };
+        assert_eq!(
+            g.title, "Check the note Export crashes on accents",
+            "the gate step ran, and mapped its title from the input: {g:?}"
+        );
+        // A person decides, from another terminal than the run's, and the
+        // run's own command carries it the rest of the way and prints its
+        // result: the gate is all the waiting this workflow does.
+        approve(&rt, &g).await;
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut child, "the run"))
+            .await
+            .expect("child");
+        let shown = std::fs::read_to_string(&log).unwrap_or_default();
+        let printed = std::fs::read_to_string(&out_file).unwrap_or_default();
+        assert!(status.success(), "{shown}\n{printed}");
+        let given: Value = serde_json::from_str(RANK_INPUT).expect("input");
+        let doc: Value =
+            serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {shown}\n{printed}"));
+        assert_eq!(doc["run"], "ask-1", "{doc}");
+        assert_eq!(doc["status"], "succeeded", "{shown}\n{doc}");
+        assert_eq!(doc["output"], given, "{doc}: the run returned its input");
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
