@@ -1076,10 +1076,17 @@ async fn a_private_stores_renamed_runs_are_matched_by_characters() {
     register(&mut old);
     old.launch().await.expect("launch");
     let (run, gate) = start_gated(&old, input(None)).await;
-    old.shutdown(Duration::from_secs(5)).await.expect("shutdown");
-    let opened = Durare::open(&database, None, crate::DEFAULT_VERSION, "notes/projét-ü-0123")
+    old.shutdown(Duration::from_secs(5))
         .await
-        .expect("engine");
+        .expect("shutdown");
+    let opened = Durare::open(
+        &database,
+        None,
+        crate::DEFAULT_VERSION,
+        "notes/projét-ü-0123",
+    )
+    .await
+    .expect("engine");
     assert!(
         opened.own_run_record(&run).await.expect("record").is_some(),
         "the renamed project's run"
