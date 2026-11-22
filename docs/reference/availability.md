@@ -322,6 +322,20 @@ stays parked with its record kept in the store, and the work goes on only as a
 new run, started again with `atomic run`. Stop every atomic process that uses a
 shared store before upgrading it, so that none goes on recording parks without
 their project.
+Runs and their gates are kept apart the same way. Each run is recorded with its
+project as it starts, and on a shared store `atomic gates list`, `approve`,
+`reject` and `answer` see only the current project's runs' gates, and `atomic
+runs show` and `atomic runs resume` only its runs: another project's gate or
+run is refused as one that does not exist. Run ids stay unique across the whole
+store, so `atomic run` refuses an id another project has taken, saying only
+that it is taken. On a local SQLite store, runs are adopted as parks are: one
+recorded before atomic kept runs' projects, or under an older name of the
+project's, becomes the project's, so a rename strands no run at its gate. A run
+started on a shared store before atomic kept runs' projects is no project's:
+none of these commands shows it or its gates, so it cannot get past a gate it
+waits at; start it again as a new run with `atomic run`. A broken manifest stops
+these commands too, and leaves the runs and gates where they are until it is
+mended. A gate decision still comes only from a person's enrolled credential.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.

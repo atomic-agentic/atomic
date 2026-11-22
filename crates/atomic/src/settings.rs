@@ -1599,6 +1599,16 @@ impl Resolved {
         self.sign_in.is_some() && self.settings.model.base_url.is_none()
     }
 
+    /// Whether someone chose the model endpoint: a flag, a variable or a
+    /// configuration file set `model.base_url`. Such an endpoint comes before
+    /// the sign-in, which is then not looked for. One detection found, from
+    /// `OPENAI_API_KEY` or a local Ollama, comes only after it.
+    pub fn endpoint_chosen(&self) -> bool {
+        let source = self.sources.get("model.base_url");
+        let detected = matches!(source, Some(Source::Detected(_)));
+        self.settings.model.base_url.is_some() && !detected
+    }
+
     /// Every setting for `atomic config --explain`: its path, its value as
     /// shown, with secrets masked, and where it came from.
     pub fn explain(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, Value, String)> {
@@ -1785,8 +1795,7 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
             };
             // With an endpoint configured, the sign-in is not looked for and
             // a run uses the endpoint.
-            let configured =
-                resolved.sign_in_unreadable.is_none() && resolved.settings.model.base_url.is_some();
+            let configured = resolved.sign_in_unreadable.is_none() && resolved.endpoint_chosen();
             let note = if configured {
                 format!(
                     "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \
