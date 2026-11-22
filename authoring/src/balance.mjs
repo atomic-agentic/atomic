@@ -12,14 +12,31 @@
 // it closed itself has no end. Its positions for void and self-closing
 // tags, fragments and elements it re-reads are not the source's, so where
 // a start tag ends is read from the source: a scan of the start tag alone,
-// its quoted values and braced expressions passed over.
+// its quoted values and braced expressions passed over, cross-checked
+// against where the parse leaves the start tag's last attribute. A start tag
+// the two readings do not agree on is refused, naming the attribute.
 
 const VOID = new Set(['area', 'base', 'br', 'col', 'command', 'embed', 'hr', 'img', 'input', 'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 const TAGS = new Set(['element', 'component', 'custom-element', 'fragment']);
+// How far past a closing tag's `<` its `>` is looked for: longer than any
+// tag name can be, and short enough that a `</` with no `>` after it costs
+// one fixed slice rather than the rest of the file.
+const CLOSER_LIMIT = 4096;
 // HTML's white space, not JavaScript's: the source is read a byte a
 // character, and `\s` would take a byte such as 0xA0 for a space.
 const SPACE = '\\t\\n\\f\\r ';
 const isSpace = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
+// The parse counts in bytes, so what it reports is measured in bytes
+// against this source, which is held one character to the byte.
+const encoder = new TextEncoder();
+// Whether the source holds `text`, in bytes, from `at`.
+const holds = (source, at, text) => {
+  const written = encoder.encode(text);
+  for (let n = 0; n < written.length; n++) if (source.charCodeAt(at + n) !== written[n]) return false;
+  return true;
+};
+// How many bytes `text` is.
+const byteLength = (text) => encoder.encode(text).length;
 
 const shown = (name) => `<${name}>`;
 const voidMessage = (name) => `\`</${name}>\` closes nothing: <${name}> is a void HTML element, which has no closing tag and cannot be a section's name`;
@@ -62,17 +79,37 @@ function check(source, ast, named) {
   for (const tag of tags) {
     // The parse can place a tag's start a byte off its `<`.
     tag.start = [tag.start, tag.start - 1, tag.start + 1].find((at) => source[at] === '<') ?? tag.start;
-    const { open, selfClosing } = startTag(source, tag.start);
+    const { open, selfClosing, unterminated } = startTag(source, tag.start);
     tag.open = open;
+    // Where the parse leaves this start tag, read from its last attribute.
+    // It leaves it further than the scan does — past a value the scan closed
+    // early, over a `/` the parse holds inside a value, or at the end of a
+    // value the parse never closed — or the scan finds no end at all where
+    // the parse read one: then the two are not reading one tag, and nothing
+    // after here can name the right one.
+    if (tag.node.type !== 'fragment') {
+      const read = attributeRead(source, tag.node.attributes);
+      if (disagrees(read, open, unterminated)) {
+        return {
+          offset: tag.start,
+          message: `the start tag of ${shown(tag.name)} cannot be read: its attribute \`${read.name}\` ends where atomic and Astro disagree about the tag`,
+        };
+      }
+    }
     if (VOID.has(tag.name) || selfClosing) {
       tag.point = true;
       continue;
     }
     if (tag.end === undefined) continue;
     // The parse ends a tag where a closing tag of its own name's length
-    // would end, so the closing tag that ended it starts there; a
-    // fragment's `</>` one byte before its end.
-    const at = tag.node.type === 'fragment' && tag.name === '' ? tag.end - 1 : tag.end - (tag.raw.length + 3);
+    // would end, so the closing tag that ended it starts there: for a named
+    // tag, its own name's length plus three bytes back. A fragment's own `</>`
+    // sits one byte before its end; when the parse read a closing tag of
+    // another name as a fragment's end it left the fragment where a `</>` of
+    // three bytes would have ended, so that tag starts three bytes back.
+    const at = tag.node.type === 'fragment' && tag.name === ''
+      ? (closerAt(source, tag.end - 1) ? tag.end - 1 : tag.end - 3)
+      : tag.end - (tag.raw.length + 3);
     if (at < tag.open) continue;
     const closer = closerAt(source, at);
     if (!closer) continue;
@@ -132,10 +169,57 @@ function check(source, ast, named) {
   return null;
 }
 
+// Whether the two readings of a start tag disagree about where it ends: the
+// parse leaves it further than the scan's `>` — past a value the scan closed
+// early, over a `/` the parse holds inside a value, or at the end of a value
+// the parse never closed — or the parse read a value where the scan found no
+// end at all.
+const disagrees = (read, open, unterminated) => read.end > open || (unterminated && read.end >= 0);
+
+// Where the parse's own reading of a start tag's last attribute ends, as
+// `{ end, name }`. The parse gives each attribute where it starts, its kind,
+// its value and the text as written, but never where it ends, so the end is
+// read back from the source against what it reports: a braced value or a
+// template literal is the text between its delimiters, a quoted one is the
+// raw text with its quotes, and a bare one is the raw text. Where the report
+// cannot be placed in the source at all, `end` is -1, which asks nothing of
+// the scan, since a report that does not match the text says nothing about
+// it; where the parse reports a value it never closed, it read past every
+// `>` there is, so its reading ends with the file.
+function attributeRead(source, attributes) {
+  let last = null;
+  for (const attribute of attributes ?? []) {
+    if ((attribute?.position?.start?.offset ?? -1) > (last?.position?.start?.offset ?? -1)) last = attribute;
+  }
+  const at = last?.position?.start?.offset;
+  const kind = last?.kind ?? '';
+  const name = last?.name ?? '';
+  if (!Number.isInteger(at) || at < 0 || at >= source.length || name === '' || !holds(source, at, name)) return { end: -1, name };
+  let i = at + byteLength(name);
+  if (kind === 'empty') return { end: i, name };
+  while (i < source.length && isSpace(source[i])) i++;
+  if (source[i] !== '=') return { end: -1, name };
+  i++;
+  while (i < source.length && isSpace(source[i])) i++;
+  const value = last.value ?? '';
+  const closed = kind === 'expression' ? ['{', '}'] : kind === 'template-literal' ? ['`', '`'] : null;
+  if (closed) {
+    if (source[i] !== closed[0] || !holds(source, i + 1, value)) return { end: -1, name };
+    const closer = i + 1 + byteLength(value);
+    return { end: source[closer] === closed[1] ? closer + 1 : source.length, name };
+  }
+  for (const text of [last.raw ?? '', value]) {
+    if (text === '') continue;
+    if (holds(source, i, text)) return { end: i + byteLength(text), name };
+  }
+  return { end: i, name };
+}
+
 // The closing tag at `at`, if one starts there: its name, a byte a
-// character, and its length.
+// character, and its length. Its `>` is looked no further for than
+// CLOSER_LIMIT bytes.
 function closerAt(source, at) {
-  const match = new RegExp(`^</([^${SPACE}/>]*)[^>]*>`).exec(source.slice(at, at + 4096));
+  const match = new RegExp(`^</([^${SPACE}/>]*)[^>]*>`).exec(source.slice(at, at + CLOSER_LIMIT));
   return match && { raw: match[1], length: match[0].length };
 }
 
@@ -166,8 +250,9 @@ function* closers(source, from = 0) {
   }
 }
 
-// Where the start tag that begins at `start` ends, and whether it closes
-// itself. Attribute values are quoted text, read to the matching quote, or
+// Where the start tag that begins at `start` ends, whether it closes
+// itself, and whether the scan found no end at all and stopped with the
+// file. Attribute values are quoted text, read to the matching quote, or
 // braced expressions, read as TypeScript to the matching brace: quotes,
 // escapes, template literals and comments inside passed over. A quote
 // outside a value is part of an attribute's name.
@@ -202,7 +287,9 @@ function startTag(source, start) {
     i++;
     while (i < source.length && !isSpace(source[i]) && source[i] !== '=' && !ends(i)) i++;
   }
-  return { open: source.length, selfClosing: false };
+  // No `>` to the end of the file: the scan holds the whole rest as one
+  // start tag, which is not what the parse makes of it.
+  return { open: source.length, selfClosing: false, unterminated: true };
 }
 
 // Past the braced expression that starts at `i`.

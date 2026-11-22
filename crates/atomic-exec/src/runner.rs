@@ -224,6 +224,7 @@ impl Request {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
             secret_env: crate::SecretEnv::default(),
         })
     }

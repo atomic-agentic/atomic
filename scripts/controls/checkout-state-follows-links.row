@@ -1,0 +1,1 @@
+checkout-state-follows-links|crates/atomic/tests/fixture_cli.rs|    match entry.file_type() {|    match path.metadata().as_ref().map(std::fs::Metadata::file_type) { // CONTROL_OFF: what a link points at is taken for the link and walked|-p atomic-agentic --features atomic-agentic/sandbox-tests --test fixture_cli -- the_state_a_checkout_is_compared_by_sees_what_git_does_not

@@ -257,21 +257,42 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
+    ("CLOUDSDK_CONFIG", &[""]),
 ];
 
-/// Where AWS's workload identities put their token files on Kubernetes when
-/// no variable says otherwise (IAM roles for service accounts, and EKS Pod
-/// Identity): denied whether or not atomic's environment names them.
-const AWS_TOKEN_DIRS: &[&str] = &[
+/// Where workload identities put their token files on Kubernetes when no
+/// variable says otherwise: AWS's (IAM roles for service accounts, and EKS
+/// Pod Identity), the pod's own service account, and Azure workload
+/// identity's. Denied whether or not atomic's environment names them.
+const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     "/var/run/secrets/eks.amazonaws.com/serviceaccount",
     "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
+    // `scripts/controls/k8s-token-dir.row` switches this off.
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+    // `scripts/controls/azure-token-dir.row` switches this off.
+    "/var/run/secrets/azure/tokens",
 ];
 
-/// The variables that name a workload token file an AWS SDK reads.
-const AWS_TOKEN_FILES: &[&str] = &[
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+/// The variables that name a workload credential file an SDK reads, each
+/// with what the file is called in a refusal: AWS's token files, Azure
+/// workload identity's, and Google's application credentials, which may be
+/// a key or a configuration naming a token file of its own (see
+/// [`google_token_files`]).
+const WORKLOAD_TOKEN_FILES: &[(&str, &str)] = &[
+    ("AWS_WEB_IDENTITY_TOKEN_FILE", "token file"),
+    ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "token file"),
+    // `scripts/controls/azure-token-file.row` switches this off.
+    ("AZURE_FEDERATED_TOKEN_FILE", "token file"),
+    // `scripts/controls/gcp-credentials-file.row` switches this off.
+    (GOOGLE_CREDENTIALS, "credentials file"),
 ];
+
+/// The variable that names Google's application credentials.
+const GOOGLE_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+
+/// The most of a credential configuration atomic reads to find the token
+/// files it names: far more than any holds.
+const CONFIG_BYTES_MAX: u64 = 1 << 20;
 
 /// The projected volume `file` is in, if it is in one, as Kubernetes mounts
 /// a service account's token: the volume holds a `..data` link to its
@@ -327,17 +348,18 @@ fn projected_volume(file: PathBuf) -> Option<PathBuf> {
     None
 }
 
-/// AWS's workload token files the variables in `env` name, a relative one
-/// resolved against the working directory `here` gives, as an AWS SDK
+/// The workload credential files the variables in `env` name, a relative
+/// one resolved against the working directory `here` gives, as an SDK
 /// started there resolves it, and, for one in a projected volume, the
-/// volume itself. An error, so nothing runs, when a name is relative and
-/// the working directory is unknown.
+/// volume itself; with the token files Google's application credentials
+/// name. An error, so nothing runs, when a name is relative and the working
+/// directory is unknown, or when Google's credentials cannot be read whole.
 fn token_files(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for name in AWS_TOKEN_FILES {
+    for (name, what) in WORKLOAD_TOKEN_FILES {
         let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
             continue;
         };
@@ -349,17 +371,248 @@ fn token_files(
         } else {
             let refused = |e: std::io::Error| {
                 format!(
-                    "{name} names the token file {} relative to the working directory, which \
-                     is unknown ({e}), so the token could not be denied to atoms' commands",
+                    "{name} names the {what} {} relative to the working directory, which \
+                     is unknown ({e}), so it could not be denied to atoms' commands",
                     file.display()
                 )
             };
             here().map_err(refused)?.join(&file)
         };
+        if *name == GOOGLE_CREDENTIALS {
+            // `scripts/controls/gcp-external-token.row` switches this off.
+            out.extend(google_token_files(&file, here)?);
+        }
         out.extend(projected_volume(file.clone()));
         out.push(file);
     }
     Ok(out)
+}
+
+/// `file` read as plainly as a name in a configuration reads, resolved
+/// against the working directory `here` gives when it is relative.
+fn named_path(file: &str, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let file: PathBuf = Path::new(file).components().collect();
+    if file.is_absolute() {
+        return Ok(file);
+    }
+    here().map(|here| here.join(&file)).map_err(|e| {
+        format!(
+            "it names {} relative to the working directory, which is unknown ({e})",
+            file.display()
+        )
+    })
+}
+
+/// The bytes of the credential configuration at `path`, followed through
+/// links as its SDK follows them, read without waiting, as opening a fifo
+/// would, and no further than [`CONFIG_BYTES_MAX`]: `None` when it is not
+/// there, or is a device, as `/dev/null` is when a variable names it to
+/// turn the configuration off, which is never opened; and an error for
+/// anything else that keeps it from being read whole.
+fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read as _;
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => format!("this user may not read it: {e}"),
+        _ => e.to_string(),
+    };
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // Only a file that is not there names nothing: any other error
+        // refuses. `scripts/controls/workload-config-not-there.row` switches
+        // this off.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+    };
+    // `scripts/controls/workload-config-device.row` switches this off.
+    let device = is_device(&meta);
+    if device {
+        return Ok(None);
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).map_err(unreadable)?;
+    // What was opened, which may not be what was looked at.
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    // `scripts/controls/workload-config-plain.row` switches this off.
+    let plain = meta.is_file();
+    if !plain {
+        return Err("it is not a plain file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(CONFIG_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > CONFIG_BYTES_MAX {
+        return Err(format!("it holds more than {CONFIG_BYTES_MAX} bytes"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Whether `meta` is a device's: a character or a block device.
+fn is_device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        meta.file_type().is_char_device() || meta.file_type().is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The token files the Google credentials file at `config` names, each
+/// with its projected volume where it is in one: an external account's
+/// `credential_source.file`, and the `output_file` its executable keeps a
+/// token in, as for the `source_credentials` an impersonated account is
+/// configured with. A key, or an account that names no file, names none,
+/// and so does a file that is not there. Anything that cannot be read whole
+/// and as JSON is refused, naming the file, so nothing runs rather than a
+/// token it may name being left readable.
+fn google_token_files(
+    config: &Path,
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as Google credentials ({why}), so a token file they name \
+             could not be denied to atoms' commands; fix it, or point {GOOGLE_CREDENTIALS} at \
+             a file that can be read",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    // `scripts/controls/gcp-config-refused.row` switches this off.
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
+    };
+    let mut names = Vec::new();
+    google_named(&value, 0, &mut names).map_err(refused)?;
+    let mut out = Vec::new();
+    for name in names {
+        let file = named_path(&name, here).map_err(refused)?;
+        out.extend(projected_volume(file.clone()));
+        out.push(file);
+    }
+    Ok(out)
+}
+
+/// What Google credentials `value` name as files holding a token, into
+/// `out`, and those of the credentials they are configured with, no deeper
+/// than a few: an error when a field that names a file is not text, or one
+/// that holds others is not an object.
+fn google_named(
+    value: &serde_json::Value,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    use serde_json::Value;
+    let Some(object) = value.as_object() else {
+        return Err("they are not a JSON object".into());
+    };
+    if depth > 4 {
+        return Err("their source credentials nest too deeply".into());
+    }
+    let named = |value: Option<&Value>, field: &str| match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone()).filter(|n| !n.is_empty())),
+        Some(_) => Err(format!("{field} is not text")),
+    };
+    let fields = |value: &Value, field: &str| {
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("{field} is not an object"))
+    };
+    if let Some(source) = object.get("credential_source") {
+        let source = fields(source, "credential_source")?;
+        out.extend(named(source.get("file"), "credential_source.file")?);
+        if let Some(executable) = source.get("executable") {
+            let executable = fields(executable, "credential_source.executable")?;
+            out.extend(named(
+                executable.get("output_file"),
+                "credential_source.executable.output_file",
+            )?);
+        }
+    }
+    if let Some(inner) = object.get("source_credentials") {
+        google_named(inner, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// The web identity token files the AWS configuration file at `config`
+/// names in any of its profiles, each with its projected volume where it is
+/// in one: one named relative to the working directory `here` gives, as an
+/// AWS SDK reads it, and one under `~/` in each of `homes` as well. A file
+/// that is not there names none; one that cannot be read whole as text is
+/// refused, naming it, so nothing runs.
+fn aws_profile_token_files(
+    config: &Path,
+    homes: &[PathBuf],
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as an AWS configuration file ({why}), so a web identity \
+             token file it names could not be denied to atoms' commands; make it a file this \
+             user can read, or move it",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    let text = String::from_utf8(bytes).map_err(|_| refused("it is not UTF-8 text".into()))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // A key ends at `=` or, as Python's configuration parser reads it,
+        // at `:`, whichever comes first.
+        // `scripts/controls/aws-profile-colon.row` switches this off.
+        let Some(at) = line.find(['=', ':']) else {
+            continue;
+        };
+        let (key, value) = (&line[..at], line[at + 1..].trim());
+        if !key.trim().eq_ignore_ascii_case("web_identity_token_file") || value.is_empty() {
+            continue;
+        }
+        // Some SDKs end a value at a `#` or `;` after white space, as a
+        // comment, and others keep it: both readings are denied.
+        // `scripts/controls/aws-profile-comment.row` switches this off.
+        let comment = comment_start(value);
+        let mut values = vec![value];
+        values.extend(
+            comment
+                .map(|at| value[..at].trim_end())
+                .filter(|v| !v.is_empty()),
+        );
+        for value in values {
+            let mut files = vec![named_path(value, here).map_err(refused)?];
+            if let Some(rest) = value.strip_prefix("~/") {
+                files.extend(homes.iter().map(|home| home.join(rest)));
+            }
+            for file in files {
+                out.extend(projected_volume(file.clone()));
+                out.push(file);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Where a comment starts in a configuration value, as the SDKs that allow
+/// one read it: at the first `#` or `;` that follows white space.
+fn comment_start(value: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .find(|&(at, c)| matches!(c, '#' | ';') && value[..at].ends_with(char::is_whitespace))
+        .map(|(at, _)| at)
 }
 
 /// The home directories whose credential places are denied, as `env` reads
@@ -401,7 +654,8 @@ pub fn home_secrets(
 ) -> Result<Vec<PathBuf>, String> {
     let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
     let mut out = Vec::new();
-    for home in real_homes(env, passwd)? {
+    let homes = real_homes(env, passwd)?;
+    for home in &homes {
         out.extend(HOME_SECRETS.iter().map(|p| home.join(p)));
     }
     for (prefix, variable) in [
@@ -433,12 +687,36 @@ pub fn home_secrets(
     if let Some(list) = env("KUBECONFIG") {
         out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
     }
-    // AWS's workload token files: where they usually are, those the
-    // variables name, a relative one resolved against atomic's working
-    // directory as an AWS SDK resolves it, and, for one in a projected
-    // volume, the volume itself.
-    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
+    // Workload token files: where they usually are, those the variables
+    // name, a relative one resolved against atomic's working directory as
+    // an SDK resolves it, and, for one in a projected volume, the volume
+    // itself.
+    out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
     out.extend(token_files(env, &std::env::current_dir)?);
+    // Those named inside a configuration rather than by a variable: an AWS
+    // profile's web identity token file, and what the application default
+    // credentials gcloud writes name.
+    let mut aws: Vec<PathBuf> = homes
+        .iter()
+        .flat_map(|home| [home.join(".aws/config"), home.join(".aws/credentials")])
+        .collect();
+    aws.extend(absolute("AWS_CONFIG_FILE"));
+    aws.extend(absolute("AWS_SHARED_CREDENTIALS_FILE"));
+    let here = &std::env::current_dir;
+    for config in &aws {
+        // `scripts/controls/aws-profile-token.row` switches this off.
+        out.extend(aws_profile_token_files(config, &homes, here)?);
+    }
+    let mut gcloud: Vec<PathBuf> = homes
+        .iter()
+        .map(|home| home.join(".config/gcloud"))
+        .collect();
+    gcloud.extend(absolute("CLOUDSDK_CONFIG"));
+    for dir in &gcloud {
+        let defaults = dir.join("application_default_credentials.json");
+        // `scripts/controls/gcp-default-credentials.row` switches this off.
+        out.extend(google_token_files(&defaults, &std::env::current_dir)?);
+    }
     out.sort();
     out.dedup();
     Ok(out)
@@ -722,11 +1000,18 @@ fn denied_paths(
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let given = writable;
-    let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let mut roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
+    let state = real(&private.state_dir);
+    // The same directories wherever else they are mounted, such as a bind of
+    // the working directory: a command may write them there too.
+    let seen_again = crate::mounts::second_mounts(&[&roots, std::slice::from_ref(&state)])
+        .map_err(|e| anyhow::Error::new(DenyRefused(format!("{e:#}"))))?;
+    roots.extend(seen_again[0].iter().cloned());
     let mut writable = roots.clone();
-    writable.push(real(&private.state_dir));
+    writable.push(state);
+    writable.extend(seen_again[1].iter().cloned());
     let mut needed = writable.clone();
     needed.extend(cwd.map(real));
     needed.push(real(codex_home));
@@ -785,6 +1070,14 @@ fn denied_paths(
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
     }
+    // A link inside a place, walked as the kernel walks it: one whose chain
+    // runs through a link a command may point, or that leads nowhere yet into
+    // what the thread may write, refuses the thread.
+    for link in &links {
+        if let Some(refused) = link_planted(link, &writable, &places) {
+            return Err(refused);
+        }
+    }
     // Only the links that lead somewhere a denial is needed count against
     // the cap.
     links.retain(|link| {
@@ -838,7 +1131,16 @@ fn denied_paths(
     for (i, path) in denied.into_iter().enumerate() {
         let found = i >= base;
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            // Nothing there yet: denied once it is.
+            // Nothing there yet: denied once it is. A place, but for
+            // atomic's own private state, that would be made in what the
+            // thread may write, or through a link there, refuses it: a
+            // command could make it for what reads it to find.
+            if !found
+                && i != 0
+                && let Some(refused) = missing_into(&path, &writable, &places)
+            {
+                return Err(refused);
+            }
             all.push(path);
             continue;
         };
@@ -846,11 +1148,40 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
-            let Some(target) = std::fs::canonicalize(&path)
-                .ok()
-                .filter(|t| deniable(t, !found))
-            else {
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would where the sandbox
+            // helper walks the places again (Linux); one that leads nowhere
+            // yet refuses it when where it leads lies in what the thread may
+            // write, where a command could put a file for what reads the
+            // place to find.
+            let unresolved = |e: anyhow::Error| {
+                refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                ))
+            };
+            let target = if found {
+                std::fs::canonicalize(&path).ok()
+            } else {
+                match resolved(&path) {
+                    Ok(Some(target)) => {
+                        // Its own chain, which a command may repoint where
+                        // it runs through what the thread may write.
+                        if let Some(refused) = rewritable_chain(&path, &writable, &places) {
+                            return Err(refused);
+                        }
+                        Some(target)
+                    }
+                    Ok(None) => {
+                        if let Some(refused) = dangling_into(&path, &writable, &places) {
+                            return Err(refused);
+                        }
+                        None
+                    }
+                    Err(e) => return Err(unresolved(e)),
+                }
+            };
+            let Some(target) = target.filter(|t| deniable(t, !found)) else {
                 continue;
             };
             if found && places.iter().any(|p| target.starts_with(p)) {
@@ -1031,6 +1362,256 @@ const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
 /// The databases Codex keeps in its home, as a pattern inside it.
 const SQLITE_FILES: &str = "*.sqlite*";
 
+/// Where [`walk_link`] found a link leads.
+enum Landing {
+    /// There now, as what it resolves to.
+    There(PathBuf),
+    /// Not there yet: where it would be once something is made there.
+    NotYet(PathBuf),
+}
+
+/// Walk `path`, a link, as the kernel walks it, a directory at a time, each
+/// link on the way followed where it is, and say where it leads. Refused
+/// when a link on the way lies in one of `writable`, where a command could
+/// point it elsewhere; when it climbs back out of one of them with `..`,
+/// where a command could make what it climbs out of a link; or when where
+/// it leads cannot be told. What lies inside a denied place of `masked` is
+/// hidden from every command, and no link or directory there can be changed.
+fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::Result<Landing> {
+    use std::path::Component;
+    let refuse = |why: String| Err(anyhow::Error::new(DenyRefused(why)));
+    // What is walked so far, every link in it followed, and what is left.
+    let mut done = PathBuf::from("/");
+    let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir))
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut hops = 0;
+    while let Some(part) = rest.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            // Up out of a directory a command may write: what it holds,
+            // that this climbs back out of, a command can make a link.
+            if let Some(root) = climbing_out(writable, masked, &done) {
+                return refuse(format!(
+                    "{} leads by way of {}, and climbs back out of it, in {}, which atoms' \
+                     commands may write, so a command could make it a link that leads \
+                     elsewhere; point {} without `..`",
+                    path.display(),
+                    done.display(),
+                    root.display(),
+                    path.display()
+                ));
+            }
+            done.pop();
+            continue;
+        }
+        let next = done.join(&part);
+        let link = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // Not there: where it would lead is this, and the rest.
+                if rest.iter().any(|p| p == ".." || p == ".") {
+                    return refuse(format!(
+                        "{} is a link that leads nowhere yet, by way of {}, and atomic cannot \
+                         tell where it would lead; point the link elsewhere",
+                        path.display(),
+                        next.display()
+                    ));
+                }
+                return Ok(Landing::NotYet(
+                    rest.iter().fold(next, |p, part| p.join(part)),
+                ));
+            }
+            Err(e) => {
+                return refuse(format!(
+                    "{} leads by way of {}, which cannot be looked at ({e}); point the link at \
+                     something atomic can reach",
+                    path.display(),
+                    next.display()
+                ));
+            }
+        };
+        if !link {
+            done = next;
+            continue;
+        }
+        // A link on the way: one a command may point elsewhere decides
+        // where the place leads, whatever it points at now.
+        if let Some(root) = changeable(writable, masked, &next) {
+            if next == path {
+                return refuse(format!(
+                    "{} is a link in {}, which atoms' commands may write, so a command could \
+                     point it elsewhere or put something in its place; keep it elsewhere, or \
+                     run the project from a directory that does not hold it",
+                    path.display(),
+                    root.display()
+                ));
+            }
+            return refuse(format!(
+                "{} leads by way of {}, a link in {}, which atoms' commands may write, so a \
+                 command could point it elsewhere; point {} past it",
+                path.display(),
+                next.display(),
+                root.display(),
+                path.display()
+            ));
+        }
+        hops += 1;
+        if hops > LINK_HOPS {
+            return refuse(format!(
+                "{} leads through more than {LINK_HOPS} links; atomic cannot tell where",
+                path.display()
+            ));
+        }
+        let to = match std::fs::read_link(&next) {
+            Ok(to) => to,
+            Err(e) => {
+                return refuse(format!(
+                    "{} leads by way of {}, a link atomic cannot read ({e}); point it at \
+                     something atomic can reach",
+                    path.display(),
+                    next.display()
+                ));
+            }
+        };
+        if to.is_absolute() {
+            done = PathBuf::from("/");
+        }
+        for part in to
+            .components()
+            .filter(|c| !matches!(c, Component::RootDir))
+            .rev()
+        {
+            rest.push_front(part.as_os_str().to_owned());
+        }
+    }
+    Ok(Landing::There(done))
+}
+
+/// Why a denied place that is a link leading nowhere yet cannot be left as
+/// it is ([`walk_link`]): a link on the way a command may point, or where it
+/// would lead lies in one of `writable`, where a command could put a file for
+/// what reads the place to find. `None` when it leads elsewhere.
+fn dangling_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        // There after all, as when it was made a moment ago.
+        Ok(Landing::There(lands)) => {
+            let root = inside_of(writable, &lands)?;
+            return Some(anyhow::Error::new(DenyRefused(format!(
+                "{} leads to {}, in {}, which atoms' commands may write; point the link \
+                 elsewhere",
+                path.display(),
+                lands.display(),
+                root.display()
+            ))));
+        }
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{} is a link to {}, which is not there yet and lies in {}, which atoms' commands may \
+         write, so a command could put a file there for what reads {} to find; point the link \
+         elsewhere, or make what it leads to first",
+        path.display(),
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
+/// Why a denied place that is not there cannot be left so: its path, walked
+/// as [`walk_link`] walks it, would be made in one of `writable`, or runs
+/// through a link a command may point elsewhere, so a command could make it
+/// for what reads it to find. `None` when it would be made elsewhere.
+fn missing_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands) | Landing::There(lands)) => lands,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, which is not there yet, would be made at {}, in {}, which atoms' commands may \
+         write, so a command could make it for what reads {} to find; make it first, or run the \
+         project from a directory that does not hold it",
+        path.display(),
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
+/// Why a link that leads somewhere now cannot be denied as what it points at
+/// ([`walk_link`]): a link on the way a command may point elsewhere, as for
+/// a place whose own chain runs through what the thread may write. `None`
+/// when its chain is the thread's to change nowhere.
+fn rewritable_chain(
+    path: &Path,
+    writable: &[PathBuf],
+    masked: &[PathBuf],
+) -> Option<anyhow::Error> {
+    walk_link(path, writable, masked).err()
+}
+
+/// Why a link found inside a denied place cannot be left as it is: its chain
+/// runs through a link a command may point elsewhere, or it leads nowhere
+/// yet into what the thread may write, where a command could put a file for
+/// what reads it to find ([`walk_link`]). `None` otherwise.
+fn link_planted(link: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(link, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        Ok(Landing::There(_)) => return None,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, inside a place denied to atoms' commands, is a link to {}, which is not there yet \
+         and lies in {}, which they may write, so a command could put a file there for what \
+         reads {} to find; point the link elsewhere, or make what it leads to first",
+        link.display(),
+        lands.display(),
+        root.display(),
+        link.display()
+    ))))
+}
+
+/// The first of `writable` that holds `path`, where a command may change it,
+/// unless a denied place of `masked` holds it too: the sandbox hides what is
+/// inside one, so no command can change it there.
+fn changeable<'a>(writable: &'a [PathBuf], masked: &[PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    if inside_of(masked, path).is_some() {
+        return None;
+    }
+    inside_of(writable, path)
+}
+
+/// The first of `writable` that `dir` lies inside, not at, where a command
+/// may change what `..` from it climbs out of ([`changeable`]).
+fn climbing_out<'a>(
+    writable: &'a [PathBuf],
+    masked: &[PathBuf],
+    dir: &Path,
+) -> Option<&'a PathBuf> {
+    changeable(writable, masked, dir).filter(|root| dir != root.as_path())
+}
+
+/// The first of `dirs` that holds `path`, or is it.
+fn inside_of<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    dirs.iter().find(|d| path.starts_with(d))
+}
+
+/// The most links [`walk_link`] follows, as the kernel does.
+const LINK_HOPS: usize = 40;
+
 /// `path` with the links among the directories above it, and itself,
 /// resolved as far as it exists, and the rest as it is named.
 fn real_spelling(path: &Path) -> PathBuf {
@@ -1182,6 +1763,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
 }
 
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
@@ -2091,7 +2692,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -2146,8 +2746,10 @@ fn late_link_targets(
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold and
-/// those second mounts come to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_targets(
     denied: &[PathBuf],
@@ -2616,7 +3218,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -2697,12 +3300,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -2730,6 +3336,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -2789,7 +3405,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -2891,6 +3512,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 secret_env: secret,
                 ..command.clone()
             },
@@ -3494,6 +4116,16 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
@@ -3795,6 +4427,21 @@ async fn new_config(
     cwd: &Path,
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
+    new_config_reading(endpoint, codex_home, cwd, arg0_paths, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+}
+
+/// [`new_config`], with the proxy variables a key's refusal reads from
+/// `var` rather than this process's environment.
+async fn new_config_reading(
+    endpoint: &ModelEndpoint,
+    codex_home: &Path,
+    cwd: &Path,
+    arg0_paths: Arg0DispatchPaths,
+    var: fn(&str) -> Option<String>,
+) -> anyhow::Result<Config> {
     let codex_home =
         AbsolutePathBuf::from_absolute_path(codex_home).context("resolve the Codex home")?;
     let cwd = AbsolutePathBuf::from_absolute_path(cwd).context("resolve the working directory")?;
@@ -3862,6 +4509,18 @@ async fn new_config(
         // provider, pointed at another base URL, with no OpenAI sign-in and
         // no websockets.
         None => {
+            // A key to an endpoint on this machine over plain http would go
+            // to a proxy in cleartext, and Codex's client cannot be told to
+            // skip proxies: the turn is refused, saying how to fix it.
+            // Elsewhere than Linux, or told to respect the system's proxy
+            // settings, Codex's client finds its proxy by other rules.
+            let rules =
+                crate::lite::ProxyRules::for_codex(cfg!(target_os = "linux"), respect_system_proxy);
+            if endpoint.api_key_env.is_some()
+                && let Some(why) = crate::lite::proxied_key(&endpoint.base_url, &var, rules)
+            {
+                anyhow::bail!(why);
+            }
             model_provider.name = "atomic endpoint".to_string();
             model_provider.base_url = Some(endpoint.base_url.clone());
             model_provider.env_key = endpoint.api_key_env.clone();
@@ -4529,7 +5188,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_file_behind_a_link_in_a_denied_directory_is_denied_too() {
-        let dir = scratch("linked-deny");
+        let dir_scratch = Scratch::new("linked-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         std::fs::create_dir_all(&config).expect("config dir");
         std::fs::create_dir_all(dir.join("kept")).expect("kept");
@@ -4605,10 +5265,21 @@ mod tests {
                 ),
                 ("NETRC", "/n/netrc"),
                 ("PASSWORD_STORE_DIR", "/pass"),
+                ("AZURE_FEDERATED_TOKEN_FILE", "/az/federated-token"),
+                ("GOOGLE_APPLICATION_CREDENTIALS", "/gcp/credentials.json"),
+                ("CLOUDSDK_CONFIG", "/gcloud"),
             ]),
             None,
         )
         .expect("homes");
+        // Where workload identities keep their tokens on Kubernetes.
+        let pod = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let azure = "/var/run/secrets/azure/tokens";
+        assert!(has(&secrets, pod), "{pod} is not among the denied places");
+        assert!(
+            has(&secrets, azure),
+            "{azure} is not among the denied places"
+        );
         for path in [
             "/cfg/gh",
             "/cfg/git/credentials",
@@ -4632,6 +5303,9 @@ mod tests {
             "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
+            "/az/federated-token",
+            "/gcp/credentials.json",
+            "/gcloud",
         ] {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
@@ -4646,7 +5320,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_token_volume_is_denied_whole() {
-        let dir = scratch("projected-token");
+        let dir_scratch = Scratch::new("projected-token");
+        let dir = dir_scratch.0.clone();
         let volume = dir.join("serviceaccount");
         std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
         std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
@@ -4683,6 +5358,244 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A token file Google's application credentials name is denied with the
+    /// credentials: an external account's source file, with its projected
+    /// volume, the file its executable keeps a token in, and the source file
+    /// of the credentials an impersonated account is configured with.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_files_googles_credentials_name_are_denied() {
+        let dir = std::fs::canonicalize(scratch("gcp-external")).expect("real");
+        let volume = dir.join("gke");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let external = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {
+                "file": volume.join("token"),
+                "executable": {"command": "/bin/true", "output_file": dir.join("cached.json")},
+            },
+        });
+        std::fs::write(dir.join("external.json"), external.to_string()).expect("config");
+        let impersonated = serde_json::json!({
+            "type": "impersonated_service_account",
+            "source_credentials": {
+                "type": "external_account",
+                "credential_source": {"file": "relative/inner-token"},
+            },
+        });
+        std::fs::write(dir.join("impersonated.json"), impersonated.to_string()).expect("config");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        for (config, wanted) in [
+            (
+                "external.json",
+                vec![
+                    volume.clone(),
+                    volume.join("token"),
+                    dir.join("cached.json"),
+                ],
+            ),
+            (
+                "impersonated.json",
+                vec![PathBuf::from("/work/relative/inner-token")],
+            ),
+        ] {
+            let named = dir.join(config).display().to_string();
+            let env =
+                |name: &str| (name == GOOGLE_CREDENTIALS).then(|| std::ffi::OsString::from(&named));
+            let found = token_files(&env, &here).expect("found");
+            assert!(
+                found.contains(&dir.join(config)),
+                "the credentials: {found:?}"
+            );
+            for file in &wanted {
+                assert!(found.contains(file), "{}: {found:?}", file.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The web identity token file an AWS profile names, and not a variable,
+    /// is denied, with its projected volume: one under `~/` in each home as
+    /// well as from the working directory, in any profile.
+    #[cfg(unix)]
+    #[test]
+    fn the_web_identity_token_file_an_aws_profile_names_is_denied() {
+        let dir = std::fs::canonicalize(scratch("aws-profile")).expect("real");
+        let volume = dir.join("eks");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".aws")).expect("home");
+        std::fs::write(
+            home.join(".aws/config"),
+            format!(
+                "[default]\nregion = eu-west-1\n[profile pod]\nweb_identity_token_file = {}\n",
+                volume.join("token").display()
+            ),
+        )
+        .expect("config");
+        std::fs::write(
+            dir.join("moved-config"),
+            format!(
+                "[profile other]\n  Web_Identity_Token_File=~/tokens/web\n\
+                 [profile colon]\nweb_identity_token_file: {d}/colon-token\n\
+                 [profile commented]\nWEB_IDENTITY_TOKEN_FILE = {d}/commented-token  # eks\n\
+                 [profile both]\nweb_identity_token_file\t:\t{d}/both-token ;note\n",
+                d = dir.display()
+            ),
+        )
+        .expect("moved");
+        let (home_s, moved) = (home.display().to_string(), dir.join("moved-config"));
+        let moved_s = moved.display().to_string();
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some(home_s.clone()),
+                "AWS_CONFIG_FILE" => Some(moved_s.clone()),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let places = home_secrets(&env, None).expect("homes");
+        for file in [
+            volume.clone(),
+            volume.join("token"),
+            home.join("tokens/web"),
+            dir.join("colon-token"),
+            dir.join("commented-token"),
+            dir.join("commented-token  # eks"),
+            dir.join("both-token"),
+        ] {
+            assert!(
+                places.contains(&file),
+                "{} is not among the denied places",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The application default credentials gcloud writes are read for the
+    /// token files they name, as Google's libraries read them with no
+    /// variable set.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_google_credentials_are_read_for_the_token_files_they_name() {
+        let dir = std::fs::canonicalize(scratch("gcp-default")).expect("real");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".config/gcloud")).expect("gcloud");
+        let config = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {"file": dir.join("adc-token")},
+        });
+        std::fs::write(
+            home.join(".config/gcloud/application_default_credentials.json"),
+            config.to_string(),
+        )
+        .expect("config");
+        let home_s = home.display().to_string();
+        let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(&home_s));
+        let places = home_secrets(&env, None).expect("homes");
+        assert!(
+            places.contains(&dir.join("adc-token")),
+            "adc-token is not among the denied places"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A credential configuration that cannot be read whole is refused,
+    /// naming it, so nothing runs: only one that is not there names nothing.
+    /// Google's credentials that are not JSON, or whose file field is not
+    /// text; a directory, a fifo (without waiting on it), a file past the
+    /// bound, a path through a file, and an AWS file that is not text.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_configuration_that_cannot_be_read_whole_is_refused() {
+        let dir = std::fs::canonicalize(scratch("config-refused")).expect("real");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        let google = |name: &str| {
+            google_token_files(&dir.join(name), &here)
+                .err()
+                .unwrap_or_default()
+        };
+        let aws = |name: &str| {
+            aws_profile_token_files(&dir.join(name), &[], &here)
+                .err()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            google_token_files(&dir.join("missing"), &here),
+            Ok(Vec::new())
+        );
+        // A device, as /dev/null is when a variable turns a configuration
+        // off, names nothing and is not opened.
+        let null = Path::new("/dev/null");
+        assert_eq!(aws_profile_token_files(null, &[], &here), Ok(Vec::new()));
+        assert_eq!(google_token_files(null, &here), Ok(Vec::new()));
+        // One this user may not read is refused, saying so.
+        std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
+        std::fs::set_permissions(
+            dir.join("theirs"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("mode");
+        assert!(
+            aws("theirs").contains("this user may not read it"),
+            "{}",
+            aws("theirs")
+        );
+        std::fs::write(dir.join("broken.json"), "{\"credential_source\": ").expect("broken");
+        assert!(
+            google("broken.json").contains("it is not JSON"),
+            "{}",
+            google("broken.json")
+        );
+        std::fs::write(
+            dir.join("number.json"),
+            r#"{"credential_source": {"file": 7}}"#,
+        )
+        .expect("number");
+        assert!(
+            google("number.json").contains("credential_source.file is not text"),
+            "{}",
+            google("number.json")
+        );
+        std::fs::create_dir_all(dir.join("a-directory")).expect("dir");
+        assert!(google("a-directory").contains("not a plain file"));
+        let fifo = std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes())
+            .expect("name");
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        assert!(aws("fifo").contains("not a plain file"), "{}", aws("fifo"));
+        let big = vec![b' '; CONFIG_BYTES_MAX as usize + 1];
+        std::fs::write(dir.join("big"), big).expect("big");
+        assert!(aws("big").contains("more than"), "{}", aws("big"));
+        // An error other than not being there: a path through a file.
+        std::fs::write(dir.join("plain"), "").expect("plain");
+        let through = google("plain/credentials.json");
+        assert!(through.contains("Not a directory"), "{through}");
+        std::fs::write(dir.join("latin1"), b"web_identity_token_file = /t\xff\n").expect("bytes");
+        assert!(
+            aws("latin1").contains("not UTF-8 text"),
+            "{}",
+            aws("latin1")
+        );
+        assert!(
+            aws("latin1").starts_with(&format!(
+                "{} could not be read",
+                dir.join("latin1").display()
+            )),
+            "the file is named"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A projected volume is found by where its token resolves to: through
     /// a link to a link to the token, and for an item nested in one of the
     /// volume's directories. A file beside a `..data` that does not resolve
@@ -4690,7 +5603,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_volume_is_found_through_links_and_for_nested_items() {
-        let dir = std::fs::canonicalize(scratch("projected-links")).expect("real");
+        let dir_scratch = Scratch::new("projected-links");
+        let dir = dir_scratch.0.clone();
         let version = "..2026_01_01_00_00_00.1";
         let volume = |name: &str| {
             let volume = dir.join(name);
@@ -4813,7 +5727,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_place_behind_a_linked_directory_is_denied_by_its_real_path() {
-        let dir = std::fs::canonicalize(scratch("real-spelling")).expect("real");
+        let dir_scratch = Scratch::new("real-spelling");
+        let dir = dir_scratch.0.clone();
         std::fs::create_dir_all(dir.join("real/gnupg")).expect("gnupg");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         link(&dir.join("real"), &dir.join("linked"));
@@ -4889,7 +5804,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_the_persons_own_files_and_directories_are_denied_behind_links() {
-        let dir = scratch("deniable");
+        let dir_scratch = Scratch::new("deniable");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
@@ -4928,7 +5844,8 @@ mod tests {
     #[test]
     fn a_late_link_is_found_and_one_that_cannot_be_denied_refuses() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-links");
+        let dir_scratch = Scratch::new("late-links");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         for d in [&place, &work.join("deep"), &dir.join("elsewhere")] {
@@ -4976,7 +5893,8 @@ mod tests {
     #[test]
     fn a_static_chain_of_links_finds_nothing_new() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-static");
+        let dir_scratch = Scratch::new("late-static");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.codex");
         let skills = dir.join("dev/skills");
         let store = dir.join("dev/store");
@@ -5005,7 +5923,8 @@ mod tests {
     #[test]
     fn a_place_that_became_a_link_is_replaced_by_its_target() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-place");
+        let dir_scratch = Scratch::new("late-place");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
         std::fs::create_dir_all(dir.join("work/deep")).expect("dir");
@@ -5058,7 +5977,8 @@ mod tests {
     #[test]
     fn nested_late_targets_collapse_to_the_outer() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-nested");
+        let dir_scratch = Scratch::new("late-nested");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let kept = dir.join("dev/kept");
         std::fs::create_dir_all(kept.join("b")).expect("dir");
@@ -5133,7 +6053,8 @@ mod tests {
     #[test]
     fn a_carried_place_is_walked_through_a_link() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-carried");
+        let dir_scratch = Scratch::new("late-carried");
+        let dir = dir_scratch.0.clone();
         let ssh = dir.join("home/.ssh");
         let gnupg = dir.join("dev/gnupg");
         std::fs::create_dir_all(&ssh).expect("dir");
@@ -5155,7 +6076,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_late_target_is_denied_at_its_second_mounts() {
-        let dir = scratch("late-aliases");
+        let dir_scratch = Scratch::new("late-aliases");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         std::fs::create_dir_all(&place).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -5190,7 +6112,8 @@ mod tests {
     #[test]
     fn a_denied_entry_that_became_a_link_is_replaced_however_it_is_spelled() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-spelled");
+        let dir_scratch = Scratch::new("late-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         std::fs::create_dir_all(&real_home).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -5720,7 +6643,8 @@ mod tests {
     fn a_place_under_a_linked_directory_that_became_a_link_leaves_no_link_denied() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-spelled");
+        let dir_scratch = Scratch::new("relisted-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -5806,7 +6730,8 @@ mod tests {
     fn a_denial_inside_a_late_target_is_taken_out() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-inner");
+        let dir_scratch = Scratch::new("relisted-inner");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let kept = dir.join("dev/kept");
         let work = dir.join("work");
@@ -5872,7 +6797,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_in_the_list_is_not_walked_as_a_place() {
-        let dir = scratch("late-inferred-alias");
+        let dir_scratch = Scratch::new("late-inferred-alias");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.config/gh");
         let shown = dir.join("dev/gh");
         let again = dir.join("again/gh");
@@ -5930,7 +6856,8 @@ mod tests {
     #[test]
     fn the_helper_relists_a_turns_profile() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted");
+        let dir_scratch = Scratch::new("relisted");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -5993,7 +6920,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
-        let dir = scratch("second-mounts");
+        let dir_scratch = Scratch::new("second-mounts");
+        let dir = dir_scratch.0.clone();
         let codex = dir.join("codex");
         for d in [&codex, &dir.join("home/.aws")] {
             std::fs::create_dir_all(d).expect("dir");
@@ -6037,10 +6965,12 @@ mod tests {
             message.contains("is a second mount") && message.contains("which they need"),
             "{message}"
         );
-        // Where it lies two levels inside a directory the thread may write.
+        // Where it lies two levels inside a directory the thread may write:
+        // the whole filesystem, bound there, is the thread's to write at `/`
+        // too, and so is the place.
         let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
         assert!(
-            message.contains("is a second mount") && message.contains("two or more levels"),
+            message.contains("home/.aws is inside /, which atoms' commands may write"),
             "{message}"
         );
         // Codex's home bound two levels inside a writable directory: its
@@ -6081,7 +7011,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
-        let dir = scratch("covering");
+        let dir_scratch = Scratch::new("covering");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let codex = dir.join("codex");
         let work = dir.join("work");
@@ -6165,7 +7096,8 @@ mod tests {
     #[test]
     fn a_pipe_is_denied_and_only_programs_devices_and_others_directories_are_left() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("pipes");
+        let dir_scratch = Scratch::new("pipes");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
@@ -6257,8 +7189,307 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    /// What a command could repoint refuses the thread: a place whose own
+    /// chain, there now, runs through a link in what the thread may write; a
+    /// link inside a place that does, or that leads nowhere yet into what
+    /// it may write; and a place that leads into a second mount of what it
+    /// may write, as much the thread's to write as the directory itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_or_a_link_in_one_a_command_could_repoint_refuses_the_thread() {
+        let dir = Scratch::new("place-chains");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let elsewhere = dir.0.join("elsewhere");
+        for d in [&home, &work, &codex, &elsewhere, &dir.0.join("state")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let writable = std::slice::from_ref(&work);
+        let refused = || {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // (b) The place, there now, through a link in what it may write.
+        std::fs::write(elsewhere.join("aws"), "[default]").expect("aws");
+        link(&elsewhere.join("aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                place.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // (a) A link inside the place, leading nowhere yet into what it may
+        // write, and one whose chain runs through a link there.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(&place).expect("dir");
+        let config = place.join("config");
+        link(&work.join("aws-config"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{}, inside a place denied to atoms' commands, is a link to {}, which is not \
+                 there yet and lies in {}",
+                config.display(),
+                work.join("aws-config").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        link(&work.join("hop"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                config.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        std::fs::remove_dir(&place).expect("rmdir");
+        drop(one);
+        // (c) Into a second mount of what it may write.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again rw - ext4 /dev/sda1 rw\n",
+            work.display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        link(Path::new("/again/aws"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to /again/aws, which is not there yet and lies in /again",
+                place.display()
+            )),
+            "{why}"
+        );
+        drop(_table);
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // A place not there yet, under a directory that is a link into what
+        // it may write, leading nowhere yet.
+        std::fs::remove_file(&place).expect("unlink");
+        let config = home.join(".config");
+        link(&work.join("cfg"), &config);
+        let gh = config.join("gh");
+        let listed = PrivateState {
+            also: vec![gh.clone()],
+            ..private.clone()
+        };
+        let why = denied_paths(&listed, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{}, which is not there yet, would be made at {}, in {}",
+                gh.display(),
+                work.join("cfg/gh").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // A place that is a link in what the thread may write, its target
+        // there now: a command could point it elsewhere.
+        link(&elsewhere.join("aws"), &work.join(".aws"));
+        let in_work = PrivateState {
+            also: vec![work.join(".aws")],
+            ..private.clone()
+        };
+        let why = denied_paths(&in_work, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{} is a link in {}, which atoms' commands may write",
+                work.join(".aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        drop(one);
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        // A place whose chain stays out of what it may write: denied.
+        link(&elsewhere.join("aws"), &place);
+        assert_eq!(refused(), None);
+    }
+
+    /// A place that is a link leading nowhere yet refuses the thread when
+    /// where it would lead, through each further link, lies in what the
+    /// thread may write or in atomic's state, where a command could put a
+    /// file for what reads the place to find, or cannot be told; one that
+    /// leads elsewhere is passed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_place_link_into_what_the_thread_may_write_refuses_it() {
+        let dir = Scratch::new("place-dangling");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let state = dir.0.join("state");
+        for d in [&home, &work, &codex, &state] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: state.clone(),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let refused = |writable: &[PathBuf]| {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let writable = std::slice::from_ref(&work);
+        // Into what the thread may write.
+        link(&work.join("aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to {}, which is not there yet and lies in {}",
+                place.display(),
+                work.join("aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Into atomic's state, for a thread that writes nothing.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&state.join("aws"), &place);
+        let why = refused(&[]).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", state.display())),
+            "{why}"
+        );
+        // Through a further link, also leading nowhere yet.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&work.join("aws"), &dir.0.join("hop"));
+        link(&dir.0.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", work.display())),
+            "{why}"
+        );
+        // Through a link partway along, itself leading nowhere yet, into
+        // what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(dir.0.join("elsewhere")).expect("dir");
+        link(&work.join("d"), &dir.0.join("elsewhere/d"));
+        link(&dir.0.join("elsewhere/d/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "is a link to {}, which is not there yet and lies in {}",
+                work.join("d/aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Through a link a command may point elsewhere: one partway along in
+        // what the thread may write, leading out of it now.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere"), &work.join("lnk"));
+        link(&work.join("lnk/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("lnk").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // And a further link that is itself in what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Up through a directory of what the thread may write, back out of
+        // it: a command could make that directory a link.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(work.join("sub")).expect("dir");
+        link(&work.join("sub/../../elsewhere/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, and climbs back out of it, in {}",
+                work.join("sub").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Somewhere it cannot tell: up from what is not there.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("missing/../aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains("atomic cannot tell where it would lead"),
+            "{why}"
+        );
+        // Elsewhere: passed over, as before.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &place);
+        assert_eq!(refused(writable), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
-        let dir = scratch("linked-secrets");
+        let dir_scratch = Scratch::new("linked-secrets");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
         std::fs::create_dir_all(home.join("keys")).expect("keys");
@@ -6302,7 +7533,8 @@ mod tests {
 
     #[test]
     fn a_denied_path_inside_another_is_left_to_it() {
-        let dir = scratch("nested-deny");
+        let dir_scratch = Scratch::new("nested-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         let credentials = config.join("credentials");
         std::fs::create_dir_all(&credentials).expect("dirs");
@@ -6400,7 +7632,9 @@ mod tests {
     #[test]
     fn a_sign_in_sends_no_organization_or_project_headers() {
         on_codex_runtime(async {
-            let (home, auth) = (scratch("home-headers"), scratch("auth-headers"));
+            let (home_scratch, auth_scratch) =
+                (Scratch::new("home-headers"), Scratch::new("auth-headers"));
+            let (home, auth) = (home_scratch.0.clone(), auth_scratch.0.clone());
             let signed_in = ModelEndpoint {
                 base_url: crate::signin::CODEX_BACKEND.into(),
                 model: "synthetic".into(),
@@ -6431,11 +7665,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 
@@ -6495,7 +7740,8 @@ mod tests {
             let model = FakeModel::start(vec![Reply::Text("pong".into())])
                 .await
                 .expect("fake model");
-            let (home, cwd) = (scratch("home"), scratch("cwd"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home"), Scratch::new("cwd"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -6519,13 +7765,108 @@ mod tests {
         });
     }
 
+    /// A Codex atom's key to an endpoint on this machine over plain http, in
+    /// an environment that names no proxy and exempts nothing, with Codex's
+    /// `respect_system_proxy` feature off and on. On Linux, where the feature
+    /// finds no platform settings, the configuration is made either way.
+    /// Elsewhere the platform's settings may name a proxy atomic cannot read:
+    /// with the feature off the key is refused unless NO_PROXY exempts the
+    /// host, and with it on, where NO_PROXY changes nothing, it is refused
+    /// with the feature named.
+    #[test]
+    fn a_key_the_systems_proxy_settings_may_carry_is_refused_where_they_apply() {
+        on_codex_runtime(async {
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} is set in this test's environment"
+                );
+            }
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "synthetic".into(),
+                api_key_env: Some("PATH".into()),
+                sign_in: None,
+            };
+            let plain = scratch("home-no-system-proxy");
+            let default = new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default()).await;
+            let respecting = scratch("home-system-proxy");
+            std::fs::write(
+                respecting.join("config.toml"),
+                "[features]\nrespect_system_proxy = true\n",
+            )
+            .expect("config");
+            let respected = new_config(
+                &endpoint,
+                &respecting,
+                &respecting,
+                Arg0DispatchPaths::default(),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                default.expect("no proxy is named");
+                respected.expect("no proxy is named, and Linux has no platform settings");
+                // A proxy value only Codex's own resolver takes, with a space
+                // before it: reqwest's default reads it as none, and with the
+                // feature on Codex sends the key to it, so the key is refused.
+                let spaced = |name: &str| {
+                    (name == "HTTP_PROXY").then(|| " http://proxy.example:3128".to_owned())
+                };
+                new_config_reading(
+                    &endpoint,
+                    &plain,
+                    &plain,
+                    Arg0DispatchPaths::default(),
+                    spaced,
+                )
+                .await
+                .expect("reqwest's default takes no proxy from it");
+                let message = format!(
+                    "{:#}",
+                    new_config_reading(
+                        &endpoint,
+                        &respecting,
+                        &respecting,
+                        Arg0DispatchPaths::default(),
+                        spaced,
+                    )
+                    .await
+                    .expect_err("refused")
+                );
+                assert!(message.contains("HTTP_PROXY names a proxy"), "{message}");
+            } else {
+                let message = format!("{:#}", default.expect_err("refused"));
+                assert!(
+                    message.contains("the system's proxy settings")
+                        && message.contains(
+                            "set NO_PROXY to include 127.0.0.1, or use an https endpoint"
+                        ),
+                    "{message}"
+                );
+                let message = format!("{:#}", respected.expect_err("refused"));
+                assert!(
+                    message.contains("turn respect_system_proxy off, or use an https endpoint"),
+                    "{message}"
+                );
+            }
+        });
+    }
+
     /// The configuration every Codex thread is started with leaves Codex's
     /// own repository-instruction discovery switched off, on both of the
     /// settings Codex gates it on.
     #[test]
     fn no_threads_configuration_discovers_repository_instructions() {
         on_codex_runtime(async {
-            let home = scratch("home-docs");
+            let home_scratch = Scratch::new("home-docs");
+            let home = home_scratch.0.clone();
             let endpoint = ModelEndpoint {
                 base_url: "http://127.0.0.1:9/unused".into(),
                 model: "synthetic".into(),
@@ -6877,7 +8218,8 @@ mod tests {
         on_codex_runtime(async {
             let replies = (0..TURNS).map(|i| Reply::Text(format!("r{i}"))).collect();
             let model = FakeModel::start(replies).await.expect("fake model");
-            let (home, cwd) = (scratch("home3"), scratch("cwd3"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home3"), Scratch::new("cwd3"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -6919,9 +8261,13 @@ mod tests {
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
-        let state = scratch("exec-sandbox");
+        let state_scratch = Scratch::new("exec-sandbox");
+        let state = state_scratch.0.clone();
         let scratch_dir = state.join("scratch/a1");
         std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        // A place there, as a place not there yet in what a command may
+        // write would refuse the list.
+        std::fs::create_dir_all(state.join("keys")).expect("keys");
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -6992,7 +8338,8 @@ mod tests {
     #[test]
     fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
         use atomic_exec::Confine;
-        let state = scratch("exec-held");
+        let state_scratch = Scratch::new("exec-held");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -7025,7 +8372,8 @@ mod tests {
     #[test]
     fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;
-        let state = scratch("exec-token-socket");
+        let state_scratch = Scratch::new("exec-token-socket");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -7094,7 +8442,8 @@ mod tests {
     #[test]
     fn the_profile_stays_bounded_however_many_projects_there_are() {
         use atomic_exec::Confine;
-        let home = scratch("many-projects");
+        let home_scratch = Scratch::new("many-projects");
+        let home = home_scratch.0.clone();
         let paths =
             CodexPaths::with_helpers("/opt/atomic".into(), "/opt/codex-linux-sandbox".into());
         let profile_len = |home: &Path| {
@@ -7455,7 +8804,8 @@ mod tests {
     fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
         use crate::typed::Sandbox;
         use codex_protocol::permissions::FileSystemAccessMode::*;
-        let dir = scratch("private");
+        let dir_scratch = Scratch::new("private");
+        let dir = dir_scratch.0.clone();
         let state = dir.join("state");
         let home = state.join("codex");
         for sub in [
@@ -7591,7 +8941,8 @@ mod tests {
 
     #[test]
     fn turn_directories_of_dead_processes_are_swept() {
-        let state = scratch("sweep");
+        let state_scratch = Scratch::new("sweep");
+        let state = state_scratch.0.clone();
         let tmp = state.join("tmp");
         std::fs::create_dir_all(&tmp).expect("tmp");
         // A pid that no process has: above the kernel's pid limit.
@@ -7633,7 +8984,8 @@ mod tests {
             ])
             .await
             .expect("fake model");
-            let (home, cwd) = (scratch("home2"), scratch("cwd2"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home2"), Scratch::new("cwd2"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -7942,10 +9294,11 @@ mod tests {
         limit: Limit,
     ) -> (anyhow::Result<(String, ThreadReport)>, Vec<Outcome>, usize) {
         let model = FakeModel::start(replies).await.expect("fake model");
-        let (home, cwd) = (
-            scratch(&format!("home-{tag}")),
-            scratch(&format!("cwd-{tag}")),
+        let (home_scratch, cwd_scratch) = (
+            Scratch::new(&format!("home-{tag}")),
+            Scratch::new(&format!("cwd-{tag}")),
         );
+        let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
         let endpoint = ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),

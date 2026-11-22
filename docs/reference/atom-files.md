@@ -51,10 +51,13 @@ atomic's environment.
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
-`private/`, the current project's Codex records, the credential and key
-directories) and the places in your home directory where credentials are
+`private/`, every project's Codex records among it, the credential and key
+directories), the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
-[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
+[configuration](#configuration)), and every other attempt's scratch
+directory in the atomic home's `scratch/`, of this project or another, live
+or not, whether a turn's, another exec step's or that of `atomic debug
+codex-prompt` or `atomic debug probe`. It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
@@ -154,8 +157,8 @@ is not, the copies are only marked read-only, and changing one changes only
 the copy. Handing files over is supported on Linux and macOS; on Windows an
 output that names a file is refused.
 
-Both directories are inside the command's scratch directory, in the project's
-state directory, and go when the step ends; what a killed process left is
+Both directories are inside the command's scratch directory, in the atomic
+home's `scratch/`, and go when the step ends; what a killed process left is
 removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
 `ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
@@ -430,23 +433,43 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them. AWS's workload token files
-are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
-`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name (one named relative to
-atomic's working directory, as AWS's SDKs read it), the whole projected
-volume when such a file is in one Kubernetes mounts, found through any
-links that lead to it (so the token it rotates in next is denied as well),
-and EKS's usual token directories,
-`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
-`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
-variable names them. An ordinary token file is denied by its path each
-time a command starts, so one replaced there is denied to the next command.
-A token given as a value rather than a file, such as
+variables, `KUBECONFIG`, `CLOUDSDK_CONFIG` and others) put them. Workload
+token files are denied too:
+
+- the files `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE` and
+  `GOOGLE_APPLICATION_CREDENTIALS` name, one named relative to atomic's
+  working directory as the SDKs read it;
+- the token files Google's credentials name, there or in the application
+  default credentials gcloud writes: an external account's source file, the
+  file its executable keeps a token in, and those of the credentials an
+  impersonated account is configured with;
+- every `web_identity_token_file` setting in your AWS configuration and
+  credentials files, written with `=` or `:`, both with and without a `#` or
+  `;` comment after it;
+- the whole projected volume when such a file is in one Kubernetes mounts,
+  found through any links that lead to it, so the token it rotates in next
+  is denied as well;
+- the usual token directories, whether or not anything names them: EKS's
+  `/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+  `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, the pod's own
+  `/var/run/secrets/kubernetes.io/serviceaccount`, and Azure workload
+  identity's `/var/run/secrets/azure/tokens`.
+
+A configuration atomic reads for the token files it names stops the run,
+with a message naming it, when it cannot be read whole, rather than leaving a
+token it may name readable: when it cannot be opened (this user may not read
+it, say), is not a plain file, is larger than any such file is, is not JSON
+or text, or gives a field that names a file a value that is not text. One
+that is not there, or is a device, as `/dev/null` is when a variable turns a
+configuration off, names nothing. An ordinary token file is denied by its
+path each time a command starts, so one replaced there is denied to the next
+command. A token given as a value rather than a file, such as
 `AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
 only a few core variables and those its atom declares, and the credential
 endpoints AWS serves on link-local and unique-local addresses are out of its
-reach, since a command reaches no private or local address. A link among them, up to four
-directory levels inside a denied directory, is denied as what it
+reach, since a command reaches no private or local address. A link among
+them, up to four directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
@@ -516,34 +539,55 @@ directory it may write, which a command could point elsewhere; when a
 denied place lies in a directory it may write that it is given through a
 link, rather than by its real path; or when a token file is named relative
 while atomic's own working directory is unknown. Each place is denied under
-its real path, which denies it under every spelling. The model
-chooses the
+its real path, which denies it under every spelling. Nor does it start
+when a denied place is a link atomic cannot resolve for a reason other
+than leading nowhere yet, such as a link to itself or into a directory you
+may not search: remove the link, or point it at something atomic can
+reach. Nor does it start when a denied place is a link leading nowhere yet
+whose path, walked a directory at a time with each link on the way
+followed, would land in a directory it may write or in atomic's state,
+where a command could put a file there for what reads the place to find;
+passes through a link in such a directory, which a command could point
+elsewhere, or climbs back out of one with `..`, where a command could make
+what it climbs out of a link; or leads where atomic cannot tell: point the
+link elsewhere, or make what it leads to first. The same walk holds a
+denied place that is a link leading somewhere now, whose chain may not
+pass through such a link either, and each link found inside a denied
+place, which may not lead nowhere yet into a directory the turn may write
+either; a link inside the place itself is hidden from commands, and so
+cannot be pointed elsewhere. A denied place that is not there yet is
+walked the same way: where it would be made in a directory the turn may
+write, or through a link there, nothing runs, since a command could make
+it for whatever reads it to find. So a turn whose working directory is
+your home refuses while `~/.aws` or another such place is missing there:
+make it first, or run the project elsewhere. A directory the turn may
+write counts as such wherever else it is mounted. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a
-denied place points at, which each command looks for again as it starts,
-in the places the list was made with, and denies at its second mounts too,
-and so is a second mount of what the list denies made since it was built,
-or of Codex's home, whose databases are denied there too, as each command
-reads the mount table again; a command whose new link or
-new second mount leads somewhere atomic would refuse to deny does not
-start. As each command starts, the links up to four levels inside the
+denied place points at, which each command looks for again as it starts, in
+the places the list was made with, and denies at its second mounts too, and
+so is a second mount of what the list denies made since it was built, or of
+Codex's home, whose databases are denied there too, as each command reads
+the mount table again; a command whose new link or new second mount leads
+somewhere atomic would refuse to deny, or whose denied place has become a
+link atomic cannot resolve for a reason other than leading nowhere, does
+not start. As each command starts, the links up to four levels inside the
 places that lead outside them to something atomic would deny, old and new,
 each target counted once, together with the second mounts of what the new
 ones point at, of everything the list denies (its own second mounts among
 them, so each pair is counted from both sides) and of Codex's home, come to
-at most 512; past that, the command does not start, and the list is
-counted the same way when the turn starts.
-A link or a mount made in the moment between that look and the sandbox's
-start, or while a long-lived command, such as a turn's unified-exec
-session, keeps running, is followed only from the next command. The file operations Codex
-makes for a turn itself, such as applying a patch, go through a helper that
-is not handed the places: it walks the list's own entries instead, so for
-them a place that was already a link when the list was made is not
-followed again: not when it has been pointed elsewhere since, not when it
-led nowhere then and leads somewhere now, and not for new links inside it
-when it leads to a directory atomic never denies. Credentials kept
-anywhere else are not covered.
+at most 512; past that, the command does not start, and the list is counted
+the same way when the turn starts. A link or a mount made in the moment
+between that look and the sandbox's start, or while a long-lived command,
+such as a turn's unified-exec session, keeps running, is followed only from
+the next command. The file operations Codex makes for a turn itself, such
+as applying a patch, go through a helper that is not handed the places: it
+walks the list's own entries instead, so for them a place that was already
+a link when the list was made is not followed again: not when it has been
+pointed elsewhere since, not when it led nowhere then and leads somewhere
+now, and not for new links inside it when it leads to a directory atomic
+never denies. Credentials kept anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,
