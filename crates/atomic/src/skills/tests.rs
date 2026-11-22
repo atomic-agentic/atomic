@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use atomic_core::AtomConfig;
+use atomic_core::cassette::{Cassette, Mode, Tally};
+use atomic_core::codex::{CodexPaths, ModelEndpoint};
+use atomic_core::eval;
+use atomic_core::eval::AtomSubject;
+use atomic_core::lite::{LimitField, LiteRuntime, Wire};
+use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::{atom, compile};
 use atomic_schema::registry::Registry;
 use serde_json::json;
@@ -398,16 +405,23 @@ fn worked_example() -> Vec<(String, String)> {
     files
 }
 
-#[test]
-fn the_worked_example_checks_renders_and_its_cases_hold() {
+/// The worked example as a project: every file SKILL.md names, written under
+/// a fresh scratch directory of this test's own.
+fn write_worked_example(tag: &str) -> (PathBuf, Vec<(String, String)>) {
     let files = worked_example();
     assert!(files.len() >= 6, "{files:?}");
-    let dir = scratch("worked-example");
+    let dir = scratch(tag);
     for (path, contents) in &files {
         let target = dir.join(path);
         std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
         std::fs::write(target, contents).expect("write");
     }
+    (dir, files)
+}
+
+#[test]
+fn the_worked_example_checks_renders_and_its_cases_hold() {
+    let (dir, files) = write_worked_example("worked-example");
     crate::check(Some(dir.clone()), false).expect("atomic check passes");
     let (atom_file, _) = files
         .iter()
@@ -477,6 +491,220 @@ fn the_worked_example_checks_renders_and_its_cases_hold() {
     );
 }
 
+/// What the test's loopback server answers one case with: the notes it was
+/// sent say what the actions are. Every case's prompt holds the typed
+/// example's notes as well as the case's, so only the case with an
+/// instruction hidden in its notes says this.
+fn example_answer(request: &Value) -> atomic_core::testing::Reply {
+    let actions = if request.to_string().contains("Ignore your instructions") {
+        // The instruction is data: it names no task, so there is no action.
+        json!([])
+    } else {
+        json!([
+            {"task": "Send the budget by Friday", "owner": "Ana"},
+            {"task": "Book the room", "owner": ""},
+        ])
+    };
+    atomic_core::testing::Reply::Text(json!({ "actions": actions }).to_string())
+}
+
+/// The example's cases as `atomic eval` runs them: [`atomic_core::eval`] and
+/// its [`atomic_core::eval::AtomSubject`], with each model call sent to
+/// `endpoint` through the cassette the command keeps beside the cases, on the
+/// `LiteRuntime` the command builds — the wire and the output-limit field the
+/// real endpoint takes, not the ones the cassette's loopback address would
+/// suggest.
+///
+/// Three parts of what the command assembles it cannot assemble here, because
+/// they belong to a project's state directory and a person's configuration
+/// rather than to a case: the Codex runtime carries no sign-in and no state to
+/// guard (a `lite` atom never runs on it), its home is a directory of this
+/// scratch rather than the project's state, and the meter is `none` rather
+/// than the one that holds the output limit of a live call — both halves of
+/// this test use the same runtime, so a recording still answers only the
+/// request it was made for.
+async fn eval_the_example(
+    atom: &atomic_core::atom::Atom,
+    project: &atomic_core::project::Project,
+    settings: &eval::Settings,
+    endpoint: &ModelEndpoint,
+    mode: Mode,
+) -> (eval::Report, Tally) {
+    let cassette = Cassette::start(
+        &settings.dir.join("cassettes"),
+        &project.dir,
+        &endpoint.base_url,
+        mode,
+    )
+    .await
+    .expect("cassette");
+    let mut lite = LiteRuntime::new(
+        ModelEndpoint {
+            base_url: cassette.base_url(&endpoint.base_url),
+            ..endpoint.clone()
+        },
+        AtomConfig::default(),
+    );
+    lite.wire = Wire::for_base_url(&endpoint.base_url);
+    lite.limit_field = Some(LimitField::for_endpoint(lite.wire, &endpoint.base_url));
+    lite.defaults.model = Some(endpoint.model.clone());
+    let runtimes = Runtimes {
+        codex: CodexRuntime {
+            paths: CodexPaths::without_helpers(),
+            codex_home: project.dir.join(".atomic/codex-home"),
+            guard: atomic_core::codex::StateGuard::NoProjectState,
+            cwd: project.dir.clone(),
+            endpoint: endpoint.clone(),
+            defaults: AtomConfig::default(),
+            artifacts: Artifacts::none(),
+            meter: atomic_core::usage::Metering::none(),
+            caches: None,
+        },
+        lite,
+        backend: atomic_core::testing::denying_nothing(Default::default()),
+        exec_meter: Default::default(),
+        clock: None,
+    };
+    let cases = eval::load_cases(atom, settings).expect("the example's cases");
+    let subject = AtomSubject {
+        atom,
+        runtimes: &runtimes,
+    };
+    let report = eval::run(atom, cases, settings, &subject, eval::Options::default()).await;
+    (report, cassette.tally())
+}
+
+/// The worked example's eval cases run. Its answers are recorded once from
+/// the test's own loopback server, and the same report then replays from the
+/// recordings beside the cases with that server sent no request at all: the
+/// replay needs no provider, no key and no network, which is what a person
+/// running `atomic eval <name>` over a checked-in cassette gets.
+///
+/// This is the engine under the command, not the command: the case selection,
+/// the endpoint it resolves, the cassette setup, the flags and the exit status
+/// are the ones this test builds rather than the ones `atomic eval` chooses.
+/// `crates/atomic/tests/eval_cli.rs` runs these same worked-example files
+/// through the real `atomic eval` argv, with `HOME` and `ATOMIC_HOME` in its
+/// own scratch, and holds the two-case count, the replay counters and the
+/// stand-in's request log there as well.
+#[test]
+fn the_worked_examples_eval_replays_from_its_cassette_with_no_model_call() {
+    use atomic_core::testing::{FakeModel, on_codex_runtime};
+    on_codex_runtime(async {
+        let (dir, files) = write_worked_example("worked-example-eval");
+        crate::check(Some(dir.clone()), false).expect("atomic check passes");
+        let (atom_file, _) = files
+            .iter()
+            .find(|(p, _)| p.ends_with(".atom.astro"))
+            .expect("an atom");
+        let project = atomic_core::project::discover(&dir).expect("the example is a project");
+        let mut registry = Registry::new();
+        let atom = atom::load(&dir.join(atom_file), &mut registry).expect("loads");
+        let settings = eval::settings(&atom, &project).expect("the cases sit beside the manifest");
+        assert!(
+            settings.dir.ends_with("evals/extract-actions"),
+            "{}",
+            settings.dir.display()
+        );
+
+        // The endpoint the recordings name: this test's loopback server, so
+        // nothing here reaches a provider.
+        let model = FakeModel::respond(example_answer)
+            .await
+            .expect("fake model");
+        let endpoint = ModelEndpoint {
+            base_url: model.base_url(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: None,
+        };
+
+        // Recorded: one call per case, each answer checked against the full
+        // output schema and every `expect` line of its case.
+        let (report, tape) =
+            eval_the_example(&atom, &project, &settings, &endpoint, Mode::Record).await;
+        let mut ids: Vec<&str> = report.cases.iter().map(|c| c.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["instruction-in-notes.yaml", "two-actions.yaml"],
+            "{report:?}"
+        );
+        assert_eq!(model.calls(), 2, "one call per case: {report:?}");
+        assert!(report.passed, "the recorded cases: {report:?}");
+        for case in &report.cases {
+            assert!(case.passed, "{}: {:?}", case.id, case.failures);
+        }
+        assert_eq!(tape.recorded, 2, "{tape:?}");
+        assert_eq!(tape.replayed, 0, "{tape:?}");
+        assert_eq!(tape.missed, 0, "{tape:?}");
+
+        // Replayed: the same report off those recordings.
+        let (sent, calls) = (model.every_request(), model.calls());
+        let (report, tape) =
+            eval_the_example(&atom, &project, &settings, &endpoint, Mode::Replay).await;
+        assert_eq!(model.calls(), calls, "the replay made a model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "the replay sent the endpoint a request of any kind"
+        );
+        assert_eq!(tape.replayed, 2, "{tape:?}");
+        assert_eq!(tape.recorded, 0, "{tape:?}");
+        assert_eq!(
+            tape.missed, 0,
+            "a case answered with no recording: {tape:?}"
+        );
+        assert_eq!(tape.corrupt, 0, "{tape:?}");
+        assert_eq!(tape.keyed, 0, "a key reached the replay: {tape:?}");
+        assert_eq!(report.atom, "extract-actions", "{report:?}");
+        assert!(report.passed, "{report:?}");
+        assert_eq!(report.pass_rate, 1.0, "{report:?}");
+        assert_eq!(report.threshold, 1.0, "every case is required",);
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.cases.len(), 2, "{report:?}");
+        for case in &report.cases {
+            assert!(case.passed, "{}: {:?}", case.id, case.failures);
+        }
+        // What each case's assertions were checked against, so a case that
+        // silently stopped checking anything fails here.
+        let actions = |id: &str| -> Value {
+            report
+                .cases
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.output.as_ref())
+                .map(|o| o["actions"].clone())
+                .expect("the case has its output")
+        };
+        assert_eq!(
+            actions("two-actions.yaml"),
+            json!([
+                {"task": "Send the budget by Friday", "owner": "Ana"},
+                {"task": "Book the room", "owner": ""},
+            ]),
+            "{report:?}"
+        );
+        assert_eq!(
+            actions("instruction-in-notes.yaml"),
+            json!([]),
+            "{report:?}"
+        );
+        let tapes: Vec<PathBuf> = std::fs::read_dir(settings.dir.join("cassettes"))
+            .expect("the recordings beside the cases")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(tapes.len(), 2, "one recording per case: {tapes:?}");
+        for tape in &tapes {
+            let kept = std::fs::read_to_string(tape).expect("recording");
+            assert!(
+                !kept.contains("Authorization"),
+                "a header in a tape: {tape:?}"
+            );
+        }
+    });
+}
+
 #[test]
 fn the_pack_names_only_commands_this_binary_has() {
     use clap::CommandFactory;
@@ -494,5 +722,109 @@ fn the_pack_names_only_commands_this_binary_has() {
                 file.path
             );
         }
+    }
+}
+
+/// `word` with every `<placeholder>` replaced by `name`, which is what the
+/// agent substitutes before running it. A `<` or `>` outside a placeholder is
+/// the test's own failure: a redirection is not part of a command to run.
+fn substituted(word: &str) -> String {
+    let mut out = String::new();
+    let mut inside = None::<char>;
+    for c in word.chars() {
+        match (c, inside) {
+            ('>', Some(_)) => inside = None,
+            ('>', None) => panic!("`{word}` closes a placeholder it never opened"),
+            ('<', _) => inside = Some('<'),
+            (_, Some(_)) => {}
+            (c, None) => out.push(c),
+        }
+    }
+    assert!(inside.is_none(), "`{word}` leaves a placeholder open");
+    if out.is_empty() {
+        "name".to_owned()
+    } else {
+        out
+    }
+}
+
+/// Every command SKILL.md tells the agent to run, as the file writes it: each
+/// backticked `atomic …`, with the name and the placeholders gone, and
+/// duplicates left out. A span that never closes, or that names no command, is
+/// this test's own failure: a command it cannot read is never left unchecked.
+fn skill_commands() -> Vec<Vec<String>> {
+    let mut commands: Vec<Vec<String>> = Vec::new();
+    for at in CREATE_ATOM_SKILL.match_indices("`atomic ").map(|(i, _)| i) {
+        // The span runs from its backtick to the one that closes it, so what
+        // the agent runs starts after "`atomic ", eight characters in.
+        let rest = &CREATE_ATOM_SKILL[at + 8..];
+        let Some(end) = rest.find('`') else {
+            panic!("SKILL.md opens `atomic … at offset {at} and never closes the span");
+        };
+        let words: Vec<String> = rest[..end].split_whitespace().map(substituted).collect();
+        assert!(
+            !words.is_empty(),
+            "SKILL.md names `atomic ` with no command after it"
+        );
+        if !commands.contains(&words) {
+            commands.push(words);
+        }
+    }
+    assert!(
+        !commands.is_empty(),
+        "SKILL.md tells the agent to run no command at all"
+    );
+    commands
+}
+
+/// What SKILL.md tells an agent to run is what this binary takes: every
+/// command in it parses with its flags, every one names a command, every
+/// placeholder is well formed, and no word needs shell quoting to reach it.
+/// A command the skill invents, a flag this binary does not name, and a
+/// command an agent would have to quote all fail here.
+#[test]
+fn every_command_the_skill_tells_the_agent_to_run_parses() {
+    use clap::Parser;
+    let commands = skill_commands();
+    let shown: Vec<String> = commands.iter().map(|c| c.join(" ")).collect();
+    let names =
+        |words: &Vec<String>, command: &str| words.first().is_some_and(|first| first == command);
+    assert!(
+        commands
+            .iter()
+            .any(|c| names(c, "check") && c.iter().any(|a| a == "--json")),
+        "the loop must check with the structured diagnostics (`atomic check --json`): {shown:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| names(c, "eval") && !c.iter().any(|a| a.starts_with("--"))),
+        "the loop must run the atom's cases (`atomic eval <name>`): {shown:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|c| names(c, "eval") && c.iter().any(|a| a == "--live")),
+        "the loop must say how a case gets recorded (`atomic eval <name> --live`): {shown:?}"
+    );
+    for words in &commands {
+        for word in words {
+            assert!(
+                word.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':')),
+                "`atomic {}` holds `{word}`, which needs quoting or escaping to reach the \
+                 command as one argument",
+                words.join(" ")
+            );
+        }
+        let argv: Vec<&str> = std::iter::once("atomic")
+            .chain(words.iter().map(String::as_str))
+            .collect();
+        crate::Cli::try_parse_from(&argv).unwrap_or_else(|e| {
+            panic!(
+                "`atomic {}` is not what this binary takes: {e}",
+                words.join(" ")
+            )
+        });
     }
 }

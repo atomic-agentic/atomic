@@ -127,10 +127,11 @@ atomic check
 atomic run summarize-and-review --input note.json
 ```
 
-The local gate shows the draft and the reviewer's verdict. Approve a result you
-accept, or reject it if the review found a problem. A `revise` verdict does not
-silently block or repair the draft in this example: the human gate is the decision.
-Rejected or expired gates stop dependent work and prevent a successful result.
+The run's terminal prompts you at the local gate with the draft and the
+reviewer's verdict. Approve a result you accept, or reject it if the review
+found a problem. A `revise` verdict does not silently block or repair the draft
+in this example: the human gate is the decision. Rejected or expired gates stop
+dependent work and prevent a successful result.
 
 The CLI reports a run ID. Inspect that run with:
 
@@ -144,16 +145,25 @@ Atomic checkpoints completed steps and stores the gate separately from the live
 model session. On recovery, completed steps return their saved outputs and a
 waiting gate remains waiting. An interrupted step may run again.
 
-In the v0.1 target, return to this project and resume the saved run:
+Return to this project and resume the saved run:
 
 ```sh
 atomic runs resume <run-id>
 ```
 
+Resume continues a run that stopped before it finished. A run whose step failed
+outright is not resumed: atomic says which run already failed and tells you to
+start a new one.
+
 The run keeps its ID and completed summaries/reviews. If the terminal closes while
 waiting for approval, the gate stays saved; its original 24-hour deadline keeps
 counting while Atomic is stopped. On resume, an expired gate rejects before any
 downstream work. Resume does not reset the deadline or approve the proposal.
+
+A decision is signed with your operator credential, and nothing enrolls it for
+you: run `atomic gates enroll` once for the project before deciding. The
+[CLI reference](../reference/cli.md#gates-and-supervision) covers where that
+credential is kept.
 
 For a headless local runtime, run `atomic serve` and keep that process running
 under a supervisor. In a second terminal, inspect and decide the waiting gate:

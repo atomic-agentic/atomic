@@ -10,21 +10,40 @@ prerequisites for building that app.
 
 ## Release status
 
-This repository currently contains the product plan and examples. An installable
-Atomic release, download location and supported installation command have not
-been published here. Installation instructions will be added with the first
-release; the commands in these docs describe the target CLI.
+No Atomic release has been published here: there is no download location and no
+supported installation command. The check under
+[verifying a download](#verifying-a-download) is what an archive from a
+published release will face; there is nothing to check against yet.
 
-See [availability](../reference/availability.md) before trying a feature.
+Atomic itself is in this repository and builds from source. With a container
+engine, git and curl on the host, from a checkout:
+
+```sh
+scripts/dev.sh cargo build --release --locked -p atomic-agentic
+```
+
+That writes `target/release/atomic`, a Linux executable (the container is a
+Linux image): the package is `atomic-agentic`, the program it builds is
+`atomic`, and `atomic --help` lists its commands.
+[Developing atomic](../development.md) covers the development container, the
+pinned toolchain and the prebuilt V8 the build links.
+
+Which commands are built and which are a later stage's plan is listed in
+[availability](../reference/availability.md); read it before trying a feature.
 
 ## What you will need
 
 - A supported development machine. Linux and macOS are the initial local targets;
   Windows support is planned on a best-effort basis.
 - Model access through an eligible ChatGPT subscription with Codex access, an
-  API key, or a supported local provider. Subscription sign-in exists upstream;
-  Atomic still needs to expose it. The API-key path detects `OPENAI_API_KEY`.
-- Git and your usual build tools for repository work.
+  API key, or a local OpenAI-compatible endpoint. Codex atoms take the
+  subscription sign-in from `atomic model login`, which atomic accepts on Linux
+  for now; the API-key path detects `OPENAI_API_KEY`.
+- Git and a container engine (Docker, or Podman) to build Atomic from source; the
+  executable itself runs with no container. `scripts/dev.sh` also wants `curl`,
+  which fetches the pinned V8 archive the first time its cache needs it; the
+  Rust toolchain and the other build tools are in the
+  [development container](../development.md#the-development-container).
 
 Atomic's Astro compiler is built into the binary and runs on the V8 engine it
 embeds, so `atomic check` and `atomic render` need no Deno, Node or npm. From
@@ -34,7 +53,11 @@ that Atomic downloads and verifies itself the first time a project needs it.
 Read [subscriptions and authentication](authentication.md) for model access:
 `atomic model login` signs Codex atoms in with ChatGPT, and an endpoint with an API key
 serves any atom. Keep credentials out of atom files and committed configuration.
-Local-model setup instructions will accompany the matching release.
+To use a local model, set `ATOMIC_MODEL_BASE_URL` to the server's OpenAI-compatible
+endpoint and `ATOMIC_MODEL` to the model it serves. If the server requires an API
+key, set `ATOMIC_MODEL_API_KEY_ENV` to the name of the variable that holds it.
+Lite atoms use Chat Completions on local servers, and Codex atoms require the
+Responses API. See [models](../models.md) for compatibility details.
 
 ## Verifying a download
 
