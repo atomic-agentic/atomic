@@ -1774,12 +1774,13 @@ pub(crate) fn permission_profile_with(
 /// directories. What the thread may write inside a denied directory, such as
 /// its own scratch directory, stays writable, as a writable root of its own.
 ///
-/// These go into the profile as they are named: `denied_paths` weighs neither
-/// them nor their second mounts. So a scratch or state root that is itself a
-/// link reaches each command's sandbox helper as a denial that is a link, and
-/// that walk denies what it points at instead (see `late_targets`). It
-/// refuses the command, and the command does not run, when what it points at
-/// holds a place the command needs to run, such as the command's own working
+/// These go into the profile spelled as they were handed over: their cap is
+/// weighed with the list's (`denied_paths_with`), but no link in them is
+/// resolved here. So a scratch or state root that is itself a link reaches
+/// each command's sandbox helper as a denial that is a link, and that walk
+/// denies what it points at instead (see `late_targets`). It refuses the
+/// command, and the command does not run, when what it points at holds a
+/// place the command needs to run, such as the command's own working
 /// directory: a turn whose root lies inside such a linked root is refused
 /// every command of its turn. That fails closed, and is what supporting
 /// scratch or state directories moved elsewhere and linked back would have to
@@ -2786,8 +2787,8 @@ fn late_link_targets(
 /// (two where the places are inferred, which needs the table too). What
 /// `denied` holds is counted from each side, as when the list is built: the
 /// second mounts of its second mounts among them, which is the count
-/// `denied_paths` holds a list to, so that a thread's commands are never
-/// refused for the cap alone. Nothing
+/// `denied_paths_with` weighs a list against the cap with, so that a list a
+/// thread starts with is not refused by its own commands. Nothing
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
@@ -6654,7 +6655,9 @@ mod tests {
     }
 
     /// What the profile will deny besides the list, the backend's scratch
-    /// directories, counts toward the cap as each command counts it.
+    /// directories, counts toward the cap as each command counts it: the
+    /// builder refuses the list the thread would start with, and so does each
+    /// command's helper, over the same denied.
     #[cfg(unix)]
     #[test]
     fn the_builder_counts_the_scratch_it_will_deny_as_each_command_does() {
@@ -6677,6 +6680,25 @@ mod tests {
                 .to_string();
         assert!(
             refused.contains("with 513 second mounts of what they deny, counted from each side"),
+            "{refused}"
+        );
+        // The scratch directory as one of the paths a command's profile
+        // denies, counted by the walk each command's helper makes before it
+        // starts the command: its own 513 second mounts, and nothing new
+        // found besides.
+        let refused = late_targets(std::slice::from_ref(&scratch), Some(&[]), &[], &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("0 second mounts of what the new ones point at"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
             "{refused}"
         );
     }
@@ -6707,10 +6729,9 @@ mod tests {
         };
         let guard = StateGuard::Deny(private.clone());
         let places = [place.clone()];
-        // As many binds under the cap as makes the place's second mounts, the
-        // place itself as theirs, and the list's other place come to 512: so
-        // neither the builder nor a command of a thread it starts with
-        // refuses.
+        // Binds one short of the cap: the place's 511 second mounts and the
+        // place itself as theirs come to 512, which is the cap, so neither
+        // the builder nor a command of a thread it starts with refuses.
         let table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS - 1));
         denied_paths(&private, &codex, Some(&work), &[]).expect("the cap counted from one side");
         // The list as a command's helper is handed it: the paths its profile
@@ -6750,11 +6771,6 @@ mod tests {
             })
             .collect();
         assert_eq!(homes, vec![codex.clone()], "{homes:?}");
-        // Off Linux there is no mount table to read, so every count here is
-        // zero and none of what the two sides weigh differs.
-        if !cfg!(target_os = "linux") {
-            return;
-        }
         let under_cap = |name: &str| -> Vec<std::ffi::OsString> {
             [
                 "codex-linux-sandbox".to_owned(),
@@ -6806,8 +6822,8 @@ mod tests {
             refused.contains("more than the 512 atomic follows"),
             "{refused}"
         );
-        // And the helper itself, which cannot tell that count from one that
-        // fits, is refused by the same walk: its caller logs that and leaves
+        // And the helper's own entry point, which every command's start
+        // calls, is refused by the same walk; its caller logs that and leaves
         // the command unrun.
         let refused = relisted(&under_cap("two"), Some(&places))
             .expect_err("refused")
