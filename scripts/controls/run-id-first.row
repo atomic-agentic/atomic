@@ -1,0 +1,1 @@
+run-id-first|crates/atomic/src/runs.rs|        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)|        && true /*CONTROL_OFF*/|-p atomic-agentic --bin atomic -- runs::tests::a_run_id_is_held_to_its_characters_and_length

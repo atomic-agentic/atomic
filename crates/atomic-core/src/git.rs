@@ -139,6 +139,19 @@ pub enum GitError {
     Unreadable,
 }
 
+impl GitError {
+    /// Whether this is git running and saying no, as distinct from git, or
+    /// the file system under it, failing before it answered at all.
+    ///
+    /// Asked about a directory, git says no both when it holds no repository
+    /// and when it holds one git cannot read, and it says little about which.
+    /// atomic leaves that difference unproven rather than pick the news it
+    /// likes, and refuses either way.
+    pub fn refused(&self) -> bool {
+        matches!(self, GitError::Failed { .. })
+    }
+}
+
 /// What a directory is to git (see [`Git::checkout_at`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Checkout {
