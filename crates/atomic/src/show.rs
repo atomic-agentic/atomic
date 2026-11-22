@@ -162,12 +162,13 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
     })))
 }
 
-/// The kind of the atom whose checkpoint `checkpoint` is, from the pipeline
-/// the run pinned in its `input`: `codex`, `lite` and so on. A checkpoint is
-/// `<turn>.<part>`, as `assess.publish`, and a turn is a step's author
-/// (`<id>`), one of its reviewers' verdicts (`<id>.review.<n>`, the step's
-/// reviewer) or a repair round of its author (`<id>.repair.<n>`). None when
-/// the run pinned no such step or atom.
+/// The kind of the atom whose published checkpoint `checkpoint` is, from the
+/// pipeline the run pinned in its `input`: `codex`, `lite` and so on. A turn
+/// is recorded only when it is published, as `<turn>.publish`: a step's
+/// accepted candidate, `<id>.publish`, which is the step's own atom's whether
+/// its author or a repair round made it, and each verdict of its reviewer,
+/// `<id>.review.<n>`, numbered from 0. A repair round publishes nothing of
+/// its own. None when the run pinned no such step or atom.
 fn atom_kind(input: &Value, checkpoint: &str) -> Option<String> {
     let turn = checkpoint
         .rsplit_once('.')
@@ -184,11 +185,10 @@ fn atom_kind(input: &Value, checkpoint: &str) -> Option<String> {
                 return None;
             }
             let found = step(id)?;
-            match role {
-                "review" => found["review"]["reviewer"].as_str()?,
-                "repair" => found["atom"].as_str()?,
-                _ => return None,
+            if role != "review" {
+                return None;
             }
+            found["review"]["reviewer"].as_str()?
         }
     };
     pipeline["atoms"][atom]["kind"].as_str().map(str::to_owned)
@@ -393,9 +393,12 @@ mod tests {
         let kind = |step| super::atom_kind(&input, step);
         assert_eq!(kind("assess.publish").as_deref(), Some("lite"));
         assert_eq!(kind("fix.publish").as_deref(), Some("codex"));
-        // A reviewer's verdict is the reviewer's; a repair round, the author's.
+        // A reviewer's verdict is the reviewer's, from the first, numbered 0.
+        assert_eq!(kind("fix.review.0.publish").as_deref(), Some("lite"));
         assert_eq!(kind("fix.review.1.publish").as_deref(), Some("lite"));
-        assert_eq!(kind("fix.repair.1.publish").as_deref(), Some("codex"));
+        // A repair round publishes under the step's own name; anything else
+        // under the step is no turn.
+        assert_eq!(kind("fix.repair.0.publish"), None);
         assert_eq!(kind("assess.review.1.publish"), None, "no reviewer");
         assert_eq!(kind("fix.review.x.publish"), None);
         assert_eq!(kind("fix.other.1.publish"), None);
