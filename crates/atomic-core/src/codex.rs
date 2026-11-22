@@ -714,6 +714,7 @@ fn program(path: &Path) -> bool {
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
+#[cfg(test)]
 fn denied_paths(
     private: &PrivateState,
     codex_home: &Path,
