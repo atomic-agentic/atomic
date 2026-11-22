@@ -91,10 +91,9 @@ jobs:
             ;;
           esac
           rows="$(scripts/controls-touched.py "${range[@]}")" || exit 1
-          report=""
-          if [ "${EVENT}" = pull_request ]; then
-            report="$(scripts/controls-touched.py "${range[@]}" --report)" || exit 1
-          fi
+          # A sweep reports the rows it leaves out too, so none is skipped
+          # without a word.
+          report="$(scripts/controls-touched.py "${range[@]}" --report)" || exit 1
           count="$(grep -c . <<<"${rows}" || true)"
           shards=$(( (count + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
           [ "${shards}" -le "${most}" ] || shards="${most}"
