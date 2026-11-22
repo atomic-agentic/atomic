@@ -14,21 +14,22 @@
 //! drivers, remotes) ever runs; and a run killed after one step goes on from
 //! the snapshot after its source is gone, each step's commit on the last.
 //!
-//! Those runs need bubblewrap and unprivileged user namespaces: each one is
-//! marked `needs_sandbox` and asks for the sandbox, so with the `sandbox-tests`
-//! feature on a sandbox that cannot start fails them, and in a build without
-//! the feature they are not built at all. What asks for the sandbox and what
-//! does not is what scripts/backends-check.sh counts on: the tests it names are
+//! Those runs need bubblewrap and unprivileged user namespaces, so each one is
+//! built on Linux with the `sandbox-tests` feature and nowhere else: it is
+//! marked `needs_sandbox` and asks for the sandbox, so with the feature on a
+//! sandbox that cannot start fails it. What asks for the sandbox and what does
+//! not is what scripts/backends-check.sh counts on: the tests it names are
 //! exactly the tests the sandbox is for, and each must fail naming it. Three
 //! tests ask for no sandbox, because nothing they run reaches a turn: the two
 //! `target.unsafe` refusals, which are made while a run is loaded, and the
 //! check of that comparison itself. They run wherever atomic builds.
 
-// On Linux the sandbox is there to be asked for only with the `sandbox-tests`
-// feature, so without it the tests that need it are not built, and the helpers
-// they alone use would read as dead.
+// Wherever the tests that need the sandbox are not built — Linux without the
+// `sandbox-tests` feature, and every other operating system — the sandbox is
+// there to be asked for nowhere, so those tests are not built here and the
+// helpers they alone use would read as dead.
 #![cfg_attr(
-    all(target_os = "linux", not(feature = "sandbox-tests")),
+    not(all(target_os = "linux", feature = "sandbox-tests")),
     allow(dead_code, unused_imports)
 )]
 #![recursion_limit = "512"]
@@ -116,32 +117,122 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
-/// Every working file under `dir`, the checkout's own; only its `.git`
-/// metadata is skipped, which [`git_metadata_files`] covers where it matters.
-/// A directory that is there but cannot be listed fails rather than goes
-/// unseen: a file hidden inside it is a change this comparison would otherwise
-/// read as nothing. One that is not there at all, like a repository with no
+/// A path the comparison of a checkout holds as its own. What it is decides how
+/// it is compared, and that is settled once, by the walk that found it, rather
+/// than asked of the file system again later (see [`working_files`]).
+enum Working {
+    /// Compared by the bytes it holds.
+    File(PathBuf),
+    /// Compared by what it points at, read from the link and never followed: a
+    /// link points where its writer chose, which may be an ancestor of the
+    /// checkout or somewhere wholly outside it.
+    Link { path: PathBuf, target: PathBuf },
+}
+
+impl Working {
+    /// The path itself, wherever it stands.
+    fn path(&self) -> &Path {
+        match self {
+            Working::File(path) | Working::Link { path, .. } => path,
+        }
+    }
+
+    /// How `path` stands right now, for a caller that has one and did not walk
+    /// to it: a link by what it points at, anything else by its bytes.
+    /// `symlink_metadata` answers about the path itself and never follows a
+    /// link, so a repository whose `.git/config` is one is compared as the link
+    /// it is. A path that is not there is kept as the file it would be, whose
+    /// reading says so.
+    fn at(path: &Path) -> Self {
+        let kind = match std::fs::symlink_metadata(path) {
+            Ok(kind) => kind,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Working::File(path.into());
+            }
+            Err(e) => panic!("cannot read what {} is to compare it: {e}", path.display()),
+        };
+        if !kind.is_symlink() {
+            return Working::File(path.into());
+        }
+        Working::Link {
+            path: path.into(),
+            target: match std::fs::read_link(path) {
+                Ok(target) => target,
+                Err(e) => panic!("cannot read where {} points: {e}", path.display()),
+            },
+        }
+    }
+
+    /// The line [`file_state`] records for it: `<path, relative to dir>` and
+    /// its sha256, or the same path with `link -> ` and what it points at, or
+    /// that path and why it could not be read.
+    fn line(&self, dir: &Path) -> String {
+        let path = self.path();
+        let name = path.strip_prefix(dir).unwrap_or(path).display();
+        match self {
+            Working::File(_) => match std::fs::read(path) {
+                Ok(bytes) => format!("{name} {}", digest(&bytes)),
+                Err(e) => format!("{name} unreadable: {e}"),
+            },
+            Working::Link { target, .. } => format!("{name} link -> {}", target.display()),
+        }
+    }
+}
+
+/// What `entry` is, asked of the entry itself. `DirEntry::file_type` answers
+/// about a link as the link it is; asking the file system after the path —
+/// `Path::is_dir`, `Path::metadata` — answers about whatever the link points
+/// at, which is how a link to an ancestor comes to be walked and a link to
+/// somewhere outside the checkout comes to be read as though it were inside.
+fn entry_type(entry: &std::fs::DirEntry, path: &Path) -> std::fs::FileType {
+    match entry.file_type() {
+        Ok(kind) => kind,
+        Err(e) => panic!("cannot read what {} is to compare it: {e}", path.display()),
+    }
+}
+
+/// Every working path under `dir`, the checkout's own.
+///
+/// Only the `.git` at `dir` itself is skipped, which is the one
+/// [`git_metadata_files`] covers; a `.git` deeper down is nothing special, so a
+/// file planted at `sub/.git/x` is compared with every other file. A directory
+/// that is there but cannot be listed fails rather than goes unseen: a file
+/// hidden inside it is a change this comparison would otherwise read as
+/// nothing. One that is not there at all, like a repository with no
 /// `.git/hooks`, has nothing to list.
-fn working_files(dir: &Path) -> Vec<PathBuf> {
+///
+/// Nothing here follows a link (see [`entry_type`]): a link is recorded by what
+/// it points at and the walk goes no further, so an ancestor linked to from
+/// inside the checkout ends the walk where it stands, and what a link outside
+/// it holds stays outside.
+fn working_files(dir: &Path) -> Vec<Working> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_owned()];
     while let Some(at) = stack.pop() {
+        let at_the_top = at == *dir;
         let entries = match std::fs::read_dir(&at) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => panic!("cannot list {} to compare it: {e}", at.display()),
         };
         for entry in entries {
-            let path = entry
-                .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", at.display()))
-                .path();
-            if path.file_name().is_some_and(|n| n == ".git") {
+            let entry =
+                entry.unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", at.display()));
+            let path = entry.path();
+            if at_the_top && path.file_name() == Some(std::ffi::OsStr::new(".git")) {
                 continue;
             }
-            if path.is_dir() {
+            let kind = entry_type(&entry, &path);
+            if kind.is_dir() {
                 stack.push(path);
+            } else if kind.is_symlink() {
+                let target = match std::fs::read_link(&path) {
+                    Ok(target) => target,
+                    Err(e) => panic!("cannot read where {} points: {e}", path.display()),
+                };
+                found.push(Working::Link { path, target });
             } else {
-                found.push(path);
+                found.push(Working::File(path));
             }
         }
     }
@@ -154,31 +245,24 @@ fn working_files(dir: &Path) -> Vec<PathBuf> {
 /// repository itself. `.git/index` is left out on purpose: `git status`
 /// refreshes it as it runs, and a change *to* the index is what `git status`'s
 /// own lines report.
-fn git_metadata_files(dir: &Path) -> Vec<PathBuf> {
+fn git_metadata_files(dir: &Path) -> Vec<Working> {
     let git = dir.join(".git");
-    let mut found = vec![git.join("config"), git.join("info/exclude")];
+    let mut found = vec![
+        Working::at(&git.join("config")),
+        Working::at(&git.join("info/exclude")),
+    ];
     found.extend(working_files(&git.join("hooks")));
     found
 }
 
-/// Every file under `dir`, and the git metadata above, as one sorted line
-/// each — `<path, relative to dir> <sha256>`, or `<path> unreadable: <why>`
-/// for a file that is not there to be read. Two answers differ whenever a file
-/// appeared, vanished or changed a byte: tracked, untracked or ignored, in the
-/// working tree or in `.git`.
+/// Every path under `dir`, and the git metadata above, as one sorted line
+/// each — see [`Working::line`]. Two answers differ whenever a path appeared,
+/// vanished or changed a byte, or a link started pointing somewhere else:
+/// tracked, untracked or ignored, in the working tree or in `.git`.
 fn file_state(dir: &Path) -> String {
-    let mut paths = working_files(dir);
-    paths.extend(git_metadata_files(dir));
-    let mut lines: Vec<String> = paths
-        .iter()
-        .map(|path| {
-            let name = path.strip_prefix(dir).unwrap_or(path).display();
-            match std::fs::read(path) {
-                Ok(bytes) => format!("{name} {}", digest(&bytes)),
-                Err(e) => format!("{name} unreadable: {e}"),
-            }
-        })
-        .collect();
+    let mut entries = working_files(dir);
+    entries.extend(git_metadata_files(dir));
+    let mut lines: Vec<String> = entries.iter().map(|entry| entry.line(dir)).collect();
     lines.sort();
     lines.join("\n")
 }
@@ -191,10 +275,11 @@ const FILES_MARK: &str = "files:";
 /// what git records ([`git_state`]); HEAD's own commit and name, read from the
 /// repository (`for-each-ref` lists the refs and never HEAD, and only
 /// `git worktree list` says anything of HEAD, in its own shape); and every
-/// file's bytes ([`file_state`]), which nothing in `git status` shows for an
-/// ignored file, a hook, the repository's configuration or `info/exclude`. Two
-/// answers are equal only when the repository is as it was, byte for byte,
-/// apart from `.git/index` (see [`git_metadata_files`]).
+/// path's bytes, or the target every link points at ([`file_state`]) — which
+/// nothing in `git status` shows for an ignored file, a hook, a link, the
+/// repository's configuration or `info/exclude`. Two answers are equal only
+/// when the repository is as it was, byte for byte, apart from `.git/index`
+/// (see [`git_metadata_files`]).
 fn repository_state(dir: &Path) -> String {
     let head = git_in(dir, &["rev-parse", "HEAD"]);
     let (named, branch) = git_try_in(dir, &["symbolic-ref", "-q", "HEAD"]);
@@ -566,7 +651,7 @@ async fn coding_run_at_the_top(dir: &Path, project: &Path, fixture: &Path, base:
 /// base in the snapshot, as check_base requires, and the commit published is
 /// the repair's, the one the second verdict was given.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_repair_round_of_a_fixture_bound_step_publishes_the_repairs_commit() {
     #[cfg(target_os = "linux")]
@@ -677,7 +762,7 @@ fn reviewed_coding(project: &Path) {
 /// commit atomic made in the fixture's snapshot, as a SHA (it runs in the
 /// project, not the snapshot, so the SHA is what it has of the change).
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
     #[cfg(target_os = "linux")]
@@ -725,7 +810,7 @@ fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot() {
     #[cfg(target_os = "linux")]
@@ -741,7 +826,7 @@ fn a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
     #[cfg(target_os = "linux")]
@@ -752,11 +837,12 @@ fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
         let before = repository_state(&checkout);
         let base = fixture(&dir.join("fixture"));
         coding_run_at_the_top(&dir, &project, &dir.join("fixture"), &base).await;
+        let after = repository_state(&checkout);
         assert_eq!(
-            repository_state(&checkout),
+            after,
             before,
             "the checkout is exactly as it was: {}",
-            left_behind(&before, &repository_state(&checkout)).join(", ")
+            left_behind(&before, &after).join(", ")
         );
     });
 }
@@ -765,8 +851,14 @@ fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
 /// as it was is [`repository_state`], which is a control of its own: a change
 /// a run could leave in the checkout that git never reports must still show up
 /// in it. Here each of those is planted by hand and required to show, and then
-/// undone and required not to. Nothing here runs a turn or reaches a model, so
-/// this test needs no sandbox.
+/// undone and required not to: HEAD detached at its own commit, a hook, the
+/// repository's configuration, a file ignored by the repository's own
+/// `info/exclude`, a file under a `.git` below the top level, a link to an
+/// ancestor of the checkout, and a directory whose contents cannot be listed.
+/// That last is shown only where the test does not run as root, which is told
+/// past a directory's mode; a run as root says in its output that it skipped
+/// that one, and every other row still runs. Nothing here runs a turn or
+/// reaches a model, so this test needs no sandbox.
 #[test]
 fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     let dir = scratch("state");
@@ -830,6 +922,55 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     );
     std::fs::write(&config, &config_bytes).unwrap();
 
+    // A `.git` below the top level is nothing special: only the checkout's own
+    // is left to [`git_metadata_files`]. A file planted under one is a file of
+    // the checkout like any other, and a walk that skips that name at any depth
+    // leaves it unseen — as git itself leaves it unseen, tracking nothing under
+    // a directory it takes for repository metadata.
+    let nested = checkout.join("sub/.git");
+    write(&nested.join("x"), "planted\n");
+    assert_eq!(
+        git_state(&checkout),
+        git,
+        "git reports the file planted under a `.git` below the top level"
+    );
+    assert_eq!(
+        left_behind(&whole, &repository_state(&checkout)),
+        ["sub/.git/x"],
+        "a file under a `.git` below the top level is not compared"
+    );
+
+    // A link to an ancestor of the checkout, which is one touch from a turn with
+    // write access. `git status` names a link of its own, but names nothing of
+    // where it points, and a comparison that asks the file system what the path
+    // is gets an answer through the link: it walks an ancestor for ever, or
+    // reads what lies outside the checkout as though it lay inside. So the walk
+    // answers about the entry itself — it compares the link and stops there,
+    // which is also why the walk ends at all.
+    let ancestor = checkout.join("sub/loop");
+    std::os::unix::fs::symlink(&checkout, &ancestor).unwrap();
+    assert!(
+        git_state(&checkout).lines().any(|l| l == "?? sub/loop"),
+        "git does not name the link at all, so this row shows nothing: {}",
+        git_state(&checkout)
+    );
+    let planted = repository_state(&checkout);
+    assert_eq!(
+        left_behind(&whole, &planted),
+        ["sub/.git/x", "sub/loop"],
+        "a link to an ancestor, or the file under the nested `.git`, is not recorded"
+    );
+    let links: Vec<&str> = file_lines(&planted)
+        .filter(|l| l.starts_with("sub/loop "))
+        .collect();
+    assert_eq!(
+        links,
+        [format!("sub/loop link -> {}", checkout.display()).as_str()],
+        "the link is not recorded by what it points at"
+    );
+    std::fs::remove_file(&ancestor).unwrap();
+    std::fs::remove_dir_all(checkout.join("sub")).unwrap();
+
     // And the very file the writing test looks for, once the repository is
     // told to ignore it: `git status` never names an ignored file, and the
     // ignore file a repository keeps for itself, `info/exclude`, is one status
@@ -860,15 +1001,49 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     let hidden = checkout.join("hidden");
     write(&hidden.join("planted.txt"), "hidden\n");
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
-    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let refusal = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = repository_state(&checkout);
-    }))
-    .is_err();
+    }));
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        refused,
-        "a directory that cannot be listed was read as nothing to compare"
-    );
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    #[allow(unsafe_code)]
+    let euid = unsafe { libc::geteuid() };
+    if euid == 0 {
+        // Root is told past a directory's mode: it lists `hidden` and every
+        // file in it, so nothing is refused here and this row cannot be made to
+        // bite. Say so loudly rather than fail; every other row above and below
+        // runs as an ordinary person would see it.
+        eprintln!(
+            "SKIP the mode-000 directory: this runs as root (euid {euid}), which is told \
+             past a directory's mode and lists one whose mode is 000, so the walk's \
+             refusal cannot be shown here. Run this test as an unprivileged person to \
+             see it."
+        );
+    } else {
+        let why = match refusal {
+            Ok(()) => {
+                let listed: Vec<String> = std::fs::read_dir(&hidden)
+                    .unwrap()
+                    .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                    .collect();
+                panic!(
+                    "a directory whose mode is 000 was listed and read as nothing to \
+                     compare; it holds {listed:?}"
+                );
+            }
+            Err(why) => why
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| why.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_else(|| "a panic with no message".to_owned()),
+        };
+        // Not merely "something failed": the walk names the directory it
+        // cannot list, which is the only way an unseen file there is reported.
+        assert!(
+            why.contains("cannot list") && why.contains("hidden"),
+            "the walk failed for another reason: {why}"
+        );
+    }
     std::fs::remove_dir_all(&hidden).unwrap();
 
     // Every one of these undone: what the checkout holds is what it held
@@ -876,11 +1051,12 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     // moment of ordinary git left behind.
     std::fs::remove_file(checkout.join("note.txt")).unwrap();
     std::fs::write(&exclude, &exclude_bytes).unwrap();
+    let again = repository_state(&checkout);
     assert_eq!(
-        repository_state(&checkout),
+        again,
         whole,
         "the checkout is as it was again: {}",
-        left_behind(&whole, &repository_state(&checkout)).join(", ")
+        left_behind(&whole, &again).join(", ")
     );
 }
 
@@ -1082,7 +1258,7 @@ fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
 /// was: the write lands in the step's worktree, which atomic commits in the
 /// fixture's snapshot, never in the checkout.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
     #[cfg(target_os = "linux")]
@@ -1144,10 +1320,12 @@ fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
             left_behind(&before, &after).join(", ")
         );
         // And the one file the turn was told to write, named: the comparison
-        // above covers it, this says which file was looked for.
-        let strayed: Vec<_> = working_files(&checkout)
-            .into_iter()
-            .filter(|p| p.file_name().is_some_and(|n| n == "note.txt"))
+        // above covers it, this says which path of the checkout answers to that
+        // name.
+        let strayed: Vec<PathBuf> = working_files(&checkout)
+            .iter()
+            .filter(|found| found.path().file_name().is_some_and(|n| n == "note.txt"))
+            .map(|found| found.path().to_owned())
             .collect();
         assert!(
             strayed.is_empty(),
@@ -1164,7 +1342,7 @@ fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
 /// was — the turn read it and changed nothing, not a file, not a ref, not HEAD,
 /// not its configuration.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_was() {
     #[cfg(target_os = "linux")]
@@ -1232,7 +1410,7 @@ fn a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_wa
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
     #[cfg(target_os = "linux")]
@@ -1274,7 +1452,7 @@ fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
     #[cfg(target_os = "linux")]
@@ -1367,7 +1545,7 @@ fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_after_a_step_goes_on_from_the_snapshot_once_its_source_is_gone() {
     #[cfg(target_os = "linux")]
