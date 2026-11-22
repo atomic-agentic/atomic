@@ -223,7 +223,7 @@ Google's credential variables name, the token files, certificates and keys
 Google's credentials and certificate configurations and AWS's profiles name,
 with the whole volume when such a file, or what a link to it leads to, is in
 a Kubernetes projected volume, so a rotated token stays denied, and
-`/var/run/secrets` and `/run/secrets` whole); and what a link among them points at, up to four
+`/var/run/secrets`, `/run/secrets` and systemd's `/run/credentials` whole); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);

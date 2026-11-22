@@ -1,0 +1,1 @@
+gcp-certificate-config-home|crates/atomic-core/src/codex.rs|            let reading = GOOGLE_AUTH;|            let reading = Reading { user: false, ..GOOGLE_AUTH };|-p atomic-agentic-core --lib --features fake-model -- the_key_googles_certificate_configuration_names_is_denied moved_configurations_are_found_as_their_tools_read_them
