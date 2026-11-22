@@ -49,6 +49,7 @@ test exec_network
 test exec_scratch
 test exec_network_fds
 test exec_network_relist
+test exec_network_syn_drop
 test exec_proxy_raise
 test failpoints
 test fixture_cli
