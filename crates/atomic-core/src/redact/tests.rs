@@ -2714,3 +2714,130 @@ fn what_a_value_left_as_written_holds_is_read_too() {
         "cookie: theme: dark",
     ]);
 }
+
+/// A value read inside one left as written ends within it: a quoted value
+/// there that opens with the other quote never runs past the outer value's
+/// closing quote, so the next assignment's name stays a name and its value
+/// is hidden, in text, its start and end, an excerpt, value() and JSON in a
+/// string, and a second pass changes nothing; and where nothing is hidden,
+/// the text is kept as written.
+#[test]
+fn a_value_read_inside_one_left_as_written_ends_within_it() {
+    let key = concat!("Zx9abc", "defghij");
+    let pass = concat!("hunter2", "xyzQ");
+    for (case, (input, secret)) in [
+        (format!("auth: \"x password='abc\" api_key: '{key}'"), key),
+        (
+            format!("auth: \"x secret='abc\", \"api_key\": '{key}'"),
+            key,
+        ),
+        (
+            format!("token: \"note pwd='a\" password: '{pass}' tail"),
+            pass,
+        ),
+        (format!("auth: 'x password=\"abc' api_key: \"{key}\""), key),
+        (
+            format!("token: 'note pwd=\"a' password: \"{pass}\" tail"),
+            pass,
+        ),
+        (
+            format!("auth: \"x client_secret := 'abc\" api_key: '{key}'"),
+            key,
+        ),
+        (
+            format!("auth: \"x password='abc\" client_secret := '{key}'"),
+            key,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        let mut held = json!({ "args": line.to_string() });
+        value(&mut held);
+        for (reading, shown) in [
+            text(&input).into_owned(),
+            bounded(&input, 4096),
+            tail(&input, 4096),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+            held.to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !shown.contains(secret),
+                "case {case}, reading {reading}: shown"
+            );
+        }
+        let once = text(&input).into_owned();
+        assert!(
+            once == input.replace(secret, REDACTED),
+            "case {case}: not only the next value was hidden"
+        );
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+    assert_kept(&[
+        "auth: \"x password='abc\" more' tail",
+        "auth: 'x password=\"abc' more\" tail",
+    ]);
+}
+
+/// A value found inside one left as written can run on past it, as after
+/// `token: password:` or `token=pwd=`, whose value is the name and
+/// separator alone, and take a name a reading that passes the value over
+/// would see for part of its own: what that reading hides is hidden too, in
+/// text, an excerpt and value(), and a second pass changes nothing.
+#[test]
+fn a_value_found_inside_one_left_as_written_never_shows_what_passing_over_hides() {
+    let key = concat!("Zx9abc", "defghij");
+    for (case, input) in [
+        format!("token: password: 'abc api_key: '{key}'"),
+        format!("token=pwd='a api_key: '{key}'"),
+        format!("auth: secret: \"x api_key: \"{key}\" tail"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        for (reading, shown) in [
+            text(&input).into_owned(),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !shown.contains(key),
+                "case {case}, reading {reading}: shown"
+            );
+        }
+        let once = text(&input).into_owned();
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+}
+
+/// A value left as written is read on inside at most [`VALUES_WITHIN`]
+/// deep, so a long bare value that looks like code, read on at each of its
+/// own assignments, takes linear steps: at sixteen times the size, about
+/// sixteen times the steps, not the 256 times a rescan of the rest at each
+/// would take.
+#[test]
+fn values_read_on_inside_one_another_take_linear_steps() {
+    for (case, unit) in ["token=x->", "password=a::", "auth: x->"]
+        .into_iter()
+        .enumerate()
+    {
+        let (small, large) = (steps_of(&unit.repeat(500)), steps_of(&unit.repeat(8_000)));
+        assert!(
+            large < 32 * small,
+            "case {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+}
