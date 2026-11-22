@@ -403,8 +403,11 @@ fn strength(name: &str) -> Strength {
     if parts.iter().any(|part| part == "key") || joined.ends_with("key") {
         return Strength::Weak;
     }
-    let weak =
-        parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
+    // `Xauthorization`, `proxyauthorization`: a header's name run together.
+    let run_together = joined.ends_with("authorization");
+    let weak = parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str()))
+        || joined.ends_with("token")
+        || run_together;
     // `max_token`, `prompt_token`, `input_tokens`, `nextToken`: a count or a
     // kind of token, which only hints, said by the word right before
     // `token`. Never in an all-upper-case name, an environment variable's,
@@ -1078,26 +1081,52 @@ fn assigned(input: &str) -> Option<String> {
         let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
         let header = ends_in_header(&input[name_start..name_end]);
         let bare = value_from == start && set_off && !header;
-        if bare && is_os_error(&input[value_from..]) {
-            at = at.max(value_to);
-            continue;
+        let error_len = if value_from == start {
+            os_error_len(&input[value_from..])
+        } else {
+            None
+        };
+        if !(bare && error_len.is_some()) {
+            // `authorization=Bearer abc`: the scheme and its credential.
+            let value = &input[value_from..value_to];
+            if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
+                && input[value_to..].starts_with(' ')
+                && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
+                && !is_not_a_secret(&input[credential_from..credential_to])
+            {
+                value_to = credential_to;
+                strength = Strength::Strong;
+            }
+            let value = &input[value_from..value_to];
+            let quoted = value_from > start;
+            if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
+                out.push_str(&input[copied..value_from]);
+                out.push_str(REDACTED);
+                copied = value_to;
+            }
         }
-        // `authorization=Bearer abc`: the scheme and its credential.
-        let value = &input[value_from..value_to];
-        if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
-            && input[value_to..].starts_with(' ')
-            && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
-            && !is_not_a_secret(&input[credential_from..credential_to])
-        {
-            value_to = credential_to;
-            strength = Strength::Strong;
-        }
-        let value = &input[value_from..value_to];
-        let quoted = value_from > start;
-        if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
-            out.push_str(&input[copied..value_from]);
-            out.push_str(REDACTED);
-            copied = value_to;
+        // What follows an operating system's error under a secret's name,
+        // `password: Permission denied (os error 13) <secret>`, is no part of
+        // the error, and the error took the place where the name's value is
+        // looked for: each word after it that looks like a credential is
+        // hidden, to the end of the line or the quote around it. Words such
+        // as `; try again`, paths and times are kept, and an assignment,
+        // `request_id=abc-123`, is read by its own name.
+        if let Some(len) = error_len {
+            let after = value_from + len;
+            let end = input[after..]
+                .find(['\n', '"', '\'', '\\'])
+                .map_or(input.len(), |i| after + i);
+            for (from, to) in words(input, after, end) {
+                let word = &input[from..to];
+                if !is_not_a_secret(word) && !reads_as_no_credential(word) && looks_like_credential(word) {
+                    out.push_str(&input[copied..from]);
+                    out.push_str(REDACTED);
+                    copied = to;
+                }
+            }
+            // Assignments after it are still read, from past what was hidden.
+            value_to = value_to.max(after).max(copied);
         }
         at = at.max(value_to);
     }
@@ -1140,16 +1169,68 @@ fn is_blank(byte: &u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
-/// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
-fn is_os_error(text: &str) -> bool {
-    OS_ERRORS.iter().any(|words| {
-        text.strip_prefix(words)
-            .and_then(|rest| rest.strip_prefix(" (os error "))
-            .is_some_and(|rest| {
-                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-                digits > 0 && rest.as_bytes().get(digits) == Some(&b')')
-            })
+/// How long the one of [`OS_ERRORS`] and its ` (os error N)` that `text`
+/// starts with is, if it starts with one.
+fn os_error_len(text: &str) -> Option<usize> {
+    OS_ERRORS.iter().find_map(|words| {
+        let rest = text.strip_prefix(words)?.strip_prefix(" (os error ")?;
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && rest.as_bytes().get(digits) == Some(&b')'))
+            .then(|| text.len() - rest.len() + digits + 1)
     })
+}
+
+/// The words of `input` between `from` and `to`, as byte ranges: what lies
+/// between blanks and the punctuation that sets a word off, `;,()[]{}<>`,
+/// without a `:` at either end. A credential's own `.`, `/`, `+`, `=`, `-`
+/// and `_` stay in its word, and so do a time's `:`.
+fn words(input: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let apart = |c: char| c.is_whitespace() || ";,()[]{}<>".contains(c);
+    let mut found = Vec::new();
+    let mut push = |s: usize, e: usize| {
+        let word = &input[s..e];
+        let trimmed = word.trim_start_matches(':');
+        let s = s + (word.len() - trimmed.len());
+        let e = s + trimmed.trim_end_matches(':').len();
+        if s < e {
+            found.push((s, e));
+        }
+    };
+    let mut start = None;
+    for (i, c) in input[from..to].char_indices() {
+        match (apart(c), start) {
+            (true, Some(s)) => {
+                push(from + s, from + i);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        push(from + s, to);
+    }
+    found
+}
+
+/// Whether `word`, after an operating system's error, is plainly something
+/// else than a credential: an absolute or relative path, `/var/lib/x`,
+/// `./x`, `~/x`; a time, digits and `-:.+TZ` with eight digits or more; or
+/// an assignment, `request_id=abc-123`, which the assignment rule reads on
+/// its own, by its name. Not a value's padding, `abc==`.
+fn reads_as_no_credential(word: &str) -> bool {
+    let path = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
+    let time = word.bytes().filter(u8::is_ascii_digit).count() >= 8
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
+    let assignment = word.split_once('=').is_some_and(|(name, value)| {
+        !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && !value.is_empty()
+            && !value.starts_with('=')
+    });
+    path || time || assignment
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {

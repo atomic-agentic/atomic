@@ -1,0 +1,1 @@
+redact-authorization-ending|crates/atomic-core/src/redact.rs|    let run_together = joined.ends_with("authorization");|    let run_together = false; // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::a_secret_after_an_os_error_under_a_secrets_name_is_hidden

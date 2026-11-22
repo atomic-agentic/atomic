@@ -2307,6 +2307,85 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
     );
 }
 
+/// A secret after an operating system's error under a secret's or a
+/// header's name is hidden, however the text is read: the error took the
+/// place where the name's value is looked for, so the value moved after it.
+/// Main showed every one of these. The error's words, and words after it
+/// that read as words, are kept.
+#[test]
+fn a_secret_after_an_os_error_under_a_secrets_name_is_hidden() {
+    let mut planted = Planted(0x5eed_0e44_0000_0081);
+    let names = [
+        "password",
+        "api_key",
+        "authorization",
+        "Authorization",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+        "x-api-key",
+        "x-auth-token",
+        "Xauthorization",
+    ];
+    let forms = [
+        "{n}: Permission denied (os error 13) {s}",
+        "{n}: No such file or directory (os error 2) {s}",
+        "open {n} : Permission denied (os error 13) :{s}",
+        "{n}: Too many levels of symbolic links (os error 40) {s}",
+        "error: {n}: Permission denied (os error 13) {s}",
+        "/srv/{n}: Permission denied (os error 13) {s}",
+        "{n}: Permission denied (os error 13), retrying with {s}",
+        "{n}: Permission denied (os error 13) token={s}",
+    ];
+    let mut shown = Vec::new();
+    let mut n = 0;
+    for name in names {
+        for form in forms {
+            for _ in 0..4 {
+                let secret = planted.secret();
+                let input = form.replace("{n}", name).replace("{s}", &secret);
+                let line = json!({ "log": input });
+                let nested = json!({ "args": json!({ "log": input }).to_string() });
+                let mut line_read = line.clone();
+                value(&mut line_read);
+                let mut nested_read = nested.clone();
+                value(&mut nested_read);
+                let readings = [
+                    text(&input).into_owned(),
+                    text(&text(&input)).into_owned(),
+                    excerpt(&line.to_string(), 4096),
+                    excerpt(&nested.to_string(), 4096),
+                    line_read.to_string(),
+                    nested_read.to_string(),
+                ];
+                for reading in readings {
+                    if reading.contains(&secret) {
+                        shown.push(format!("{n}: {reading}"));
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "{} of {n} shown: {shown:#?}", shown.len());
+
+    let secret = planted.secret();
+    assert_eq!(
+        text(&format!("/srv/password: Permission denied (os error 13) {secret}")),
+        "/srv/password: Permission denied (os error 13) [REDACTED]"
+    );
+    assert_kept(&[
+        "password: Permission denied (os error 13), retrying in 5s",
+        "open /srv/token: No such file or directory (os error 2); try again",
+        "api_key: Permission denied (os error 13)",
+        "password: No such file or directory (os error 2), run 2026-11-21T10:00:00Z",
+        "token: Permission denied (os error 13) (path /var/lib/atomic/runs/run-1a2b3c4d)",
+        "auth: Permission denied (os error 13) request_id=abc-123",
+    ]);
+}
+
 /// Redacting text twice changes nothing: a rule that a first rule's marker
 /// leaves something for, a header after an assignment's marker or a value
 /// after an open assignment, has already read it.
