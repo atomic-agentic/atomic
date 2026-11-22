@@ -218,8 +218,9 @@ unchanged, so commit or put back changes to those files first; changes to
 other files do not matter. It also refuses to start while another run holds the
 tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
 the same files and each saves its own originals, so the one that finishes last
-would put back the other's switched-off source. That lock is closed before cargo
-runs, so a test that leaves a process behind does not hold a finished run's lock.
+would put back the other's switched-off source. That lock is closed before the
+run's cargo and its git are started, so neither a test that leaves a process
+behind nor a git that starts a fsmonitor daemon holds a finished run's lock.
 The lock frees itself when the run that took it ends, however it ends, so its
 file is never something to remove: removing it frees nothing and would let a
 third run lock a fresh file beside the one still held.

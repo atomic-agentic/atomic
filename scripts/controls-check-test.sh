@@ -172,6 +172,26 @@ exit "${status}"
 SH
 chmod +x "${WORK}/bin/cargo"
 
+# A git that starts a daemon for the worktree out of `git ls-files`, which is
+# what a git whose worktree has core.fsmonitor set does. The image's own git is
+# built without fsmonitor support -- `git fsmonitor--daemon status` answers
+# "fsmonitor--daemon not supported on this platform" -- so no git really run
+# here can start anything that outlives the command, and this stands in for that
+# one behaviour: it answers everything else exactly as git does, and leaves one
+# process behind out of the first `git ls-files` it is asked for, noting its pid
+# to git-daemon-pid so the case that asked for it can stop it.
+mkdir -p "${WORK}/bin-git-daemon"
+git_bin="$(command -v git)"
+cat >"${WORK}/bin-git-daemon/git" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = ls-files ] && [ ! -e git-daemon-pid ]; then
+    (exec sleep 300) </dev/null >/dev/null 2>&1 &
+    echo "\$!" >git-daemon-pid
+fi
+exec "${git_bin}" "\$@"
+SH
+chmod +x "${WORK}/bin-git-daemon/git"
+
 # A cp that keeps the timestamp of what it copies, as `cp -p` or an alias
 # for it does. A plain cp gives the file a new mtime, so cargo rebuilds; only
 # with this cp on the PATH does the rebuild case depend on the script's own
@@ -718,6 +738,34 @@ done
 [ "${free}" -eq 0 ] ||
     fail "orphan left behind: pid ${orphan_pid} holds the lock even after it was killed"
 
+# A git that starts a daemon is given the lock's descriptor closed too. The
+# daemon outlives the `git ls-files` that started it, so a descriptor handed
+# down keeps the tree locked after the run has exited, which the next run reads
+# as one still going. Here the lock is asked about while the daemon is still
+# alive: the run is over and its own descriptor is gone, so the lock is free
+# only if nothing else was ever handed it.
+repo="$(fresh)"
+RUN_PATH="${WORK}/bin-git-daemon"
+run honest git-dir
+RUN_PATH=
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" || fail "git daemon: exit ${code}: ${out}"
+untouched || fail "git daemon: the source is left modified"
+git_daemon_pid="$(cat "${repo}/git-daemon-pid")"
+[ -n "${git_daemon_pid}" ] || fail "git daemon: the stand-in git started no daemon"
+free=1
+for _ in $(seq 1 100); do
+    if flock -n "${repo}/target/controls-check.lock" -c 'exit 0' 2>/dev/null; then
+        free=0
+        break
+    fi
+    sleep 0.1
+done
+# What this case asked for is this case's to stop, and only once the lock has
+# been asked about: killed first, it would release a descriptor it was holding.
+kill -KILL "${git_daemon_pid}" 2>/dev/null
+[ "${free}" -eq 0 ] ||
+    fail "git daemon: pid ${git_daemon_pid} holds the lock even after the run ended"
+
 # What each case above is the control of, in scripts/controls-check.sh. A
 # control is tested by removing it: neutralise one line at a time and its case
 # fails.
@@ -748,6 +796,8 @@ done
 #   flock -n 9                                      the lock held
 #   9>&-                              in run_cargo  the orphan left behind, and
 #                                                   the killed holder's cargo
+#   9>&-                              in git()      the daemon the run's git left
+#                                                   behind
 #   command -v flock >/dev/null 2>&1 || die         refuses a run it cannot keep
 #                                                   apart from another; not
 #                                                   tested, because faking that

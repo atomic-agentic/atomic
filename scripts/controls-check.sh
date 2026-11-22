@@ -94,6 +94,17 @@ fi
 flock -n 9 ||
     die "${LOCK} is held by another scripts/controls-check.sh run in this tree; it frees itself when that run ends, so wait for it and do not remove ${LOCK}; nothing was edited"
 
+# No git is handed the lock's descriptor, as no cargo is. A git whose worktree
+# has core.fsmonitor set starts a fsmonitor daemon out of `git diff` or
+# `git ls-files`, which outlives the command that started it; given the
+# descriptor it would keep the tree locked after this run had exited, which the
+# next run reads as one still going. Nothing else the run starts can do that:
+# cp, touch, tr, find, sort, grep, sed, awk, rm, mkdir, python3 and flock all
+# answer and go, and none of them leaves a process behind the run.
+git() {
+    command git "$@" 9>&-
+}
+
 # Where a file's original is kept.
 copy_of() {
     echo "${STATE}/$(tr / % <<<"$1")"
