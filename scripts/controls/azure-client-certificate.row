@@ -1,0 +1,1 @@
+azure-client-certificate|crates/atomic-core/src/codex.rs|    ("AZURE_CLIENT_CERTIFICATE_PATH", "certificate file"),|    ("", "certificate file"),|-p atomic-agentic-core --lib --features fake-model the_credential_places_are_found_wherever_the_environment_moves_them

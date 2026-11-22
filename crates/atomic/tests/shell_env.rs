@@ -1292,10 +1292,12 @@ fn aws_workload_token_files_stay_denied_whether_plain_or_mounted() {
 
 /// The workload credentials beside AWS's stay denied to a turn's commands,
 /// and every command still starts: the token Azure workload identity's
-/// variable names, Google's application credentials and the token files
-/// they name, and the web identity token file an AWS profile names rather
-/// than a variable. Each token is in a projected volume, as Kubernetes
-/// mounts one, so the version it rotates in next is denied too.
+/// variable names and an Azure client certificate, Google's application
+/// credentials and the token files they name, the private key a Google
+/// certificate configuration names, and the web identity token file an AWS
+/// profile names rather than a variable. Each token, and the key, is in a
+/// projected volume, as Kubernetes mounts one, so the version it rotates in
+/// next is denied too.
 #[test]
 fn workload_credentials_beside_aws_stay_denied() {
     support::require_sandbox();
@@ -1308,7 +1310,7 @@ fn workload_credentials_beside_aws_stay_denied() {
         let now = "..2026_01_01_00_00_00.1";
         let next = "..2026_01_01_01_00_00.2";
         let mut reads = Vec::new();
-        for volume in ["azure", "gke", "eks"] {
+        for volume in ["azure", "gke", "eks", "spiffe"] {
             let at = dir.join(volume);
             for version in [now, next] {
                 std::fs::create_dir_all(at.join(version)).unwrap();
@@ -1348,8 +1350,16 @@ fn workload_credentials_beside_aws_stay_denied() {
             ),
         )
         .unwrap();
+        // X.509 federation's key, named by a certificate configuration, and
+        // an Azure client certificate.
+        let certificates = serde_json::json!({
+            "cert_configs": {"workload": {"key_path": dir.join("spiffe/token")}},
+        });
+        std::fs::write(dir.join("gcp/certificate_config.json"), certificates.to_string()).unwrap();
+        std::fs::write(dir.join("gcp-cache/client.pem"), "canary-azure-certificate\n").unwrap();
         reads.push(dir.join("gcp/credentials.json"));
         reads.push(dir.join("gcp-cache/token.json"));
+        reads.push(dir.join("gcp-cache/client.pem"));
         let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
         let command = format!(
             "cat {} 2>/dev/null; cat {}/gcp-cache/readme; echo looked",
@@ -1359,6 +1369,8 @@ fn workload_credentials_beside_aws_stay_denied() {
         let azure = dir.join("azure/token").display().to_string();
         let google = dir.join("gcp/credentials.json").display().to_string();
         let aws = dir.join("aws/config").display().to_string();
+        let x509 = dir.join("gcp/certificate_config.json").display().to_string();
+        let client = dir.join("gcp-cache/client.pem").display().to_string();
         let printed = look_once(
             &dir,
             &home,
@@ -1367,6 +1379,8 @@ fn workload_credentials_beside_aws_stay_denied() {
                 ("AZURE_FEDERATED_TOKEN_FILE", azure.as_str()),
                 ("GOOGLE_APPLICATION_CREDENTIALS", google.as_str()),
                 ("AWS_CONFIG_FILE", aws.as_str()),
+                ("GOOGLE_API_CERTIFICATE_CONFIG", x509.as_str()),
+                ("AZURE_CLIENT_CERTIFICATE_PATH", client.as_str()),
             ],
         )
         .await;

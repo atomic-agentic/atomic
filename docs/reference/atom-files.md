@@ -430,28 +430,42 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG`, `CLOUDSDK_CONFIG` and others) put them. Workload
-token files are denied too:
+variables, `KUBECONFIG`, `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR` and others)
+put them; `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and
+`CLOUDSDK_CONFIG` are read as botocore and gcloud read them, so one under
+`~/` or `$HOME/`, or relative to atomic's working directory, is found too.
+Workload credentials are denied too:
 
 - the files `AWS_WEB_IDENTITY_TOKEN_FILE`,
-  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE` and
-  `GOOGLE_APPLICATION_CREDENTIALS` name, one named relative to atomic's
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE`,
+  `AZURE_CLIENT_CERTIFICATE_PATH`, `GOOGLE_APPLICATION_CREDENTIALS` and
+  `GOOGLE_API_CERTIFICATE_CONFIG` name, one named relative to atomic's
   working directory as the SDKs read it;
 - the token files Google's credentials name, there or in the application
   default credentials gcloud writes: an external account's source file, the
-  file its executable keeps a token in, and those of the credentials an
+  file its executable keeps a token in, the certificate configuration of
+  X.509 workload identity federation, and those of the credentials an
   impersonated account is configured with;
+- the certificate and private key a Google certificate configuration
+  names, in `GOOGLE_API_CERTIFICATE_CONFIG`'s file, gcloud's own
+  `certificate_config.json`, or one Google's credentials name;
 - every `web_identity_token_file` setting in your AWS configuration and
   credentials files, written with `=` or `:`, both with and without a `#` or
   `;` comment after it;
 - the whole projected volume when such a file is in one Kubernetes mounts,
   found through any links that lead to it, so the token it rotates in next
   is denied as well;
-- the usual token directories, whether or not anything names them: EKS's
-  `/var/run/secrets/eks.amazonaws.com/serviceaccount` and
-  `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, the pod's own
-  `/var/run/secrets/kubernetes.io/serviceaccount`, and Azure workload
-  identity's `/var/run/secrets/azure/tokens`.
+- `/var/run/secrets` and `/run/secrets` whole, whether or not anything
+  names them: where Kubernetes mounts the pod's own service account token,
+  EKS's and Azure workload identity's, and projected tokens of any audience,
+  and where a container engine mounts the secrets it is given by name.
+
+Not yet denied: a credential file gcloud is pointed at by its own
+settings (`CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE`, a configuration's
+`auth/credential_file_override`, or `gcloud auth login --cred-file`)
+outside the places above, and the certificate and private key an AWS IAM
+Roles Anywhere `credential_process` passes to `aws_signing_helper`. Keep
+such files in a denied place, such as `~/.config/gcloud` or `~/.aws`.
 
 A configuration atomic reads for the token files it names stops the run,
 with a message naming it, when it cannot be read whole, rather than leaving a

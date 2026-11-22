@@ -250,27 +250,34 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("GNUPGHOME", &[""]),
     ("CARGO_HOME", &["credentials", "credentials.toml"]),
     ("DOCKER_CONFIG", &["config.json"]),
-    ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
-    ("AWS_CONFIG_FILE", &[""]),
     ("NETRC", &[""]),
     ("NPM_CONFIG_USERCONFIG", &[""]),
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
-    ("CLOUDSDK_CONFIG", &[""]),
+    // `scripts/controls/azure-config-dir.row` switches this off.
+    ("AZURE_CONFIG_DIR", &[""]),
 ];
 
-/// Where workload identities put their token files on Kubernetes when no
-/// variable says otherwise: AWS's (IAM roles for service accounts, and EKS
-/// Pod Identity), the pod's own service account, and Azure workload
-/// identity's. Denied whether or not atomic's environment names them.
+/// Variables that move a credential file or directory elsewhere and are
+/// read as botocore and gcloud read them, `~/`, `$HOME/` and a relative name
+/// included (see [`expanded`]): denied whole, and read for the token files
+/// they name.
+const AWS_CONFIG: &str = "AWS_CONFIG_FILE";
+const AWS_CREDENTIALS: &str = "AWS_SHARED_CREDENTIALS_FILE";
+const GCLOUD_CONFIG: &str = "CLOUDSDK_CONFIG";
+
+/// Where Kubernetes and container engines mount secrets, denied whole
+/// whether or not atomic's environment names anything in them: the pod's
+/// own service account, AWS's (IAM roles for service accounts, and EKS Pod
+/// Identity), Azure workload identity's, projected tokens of any audience,
+/// and the secrets a container engine mounts by name. Nothing a command
+/// needs is kept there.
 const WORKLOAD_TOKEN_DIRS: &[&str] = &[
-    "/var/run/secrets/eks.amazonaws.com/serviceaccount",
-    "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
-    // `scripts/controls/k8s-token-dir.row` switches this off.
-    "/var/run/secrets/kubernetes.io/serviceaccount",
-    // `scripts/controls/azure-token-dir.row` switches this off.
-    "/var/run/secrets/azure/tokens",
+    // `scripts/controls/secrets-dir-var-run.row` switches this off.
+    "/var/run/secrets",
+    // `scripts/controls/secrets-dir-run.row` switches this off.
+    "/run/secrets",
 ];
 
 /// The variables that name a workload credential file an SDK reads, each
@@ -283,12 +290,20 @@ const WORKLOAD_TOKEN_FILES: &[(&str, &str)] = &[
     ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "token file"),
     // `scripts/controls/azure-token-file.row` switches this off.
     ("AZURE_FEDERATED_TOKEN_FILE", "token file"),
+    // `scripts/controls/azure-client-certificate.row` switches this off.
+    ("AZURE_CLIENT_CERTIFICATE_PATH", "certificate file"),
     // `scripts/controls/gcp-credentials-file.row` switches this off.
     (GOOGLE_CREDENTIALS, "credentials file"),
+    // `scripts/controls/gcp-certificate-config-var.row` switches this off.
+    (GOOGLE_CERTIFICATES, "certificate configuration"),
 ];
 
 /// The variable that names Google's application credentials.
 const GOOGLE_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+
+/// The variable that names Google's certificate configuration, which names
+/// the certificate and private key of X.509 workload identity federation.
+const GOOGLE_CERTIFICATES: &str = "GOOGLE_API_CERTIFICATE_CONFIG";
 
 /// The most of a credential configuration atomic reads to find the token
 /// files it names: far more than any holds.
@@ -381,6 +396,9 @@ fn token_files(
         if *name == GOOGLE_CREDENTIALS {
             // `scripts/controls/gcp-external-token.row` switches this off.
             out.extend(google_token_files(&file, here)?);
+        }
+        if *name == GOOGLE_CERTIFICATES {
+            out.extend(google_certificate_files(&file, here)?);
         }
         out.extend(projected_volume(file.clone()));
         out.push(file);
@@ -492,13 +510,74 @@ fn google_token_files(
         Ok(value) => value,
         Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
     };
-    let mut names = Vec::new();
-    google_named(&value, 0, &mut names).map_err(refused)?;
+    let (mut names, mut certificates) = (Vec::new(), Vec::new());
+    google_named(&value, 0, &mut names, &mut certificates).map_err(refused)?;
     let mut out = Vec::new();
     for name in names {
         let file = named_path(&name, here).map_err(refused)?;
         out.extend(projected_volume(file.clone()));
         out.push(file);
+    }
+    for name in certificates {
+        let config = named_path(&name, here).map_err(refused)?;
+        // `scripts/controls/gcp-certificate-files.row` switches this off.
+        out.extend(google_certificate_files(&config, here)?);
+        out.extend(projected_volume(config.clone()));
+        out.push(config);
+    }
+    Ok(out)
+}
+
+/// The certificate and private key files the Google certificate
+/// configuration at `config` names, each with its projected volume where it
+/// is in one: the `cert_path` and `key_path` of each of its `cert_configs`.
+/// A file that is not there names none; one that cannot be read whole and
+/// as JSON is refused, naming it, so nothing runs.
+fn google_certificate_files(
+    config: &Path,
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    use serde_json::Value;
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as a Google certificate configuration ({why}), so the \
+             private key it names could not be denied to atoms' commands; fix it, or point \
+             {GOOGLE_CERTIFICATES} at a file that can be read",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
+    };
+    let Some(object) = value.as_object() else {
+        return Err(refused("it is not a JSON object".into()));
+    };
+    let mut out = Vec::new();
+    let Some(kinds) = object.get("cert_configs") else {
+        return Ok(out);
+    };
+    let Some(kinds) = kinds.as_object() else {
+        return Err(refused("cert_configs is not an object".into()));
+    };
+    for (kind, entry) in kinds {
+        let Some(entry) = entry.as_object() else {
+            return Err(refused(format!("cert_configs.{kind} is not an object")));
+        };
+        for field in ["cert_path", "key_path"] {
+            let name = match entry.get(field) {
+                None | Some(Value::Null) => continue,
+                Some(Value::String(name)) if name.is_empty() => continue,
+                Some(Value::String(name)) => name,
+                Some(_) => return Err(refused(format!("cert_configs.{kind}.{field} is not text"))),
+            };
+            let file = named_path(name, here).map_err(refused)?;
+            out.extend(projected_volume(file.clone()));
+            out.push(file);
+        }
     }
     Ok(out)
 }
@@ -511,6 +590,7 @@ fn google_named(
     value: &serde_json::Value,
     depth: usize,
     out: &mut Vec<String>,
+    certificates: &mut Vec<String>,
 ) -> Result<(), String> {
     use serde_json::Value;
     let Some(object) = value.as_object() else {
@@ -540,11 +620,56 @@ fn google_named(
                 "credential_source.executable.output_file",
             )?);
         }
+        // X.509 workload identity federation: a certificate configuration
+        // names the certificate and its private key. One that says to use
+        // the default configuration is read anyway (see [`home_secrets`]).
+        if let Some(certificate) = source.get("certificate") {
+            let certificate = fields(certificate, "credential_source.certificate")?;
+            let field = "credential_source.certificate.certificate_config_location";
+            // `scripts/controls/gcp-certificate-location.row` switches this off.
+            let location = named(certificate.get("certificate_config_location"), field)?;
+            certificates.extend(location);
+        }
     }
     if let Some(inner) = object.get("source_credentials") {
-        google_named(inner, depth + 1, out)?;
+        google_named(inner, depth + 1, out, certificates)?;
     }
     Ok(())
+}
+
+/// The places the variable `name` in `env` names, as botocore and gcloud
+/// read it: as it is when absolute; under each of `homes` when it starts
+/// `~/`, `$HOME/` or `${HOME}/`; and otherwise relative to the working
+/// directory `here` gives. An error, so nothing runs, when it is relative
+/// and the working directory is unknown.
+fn expanded(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    name: &str,
+    homes: &[PathBuf],
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let Some(value) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
+        return Ok(Vec::new());
+    };
+    if value.is_absolute() {
+        return Ok(vec![value]);
+    }
+    let text = value.to_string_lossy();
+    // `scripts/controls/expanded-home.row` switches this off.
+    let under_home: &[&str] = &["~/", "$HOME/", "${HOME}/"];
+    if let Some(rest) = under_home.iter().find_map(|p| text.strip_prefix(p)) {
+        return Ok(homes.iter().map(|home| home.join(rest)).collect());
+    }
+    let refused = |e: std::io::Error| {
+        format!(
+            "{name} names {} relative to the working directory, which is unknown ({e}), so it \
+             could not be denied to atoms' commands",
+            value.display()
+        )
+    };
+    // `scripts/controls/expanded-relative.row` switches this off.
+    let relative = here().map_err(refused)?.join(&value);
+    Ok(vec![relative])
 }
 
 /// The web identity token files the AWS configuration file at `config`
@@ -696,13 +821,19 @@ pub fn home_secrets(
     // Those named inside a configuration rather than by a variable: an AWS
     // profile's web identity token file, and what the application default
     // credentials gcloud writes name.
+    let here = &std::env::current_dir;
+    let moved_aws = [
+        expanded(env, AWS_CONFIG, &homes, here)?,
+        expanded(env, AWS_CREDENTIALS, &homes, here)?,
+    ]
+    .concat();
+    let moved_gcloud = expanded(env, GCLOUD_CONFIG, &homes, here)?;
+    out.extend(moved_aws.iter().chain(&moved_gcloud).cloned());
     let mut aws: Vec<PathBuf> = homes
         .iter()
         .flat_map(|home| [home.join(".aws/config"), home.join(".aws/credentials")])
         .collect();
-    aws.extend(absolute("AWS_CONFIG_FILE"));
-    aws.extend(absolute("AWS_SHARED_CREDENTIALS_FILE"));
-    let here = &std::env::current_dir;
+    aws.extend(moved_aws);
     for config in &aws {
         // `scripts/controls/aws-profile-token.row` switches this off.
         out.extend(aws_profile_token_files(config, &homes, here)?);
@@ -711,11 +842,14 @@ pub fn home_secrets(
         .iter()
         .map(|home| home.join(".config/gcloud"))
         .collect();
-    gcloud.extend(absolute("CLOUDSDK_CONFIG"));
+    gcloud.extend(moved_gcloud);
     for dir in &gcloud {
         let defaults = dir.join("application_default_credentials.json");
         // `scripts/controls/gcp-default-credentials.row` switches this off.
         out.extend(google_token_files(&defaults, &std::env::current_dir)?);
+        let certificates = dir.join("certificate_config.json");
+        // `scripts/controls/gcp-default-certificates.row` switches this off.
+        out.extend(google_certificate_files(&certificates, here)?);
     }
     out.sort();
     out.dedup();
@@ -4886,15 +5020,17 @@ mod tests {
                 ("AZURE_FEDERATED_TOKEN_FILE", "/az/federated-token"),
                 ("GOOGLE_APPLICATION_CREDENTIALS", "/gcp/credentials.json"),
                 ("CLOUDSDK_CONFIG", "/gcloud"),
+                ("AZURE_CLIENT_CERTIFICATE_PATH", "/az/client.pem"),
+                ("AZURE_CONFIG_DIR", "/azcfg"),
+                ("GOOGLE_API_CERTIFICATE_CONFIG", "/gcp/certificate_config.json"),
             ]),
             None,
         )
         .expect("homes");
-        // Where workload identities keep their tokens on Kubernetes.
-        let pod = "/var/run/secrets/kubernetes.io/serviceaccount";
-        let azure = "/var/run/secrets/azure/tokens";
-        assert!(has(&secrets, pod), "{secrets:?}");
-        assert!(has(&secrets, azure), "{secrets:?}");
+        // Where Kubernetes and container engines mount secrets, whole.
+        let (var_run, run) = ("/var/run/secrets", "/run/secrets");
+        assert!(has(&secrets, var_run), "{secrets:?}");
+        assert!(has(&secrets, run), "{secrets:?}");
         for path in [
             "/cfg/gh",
             "/cfg/git/credentials",
@@ -4914,13 +5050,14 @@ mod tests {
             "/aws/creds",
             "/aws/web-identity-token",
             "/aws/pod-identity-token",
-            "/var/run/secrets/eks.amazonaws.com/serviceaccount",
-            "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
             "/az/federated-token",
             "/gcp/credentials.json",
             "/gcloud",
+            "/az/client.pem",
+            "/azcfg",
+            "/gcp/certificate_config.json",
         ] {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
@@ -5031,6 +5168,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The certificate and private key of Google's X.509 workload identity
+    /// federation are denied, with the certificate configuration that names
+    /// them, whether credentials name the configuration or a variable does,
+    /// and with the projected volume a key is in.
+    #[cfg(unix)]
+    #[test]
+    fn the_key_googles_certificate_configuration_names_is_denied() {
+        let dir = std::fs::canonicalize(scratch("gcp-x509")).expect("real");
+        let volume = dir.join("spiffe");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/private_key.pem"), "k").expect("key");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/private_key.pem"), &volume.join("private_key.pem"));
+        let certificates = serde_json::json!({
+            "version": 1,
+            "cert_configs": {"workload": {
+                "cert_path": dir.join("certificates.pem"),
+                "key_path": volume.join("private_key.pem"),
+            }},
+        });
+        std::fs::write(dir.join("certificate_config.json"), certificates.to_string())
+            .expect("certificate configuration");
+        let credentials = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {"certificate": {
+                "certificate_config_location": dir.join("certificate_config.json"),
+            }},
+        });
+        std::fs::write(dir.join("credentials.json"), credentials.to_string()).expect("config");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        let wanted = [
+            dir.join("certificate_config.json"),
+            dir.join("certificates.pem"),
+            volume.join("private_key.pem"),
+            volume.clone(),
+        ];
+        for (variable, file) in [
+            (GOOGLE_CREDENTIALS, "credentials.json"),
+            (GOOGLE_CERTIFICATES, "certificate_config.json"),
+        ] {
+            let named = dir.join(file).display().to_string();
+            let env = |name: &str| (name == variable).then(|| std::ffi::OsString::from(&named));
+            let found = token_files(&env, &here).expect("found");
+            for file in &wanted {
+                assert!(found.contains(file), "{variable}: {}: {found:?}", file.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The variables that move AWS's and gcloud's configuration are read as
+    /// botocore and gcloud read them: under `~/` and `$HOME/` in each home,
+    /// and relative to the working directory, which, unknown, refuses.
+    #[test]
+    fn moved_configurations_are_found_as_their_tools_read_them() {
+        let env = |name: &str| {
+            match name {
+                AWS_CONFIG => Some("~/moved/aws-config"),
+                AWS_CREDENTIALS => Some("${HOME}/moved/aws-credentials"),
+                GCLOUD_CONFIG => Some("relative/gcloud"),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let homes = [PathBuf::from("/nowhere/a"), PathBuf::from("/nowhere/b")];
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        assert_eq!(
+            expanded(&env, AWS_CONFIG, &homes, &here),
+            Ok(vec![
+                PathBuf::from("/nowhere/a/moved/aws-config"),
+                PathBuf::from("/nowhere/b/moved/aws-config"),
+            ])
+        );
+        assert_eq!(
+            expanded(&env, AWS_CREDENTIALS, &homes, &here).map(|p| p.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            expanded(&env, GCLOUD_CONFIG, &homes, &here),
+            Ok(vec![PathBuf::from("/work/relative/gcloud")])
+        );
+        let gone = || -> std::io::Result<PathBuf> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let refused = expanded(&env, GCLOUD_CONFIG, &homes, &gone).expect_err("refused");
+        assert!(refused.starts_with("CLOUDSDK_CONFIG names relative/gcloud"), "{refused}");
+    }
+
     /// The web identity token file an AWS profile names, and not a variable,
     /// is denied, with its projected volume: one under `~/` in each home as
     /// well as from the working directory, in any profile.
@@ -5107,10 +5332,19 @@ mod tests {
             config.to_string(),
         )
         .expect("config");
+        let certificates = serde_json::json!({
+            "cert_configs": {"workload": {"key_path": dir.join("default-key.pem")}},
+        });
+        std::fs::write(
+            home.join(".config/gcloud/certificate_config.json"),
+            certificates.to_string(),
+        )
+        .expect("certificates");
         let home_s = home.display().to_string();
         let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(&home_s));
         let places = home_secrets(&env, None).expect("homes");
         assert!(places.contains(&dir.join("adc-token")), "{places:?}");
+        assert!(places.contains(&dir.join("default-key.pem")), "{places:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5170,6 +5404,27 @@ mod tests {
             google("number.json").contains("credential_source.file is not text"),
             "{}",
             google("number.json")
+        );
+        let certificates = |name: &str| {
+            google_certificate_files(&dir.join(name), &here)
+                .err()
+                .unwrap_or_default()
+        };
+        std::fs::write(
+            dir.join("key-number.json"),
+            r#"{"cert_configs": {"workload": {"key_path": 7}}}"#,
+        )
+        .expect("key number");
+        assert!(
+            certificates("key-number.json").contains("cert_configs.workload.key_path is not text"),
+            "{}",
+            certificates("key-number.json")
+        );
+        std::fs::write(dir.join("configs-list.json"), r#"{"cert_configs": []}"#).expect("list");
+        assert!(
+            certificates("configs-list.json").contains("cert_configs is not an object"),
+            "{}",
+            certificates("configs-list.json")
         );
         std::fs::create_dir_all(dir.join("a-directory")).expect("dir");
         assert!(google("a-directory").contains("not a plain file"));

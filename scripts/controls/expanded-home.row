@@ -1,0 +1,1 @@
+expanded-home|crates/atomic-core/src/codex.rs|    let under_home: &[&str] = &["~/", "$HOME/", "${HOME}/"];|    let under_home: &[&str] = &[];|-p atomic-agentic-core --lib --features fake-model moved_configurations_are_found_as_their_tools_read_them
