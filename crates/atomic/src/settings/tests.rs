@@ -744,134 +744,113 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
     );
 }
 
-/// Whether anything is still waiting on `stream`, having waited `within` for
-/// it to arrive: `None` says the socket held nothing at all. `recv` with
-/// `MSG_PEEK` looks without taking, so a stand-in that has read once still
-/// answers what that read got. A socket that cannot be asked is not a socket
-/// shown to be empty, so an error on either call says something is waiting, as
-/// `Some(usize::MAX)`.
-#[allow(unsafe_code)]
-fn still_waiting(stream: &std::net::TcpStream, within: Duration) -> Option<usize> {
-    let raw = std::os::fd::AsRawFd::as_raw_fd(stream);
-    let mut readable: libc::fd_set = unsafe { std::mem::zeroed() };
-    unsafe { libc::FD_SET(raw, &mut readable) };
-    let mut budget = libc::timeval {
-        tv_sec: within.as_secs() as libc::time_t,
-        tv_usec: within.subsec_micros() as libc::suseconds_t,
-    };
-    let ready = unsafe {
-        libc::select(
-            raw + 1,
-            &mut readable,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut budget,
-        )
-    };
-    // One descriptor was given, so any other answer is not this socket's.
-    if !(0..=1).contains(&ready) {
-        return Some(usize::MAX);
-    }
-    if ready == 0 {
-        return None;
-    }
-    // One byte is enough to know the request did not come whole.
-    let mut byte = [0u8; 1];
-    let n = unsafe { libc::recv(raw, byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK) };
-    if n < 0 {
-        return Some(usize::MAX);
-    }
-    if n == 0 {
-        // The peer has closed and nothing is left to read.
-        return None;
-    }
-    Some(n as usize)
+/// The request head [`write_request`] is given, which is the one the probe
+/// builds for `addr`.
+fn request_head(addr: SocketAddr) -> Vec<u8> {
+    format!("GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n").into_bytes()
 }
 
-/// What a one-read stand-in saw: the text its one read took, and whether the
-/// socket still held part of the request afterwards. `left` is `Some` with how
-/// many bytes it held, or `Some(usize::MAX)` when the socket could not be
-/// asked, which is not the same as being shown to be empty.
-struct OneRead {
-    head: String,
-    left: Option<usize>,
+/// A writer that keeps every write call it is given, so how many writes there
+/// were and what each held are read back rather than guessed at from timing.
+#[derive(Default)]
+struct Writes(Vec<Vec<u8>>);
+
+impl Write for Writes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.push(buf.to_vec());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-/// A stand-in Ollama that reads exactly once, as a server that answers on its
-/// first read does: it takes what its one `read` gets, answers that, and
-/// closes with whatever the read did not take. One `read` takes what has
-/// arrived and no more, however big the buffer, so a request sent in one write
-/// is whole in that read and leaves nothing in the socket, while a request
-/// sent in several writes leaves its later parts there. Closing with a request
-/// part unread resets the connection, which can lose the answer before the
-/// client reads it.
-fn ollama_one_read() -> (SocketAddr, std::sync::mpsc::Receiver<OneRead>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("addr");
-    let (tell, told) = std::sync::mpsc::channel();
-    let (ready, waiting) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        // Nothing sits between saying so and waiting, and between `accept` and
-        // `read`: the stand-in is at the socket as early as a running server
-        // is, so a request still on its way is taken in pieces and a whole one
-        // is taken whole.
-        let mut got = [0u8; 256];
-        let _ = ready.send(());
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut saw = match stream.read(&mut got) {
-            Ok(n) => OneRead {
-                head: String::from_utf8_lossy(&got[..n]).into_owned(),
-                left: None,
-            },
-            Err(e) => OneRead {
-                head: format!("the one read failed: {e}"),
-                left: Some(usize::MAX),
-            },
-        };
-        // What the one read left is looked for before the answer goes out, so
-        // the answer is still decided by that read alone.
-        saw.left = still_waiting(&stream, Duration::from_millis(100));
+/// A writer that refuses every write, so the error `write_request` hands back
+/// is the writer's own.
+struct Refuses;
+
+impl Write for Refuses {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("this writer refuses every write"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// That the probe's request goes out as one write: the writer is asked exactly
+/// once, and that one call holds every byte of the request head, ending with
+/// the blank line that ends it. So a server that answers what its first read
+/// gets, and closes with the rest unread, has the whole request. The counting
+/// writer sees each call as it happens, which is what makes this a fact about
+/// the code rather than about timing: a request written in pieces is asked for
+/// once per piece however fast the machine, on any number of CPUs and under
+/// any load. The last assertion shows that a writer which refuses hands back
+/// its own error, which is what `probe_within` turns into a `None`, meaning
+/// "not detected", for a request that never went out.
+#[test]
+fn probe_puts_the_request_head_on_one_write() {
+    let addr: SocketAddr = "127.0.0.1:11434".parse().expect("addr");
+    let head = request_head(addr);
+    let mut written = Writes::default();
+    write_request(&mut written, &head).expect("the one write");
+    let Writes(calls) = &written;
+    assert_eq!(
+        calls.len(),
+        1,
+        "the request went out in {} writes, not one: {calls:?}",
+        calls.len()
+    );
+    assert_eq!(calls[0], head, "the one write was not the request head");
+    assert!(
+        calls[0].ends_with(b"\r\n\r\n"),
+        "the one write did not end the request head: {:?}",
+        String::from_utf8_lossy(&calls[0])
+    );
+    let refused = write_request(&mut Refuses, &head).expect_err("a refused write stays refused");
+    assert_eq!(
+        refused.to_string(),
+        "this writer refuses every write",
+        "the writer's own error is what comes back"
+    );
+}
+
+/// The probe over loopback against the fake Ollama, which reads the request
+/// one byte at a time until its blank line: what the probe sends reaches a
+/// server as that request, and the answer comes back. The `Host` assertion is
+/// what ties it to the bytes [`probe_puts_the_request_head_on_one_write`]
+/// counts, since those are built from the address the probe was given.
+///
+/// This test says nothing about how many writes carried the request: a server
+/// that reads to the end of the head takes every write however many there
+/// were, so that is guarded by the counting test alone.
+#[test]
+fn the_probe_sends_a_request_a_server_can_end_reading() {
+    let (addr, told) = fake_ollama(|stream| {
         let body = r#"{"models":[{"name":"one:latest"}]}"#;
         let _ = stream.write_all(
             format!(
-                "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                "HTTP/1.0 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
                 body.len()
             )
             .as_bytes(),
         );
-        let _ = tell.send(saw);
-        // The stream is dropped here: the answer is out and the connection
-        // ends, with whatever the one read did not take still unread.
     });
-    // Only once the stand-in says it is at the socket: a probe sent before it
-    // got there would find the whole request waiting.
-    waiting
+    assert_eq!(probe_ollama(addr), Some(vec!["one:latest".to_string()]));
+    let head = told
         .recv_timeout(Duration::from_secs(20))
-        .expect("the stand-in never waited for the connection");
-    (addr, told)
-}
-
-#[test]
-fn the_probe_sends_its_request_in_one_write_so_a_server_that_reads_once_gets_it_all() {
-    let (addr, told) = ollama_one_read();
-    let got = probe_ollama(addr);
-    let OneRead { head, left } = told
-        .recv_timeout(Duration::from_secs(20))
-        .expect("the stand-in never answered");
-    // The answer went out on what the one read got, so that read must hold the
-    // whole request head and not one byte of it may still be waiting. A
-    // stand-in that waited before reading could not say this: one read then
-    // takes every write that has arrived, however many there were.
+        .expect("the stand-in never read the request");
+    let addr_text = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Host: "))
+        .expect("the request names its Host");
     assert!(
-        head.ends_with("\r\n\r\n"),
-        "the one read did not take the whole request head: {head:?}"
+        head.starts_with("GET /api/tags HTTP/1.0\r\n") && head.ends_with("\r\n\r\n"),
+        "not the request the probe sends: {head:?}"
     );
-    assert_eq!(
-        left, None,
-        "part of the request was still in the socket, or the socket could not \
-         be asked: {left:?}"
-    );
-    assert_eq!(got, Some(vec!["one:latest".to_string()]));
+    // The Host is the address the probe was given, which is what the counting
+    // test's expected bytes are built from.
+    assert_eq!(addr_text, addr.to_string(), "the Host names another addr");
 }
 
 #[test]
