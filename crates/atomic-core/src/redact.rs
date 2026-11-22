@@ -249,7 +249,9 @@ const STOPWORDS: &[&str] = &[
 /// first (see [`excerpt`]), so a huge provider body or stderr costs little.
 pub const MAX_TEXT: usize = 64 * 1024;
 /// How deep JSON text inside JSON strings is opened. Each level doubles its
-/// escaping, and opening without a bound could overflow the stack.
+/// escaping, and opening without a bound could overflow the stack. Deeper,
+/// a string that starts as JSON does is hidden whole (see
+/// [`redact_string`]).
 const MAX_NESTED_JSON: usize = 4;
 
 /// Token formats of well-known providers: a prefix, and the least number of
@@ -1499,6 +1501,17 @@ fn redact_string(string: &mut String, nested: usize) {
         opened = redacted != *string && was_json(string);
         written = std::mem::replace(string, redacted);
     }
+    // Past the depth JSON in a string is opened at, JSON cannot be read:
+    // the rules that read its names and pairs, as a header's name and
+    // value, never see it, and text redaction alone may leave their
+    // secrets. A string there that starts as JSON does once redacted as
+    // text, whether it parses or not, is hidden whole. It is read after
+    // text redaction, so one that redaction makes start so, `[REDACTED] …`,
+    // is hidden now rather than on a second pass.
+    if nested >= MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) {
+        *string = REDACTED.to_owned();
+        return;
+    }
     // JSON inside a string, such as a model's raw tool arguments: an escape
     // can hide where a secret starts, and a secret-named field is only clear
     // once parsed.
@@ -1540,7 +1553,9 @@ fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
 /// the same keys and indices, and so in turn for what it holds. Where it
 /// cannot be told, a key gone, a list grown or shrunk, or a value of
 /// another type, a place holding JSON counts as broken; one hidden whole
-/// counts as kept, as it shows nothing. JSON that reads as
+/// counts as kept, as it shows nothing. An object with fewer keys after,
+/// as when text redaction renames a key into a sibling's name, counts as
+/// broken whatever it holds. JSON that reads as
 /// JSON only after text redaction counts for nothing, so it cannot make up
 /// for JSON broken beside it.
 fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
@@ -1559,6 +1574,12 @@ fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
             .iter()
             .zip(texted)
             .all(|(written, texted)| kept_json(written, texted, nested)),
+        // Fewer keys after: text redaction renamed one into a sibling's
+        // name, `https://u:pw@h` into `https://u:[REDACTED]@h`, and a parse
+        // keeps only the last value given a name, so the other is read by
+        // no rule that reads names and pairs, and the texted string can
+        // show it as text redaction left it.
+        (Value::Object(written), Value::Object(texted)) if texted.len() < written.len() => false,
         (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
             texted.get(key).map_or_else(
                 || !holds_json(field, nested),

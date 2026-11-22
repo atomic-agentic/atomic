@@ -744,8 +744,8 @@ fn nesting_as_deep_as_a_large_payload_allows_does_not_overflow() {
         .expect("no overflow");
 }
 
-/// Past the nesting limit a shape is still found, because the text rules see
-/// through the escaping.
+/// Past the nesting limit a shape is still hidden: the string there that
+/// starts as JSON does is hidden whole.
 #[test]
 fn deeply_nested_json_is_bounded() {
     let mut nested = json!(format!("{SAMPLE} "));
@@ -2673,4 +2673,149 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
         shown, 0,
         "a value one reading hides shows when the readings repeat"
     );
+}
+
+/// JSON held in strings deeper than [`MAX_NESTED_JSON`] cannot be opened,
+/// so the rules that read its names and pairs never see it: a header's
+/// name and value, `{"name": "X-Api-Key", "value": "<key>"}`, which no text
+/// rule reads, is hidden with the string that holds it, under an ordinary
+/// name and under hints, beside a plain sibling or one text redaction
+/// renames, at depths 3 and 4, where its string is past the bound, and
+/// deeper, and a second pass changes nothing.
+#[test]
+fn json_held_past_the_nesting_bound_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
+    for note in ["x\\\\q", "hi"] {
+        for sibling in ["b", "https://u:pw@h"] {
+            let inner = format!(
+                "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+                 \"note\": \"{note}\"}}"
+            );
+            let first = Value::String(
+                if sibling == "b" {
+                    "a"
+                } else {
+                    "https://u:[REDACTED]@h"
+                }
+                .to_owned(),
+            );
+            let mut doc = format!(
+                "{{{first}: {}, {}: \"ok\"}}",
+                Value::String(held(&inner)),
+                Value::String(sibling.to_owned())
+            );
+            for depth in 1..=MAX_NESTED_JSON + 2 {
+                for parent in ["body", "msg", "key", "token", "args", "note"] {
+                    let mut out = json!({ parent: doc.clone() });
+                    value(&mut out);
+                    let shown = out.to_string();
+                    assert!(
+                        !shown.contains(&key[4..]),
+                        "depth {depth}, note {note:?}, sibling {sibling:?}, under \
+                         {parent}: the header's value showed"
+                    );
+                    assert!(shown.contains(REDACTED), "depth {depth}, under {parent}");
+                    let mut again = out.clone();
+                    value(&mut again);
+                    assert!(
+                        again == out,
+                        "depth {depth}, note {note:?}, sibling {sibling:?}, under \
+                         {parent}: a second pass changed it"
+                    );
+                }
+                doc = held(&doc);
+            }
+        }
+    }
+}
+
+/// Past [`MAX_NESTED_JSON`], a string that starts as JSON does but does
+/// not parse, cut say, is hidden whole too, and so is one that text
+/// redaction makes start so, so a second pass changes nothing; a string
+/// that does not start so is redacted as text, as at any depth.
+#[test]
+fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
+    let token = concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz0123");
+    // `deep` held in a string at depth `MAX_NESTED_JSON`.
+    let wrap = |deep: &str| {
+        let mut held = json!({ "k": deep });
+        for _ in 0..MAX_NESTED_JSON {
+            held = json!({ "k": held.to_string() });
+        }
+        held
+    };
+    let cut = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{}\"", &token[7..]);
+    let led = format!("{token} then more");
+    for (case, (deep, expected)) in [
+        (cut.as_str(), REDACTED),
+        (led.as_str(), REDACTED),
+        ("plain words", "plain words"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = wrap(deep);
+        value(&mut out);
+        assert!(
+            out == wrap(expected),
+            "case {case}: not redacted as expected"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert!(again == out, "case {case}: a second pass changed it");
+    }
+}
+
+/// Text redaction that renames a key of JSON held in a string into a
+/// sibling's name, `https://u:pw@h` into `https://u:[REDACTED]@h`, leaves a
+/// parse with only the later value: what the other held is read by no rule
+/// that reads names and pairs, a header's name and value say, so the string
+/// is hidden whole, whichever key comes first and whether the value is an
+/// object or JSON in a string, under an ordinary name and under hints, at
+/// depths 1 to 4, and a second pass changes nothing.
+#[test]
+fn a_key_text_redaction_renames_into_a_siblings_name_hides_the_string_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let in_string = |s: &str| Value::String(s.to_owned()).to_string();
+    let held_pair = in_string(&format!("{{\"headers\": [{pair}]}}"));
+    let twin = in_string("{\"headers\": [{\"name\": \"x\", \"value\": \"y\"}]}");
+    let renamed = in_string("https://u:[REDACTED]@h");
+    let sibling = in_string("https://u:pw@h");
+    for (shape, (held, beside)) in [
+        (pair.as_str(), "\"ok\""),
+        (held_pair.as_str(), "\"ok\""),
+        (held_pair.as_str(), twin.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for first in [true, false] {
+            let mut doc = if first {
+                format!("{{{renamed}: {held}, {sibling}: {beside}}}")
+            } else {
+                format!("{{{sibling}: {beside}, {renamed}: {held}}}")
+            };
+            for depth in 1..=4 {
+                for parent in ["body", "msg", "key", "token", "args", "note"] {
+                    let mut out = json!({ parent: doc.clone() });
+                    value(&mut out);
+                    assert!(
+                        !out.to_string().contains(&key[4..]),
+                        "shape {shape}, first {first}, depth {depth}, under {parent}: \
+                         the header's value showed"
+                    );
+                    let mut again = out.clone();
+                    value(&mut again);
+                    assert!(
+                        again == out,
+                        "shape {shape}, first {first}, depth {depth}, under {parent}: \
+                         a second pass changed it"
+                    );
+                }
+                doc = format!("{{\"body\": {}}}", in_string(&doc));
+            }
+        }
+    }
 }
