@@ -1,0 +1,1 @@
+sandbox-helper-link-real-dir|crates/atomic-core/src/codex.rs|        .map(std::fs::Metadata::is_dir)|        .map(std::fs::Metadata::is_file).map(std::ops::Not::not)|-p atomic-agentic-core --lib --features fake-model a_link_planted_as_the_helpers_directory_is_denied

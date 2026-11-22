@@ -1,0 +1,1 @@
+signin-logout-stopped-short|crates/atomic-core/src/signin.rs|        let stopped_short = outcome.is_err() && self.made;|        let stopped_short = false /*CONTROL_OFF*/ && outcome.is_err() && self.made;|-p atomic-agentic-core --lib signin::tests::a_logout_that_stops_short_leaves_no_directory_it_made

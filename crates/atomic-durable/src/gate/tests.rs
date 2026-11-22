@@ -757,7 +757,8 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
 
 /// The same title and the same shown content, with only an evidence digest
 /// changed: a new proposal, and the approval made on the old evidence does
-/// not carry over to it.
+/// not carry over to it, while a new approval carrying the new proposal is
+/// decided.
 async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) {
     register(&mut rt);
     rt.launch().await.expect("launch");
@@ -772,7 +773,7 @@ async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R)
         evidence: vec![other.into()],
         ..input(None)
     };
-    let (_, second) = start_gated(&rt, changed).await;
+    let (second_run, second) = start_gated(&rt, changed).await;
     assert_eq!((&second.title, &second.show), (&first.title, &first.show));
     assert_ne!(
         second.proposal, first.proposal,
@@ -795,6 +796,22 @@ async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R)
             .expect("stored")
             .resolution,
         None
+    );
+    // The refusal was the old approval, not the new evidence: a command that
+    // carries the second gate's own proposal decides it. And the run
+    // finishes, so the shutdown below has nothing left to wait for.
+    decide(
+        &rt,
+        &me(&rt).await,
+        command(&second, &unique("e"), Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert!(
+        outcome(&rt, &second_run)
+            .await
+            .expect("finishes")
+            .approved()
     );
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
@@ -826,6 +843,224 @@ async fn redelivery_wakes_a_run_whose_decider_stopped_early<R: DurableRuntime>(m
     let resolution: Resolution = outcome(&rt, &run).await.expect("finishes");
     assert!(resolution.approved());
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// Two projects sharing one store, each on a runtime of its own: the
+/// second neither lists, finds nor decides the first one's gate, nor sees
+/// its run, nor wakes it, and the first does all of these for its own.
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs(database: crate::Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, None, crate::DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    let theirs = open("project-b").await;
+    register(&mut mine);
+    mine.launch().await.expect("launch");
+    let (run, gate) = start_gated(&mine, input(None)).await;
+    // Project B: no such gate, and no such run.
+    assert!(
+        gates(&theirs, GateFilter::default())
+            .await
+            .expect("gates")
+            .iter()
+            .all(|g| g.id != gate.id),
+        "project B lists project A's gate"
+    );
+    assert!(find(&theirs, &gate.id).await.expect("find").is_none());
+    assert_eq!(
+        decide(
+            &theirs,
+            &me(&theirs).await,
+            command(&gate, "b1", Verdict::Approve)
+        )
+        .await,
+        Err(DecideError::NoSuchGate(gate.id.clone()))
+    );
+    assert!(theirs.own_run_record(&run).await.expect("record").is_none());
+    assert!(mine.own_run_record(&run).await.expect("record").is_some());
+    let listed = gates(&mine, GateFilter::default()).await.expect("gates");
+    assert!(listed.iter().any(|g| g.id == gate.id), "{listed:?}");
+    // Retention keeps every project's evidence, whoever asks.
+    assert!(
+        pinned_evidence(&theirs)
+            .await
+            .expect("pinned")
+            .contains(&EVIDENCE.to_owned()),
+        "another project's evidence is not kept"
+    );
+    // Decided by its project, the decision is not B's to read back: the
+    // same command, sent by B, finds no gate.
+    let (decided_run, decided) = start_gated(&mine, input(None)).await;
+    decide(
+        &mine,
+        &me(&mine).await,
+        command(&decided, "a1", Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert_eq!(
+        decide(
+            &theirs,
+            &me(&theirs).await,
+            command(&decided, "a1", Verdict::Approve)
+        )
+        .await,
+        Err(DecideError::NoSuchGate(decided.id.clone()))
+    );
+    assert!(
+        outcome(&mine, &decided_run)
+            .await
+            .expect("finishes")
+            .approved()
+    );
+    // A run id another project recorded first, with no run behind it, as
+    // one that stopped before its run began leaves it, stays theirs.
+    let taken = unique("taken");
+    let id = taken.clone();
+    theirs
+        .control_transaction(move |mut tx| {
+            let id = id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, 'project-b')",
+                    &[Param::Text(id)],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .expect("a row of B's");
+    assert!(mine.run_id_taken_elsewhere(&taken).await.expect("taken"));
+    let refused = mine
+        .start("gated", &taken, input(None))
+        .await
+        .expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("taken in this store by another project"),
+        "{refused}"
+    );
+    assert!(
+        mine.run_record(&taken).await.expect("record").is_none(),
+        "it ran"
+    );
+    // A decision recorded with no wake-up: only its own project's runtime
+    // wakes the run.
+    let id = gate.id.clone();
+    mine.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE atomic_gates SET state = 'approved', decided_by = 'local:dev', \
+                 decided_at = 1, command_id = 'c1' WHERE gate_id = ?",
+                &[Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("decide without waking");
+    assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
+    assert!(redeliver(&mine).await.expect("redeliver") >= 1);
+    assert!(outcome(&mine, &run).await.expect("finishes").approved());
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_projects")));
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_postgres() {
+    let schema = crate::testing::schema("gate_projects").await;
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// A local SQLite store's runs recorded for no project, as before runs had
+/// one, or under an older name of the project's (`<old name>/<state id>`, as
+/// before its manifest was renamed), become the project's when atomic opens
+/// the store for it: their gates are listed and the runs shown. Another
+/// project's run is left as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_stores_old_runs_become_the_projects() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_adopt")));
+    let database = crate::Database::Sqlite(path.clone());
+    // A run started for `key`, and its gate.
+    let started = |key: Option<&'static str>| {
+        let database = database.clone();
+        let path = path.clone();
+        async move {
+            let mut rt = match key {
+                Some(key) => Durare::open(&database, None, crate::DEFAULT_VERSION, key)
+                    .await
+                    .expect("engine"),
+                None => Durare::sqlite(&path).await.expect("engine"),
+            };
+            register(&mut rt);
+            rt.launch().await.expect("launch");
+            let started = start_gated(&rt, input(None)).await;
+            rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            started
+        }
+    };
+    // Under an older name of the project, as before its manifest was
+    // renamed; another project's; and, last, one from before runs had a
+    // project.
+    let renamed = started(Some("old-name/the-project-0123")).await;
+    let foreign = started(Some("notes/another-project-4567")).await;
+    let unowned = started(None).await;
+    let opened = Durare::open(
+        &database,
+        None,
+        crate::DEFAULT_VERSION,
+        "notes/the-project-0123",
+    )
+    .await
+    .expect("engine");
+    for (run, gate) in [&unowned, &renamed] {
+        assert!(
+            opened.own_run_record(run).await.expect("record").is_some(),
+            "{run}"
+        );
+        assert!(
+            find(&opened, &gate.id).await.expect("find").is_some(),
+            "{run}"
+        );
+    }
+    let (run, gate) = &foreign;
+    assert!(
+        opened.own_run_record(run).await.expect("record").is_none(),
+        "{run}"
+    );
+    assert!(
+        find(&opened, &gate.id).await.expect("find").is_none(),
+        "{run}"
+    );
+    opened
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
 }
 
 #[test]

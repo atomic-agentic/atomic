@@ -205,8 +205,10 @@ denied place or a linked secret lies two or more levels inside a directory it
 may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
-is denied only to the commands that start after it, and a link made after
-the list is not followed until the next turn or step. Credentials kept
+is denied only to the commands that start after it, and so is what a link
+made after the list inside a denied place points at: each command looks for
+such links again as it starts, and one made while a command runs is followed
+from the next. Credentials kept
 anywhere else are not covered. An
 exec atom's command may write only its scratch directory and its run's own
 build caches, which no other run's command may write, though one can still read them by their path, and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
@@ -215,7 +217,10 @@ any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
 draw on the terminal atomic runs in, whether through `/dev/tty`, the
 terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
-needs bubblewrap and unprivileged user namespaces there: where the sandbox
+needs bubblewrap and unprivileged user namespaces there; a bubblewrap older
+than 0.9, without `--argv0`, as Ubuntu 22.04 ships, works too, since Codex
+runs the sandbox helper through a link atomic keeps in its own state, by its
+path, which no command can write. Where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead sets that run
@@ -317,6 +322,20 @@ stays parked with its record kept in the store, and the work goes on only as a
 new run, started again with `atomic run`. Stop every atomic process that uses a
 shared store before upgrading it, so that none goes on recording parks without
 their project.
+Runs and their gates are kept apart the same way. Each run is recorded with its
+project as it starts, and on a shared store `atomic gates list`, `approve`,
+`reject` and `answer` see only the current project's runs' gates, and `atomic
+runs show` and `atomic runs resume` only its runs: another project's gate or
+run is refused as one that does not exist. Run ids stay unique across the whole
+store, so `atomic run` refuses an id another project has taken, saying only
+that it is taken. On a local SQLite store, runs are adopted as parks are: one
+recorded before atomic kept runs' projects, or under an older name of the
+project's, becomes the project's, so a rename strands no run at its gate. A run
+started on a shared store before atomic kept runs' projects is no project's:
+none of these commands shows it or its gates, so it cannot get past a gate it
+waits at; start it again as a new run with `atomic run`. A broken manifest stops
+these commands too, and leaves the runs and gates where they are until it is
+mended. A gate decision still comes only from a person's enrolled credential.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
