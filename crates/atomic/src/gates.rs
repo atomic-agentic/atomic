@@ -353,9 +353,10 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
-    /// The deciding commands keep what an answer names from a sweep that
-    /// read the gate store before the decision: here the sweep reads the
-    /// gate open, the operator answers naming content stored long ago, and
+    /// The deciding commands keep what an answer and a comment name from a
+    /// sweep that read the gate store before the decision: here the sweep
+    /// reads the gate open, the operator answers and comments naming content
+    /// stored long ago, and
     /// the sweep's delete, with a grace that covers what was just written,
     /// keeps it.
     #[test]
@@ -372,7 +373,11 @@ mod tests {
                     .expect("put")
                     .artifact
             };
-            let (chosen, loose) = (put(b"the file chosen long ago"), put(b"nothing names this"));
+            let (chosen, noted, loose) = (
+                put(b"the file chosen long ago"),
+                put(b"the file a comment names"),
+                put(b"nothing names this"),
+            );
             for blob in store.stored().expect("stored") {
                 let path = dir
                     .join("artifacts/blobs/sha256")
@@ -435,7 +440,7 @@ mod tests {
                     command_id: "kept".into(),
                     gate: found.id.clone(),
                     verdict: Verdict::Approve,
-                    comment: None,
+                    comment: Some(format!("as in sha256:{}", noted.digest())),
                     proposal: found.proposal.clone(),
                     answer: Some(answer),
                 },
@@ -450,10 +455,9 @@ mod tests {
                 )
                 .expect("sweep");
             assert_eq!(swept.removed, [loose]);
-            assert!(
-                store.stored().expect("stored").contains(&chosen),
-                "the answer's content was swept"
-            );
+            let stored = store.stored().expect("stored");
+            assert!(stored.contains(&chosen), "the answer's content was swept");
+            assert!(stored.contains(&noted), "the comment's content was swept");
             rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
             let _ = std::fs::remove_dir_all(&dir);
         });
