@@ -1239,15 +1239,16 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
 /// link: a link is recorded by what it points at and nothing under it is
 /// compared; a directory is compared by its contents, and the walk it starts
 /// leaves nothing out by name, which is what keeps a `.git` planted under the
-/// hooks directory in the answer too. And a hooks directory that cannot be
-/// asked what it is, or cannot be listed once it is one, fails the comparison
-/// rather than reads as an empty one.
+/// hooks directory in the answer too. And a hooks directory whose mode refuses
+/// the listing fails the comparison rather than reads as an empty one — a mode
+/// like that leaves the directory askable and the listing refused, which is
+/// what this row reaches; a root that cannot be asked at all is the `.git`
+/// test's row.
 ///
 /// Like the check above, nothing here runs a turn or reaches a model, so this
-/// test needs no sandbox. The one state it cannot show is a directory whose mode
-/// is 000 asked of a run that is root, which is told past a mode; a run as root
-/// says so in its output, as the other test does, and every other row still
-/// runs.
+/// test needs no sandbox. The one state it cannot show is that directory asked
+/// of a run that is root, which is told past a mode; a run as root says so in
+/// its output, as the other tests do, and every other row still runs.
 #[test]
 fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
     let dir = scratch("hooks-state");
@@ -1332,9 +1333,9 @@ fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
     );
 
     // The same swap with a source a turn made: the names under the link and the
-    // bytes they hold are whatever its writer chose, including this checkout's
-    // own hook names and contents. None of it is this checkout's, so none of it
-    // is compared; what is reported is one link and where it leads.
+    // bytes they hold are whatever its writer chose, in hook names this checkout
+    // would itself use. None of it is this checkout's, so none of it is
+    // compared; what is reported is one link and where it leads.
     let planted = dir.join("planted-hooks");
     write(&planted.join("pre-commit"), "#!/bin/sh\nexit 0\n");
     std::fs::rename(&hooks, &moved).unwrap();
