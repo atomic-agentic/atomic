@@ -219,8 +219,10 @@ other files do not matter. It also refuses to start while another run holds the
 tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
 the same files and each saves its own originals, so the one that finishes last
 would put back the other's switched-off source. That lock is closed before cargo
-runs, so a test that leaves a process behind does not hold a finished run's
-lock.
+runs, so a test that leaves a process behind does not hold a finished run's lock.
+The lock frees itself when the run that took it ends, however it ends, so its
+file is never something to remove: removing it frees nothing and would let a
+third run lock a fresh file beside the one still held.
 
 Each control is one file under `scripts/controls/`, named `<name>.row` and
 holding one line:

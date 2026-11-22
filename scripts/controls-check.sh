@@ -86,9 +86,13 @@ if ! exec 9>>"${LOCK}"; then
     die "cannot open ${LOCK} for the run's lock; nothing was edited"
 fi
 # The refusal must not remove anything: a run that holds the lock is keeping
-# what it has saved in ${STATE}, which die_unedited would delete.
+# what it has saved in ${STATE}, which die_unedited would delete. And there is
+# nothing here for anyone to clean up: the kernel frees the lock when the run
+# that took it ends, however it ends, and removing the file would free nothing
+# while letting a third run lock a fresh file beside the run still holding the
+# old one.
 flock -n 9 ||
-    die "${LOCK} is held by another scripts/controls-check.sh run in this tree; wait for it to finish, and remove ${LOCK} only once no run is left; nothing was edited"
+    die "${LOCK} is held by another scripts/controls-check.sh run in this tree; it frees itself when that run ends, so wait for it and do not remove ${LOCK}; nothing was edited"
 
 # Where a file's original is kept.
 copy_of() {
