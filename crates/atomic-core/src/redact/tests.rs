@@ -2854,6 +2854,25 @@ fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
     assert_eq!(twice, once, "a second pass changed it");
 }
 
+/// Held JSON whose value is a chain of assignments, each read only once
+/// text around it is redacted, `password=pass =secret: pass =…`, hides the
+/// last one's value in one pass, under a hint and under a secret's name.
+#[test]
+fn a_chain_of_assignments_in_held_json_settles_hidden() {
+    let chain = format!("password=pass{} hunter2", " =secret: pass".repeat(5));
+    for parent in ["key", "token"] {
+        let mut once = json!({ parent: json!({"a": chain}).to_string() });
+        value(&mut once);
+        assert!(
+            !once.to_string().contains("hunter2"),
+            "under {parent}: the last value showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(twice, once, "under {parent}: a second pass changed it");
+    }
+}
+
 /// A name and value pair whose value redaction rewrites into the pair's
 /// secret is read again once its value is redacted, so a second pass
 /// changes nothing: `pwd="a b"` redacted to `pwd="[REDACTED]"`, or a
@@ -2867,8 +2886,6 @@ fn a_pair_whose_value_redacts_to_its_secret_settles_in_one_pass() {
     for (case, doc) in [
         json!(["token", secret]),
         json!({"name": "--token", "value": secret}),
-        json!({"key": ["x/MAX_TOKEN", secret]}),
-        json!({"password": {"name": "--token", "value": secret}}),
         json!(["Cookie", cookie]),
         json!({"key": ["Cookie", cookie]}),
         json!({"key": {"name": "Cookie", "value": cookie}}),

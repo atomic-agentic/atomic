@@ -1,1 +1,1 @@
-held-string-settle|crates/atomic-core/src/redact.rs|            if is_secret_value(strength, string) {|            if false /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::a_held_string_that_redacts_to_a_credential_settles_in_one_pass
+held-string-settle|crates/atomic-core/src/redact.rs|            if is_secret_value(strength, string) {|            if false /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib -- redact::tests::a_held_string_that_redacts_to_a_credential_settles_in_one_pass redact::tests::spaced_compact_held_json_settles_in_one_pass
