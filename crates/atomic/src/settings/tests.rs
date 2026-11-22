@@ -744,6 +744,136 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
     );
 }
 
+/// Whether anything is still waiting on `stream`, having waited `within` for
+/// it to arrive: `None` says the socket held nothing at all. `recv` with
+/// `MSG_PEEK` looks without taking, so a stand-in that has read once still
+/// answers what that read got. A socket that cannot be asked is not a socket
+/// shown to be empty, so an error on either call says something is waiting, as
+/// `Some(usize::MAX)`.
+#[allow(unsafe_code)]
+fn still_waiting(stream: &std::net::TcpStream, within: Duration) -> Option<usize> {
+    let raw = std::os::fd::AsRawFd::as_raw_fd(stream);
+    let mut readable: libc::fd_set = unsafe { std::mem::zeroed() };
+    unsafe { libc::FD_SET(raw, &mut readable) };
+    let mut budget = libc::timeval {
+        tv_sec: within.as_secs() as libc::time_t,
+        tv_usec: within.subsec_micros() as libc::suseconds_t,
+    };
+    let ready = unsafe {
+        libc::select(
+            raw + 1,
+            &mut readable,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut budget,
+        )
+    };
+    // One descriptor was given, so any other answer is not this socket's.
+    if !(0..=1).contains(&ready) {
+        return Some(usize::MAX);
+    }
+    if ready == 0 {
+        return None;
+    }
+    // One byte is enough to know the request did not come whole.
+    let mut byte = [0u8; 1];
+    let n = unsafe { libc::recv(raw, byte.as_mut_ptr().cast(), 1, libc::MSG_PEEK) };
+    if n < 0 {
+        return Some(usize::MAX);
+    }
+    if n == 0 {
+        // The peer has closed and nothing is left to read.
+        return None;
+    }
+    Some(n as usize)
+}
+
+/// What a one-read stand-in saw: the text its one read took, and whether the
+/// socket still held part of the request afterwards. `left` is `Some` with how
+/// many bytes it held, or `Some(usize::MAX)` when the socket could not be
+/// asked, which is not the same as being shown to be empty.
+struct OneRead {
+    head: String,
+    left: Option<usize>,
+}
+
+/// A stand-in Ollama that reads exactly once, as a server that answers on its
+/// first read does: it takes what its one `read` gets, answers that, and
+/// closes with whatever the read did not take. One `read` takes what has
+/// arrived and no more, however big the buffer, so a request sent in one write
+/// is whole in that read and leaves nothing in the socket, while a request
+/// sent in several writes leaves its later parts there. Closing with a request
+/// part unread resets the connection, which can lose the answer before the
+/// client reads it.
+fn ollama_one_read() -> (SocketAddr, std::sync::mpsc::Receiver<OneRead>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (tell, told) = std::sync::mpsc::channel();
+    let (ready, waiting) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Nothing sits between saying so and waiting, and between `accept` and
+        // `read`: the stand-in is at the socket as early as a running server
+        // is, so a request still on its way is taken in pieces and a whole one
+        // is taken whole.
+        let mut got = [0u8; 256];
+        let _ = ready.send(());
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut saw = match stream.read(&mut got) {
+            Ok(n) => OneRead {
+                head: String::from_utf8_lossy(&got[..n]).into_owned(),
+                left: None,
+            },
+            Err(e) => OneRead {
+                head: format!("the one read failed: {e}"),
+                left: Some(usize::MAX),
+            },
+        };
+        // What the one read left is looked for before the answer goes out, so
+        // the answer is still decided by that read alone.
+        saw.left = still_waiting(&stream, Duration::from_millis(100));
+        let body = r#"{"models":[{"name":"one:latest"}]}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+        let _ = tell.send(saw);
+        // The stream is dropped here: the answer is out and the connection
+        // ends, with whatever the one read did not take still unread.
+    });
+    // Only once the stand-in says it is at the socket: a probe sent before it
+    // got there would find the whole request waiting.
+    waiting
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the stand-in never waited for the connection");
+    (addr, told)
+}
+
+#[test]
+fn the_probe_sends_its_request_in_one_write_so_a_server_that_reads_once_gets_it_all() {
+    let (addr, told) = ollama_one_read();
+    let got = probe_ollama(addr);
+    let OneRead { head, left } = told
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the stand-in never answered");
+    // The answer went out on what the one read got, so that read must hold the
+    // whole request head and not one byte of it may still be waiting. A
+    // stand-in that waited before reading could not say this: one read then
+    // takes every write that has arrived, however many there were.
+    assert!(
+        head.ends_with("\r\n\r\n"),
+        "the one read did not take the whole request head: {head:?}"
+    );
+    assert_eq!(
+        left, None,
+        "part of the request was still in the socket, or the socket could not \
+         be asked: {left:?}"
+    );
+    assert_eq!(got, Some(vec!["one:latest".to_string()]));
+}
+
 #[test]
 fn a_key_goes_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_too() {
     let d = dir(&[(
