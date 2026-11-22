@@ -307,10 +307,11 @@ row instead, in up to sixteen shards, so that what touches no row, such as
 changes that only break a row together or a lockfile or pin bump, is checked
 too.
 
-A row a GitHub runner cannot run is listed, with its reason, in
-`scripts/controls-local.txt`. CI reports it as "not run in CI" and leaves it
-to a local run; a pull request that changes the list gets a warning, and
-should say why.
+A row CI does not run, one a GitHub runner cannot run or one known to fail
+until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
+A pull request touching it, and every sweep, reports it as "not run in CI",
+with a warning, and leaves it to a local run; a pull request that changes the
+list gets a warning too, and should say why.
 
 ## Milestone acceptance
 

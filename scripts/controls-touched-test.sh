@@ -261,6 +261,16 @@ python3 "${TOUCHED}" --all HEAD >"${WORK}/out" 2>"${WORK}/err" || code=$?
 OUT="$(cat "${WORK}/out")"
 expect "every row" "$(printf 'a\nb\nc')"
 python3 "${TOUCHED}" --all "${BASE}" HEAD >/dev/null 2>&1 && fail "--all with two revisions was accepted"
+printf 'b: needs a device the runner lacks\n' >scripts/controls-local.txt
+commit
+code=0
+python3 "${TOUCHED}" --all HEAD >"${WORK}/out" 2>"${WORK}/err" || code=$?
+OUT="$(cat "${WORK}/out")"
+expect "a sweep leaves a local-only row out" "$(printf 'a\nc')"
+code=0
+python3 "${TOUCHED}" --all HEAD --report >"${WORK}/out" 2>"${WORK}/err" || code=$?
+OUT="$(cat "${WORK}/out")"
+expect "a sweep reports a local-only row" "not run in CI b: needs a device the runner lacks"
 
 # Rows a CI runner cannot run.
 fresh
