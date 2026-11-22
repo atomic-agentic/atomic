@@ -439,6 +439,7 @@ pub async fn run(
     let admitted = tokio::select! {
         admitted = &mut admission => admitted,
         signal = signals.next() => {
+            // CI probe: a trivial change beside the run-stop-admission switch.
             halt.store(true, std::sync::atomic::Ordering::SeqCst);
             signalled = Some(signal);
             admission.await
