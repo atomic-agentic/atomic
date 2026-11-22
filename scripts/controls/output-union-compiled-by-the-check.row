@@ -1,0 +1,1 @@
+output-union-compiled-by-the-check|crates/atomic/src/main.rs|                schemas.push(output);|                let _ = output; /*CONTROL_OFF*/|-p atomic-agentic --test examples -- atomic_check_reads_openapi_toolsets

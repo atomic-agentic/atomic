@@ -440,6 +440,29 @@ fn atomic_check_reads_openapi_toolsets() {
         "{error}"
     );
     std::fs::remove_file(dir.join("toolsets/media.openapi.yaml")).expect("remove");
+    // A named success leaves the default response out of the output union,
+    // but the executor can still choose that default for another success
+    // status. Every media schema of that fallback must compile too; the
+    // union's compile cannot catch a broken second default media schema.
+    std::fs::write(
+        dir.join("toolsets/default-media.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: DefaultMedia, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: defaultMedia\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json: { schema: { type: object } }\n        default:\n          description: fallback\n          content:\n            application/json: { schema: { type: object } }\n            application/problem+json: { schema: { type: object, properties: { title: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a second default media type's schema that does not compile passed"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("default-media.openapi.yaml")
+            && error.contains("operation `defaultMedia`")
+            && error.contains("schema (unregistered):")
+            && error.contains("12"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/default-media.openapi.yaml")).expect("remove");
     // A failure response is not one a reply is checked against, so nothing of
     // it is compiled: a `404` whose schema reaches for a component that is not
     // in the spec does not fail the check, and the operation beside it is
@@ -461,6 +484,74 @@ fn atomic_check_reads_openapi_toolsets() {
         String::from_utf8_lossy(&output.stdout)
     );
     std::fs::remove_file(dir.join("toolsets/failed.openapi.yaml")).expect("remove");
+    // A tool's `output` is a document of its own: where its successes describe
+    // different bodies it is an `anyOf`, and here each of its members defines
+    // its own `$defs` under the one name `Leaf`. Each member is a schema
+    // resource of its own, so a member's `#/$defs/Leaf` reaches the `$defs` it
+    // carries, and the union — which holds none — compiles. Read in the union's
+    // document instead, each member's reference would reach a `$defs` the union
+    // does not hold, and the tool's output would be a schema that does not
+    // compile. `atomic check` compiles that document, and nothing else does, so
+    // that is where it would be said.
+    std::fs::write(
+        dir.join("toolsets/union.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing, defined beside the response\n          content:\n            application/json:\n              schema:\n                $ref: '#/$defs/Leaf'\n                $defs:\n                  Leaf: { type: object, required: [thing], properties: { thing: { type: string } } }\n        '202':\n          description: a leaf, defined the same way under the same name\n          content:\n            application/json:\n              schema:\n                $ref: '#/$defs/Leaf'\n                $defs:\n                  Leaf: { type: object, required: [ticket], properties: { ticket: { type: integer } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        output.status.success(),
+        "a union whose members are each their own document failed the check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // What gets compiled is a schema like any other, so a member of the union
+    // that reaches for a `$defs` name nothing holds is refused, with its file
+    // and its operation named and none of the spec's other tools blamed. That
+    // is the compile of the member by itself refusing: a member carries the
+    // `$id` that makes every reference inside it mean what it means in the
+    // member alone, and the union holds nothing beside its members for one to
+    // reach, so nothing here turns on which of the two says it first.
+    std::fs::write(
+        dir.join("toolsets/union.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing\n          content:\n            application/json:\n              schema: { $ref: '#/$defs/Nowhere' }\n        '202':\n          description: a ticket\n          content:\n            application/json:\n              schema: { type: object }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a tool whose output reaches for a `$defs` that is not there passed the check"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("union.openapi.yaml") && error.contains("operation `thing`"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/union.openapi.yaml")).expect("remove");
+    // The union is compiled too, which is the one thing no member's compile
+    // asks: a member that names its own document resolves what it writes
+    // against that name, so a root-relative `$ref: '/'` — no scheme, no
+    // fragment — resolves when that member is compiled on its own and resolves
+    // to nothing once it stands as a document of its own. Only the union's
+    // compile sees that, and its members are the only documents carrying an id
+    // of atomic's, so the refusal names one.
+    std::fs::write(
+        dir.join("toolsets/union.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Rooted, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing, reaching for a root nothing names\n          content:\n            application/json:\n              schema: { $ref: '/' }\n        '202':\n          description: a count\n          content:\n            application/json:\n              schema: { type: string }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a tool whose output document resolves nothing its members alone do not passed the check"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("union.openapi.yaml")
+            && error.contains("operation `thing`")
+            && error.contains("urn:atomic:response:0"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/union.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",
