@@ -1,0 +1,1 @@
+runs-show-reviewer-turn|crates/atomic/src/show.rs|            if role != "review" {|            if role != "review-off" { // CONTROL_OFF|-p atomic-agentic --bin atomic show::tests::a_recorded_turn_is_named_by_its_atoms_kind
