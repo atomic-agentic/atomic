@@ -214,7 +214,7 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
     std::fs::remove_file(&ready).expect("ready");
     let again = local
         .run(&command(&done))
-        .expect("a command starts once the first has ended");
+        .unwrap_or_else(|e| panic!("a command starts once the first has ended: {e}"));
     assert!(
         again.success(),
         "{}",

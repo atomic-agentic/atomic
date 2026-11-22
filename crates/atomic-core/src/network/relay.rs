@@ -158,8 +158,15 @@ impl Drop for Relay {
 pub(super) struct Admission {
     shared: Arc<Shared>,
     token: String,
-    _ended: watch::Sender<()>,
+    ended: Option<watch::Sender<()>>,
+    /// The command, while any of its connections holds it.
+    admitted: std::sync::Weak<Admitted>,
 }
+
+/// How long the end of a command waits for its connections to let go,
+/// so that a command started right after it finds its room given back.
+/// One the proxy has not let go of by then keeps the room.
+const RELEASE_WAIT: Duration = Duration::from_secs(1);
 
 impl Drop for Admission {
     fn drop(&mut self) {
@@ -168,6 +175,11 @@ impl Drop for Admission {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.token);
+        drop(self.ended.take());
+        let started = std::time::Instant::now();
+        while self.admitted.strong_count() > 0 && started.elapsed() < RELEASE_WAIT {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -226,11 +238,13 @@ impl Relay {
             !commands.contains_key(&token),
             "the relay already admits a command with this token"
         );
+        let weak = Arc::downgrade(&admitted);
         commands.insert(token.clone(), admitted);
         Ok(Admission {
             shared: self.shared.clone(),
             token,
-            _ended: ended,
+            ended: Some(ended),
+            admitted: weak,
         })
     }
 }
