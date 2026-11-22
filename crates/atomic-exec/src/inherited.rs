@@ -90,7 +90,10 @@ fn close_range_except(keep: &[RawFd]) -> std::io::Result<()> {
     }
     // SAFETY: F_GETFD only reads the descriptor's flags.
     let flags = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETFD) };
-    if flags == -1 || flags & libc::FD_CLOEXEC == 0 {
+    // Flags that cannot be read are no proof of a mark.
+    let unread = flags == -1;
+    let inheritable = flags & libc::FD_CLOEXEC == 0;
+    if unread || inheritable {
         return Err(std::io::Error::other(
             "close_range reported success but left a descriptor inheritable",
         ));
@@ -169,10 +172,16 @@ mod tests {
         flags & libc::FD_CLOEXEC != 0
     }
 
+    /// Held by the tests that mark this process's descriptors, or that
+    /// look at a descriptor no call may mark meanwhile: a test's thread
+    /// shares the descriptors of every other.
+    static DESCRIPTORS_HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Every descriptor past the standard three is kept from children, but
     /// the ones kept on purpose, both by `close_range` and by the listing.
     #[test]
     fn descriptors_are_kept_from_children_but_those_kept_on_purpose() {
+        let _held = DESCRIPTORS_HELD.lock().unwrap_or_else(|e| e.into_inner());
         let file = std::fs::File::open("/dev/null").expect("file");
         for how in ["close_range", "either", "listing"] {
             let left = inheritable(&file);
@@ -191,6 +200,112 @@ mod tests {
             assert!(close_on_exec(&left), "{how}: left open is kept");
             assert!(!close_on_exec(&handed), "{how}: handed passes");
         }
+    }
+
+    /// Run `call` on a thread of its own whose seccomp filter answers
+    /// `close_range` with success and does nothing, as a container's
+    /// profile can, and, when `getfd_fails`, `fcntl(F_GETFD)` with `EPERM`
+    /// (not `EBADF`, which a debug build's check that a descriptor it drops
+    /// is open would take for a closed one). The filter is the thread's
+    /// alone, so no other test sees it.
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    fn where_close_range_does_nothing<T: Send + 'static>(
+        getfd_fails: bool,
+        call: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        std::thread::spawn(move || {
+            let op = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+                code: code as u16,
+                jt,
+                jf,
+                k,
+            };
+            let load = libc::BPF_LD | libc::BPF_W | libc::BPF_ABS;
+            let equal = libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K;
+            let answer = libc::BPF_RET | libc::BPF_K;
+            // The call's number, then the low word of its second argument
+            // (on a little-endian machine, as atomic's Linux targets are).
+            let command = std::mem::offset_of!(libc::seccomp_data, args) as u32
+                + std::mem::size_of::<u64>() as u32;
+            let getfd = if getfd_fails {
+                libc::SYS_fcntl as u32
+            } else {
+                u32::MAX
+            };
+            let filter = [
+                op(load, 0, 0, 0),
+                op(equal, 0, 1, libc::SYS_close_range as u32),
+                op(answer, 0, 0, libc::SECCOMP_RET_ERRNO),
+                op(equal, 0, 3, getfd),
+                op(load, 0, 0, command),
+                op(equal, 0, 1, libc::F_GETFD as u32),
+                op(answer, 0, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+                op(answer, 0, 0, libc::SECCOMP_RET_ALLOW),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr().cast_mut(),
+            };
+            // SAFETY: prctl takes integers and, for the filter, a pointer to
+            // a program on this stack that the kernel copies.
+            unsafe {
+                assert_eq!(
+                    libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0),
+                    0,
+                    "no_new_privs: {}",
+                    std::io::Error::last_os_error()
+                );
+                assert_eq!(
+                    libc::prctl(
+                        libc::PR_SET_SECCOMP,
+                        libc::SECCOMP_MODE_FILTER,
+                        &program as *const libc::sock_fprog,
+                    ),
+                    0,
+                    "seccomp: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            call()
+        })
+        .join()
+        .expect("the filtered thread")
+    }
+
+    /// A `close_range` that reports success and marks nothing, as a seccomp
+    /// filter answering it with no error makes it, is caught by the probe
+    /// descriptor that comes out inheritable: an error, so that
+    /// [`keep_from_children`] reads the listing instead, and not a sweep
+    /// that left every descriptor to the programs this process starts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_close_range_that_marks_nothing_is_an_error() {
+        let _held = DESCRIPTORS_HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let file = std::fs::File::open("/dev/null").expect("file");
+        let left = inheritable(&file);
+        let refused = where_close_range_does_nothing(false, || close_range_except(&[]))
+            .expect_err("a close_range that marks nothing");
+        assert_eq!(
+            refused.to_string(),
+            "close_range reported success but left a descriptor inheritable"
+        );
+        // The filter took effect: close_range marked nothing.
+        assert!(!close_on_exec(&left), "close_range marked a descriptor");
+    }
+
+    /// A probe whose flags cannot be read after such a `close_range` is
+    /// an error too, not taken for one that came out marked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_whose_flags_cannot_be_read_is_an_error() {
+        let _held = DESCRIPTORS_HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let refused = where_close_range_does_nothing(true, || close_range_except(&[]))
+            .expect_err("a probe whose flags cannot be read");
+        assert_eq!(
+            refused.to_string(),
+            "close_range reported success but left a descriptor inheritable"
+        );
     }
 
     /// A listing that cannot be read, for any reason, is an error, and so is
