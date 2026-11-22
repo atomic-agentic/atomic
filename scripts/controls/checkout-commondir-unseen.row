@@ -1,0 +1,1 @@
+checkout-commondir-unseen|crates/atomic-core/src/state.rs|        Err(e) if not_there(&e) => return Ok(None),|        Err(_) => return Ok(None), /*CONTROL_OFF: a commondir target that cannot be looked at counts as absent*/|-p atomic-agentic-core --lib -- state::tests::a_commondir_target_that_cannot_be_seen_refuses_the_project

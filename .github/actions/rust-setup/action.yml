@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # What every Linux Rust job in CI needs before cargo runs: system packages,
-# the pinned toolchain and Astro compiler host, the build caches and the
+# the pinned toolchain, the build caches and the
 # verified V8 archive, and for the test jobs the test Postgres and the user
 # namespaces Codex's sandbox needs. Actions are pinned by commit SHA.
 #
@@ -105,12 +105,6 @@ runs:
           exit 1
         fi
         echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
-
-    - name: Pinned Astro compiler host
-      shell: bash
-      run: |
-        python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
-        echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
 
     # rustup installs the toolchain and components rust-toolchain.toml names.
     - name: Toolchain

@@ -29,11 +29,114 @@
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
+
+/// How long a command that should finish may take before the test gives up on
+/// it: a suite that cannot reach its backend fails, and never hangs.
+const COMMAND_BOUND: Duration = Duration::from_secs(120);
+
+/// How long one of that command's streams may stay open after the command is
+/// gone before the test gives up on reading it. What holds a stream open once
+/// the command has ended is some other process holding its end of the pipe,
+/// and the test waits for no process it did not start.
+const PIPE_BOUND: Duration = Duration::from_secs(30);
+
+/// Read `pipe` to its end and give the answer as one to come: the reading
+/// runs on a thread of its own, so the stream is emptied the whole time
+/// something else — the command, or another of its streams — is waited for.
+fn read_on_a_thread(
+    pipe: impl Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (came, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut bytes = Vec::new();
+        let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = came.send(read);
+    });
+    answer
+}
+
+/// What one stream answered, waiting no longer than [`PIPE_BOUND`] for it. A
+/// stream still open after that is one a process the command left behind
+/// holds, and the test says so rather than wait for it. A stream whose reading
+/// failed is said so too: half a stream is never taken for all of it.
+fn answered(
+    came: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    which: &str,
+    what: &str,
+) -> Vec<u8> {
+    match came.recv_timeout(PIPE_BOUND) {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => panic!("{what}: reading its {which}: {e}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{what}: the thread reading its {which} ended without saying what it read")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "{what} kept its {which} open {} s after its process was gone: something it left \
+             behind holds that pipe, and this test waits for nothing it did not start",
+            PIPE_BOUND.as_secs()
+        ),
+    }
+}
+
+/// Run what `cmd` describes to its end, writing `stdin` to it, and say what it
+/// answered. Its three pipes are each carried by a thread of their own, so a
+/// command that fills one stream is read while another of its streams is
+/// still open.
+///
+/// A command still running after [`COMMAND_BOUND`] is killed and reaped and the
+/// test fails, so a command that hangs is never left running for the next one;
+/// a stream still open [`PIPE_BOUND`] after its process is gone fails the test
+/// too, so no process this test did not start can hang it past those two
+/// bounds. The threads still reading streams the test gave up on are left to
+/// end when the processes holding those pipes do.
+fn run_and_capture(cmd: &mut Command, stdin: &str, what: &str) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("start {what}: {e}"));
+    let said = read_on_a_thread(child.stdout.take().expect("stdout"));
+    let complained = read_on_a_thread(child.stderr.take().expect("stderr"));
+    // Its input is written on a thread of its own too, so a command that
+    // never reads what it is given cannot stop the test from reading what it
+    // says; and the write end is then closed, so a command waiting for its
+    // input to end is not waiting for nothing.
+    let mut input = child.stdin.take().expect("stdin");
+    let given = stdin.to_owned();
+    std::thread::spawn(move || {
+        let _ = input.write_all(given.as_bytes());
+        drop(input);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= COMMAND_BOUND {
+                    // Not left running for whatever the test does next.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{what} did not finish within {} s", COMMAND_BOUND.as_secs());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{what}: waiting for it: {e}"),
+        }
+    };
+    Output {
+        status,
+        stdout: answered(said, "stdout", what),
+        stderr: answered(complained, "stderr", what),
+    }
+}
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -195,8 +298,8 @@ fn eval(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
 
 /// `atomic <args>` run in `cwd`, with nothing configured: HOME and atomic's
 /// own state inside the test's scratch directory, no key and no endpoint from
-/// the environment, and no local Ollama for detection to find. What `env`
-/// adds is the only configuration the command sees.
+/// the environment, and no local Ollama for detection to find. What a caller
+/// adds to this is the only configuration the command sees.
 fn atomic_command(dir: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(ATOMIC);
     cmd.args(args)
@@ -211,18 +314,13 @@ fn atomic_command(dir: &Path, cwd: &Path, args: &[&str]) -> Command {
         .env_remove("ATOMIC_DATABASE_URL")
         // Nothing listens on the discard port, so detection never finds a
         // local Ollama and an endpoint comes only from what a test sets.
-        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
-        .stdin(Stdio::null());
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9");
     cmd
 }
 
-/// `atomic <args>` run in `cwd` on that environment, with `env` added.
-fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = atomic_command(dir, cwd, args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.output().expect("atomic")
+/// `atomic <args>` run in `cwd` on that environment, with nothing added.
+fn atomic(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
+    run_and_capture(&mut atomic_command(dir, cwd, args), "", "atomic")
 }
 
 fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -240,7 +338,8 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().expect("atomic eval")
+    // Waited for under the same bound as every other command this suite runs.
+    run_and_capture(&mut cmd, "", "atomic eval")
 }
 
 fn text(out: &Output) -> String {
@@ -399,23 +498,34 @@ fn from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bo
         // A new user's first command, in an empty directory of their own.
         let fresh = dir.join("note-tools");
         std::fs::create_dir_all(&fresh).expect("dir");
-        let init = atomic(&dir, &fresh, &["init"], &[]);
+        let init = atomic(&dir, &fresh, &["init"]);
         assert!(init.status.success(), "{}", text(&init));
 
         // Nothing is hand edited: the case recorded below is the one init
-        // wrote, with the expectation it ships with.
+        // wrote, with the expectation and the input it ships with.
         let case = std::fs::read_to_string(fresh.join("evals/summarize-note/export-crash.yaml"))
             .expect("the sample case init wrote");
         assert!(
             case.contains("output.summary.size() > 0"),
             "the case is init's own, not a test's: {case}"
         );
+        let note = case
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("text: "))
+            .unwrap_or_else(|| panic!("the case gives its own input: {case}"))
+            .to_owned();
 
         // Recorded live against the fake model: every atom with cases runs,
-        // which is the one atom init wrote, in one model call.
+        // which is the one atom init wrote, in one model call that asks with
+        // the note from init's own case.
         let live = eval_async(&dir, &fresh, &url, &["--live"]).await;
         assert!(live.status.success(), "{}", text(&live));
         assert_eq!(model.calls(), 1, "recording the case is one model call");
+        let asked = model.requests()[0].to_string();
+        assert!(
+            asked.contains(&note),
+            "the live eval sent the input from the case init wrote ({note}): {asked}"
+        );
         let out = String::from_utf8_lossy(&live.stdout);
         assert!(
             out.contains("PASS summarize-note: 1 of 1 cases passed"),
@@ -423,24 +533,32 @@ fn from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bo
         );
 
         // The recording is in the project, beside the case it answers, which
-        // is what makes the next replay need nothing but the project.
+        // is what makes the next replay need nothing but the project: one
+        // case, one recording.
         let cassettes = fresh.join("evals/summarize-note/cassettes");
         let recordings: Vec<PathBuf> = std::fs::read_dir(&cassettes)
             .unwrap_or_else(|e| panic!("{}: {e}", cassettes.display()))
             .map(|entry| entry.expect("entry").path())
             .collect();
-        assert!(
-            !recordings.is_empty(),
-            "the recorded answer is kept in the project: {recordings:?}"
+        assert_eq!(
+            recordings.len(),
+            1,
+            "the one case leaves one recording: {recordings:?}"
         );
 
         // Replayed: no key, no model call, the answer read off that
         // recording. It names the endpoint it was made against, so the replay
         // is given that same endpoint and the fake model counts whatever it
-        // is asked for.
+        // is asked for — which, offline, is nothing at all.
+        let sent = model.every_request();
         let replayed = eval_async(&dir, &fresh, &url, &["--json"]).await;
         assert!(replayed.status.success(), "{}", text(&replayed));
         assert_eq!(model.calls(), 1, "the replay made no model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "offline, the replay sent the endpoint no request of any kind"
+        );
         let report: Value =
             serde_json::from_slice(&replayed.stdout).expect("one JSON report from --json");
         assert_eq!(report["passed"], true, "the replayed report passes");
@@ -647,6 +765,13 @@ fn a_replay_reads_no_api_key_and_sends_none() {
         .await
         .expect("eval");
         assert!(live.status.success(), "{}", text(&live));
+        // The live eval sent one request per case, and nothing else.
+        let sent = model.every_request();
+        assert_eq!(
+            sent.len(),
+            2,
+            "two cases, two requests, no probe beside them: {sent:?}"
+        );
         let (d, p, u) = (dir.clone(), project.clone(), url.clone());
         let replay = tokio::task::spawn_blocking(move || {
             eval_with(&d, &p, &u, &["note", "--json"], &secret)
@@ -654,6 +779,12 @@ fn a_replay_reads_no_api_key_and_sends_none() {
         .await
         .expect("eval");
         assert!(replay.status.success(), "{}", text(&replay));
+        assert_eq!(model.calls(), 2, "the replay made no model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "the replay sent the endpoint no request of any kind"
+        );
         let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
         assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
         assert_eq!(
@@ -1375,4 +1506,76 @@ fn naming_several_atoms_refuses_an_untrusted_case_before_any_atom_runs() {
         assert_eq!(model.calls(), 0, "an atom ran before the refusal");
         assert!(!project.join("evals/note/cassettes").exists());
     });
+}
+
+/// What the command below writes to its error stream: more than any pipe
+/// holds, so it cannot finish writing until someone is reading. The shell
+/// doubles this from one character, so what it writes is exactly it.
+const STREAM_FILLED: usize = 256 * 1024;
+
+/// What the same command writes to its output stream, which the test looks
+/// for in what it read: a reader that took the streams in the wrong order
+/// would lose the command's end, and its own exit code, without noticing.
+const STREAM_SAID: usize = 4096;
+
+/// How long that command may take, which is less than [`COMMAND_BOUND`] so
+/// that a stream nobody reads fails this test on its own rather than waiting
+/// out the bound meant for a command that has hung.
+const STREAM_BOUND: Duration = Duration::from_secs(60);
+
+/// Every stream of a command is read while it runs, not one after the other:
+/// a command that fills its error stream while its output is still open is
+/// read, waited for and reported. The command is the shell and what it writes
+/// is this test's own text, so it reaches no endpoint and needs no model.
+#[test]
+fn a_command_that_fills_one_stream_is_read_while_it_writes_the_other() {
+    let dir = scratch("streams");
+    let script = dir.join("both-streams.sh");
+    // Error stream first, and more of it than a pipe holds, with its output
+    // still open; then its output, then an exit code of its own.
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nfilled=e\nwhile [ ${{#filled}} -lt {STREAM_FILLED} ]; do \
+             filled=$filled$filled; done\nprintf '%s' \"$filled\" >&2\n\
+             printf '%s' \"$STREAM_SAID\"\nexit 3\n"
+        ),
+    )
+    .expect("script");
+    let said = "s".repeat(STREAM_SAID);
+    let for_command = said.clone();
+    let (came, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut command = Command::new("/bin/sh");
+        command.arg(&script).env("STREAM_SAID", &for_command);
+        let _ = came.send(run_and_capture(&mut command, "", "the two-stream command"));
+    });
+    let out = match answer.recv_timeout(STREAM_BOUND) {
+        Ok(out) => out,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the thread running the two-stream command ended with no answer for it")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the two-stream command was not read within {} s: the stream nobody reads is \
+             full, and the command cannot reach its own end",
+            STREAM_BOUND.as_secs()
+        ),
+    };
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "it ended by itself, uncut: {}",
+        text(&out)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "e".repeat(STREAM_FILLED),
+        "all of its error stream, which filled the pipe"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        said,
+        "all of its output stream, which was still open while its error stream filled"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

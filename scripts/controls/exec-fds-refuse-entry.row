@@ -1,0 +1,1 @@
+exec-fds-refuse-entry|crates/atomic/src/main.rs|from the programs it starts")?;|from the programs it starts").ok(); // CONTROL_OFF|-p atomic-agentic --features atomic-agentic/sandbox-tests --test inherited_fds -- atomic_refuses_to_start_where_it_cannot_keep_descriptors_from_its_children

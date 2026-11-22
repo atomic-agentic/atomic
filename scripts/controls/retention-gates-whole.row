@@ -1,0 +1,1 @@
+retention-gates-whole|crates/atomic/src/retention.rs|        all.push(serde_json::to_value(gate)?);|        let _ = gate;|-p atomic-agentic --lib retention::tests::every_part_of_what_the_gate_store_keeps_is_read

@@ -1,0 +1,1 @@
+env-refused-by-type|crates/atomic-core/src/config.rs|        if let Err(e) = serde_json::from_value::<T>(alone) {|        if let Err(e) = Ok::<(), serde_json::Error>(()) {|-p atomic-agentic-core --lib -- config::tests::a_value_the_setting_s_own_type_refuses_names_the_variable

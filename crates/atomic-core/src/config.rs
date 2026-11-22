@@ -127,6 +127,18 @@ pub enum ConfigError {
 }
 
 /// Resolve a configuration of type `T` through every layer.
+///
+/// `T`'s default is the configuration's shape: every layer is merged onto it,
+/// and the settings a variable or a flag may name are its leaves. That puts a
+/// requirement on `T`. `T::default()` must round-trip through JSON, and every
+/// leaf must deserialize on its own, with everything else left at its default:
+/// an environment variable is refused by its own name by writing its value
+/// into a copy of the default and reading the whole back into `T`, before it
+/// is merged in. So a setting whose type accepts a value only once a sibling
+/// field says so — an internally tagged enum whose variant carries fields the
+/// default does not have, say — has that value refused by its variable
+/// although the type accepts it. Such a setting needs its own path in, not
+/// `ATOMIC_*`.
 pub fn resolve<T>(layers: &Layers<'_>) -> Result<Resolved<T>, ConfigError>
 where
     T: Default + Serialize + DeserializeOwned,

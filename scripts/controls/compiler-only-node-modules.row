@@ -1,0 +1,1 @@
+compiler-only-node-modules|crates/atomic-core/src/compiler_host.rs|if url.as_str() != MAIN {|if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib -- compiler_host::tests::no_other_module_can_be_imported
