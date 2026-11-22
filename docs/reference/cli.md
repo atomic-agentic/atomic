@@ -329,10 +329,18 @@ layout resumes and recovers it. A run of another layout is refused by
 
 On a PostgreSQL store several projects share, `atomic serve` lists, takes
 and recovers only its own project's runs. Give each project's processes an
-executor identity of their own: when an identity, set in user configuration
-for example, owns another project's unfinished run that recovery would
-take, `atomic serve` refuses to start rather than run that project's run in
-this one's code, and says how many such runs there are without naming them.
+executor identity of their own (`ATOMIC_EXECUTOR_ID`, or `--executor-id`).
+When an identity, set in user configuration for example, owns an unfinished
+run recovery would take that is not this project's, `atomic serve` refuses to
+start rather than run it in this project's code, and says how many such runs
+there are without naming them. Such a run is another project's, or of no
+project (recorded before runs had projects), or this project's under an
+older manifest name or path. Once the project has an identity of its own,
+`atomic runs resume <id> --owner-stopped` takes over each of its runs left
+under the old one. The check finds runs already left; it does not stop a
+live process of another project that starts a run under the same identity at
+the same moment, and one identity shared by processes that run at once is
+not supported.
 Atomic refuses to start when the durable engine's own version variable
 (`DBOS__APPVERSION`) is set.
 

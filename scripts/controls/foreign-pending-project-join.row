@@ -1,0 +1,1 @@
+foreign-pending-project-join|crates/atomic-durable/src/runtime.rs|                             AND COALESCE(rp.project, '') <> ?",|                             AND COALESCE(rp.project, '') <> ? AND 1 = 0", // CONTROL_OFF|-p atomic-agentic-durable --lib gate::tests::a_project_neither_lists_nor_recovers_anothers_runs_on_sqlite

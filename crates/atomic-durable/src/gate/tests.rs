@@ -1031,59 +1031,89 @@ async fn a_project_neither_lists_nor_recovers_anothers_runs(database: crate::Dat
         },
     );
     mine.launch().await.expect("launch");
-    let run = unique("counted");
-    mine.start("counted", &run, ()).await.expect("start");
-    mine.result::<()>(&run).await.expect("finished");
-    let id = run.clone();
-    mine.control_transaction(move |mut tx| {
-        let id = id.clone();
-        Box::pin(async move {
-            tx.execute(
-                "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?",
-                &[Param::Text(id)],
-            )
+    // A statement on one run's rows.
+    let on = |sql: &'static str, run: &str| {
+        let run = run.to_owned();
+        let rt = &mine;
+        async move {
+            rt.control_transaction(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move { tx.execute(sql, &[Param::Text(run)]).await.map(|_| ()) })
+            })
             .await
-            .map(|_| ())
-        })
-    })
-    .await
-    .expect("unfinished");
+            .expect(sql)
+        }
+    };
+    const UNFINISHED: &str =
+        "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?";
+    const FINISHED: &str = "UPDATE workflow_status SET status = 'SUCCESS' WHERE workflow_uuid = ?";
+    // Three runs left unfinished, as a crash leaves them, under the one
+    // identity: A's, one that becomes B's, and one that becomes no
+    // project's.
+    let mut left = Vec::new();
+    for _ in 0..3 {
+        let run = unique("counted");
+        mine.start("counted", &run, ()).await.expect("start");
+        mine.result::<()>(&run).await.expect("finished");
+        on(UNFINISHED, &run).await;
+        left.push(run);
+    }
+    let (run, bs, nones) = (left[0].clone(), left[1].clone(), left[2].clone());
+    on(
+        "UPDATE atomic_run_projects SET project = 'project-b' WHERE run_id = ?",
+        &bs,
+    )
+    .await;
     let theirs = open("project-b").await;
+    // After B's store is opened, which on SQLite adopts runs of no project.
+    on("DELETE FROM atomic_run_projects WHERE run_id = ?", &nones).await;
+    let ids =
+        |runs: Vec<crate::runtime::RunRecord>| runs.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    let all = ids(theirs.unfinished().await.expect("unfinished"));
     assert!(
-        theirs
-            .unfinished()
-            .await
-            .expect("unfinished")
-            .iter()
-            .any(|r| r.id == run),
-        "the run is in the store"
+        left.iter().all(|r| all.contains(r)),
+        "the runs are in the store"
     );
+    let listed = ids(theirs.own_unfinished().await.expect("own unfinished"));
+    assert!(listed.contains(&bs), "project B's own run: {listed:?}");
+    assert!(!listed.contains(&run), "project B lists project A's run");
     assert!(
-        theirs
-            .own_unfinished()
-            .await
-            .expect("own unfinished")
-            .iter()
-            .all(|r| r.id != run),
-        "project B lists project A's run"
+        !listed.contains(&nones),
+        "project B lists a run of no project"
     );
-    let refused = theirs.recover().await.expect_err("project B recovers");
-    assert!(
-        refused.to_string().contains("of another project"),
-        "{refused}"
-    );
-    assert!(!refused.to_string().contains(&run), "it names A's run");
-    assert_eq!(tries.load(Ordering::SeqCst), 1, "project B ran A's run");
-    assert!(
-        mine.own_unfinished()
-            .await
-            .expect("own unfinished")
-            .iter()
-            .any(|r| r.id == run)
-    );
+    let refused = theirs
+        .recover()
+        .await
+        .expect_err("project B recovers")
+        .to_string();
+    for said in [
+        "owns 2 unfinished run(s) of another project",
+        "of no project",
+        "under an older manifest name or path",
+        "ATOMIC_EXECUTOR_ID, or --executor-id",
+        "`atomic runs resume <id> --owner-stopped`",
+        "is not supported",
+    ] {
+        assert!(refused.contains(said), "{said:?} in {refused}");
+    }
+    for id in &left {
+        assert!(!refused.contains(id.as_str()), "it names {id}");
+    }
+    assert_eq!(tries.load(Ordering::SeqCst), 3, "project B ran a run");
+    let listed = ids(mine.own_unfinished().await.expect("own unfinished"));
+    assert!(listed.contains(&run) && !listed.contains(&bs) && !listed.contains(&nones));
+    // A refuses too while B's run and the run of no project are left.
+    let refused = mine
+        .recover()
+        .await
+        .expect_err("project A recovers")
+        .to_string();
+    assert!(refused.contains("owns 2 unfinished run(s)"), "{refused}");
+    on(FINISHED, &bs).await;
+    on(FINISHED, &nones).await;
     assert_eq!(mine.recover().await.expect("recover"), 1);
     mine.result::<()>(&run).await.expect("recovered");
-    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    assert_eq!(tries.load(Ordering::SeqCst), 4);
     mine.shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");

@@ -1552,13 +1552,36 @@ impl Durare {
     /// whatever its version: on a store several projects share, another
     /// project's run is not one, even under the same executor identity.
     pub async fn own_unfinished(&self) -> Result<Vec<RunRecord>> {
-        let mut own = Vec::new();
+        let project = self.project.as_deref().unwrap_or_default().to_owned();
+        // One reading of which unfinished runs are this project's, as the
+        // gate store reads it: a run with no project's row is a runtime for
+        // no project's.
+        let own: std::collections::BTreeSet<String> = self
+            .reads
+            .read(move |mut tx| {
+                let project = project.clone();
+                Box::pin(async move {
+                    tx.query_all(
+                        "SELECT w.workflow_uuid AS id FROM workflow_status w \
+                         LEFT JOIN atomic_run_projects rp ON rp.run_id = w.workflow_uuid \
+                         WHERE w.status IN ('PENDING', 'ENQUEUED') \
+                         AND COALESCE(rp.project, '') = ?",
+                        &[Param::Text(project)],
+                    )
+                    .await?
+                    .iter()
+                    .map(|row| row.text("id"))
+                    .collect()
+                })
+            })
+            .await?;
+        let mut runs = Vec::new();
         for run in self.unfinished().await? {
-            if self.owns_run(&run.id).await? {
-                own.push(run);
+            if own.contains(&run.id) {
+                runs.push(run);
             }
         }
-        Ok(own)
+        Ok(runs)
     }
 
     /// This project's unfinished runs this executor identity owns that an
@@ -1573,31 +1596,40 @@ impl Durare {
     }
 
     /// How many of the runs recovery would take, those `PENDING` at this
-    /// engine's version under its executor identity, are another project's.
+    /// engine's version under its executor identity, are not this project's,
+    /// in one reading: another project's, one recorded before runs had
+    /// projects, or this project's under an older manifest name or path.
     async fn foreign_pending(&self) -> Result<usize> {
-        let version = self.engine.app_version();
-        let pending = self
-            .engine
-            .list_workflows(&durare::ListFilter {
-                status: vec!["PENDING".into()],
-                executor_ids: vec![self.engine.executor_id().to_owned()],
-                // As recovery selects them: an unset version selects any.
-                app_version: if version.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![version.to_owned()]
-                },
-                ..durare::ListFilter::default()
+        let (executor, version, project) = (
+            self.engine.executor_id().to_owned(),
+            self.engine.app_version().to_owned(),
+            self.project.as_deref().unwrap_or_default().to_owned(),
+        );
+        self.reads
+            .read(move |mut tx| {
+                let (executor, version, project) =
+                    (executor.clone(), version.clone(), project.clone());
+                Box::pin(async move {
+                    // As recovery selects them: an unset version selects any.
+                    let row = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS theirs FROM workflow_status w \
+                             LEFT JOIN atomic_run_projects rp ON rp.run_id = w.workflow_uuid \
+                             WHERE w.status = 'PENDING' AND w.executor_id = ? \
+                             AND (? = '' OR w.application_version = ?) \
+                             AND COALESCE(rp.project, '') <> ?",
+                            &[
+                                Param::Text(executor),
+                                Param::Text(version.clone()),
+                                Param::Text(version),
+                                Param::Text(project),
+                            ],
+                        )
+                        .await?;
+                    Ok(usize::try_from(row.int("theirs")?).unwrap_or(usize::MAX))
+                })
             })
             .await
-            .map_err(from_durare)?;
-        let mut theirs = 0;
-        for run in pending {
-            if !self.owns_run(&run.id).await? {
-                theirs += 1;
-            }
-        }
-        Ok(theirs)
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its
@@ -1744,6 +1776,22 @@ impl Durare {
         records.sort_by_key(|r| (r.run.clone(), position(r)));
         Ok(records)
     }
+}
+
+/// Why recovery refused: `executor` owns `theirs` unfinished runs that are
+/// not this project's, and what to do about it.
+fn foreign_runs_refusal(executor: &str, theirs: usize) -> String {
+    format!(
+        "executor {executor} owns {theirs} unfinished run(s) of another project in this store, \
+         which recovering would run here, so none is recovered. Such a run is another \
+         project's, or of no project (recorded before runs had projects), or this project's \
+         under an older manifest name or path. Give each project's processes an executor \
+         identity of their own (ATOMIC_EXECUTOR_ID, or --executor-id), then take over each of \
+         this project's runs left under the old identity with `atomic runs resume <id> \
+         --owner-stopped`. This finds runs already left, not one another project's live \
+         process starts at the same moment: one identity shared by processes that run at once \
+         is not supported"
+    )
 }
 
 impl DurableRuntime for Durare {
@@ -1936,15 +1984,17 @@ impl DurableRuntime for Durare {
         let own = [self.engine.executor_id().to_owned()];
         // Recovery takes every unfinished run this executor identity owns at
         // this version, whichever project's. On a store several projects
-        // share, another project's among them would run here, in this
-        // project's code: refused before any is taken.
+        // share, a run left there by another project's process would run
+        // here, in this project's code: refused before any is taken. This
+        // finds the runs already left, not one a live process of another
+        // project starts under the same identity between this reading and
+        // recovery's own: an identity shared by processes that run at once
+        // is not supported.
         let theirs = self.foreign_pending().await?;
         if theirs > 0 {
-            return Err(DurableError::Engine(format!(
-                "executor {} owns {theirs} unfinished run(s) of another project in this store, \
-                 which recovering would run here; give each project's processes an executor \
-                 identity of their own (ATOMIC_EXECUTOR_ID)",
-                self.engine.executor_id()
+            return Err(DurableError::Engine(foreign_runs_refusal(
+                self.engine.executor_id(),
+                theirs,
             )));
         }
         Ok(self
