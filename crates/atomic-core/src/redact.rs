@@ -1912,8 +1912,9 @@ impl Line {
     }
 
     /// Text that is safe to show as it is: a name a person or a workflow
-    /// chose (a run's id, a gate's), escaped for the terminal, or a value
-    /// redacted already, such as by [`value`] or [`bounded`].
+    /// chose, such as a run's id, or a value redacted already, such as by
+    /// [`value`] or [`bounded`]. It needs no escaping first: the whole line
+    /// is made safe for a terminal when it is written.
     pub fn shown(mut self, text: &str) -> Self {
         self.text.push_str(text);
         self
