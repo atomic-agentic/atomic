@@ -360,6 +360,11 @@ impl ProjectState {
                     return Err(StateError::Both { old, current });
                 }
             }
+            // Validate all source entries before moving even the first member:
+            // relocating a relative link can change where private state lives.
+            for name in LEGACY {
+                legacy_source_safe(&dir.join(name))?;
+            }
             let database = dir.join("atomic.db");
             if database_in_use(&database)? {
                 return Err(StateError::InUse {
@@ -776,6 +781,26 @@ fn legacy_entry_present(path: &Path) -> Result<bool, StateError> {
             path: path.to_owned(),
             source,
         }),
+    }
+}
+
+fn legacy_source_safe(path: &Path) -> Result<(), StateError> {
+    let fail = |source| StateError::Create {
+        path: path.to_owned(),
+        source,
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(fail(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "legacy state entry is a symbolic link",
+                )));
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(fail(source)),
     }
 }
 
@@ -2938,19 +2963,86 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn legacy_inventory_moves_an_existing_dangling_entry() {
-        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-entry");
-        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
-        std::fs::remove_dir_all(old.join("context")).expect("replace old context");
-        std::os::unix::fs::symlink("missing", old.join("context")).expect("old entry");
-        state.create().expect("moves existing entries");
+    fn legacy_inventory_refuses_source_links_before_moving_members() {
+        for target in ["missing", "../../outside", "live"] {
+            let (home, state, old) = legacy_lock_fixture("legacy-inventory-entry");
+            std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+            std::fs::write(old.join("atomic.db-wal"), "old WAL").expect("old WAL");
+            std::fs::remove_dir_all(old.join("context")).expect("replace old context");
+            std::os::unix::fs::symlink(target, old.join("context")).expect("old entry");
+            if target == "../../outside" {
+                std::fs::create_dir(home.join("home/outside"))
+                    .expect("destination-relative target");
+            }
+            if target == "live" {
+                std::fs::create_dir(old.join("live")).expect("existing link target");
+                assert!(
+                    std::fs::metadata(old.join("context"))
+                        .expect("live link")
+                        .is_dir()
+                );
+            } else {
+                assert_eq!(
+                    std::fs::metadata(old.join("context"))
+                        .expect_err("old link is dangling")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            match state
+                .create()
+                .expect_err("source links must refuse before any member moves")
+            {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, old.join("context"));
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                    assert_eq!(source.to_string(), "legacy state entry is a symbolic link");
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_link(old.join("context")).expect("original link remains"),
+                Path::new(target)
+            );
+            for (name, bytes) in [("atomic.db", "old database"), ("atomic.db-wal", "old WAL")] {
+                assert_eq!(
+                    std::fs::read_to_string(old.join(name)).expect("source remains"),
+                    bytes
+                );
+                assert_eq!(
+                    std::fs::symlink_metadata(state.private_dir().join(name))
+                        .expect_err("destination untouched")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            assert_eq!(
+                std::fs::symlink_metadata(state.context_dir())
+                    .expect_err("no context installed")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_keeps_links_inside_an_ordinary_context_directory() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-context-directory");
+        std::os::unix::fs::symlink("kept", old.join("context/nested-link")).expect("nested link");
+        state.create().expect("ordinary context directory migrates");
         assert_eq!(
-            std::fs::read_link(state.context_dir()).expect("entry moved without following it"),
-            Path::new("missing")
+            std::fs::read_to_string(state.context_dir().join("kept")).expect("context bytes"),
+            "unmoved"
+        );
+        assert_eq!(
+            std::fs::read_link(state.context_dir().join("nested-link"))
+                .expect("nested link retained"),
+            Path::new("kept")
         );
         assert_eq!(
             std::fs::symlink_metadata(old.join("context"))
-                .expect_err("no old entry left behind")
+                .expect_err("old context moved")
                 .kind(),
             std::io::ErrorKind::NotFound
         );
