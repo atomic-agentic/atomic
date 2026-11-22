@@ -571,6 +571,134 @@ commit
 run
 refused "a NUL in an include path is refused" "has a NUL in a Rust path"
 
+# Independent review regressions: every literal reader remains selected
+# when one of them also owns a directory; legal trivia cannot hide syntax.
+review_fixture() {
+    fresh
+    git rm -q scripts/controls/a.row scripts/controls/b.row scripts/controls/c.row
+    mkdir -p scripts/controls crates/k/tests/data crates/k/src
+    printf '%s\n' "$1" >crates/k/tests/alpha.rs
+    printf '%s\n' "${2:-fn beta() {}}" >crates/k/tests/beta.rs
+    printf 'before\n' >crates/k/tests/data/word
+    printf 'before\n' >crates/k/src/word
+    printf 'pub fn helper() {}\n' >crates/k/src/helper.rs
+    echo 'alpha|src/other.rs|fn other|off|-p k --test alpha -- guard_alpha' >scripts/controls/alpha.row
+    echo 'beta|src/other.rs|fn other|off|-p k --test beta -- guard_beta' >scripts/controls/beta.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+for read in 'tests/data/word' 'tests/'; do
+    review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' "fn b() { let _ = std::fs::read(\"${read}\"); }"
+    printf 'after\n' >crates/k/tests/data/word
+    commit
+    run
+    expect "directory ownership retains the other literal reader ${read}" "$(printf 'alpha\nbeta')"
+    off runtime-readers 'readers.append((path, name))' 'pass'
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with other runtime readers off, missing selection was not exposed: ${OUT}"
+    unset SCRIPT
+done
+
+for source in 'const V: &str = include_str /* trivia */ !("../src/word");' '#[ /* trivia */ path = "../src/helper.rs"] mod helper;'; do
+    review_fixture "${source}"
+    printf 'after\n' >crates/k/src/word
+    printf 'pub fn helper() { 1; }\n' >crates/k/src/helper.rs
+    commit
+    run
+    expect "comments between Rust tokens preserve an includer" "alpha"
+    off literal-trivia 'candidate = "include" in source or ("#" in source and "path" in source)' 'candidate = re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source)'
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with comment-aware discovery off, missing selection was not exposed: ${OUT}"
+    unset SCRIPT
+done
+
+# Only the target changes, not the symlink spelling the includer reads.
+review_fixture 'const V: &str = include_str!("../src/alias");'
+ln -s word crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/word
+commit
+run
+expect "a literal include follows its committed symlink target" "alpha"
+off include-links 'for dependency in included_paths(commit, name, path, modes):' 'for dependency in (posixpath.normpath(path),):'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with link resolution off, the missing target was not exposed: ${OUT}"
+unset SCRIPT
+
+review_fixture 'const V: &str = include_str!("../src/alias/word");'
+mkdir -p crates/k/src/real
+printf 'before\n' >crates/k/src/real/word
+ln -s real crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/real/word
+commit
+run
+expect "an intermediate directory link retains the real input" "alpha"
+
+# Changing an intermediate link must select the reader too.
+BASE="$(git rev-parse HEAD)"
+mkdir -p crates/k/src/other
+printf 'other\n' >crates/k/src/other/word
+rm crates/k/src/alias
+ln -s other crates/k/src/alias
+commit
+run
+expect "retargeting an intermediate link selects its includer" "alpha"
+off link-retarget 'for dependency in included_paths(commit, name, path, modes):' 'for dependency in (posixpath.normpath(path),):'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with link paths discarded, a retarget still selected: ${OUT}"
+unset SCRIPT
+
+# Resolve links before .., as a filesystem would, rather than guessing
+# from a lexical normalization of the spelling.
+review_fixture 'const V: &str = include_str!("../src/alias/../word");'
+mkdir -p crates/k/src/real/sub
+printf 'marker\n' >crates/k/src/real/sub/marker
+printf 'before\n' >crates/k/src/real/word
+ln -s real/sub crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/real/word
+commit
+run
+expect "a parent component follows the resolved directory link" "alpha"
+BASE="$(git rev-parse HEAD)"
+printf 'unrelated\n' >crates/k/src/word
+commit
+run
+expect "the lexical sibling is not the linked input" ""
+
+for link in alias ../../../../outside /outside; do
+    review_fixture 'const V: &str = include_bytes!("../src/alias");'
+    ln -s "${link}" crates/k/src/alias
+    commit
+    run
+    if [ "${link}" = alias ]; then
+        refused "an included data link loop refuses selection" "link that does not end"
+    else
+        refused "an included data link out of the repository refuses selection" "out of the repository"
+    fi
+done
+review_fixture 'const V: &str = include_bytes!("../src/word/child");'
+printf 'after\n' >crates/k/src/word
+commit
+run
+refused "an included input cannot traverse a regular file" "not a directory"
+
+review_fixture 'const V: &str = include_bytes!("../src/alias");'
+ln -s . crates/k/src/alias
+commit
+run
+refused "an included link ending at a directory refuses selection" "not a regular file"
+review_fixture 'const V: &str = include_bytes!("../src/real/.");'
+mkdir -p crates/k/src/real
+printf 'marker\n' >crates/k/src/real/marker
+commit
+run
+refused "an included trailing parent component cannot hide a directory" "not a regular file"
+
 # Every row, for a full sweep.
 fresh
 code=0

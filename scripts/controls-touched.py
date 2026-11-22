@@ -44,6 +44,7 @@ build, then by name, and cut into N runs of nearly equal length.
 """
 
 import argparse
+import collections
 import functools
 import os
 import posixpath
@@ -360,6 +361,67 @@ def in_tree(path):
     return not posixpath.isabs(path) and path != ".." and not path.startswith("../")
 
 
+def included_paths(commit, source, path, modes):
+    """Every tracked link and final input a literal include depends on.
+
+    Walk the committed tree, not the host filesystem. Resolve links before
+    parent components, retaining link names so retargeting a directory link
+    is a change to the includer too. A missing input name remains a dependency
+    (including when the change removes it); it never means no dependency.
+    """
+    if posixpath.isabs(path):
+        raise Refused(f"{source} includes a path out of the repository")
+    pending = collections.deque(path.split("/"))
+    resolved, names, seen, hops = [], set(), set(), 0
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise Refused(f"{source} includes a path out of the repository")
+            resolved.pop()
+            continue
+        resolved.append(part)
+        current = "/".join(resolved)
+        mode = modes.get(current)
+        if mode is None:
+            # There can be no tracked descendant below a missing component.
+            # Preserve its logical final name for additions/removals instead
+            # of treating a dangling include as an empty set of readers.
+            missing = posixpath.normpath("/".join([*resolved, *pending]))
+            if not in_tree(missing):
+                raise Refused(f"{source} includes a path out of the repository")
+            names.add(missing)
+            return names
+        if mode == "120000":
+            state = (current, tuple(pending))
+            if state in seen or hops >= 40:
+                raise Refused(f"{current} is an included link that does not end")
+            seen.add(state)
+            hops += 1
+            names.add(current)
+            target = git("cat-file", "blob", f"{commit}:{current}").decode("utf-8", errors="surrogateescape")
+            if not target or "\0" in target:
+                raise Refused(f"{current} is an included link with an unreadable target")
+            if posixpath.isabs(target):
+                raise Refused(f"{current} is an included link out of the repository")
+            resolved.pop()
+            pending.extendleft(reversed(target.split("/")))
+            continue
+        if pending and mode != "040000":
+            raise Refused(f"{current}, on an included path, is not a directory")
+        if not pending:
+            if mode not in ("100644", "100755"):
+                raise Refused(f"{current}, which {source} includes, is not a regular file")
+            names.add(current)
+    final = "/".join(resolved)
+    if modes.get(final) not in ("100644", "100755"):
+        raise Refused(f"{final}, which {source} includes, is not a regular file")
+    names.add(final)
+    return names
+
+
 @functools.lru_cache(maxsize=None)
 def source_references(commit):
     """One level of literal includers and integration targets naming data.
@@ -368,11 +430,12 @@ def source_references(commit):
     own directory, not a basename match elsewhere in the tree. A named tests/... data directory is owned
     by every integration target that names it; ambiguous owners are all kept.
     """
-    included, data, sources = {}, [], set()
+    included, data, sources, readers = {}, [], set(), []
     entries = []
     for entry in filter(None, git("ls-tree", "-r", "-t", "-z", commit).split(b"\0")):
         meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
         entries.append((meta.split(" ")[0], name))
+    modes = dict((name, mode) for mode, name in entries)
     directories = {name for mode, name in entries if mode == "040000"}
     macro = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*$")
     attribute = re.compile(r"#\s*\[\s*path\s*=\s*$")
@@ -389,9 +452,8 @@ def source_references(commit):
         )
         # Sources with neither include syntax nor a target's data path
         # cannot contribute a reference. Avoid lexing unrelated fixtures.
-        if not re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source) and not (
-            target and "tests/" in source
-        ):
+        candidate = "include" in source or ("#" in source and "path" in source)
+        if not candidate and not (target and "tests/" in source):
             continue
         code, literals = rust_literals(name, source)
         previous, depth = 0, 0
@@ -406,24 +468,29 @@ def source_references(commit):
             # data fallback. Those paths remain covered by the sweep.
             top_level_path = depth == 0 and attribute.search(before)
             if macro.search(before) or top_level_path:
-                path = posixpath.normpath(posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw)))
-                if in_tree(path):
-                    included.setdefault(path, set()).add(name)
+                path = posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw))
+                for dependency in included_paths(commit, name, path, modes):
+                    included.setdefault(dependency, set()).add(name)
             if target and literal.startswith("tests/"):
                 path = posixpath.normpath(posixpath.join(*parts[:2], literal_path(name, literal, raw)))
+                if in_tree(path):
+                    readers.append((path, name))
                 # Only a concrete directory below this crate's tests root
                 # can narrow the old shared-data rule. A root-wide read, a
                 # runtime filename or an unknown path keeps that fallback.
                 tests = "/".join(parts[:3]) + "/"
                 if path.startswith(tests) and path in directories:
                     data.append((path, name))
-    return included, data, sources
+    return included, data, sources, readers
 
 
-def references_to(path, references):
-    included, data, _ = references
+def references_to(path, references, owners_only=False):
+    included, data, _, readers = references
     owners = set(included.get(path, ()))
-    for directory, target in data:
+    # A broad directory owner cannot make exact-file or root-wide readers
+    # disappear. All readers select rows; only proven directory owners can
+    # narrow the old shared-data fallback.
+    for directory, target in data + ([] if owners_only else readers):
         if path == directory or path.startswith(directory + "/"):
             owners.add(target)
     return owners
@@ -456,7 +523,7 @@ def shared_test_crates(base, head, changed, references):
             if compiled:
                 crates.add(parts[1])
                 continue
-        owners = set().union(*(references_to(path, refs) for refs in references))
+        owners = set().union(*(references_to(path, refs, owners_only=True) for refs in references))
         # We expanded only one level. A reader added by that expansion can
         # itself have readers not in this change: keep the broad fallback
         # rather than pretend the second dependency level was followed.
