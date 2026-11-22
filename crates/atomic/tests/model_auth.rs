@@ -136,13 +136,54 @@ fn ollama_on_loopback() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let accepted = started.elapsed().as_millis();
-            let mut request = [0u8; 4096];
-            let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
-            let line = String::from_utf8_lossy(&request[..n])
+            // The whole request head, however many writes it came in: an
+            // answer sent while some of it is still unread, and the stream
+            // then dropped, resets the connection, which can lose the
+            // answer before the client reads it.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let complete = loop {
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break true;
+                }
+                match std::io::Read::read(&mut stream, &mut chunk) {
+                    Ok(0) | Err(_) => break false,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+                if request.len() > 1 << 16 {
+                    break false;
+                }
+            };
+            // And its body, by its length, for the same reason.
+            let head_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(request.len(), |at| at + 4);
+            let length = String::from_utf8_lossy(&request[..head_end])
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while complete && request.len() < head_end + length {
+                match std::io::Read::read(&mut stream, &mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let line = String::from_utf8_lossy(&request)
                 .lines()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
+            let line = if complete {
+                line
+            } else {
+                format!("{line} (an incomplete request)")
+            };
             let body = r#"{"models":[{"name":"synthetic"}]}"#;
             let answered = std::io::Write::write_all(
                 &mut stream,
