@@ -11,7 +11,8 @@
 //! - this process holding them, with an unconfined command run through
 //!   `atomic runner`, which keeps them from what it starts.
 //!
-//! (A turn's shell is `shell_env`'s.) Needs bubblewrap and unprivileged
+//! atomic refuses to start, and so does its sandbox helper, where it cannot
+//! keep them from what it starts. (A turn's shell is `shell_env`'s.) Needs bubblewrap and unprivileged
 //! user namespaces, so it runs with the `sandbox-tests` feature; with the
 //! feature on, a sandbox that cannot start fails the test.
 
@@ -27,11 +28,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The descriptors the command was started with, before it opens any of
-/// its own, as `{"fds": "0,1,2"}`.
-const LIST: &str = "import json, os, sys\n\
-    fds = sorted(int(fd) for fd in os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + fd))\n\
-    json.dump({'fds': ','.join(map(str, fds))}, sys.stdout)\n";
+/// The descriptors the command holds, every one it could have, found
+/// by asking each number up to its limit (at most 65536) rather than by
+/// listing a directory, which would open one of its own: `{"fds": "0,1,2"}`.
+const LIST: &str = "import fcntl, json, resource, sys\n\
+    def is_open(fd):\n\
+    \x20   try:\n\
+    \x20       fcntl.fcntl(fd, fcntl.F_GETFD)\n\
+    \x20       return True\n\
+    \x20   except OSError:\n\
+    \x20       return False\n\
+    top = min(resource.getrlimit(resource.RLIMIT_NOFILE)[0], 1 << 16)\n\
+    json.dump({'fds': ','.join(str(fd) for fd in range(top) if is_open(fd))}, sys.stdout)\n";
 
 /// A scratch directory of the test's own, not under /tmp: atomic refuses
 /// scratch where sandboxed turns may write.
@@ -139,6 +147,7 @@ fn a_confined_command_holds_none_of_the_descriptors_left_open_in_its_parent() {
 /// runner keeps them from what it starts.
 #[test]
 fn a_runners_command_holds_none_of_the_descriptors_left_open_in_its_parent() {
+    support::require_sandbox();
     let dir = scratch("runner");
     let _left = left_open_here(&dir);
     let runner = atomic_exec::runner::ProcessRunner {
@@ -264,6 +273,138 @@ fn an_exec_atoms_command_holds_none_of_the_descriptors_atomic_was_started_with()
         );
         let doc: Value = serde_json::from_slice(&out.stdout).expect("a result");
         assert_eq!(doc["output"]["fds"], "0,1,2", "{how}: {doc}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Start `command` where `close_range` answers `ENOSYS`, as on a kernel
+/// before 5.11, and, when `no_listing`, in a mount namespace of its own whose
+/// `/proc` is an empty directory, so that it cannot list its descriptors
+/// either.
+#[allow(unsafe_code)]
+fn without_close_range(command: &mut std::process::Command, no_listing: bool) {
+    // SAFETY: between fork and exec the closure makes only system calls
+    // (unshare, mount, prctl), which are async-signal-safe, and allocates
+    // nothing: the filter is on its stack.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(command, move || {
+            let fail = || Err(std::io::Error::last_os_error());
+            if no_listing {
+                if libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) != 0 {
+                    return fail();
+                }
+                let none = std::ptr::null();
+                if libc::mount(
+                    none,
+                    c"/".as_ptr(),
+                    none,
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    none.cast(),
+                ) != 0
+                {
+                    return fail();
+                }
+                if libc::mount(
+                    c"none".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    none.cast(),
+                ) != 0
+                {
+                    return fail();
+                }
+            }
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return fail();
+            }
+            // Load the call's number; answer close_range with ENOSYS, allow
+            // the rest.
+            let op = |code: u32, jt: u8, jf: u8, k: u32| libc::sock_filter {
+                code: code as u16,
+                jt,
+                jf,
+                k,
+            };
+            let filter = [
+                op(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+                op(
+                    libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                    0,
+                    1,
+                    libc::SYS_close_range as u32,
+                ),
+                op(
+                    libc::BPF_RET | libc::BPF_K,
+                    0,
+                    0,
+                    libc::SECCOMP_RET_ERRNO | libc::ENOSYS as u32,
+                ),
+                op(libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr().cast_mut(),
+            };
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &program as *const libc::sock_fprog,
+            ) != 0
+            {
+                return fail();
+            }
+            Ok(())
+        });
+    }
+}
+
+/// atomic, unable to keep the descriptors it was started with from what it
+/// starts, refuses to start, saying why; with only `close_range` refused it
+/// lists them instead, and starts.
+#[test]
+fn atomic_refuses_to_start_where_it_cannot_keep_descriptors_from_its_children() {
+    support::require_sandbox();
+    for no_listing in [true, false] {
+        let mut atomic = std::process::Command::new(env!("CARGO_BIN_EXE_atomic"));
+        atomic.arg("--version");
+        without_close_range(&mut atomic, no_listing);
+        let out = atomic.output().expect("started");
+        let said = String::from_utf8_lossy(&out.stderr);
+        let refused = said
+            .contains("keep the descriptors atomic was started with from the programs it starts");
+        if no_listing {
+            assert!(!out.status.success() && refused, "{no_listing}: {said}");
+        } else {
+            assert!(out.status.success() && !refused, "{no_listing}: {said}");
+        }
+    }
+}
+
+/// The sandbox helper, unable to keep the descriptors it was started with
+/// from the command, does not start it, saying why; with only `close_range`
+/// refused it lists them instead, and goes on.
+#[test]
+fn the_sandbox_helper_refuses_where_it_cannot_keep_descriptors_from_the_command() {
+    support::require_sandbox();
+    let dir = scratch("helper-refuses");
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_atomic"),
+        dir.join("codex-linux-sandbox"),
+    )
+    .expect("sandbox helper");
+    for no_listing in [true, false] {
+        let mut helper = std::process::Command::new(dir.join("codex-linux-sandbox"));
+        helper.args(["--sandbox-policy-cwd", "/"]);
+        without_close_range(&mut helper, no_listing);
+        let out = helper.output().expect("started");
+        let said = String::from_utf8_lossy(&out.stderr);
+        let refused = said.contains("cannot keep the descriptors it was started with");
+        if no_listing {
+            assert!(!out.status.success() && refused, "{no_listing}: {said}");
+        } else {
+            assert!(!refused, "{no_listing}: {said}");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

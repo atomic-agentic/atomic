@@ -48,10 +48,21 @@ pub fn handed_secret_fd() -> Option<RawFd> {
 }
 
 /// [`keep_from_children`] with `close_range`, around each descriptor in
-/// `keep`.
+/// `keep`. A descriptor opened for the purpose without close-on-exec must
+/// come out marked: a `close_range` that reports success and marks nothing,
+/// as a seccomp filter answering it with no error would, is an error.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn close_range_except(keep: &[RawFd]) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    // SAFETY: open reads one NUL-terminated path; the descriptor it returns
+    // is owned here alone.
+    let probe = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+    if probe < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    let probe = unsafe { OwnedFd::from_raw_fd(probe) };
     let mut kept: Vec<u32> = keep
         .iter()
         .filter_map(|fd| u32::try_from(*fd).ok())
@@ -76,6 +87,13 @@ fn close_range_except(keep: &[RawFd]) -> std::io::Result<()> {
             }
         }
         first = fd.saturating_add(1);
+    }
+    // SAFETY: F_GETFD only reads the descriptor's flags.
+    let flags = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETFD) };
+    if flags == -1 || flags & libc::FD_CLOEXEC == 0 {
+        return Err(std::io::Error::other(
+            "close_range reported success but left a descriptor inheritable",
+        ));
     }
     Ok(())
 }
@@ -156,19 +174,22 @@ mod tests {
     #[test]
     fn descriptors_are_kept_from_children_but_those_kept_on_purpose() {
         let file = std::fs::File::open("/dev/null").expect("file");
-        for keep_listed in [false, true] {
+        for how in ["close_range", "either", "listing"] {
             let left = inheritable(&file);
             let handed = inheritable(&file);
             assert!(!close_on_exec(&left) && !close_on_exec(&handed));
             let kept = [handed.as_raw_fd()];
-            if keep_listed {
-                keep_listed_from_children(std::path::Path::new(DESCRIPTORS), &kept)
-                    .expect("listed");
-            } else {
-                keep_from_children(&kept).expect("kept");
+            match how {
+                #[cfg(target_os = "linux")]
+                "close_range" => close_range_except(&kept).expect("close_range"),
+                #[cfg(not(target_os = "linux"))]
+                "close_range" => continue,
+                "either" => keep_from_children(&kept).expect("kept"),
+                _ => keep_listed_from_children(std::path::Path::new(DESCRIPTORS), &kept)
+                    .expect("listed"),
             }
-            assert!(close_on_exec(&left), "{keep_listed}: left open is kept");
-            assert!(!close_on_exec(&handed), "{keep_listed}: handed passes");
+            assert!(close_on_exec(&left), "{how}: left open is kept");
+            assert!(!close_on_exec(&handed), "{how}: handed passes");
         }
     }
 
@@ -198,7 +219,8 @@ mod tests {
         assert_eq!(refused.kind(), std::io::ErrorKind::InvalidData, "{refused}");
         let looped = dir.join("looped");
         std::os::unix::fs::symlink(&looped, &looped).expect("link");
-        assert!(keep_listed_from_children(&looped, &[]).is_err());
+        let refused = keep_listed_from_children(&looped, &[]).expect_err("a loop");
+        assert_eq!(refused.raw_os_error(), Some(libc::ELOOP), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

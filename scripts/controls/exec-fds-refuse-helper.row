@@ -1,0 +1,1 @@
+exec-fds-refuse-helper|crates/atomic-core/src/codex.rs|keep_from_children(&handed) {|keep_from_children(&handed).or(Ok::<(), std::io::Error>(())) /* CONTROL_OFF */ {|-p atomic-agentic --features atomic-agentic/sandbox-tests --test inherited_fds -- the_sandbox_helper_refuses_where_it_cannot_keep_descriptors_from_the_command

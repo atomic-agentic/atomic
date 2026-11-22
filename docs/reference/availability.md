@@ -143,7 +143,13 @@ past the standard three close-on-exec as it starts, and so does Codex's Linux
 sandbox helper before it starts a command, so a command holds only what atomic
 hands it. That includes descriptors handed to atomic on purpose, such as
 systemd's socket activation (`LISTEN_FDS`) or a `make` jobserver: none reaches
-a command, or another program atomic starts. A turn's commands run with no
+a command, or another program atomic starts. On Linux, atomic uses
+`close_range`, or, on a kernel before 5.11, the list in `/proc/self/fd`; where
+it has neither, atomic does not start, and the helper does not start the
+command. Codex also starts a turn's commands on a pseudo-terminal of their own,
+closing, as far as it can, what they would inherit. On macOS atomic relies on
+the list in `/dev/fd`, which is not verified. Windows, where a process
+inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn, of the project or another project of the same
