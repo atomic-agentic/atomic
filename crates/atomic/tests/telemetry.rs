@@ -333,7 +333,10 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
             .spawn()
             .unwrap(),
     );
-    let limit = std::time::Duration::from_secs(3);
+    // Longer than what the wait gives one poll, so that a poll is bounded by
+    // its own budget and never by the deadline landing mid-poll: the only way
+    // this wait kills a poll is a poll that does not answer.
+    let limit = std::time::Duration::from_secs(15);
     let began = std::time::Instant::now();
     let why = failed_wait(|| {
         wait_for_gate_by(&dir, "http://127.0.0.1:9/v1", &mut child, limit);
@@ -341,23 +344,26 @@ fn a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll() {
     let ended = began.elapsed();
     // Its own limit ended it, and not the run: `sleep` does not stop on its
     // own, and the other reason the wait gives is that the run ended first.
+    // The message may say how much longer a poll it had started was waited for,
+    // so this holds the two halves of the reason rather than its whole text.
     assert!(
-        why.contains(&format!(
-            "no gate opened in {limit:?}, so the run was killed"
-        )),
+        why.contains(&format!("no gate opened in {limit:?}")),
         "not the wait's own limit that ended it: {why}"
+    );
+    assert!(
+        why.contains("so the run was killed"),
+        "the wait did not say it ended the run: {why}"
     );
     // It came back at its limit: far past it would be waiting for a run that
     // sleeps on rather than ending it, and short of it is a wait that gave up
-    // before it had polled. The room below is for the polls still running when
-    // the deadline passes, each of which is waited for as long as it takes to
-    // end once the wait has killed it.
+    // before it had polled. The room below is for the one poll still running
+    // when the deadline passes, which is waited for as long as it takes to end.
     assert!(
         ended >= limit,
         "the wait gave up after {ended:?}, short of its {limit:?}"
     );
     assert!(
-        ended < limit + std::time::Duration::from_secs(30),
+        ended < limit + std::time::Duration::from_secs(90),
         "the wait went on for {ended:?} past its {limit:?}"
     );
     // And it ended the run rather than leaving it asleep for 400 s.

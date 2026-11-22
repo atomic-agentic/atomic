@@ -771,9 +771,17 @@ impl Drained {
 /// before it is killed and tried again: far more than that command takes,
 /// however loaded the machine, and far less than [`GATE_LIMIT`], so a CLI
 /// stuck on a lock costs one poll rather than the whole wait. A `limit`
-/// shorter than this bounds the poll instead, down to the wait's own
-/// deadline.
+/// shorter than this bounds the poll instead, down to what the wait has left
+/// of its own time — which is why a poll only starts with at least
+/// [`POLL_GRACE`] of that left.
 const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much of the wait's own time a poll must have left to be started at
+/// all: what bounds a poll that then runs past it is this, not the deadline,
+/// so a poll is killed for not answering rather than for the wait running out
+/// mid-poll. It is far more than `atomic gates list` takes and far less than
+/// [`POLL_LIMIT`].
+const POLL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
 /// `atomic gates list` shows, reading its output meanwhile, for no longer
@@ -799,12 +807,12 @@ pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
 /// stops where the kill landed and would hide the last real answer.
 ///
 /// `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll` runs
-/// this with a limit of 3 s, so that it reaches its deadline in seconds: it
-/// holds the count to what happened — more than one poll, none of them
-/// killed — and reads back as an answer what the message quotes. With the
-/// deadline guard there switched off, the wait starts one more poll, one it
-/// has no time left to wait for, and that poll is killed where it stands;
-/// the test fails on the count.
+/// this with a limit of seconds, longer than one poll is given, so that it
+/// reaches its deadline in seconds: it holds the count to what happened — more
+/// than one poll, none of them killed — and reads back as an answer what the
+/// message quotes. With the guard there switched off, the wait starts one more
+/// poll, one it has no time left to wait for, and that poll is killed where it
+/// stands; the test fails on the count.
 /// `a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for` holds
 /// what the message quotes, and how long it says that took, to what a run
 /// that ends before its gate really did.
@@ -825,7 +833,8 @@ pub(crate) fn wait_for_gate_by(
     limit: std::time::Duration,
 ) -> Drained {
     let drained = Drained::of(child);
-    let deadline = std::time::Instant::now() + limit;
+    let began = std::time::Instant::now();
+    let deadline = began + limit;
     let mut polls = 0usize;
     let mut killed = 0usize;
     // What the last poll that answered said, and how long that one took. A
@@ -833,16 +842,19 @@ pub(crate) fn wait_for_gate_by(
     // printed is what it had got out before the kill, usually nothing.
     let mut answered: Option<(Output, std::time::Duration)> = None;
     loop {
-        // A poll starts only while the wait has time left to wait for it.
-        // One spawned at or past the deadline has no time at all, is killed
-        // where it stands, and what it had printed by then is not the last
-        // thing the command said. The deadline is weighed again below, so
-        // the wait ends there whether a poll ran or not.
+        // A poll starts only while the wait has a real budget left to wait
+        // for one: a poll spawned with nothing left has no time to answer, is
+        // killed where it stands, and what it had printed by then is not the
+        // last thing the command said. Weighing the grace rather than the bare
+        // deadline is also what leaves a poll killed only for not answering: a
+        // poll started with [`POLL_GRACE`] left is bounded by that, not cut
+        // short where the deadline happens to fall. The deadline is weighed
+        // again below, so the wait ends there whether a poll ran or not.
         // `scripts/controls/telemetry-poll-not-started-late` switches this
         // off, and the wait then leaves one poll killed at birth, which
         // `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll`
         // fails on.
-        if std::time::Instant::now() < deadline {
+        if std::time::Instant::now() + POLL_GRACE < deadline {
             let started = std::time::Instant::now();
             let mut poll = Child::new(
                 command(dir, model, &["gates", "list", "--json"], &[])
@@ -885,12 +897,26 @@ pub(crate) fn wait_for_gate_by(
             }
         }
         let ended = child.try_wait().unwrap();
-        if ended.is_some() || std::time::Instant::now() >= deadline {
+        // The last thing the wait weighed before it gave up: its own bound,
+        // and what a poll still running was given, are said apart because a
+        // poll's own bound can take the wait past its bound by that much.
+        let past = std::time::Instant::now();
+        if ended.is_some() || past >= deadline {
             let why = match ended {
                 Some(_) => "the run ended before its gate".to_owned(),
                 None => {
                     signal(child, "KILL");
-                    format!("no gate opened in {limit:?}, so the run was killed")
+                    // A wait whose bound is shorter than what it gives one of
+                    // its polls ends on that poll's own bound, so it says how
+                    // long it sat rather than restating a bound it did not
+                    // keep to the millisecond.
+                    let sat = past.duration_since(began);
+                    let poll_gave = if limit < POLL_GRACE {
+                        format!(", and {} ms for the poll it had started", sat.as_millis())
+                    } else {
+                        String::new()
+                    };
+                    format!("no gate opened in {limit:?}{poll_gave}, so the run was killed")
                 }
             };
             let out = drained.wait(child);
