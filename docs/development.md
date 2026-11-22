@@ -261,7 +261,10 @@ different control, a file holding anything but one row, a second file naming a
 control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
-fails until it is updated.
+fails until it is updated. `scripts/controls-on.py` and
+`scripts/controls-touched.py` read row files by these same rules, and refuse a
+row that names no control; the second reads them from git's tree, so a row
+file that is a link must lead to a regular file inside the repository.
 
 `python3 scripts/controls-on.py` asks of every row whether its file holds the
 control rather than what switching the row off writes, and CI runs it on the
