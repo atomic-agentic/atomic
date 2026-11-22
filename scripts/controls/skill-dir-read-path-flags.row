@@ -1,1 +1,0 @@
-skill-dir-read-path-flags|crates/atomic/src/setup.rs|    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, at::READ_FLAGS);|    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, 0);|-p atomic-agentic --bin atomic -- a_fifo_for_a_skill_file_is_refused_without_waiting

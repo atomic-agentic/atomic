@@ -35,6 +35,9 @@
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+use git_repo::{git_in, git_state};
+
+mod git_repo;
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
 
@@ -60,7 +63,8 @@ fn stdout_json(out: &Output) -> Value {
 }
 
 /// The command `git` runs in `dir`: as a person runs it, with no global or
-/// system configuration read.
+/// system configuration read. [`git_in`] runs it and asks for success; this one
+/// is for a caller that reads a non-zero exit as an answer (see [`git_try_in`]).
 fn git_command(dir: &Path, args: &[&str]) -> Command {
     let mut command = Command::new("git");
     command
@@ -79,14 +83,6 @@ fn git_command(dir: &Path, args: &[&str]) -> Command {
     command
 }
 
-/// git in `dir`, as a person runs it, failing the test with what it printed
-/// when it fails.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = git_command(dir, args).output().unwrap();
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
 /// git in `dir`, where a non-zero exit is an answer of its own: whether it
 /// succeeded, and what it printed. `git symbolic-ref -q HEAD` exits 1 and
 /// prints nothing exactly when HEAD is detached, which is a state a test
@@ -96,18 +92,6 @@ fn git_try_in(dir: &Path, args: &[&str]) -> (bool, String) {
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-    )
-}
-
-/// What git records about the repository at `dir`: its refs, its worktrees,
-/// and what `git status` sees there — every change and every untracked file,
-/// which is not every file (see [`repository_state`]).
-fn git_state(dir: &Path) -> String {
-    format!(
-        "{}\n{}\n{}",
-        git_in(dir, &["for-each-ref"]),
-        git_in(dir, &["worktree", "list", "--porcelain"]),
-        git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
     )
 }
 
@@ -443,14 +427,17 @@ fn file_state(dir: &Path) -> String {
 const FILES_MARK: &str = "files:";
 
 /// Everything about the repository at `dir` that a run could leave changed:
-/// what git records ([`git_state`]); HEAD's own commit and name, read from the
-/// repository (`for-each-ref` lists the refs and never HEAD, and only
+/// what git records ([`git_state`], the one reading the suites that run a step
+/// share — its refs, its worktrees, its working tree with every untracked file,
+/// its own configuration and its objects); HEAD's own commit and name, read
+/// from the repository (`for-each-ref` lists the refs and never HEAD, and only
 /// `git worktree list` says anything of HEAD, in its own shape); and every
 /// path's bytes, or the target every link points at ([`file_state`]) — which
-/// nothing in `git status` shows for an ignored file, a hook, a link, the
-/// repository's configuration or `info/exclude`. Two answers are equal only
-/// when the repository is as it was, byte for byte, apart from `.git/index`
-/// (see [`git_metadata_files`]).
+/// nothing in `git status` shows for an ignored file, a hook, a link or
+/// `info/exclude`, and which reads every file, the repository's configuration
+/// included, as the bytes it holds rather than as git makes them out. Two
+/// answers are equal only when the repository is as it was, byte for byte,
+/// apart from `.git/index` (see [`git_metadata_files`]).
 fn repository_state(dir: &Path) -> String {
     let head = git_in(dir, &["rev-parse", "HEAD"]);
     let (named, branch) = git_try_in(dir, &["symbolic-ref", "-q", "HEAD"]);
@@ -1017,16 +1004,18 @@ fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
 
 /// The comparison every claim below makes when it says the checkout is exactly
 /// as it was is [`repository_state`], which is a control of its own: a change
-/// a run could leave in the checkout that git never reports must still show up
-/// in it. Here each of those is planted by hand and required to show, and then
-/// undone and required not to: HEAD detached at its own commit, a hook, the
-/// repository's configuration, a file ignored by the repository's own
-/// `info/exclude`, a file under a `.git` below the top level, a link to an
-/// ancestor of the checkout, and a directory whose contents cannot be listed.
-/// That last is shown only where the test does not run as root, which is told
-/// past a directory's mode; a run as root says in its output that it skipped
-/// that one, and every other row still runs. Nothing here runs a turn or
-/// reaches a model, so this test needs no sandbox.
+/// a run could leave in the checkout must show up in it, whether or not git
+/// reports it. Here one such change is planted by hand and required to show,
+/// and then undone and required not to: HEAD detached at its own commit, a
+/// hook, a file ignored by the repository's own `info/exclude`, a file under a
+/// `.git` below the top level, a link to an ancestor of the checkout, and a
+/// directory whose contents cannot be listed — none of which `git status` names
+/// — and the repository's own configuration, which `git status` does not name
+/// either but which [`git_state`], the reading this comparison is built on,
+/// does. That last directory is shown only where the test does not run as root,
+/// which is told past a directory's mode; a run as root says in its output that
+/// it skipped that one, and every other row still runs. Nothing here runs a
+/// turn or reaches a model, so this test needs no sandbox.
 #[test]
 fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     let dir = scratch("state");
@@ -1075,13 +1064,24 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     std::fs::remove_file(&hook).unwrap();
 
     // The repository's own configuration: what it would run, fetch or filter.
+    // `git status` never names it, so this is the one plant of these that the
+    // shared reading of git already answers, through `git config --list
+    // --local`; here that answers for the reading itself. What the walk adds is
+    // the file rather than the settings read out of it — the bytes it holds, or
+    // the link it is, which is what a comparison of parsed settings cannot see.
     let config = checkout.join(".git/config");
     let config_bytes = std::fs::read(&config).unwrap();
     git_in(&checkout, &["config", "atomic.test", "planted"]);
+    let read = git_state(&checkout);
+    let named: Vec<&str> = read
+        .lines()
+        .filter(|l| l.starts_with("atomic.test"))
+        .collect();
     assert_eq!(
-        git_state(&checkout),
-        git,
-        "git reports no configuration change"
+        named,
+        ["atomic.test=planted"],
+        "git's reading misses a setting planted in the repository's own \
+         configuration: {read}"
     );
     assert_eq!(
         left_behind(&whole, &repository_state(&checkout)),

@@ -1,0 +1,1 @@
+failure-said-redacts-rest|crates/atomic/src/failure.rs|        let rest = atomic_core::redact::text(&text);|        let rest = std::borrow::Cow::<str>::Borrowed(&text); // CONTROL_OFF|-p atomic-agentic --bin atomic failure::tests::a_named_failure_keeps_its_names_and_redacts_its_text
