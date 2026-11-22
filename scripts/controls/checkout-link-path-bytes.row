@@ -1,0 +1,1 @@
+checkout-link-path-bytes|crates/atomic-core/src/state.rs|            PathBuf::from(std::ffi::OsStr::from_bytes(ascii_trim(bytes)))|            PathBuf::from(String::from_utf8_lossy(ascii_trim(bytes)).as_ref()) /*CONTROL_OFF: a path that is no text is read as lossy text*/|-p atomic-agentic-core --lib -- state::tests::a_link_file_naming_a_path_that_is_no_text_is_still_read
