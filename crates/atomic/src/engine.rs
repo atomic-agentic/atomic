@@ -14,14 +14,13 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::state::ProjectState;
-use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
 use atomic_exec::runner::ProcessRunner;
@@ -115,32 +114,64 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The key the project's records go by in its durable store, where several
+/// projects may share one PostgreSQL schema: its manifest's name, or its
+/// directory's name with no manifest, and its state id (see
+/// [`ProjectState::id`]). Neither alone tells projects apart: the state id
+/// comes from the project's path, which projects on different machines or
+/// containers can share, and names repeat. The same project checked out at
+/// another path, or renamed, is another project there.
+///
+/// Only a manifest that is not there falls back to the directory's name. One
+/// that cannot be read or is not valid is refused: a key made from the
+/// directory's name instead would hide the project's own parks, and on a
+/// shared store could be another project's.
+pub fn store_project(state: &ProjectState) -> anyhow::Result<String> {
+    let name = match atomic_core::project::discover(state.root()) {
+        Ok(project) => project.name,
+        Err(atomic_core::project::ProjectError::NotFound(_)) => state
+            .root()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(
+                "read the project's manifest, whose name its records in the store go by",
+            ));
+        }
+    };
+    Ok(format!("{name}/{}", state.id()))
+}
+
 /// The backend on this machine that `atomic run`, `atomic serve` and the
-/// evals run turns and exec atoms' commands on, unconfined and unconnected:
-/// scratch in the project's state, outside every directory a sandboxed
-/// turn may write.
+/// evals run turns and exec atoms' commands on, unconfined and unconnected
+/// (see [`ProjectState::run_backend`]): scratch outside every directory a
+/// sandboxed turn may write, and every other scratch directory in the
+/// atomic home's `scratch/` denied to its commands.
 pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
-    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"))
+    state.run_backend()
 }
 
 /// The backend `atomic debug codex-prompt` and `atomic debug probe` run
-/// their turn on: one of its own beside [`local_backend`], since these
-/// commands take no execution lock, and connecting empties a backend's
-/// shared temporary directory, which a run's turns may be using.
+/// their turn on (see [`ProjectState::debug_backend`]): one of its own
+/// beside [`local_backend`], since these commands take no execution lock,
+/// and connecting empties a backend's shared temporary directory, which a
+/// run's turns may be using.
 pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
-    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch-debug"))
+    state.debug_backend()
 }
 
 /// The backend exec atoms' commands run on with `runner`: scratch in the
-/// project's state, confined like turns' commands where that is verified,
-/// connected once.
+/// atomic home's `scratch/`, confined like turns' commands where that is
+/// verified, connected once.
 pub fn exec_backend(
     state: &ProjectState,
     paths: &CodexPaths,
     runner: RunnerKind,
 ) -> anyhow::Result<atomic_exec::Backend> {
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
+    // Scratch directories live in the atomic home's `scratch/`, beside
+    // every other project's, outside every directory a sandboxed turn may
+    // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = local_backend(state);
@@ -498,12 +529,23 @@ pub async fn open(
         exec_meter: Default::default(),
         clock: None,
     });
-    // Never the developer's checkout: a run's worktree steps use the
-    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
-    let worktrees: Option<Arc<Worktrees>> = None;
-    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
-        .await
-        .with_context(|| format!("open the durable store at {}", describe(&database)))?;
+    // Never the developer's checkout: a run's worktree steps work in a
+    // worktree of the snapshot of the fixture the run is bound to (see
+    // `atomic_core::fixture`), and `atomic run` binds every run that changes
+    // code to one before it starts. So no repository of the project is offered
+    // here whatever git would say about it, and what git does say about it is
+    // asked where a run that names no fixture is refused, so that refusal can
+    // tell a project in no repository from one git could not read (see
+    // `runs::bind_fixture`).
+    let worktrees = ProjectWorktrees::FixtureOnly;
+    let mut rt = Durare::open(
+        &database,
+        executor.as_deref(),
+        LAYOUT_VERSION,
+        &store_project(state)?,
+    )
+    .await
+    .with_context(|| format!("open the durable store at {}", describe(&database)))?;
     register_pipeline(
         &mut rt,
         Services {
@@ -555,4 +597,69 @@ fn file_limits() -> anyhow::Result<atomic_core::artifact::files::Limits> {
         }
     }
     Ok(limits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A project directory of its own, under the build's target directory.
+    fn project(tag: &str) -> std::path::PathBuf {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-engine-tests")
+            .join(format!("{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("project");
+        std::fs::canonicalize(&dir).expect("canonical")
+    }
+
+    /// A project's store key is its manifest's name and its state id. With
+    /// no manifest, the directory's name stands in. A manifest that is there
+    /// but cannot be used is refused, not taken for none: the key it gave
+    /// would be another project's.
+    #[test]
+    fn the_store_key_falls_back_only_when_no_manifest_is_there() {
+        let none = project("no-manifest");
+        let state = ProjectState::resolve(&none).expect("state");
+        let dir = none
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            store_project(&state).expect("no manifest"),
+            format!("{dir}/{}", state.id())
+        );
+
+        let named = project("named");
+        std::fs::write(named.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
+        let state = ProjectState::resolve(&named).expect("state");
+        assert_eq!(
+            store_project(&state).expect("a manifest"),
+            format!("notes/{}", state.id())
+        );
+
+        // Not valid YAML: a parse error, not "not there".
+        let broken = project("broken");
+        std::fs::write(broken.join("atomic.yaml"), "atomic: 1\nname: [notes\n").expect("manifest");
+        let state = ProjectState::resolve(&broken).expect("state");
+        let refused = store_project(&state).expect_err("a broken manifest");
+        assert!(
+            format!("{refused:#}").contains("read the project's manifest"),
+            "{refused:#}"
+        );
+
+        // Both manifest forms at once.
+        let both = project("both");
+        std::fs::write(both.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
+        std::fs::create_dir_all(both.join(".atomic")).expect(".atomic");
+        std::fs::write(both.join(".atomic/atomic.yaml"), "atomic: 1\nname: other\n")
+            .expect("manifest");
+        let state = ProjectState::resolve(&both).expect("state");
+        assert!(store_project(&state).is_err(), "both manifests");
+
+        for dir in [none, named, broken, both] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
 }

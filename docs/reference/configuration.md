@@ -69,6 +69,14 @@ settings as `atomic.yaml`, and the project's files override it — except the
 `budget` caps and prices, which are ceilings a project can only tighten, as
 [Budgets](budgets.md#your-own-caps-are-ceilings) describes.
 
+The directory is found as the operating system gives it, the same way for the
+denial of it to every atom's commands and the refusal of a state directory
+inside it, so the three cannot name different directories: `XDG_CONFIG_HOME`,
+else `HOME` with `.config` below it, else the home the password database gives
+this user when the environment names no absolute one. A relative
+`XDG_CONFIG_HOME` names no directory and gives way to `HOME`, as the XDG rule
+says.
+
 Selecting a configuration profile is planned. The loader reads
 `atomic.<profile>.yaml` when a profile is named and refuses the run when the
 file is missing, but no command names one yet. The `--profile` flag on
@@ -262,6 +270,43 @@ name that resolves to this machine, such as one that `/etc/hosts` maps to
 `127.0.1.1`, counts as elsewhere and uses the proxies the environment names, so
 put it in `NO_PROXY`.
 
+A Codex atom calls through Codex's own client, which atomic cannot tell to skip
+a proxy or to refuse a redirect. When a key would go to an endpoint on this
+machine over plain `http` and the client would send it through a proxy that
+`HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy` names, the atom's turn is
+refused before anything is sent, naming the variable. Whether `NO_PROXY` exempts
+the host is decided by the client's own rules, so the entry must name the host
+as the URL does: `localhost` does not exempt `127.0.0.1`, `*` exempts names but
+not addresses, and `NO_PROXY`, when it is set at all, hides `no_proxy`. Add the
+host to `NO_PROXY` (for example `NO_PROXY=127.0.0.1`) or use an `https`
+endpoint.
+
+On any platform but Linux, the system's proxy settings can carry the key too,
+and atomic cannot read them. With Codex's default, Codex's client may take a
+proxy from them where the variables name none, and `NO_PROXY` still applies:
+the turn is refused unless `NO_PROXY` exempts the host. With Codex's
+`respect_system_proxy` feature on, the platform's settings and their own bypass
+list decide and `NO_PROXY` changes nothing, so the turn is always refused: turn
+the feature off, or use an `https` endpoint. On Linux the feature finds no
+platform settings, and Codex reads the proxy variables itself: the upper-case
+name of each pair wins whenever it is set, an empty value means none, and any
+other value of `HTTP_PROXY` or else `ALL_PROXY` is taken as the proxy, even one
+with spaces or a line break around it, so atomic refuses the turn for it unless
+`NO_PROXY` exempts the host.
+
+This machine is recognised as for a lite atom: a host name that only resolves
+here is not refused and goes through the proxy, so put it in `NO_PROXY`
+yourself.
+
+Redirects stay open: Codex's client follows one, so an `https` endpoint that
+redirects to `http` on the same host and port receives the key again in
+cleartext. Point a Codex atom only at an endpoint you trust not to redirect.
+
+For a lite or a Codex atom alike, a key sent over plain `http` to an endpoint
+elsewhere than this machine is not refused: it travels in cleartext across the
+network, and through any proxy on the way. Use `https` for any endpoint that is
+not on this machine.
+
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
 as [models](../models.md) describes. The names are settled and appear in the
@@ -333,7 +378,7 @@ process environment does.
 
 | Variable | Sets |
 | --- | --- |
-| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied. A home that leads there is refused at start, before anything is created in it — whether it leads there directly, by a link, by `..`, or from the directory the command was run in — and so is a home whose path atomic cannot resolve. So is a configuration directory atomic cannot resolve: if `HOME`, or `XDG_CONFIG_HOME`, names a directory that is missing, unreadable, or a link that leads nowhere, atomic cannot tell where its state would go relative to it and refuses to run, and only fixing `HOME` or `XDG_CONFIG_HOME` helps there, not `ATOMIC_HOME`. Every `atomic` command refuses it but `atomic model`, which keeps nothing in a project's state, the `runner` role, which runs one command for a control plane, and the help and version output, which run nothing |
+| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied. A home that leads there is refused at start, before anything is created in it — whether it leads there directly, by a link, by `..`, or from the directory the command was run in — and so is a home whose path atomic cannot resolve. So is a configuration directory atomic cannot resolve: if `HOME`, or `XDG_CONFIG_HOME`, names a directory that cannot be entered, that passes through something which is not a directory, that is a link leading nowhere, or that cannot otherwise be looked up, atomic cannot tell where its state would go relative to it and refuses to run, and only fixing `HOME` or `XDG_CONFIG_HOME` helps there, not `ATOMIC_HOME`. Every `atomic` command refuses it but `atomic model`, which keeps nothing in a project's state, the `runner` role, which runs one command for a control plane, and the help and version output, which run nothing |
 | `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |

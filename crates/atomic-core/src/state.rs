@@ -13,19 +13,28 @@
 //!                             entry for the whole of `<home>/private`:
 //!     atomic.db     atomic's own database (durable workflows, the gate store)
 //!     context/      context checkpoints
+//!     codex/        what Codex records of the project's threads: its state
+//!                   databases and its logs
 //!     runtime.lock  held by the one process that executes the project's runs
+//! <home>/scratch/<project>/   the project's backends' scratch roots, denied
+//!                             to every atom's commands, with every other
+//!                             project's, by one entry for the whole of
+//!                             `<home>/scratch`, an attempt's own apart:
+//!     run/          each atom attempt's scratch directory of `atomic run`,
+//!                   `atomic serve` and `atomic eval`, and the temporary
+//!                   directory their turns share
+//!     debug/        the same for `atomic debug codex-prompt` and `atomic debug
+//!                   probe`
 //! <state>/ = <home>/projects/<project>/
-//!   codex/        Codex's home for atom threads, with its own state database
-//!                 (denied to atoms too, apart from the shell snapshots and
-//!                 helper links Codex's shell needs)
+//!   codex/        Codex's home for atom threads: it keeps no thread
+//!                 records; its helper links are the only part a turn's
+//!                 shell reads, the rest denied to atoms
 //!   worktrees/    one worktree per code-changing step
 //!   cache/        build caches shared by a project's steps
 //!   fixtures/     a bare snapshot of each commit a coding run is bound to
 //!                 (see [`crate::fixture`]), each made whole before it
 //!                 appears
 //!   tmp/          each turn's own temporary directory
-//!   scratch/      each atom attempt's scratch directory, and the
-//!                 temporary directory its backend's turns share
 //! ```
 //!
 //! Atom threads therefore never mix with the user's own Codex sessions.
@@ -55,6 +64,9 @@ pub struct ProjectState {
     root: PathBuf,
     dir: PathBuf,
     private: PathBuf,
+    /// Its backends' scratch roots' parent, in the home's `scratch/`, beside
+    /// every other project's.
+    scratch: PathBuf,
 }
 
 /// Why the state directory could not be resolved or created.
@@ -231,11 +243,19 @@ impl ResolveSide {
                  would be inside your own configuration directory"
                     .into()
             }
+            // Not "missing": a name below the deepest directory that is there
+            // is what placing folds without asking, and is no reason to refuse.
+            // What cannot be placed is a directory no one may enter, a path
+            // through something that is not a directory, a link that leads
+            // nowhere, a link that leads round in a circle, and whatever else
+            // the filesystem says when asked — see [`real_path`], which refuses
+            // on every answer but "not there".
             ResolveSide::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
-                 placed: it, or a directory above it, is missing, cannot be read, or is a link \
-                 that leads nowhere; until then atomic cannot tell whether its state would be \
-                 inside that directory"
+                 placed: it, or a directory above it, cannot be entered, passes through \
+                 something that is not a directory, is a link that leads nowhere, or cannot \
+                 otherwise be looked up; until then atomic cannot tell whether its state \
+                 would be inside that directory"
                     .into()
             }
         }
@@ -251,6 +271,7 @@ impl ProjectState {
             root: root.to_owned(),
             dir: home.join("projects/test"),
             private: home.join("private/test"),
+            scratch: home.join("scratch/test"),
         }
     }
 
@@ -266,6 +287,7 @@ impl ProjectState {
         Ok(Self {
             dir: home.join("projects").join(&id),
             private: home.join("private").join(&id),
+            scratch: home.join("scratch").join(&id),
             root,
         })
     }
@@ -297,6 +319,8 @@ impl ProjectState {
         create(&self.codex_home())?;
         private_dir(&self.private_root())?;
         private_dir(&self.private)?;
+        self.move_codex_records()?;
+        self.retire_legacy_scratch()?;
         let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
             .into_iter()
             .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
@@ -379,6 +403,18 @@ impl ProjectState {
         &self.dir
     }
 
+    /// The project's id: its root's last component and a hash of its full
+    /// path, which names its state directory. A store several projects
+    /// share tells their records apart by `<manifest name>/<id>`, so the
+    /// same project checked out at another path, or renamed, is another
+    /// project there.
+    pub fn id(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     /// What is this project's alone: denied to every atom's commands.
     pub fn private_dir(&self) -> PathBuf {
         self.private.clone()
@@ -406,6 +442,185 @@ impl ProjectState {
     /// Codex's home for atom threads.
     pub fn codex_home(&self) -> PathBuf {
         self.dir.join("codex")
+    }
+
+    /// Where Codex keeps what it records of the project's threads, its state
+    /// databases and logs: in the project's private directory, which every
+    /// project's commands are denied, not in its Codex home.
+    pub fn codex_records(&self) -> PathBuf {
+        self.private.join("codex")
+    }
+
+    /// Hold the state directory's migration lock while `body` runs: one
+    /// process migrates at a time. Taken and let go around each migration,
+    /// never nested, since a second lock on the same file waits forever.
+    fn migrating<T>(&self, body: impl FnOnce() -> Result<T, StateError>) -> Result<T, StateError> {
+        let lock_path = self.dir.join("migrate.lock");
+        let fail = |source| StateError::Create {
+            path: lock_path.clone(),
+            source,
+        };
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(fail)?;
+        lock.lock().map_err(fail)?;
+        let out = body();
+        drop(lock);
+        out
+    }
+
+    /// Move what an older atomic let Codex record in the Codex home, its
+    /// `*.sqlite` databases with their `-wal` and `-shm` files and its
+    /// `log/`, into [`ProjectState::codex_records`], where no command can
+    /// read it. A database moves as one unit, its sidecars first and its main
+    /// file last, so no `-wal` is ever paired with another database's file.
+    /// One already in the records keeps its place, and the old unit is
+    /// removed whole. A database another process still has open is left,
+    /// with a warning, to move once it is not. Under the migration lock; a
+    /// file that is gone when its turn comes was moved by another process.
+    fn move_codex_records(&self) -> Result<(), StateError> {
+        let home = self.codex_home();
+        let names: Vec<String> = match std::fs::read_dir(&home) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(StateError::Create { path: home, source }),
+        };
+        let mut bases: Vec<String> = names
+            .iter()
+            .filter_map(|n| {
+                ["-wal", "-shm", ""]
+                    .iter()
+                    .find_map(|tail| n.strip_suffix(&format!(".sqlite{tail}")))
+                    .map(str::to_owned)
+            })
+            .collect();
+        bases.sort();
+        bases.dedup();
+        let has_log = names.iter().any(|n| n == "log");
+        if bases.is_empty() && !has_log {
+            return Ok(());
+        }
+        let records = self.codex_records();
+        self.migrating(|| {
+            private_dir(&records)?;
+            for base in &bases {
+                let main = home.join(format!("{base}.sqlite"));
+                if database_in_use(&main) {
+                    crate::log_line!(
+                        "atomic: {} is in use, so it stays in the Codex home until it is not",
+                        main.display()
+                    );
+                    continue;
+                }
+                let keep = records.join(format!("{base}.sqlite")).exists();
+                // Sidecars first, the main file last.
+                for tail in ["-wal", "-shm", ""] {
+                    let name = format!("{base}.sqlite{tail}");
+                    let (old, new) = (home.join(&name), records.join(&name));
+                    if keep {
+                        remove_record(&old)?;
+                    } else {
+                        move_record(&old, &new)?;
+                    }
+                }
+            }
+            if has_log {
+                let (old, new) = (home.join("log"), records.join("log"));
+                if new.exists() {
+                    remove_record(&old)?;
+                } else {
+                    move_record(&old, &new)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The scratch roots an older atomic kept in the state directory,
+    /// `<state>/scratch` and `<state>/scratch-debug`, while they are still
+    /// there: denied to every backend's commands until they are gone.
+    fn legacy_scratch_roots(&self) -> Vec<PathBuf> {
+        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+            .into_iter()
+            // Only one surely not there is left out: one that cannot be
+            // looked at is denied.
+            .filter(|root| {
+                !matches!(std::fs::symlink_metadata(root), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect()
+    }
+
+    /// Retire the scratch roots an older atomic kept in the state directory:
+    /// what attempts of processes that no longer run left there goes, and a
+    /// root goes once nothing else is in it. One whose attempts may still
+    /// run, as under an older atomic still running, stays, and stays denied.
+    /// Under the migration lock.
+    fn retire_legacy_scratch(&self) -> Result<(), StateError> {
+        let roots = self.legacy_scratch_roots();
+        if roots.is_empty() {
+            return Ok(());
+        }
+        self.migrating(|| {
+            for root in &roots {
+                if let Err(e) = atomic_exec::retire_scratch_root(root) {
+                    crate::log_line!(
+                        "atomic: could not remove the old scratch directory {}: {e}",
+                        root.display()
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The scratch roots of the project's backends: `atomic run`, `atomic
+    /// serve` and `atomic eval`'s, and that of `atomic debug codex-prompt` and
+    /// `atomic debug probe`, which is apart because those commands take no
+    /// execution lock. They lie in [`ProjectState::scratch_home`], beside
+    /// every other project's.
+    fn scratch_roots(&self) -> [PathBuf; 2] {
+        [self.scratch.join("run"), self.scratch.join("debug")]
+    }
+
+    /// Where every project of the home keeps its backends' scratch roots,
+    /// `<home>/scratch/`: denied whole, by one entry however many projects
+    /// there are, to every backend's commands, their own attempt's directory
+    /// apart, so no turn or command reads another attempt's, of this project
+    /// or another.
+    pub fn scratch_home(&self) -> PathBuf {
+        self.scratch
+            .parent()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.scratch.clone())
+    }
+
+    /// The local backend `atomic run`, `atomic serve` and `atomic eval` run
+    /// atoms on.
+    pub fn run_backend(&self) -> atomic_exec::LocalBackend {
+        let [run, _] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(run).denying(self.denied_scratch())
+    }
+
+    /// What every backend of the project denies its commands: the home's
+    /// whole `scratch/`, and the scratch roots an older atomic kept in the
+    /// state directory, while they are still there.
+    fn denied_scratch(&self) -> Vec<PathBuf> {
+        let mut denied = vec![self.scratch_home()];
+        denied.extend(self.legacy_scratch_roots());
+        denied
+    }
+
+    /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
+    /// run their turn on, beside the one runs use.
+    pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
+        let [_, debug] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(debug).denying(self.denied_scratch())
     }
 
     /// The file the execution lock is held on.
@@ -551,6 +766,56 @@ fn hold_lock(path: &Path) -> Option<Option<std::fs::File>> {
         Ok(()) => Some(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => None,
         Err(std::fs::TryLockError::Error(_)) => Some(None),
+    }
+}
+
+/// Remove a record a Codex home kept, a file or the `log/` directory; one
+/// already gone is no error.
+fn remove_record(path: &Path) -> Result<(), StateError> {
+    let gone = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    };
+    match gone {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(StateError::Create {
+            path: path.to_owned(),
+            source: e,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Move a record a Codex home kept to `new`: renamed, or, where `new` is on
+/// another filesystem, copied and then removed. One already gone is no
+/// error: another process moved it.
+fn move_record(old: &Path, new: &Path) -> Result<(), StateError> {
+    let fail = |source| StateError::Create {
+        path: new.to_owned(),
+        source,
+    };
+    match std::fs::rename(old, new) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_record(old, new).map_err(fail)?;
+            remove_record(old)
+        }
+        Err(e) => Err(fail(e)),
+    }
+}
+
+/// Copy a record, a file or a directory of files, to `new`.
+fn copy_record(old: &Path, new: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(old)?.is_dir() {
+        std::fs::create_dir_all(new)?;
+        for entry in std::fs::read_dir(old)? {
+            let entry = entry?;
+            copy_record(&entry.path(), &new.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(old, new).map(|_| ())
     }
 }
 
@@ -898,29 +1163,45 @@ pub fn user_config_dir() -> Option<PathBuf> {
     user_config_dir_in(&process_env, &process_passwd_home())
 }
 
-/// A variable of this process's environment, as the operating system gives it.
-#[cfg(not(test))]
+// What [`process_env`] and [`process_passwd_home`] answer: this process's own
+// environment and password database, or, in a test run of this crate only, what
+// a test has said they are for its own thread — see [`as_process`], which says
+// it, and [`TestProcessGuard`], which puts this process's own back.
+//
+// The entry point above reads the environment and the password database
+// itself, so without this their *wiring* — that they ask the password database
+// for a home when the environment names none — could be tested only against
+// this machine's user and this process's real environment, which a test must
+// not depend on and must not change under the other tests running beside it.
+// A build that is not this crate's own tests compiles the override away:
+// nothing outside those tests can set it, and no variable, file or atom can.
+
+/// A variable of this process's environment, as the operating system gives it;
+/// for the thread a test runs on, what `as_process` said this thread's
+/// environment holds instead.
 fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .map(|process| process.env.get(name).cloned())
+    }) {
+        return said;
+    }
     std::env::var_os(name)
 }
 
-/// The home this process's user has in the password database.
-#[cfg(not(test))]
+/// The home this process's user has in the password database; for the thread a
+/// test runs on, what `as_process` said the password database gives instead.
 fn process_passwd_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| p.borrow().as_ref().map(|process| process.passwd.clone()))
+    {
+        return said;
+    }
     passwd_home()
 }
 
-// What [`process_env`] and [`process_passwd_home`] answer: this process's own
-// environment and password database, or, in a test run of this crate only, what
-// a test has said they are for its own thread.
-//
-// The two entry points above read the environment and the password database
-// themselves, so without this their *wiring* — that they ask the password
-// database for a home when the environment names none — could be tested only
-// against this machine's user and this process's real environment, which a test
-// must not depend on and must not change under the other tests running beside
-// it. A release build compiles the override away: nothing outside this crate's
-// own tests can set it, and no variable, file or atom can.
 #[cfg(test)]
 thread_local! {
     static PROCESS: std::cell::RefCell<Option<TestProcess>> = const {
@@ -933,22 +1214,6 @@ thread_local! {
 struct TestProcess {
     env: std::collections::BTreeMap<String, std::ffi::OsString>,
     passwd: Option<PathBuf>,
-}
-
-#[cfg(test)]
-fn process_env(name: &str) -> Option<std::ffi::OsString> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.env.get(name).cloned(),
-        None => std::env::var_os(name),
-    })
-}
-
-#[cfg(test)]
-fn process_passwd_home() -> Option<PathBuf> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.passwd.clone(),
-        None => passwd_home(),
-    })
 }
 
 /// Say, for this test thread, that the environment holds exactly `vars` — a
@@ -1117,6 +1382,26 @@ pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
 /// needs before it can be compared with anything: [`std::path::absolute`],
 /// which joins the working directory without folding the names that are not
 /// there yet. `None` when the working directory cannot be read.
+///
+/// Most homes a command brings to [`outside_user_config`] are absolute before
+/// they get here: [`atomic_home`] reads a relative `ATOMIC_HOME` from the
+/// working directory itself, and the configuration directory is kept only when
+/// `XDG_CONFIG_HOME`, `HOME` or the password database names an absolute one.
+/// The default data directory is absolute too, except in one case: the platform
+/// rule [`base_dir`] falls back to — `dirs::data_dir` — takes a `HOME` that is
+/// not absolute as the home it gives, so a person who sets a relative `HOME`,
+/// sets no `ATOMIC_HOME` and sets no `XDG_DATA_HOME` gets
+/// `<relative HOME>/.local/share/atomic`, which is relative and comes here as it
+/// stands, read from the working directory like any other relative spelling. So
+/// this is the backstop for a relative
+/// `ATOMIC_HOME` and the live path for that one — and a backstop that must
+/// still work, because a spelling compared unresolved is the one thing that
+/// lets a state into the denied directory. The tests that keep it living are
+/// `a_relative_state_directory_is_placed_from_the_working_directory`, which asks
+/// [`outside_user_config`] itself, with the spelling relative, and
+/// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+/// in `crates/atomic/tests/state_cli.rs`, which is what a command does with a
+/// relative `HOME` and no `ATOMIC_HOME`.
 fn placed(path: &Path) -> Option<PathBuf> {
     std::path::absolute(path).ok()
 }
@@ -1238,6 +1523,23 @@ pub(crate) fn passwd_name(uid: u32) -> Option<String> {
 /// to: it is accepted only when its target is a directory the user owns and
 /// no one else can enter.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
+    if existing_private_dir(dir)? {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|source| StateError::Create {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// [`private_dir`]'s checks on `dir` where it is, made private as they
+/// make it, without making it: whether it is there. Not there, nothing is
+/// made.
+pub(crate) fn existing_private_dir(dir: &Path) -> Result<bool, StateError> {
     let fail = |source| StateError::Create {
         path: dir.to_owned(),
         source,
@@ -1247,13 +1549,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         why,
     };
     let meta = match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            return builder.create(dir).map_err(fail);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(fail(e)),
         Ok(meta) => meta,
     };
@@ -1263,7 +1559,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         if meta.file_type().is_symlink() {
             let target = std::fs::metadata(dir).map_err(fail)?;
             if target.is_dir() && target.uid() == effective_uid() && target.mode() & 0o077 == 0 {
-                return Ok(());
+                return Ok(true);
             }
             return Err(refuse(
                 "is a symbolic link to a directory that is not yours alone: make the target \
@@ -1288,7 +1584,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     if !meta.is_dir() {
         return Err(refuse("is not a directory".into()));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A readable, collision-resistant id: the root's last component, then the
@@ -1314,6 +1610,272 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an older atomic let Codex record in the project's Codex home, its
+    /// databases and logs, moves into the project's private directory when
+    /// the state is created; what a turn's shell needs there stays.
+    #[test]
+    fn codex_records_move_out_of_the_codex_home() {
+        let home =
+            std::env::temp_dir().join(format!("atomic-codex-records-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(codex.join("log")).expect("log");
+        std::fs::create_dir_all(codex.join("tmp/arg0-linux")).expect("arg0");
+        for name in [
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "logs_2.sqlite",
+            "log/codex.log",
+        ] {
+            std::fs::write(codex.join(name), "records").expect("record");
+        }
+        state.create().expect("created");
+        let records = state.codex_records();
+        assert!(records.starts_with(state.private_dir()));
+        for name in [
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "logs_2.sqlite",
+            "log/codex.log",
+        ] {
+            assert!(
+                !codex.join(name).exists(),
+                "{name} is still in the Codex home"
+            );
+            assert!(records.join(name).exists(), "{name} did not move");
+        }
+        assert!(
+            codex.join("tmp/arg0-linux").is_dir(),
+            "the helper links went too"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The scratch roots an older atomic kept in the state directory are
+    /// denied to every backend's commands while they are there, and go when
+    /// the state is next created, once what is in them belonged to
+    /// processes that no longer run. One holding a live attempt stays, and
+    /// stays denied.
+    #[test]
+    fn old_scratch_roots_are_denied_until_they_are_retired() {
+        use atomic_exec::ExecutionBackend;
+        let home = std::env::temp_dir().join(format!("atomic-old-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let (old, old_debug) = (
+            state.dir().join("scratch"),
+            state.dir().join("scratch-debug"),
+        );
+        // A dead turn's HOME, with what it kept there.
+        let dead = old.join("fix-0123/999999999.1-a0");
+        std::fs::create_dir_all(&dead).expect("dead attempt");
+        std::fs::write(dead.join(".bash_history"), "a secret typed in a turn").expect("secret");
+        // One whose owner may still run: this process, which is alive.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let start = stat
+            .rsplit_once(')')
+            .and_then(|(_, after)| after.split_whitespace().nth(19))
+            .unwrap_or("0")
+            .to_owned();
+        let live = old_debug.join(format!("check-4567/{}.{start}-a1", std::process::id()));
+        std::fs::create_dir_all(&live).expect("live attempt");
+        for backend in [state.run_backend(), state.debug_backend()] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: "t".into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            for dir in [&old, &old_debug] {
+                assert!(
+                    workspace.denied.contains(dir),
+                    "{} is not denied: {:?}",
+                    dir.display(),
+                    workspace.denied
+                );
+            }
+            backend.close(&workspace).expect("closes");
+        }
+        state.create().expect("created");
+        assert!(!old.exists(), "the dead attempts' old root stayed");
+        assert!(live.exists(), "a live attempt's scratch went");
+        let backend = state.run_backend();
+        let workspace = backend
+            .open(&atomic_exec::Open {
+                label: "t".into(),
+                run: "r".into(),
+                step: "s".into(),
+                attempt: "a2".into(),
+                source: Some(root.clone()),
+                ..Default::default()
+            })
+            .expect("opens");
+        assert!(
+            workspace.denied.contains(&old_debug),
+            "{:?}",
+            workspace.denied
+        );
+        assert!(!workspace.denied.contains(&old), "{:?}", workspace.denied);
+        backend.close(&workspace).expect("closes");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A Codex database another process still has open stays in the Codex
+    /// home, and the state is created all the same; it moves once closed.
+    #[test]
+    fn a_codex_database_in_use_moves_only_once_closed() {
+        let home = std::env::temp_dir().join(format!("atomic-codex-in-use-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(&codex).expect("codex home");
+        let db = codex.join("state_5.sqlite");
+        let mut holder = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3, sys, time\n\
+                 c = sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL')\n\
+                 c.execute('CREATE TABLE IF NOT EXISTS t (x)'); c.execute('INSERT INTO t VALUES (1)'); c.commit()\n\
+                 print('open', flush=True); time.sleep(60)",
+            ])
+            .arg(&db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(holder.stdout.as_mut().expect("stdout")),
+            &mut ready,
+        )
+        .expect("ready");
+        assert_eq!(ready.trim(), "open");
+        state.create().expect("created while the database is open");
+        assert!(db.exists(), "an open database was moved");
+        holder.kill().expect("stop the holder");
+        holder.wait().expect("reap");
+        state.create().expect("created");
+        assert!(!db.exists(), "the closed database stayed");
+        assert!(state.codex_records().join("state_5.sqlite").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A Codex database moves as one unit: where the records already hold
+    /// one by that name, the old one and its sidecars are removed whole and
+    /// none of them is paired with the kept file. Two starts at once both
+    /// succeed, and each record moves once.
+    #[test]
+    fn codex_databases_move_whole_and_two_starts_agree() {
+        let home = std::env::temp_dir().join(format!("atomic-codex-units-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(&codex).expect("codex home");
+        let records = state.codex_records();
+        std::fs::create_dir_all(&records).expect("records");
+        std::fs::write(records.join("state_5.sqlite"), "kept").expect("kept");
+        std::fs::write(codex.join("state_5.sqlite"), "old").expect("old");
+        std::fs::write(codex.join("state_5.sqlite-wal"), "old wal").expect("old wal");
+        std::fs::write(codex.join("logs_2.sqlite"), "logs").expect("logs");
+        std::fs::write(codex.join("logs_2.sqlite-wal"), "logs wal").expect("logs wal");
+        let starts: Vec<_> = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || state.create())
+            })
+            .collect();
+        for start in starts {
+            start.join().expect("thread").expect("both starts succeed");
+        }
+        assert_eq!(
+            std::fs::read_to_string(records.join("state_5.sqlite")).expect("kept"),
+            "kept"
+        );
+        assert!(
+            !records.join("state_5.sqlite-wal").exists(),
+            "an old -wal was paired with the kept database"
+        );
+        assert!(
+            !codex.join("state_5.sqlite").exists() && !codex.join("state_5.sqlite-wal").exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(records.join("logs_2.sqlite")).expect("logs"),
+            "logs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(records.join("logs_2.sqlite-wal")).expect("logs wal"),
+            "logs wal"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// No backend's commands may read another's attempts, of this project or
+    /// another: each backend of the project keeps its scratch root in the
+    /// home's `scratch/`, beside every other project's, and denies its
+    /// workspaces that directory whole, by one entry, which it makes if
+    /// missing; its own attempt's directory is apart.
+    #[test]
+    fn every_backend_denies_every_projects_scratch() {
+        use atomic_exec::ExecutionBackend;
+        let home =
+            std::env::temp_dir().join(format!("atomic-scratch-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let all = home.join("scratch");
+        assert_eq!(state.scratch_home(), all);
+        let roots = [all.join("test/run"), all.join("test/debug")];
+        // Another project's, which no backend of this one may read.
+        let other = all.join("other/run");
+        for (what, backend, own) in [
+            ("run", state.run_backend(), &roots[0]),
+            ("debug", state.debug_backend(), &roots[1]),
+        ] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: what.into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            let scratch = workspace.scratch.clone().expect("scratch");
+            assert!(scratch.starts_with(own), "{what}: {}", scratch.display());
+            assert!(
+                workspace.denied.contains(&all),
+                "{what}: {:?}",
+                workspace.denied
+            );
+            for dir in roots.iter().chain([&other]) {
+                assert!(
+                    workspace.denied.iter().any(|d| dir.starts_with(d)),
+                    "{what}: {} is not denied: {:?}",
+                    dir.display(),
+                    workspace.denied
+                );
+            }
+            assert!(all.is_dir(), "{what}: {} was not made", all.display());
+            backend.close(&workspace).expect("closes");
+            let _ = std::fs::remove_dir_all(&all);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// A `.git` another user owns above a project, here a link to a device,
     /// counts its directory as a checkout and refuses nothing: it is not a
@@ -1570,6 +2132,7 @@ mod tests {
             root: dir.clone(),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         state.create().expect("state");
         let held = state.lock_execution("atomic serve").expect("free");
@@ -1598,6 +2161,7 @@ mod tests {
             root: dir.clone(),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         state.create().expect("state");
         // A previous holder's words, left in the file, and a new holder that
@@ -1638,6 +2202,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         std::fs::create_dir_all(state.dir().join("context")).expect("old layout");
         std::fs::write(state.dir().join("atomic.db"), "db").expect("old database");
@@ -1671,6 +2236,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("home/projects/p"),
             private: dir.join("home/private/p"),
+            scratch: dir.join("home/scratch/p"),
         };
         let old = state.dir().join("private");
         std::fs::create_dir_all(old.join("context")).expect("old layout");
@@ -1733,6 +2299,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("home/projects/p"),
             private: dir.join("home/private/p"),
+            scratch: dir.join("home/scratch/p"),
         };
         state.create().expect("the current layout");
         std::fs::write(state.database(), "current").expect("current database");
@@ -2271,15 +2838,23 @@ mod tests {
     /// configuration directory, and the state gets made inside the very
     /// directory every atom's command is denied. Only `NotFound` may be read as
     /// missing, so this home is refused for the lookup that failed.
+    ///
+    /// Mode 000 is no bar to the superuser, so this does not stop when the
+    /// tests run as root: it then asserts the refusal this shape exists to
+    /// bring about — the home is the configuration directory's own, which the
+    /// walk through the closed directory is what would have hidden — so a check
+    /// that let a state inside the denied directory fails here whoever runs it.
+    /// What only a process that cannot look in everything sees is *which*
+    /// answer the walk gave: the lookup that failed, and the configuration
+    /// directory as the side that cannot be placed. `scripts/controls-check.sh`
+    /// runs as the operator, never as root, so that is what
+    /// `scripts/controls/state-walk-notfound-only.row` is switched off and seen
+    /// failing under; the same rule where the superuser cannot undo it is
+    /// pinned by `a_home_that_walks_through_a_file_is_refused`, which the same
+    /// row runs.
     #[test]
     fn a_home_behind_a_directory_nobody_may_look_in_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        // A process that may look in any directory cannot make these lookups
-        // fail, so the refusal has nothing here to be seen in: mode 000 is no
-        // bar to the superuser.
-        if effective_uid() == 0 {
-            return;
-        }
         let scratch = setup("closed", &["closed", "settings/atomic"], &[]);
         std::os::unix::fs::symlink(
             scratch.join("settings/atomic"),
@@ -2294,6 +2869,7 @@ mod tests {
         // The home as its owner spelled it: `ATOMIC_HOME` names the link, which
         // is where the configuration directory really is.
         let home = scratch.join("closed/into-config/state");
+        let config = scratch.join("settings/atomic");
         let outcome = check(
             &scratch,
             &[
@@ -2304,6 +2880,26 @@ mod tests {
             None,
             None,
         );
+        if effective_uid() == 0 {
+            // Nothing failed to be looked up: the walk went through the closed
+            // directory, followed the link and read where the home really is,
+            // which is inside the configuration directory. That is the refusal
+            // this shape is for, so the comparison that refuses a directory
+            // inside the configuration one — the half mode 000 cannot hide — is
+            // seen failing for the superuser too, rather than passing because
+            // nothing here could be made to fail.
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(StateError::InsideConfig(outside))
+                        if outside.state == config.join("state") && outside.config == config
+                ),
+                "as the superuser the home behind the closed directory is the \
+                 configuration directory's own and was not refused for it: {:?}",
+                words(&outcome)
+            );
+            return;
+        }
         let why = words(&outcome);
         assert!(
             why.starts_with(&format!(
@@ -2319,7 +2915,11 @@ mod tests {
         );
         // The same closed door on the other side: with the configuration
         // directory itself unreachable, no home can be compared with it, and
-        // the refusal says which of the two directories it could not place.
+        // the refusal says which of the two directories it could not place. Not
+        // reached as the superuser, for whom the door opens: the target the link
+        // leads to is placed, `/elsewhere` is beside it, and there is nothing to
+        // refuse. A directory that cannot be placed for anyone at all is the
+        // shape `a_home_that_walks_through_a_file_is_refused` pins.
         let outcome = check(
             &scratch,
             &[("XDG_CONFIG_HOME", "/closed/into-config")],
@@ -2333,6 +2933,45 @@ mod tests {
                 Err(StateError::Resolve { side, .. }) if *side == ResolveSide::Config
             ),
             "a configuration directory nobody may look in was not the side named: {outcome:?}"
+        );
+    }
+
+    /// A name in the middle of a home's path that is a file and not a
+    /// directory, with one name below it and two `..` back over both. Asking
+    /// what is below a file is not the same as a name not being there: only
+    /// `NotFound` may be read as missing. Reading what the filesystem says about
+    /// a file as "missing" and walking on finds the file itself, and the home is
+    /// then placed by folding its own spelling over it — out of the file's name,
+    /// back out of the directory holding it, to the throwaway directory beside
+    /// the configuration directory, and accepted — while a directory below a
+    /// file cannot be anywhere at all. So the refusal is for the lookup that
+    /// failed, and it says what the filesystem said. The superuser sees this
+    /// shape too: nothing here needs a directory closed.
+    #[test]
+    fn a_home_that_walks_through_a_file_is_refused() {
+        let scratch = setup("notdir", &["home/.config/atomic"], &[]);
+        std::fs::write(scratch.join("gate"), "a file, not a directory").expect("the file");
+        let spelled = "/gate/x/../..";
+        let outcome = check(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", spelled)],
+            spelled,
+            None,
+            None,
+        );
+        let why = words(&outcome);
+        let home = scratch.join("gate/x/../..");
+        assert!(
+            why.starts_with(&format!(
+                "refused: cannot resolve atomic's state directory {}: ",
+                home.display()
+            )),
+            "not the refusal of a home below a file: {why}"
+        );
+        assert!(
+            why.contains(&format!("{} cannot be looked up: ", home.display()))
+                && why.contains("Not a directory"),
+            "the refusal does not say which lookup failed and what it said: {why}"
         );
     }
 
@@ -2367,6 +3006,50 @@ mod tests {
             ),
             "a state directory inside the password home was not refused by the check itself: \
              {outcome:?}"
+        );
+    }
+
+    /// A relative state directory is placed — read from the directory the
+    /// command was run in, the names below it that are not there yet kept as
+    /// they were spelled — before it is compared with anything. This asks
+    /// [`outside_user_config`], the one entry a command uses, because [`placed`]
+    /// is what does that on that path. A command brings an absolute home here
+    /// except with a relative `HOME` and no `ATOMIC_HOME` — see [`placed`] — so
+    /// this is where the placing of a relative spelling is kept working for the
+    /// caller that hands one over, which the command a person runs with a
+    /// relative `HOME` shows end to end:
+    /// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+    /// in `crates/atomic/tests/state_cli.rs`. Given the spelling unresolved here
+    /// there is nothing to compare, and the check refuses the run for a
+    /// directory it cannot place.
+    ///
+    /// Nothing is created in the working directory: the name is one no
+    /// directory holds, so placing it asks nothing of the filesystem beyond the
+    /// working directory itself.
+    #[test]
+    fn a_relative_state_directory_is_placed_from_the_working_directory() {
+        let scratch = setup("relative-home", &[], &[]);
+        // The configuration directory is `.config/atomic` below `HOME`, which
+        // the throwaway directory's parent gives — below the temporary
+        // directory, so a state below this process's working directory is not
+        // inside it and the placed case runs.
+        let _process = as_process(&scratch, &[("HOME", "/.."), ("ATOMIC_HOME", "state")], None);
+        let outcome = outside_user_config(Path::new("state"));
+        assert_eq!(
+            words(&outcome),
+            "accepted",
+            "a relative state directory was not placed from the working directory, and \
+             unresolved there is nothing to compare it with: {outcome:?}"
+        );
+        // The same directory spelled out from the working directory answers
+        // alike: placing is what makes the two spellings one directory.
+        let spelled = std::env::current_dir()
+            .expect("the working directory")
+            .join("state");
+        assert_eq!(
+            words(&outside_user_config(&spelled)),
+            words(&outcome),
+            "{spelled:?} is not what the relative spelling names: {outcome:?}"
         );
     }
 }

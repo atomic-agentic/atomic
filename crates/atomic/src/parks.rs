@@ -72,9 +72,14 @@ fn whole(value: f64, flag: &str) -> anyhow::Result<i64> {
 
 pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<()> {
     let database = crate::engine::database(state)?;
-    let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
-        .await
-        .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
+    let rt = Durare::open(
+        &database,
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &crate::engine::store_project(state)?,
+    )
+    .await
+    .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
     match command {
         ParksCommand::List => {
             for park in release::waiting(&rt).await? {
@@ -171,12 +176,15 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                 );
             }
             if let Some(why) = &release.wake_failed {
-                atomic_core::log_line!(
-                    "warning: the release is recorded, but waking run {} failed: {why}; atomic \
-                     serve or atomic runs resume {} delivers it",
-                    released.park.run,
-                    released.park.run
-                );
+                atomic_core::redact::Line::new()
+                    .plain("warning: the release is recorded, but waking run ")
+                    .shown(&released.park.run)
+                    .plain(" failed: ")
+                    .redacted(why)
+                    .plain("; atomic serve or atomic runs resume ")
+                    .shown(&released.park.run)
+                    .plain(" delivers it")
+                    .log();
             }
             Ok(())
         }

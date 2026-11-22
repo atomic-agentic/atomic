@@ -589,30 +589,30 @@ fn an_excerpt_of_a_json_body_is_redacted_as_json() {
     let out = tail(&ending, 4096);
     assert!(!out.contains(&key[20..]), "tail kept the key's end");
     // Bounded before it is redacted: ten megabytes cost no more than the
-    // excerpt's margin.
+    // excerpt's margin. Counted in the steps the scan takes (see `STEPS`),
+    // which this thread's work alone sets, not in time, which a loaded
+    // machine stretches.
     let huge = "a=".repeat(5 * 1024 * 1024);
+    let steps_taken = |redact: &mut dyn FnMut()| {
+        STEPS.with(|steps| steps.set(0));
+        redact();
+        STEPS.with(std::cell::Cell::get)
+    };
+    let most = |chars: usize| 2 * super::margin(chars) as u64;
     for (name, redact) in [
         ("excerpt", excerpt as fn(&str, usize) -> String),
         ("bounded", bounded),
         ("tail", tail),
     ] {
-        let start = std::time::Instant::now();
-        let _ = redact(&huge, 500);
-        let taken = start.elapsed();
-        assert!(
-            taken < std::time::Duration::from_secs(1),
-            "{name} took {taken:?}"
-        );
+        let taken = steps_taken(&mut || {
+            let _ = redact(&huge, 500);
+        });
+        assert!(taken <= most(500), "{name} took {taken} steps");
     }
     // A JSON report's strings, and so a panic's message, are bounded too.
     let mut report = json!({"description": huge});
-    let start = std::time::Instant::now();
-    value(&mut report);
-    let taken = start.elapsed();
-    assert!(
-        taken < std::time::Duration::from_secs(1),
-        "a JSON string took {taken:?}"
-    );
+    let taken = steps_taken(&mut || value(&mut report));
+    assert!(taken <= most(MAX_TEXT), "a JSON string took {taken} steps");
     // The excerpt is bounded, and so is the tail.
     let long = format!("{shape} {}", "y".repeat(10_000_000));
     assert!(excerpt(&long, 500).chars().count() <= 501);
@@ -1379,6 +1379,31 @@ fn a_line_is_written_as_it_was_put_together() {
     assert!(long.written().ends_with('…'));
 }
 
+/// What a line quotes, such as an error, is redacted on its own, and the
+/// names beside it are not: a run named for a secret still reads as it is
+/// when the error after it holds one.
+#[test]
+fn a_lines_quoted_text_is_redacted_on_its_own() {
+    let line = Line::new()
+        .plain("run ")
+        .shown("rotate-secret")
+        .plain(" failed: ")
+        .redacted(&format!("the push said {SAMPLE}"))
+        .plain("; continue it with `atomic runs resume ")
+        .shown("rotate-secret")
+        .plain("`");
+    let written = line.written();
+    assert!(
+        !written.contains(&SAMPLE[4..]),
+        "the token showed: {written}"
+    );
+    assert_eq!(
+        written,
+        "run rotate-secret failed: the push said [REDACTED]; continue it with `atomic runs \
+         resume rotate-secret`"
+    );
+}
+
 /// A log line names what a caller or a model chose, such as a run's id, so
 /// it reaches the terminal escaped; it is redacted first, so a token a
 /// terminal escape sequence colours is still found. Its lines and tabs
@@ -2136,6 +2161,518 @@ fn rewritten_held_json_settles_in_one_pass() {
         value(&mut twice);
         assert_eq!(twice, once, "case {case}: a second pass changed it");
     }
+}
+
+/// What `io::Error` writes for an operating system's error, alone and after
+/// the path it is about, is kept whole, whatever the path's last name: a
+/// sign-in's directory, `credentials`, `secrets`, `token`.
+#[test]
+fn an_os_error_after_a_path_is_kept_whole() {
+    let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+    let missing = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    let looped = std::io::Error::from_raw_os_error(libc::ELOOP).to_string();
+    let mut kept = vec![denied.clone(), missing.clone(), looped.clone()];
+    for name in [
+        "codex-auth",
+        "credentials",
+        "secrets",
+        "token",
+        "auth.json",
+        "api_key",
+        "DB_PASSWORD",
+    ] {
+        for error in [&denied, &missing, &looped] {
+            kept.push(format!(
+                "/home/dev/.config/atomic/credentials/{name}: {error}"
+            ));
+            kept.push(format!("open {name}: {error}"));
+            kept.push(format!("error: {name}: {error}; try again"));
+        }
+    }
+    let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
+    assert_kept(&kept);
+}
+
+/// A deterministic stream of numbers, so the planted secrets below are the
+/// same on every run, and on main, where the same cases are hidden.
+struct Planted(u64);
+
+impl Planted {
+    fn next(&mut self) -> u64 {
+        // xorshift64*
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A secret no rule could take for a word: letters and digits, with at
+    /// least one of each, 16 to 40 long.
+    fn secret(&mut self) -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let len = 16 + (self.next() % 25) as usize;
+        let mut s: String = (0..len)
+            .map(|_| CHARS[(self.next() % CHARS.len() as u64) as usize] as char)
+            .collect();
+        s.replace_range(0..1, "q");
+        s.push('7');
+        s
+    }
+}
+
+/// Secrets planted after a secret's name, however the text around them
+/// looks like an operating system's error, stay hidden: the oracle is the
+/// planted value itself, not what redaction makes of it. The same cases
+/// pass on main, so keeping an operating system's error whole shows no
+/// secret main hides.
+#[test]
+fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
+    let mut planted = Planted(0x5eed_a70c_0000_0013);
+    let names = [
+        "password",
+        "DB_PASSWORD",
+        "client_secret",
+        "secrets",
+        "api_key",
+        "apikey",
+        "access_token",
+        "AUTH_TOKEN",
+        "github_token",
+    ];
+    let seps = [": ", "=", " = ", ": \"", "='"];
+    let mut shown = Vec::new();
+    let mut n = 0;
+    for name in names {
+        for sep in seps {
+            for _ in 0..8 {
+                let secret = planted.secret();
+                let close = match sep {
+                    ": \"" => "\"",
+                    "='" => "'",
+                    _ => "",
+                };
+                let mut inputs = vec![
+                    format!("{name}{sep}{secret}{close}"),
+                    format!("/srv/app/{name}{sep}{secret}{close} (os error 13)"),
+                    format!("{name}{sep}{secret}{close} denied (os error 13)"),
+                    format!("{name}{sep}{secret}{close}: Permission denied (os error 13)"),
+                    format!("open /srv/{name}{sep}{secret}{close}"),
+                ];
+                // A quoted value that leads with an operating system's
+                // error and goes on: the whole quoted value is the secret's,
+                // and it stays hidden. Only quoted: after a bare value main
+                // hides nothing past its first word either.
+                if !close.is_empty() {
+                    inputs.push(format!(
+                        "{name}{sep}Permission denied (os error 13) {secret}{close}"
+                    ));
+                    inputs.push(format!(
+                        "{name}{sep}No such file or directory (os error 2){secret}{close}"
+                    ));
+                }
+                for input in inputs {
+                    if text(&input).contains(&secret) {
+                        shown.push(n);
+                    }
+                    n += 1;
+                }
+            }
+        }
+        // A header's value that leads with a secret's name and an operating
+        // system's error, hard against the name: a credential, not an error.
+        for _ in 0..8 {
+            let secret = planted.secret();
+            let mut header = serde_json::json!({
+                "Authorization": format!("{name}:Permission denied (os error 13) {secret}")
+            });
+            value(&mut header);
+            if header.to_string().contains(&secret) {
+                shown.push(n);
+            }
+            n += 1;
+        }
+    }
+    // An operating system's error under a header's name, read twice: once
+    // as text and again as the JSON around it, by excerpt(), or inside a
+    // JSON string that value() reads twice. The header's value is a
+    // credential, so the second reading must not find the secret. (A log
+    // line holding it, read once by value(), shows the secret after the
+    // error on main too: only its first word is taken for the value.)
+    // Under a header's own name and under longer names that end in one, as
+    // the header rule finds it there.
+    for header in [
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+    ] {
+        for _ in 0..8 {
+            let secret = planted.secret();
+            let log = format!("{header}: Permission denied (os error 13) {secret}");
+            let nested = format!("open {header} : Permission denied (os error 13) :{secret}");
+            let line = serde_json::json!({"log": log});
+            let args = serde_json::json!({"args": serde_json::json!({"log": nested}).to_string()});
+            let mut read = args.clone();
+            value(&mut read);
+            let readings = [
+                excerpt(&line.to_string(), 4096),
+                excerpt(&args.to_string(), 4096),
+                read.to_string(),
+            ];
+            for reading in readings {
+                if reading.contains(&secret) {
+                    shown.push(n);
+                }
+                n += 1;
+            }
+        }
+    }
+    assert!(
+        shown.is_empty(),
+        "planted secrets shown in cases {shown:?} of {n}"
+    );
+}
+
+/// Redacting text twice changes nothing: a rule that a first rule's marker
+/// leaves something for, a header after an assignment's marker or a value
+/// after an open assignment, has already read it.
+#[test]
+fn text_redacted_again_changes_nothing() {
+    // Whether each is hidden whole: a header before a run of backslashed
+    // chunks reads one chunk more each time, and is still changing when the
+    // readings run out.
+    for (case, (input, whole)) in [
+        ("api_key=Authorization: Cookie: =12", false),
+        ("PASSWORD=Authorization: Authorization: Basic ;", false),
+        ("secret: Authorization: x-api-key: =", false),
+        ("--password Authorization: Cookie: Cookie: =12", false),
+        ("=secret: Cookie: x-api-key: '&", false),
+        ("123456x-api-key: Cookie: Authorization: Basic [REDACTED]", false),
+        ("Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij", true),
+        (
+            "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij:Authorization: Cookie: sid=s3cr3tvalue",
+            true,
+        ),
+        ("Proxy-Authorization: --token \\x-api-key: api.telegram.org/bot[", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let once = text(input).into_owned();
+        assert_eq!(once == REDACTED, whole, "case {case}: {once:?}");
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+    // Generated: names, separators, headers and values strung together.
+    const PARTS: &[&str] = &[
+        "password=",
+        "password",
+        "token=",
+        "secret: ",
+        "Authorization: ",
+        "Bearer ",
+        "Cookie: ",
+        "x-api-key: ",
+        "--password ",
+        "-p",
+        "12",
+        "123456",
+        " ",
+        "\n",
+        "=",
+        ":",
+        ";",
+        ",",
+        "\"",
+        "'",
+        "abc",
+        "hunter2",
+        "dbpassword",
+        "(2)",
+        "[REDACTED]",
+        "api_key=",
+        "&",
+        "?",
+        "user",
+        "pass=",
+        "PASSWORD=",
+        "-12",
+        "=12",
+        "Basic ",
+        "\\",
+        "\\ab ",
+        " c\\ab",
+        "Proxy-Authorization: ",
+        "--token ",
+        "\\x-api-key: ",
+    ];
+    let mut seed: u64 = 77;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut unstable = 0;
+    for _ in 0..50_000 {
+        let mut input = String::new();
+        for _ in 0..=next(6) {
+            input.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+        }
+        let once = text(&input).into_owned();
+        if text(&once) != once {
+            unstable += 1;
+        }
+    }
+    assert_eq!(unstable, 0, "a second pass changed generated text");
+}
+
+/// A credential a header's value runs into past a backslash is hidden with
+/// the rest of the value; a long run of backslashed chunks after a header,
+/// which a reading at a time would never finish, is hidden whole.
+#[test]
+fn a_value_past_a_backslash_stays_hidden() {
+    let out = text("Authorization: Bearer abcd1234efgh\\/Qk9Lx3sR2tY7uV8w").into_owned();
+    assert!(
+        !out.contains("Qk9Lx3sR2tY7uV8w"),
+        "the rest of the credential showed"
+    );
+    let chunks: String = (0..1000).map(|i| format!(" \\c{i}")).collect();
+    let input = format!("Authorization: Bearer x{chunks} password=s3cr3tvalue");
+    assert_eq!(text(&input), REDACTED);
+}
+
+/// Reading text until it settles hides every secret that follows a
+/// header, a scheme, a flag or an assignment, with only backslashes or
+/// escaped slashes between: over generated strings the test plants such
+/// secrets among other parts and checks each is absent from the result,
+/// with no reading of the rules as its oracle.
+#[test]
+fn reading_until_settled_hides_every_planted_secret() {
+    const PREFIXES: &[&str] = &[
+        "password=",
+        "token=",
+        "api_key=",
+        "Authorization: ",
+        "Authorization: Bearer ",
+        "Proxy-Authorization: Bearer ",
+        "Cookie: sid=",
+        "x-api-key: ",
+        "--password ",
+        "--token ",
+    ];
+    const BETWEEN: &[&str] = &["\\", "\\/"];
+    const NOISE: &[&str] = &[" ", "\\", "\\/", "\\ab ", "abcd1234efgh", "note", "\n"];
+    let mut seed: u64 = 9001;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut shown = 0;
+    for _ in 0..30_000 {
+        let mut input = String::new();
+        let mut planted = Vec::new();
+        for _ in 0..=next(5) {
+            if next(2) == 0 {
+                input.push_str(NOISE[next(NOISE.len() as u64) as usize]);
+                continue;
+            }
+            input.push(' ');
+            input.push_str(PREFIXES[next(PREFIXES.len() as u64) as usize]);
+            for _ in 0..next(3) {
+                input.push_str(BETWEEN[next(BETWEEN.len() as u64) as usize]);
+            }
+            let mut secret = String::from("Q7");
+            for _ in 0..22 {
+                secret.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+            }
+            input.push_str(&secret);
+            input.push(' ');
+            planted.push(secret);
+        }
+        let settled = text(&input).into_owned();
+        shown += planted
+            .iter()
+            .filter(|p| settled.contains(p.as_str()))
+            .count();
+    }
+    assert_eq!(shown, 0, "a planted secret showed");
+}
+
+/// JSON in a string that text redaction breaks is hidden whole: the rules
+/// that read its names and pairs can no longer read it, and what they
+/// would hide must not show as text redaction left it.
+#[test]
+fn json_that_text_redaction_breaks_is_hidden_whole() {
+    let inner = json!({
+        "headers": [{"name": "X-Api-Key", "value": "Qk9Lx3sR2tY7uV8w"}],
+        "note": "Authorization: \\Bearer \\\\",
+    })
+    .to_string();
+    // Under an ordinary name and under a hint, where held JSON is opened.
+    for parent in ["body", "key"] {
+        let mut out = json!({ parent: inner.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("Qk9Lx3sR2tY7uV8w"),
+            "under {parent}: the header's value showed"
+        );
+        let body = out[parent].as_str().expect("a string");
+        assert!(
+            body == REDACTED || serde_json::from_str::<Value>(body).is_ok(),
+            "under {parent}: neither hidden whole nor JSON"
+        );
+    }
+}
+
+/// JSON that text redaction breaks deeper in, in a string the JSON it
+/// changed holds, is hidden whole too: by the time redaction reaches that
+/// string it no longer reads as JSON, and what the rules that read names
+/// and pairs would hide there must not show.
+#[test]
+fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
+    let doc = held(&held(&inner));
+    // Beside a value held JSON hides, so that opened under a hint it is
+    // written back from what text redaction made of it.
+    let token = concat!("Zx81", "kQ0pL2mN4bV6");
+    let beside = format!(
+        "{{\"k\": \"{token}\", \"body\": {}}}",
+        Value::String(held(&inner))
+    );
+    // Under an ordinary name and under a hint, where held JSON is opened.
+    for (parent, doc) in [("body", &doc), ("key", &doc), ("key", &beside)] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]) && !out.to_string().contains(&token[4..]),
+            "under {parent}: a secret showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "under {parent}: a second pass changed it");
+    }
+}
+
+/// JSON that text redaction mends beside JSON it breaks does not make up
+/// for it: a string that does not read as JSON as written, a bad escape
+/// in a URL's password say, can read as JSON once text redaction hides the
+/// password, and the JSON broken beside it is still hidden whole.
+#[test]
+fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let mended = r#"{"u":"https://user:pa\qss@host/"}"#;
+    let mended = Value::String(mended.to_owned());
+    let held = |s: &str| Value::String(format!("{{\"body\": {}}}", Value::String(s.to_owned())));
+    let doc = format!(
+        "{{\"body\": {}, \"b0\": {mended}, \"b1\": {mended}}}",
+        held(&inner)
+    );
+    for parent in ["body", "key", "token"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "under {parent}: the header's value showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "under {parent}: a second pass changed it");
+    }
+}
+
+/// Text still changing when the readings run out is hidden whole.
+#[test]
+fn text_still_changing_at_the_bound_is_hidden_whole() {
+    let input = "api_key=Authorization: Cookie: =12";
+    PASSES.with(|p| p.set(1));
+    let capped = text(input).into_owned();
+    PASSES.with(|p| p.set(TEXT_PASSES));
+    assert_eq!(capped, REDACTED);
+    assert_ne!(text(input), REDACTED, "settled within the bound, it is not");
+}
+
+/// A key's value is held as surely as any reading of its name says: one
+/// that a single reading would hide is hidden when text is read until it
+/// settles.
+#[test]
+fn a_key_is_judged_by_every_reading_of_its_name() {
+    for (case, doc) in [
+        json!({"key Proxy-Authorization: -p password": "hunter2"}),
+        json!({"token": {"key Proxy-Authorization: -p password x-api-key: v.file": "hunter2"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2"),
+            "case {case}: the value showed"
+        );
+    }
+    // Generated keys: nothing a single reading hides shows when the
+    // readings repeat.
+    const PARTS: &[&str] = &[
+        "key ",
+        "Proxy-Authorization: ",
+        "-p ",
+        "password",
+        " x-api-key: ",
+        "v.file",
+        "token=",
+        "Cookie: ",
+        "--password ",
+        "secret",
+        "=",
+        " ",
+        "\\ab",
+        "api_key=",
+        "Bearer ",
+    ];
+    let mut seed: u64 = 4242;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut shown = 0;
+    for _ in 0..20_000 {
+        let mut key = String::new();
+        for _ in 0..=next(6) {
+            key.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+        }
+        let doc = if next(2) == 0 {
+            json!({ key: "hunter2" })
+        } else {
+            json!({"token": { key: "hunter2" }})
+        };
+        let run = |passes: usize| {
+            PASSES.with(|p| p.set(passes));
+            let mut out = doc.clone();
+            value(&mut out);
+            PASSES.with(|p| p.set(TEXT_PASSES));
+            out.to_string().contains("hunter2")
+        };
+        if run(TEXT_PASSES) && !run(1) {
+            shown += 1;
+        }
+    }
+    assert_eq!(
+        shown, 0,
+        "a value one reading hides shows when the readings repeat"
+    );
 }
 
 /// A secret's name and value pair in JSON held in a string is read as

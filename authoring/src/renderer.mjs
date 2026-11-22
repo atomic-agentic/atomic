@@ -75,6 +75,12 @@ function lineOf(node) {
   if (!file) return undefined;
   return (file.atomicLine ?? 1) + file.getLineAndCharacterOfPosition(node.getStart(file)).line;
 }
+// Whether a rejection is the Astro parser faulting inside itself: the Go
+// runtime hands back no parse result at all, and the wasm shim's read of it
+// is what throws. A rejection of any other shape is not the file's doing and
+// is left to travel as it is.
+const faulted = (cause) =>
+  cause instanceof TypeError && String(cause?.message ?? '').includes("reading 'ast'");
 function error(unit, node, message) {
   throw new AtomDiagnostic(message, unit?.file, lineOf(node));
 }
@@ -236,7 +242,18 @@ export async function compile(file, options = {}) {
       if (cause instanceof FenceError) throw new AtomDiagnostic(cause.message, canonical, cause.line);
       throw cause;
     }
-    const parsed = await parse(fenced, { position: true });
+    // The parser is a Go program, and on some sources it faults inside
+    // itself: it prints its own runtime failure and rejects over a parse
+    // result that was never built. That is nothing an author can act on, so
+    // the file is refused for what is known — the compiler could not read it,
+    // and cannot say where. Any other rejection is ours and travels as it is.
+    let parsed;
+    try {
+      parsed = await parse(fenced, { position: true });
+    } catch (cause) {
+      if (faulted(cause)) throw new AtomDiagnostic('the Astro compiler could not read this file and gave no diagnostic; a closing tag or a comment inside a {…} expression is a known trigger', canonical);
+      throw cause;
+    }
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
     if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
     // Tags are the prompt's structure, and Astro accepts unbalanced ones

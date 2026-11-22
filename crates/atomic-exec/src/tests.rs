@@ -15,6 +15,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
         secret_env: Default::default(),
     })
 }
@@ -72,6 +73,7 @@ fn no_shell_expands_the_arguments() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
             secret_env: Default::default(),
         })
         .expect("runs");
@@ -92,6 +94,7 @@ fn a_missing_program_cannot_start() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
             secret_env: Default::default(),
         })
         .expect_err("missing");
@@ -477,6 +480,61 @@ fn a_scratch_root_a_sandboxed_turn_could_write_is_refused() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// No writable root may lie at or in a directory a workspace's commands are
+/// denied, its backend's scratch root or another backend's it is told to
+/// deny, where Codex's sandbox would reopen it writable; nor may a denied
+/// directory lie in a writable root. A refused workspace makes nothing.
+#[test]
+fn a_writable_root_in_a_denied_directory_is_refused() {
+    let src = source("in-denied");
+    let own = backend("in-denied");
+    let sibling = own
+        .scratch_root()
+        .with_file_name(format!("sibling-in-denied-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    let local = own.clone().denying([sibling.clone()]);
+    let opening_with = |roots: Vec<PathBuf>| Open {
+        writable_roots: roots,
+        ..opening(&src, "fix", "a1")
+    };
+    for (root, says) in [
+        (sibling.join("x"), "which a workspace's commands are denied"),
+        // At the denied root itself, which it would also cover.
+        (sibling.clone(), "where a sandboxed turn may write"),
+        (
+            local.scratch_root().join("y"),
+            "which a workspace's commands are denied",
+        ),
+        (
+            sibling.parent().expect("parent").to_owned(),
+            "where a sandboxed turn may write",
+        ),
+    ] {
+        let error = local
+            .open(&opening_with(vec![root.clone()]))
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains(says),
+            "{}: {error}",
+            root.display()
+        );
+        assert!(
+            !sibling.exists(),
+            "{}: the sibling root was made",
+            root.display()
+        );
+    }
+    let opened = local
+        .open(&opening_with(vec![std::env::temp_dir()]))
+        .expect("opens");
+    assert!(opened.denied.contains(&sibling), "{:?}", opened.denied);
+    assert!(sibling.is_dir(), "the sibling root was not made");
+    local.close(&opened).expect("closes");
+    let _ = workspace::remove_tree(local.scratch_root());
+    let _ = std::fs::remove_dir_all(&sibling);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 /// Every workspace on a backend shares one private temporary directory,
 /// outside every attempt's scratch.
 #[test]
@@ -597,6 +655,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
         secret_env: Default::default(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
@@ -848,6 +907,85 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
         started.elapsed()
     );
     assert_eq!(done.stdout, b"done");
+}
+
+/// A backend's own scratch root inside a directory it also denies is left to
+/// that one, but only when it truly lies there: one that is a link to
+/// somewhere else is not covered by the directory its link sits in, and is
+/// denied itself.
+#[cfg(unix)]
+#[test]
+fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/atomic-exec-tests")
+        .join(format!("outermost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (home, elsewhere) = (base.join("scratch"), base.join("elsewhere"));
+    std::fs::create_dir_all(home.join("p")).expect("home");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let inside = home.join("p/run");
+    std::fs::create_dir_all(&inside).expect("inside");
+    let linked = home.join("p/debug");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+    assert_eq!(
+        workspace::outermost(&[inside.clone(), home.clone()]),
+        vec![home.clone()],
+        "a root truly inside is left to the outer one"
+    );
+    assert_eq!(
+        workspace::outermost(&[linked.clone(), home.clone()]),
+        vec![linked.clone(), home.clone()],
+        "a root linked elsewhere is denied itself"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A scratch root no longer used is retired: dead attempts go, and the root
+/// with them once only its dot-entries are left. An attempt whose owner may
+/// still run, or an entry that does not say whose it is, keeps it.
+#[test]
+fn an_old_scratch_root_goes_only_once_nothing_live_is_in_it() {
+    let make = |tag: &str| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-exec-tests")
+            .join(format!("retire-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dead = root.join("fix-0123/999999999.1-a0");
+        std::fs::create_dir_all(&dead).expect("dead attempt");
+        std::fs::write(dead.join("secret"), "a dead turn's HOME").expect("secret");
+        std::fs::create_dir_all(root.join(".tmp")).expect("shared tmp");
+        root
+    };
+    let gone = make("dead");
+    assert!(
+        retire_scratch_root(&gone).expect("retired"),
+        "the root stayed"
+    );
+    assert!(!gone.exists());
+    assert!(
+        retire_scratch_root(&gone).expect("again"),
+        "a root already gone is retired"
+    );
+
+    let live = make("live");
+    let mine = live
+        .join("check-4567")
+        .join(tagged(std::process::id(), "a1"));
+    std::fs::create_dir_all(&mine).expect("live attempt");
+    assert!(!retire_scratch_root(&live).expect("kept"));
+    assert!(mine.exists(), "a live attempt's scratch went");
+    assert!(
+        !live.join("fix-0123/999999999.1-a0").exists(),
+        "the dead attempt beside it stayed"
+    );
+
+    let unknown = make("unknown");
+    std::fs::write(unknown.join("left-by-someone"), "x").expect("unknown entry");
+    assert!(!retire_scratch_root(&unknown).expect("kept"));
+    assert!(unknown.join("left-by-someone").exists());
+
+    let _ = std::fs::remove_dir_all(&live);
+    let _ = std::fs::remove_dir_all(&unknown);
 }
 
 /// A command's secret variables reach it on a Unix socket whose descriptor

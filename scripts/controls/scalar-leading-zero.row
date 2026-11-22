@@ -1,0 +1,1 @@
+scalar-leading-zero|tools/yaml_scalar.py|        if len(body) > 1 and body.startswith("0"):|        if False and len(body) > 1 and body.startswith("0"):|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does

@@ -16,7 +16,7 @@
 use crate::engine::{self, EngineArgs};
 use crate::failure::Failure;
 use crate::target;
-use atomic_app::pipeline::PIPELINE;
+use atomic_app::pipeline::{PIPELINE, ProjectWorktrees};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
 use atomic_durable::{DurableError, DurableRuntime, RunStatus};
@@ -77,11 +77,22 @@ fn bind_fixture(
     use atomic_core::fixture::{self, FixtureError};
     let (Some(repo), Some(rev)) = (&args.fixture, &args.fixture_rev) else {
         if run.pipeline.changes_code() {
+            // A run's worktrees are made from the repository it names, never
+            // from the project's checkout, so what was found about the project
+            // changes nothing about the refusal. It is still said, because a
+            // step that needs a worktree is asking why there is none — and
+            // "git refused the project's directory" is different news from
+            // "atomic cannot tell whether it is in a repository". A project
+            // with a repository gets the plain refusal.
+            let found = match ProjectWorktrees::find(state) {
+                ProjectWorktrees::Found(_) => String::new(),
+                found => format!(", and {}", found.describe()),
+            };
             return Err(Failure::new(
                 "fixture.required",
                 format!(
                     "workflow `{}` changes code in a worktree, and no fixture repository is \
-                     named; atomic never works in your own checkout",
+                     named{found}; atomic never works in your own checkout",
                     run.pipeline.name
                 ),
                 "name the repository and the revision to start from: --fixture <repo> \
@@ -101,6 +112,11 @@ fn bind_fixture(
             FixtureError::Path { .. } => (
                 "fixture.path",
                 "give --fixture the path of a git repository on this machine",
+            ),
+            FixtureError::Unreadable { .. } => (
+                "fixture.unreadable",
+                "make the repository readable by the account atomic runs as, or name one that \
+                 is; atomic refuses to guess what it could not read",
             ),
             FixtureError::Revision { .. } => (
                 "fixture.revision",
@@ -371,6 +387,17 @@ pub async fn run(
     // The engine treats a run id as an idempotency key: starting one that
     // exists would wait for that run, whatever it runs, instead of this one.
     // Checked under the lock, so no other local process starts it meanwhile.
+    // Taken by another project on a shared store: said with nothing of
+    // their run, which this project can neither read nor resume.
+    if engine.rt.run_id_taken_elsewhere(&run_id).await? {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "run.exists",
+            format!("the run id {run_id} is taken in this store by another project"),
+            "give a new id, or leave out --run-id for one",
+        )
+        .into());
+    }
     if let Some(existing) = engine.rt.run_record(&run_id).await? {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         let state = match existing.status {
@@ -402,12 +429,16 @@ pub async fn run(
         ))
         .log();
     if let Some(f) = &run.pipeline.fixture {
-        atomic_core::log_line!(
-            "run {run_id}: fixture {} at {} pinned to commit {}",
-            f.source.display(),
-            f.rev,
-            f.commit
-        );
+        atomic_core::redact::Line::new()
+            .plain("run ")
+            .shown(&run_id)
+            .plain(": fixture ")
+            .redacted(&f.source.display().to_string())
+            .plain(" at ")
+            .redacted(&f.rev)
+            .plain(" pinned to commit ")
+            .shown(&f.commit)
+            .log();
     }
     // What its input names is kept from a sweep until the input is recorded;
     // a field its contract types as an artifact must name stored content.
@@ -496,7 +527,7 @@ pub async fn resume(
     )
     .await?;
     let id = &args.run_id;
-    let record = engine.rt.run_record(id).await?;
+    let record = engine.rt.own_run_record(id).await?;
     match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -564,11 +595,16 @@ pub async fn resume(
             // likely panic again: say so, and note afresh what this resume
             // finds.
             if let Some(message) = atomic_app::panics::of(id) {
-                atomic_core::log_line!(
-                    "run {id}: it was parked because atomic's own workflow code panicked \
-                     ({message}); resuming it, the panic will likely happen again unless this \
-                     atomic has it fixed"
-                );
+                atomic_core::redact::Line::new()
+                    .plain("run ")
+                    .shown(id)
+                    .plain(": it was parked because atomic's own workflow code panicked (")
+                    .redacted(&message)
+                    .plain(
+                        "); resuming it, the panic will likely happen again unless this atomic \
+                         has it fixed",
+                    )
+                    .log();
             }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
@@ -806,23 +842,29 @@ pub async fn serve(
     engine.launch().await?;
     // The engine parks a run whose workflow code panicked, and one it has
     // recovered too often, instead of recovering it once more: name each,
-    // with its cause.
-    let now = parked(engine.rt.runs_in(PARKED).await?);
+    // with its cause. Only this project's: another's run is not named.
+    let mut now = Vec::new();
+    for id in parked(engine.rt.runs_in(PARKED).await?) {
+        if engine.rt.own_run_record(&id).await?.is_some() {
+            now.push(id);
+        }
+    }
     for id in &now {
         match atomic_app::panics::of(id) {
             // Whenever it panicked, in this process's recovery or an
             // earlier process.
-            Some(message) => atomic_core::log_line!(
-                "atomic serve: {}; {}",
-                atomic_app::panics::cause(id, &message),
-                atomic_app::panics::hint(id)
-            ),
+            Some(message) => atomic_app::panics::served(id, &message).log(),
             None if before.contains(id) => {}
-            None => atomic_core::log_line!(
-                "atomic serve: run {id} stopped without finishing more times than the engine \
-                 allows, so it is parked; find why, then continue it with `atomic runs resume \
-                 {id}`"
-            ),
+            None => atomic_core::redact::Line::new()
+                .plain("atomic serve: run ")
+                .shown(id)
+                .plain(
+                    " stopped without finishing more times than the engine allows, so it is \
+                     parked; find why, then continue it with `atomic runs resume ",
+                )
+                .shown(id)
+                .plain("`")
+                .log(),
         }
     }
     // A gate decided, or a park released, while its run was down may never
@@ -840,14 +882,18 @@ pub async fn serve(
         .map(|r| format!("{} (layout {})", r.id, r.version))
         .collect();
     if !stranded.is_empty() {
-        atomic_core::log_line!(
-            "atomic serve: left {} unfinished run(s) started by an atomic of another durable step \
-             layout, which this one ({}) cannot continue: {}; continue them with an atomic of \
-             their layout",
-            stranded.len(),
-            engine.rt.version(),
-            stranded.join(", ")
-        );
+        atomic_core::redact::Line::new()
+            .plain("atomic serve: left ")
+            .shown(&stranded.len().to_string())
+            .plain(
+                " unfinished run(s) started by an atomic of another durable step layout, which \
+                 this one (",
+            )
+            .shown(engine.rt.version())
+            .plain(") cannot continue: ")
+            .shown(&stranded.join(", "))
+            .plain("; continue them with an atomic of their layout")
+            .log();
     }
     atomic_core::log_line!(
         "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"

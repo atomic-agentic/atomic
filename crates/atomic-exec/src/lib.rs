@@ -59,7 +59,7 @@ pub(crate) fn log(line: &str) {
     }
 }
 
-pub use workspace::{Open, Sandbox, Shell, Workspace};
+pub use workspace::{Open, Sandbox, Shell, Workspace, retire_scratch_root};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -145,6 +145,12 @@ pub struct Command {
     /// confines it; with none, it has no network at all. A backend that does
     /// not confine its commands ignores it.
     pub network: Vec<String>,
+    /// Directories it may neither read nor write, apart from the
+    /// [`writable`](Self::writable) ones inside them, when its backend
+    /// confines it: its workspace's [`denied`](Workspace::denied), the
+    /// backend's scratch directories, so it reads no other attempt's. A
+    /// backend that does not confine its commands ignores it.
+    pub denied: Vec<PathBuf>,
     /// Variables it gets on a socket instead of in its environment, which
     /// another process of the same user can read through /proc until the
     /// program has made itself non-dumpable: see [`SecretEnv`]. Only a
@@ -237,9 +243,10 @@ impl SecretEnv {
 /// sandbox, so a backend elsewhere is free to confine its own way.
 pub trait Confine: Send + Sync {
     /// The command that runs `command` confined. It must run `command` with
-    /// exactly its environment and in its directory, and let it write only
+    /// exactly its environment and in its directory, let it write only
     /// [`Command::writable`], except [`Command::read_only`] inside them,
-    /// which it may only read. `tmp` is the backend's private temporary
+    /// which it may only read, and keep it out of [`Command::denied`] apart
+    /// from the writable directories inside them. `tmp` is the backend's private temporary
     /// directory, where the sandbox may keep records of its own.
     fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
 
@@ -514,12 +521,16 @@ impl ExecutionBackend for Backend {
 /// Each attempt's scratch directory is a private one under
 /// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
 /// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
-/// as one in the project's state directory: [`LocalBackend::in_dir`].
+/// as one in the atomic home's `scratch/`: [`LocalBackend::in_dir`].
 #[derive(Clone)]
 pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
+    /// Directories its workspaces' commands are kept out of besides its own
+    /// scratch root, such as the directory that holds every backend's
+    /// scratch roots.
+    denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
     checked: Arc<std::sync::OnceLock<()>>,
@@ -531,6 +542,7 @@ impl std::fmt::Debug for LocalBackend {
             .field("scratch_root", &self.scratch_root)
             .field("tmp", &self.tmp)
             .field("confined", &self.confine.is_some())
+            .field("denying", &self.denying)
             .finish()
     }
 }
@@ -563,8 +575,19 @@ impl LocalBackend {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
+    }
+
+    /// The same backend, keeping its workspaces' commands out of `dirs` as
+    /// well as its own scratch root, such as the directory that holds every
+    /// backend's scratch roots, of every project, so no command of one reads
+    /// another's attempts. Each is created, if missing, when a workspace
+    /// opens, so it cannot appear undenied while a command runs.
+    pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.denying.extend(dirs);
+        self
     }
 
     /// The same backend, running every command under `confine`.
@@ -616,7 +639,7 @@ impl Default for LocalBackend {
     /// directory every such backend of this user shares. Sandboxed turns may
     /// write there, so [`connect`](ExecutionBackend::connect) refuses it:
     /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
-    /// in the project's state directory, and this one is for tests that
+    /// in the atomic home's `scratch/`, and this one is for tests that
     /// open workspaces without connecting. Each has its own scratch root,
     /// since runs of different stores may share a run and step name.
     fn default() -> Self {
@@ -636,6 +659,7 @@ impl Default for LocalBackend {
             )),
             tmp: base.join(".tmp"),
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
     }
@@ -685,7 +709,7 @@ impl ExecutionBackend for LocalBackend {
             confine.check(&self.tmp)?;
             let _ = self.checked.set(());
         }
-        workspace::open_local(&self.scratch_root, &self.tmp, request)
+        workspace::open_local(&self.scratch_root, &self.tmp, &self.denying, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {

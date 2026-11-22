@@ -299,10 +299,36 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
-            user_config_dir: &atomic_core::state::user_config_dir,
+            user_config_dir: &user_config_dir_here,
             sign_in: &|_| Ok(None),
         }
     }
+}
+
+/// [`Surroundings`] reads the person's own configuration directory from this
+/// process with [`atomic_core::state::user_config_dir`], which reads
+/// `XDG_CONFIG_HOME` and `HOME` as the operating system gives them and falls
+/// back to the home the password database gives: the same resolution the denial
+/// of that directory to atoms' commands and the refusal of a state directory
+/// inside it are made from.
+///
+/// A function, where every other field `without_probe` gives is a closure,
+/// because a control's switch is written in a `|`-delimited row (see
+/// `scripts/controls-check.sh`), which no closure can be written without.
+/// `scripts/controls/settings-user-config-dir.row` switches what this asks of
+/// `XDG_CONFIG_HOME` and `HOME` to what [`Surroundings::env`] already gives —
+/// the same two variables read as text — which is the one reading that sees
+/// nothing where the operating system gives bytes that are not text, and so the
+/// one that looks for a person's settings in another directory than the one the
+/// denial covers. The row runs
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`,
+/// which gives a command a configuration directory of just such bytes: that is
+/// where the two readings part, and the switch keeps the home the password
+/// database gives, since that fallback is what
+/// `scripts/controls/state-config-passwd-home.row` and
+/// `scripts/controls/state-check-passwd-wired.row` switch, in `state.rs`.
+fn user_config_dir_here() -> Option<PathBuf> {
+    atomic_core::state::user_config_dir()
 }
 
 /// The person's sign-in, if someone is signed in, found without creating
@@ -1573,6 +1599,16 @@ impl Resolved {
         self.sign_in.is_some() && self.settings.model.base_url.is_none()
     }
 
+    /// Whether someone chose the model endpoint: a flag, a variable or a
+    /// configuration file set `model.base_url`. Such an endpoint comes before
+    /// the sign-in, which is then not looked for. One detection found, from
+    /// `OPENAI_API_KEY` or a local Ollama, comes only after it.
+    pub fn endpoint_chosen(&self) -> bool {
+        let source = self.sources.get("model.base_url");
+        let detected = matches!(source, Some(Source::Detected(_)));
+        self.settings.model.base_url.is_some() && !detected
+    }
+
     /// Every setting for `atomic config --explain`: its path, its value as
     /// shown, with secrets masked, and where it came from.
     pub fn explain(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, Value, String)> {
@@ -1759,8 +1795,7 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
             };
             // With an endpoint configured, the sign-in is not looked for and
             // a run uses the endpoint.
-            let configured =
-                resolved.sign_in_unreadable.is_none() && resolved.settings.model.base_url.is_some();
+            let configured = resolved.sign_in_unreadable.is_none() && resolved.endpoint_chosen();
             let note = if configured {
                 format!(
                     "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \

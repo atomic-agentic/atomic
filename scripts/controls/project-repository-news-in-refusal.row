@@ -1,0 +1,1 @@
+project-repository-news-in-refusal|crates/atomic/src/runs.rs|                found => format!(", and {}", found.describe()),|                _ => String::new(),|-p atomic-agentic --test run_cli -- a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked

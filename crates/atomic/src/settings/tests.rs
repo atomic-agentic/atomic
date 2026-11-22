@@ -2011,3 +2011,71 @@ fn a_projects_files_cannot_set_openai_base_url() {
         assert!(refused.contains(key), "{file} set {key}: {refused}");
     }
 }
+
+/// An endpoint someone chose, in a file, a variable or a flag, comes before
+/// the sign-in; one detection found does not, so a sign-in that cannot be read
+/// is not said to be passed over for it.
+#[test]
+fn only_an_endpoint_someone_chose_comes_before_the_sign_in() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let none = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert!(!none.endpoint_chosen(), "no endpoint");
+    let key = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value")],
+        &nobody,
+    );
+    assert!(key.settings.model.base_url.is_some());
+    assert!(!key.endpoint_chosen(), "detected from OPENAI_API_KEY");
+    let ollama = resolved(&d, &EngineArgs::default(), &[], &|_| {
+        Some(vec!["qwen3:8b".to_owned()])
+    });
+    assert!(ollama.settings.model.base_url.is_some());
+    assert!(!ollama.endpoint_chosen(), "detected at a local Ollama");
+    let variable = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9000/v1"),
+            ("ATOMIC_MODEL", "m"),
+        ],
+        &nobody,
+    );
+    assert!(variable.endpoint_chosen(), "set by a variable");
+    let file = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: http://127.0.0.1:9000/v1\n  name: m\n",
+    )]);
+    let chosen = resolved(&file, &EngineArgs::default(), &[], &nobody);
+    assert!(chosen.endpoint_chosen(), "set in the manifest");
+}
+
+/// Only the wiring, and nothing about how the directory is read: that
+/// [`Surroundings::here`], which is what a person's run builds, asks
+/// [`atomic_core::state::user_config_dir`] for the person's own configuration
+/// directory — the same function the denial of that directory to every atom's
+/// commands and the refusal of a state directory inside it call — rather than
+/// putting a reading of `XDG_CONFIG_HOME` and `HOME` here.
+///
+/// Both sides read this process's own environment and its own password
+/// database, so what this can see is a person's run asking for a different
+/// *resolution* — other variables, another fallback, none at all — and not for a
+/// different *reading* of the same two, because two readings of one environment
+/// in which every variable is text agree. That the reading itself must be as the
+/// operating system gives it — see a configuration directory whose name is bytes
+/// that are not text as the directory it is, and source the settings in it — is
+/// pinned end to end by
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`
+/// in `crates/atomic/tests/state_cli.rs`, which is the test
+/// `scripts/controls/settings-user-config-dir.row` switches off and runs.
+#[test]
+fn a_persons_run_asks_the_state_for_its_own_configuration_directory() {
+    let here = Surroundings::here();
+    assert_eq!(
+        user_config(here.user_config_dir),
+        atomic_core::state::user_config_dir().map(|dir| dir.join("config.yaml")),
+        "settings do not read the configuration directory the denial and the state \
+         check are made from"
+    );
+}

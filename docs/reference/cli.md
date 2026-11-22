@@ -130,8 +130,9 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 
 | Kind | When |
 | --- | --- |
-| `fixture.required` | The workflow changes code and no fixture is named |
-| `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
+| `fixture.required` | The workflow changes code and no fixture is named. When the project's own directory offers no worktree, the refusal says what was found about it: that git refused it — which it says alike of a directory holding no repository and of a repository it cannot read — or that git never got to answer for it |
+| `fixture.path` | git finds no repository at `--fixture`, or it names a directory inside a repository rather than that repository's top |
+| `fixture.unreadable` | Nothing was learned about `--fixture`, because git never got to answer for it: it could not be run on that directory, was stopped, or printed what atomic cannot read. The description carries what stopped git, and atomic does not guess whether a repository is there |
 | `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
 | `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
 | `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
@@ -159,12 +160,12 @@ authentication](../getting-started/authentication.md).
 | Command or surface | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic gates enroll` | Enroll your operator credential for the project, from a terminal; `--replace` rotates it or replaces a lost one | v0.1 local, Linux |
-| `atomic gates list` | Inspect durable gates | v0.1 local |
+| `atomic gates list` | Inspect durable gates; on a shared store, only the project's runs' gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
 | `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
 | The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
-| `atomic parks list` | List the runs parked on a budget cap and not yet released | v0.1 local |
+| `atomic parks list` | List the project's runs parked on a budget cap and not yet released; on a shared store, no other project's | v0.1 local |
 | `atomic parks release <park-id>` | Release a parked run as the local operator, with your enrolled credential; `--tokens`, `--minutes` and `--cost-usd` raise the refusing allowance first (`--scope` names another of the run's own), `--comment` is recorded, `--command-id` makes a repeat safe | v0.1 local, Linux |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
