@@ -1,0 +1,1 @@
+run-id-charset|crates/atomic/src/runs.rs|        && id.bytes().all(allowed);|        && { let _ = allowed; true }; /*CONTROL_OFF*/|-p atomic-agentic --bin atomic -- runs::tests::a_run_id_is_held_to_its_characters_and_length
