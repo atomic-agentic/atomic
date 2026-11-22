@@ -1091,7 +1091,11 @@ async fn a_project_neither_lists_nor_recovers_anothers_runs(database: crate::Dat
         "of no project",
         "under an older manifest name or path",
         "ATOMIC_EXECUTOR_ID, or --executor-id",
-        "`atomic runs resume <id> --owner-stopped`",
+        "`atomic runs resume <id> --owner-stopped` from the project under the manifest name \
+         and path that started it",
+        "a run under an older name or path is not found",
+        "A run of no project on a store several projects share cannot be taken over from any \
+         project, and is left behind once the identity changes",
         "is not supported",
     ] {
         assert!(refused.contains(said), "{said:?} in {refused}");

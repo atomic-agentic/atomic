@@ -335,12 +335,15 @@ run recovery would take that is not this project's, `atomic serve` refuses to
 start rather than run it in this project's code, and says how many such runs
 there are without naming them. Such a run is another project's, or of no
 project (recorded before runs had projects), or this project's under an
-older manifest name or path. Once the project has an identity of its own,
-`atomic runs resume <id> --owner-stopped` takes over each of its runs left
-under the old one. The check finds runs already left; it does not stop a
-live process of another project that starts a run under the same identity at
-the same moment, and one identity shared by processes that run at once is
-not supported.
+older manifest name or path. Once each project has an identity of its own,
+`atomic runs resume <id> --owner-stopped` takes over a run left under the old
+one, run from the project under the manifest name and path that started the
+run: from the project as it is now, a run under an older name or path is not
+found. A run of no project cannot be taken over from any project, and is left
+behind once the identity changes. The check finds runs already left; it does
+not stop a live process of another project that starts a run under the same
+identity at the same moment, and one identity shared by processes that run at
+once is not supported.
 Atomic refuses to start when the durable engine's own version variable
 (`DBOS__APPVERSION`) is set.
 

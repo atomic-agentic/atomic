@@ -1786,9 +1786,12 @@ fn foreign_runs_refusal(executor: &str, theirs: usize) -> String {
          which recovering would run here, so none is recovered. Such a run is another \
          project's, or of no project (recorded before runs had projects), or this project's \
          under an older manifest name or path. Give each project's processes an executor \
-         identity of their own (ATOMIC_EXECUTOR_ID, or --executor-id), then take over each of \
-         this project's runs left under the old identity with `atomic runs resume <id> \
-         --owner-stopped`. This finds runs already left, not one another project's live \
+         identity of their own (ATOMIC_EXECUTOR_ID, or --executor-id), then take over each run \
+         left under the old identity with `atomic runs resume <id> --owner-stopped` from the \
+         project under the manifest name and path that started it: from the project as it is \
+         now, a run under an older name or path is not found. A run of no project on a store \
+         several projects share cannot be taken over from any project, and is left behind once \
+         the identity changes. This finds runs already left, not one another project's live \
          process starts at the same moment: one identity shared by processes that run at once \
          is not supported"
     )
