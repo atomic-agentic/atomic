@@ -407,7 +407,12 @@ pub async fn run(
             plans.insert(atom.name.clone(), plan);
         }
     }
-    let exec = crate::engine::exec_backend(&state, paths, crate::engine::runner_of(&resolved)?)?;
+    let exec = crate::engine::exec_backend(
+        &state,
+        paths,
+        crate::engine::runner_of(&resolved)?,
+        resolved.settings.exec.connections_per_command,
+    )?;
     let unique = format!(
         "{}-{}",
         std::time::SystemTime::now()

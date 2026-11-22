@@ -164,11 +164,14 @@ pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
 
 /// The backend exec atoms' commands run on with `runner`: scratch in the
 /// project's state, confined like turns' commands where that is verified,
+/// each command that declares hosts holding at most
+/// `connections_per_command` connections through its proxy at once,
 /// connected once.
 pub fn exec_backend(
     state: &ProjectState,
     paths: &CodexPaths,
     runner: RunnerKind,
+    connections_per_command: u32,
 ) -> anyhow::Result<atomic_exec::Backend> {
     // Scratch directories live in the project's state directory, outside
     // every directory a sandboxed turn may write. Connected once: what the
@@ -187,8 +190,11 @@ pub fn exec_backend(
             atomic_core::codex::StateGuard::for_project(state)?,
             state.codex_home(),
         )
+        .and_then(|sandbox| sandbox.limiting_connections(connections_per_command))
         .context("confine exec atoms' commands")?,
     ));
+    #[cfg(not(target_os = "linux"))]
+    let _ = connections_per_command;
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
         RunnerKind::Process => atomic_exec::Backend::connect(process_runner(
@@ -507,7 +513,12 @@ pub async fn open(
     let store = LocalStore::for_project(state).context("the artifact store")?;
     // A run whose workflow code panics is noted where later processes look.
     atomic_app::panics::keep_in(state.private_dir().join("panics"));
-    let exec = exec_backend(state, paths, runner_of(&resolved)?)?;
+    let exec = exec_backend(
+        state,
+        paths,
+        runner_of(&resolved)?,
+        resolved.settings.exec.connections_per_command,
+    )?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),

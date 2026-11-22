@@ -114,6 +114,24 @@ impl Default for DatabaseSettings {
     }
 }
 
+/// How exec atoms' commands run.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExecSettings {
+    /// How many connections a command that declares hosts may hold through
+    /// its proxy at once, from 1 to
+    /// [`atomic_core::network::MAX_CONNECTIONS_PER_COMMAND`].
+    pub connections_per_command: u32,
+}
+
+impl Default for ExecSettings {
+    fn default() -> Self {
+        Self {
+            connections_per_command: atomic_core::network::DEFAULT_CONNECTIONS_PER_COMMAND,
+        }
+    }
+}
+
 /// Every setting, as `atomic.yaml` and its layers hold it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -147,6 +165,8 @@ pub struct Settings {
     pub backend_wait: Value,
     /// Budget caps and prices (see [`atomic_core::budget`]).
     pub budget: BudgetSettings,
+    /// How exec atoms' commands run.
+    pub exec: ExecSettings,
 }
 
 impl Default for Settings {
@@ -164,6 +184,7 @@ impl Default for Settings {
             executor_id: None,
             backend_wait: Value::Null,
             budget: BudgetSettings::default(),
+            exec: ExecSettings::default(),
         }
     }
 }
@@ -175,6 +196,21 @@ impl Settings {
     pub fn backend_wait(&self) -> Option<u64> {
         self.backend_wait.as_u64()
     }
+}
+
+/// `per_command`, `exec.connections_per_command` as resolved from `source`,
+/// if it is from 1 to [`atomic_core::network::MAX_CONNECTIONS_PER_COMMAND`];
+/// otherwise refused, naming where it came from.
+fn connections_per_command(per_command: u32, source: Option<&Source>) -> Result<u32, ConfigError> {
+    let most = atomic_core::network::MAX_CONNECTIONS_PER_COMMAND;
+    if (1..=most).contains(&per_command) {
+        return Ok(per_command);
+    }
+    let from = source.map_or_else(|| "default".into(), describe);
+    Err(ConfigError::Invalid(format!(
+        "exec.connections_per_command, from {from}, is how many connections a command may hold \
+         through its proxy at once: from 1 to {most}"
+    )))
 }
 
 /// `backend_wait` as resolved, from `source`: a whole number of seconds of at
@@ -533,6 +569,10 @@ pub fn resolve(
     }
     let withheld_key = refuse_from_project(&settings, &sources, user.as_deref())?;
     settings.backend_wait = backend_wait(&settings.backend_wait, sources.get("backend_wait"))?;
+    settings.exec.connections_per_command = connections_per_command(
+        settings.exec.connections_per_command,
+        sources.get("exec.connections_per_command"),
+    )?;
     let mut notes = Vec::new();
     if let Some(why) = &withheld_key {
         settings.model.api_key_env = None;

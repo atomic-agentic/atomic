@@ -2958,6 +2958,16 @@ impl ExecSandbox {
         })
     }
 
+    /// The same confinement, letting each command that declares hosts hold
+    /// at most `per_command` connections through its proxy at once
+    /// (`exec.connections_per_command`; [`crate::network`] says how they
+    /// are counted). Refused outside 1 to
+    /// [`crate::network::MAX_CONNECTIONS_PER_COMMAND`].
+    pub fn limiting_connections(mut self, per_command: u32) -> anyhow::Result<Self> {
+        self.proxies = self.proxies.limiting(per_command)?;
+        Ok(self)
+    }
+
     /// The same confinement, letting a command name `addrs`, loopback
     /// addresses that atomic's policy refuses, as hosts, on any port. For
     /// tests that serve on this machine; atomic never calls it, and only a

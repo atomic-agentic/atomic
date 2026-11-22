@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! A confined command that holds many tunnels through its proxy to a server
-//! that answers stays within its share of atomic's file descriptors: the
-//! admission budget holds for an upstream that behaves (a command that
-//! abandons connections to one that never answers can pass it; that is not
-//! enforced). With atomic's limit on open files held at 1024, soft and hard,
-//! a command opens 300 tunnels through the proxy to a server on this
-//! machine that keeps every one open. Its sandbox's bridge
-//! lets at most 128 through at once, each costing atomic two descriptors,
-//! so the proxy holds no more than its per-command allowance, and that is
-//! within half of the limit. While it runs, a second command that declares
-//! hosts would pass that half, and does not start.
+//! that answers stays within its share of atomic's file descriptors. With
+//! atomic's limit on open files held at 1024, soft and hard, a command
+//! opens 300 tunnels through the proxy to a server on this machine that
+//! greets every connection and keeps it open. The relay in front of the
+//! proxy lets 64 of them through at once and closes the rest, so the proxy
+//! holds no more than the command's allowance, and that is within half of
+//! the limit. While it runs, a second command that declares hosts would
+//! pass that half, and does not start; once the first has ended, its room
+//! is free again. (A command that abandons connections to a port that never
+//! answers is `exec_network_syn_drop`'s.)
 //!
 //! Needs bubblewrap, unprivileged user namespaces and a network namespace
 //! of the command's own, so it runs with the `sandbox-tests` feature; with
@@ -114,14 +114,16 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         })
         .expect("opens");
 
-    // A server that keeps every connection it gets.
+    // A server that greets every connection it gets, so the relay sees the
+    // proxy's dial reached it, and keeps it.
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
     let target = listener.local_addr().expect("address").to_string();
     let held: Arc<Mutex<Vec<TcpStream>>> = Arc::default();
     {
         let held = held.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
+            for mut stream in listener.incoming().flatten() {
+                let _ = std::io::Write::write_all(&mut stream, b"hi");
                 held.lock().expect("held").push(stream);
             }
         });
@@ -173,7 +175,11 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         let proxy = open_descriptors()
             .saturating_sub(before)
             .saturating_sub(servers);
-        assert!(tunnels >= 64, "the command opened only {tunnels} tunnels");
+        assert_eq!(
+            tunnels,
+            u64::from(atomic_core::network::DEFAULT_CONNECTIONS_PER_COMMAND),
+            "the relay lets the command's limit through, and no more"
+        );
         // The running command's own pipes are counted too: a few more.
         assert!(
             proxy <= DESCRIPTORS_PER_COMMAND + 8,

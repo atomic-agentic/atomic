@@ -191,32 +191,55 @@ clients and SDKs read and which come on top of its `env`; a client that ignores
 them reaches nothing. An atom's `env` cannot set any of them. It can open no
 other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
-names one. Each connection must open with a token that atomic gives the
-command's sandbox and that the command itself never sees, so no sandboxed
-process and no other user's process can use the proxy, unless it has
-`CAP_SYS_PTRACE` over the sandbox helper's user namespace, as root does. A
+names one. The command's sandbox reaches the proxy only through a relay
+atomic runs in front of it. Each connection must open with a token that atomic
+gives the command's sandbox and that the command itself never sees; the relay
+passes the connection on with another token, which never leaves atomic, so
+no sandboxed process and no other user's process can use the proxy, unless it
+has `CAP_SYS_PTRACE` over the sandbox helper's user namespace, as root does. A
 process of your own user that runs outside any sandbox is not kept out: it
 can enter the command's namespaces and use the sandbox's own route to the
-proxy. Once the command ends, its token admits no new connection.
+relay. Once the command ends, its token admits no new connection. A
+connection the relay cannot tie to a running command is closed and never
+reaches the proxy.
+
+A command may hold at most 64 connections through its proxy at once, or the
+number `exec.connections_per_command` sets, from 1 to 128 (see
+[configuration](configuration.md#the-settings-a-command-resolves)); one more
+is closed at once, and the command may open another when one of its own has
+ended. A connection counts until the proxy has let go of it, not only until
+the command has dropped it: the proxy answers an HTTPS `CONNECT` before it
+dials and keeps the connection until the dial ends, and the kernel gives up a
+dial to a host that never answers only after about two minutes. A request the
+proxy never answered also counts until that time has passed since it was
+sent, even if the proxy closed the connection sooner. So a command that keeps
+opening and abandoning connections to a host that never answers holds its 64
+and is refused more until those dials end; it does not take other commands'
+room. A connection whose first request gets no answer within 10 seconds is
+closed: for an HTTPS tunnel, the host's first bytes after the proxy's `200`,
+such as its TLS greeting; for a plain HTTP request, the first bytes of the
+response, so a plain HTTP server that takes longer than that to start its
+response is cut off. The connection still counts until the proxy has let go
+of it.
 
 Each command that declares hosts is admitted against a budget of open files:
-its sandbox keeps at most 128 connections to the proxy open at once, and
-atomic reserves two open files for each (the command's and one upstream) and a
-few to spare, and the commands that declare hosts may reserve no more than
-half of atomic's limit on open files between them. When they need more room,
-atomic first raises its own limit as far as the hard limit allows, up to
-65536, and the commands it starts afterwards inherit that; a command that
-would still pass it does not start, and says so, and its step fails rather
-than waits. To run more of them at once, raise atomic's hard limit on open
-files, or start it with a higher soft limit. The budget holds while the hosts
-a command reaches answer and close as they should; it is not a limit the proxy
-enforces. The proxy answers an HTTPS `CONNECT` before it dials and sets no
-time limit of its own on the dial (the kernel's connect timeout still
-applies), may dial more than one of a host's addresses for one connection,
-keeps a connection's files for a while after the command has dropped it, and
-keeps a tunnel open until the host closes it, so a command that keeps opening
-and abandoning connections to a host that never answers can take more than its
-share, and can leave atomic short of open files.
+for each connection it may hold, atomic reserves five open files (the relay's
+two, the proxy's own and up to three dials the proxy makes at once for it),
+one for each of the 128 connections its sandbox may open to the relay, and a
+few to spare, 464 for the default 64; and the commands that declare hosts may
+reserve no more than half of atomic's limit on open files between them. A
+command's room is given back when its last connection has stopped counting.
+When they need more room, atomic first raises its own limit as far as the
+hard limit allows, up to 65536, and the commands it starts afterwards inherit
+that; a command that would still pass it does not start, and says so, and its
+step fails rather than waits. To run more of them at once, raise atomic's hard
+limit on open files, start it with a higher soft limit, or lower
+`exec.connections_per_command`. Two things are outside the count. A host
+whose name resolves to several addresses may leave the proxy's dials to the
+others running, for up to the kernel's connect timeout, after one of them
+connected and answered. And the proxy keeps a tunnel open until the host
+closes it, even after the command has ended, though the relay closes its own
+side then.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling

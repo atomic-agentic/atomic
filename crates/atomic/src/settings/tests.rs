@@ -413,6 +413,7 @@ fn every_setting_has_a_source_and_the_manifest_keys_are_not_settings() {
         "runner",
         "executor_id",
         "backend_wait",
+        "exec.connections_per_command",
         "budget.atom.tokens",
         "budget.workflow.minutes",
         "budget.call.input_tokens",
@@ -1066,6 +1067,68 @@ fn the_backend_wait_is_a_setting_of_at_least_a_second() {
             e.contains(&format!("backend_wait, {from}"))
                 && e.contains("a whole number of seconds, at least 1"),
             "{file:?} {var:?}: {e}"
+        );
+    }
+}
+
+/// `exec.connections_per_command` is 64 unless a file, or its variable, sets
+/// another number from 1 to 128; anything else is refused, naming where it
+/// came from.
+#[test]
+fn the_connections_per_command_are_a_setting_from_1_to_128() {
+    let none = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let r = resolved(&none, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(r.settings.exec.connections_per_command, 64);
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nexec:\n  connections_per_command: 16\n",
+    )]);
+    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(r.settings.exec.connections_per_command, 16);
+    assert!(matches!(
+        source(&r, "exec.connections_per_command"),
+        Source::File { .. }
+    ));
+    let var = "ATOMIC_EXEC_CONNECTIONS_PER_COMMAND";
+    let r = resolved(&d, &EngineArgs::default(), &[(var, "128")], &nobody);
+    assert_eq!(r.settings.exec.connections_per_command, 128);
+    assert_eq!(
+        source(&r, "exec.connections_per_command"),
+        &Source::Env(var.into())
+    );
+    for (file, value) in [
+        ("exec:\n  connections_per_command: 0\n", None),
+        ("exec:\n  connections_per_command: 129\n", None),
+        ("", Some("0")),
+        ("", Some("1000")),
+    ] {
+        let d = dir(&[("atomic.yaml", &format!("{MANIFEST_ONLY}{file}"))]);
+        let vars: Vec<(&str, &str)> = value.map(|v| (var, v)).into_iter().collect();
+        let e = resolved_where(&d, &EngineArgs::default(), &vars, &nobody)
+            .expect_err("refused")
+            .to_string();
+        let from = match value {
+            Some(_) => format!("from environment variable {var}"),
+            None => format!("from {}", d.join("atomic.yaml").display()),
+        };
+        assert!(
+            e.contains(&format!("exec.connections_per_command, {from}"))
+                && e.contains("from 1 to 128"),
+            "{file:?} {value:?}: {e}"
+        );
+    }
+    for (file, value) in [
+        ("exec:\n  connections_per_command: -1\n", None),
+        ("exec:\n  connections_per_command: many\n", None),
+        ("exec:\n  connections_per_command: ~\n", None),
+        ("", Some("-1")),
+        ("", Some("many")),
+    ] {
+        let d = dir(&[("atomic.yaml", &format!("{MANIFEST_ONLY}{file}"))]);
+        let vars: Vec<(&str, &str)> = value.map(|v| (var, v)).into_iter().collect();
+        assert!(
+            resolved_where(&d, &EngineArgs::default(), &vars, &nobody).is_err(),
+            "{file:?} {value:?}"
         );
     }
 }
