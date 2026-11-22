@@ -1182,11 +1182,28 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
     if !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
         return captures[0].to_string();
     }
-    // A run of backslashes a bare value ends in escapes the quote after it,
-    // as in an escaped argument list, `[\"--password\", \"x\"]`: kept, so
-    // the quotes still pair.
-    let escape = &raw[raw.trim_end_matches('\\').len()..];
+    // A run of backslashes a bare value ends in escapes the quote after it.
+    // In an escaped argument list, `[\"--password\", \"x\"]`, that quote
+    // closes the one escaped alike before the value: the run is kept, so the
+    // quotes still pair. Any other run escapes a quote no reading paired,
+    // and is hidden with the value: JSON that this breaks is then hidden
+    // whole.
+    let value = raw.trim_end_matches('\\');
+    let run = &raw[value.len()..];
+    let opened = [format!("{run}\""), format!("{run}'")]
+        .iter()
+        .any(|quote| prefix.ends_with(quote.as_str()));
+    let escape = if value.is_empty() || !opened { "" } else { run };
     format!("{prefix}{REDACTED}{escape}")
+}
+
+/// [`redact_flag`] for [`FLAG_UNESCAPED`]: a value of backslashes alone
+/// there escapes a quote [`FLAG`] has read already, and is left.
+fn redact_unescaped_flag(captures: &Captures<'_>) -> String {
+    if captures[3].trim_start_matches('\\').is_empty() {
+        return captures[0].to_string();
+    }
+    redact_flag_within(captures, 0)
 }
 
 /// Whether a quoted value reads as more than one: it assigns a name,
@@ -1350,7 +1367,7 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
-    apply(&FLAG_UNESCAPED, &redact_flag);
+    apply(&FLAG_UNESCAPED, &redact_unescaped_flag);
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }
