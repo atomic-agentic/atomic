@@ -47,6 +47,7 @@ test stale_roots
 test exec_caches
 test exec_network
 test exec_network_fds
+test exec_network_relist
 test exec_proxy_raise
 test failpoints
 test fixture_cli
