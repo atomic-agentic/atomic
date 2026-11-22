@@ -1,0 +1,1 @@
+sandbox-place-missing-into|crates/atomic-core/src/codex.rs|                && let Some(refused) = missing_into(&path, &writable, &places)|                && let Some(refused) = None::<anyhow::Error> // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_place_or_a_link_in_one_a_command_could_repoint_refuses_the_thread
