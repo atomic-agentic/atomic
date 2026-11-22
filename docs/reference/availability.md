@@ -150,8 +150,9 @@ attempts by their path. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
-command, which has a scratch directory of its own too, is not yet kept from
-the others' in the same way. (Codex's
+command, which has a scratch directory of its own too, is kept out of the
+project's other ones in the same way, its own apart, wherever its command is
+confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -184,11 +185,12 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them); AWS's workload token files (the files
-`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
-name, with the whole volume when such a file, or what a link to it leads
-to, is in a Kubernetes projected volume, so a rotated token stays denied,
-and EKS's usual token directories under `/var/run/secrets`); and what a link among them points at, up to four
+`KUBECONFIG`, put them); workload token files (the files AWS's, Azure
+workload identity's and Google's credential variables name, the token files
+Google's credentials and AWS's profiles name, with the whole volume when
+such a file, or what a link to it leads to, is in a Kubernetes projected
+volume, so a rotated token stays denied, and the usual token directories
+under `/var/run/secrets` for EKS, the pod's service account and Azure); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);
@@ -216,7 +218,10 @@ any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
 draw on the terminal atomic runs in, whether through `/dev/tty`, the
 terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
-needs bubblewrap and unprivileged user namespaces there: where the sandbox
+needs bubblewrap and unprivileged user namespaces there; a bubblewrap older
+than 0.9, without `--argv0`, as Ubuntu 22.04 ships, works too, since Codex
+runs the sandbox helper through a link atomic keeps in its own state, by its
+path, which no command can write. Where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead sets that run
@@ -318,6 +323,20 @@ stays parked with its record kept in the store, and the work goes on only as a
 new run, started again with `atomic run`. Stop every atomic process that uses a
 shared store before upgrading it, so that none goes on recording parks without
 their project.
+Runs and their gates are kept apart the same way. Each run is recorded with its
+project as it starts, and on a shared store `atomic gates list`, `approve`,
+`reject` and `answer` see only the current project's runs' gates, and `atomic
+runs show` and `atomic runs resume` only its runs: another project's gate or
+run is refused as one that does not exist. Run ids stay unique across the whole
+store, so `atomic run` refuses an id another project has taken, saying only
+that it is taken. On a local SQLite store, runs are adopted as parks are: one
+recorded before atomic kept runs' projects, or under an older name of the
+project's, becomes the project's, so a rename strands no run at its gate. A run
+started on a shared store before atomic kept runs' projects is no project's:
+none of these commands shows it or its gates, so it cannot get past a gate it
+waits at; start it again as a new run with `atomic run`. A broken manifest stops
+these commands too, and leaves the runs and gates where they are until it is
+mended. A gate decision still comes only from a person's enrolled credential.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.

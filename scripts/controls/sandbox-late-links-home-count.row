@@ -1,0 +1,1 @@
+sandbox-late-links-home-count|crates/atomic-core/src/codex.rs|    let count = held.len() + aliases + mounted + home_mounts;|    let count = held.len() + aliases + mounted; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model the_cap_counts_the_second_mounts_of_what_is_denied_and_of_codex_home

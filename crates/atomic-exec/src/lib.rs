@@ -145,6 +145,12 @@ pub struct Command {
     /// confines it; with none, it has no network at all. A backend that does
     /// not confine its commands ignores it.
     pub network: Vec<String>,
+    /// Directories it may neither read nor write, apart from the
+    /// [`writable`](Self::writable) ones inside them, when its backend
+    /// confines it: its workspace's [`denied`](Workspace::denied), the
+    /// backend's scratch directories, so it reads no other attempt's. A
+    /// backend that does not confine its commands ignores it.
+    pub denied: Vec<PathBuf>,
     /// Variables it gets on a socket instead of in its environment, which
     /// another process of the same user can read through /proc until the
     /// program has made itself non-dumpable: see [`SecretEnv`]. Only a
@@ -237,9 +243,10 @@ impl SecretEnv {
 /// sandbox, so a backend elsewhere is free to confine its own way.
 pub trait Confine: Send + Sync {
     /// The command that runs `command` confined. It must run `command` with
-    /// exactly its environment and in its directory, and let it write only
+    /// exactly its environment and in its directory, let it write only
     /// [`Command::writable`], except [`Command::read_only`] inside them,
-    /// which it may only read. `tmp` is the backend's private temporary
+    /// which it may only read, and keep it out of [`Command::denied`] apart
+    /// from the writable directories inside them. `tmp` is the backend's private temporary
     /// directory, where the sandbox may keep records of its own.
     fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
 
