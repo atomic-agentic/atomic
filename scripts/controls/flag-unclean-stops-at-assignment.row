@@ -1,0 +1,1 @@
+flag-unclean-stops-at-assignment|crates/atomic-core/src/redact.rs|        if starts_word && assignment_at(rest, i) {|        if false /*CONTROL_OFF*/ && starts_word && assignment_at(rest, i) {|-p atomic-agentic-core --lib redact::tests::assignments_after_flags_keep_their_values_hidden

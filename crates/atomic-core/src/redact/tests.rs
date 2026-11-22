@@ -3090,3 +3090,37 @@ fn an_unclean_value_is_not_cut_after_an_assignment() {
     let line = format!("sh -c \"x --token [a,api_key='{credential}'\"");
     assert!(!text(&line).contains(&credential[4..]), "the value showed");
 }
+
+/// An unclean flag value stops before an assignment after it, a separator
+/// alone is no flag's value, and quotes ambiguous only across lines hide
+/// the text: in each, the assignment's value or the flag's stays hidden,
+/// as text and in held JSON.
+#[test]
+fn assignments_after_flags_keep_their_values_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("echo \"--token [a, b] api_key= '{credential}'\""),
+        format!("echo \"--token [a, b] token: '{credential}'\""),
+        format!("echo \"--password , token: '{credential}'\""),
+        format!("echo \"--token [a, b] token => '{credential}'\""),
+        format!("--auth , API_KEY= -p{credential}"),
+        format!("echo \"--auth , API_KEY= -p{credential}\""),
+        format!("sh -c 'login --password : {credential}'"),
+        format!("sh -c 'login --password = {credential}'"),
+        format!("--name\n\"login --auth-token \"{credential}\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = json!({"key": json!({"cmd": line}).to_string()});
+        value(&mut held);
+        assert!(
+            !held.to_string().contains(&credential[4..]),
+            "case {case}: shown in held JSON"
+        );
+    }
+}

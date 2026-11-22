@@ -1355,7 +1355,10 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
         }
         return captures[0].to_string();
     }
-    if !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
+    // A separator of an assignment, `--password = x`, is no value: the
+    // pair is left to the reading of assignments.
+    let separator = [":", "=", "=>", ":="].contains(&raw);
+    if separator || !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
         return captures[0].to_string();
     }
     // A run of backslashes a bare value ends in escapes the quote after it.
@@ -1441,19 +1444,22 @@ fn hide_ambiguous_lines(input: &str) -> Option<String> {
     if !quotes_nest_ambiguously(input) {
         return None;
     }
-    Some(
-        input
-            .split_inclusive('\n')
-            .map(|line| {
-                let body = line.trim_end_matches(['\n', '\r']);
-                if quotes_nest_ambiguously(body) {
-                    format!("{REDACTED}{}", &line[body.len()..])
-                } else {
-                    line.to_owned()
-                }
-            })
-            .collect(),
-    )
+    let mut hidden = false;
+    let lines: String = input
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\n', '\r']);
+            if quotes_nest_ambiguously(body) {
+                hidden = true;
+                format!("{REDACTED}{}", &line[body.len()..])
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    // Ambiguous only across lines, a flag on one and its value on the
+    // next: no line alone can be hidden for it, so all of it is.
+    Some(if hidden { lines } else { REDACTED.to_owned() })
 }
 
 /// The quoted value `rest` starts with, plain or escaped, closed by the
@@ -1625,12 +1631,18 @@ impl LastQuote {
 /// after a space, the end of the line, or the quote that ends the string
 /// the flag is in, escaped as the nearest quote before the flag
 /// (`enclosing`) is or less, and not its backslashes; to the end if there
-/// is none. Never just past a `=` or `:`, which would leave the name it
-/// assigns hidden and its value bare.
+/// is none. Never past the start of an assignment, or just past a `=` or
+/// `:`, which would leave the name it assigns hidden and its value bare.
 fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
     let bytes = rest.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
+        // A word that starts an assignment, `api_key= x`, `token => x`, is
+        // left to the reading of assignments, which hides its value.
+        let starts_word = i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b',' | b'[' | b'{');
+        if starts_word && assignment_at(rest, i) {
+            return i;
+        }
         match bytes[i] {
             b'\n' => return i,
             b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return i,
@@ -1648,6 +1660,15 @@ fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
         i += 1;
     }
     bytes.len()
+}
+
+/// Whether the word of `text` at `at` starts an assignment (see
+/// [`word_starts_assignment`]).
+fn assignment_at(text: &str, at: usize) -> bool {
+    let end = text[at..]
+        .find(|c: char| c.is_whitespace())
+        .map_or(text.len(), |n| at + n);
+    word_starts_assignment(text, at, end)
 }
 
 /// Whether a quoted value reads as more than one: it assigns a name,

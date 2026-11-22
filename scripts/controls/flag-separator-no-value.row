@@ -1,0 +1,1 @@
+flag-separator-no-value|crates/atomic-core/src/redact.rs|    let separator = [":", "=", "=>", ":="].contains(&raw);|    let separator = false; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::assignments_after_flags_keep_their_values_hidden
