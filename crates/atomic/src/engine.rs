@@ -535,7 +535,7 @@ pub async fn open(
     // code to one before it starts. So no repository of the project is offered
     // here whatever git would say about it, and what git does say about it is
     // asked where a run that names no fixture is refused, so that refusal can
-    // tell a project in no repository from one git could not read (see
+    // tell a directory git refused from one git could not be asked about (see
     // `runs::bind_fixture`).
     let worktrees = ProjectWorktrees::FixtureOnly;
     let mut rt = Durare::open(
