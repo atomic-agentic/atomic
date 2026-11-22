@@ -17,7 +17,7 @@ guarding test can stop it failing; or changes anything under the row's
 test code that crate's targets share (crates/<c>/tests/support/, fixtures/
 and the like: a directory there that is no one target's), or a shared test
 helper outside tests/ that scripts/controls-shared.txt lists for the row (by
-its --test target or a feature it turns on). The rows
+its --test target, a feature it turns on or a package it builds). The rows
 are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
@@ -251,7 +251,9 @@ def shared_test_crates(base, head, changed):
 def shared_helpers(head):
     """The test helpers outside crates/<c>/tests/ that scripts/controls-shared.txt
     lists, each with the rows it serves: `--test` for every row with a --test
-    target, `feature=<name>` for every row whose --features carry <name>. A
+    target, `feature=<name>` for every row whose features turn <name> on
+    (--all-features turns every one on), `package=<name>` for every row that
+    builds that package (--workspace, or no package named, builds them all). A
     line the script cannot read, or a helper that is not there, is refused:
     a stale line would select nothing."""
     if not exists(head, SHARED):
@@ -264,10 +266,11 @@ def shared_helpers(head):
         path, colon, serves = line.partition(":")
         path, words = posixpath.normpath(path.strip()), serves.split()
         if not colon or not path or not words:
-            raise Refused(f"{SHARED}:{n}: '{line}' is not '<path>: <--test or feature=<name>> ...'")
+            raise Refused(f"{SHARED}:{n}: '{line}' is not '<path>: <--test, feature=<name> or package=<name>> ...'")
         for word in words:
-            if word != "--test" and not (word.startswith("feature=") and len(word) > len("feature=")):
-                raise Refused(f"{SHARED}:{n}: '{word}' is neither --test nor feature=<name>")
+            kind, equals, value = word.partition("=")
+            if word != "--test" and not (equals and kind in ("feature", "package") and value):
+                raise Refused(f"{SHARED}:{n}: '{word}' is none of --test, feature=<name> and package=<name>")
         if not exists(head, path):
             raise Refused(f"{SHARED}:{n}: names {path}, which is not there")
         helpers.setdefault(path, set()).update(words)
@@ -275,26 +278,57 @@ def shared_helpers(head):
 
 
 def features(args):
-    """The features a row's cargo arguments turn on, each by its own name."""
+    """The features a row's cargo arguments turn on, each by its own name,
+    and whether they turn on every feature (--all-features)."""
+    words = args.split()
+    before = words[: words.index("--")] if "--" in words else words
+    named, every = set(), False
+    for i, a in enumerate(before):
+        value = None
+        if a in ("--features", "-F") and i + 1 < len(before):
+            value = before[i + 1]
+        elif a.startswith("--features="):
+            value = a[len("--features=") :]
+        elif a.startswith("-F") and a != "-F":
+            value = a[2:].lstrip("=")
+        elif a == "--all-features":
+            every = True
+        for feature in (value or "").replace(",", " ").split():
+            named.add(feature.rsplit("/", 1)[-1])
+    return named, every
+
+
+def packages(args):
+    """The packages a row's cargo arguments build, or None for any of them
+    (--workspace, or no package named, which is the workspace's own)."""
     words = args.split()
     before = words[: words.index("--")] if "--" in words else words
     named = set()
     for i, a in enumerate(before):
-        value = None
-        if a == "--features" and i + 1 < len(before):
-            value = before[i + 1]
-        elif a.startswith("--features="):
-            value = a[len("--features=") :]
-        for feature in (value or "").replace(",", " ").split():
-            named.add(feature.rsplit("/", 1)[-1])
-    return named
+        if a == "--workspace" or a == "--all":
+            return None
+        if a in ("-p", "--package") and i + 1 < len(before):
+            named.add(before[i + 1])
+        elif a.startswith("--package="):
+            named.add(a[len("--package=") :])
+        elif a.startswith("-p") and a != "-p":
+            named.add(a[2:].lstrip("="))
+    return named or None
 
 
 def serves(row, words):
     """Whether a helper serving `words` serves the row."""
     if "--test" in words and test_targets(row["args"]):
         return True
-    return any(word[len("feature=") :] in features(row["args"]) for word in words if word.startswith("feature="))
+    turned_on, every = features(row["args"])
+    for word in words:
+        if word.startswith("feature=") and (every or word[len("feature=") :] in turned_on):
+            return True
+    built = packages(row["args"])
+    for word in words:
+        if word.startswith("package=") and (built is None or word[len("package=") :] in built):
+            return True
+    return False
 
 
 def selects(row, changed, contents, shared, head):

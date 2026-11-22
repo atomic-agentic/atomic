@@ -271,7 +271,9 @@ no one target's, or a file there that is not Rust), every row whose
 `tests/` that `scripts/controls-shared.txt` lists (the fake model in
 `crates/atomic-core/src/testing.rs`, the Postgres test schema in
 `crates/atomic-durable/src/testing.rs`), every row the list says it serves:
-each with a `--test` target, or each whose features turn on the one named. The script fails on a row file it cannot
+each with a `--test` target, each whose features turn on the one named, or
+each that builds a package named, since a crate's own unit tests and those of
+the crates that turn its test features on compile the helper too. The script fails on a row file it cannot
 read, and on a row file deleted while its switch's text is still in some
 file, rows aside, that no other row switches it in: a control whose code
 remains, renamed or moved included, keeps its row.

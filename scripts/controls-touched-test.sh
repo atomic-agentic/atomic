@@ -283,6 +283,35 @@ commit
 run
 expect "a helper serving a feature, named in a list of features" "$(printf 'q\nr')"
 
+helper_fixture 'package=h'
+printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+commit
+run
+expect "a helper serving a package: its rows and the workspace's" "$(printf 'p\nq\nr')"
+off package 'if word.startswith("package=") and (built is None' 'if False and (built is None'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the package rule off, a change to the helper still selected: ${OUT}"
+unset SCRIPT
+
+# Each way cargo is told a feature turns it on.
+for spelling in '-F fake-model' '-Ffake-model' '-F=fake-model' '--features=y/fake-model' '--all-features'; do
+    helper_fixture 'feature=fake-model'
+    git rm -q scripts/controls/p.row scripts/controls/q.row
+    echo "s|src/other.rs|fn other|fn o4|-p h --lib ${spelling} -- test_s" >scripts/controls/s.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+    commit
+    run
+    expect "a feature turned on with ${spelling}" "s"
+done
+
+helper_fixture '--test'
+printf 'crates/h/src/testing.rs: feature=\n' >scripts/controls-shared.txt
+commit
+run
+refused "a helper line naming an empty feature" "'feature=' is none of --test"
+
 helper_fixture '--test'
 git rm -q crates/h/src/testing.rs
 commit
@@ -293,13 +322,13 @@ helper_fixture '--test'
 printf 'crates/h/src/testing.rs: everything\n' >scripts/controls-shared.txt
 commit
 run
-refused "a helper line serving what is not known" "'everything' is neither --test nor feature=<name>"
+refused "a helper line serving what is not known" "'everything' is none of --test, feature=<name> and package=<name>"
 
 helper_fixture '--test'
 printf 'crates/h/src/testing.rs\n' >scripts/controls-shared.txt
 commit
 run
-refused "a helper line serving nothing" "is not '<path>: <--test or feature=<name>> ...'"
+refused "a helper line serving nothing" "is not '<path>: <--test, feature=<name> or package=<name>> ...'"
 
 shared_fixture
 printf 'data, changed\n' >crates/m/tests/fixtures/one.txt
