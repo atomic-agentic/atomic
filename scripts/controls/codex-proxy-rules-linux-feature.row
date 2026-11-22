@@ -1,0 +1,1 @@
+codex-proxy-rules-linux-feature|crates/atomic-core/src/lite.rs|            (true, true) => Self::CodexVariables,|            (true, true) => Self::Variables,|-p atomic-agentic-core --lib --features fake-model a_codex_atoms_proxy_rules_follow_the_platform_and_the_feature

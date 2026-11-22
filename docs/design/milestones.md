@@ -1078,8 +1078,8 @@ as a pair; and a cassette key built from the complete effective request.
   input read from a file, from standard input or from `--data` becomes the
   same run input.
 - A change to validation alone reuses earlier results, labelled as historical,
-  while a change to prepared context, generation schema, tool fixtures or model
-  settings makes the recording unusable.
+  while a change to generation schema or model settings makes the recording
+  unusable.
 - `atomic run` returns the same result whether the target is named from inside
   the project or given as a path from elsewhere.
 
@@ -1094,7 +1094,15 @@ prompt snapshots for `atomic render` along with `--as` and `--org` to render
 for a given principal and organization, the `--plan` preview, the
 `--effects preview` mode and variants. Workspace
 member discovery and shared schema and name resolution are already built and
-are not part of this work. The full M39 acceptance applies.
+are not part of this work. The full M39 acceptance applies, with one clause
+moved here from M39a: in v0.1 no tool definition and no prepared value reaches
+a recorded request, so only M39b can show that editing them throws a recording
+away.
+
+**Acceptance:**
+
+- A change to prepared context or to a tool fixture makes the recording
+  unusable.
 
 ## M40: Learning loop
 

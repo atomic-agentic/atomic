@@ -77,28 +77,171 @@ pub fn model_client(
     builder.build().context("build the HTTP client")
 }
 
-/// Whether `base_url` is plain `http` to this machine: a loopback address,
-/// an unspecified one (`0.0.0.0` or `[::]`, which connect here), either as
-/// an IPv4-mapped IPv6 address, or `localhost`.
+/// Whether `base_url` is plain `http` to this machine: see
+/// [`http_loopback_host`].
 pub(crate) fn http_loopback(base_url: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(base_url) else {
-        return false;
+    http_loopback_host(base_url).is_some()
+}
+
+/// How a Codex atom's model client finds its proxy, which decides what
+/// [`proxied_key`] can know of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProxyRules {
+    /// The proxy variables, as reqwest reads them: Linux, with Codex's
+    /// default.
+    Variables,
+    /// The proxy variables, as Codex's own resolver reads them: Linux, with
+    /// Codex's `respect_system_proxy` feature on, which finds no platform
+    /// settings there.
+    CodexVariables,
+    /// The proxy variables, and else the platform's settings, with
+    /// `NO_PROXY` applied to both: another platform, with Codex's default.
+    VariablesOrPlatform,
+    /// The platform's settings and their own bypass list, which atomic
+    /// cannot read, `NO_PROXY` not applied: another platform, with
+    /// `respect_system_proxy` on.
+    Platform,
+}
+
+impl ProxyRules {
+    /// The rules on Linux (`linux`) or elsewhere, with Codex's
+    /// `respect_system_proxy` feature on or off.
+    pub fn for_codex(linux: bool, respect_system_proxy: bool) -> Self {
+        match (linux, respect_system_proxy) {
+            (true, false) => Self::Variables,
+            (true, true) => Self::CodexVariables,
+            (false, false) => Self::VariablesOrPlatform,
+            (false, true) => Self::Platform,
+        }
+    }
+}
+
+/// Why a model call carrying a key to `base_url` would hand that key to a
+/// proxy in cleartext, if it would or may: the endpoint is plain `http` on
+/// this machine (see [`http_loopback_host`]) and, by `rules`, the client
+/// would or may send the call by a proxy. A Codex atom's client cannot be
+/// told to skip proxies, so its turn is refused rather than sent.
+///
+/// Whether the variables `var` reads name a proxy for the call is asked of
+/// the matcher reqwest's client uses, built from them as the rules read
+/// them. Where the platform's settings may also name one, the call is
+/// refused unless `NO_PROXY` exempts the host, and where they alone decide,
+/// it is always refused, since what they would do cannot be asked.
+pub fn proxied_key(
+    base_url: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+    rules: ProxyRules,
+) -> Option<String> {
+    use hyper_util::client::proxy::matcher::Matcher;
+    let host = http_loopback_host(base_url)?;
+    // The URI as the client sends it: parsed, so normalized, first. One that
+    // does not parse is never sent, so there is nothing to refuse.
+    let uri: http::Uri = reqwest::Url::parse(base_url).ok()?.as_str().parse().ok()?;
+    let plain = format!("the model endpoint {base_url} is plain http on this machine");
+    let fix = format!("set NO_PROXY to include {host}, or use an https endpoint");
+    if rules == ProxyRules::Platform {
+        return Some(format!(
+            "{plain}, and Codex's respect_system_proxy feature has the system's proxy settings, \
+             which atomic cannot read and NO_PROXY does not change, decide whether a proxy \
+             carries its API key in cleartext; turn respect_system_proxy off, or use an https \
+             endpoint"
+        ));
+    }
+    // The first variable of each pair that is set, even empty, is the one
+    // read: reqwest's rule, and Codex's resolver's.
+    let first = |names: [&'static str; 2]| {
+        names
+            .into_iter()
+            .find_map(|name| var(name).map(|value| (name, value)))
     };
-    let Some(host) = url.host_str().filter(|_| url.scheme() == "http") else {
-        return false;
+    let http = first(["HTTP_PROXY", "http_proxy"]);
+    let all = first(["ALL_PROXY", "all_proxy"]);
+    let no = first(["NO_PROXY", "no_proxy"])
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    let exempt = Matcher::builder()
+        .http("proxy.invalid:3128")
+        .no(no.as_str())
+        .build()
+        .intercept(&uri)
+        .is_none();
+    let named = |from: &str| {
+        Some(format!(
+            "{plain}, and {from} names a proxy that would carry its API key there in cleartext; \
+             {fix}"
+        ))
     };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if rules == ProxyRules::CodexVariables {
+        // Codex's resolver takes the HTTP_PROXY pair's value, else the
+        // ALL_PROXY pair's, when it is not empty, as the one proxy for every
+        // scheme, and parses it more leniently than the matcher below would
+        // (it trims spaces and drops tabs and line breaks). Any value it
+        // takes counts as naming a proxy: one Codex cannot use fails its
+        // client before anything is sent, so refusing it costs nothing.
+        let taken = [&http, &all]
+            .into_iter()
+            .flatten()
+            .find(|(_, value)| !value.is_empty());
+        return match taken {
+            Some((from, _)) if !exempt => named(from),
+            _ => None,
+        };
+    }
+    let value = |pair: &Option<(&str, String)>| pair.as_ref().map(|(_, v)| v.clone());
+    let matcher = Matcher::builder()
+        .http(value(&http).unwrap_or_default())
+        .all(value(&all).unwrap_or_default())
+        .no(no.as_str())
+        .build();
+    if matcher.intercept(&uri).is_some() {
+        // The variable the proxy came from: HTTP_PROXY's pair when it names
+        // one, else ALL_PROXY's.
+        let from = [http, all]
+            .into_iter()
+            .flatten()
+            .find(|(_, value)| {
+                Matcher::builder()
+                    .http(value.as_str())
+                    .build()
+                    .intercept(&uri)
+                    .is_some()
+            })
+            .map_or("a proxy variable", |(name, _)| name);
+        return named(from);
+    }
+    if rules == ProxyRules::VariablesOrPlatform && !exempt {
+        return Some(format!(
+            "{plain}, and the system's proxy settings, which atomic cannot read, may carry its \
+             API key to a proxy in cleartext; {fix}"
+        ));
+    }
+    None
+}
+
+/// The host of `base_url` as the client matches it against `NO_PROXY`
+/// (lower case, an address without brackets, a trailing dot kept), when it
+/// is plain `http` to this machine: a loopback address, an unspecified one
+/// (`0.0.0.0` or `[::]`, which connect here), either as an IPv4-mapped IPv6
+/// address, or `localhost`.
+fn http_loopback_host(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str().filter(|_| url.scheme() == "http")?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
     let here = |ip: std::net::IpAddr| ip.is_loopback() || ip.is_unspecified();
-    match host.parse::<std::net::IpAddr>() {
+    let local = match host.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| here(v4.into())) => {
             true
         }
         Ok(ip) => here(ip),
         Err(_) => {
-            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            let name = host.trim_end_matches('.');
             name == "localhost" || name.ends_with(".localhost")
         }
-    }
+    };
+    local.then_some(host)
 }
 
 /// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
