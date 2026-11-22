@@ -1062,6 +1062,26 @@ fn assigned(input: &str) -> Option<String> {
         let Some((value_from, mut value_to)) = value_after(input, start) else {
             continue;
         };
+        // What the operating system said of the path before it, as Rust
+        // writes it, `Permission denied (os error 13)`: no secret, whatever
+        // the path's last name is. Only a bare value set off by a blank, as
+        // `path: Permission denied` is: a quoted one runs to its closing
+        // quote, and whatever follows the error in it is the value's; and
+        // one written hard against its name, `passwd:Permission denied …`,
+        // or inside `Some(`, is no error message's shape. The byte after the
+        // separator is tested itself, since `value_start` skips `Some(` too.
+        // Never under a name a header's name ends, as the header rule finds
+        // one, such as `proxy-authorization` or `X-Authorization`: what a
+        // header holds is a credential, however it reads, and a later pass
+        // over the same text, such as a JSON string's own, takes what this
+        // one hid as the header's credential and hides the rest with it.
+        let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
+        let header = ends_in_header(&input[name_start..name_end]);
+        let bare = value_from == start && set_off && !header;
+        if bare && is_os_error(&input[value_from..]) {
+            at = at.max(value_to);
+            continue;
+        }
         // `authorization=Bearer abc`: the scheme and its credential.
         let value = &input[value_from..value_to];
         if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
@@ -1086,6 +1106,50 @@ fn assigned(input: &str) -> Option<String> {
     }
     out.push_str(&input[copied..]);
     Some(out)
+}
+
+/// What the operating system says of a failed file or socket operation, as
+/// Rust's `io::Error` writes it: one of these words, then ` (os error N)`.
+/// Only these exact words, so nothing else that ends in such a suffix is
+/// taken for one.
+const OS_ERRORS: &[&str] = &[
+    "Permission denied",
+    "Operation not permitted",
+    "No such file or directory",
+    "Not a directory",
+    "Is a directory",
+    "File exists",
+    "Directory not empty",
+    "Read-only file system",
+    "Too many levels of symbolic links",
+    "No space left on device",
+    "Device or resource busy",
+    "Resource busy",
+    "Text file busy",
+    "Input/output error",
+    "Bad file descriptor",
+    "Invalid argument",
+    "No such device or address",
+    "File name too long",
+    "Resource temporarily unavailable",
+    "Connection refused",
+];
+
+/// Whether `byte` is a space or a tab.
+fn is_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
+fn is_os_error(text: &str) -> bool {
+    OS_ERRORS.iter().any(|words| {
+        text.strip_prefix(words)
+            .and_then(|rest| rest.strip_prefix(" (os error "))
+            .is_some_and(|rest| {
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                digits > 0 && rest.as_bytes().get(digits) == Some(&b')')
+            })
+    })
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
@@ -1692,9 +1756,7 @@ fn header_named(name: &str) -> Option<&str> {
     } else {
         name.rsplit('.').next().unwrap_or(name)
     };
-    [name, last]
-        .into_iter()
-        .find(|n| HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)))
+    [name, last].into_iter().find(|n| is_header_name(n))
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1882,6 +1944,26 @@ fn key_looks_like_credential(key: &str) -> bool {
         .is_some_and(|(user, host)| !user.is_empty() && host.contains('.'));
     !(is_not_a_secret(key) || email || key.split(['-', '_', '.', '/', ':']).all(word))
         && looks_like_credential(key)
+}
+
+/// Whether `name` is one of [`HEADERS`], in any case.
+fn is_header_name(name: &str) -> bool {
+    HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether `name` ends, in any case, with one of [`HEADERS`] that starts at
+/// a word boundary, as the header rule finds a header's name inside a longer
+/// one: `X-Authorization`, `http.proxy-authorization`, not `Xauthorization`.
+fn ends_in_header(name: &str) -> bool {
+    HEADERS.iter().any(|h| {
+        let Some(at) = name.len().checked_sub(h.len()) else {
+            return false;
+        };
+        let word_before = name.as_bytes()[..at]
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(h) && !word_before
+    })
 }
 
 /// Header names whose values are credentials.
