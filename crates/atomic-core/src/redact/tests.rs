@@ -2614,3 +2614,34 @@ fn a_flag_value_no_reading_takes_whole_is_hidden_on() {
         );
     }
 }
+
+/// Quotes nested at one escaping depth that no reading can pair, around a
+/// secret-named flag's value, hide the text they are in whole: a flag's
+/// quoted value that cuts off the value of a secret-named flag inside it,
+/// or one that runs straight on into a flag.
+#[test]
+fn quotes_nested_at_one_depth_hide_their_text_whole() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("sh --name \"login sh --cmd \\\"login --auth-token \\\"{credential}\"\\\" --name"),
+        format!("run x sh -p \\\"login --password \\\"{credential} --secret now"),
+        format!("--cmd \\\"sh --secret \\\"login [\"-c\", \"{credential}\"]"),
+        format!("run \\\"sh --auth-token \"login [\"--pw\",\"{credential}\"]\", now"),
+        format!("run \\\"sh --token \\\"login --auth-token \\\"{credential}\\\"\\\"now"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(text(&line), REDACTED, "case {case}: not hidden whole");
+        let mut out = json!({"arguments": json!({"cmd": line}).to_string()});
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in JSON"
+        );
+    }
+    // Quotes that pair, around a secret flag inside a command, keep the
+    // text.
+    let paired = "sh -c \"login --password hunter2\" now";
+    assert_ne!(text(paired), REDACTED);
+}

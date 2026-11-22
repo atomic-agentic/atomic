@@ -305,10 +305,14 @@ static FLAG_AT_START: LazyLock<Regex> =
     LazyLock::new(|| regex(&format!("^(?:{})", flag_pattern())));
 fn flag_pattern() -> String {
     format!(
-        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["']))({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*){separator})({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+        separator = FLAG_SEPARATOR,
         escaped = escaped_quoted(),
     )
 }
+/// What separates a flag from its value: space, or the escaped or plain
+/// quotes and comma between two items of an argument list.
+const FLAG_SEPARATOR: &str = r#"(?:\s+|\\*["']\s*,\s*\\*["'])"#;
 /// The alternatives of [`FLAG`]'s value for one in escaped quotes, `\"x\"`
 /// or `\\\"x\\\"`, tried before a bare value would take the backslash:
 /// closed by the first quote after it, which must be escaped as the opening
@@ -338,7 +342,9 @@ static FLAG_UNESCAPED: LazyLock<Regex> = LazyLock::new(|| {
 });
 /// A flag and what separates it from its value, as [`FLAG`] reads them.
 static FLAG_HEAD: LazyLock<Regex> = LazyLock::new(|| {
-    regex(r#"(?:^|[\s"'\[,])--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["'])"#)
+    regex(&format!(
+        r#"(?:^|[\s"'\[,])--?([A-Za-z0-9][A-Za-z0-9-]*){FLAG_SEPARATOR}"#
+    ))
 });
 /// An authorization, cookie or API key header and its value, to the end of
 /// the line or the quote around it.
@@ -1220,6 +1226,86 @@ fn redact_unescaped_flag(captures: &Captures<'_>) -> String {
     redact_flag_within(captures, 0)
 }
 
+/// Whether `input` nests quotes at one escaping depth so that no reading
+/// can pair them: a flag's quoted value holds a secret-named flag whose own
+/// value the quote closing the outer one cuts off, or opens a quote
+/// nothing in it closes; or a quoted value closes on a quote that runs
+/// straight on into a flag (any flag after a secret's value, a
+/// secret-named one after another's). Such text is hidden whole, as
+/// reading it as written would.
+fn quotes_nest_ambiguously(input: &str) -> bool {
+    FLAG_HEAD.captures_iter(input).any(|head| {
+        let Some(whole) = head.get(0) else {
+            return false;
+        };
+        let Some((inner, all)) = quoted_prefix(&input[whole.end()..]) else {
+            return false;
+        };
+        // A quoted value closed by a quote that runs straight on into a
+        // flag, `"login ["--pw", "x"]"`: the closing quote opens a value
+        // inside it. A secret's value so closed is ambiguous whatever flag
+        // follows; another's, when a secret-named one does.
+        let after = &input[whole.end() + all.len()..];
+        let attached = if strength(&head[1]) == Strength::None {
+            secret_flag_at(after)
+        } else {
+            starts_flag(after.as_bytes())
+        };
+        if attached {
+            return true;
+        }
+        FLAG_HEAD.captures_iter(inner).any(|nested| {
+            let Some(at) = nested.get(0) else {
+                return false;
+            };
+            if strength(&nested[1]) == Strength::None {
+                return false;
+            }
+            let value = &inner[at.end()..];
+            value.is_empty()
+                || (value.trim_start_matches('\\').starts_with(['"', '\''])
+                    && quoted_prefix(value).is_none())
+        })
+    })
+}
+
+/// Whether `text` starts with a secret-named flag, `--password` say.
+fn secret_flag_at(text: &str) -> bool {
+    let name = text.trim_start_matches('-');
+    let dashes = text.len() - name.len();
+    let end = name
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(name.len());
+    (1..=2).contains(&dashes)
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && strength(&name[..end]) != Strength::None
+}
+
+/// The quoted value `rest` starts with, plain or escaped, closed by the
+/// first quote of the same kind escaped alike on its line: what it holds,
+/// and all of it.
+fn quoted_prefix(rest: &str) -> Option<(&str, &str)> {
+    let escapes = rest.len() - rest.trim_start_matches('\\').len();
+    let quote = rest[escapes..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))?;
+    let body = &rest[escapes + 1..];
+    let line = body.find('\n').map_or(body, |end| &body[..end]);
+    let mut from = 0;
+    while let Some(at) = line[from..].find(quote) {
+        let close = from + at;
+        let run = line[..close].len() - line[..close].trim_end_matches('\\').len();
+        if run == escapes {
+            let inner = &line[..close - run];
+            let end = escapes + 1 + close + 1;
+            return Some((inner, &rest[..end]));
+        }
+        from = close + 1;
+    }
+    None
+}
+
 /// Read once more each secret-named flag's value, and hide what follows
 /// the flag where the flag readings left no clean value: one that starts with a bracket or a comma, opens a quote
 /// that no quote escaped alike closes, or runs on into more than a value.
@@ -1477,6 +1563,9 @@ fn read_strength(name: &str, written: bool) -> Strength {
 
 /// One reading of `input` by every text rule (see [`text`]).
 fn text_once(input: &str) -> Cow<'_, str> {
+    if quotes_nest_ambiguously(input) {
+        return Cow::Owned(REDACTED.to_owned());
+    }
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
