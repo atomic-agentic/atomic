@@ -625,6 +625,16 @@ off include-links 'for dependency in included_paths(commit, name, path, modes):'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with link resolution off, the missing target was not exposed: ${OUT}"
 unset SCRIPT
+BASE="$(git rev-parse HEAD)"
+git rm -q crates/k/src/word
+commit
+run
+expect "deleting a linked input retains the base-tree reader" "alpha"
+BASE="$(git rev-parse HEAD)"
+printf 'restored\n' >crates/k/src/word
+commit
+run
+expect "adding a missing linked input retains its reader" "alpha"
 
 review_fixture 'const V: &str = include_str!("../src/alias/word");'
 mkdir -p crates/k/src/real
