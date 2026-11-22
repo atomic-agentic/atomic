@@ -35,6 +35,7 @@ test budgets
 test change_request
 test change_request_example
 test change_review_helpers
+test catalog_checker
 test coding_tasks
 test command_environment
 test entry_point
@@ -42,6 +43,7 @@ test examples
 test exec_private_state
 test late_links
 test second_mounts
+test stale_roots
 test exec_caches
 test exec_network
 test exec_network_fds
@@ -67,6 +69,8 @@ test git_safety
 test cancelled_open
 test stopping_open
 test worktrees
+test model_client
+test toolset_client
 test dbos_schema
 test executor_identity
 test gates

@@ -998,7 +998,7 @@ async fn run_contract(
     workspace.close().await;
     let (_, report) = conversation.map_err(|e| match crate::usage::meter_failure(&e) {
         // The meter refused the next call: nothing was sent for it.
-        Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
+        Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.clone()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
         None => turn_failure(&e),
     })?;
@@ -1105,6 +1105,9 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
             .or_insert_with(|| scratch.join(".cargo").display().to_string());
     }
     turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
+    // The backend's scratch directories are no turn's to read; a
+    // `workspace-write` turn's own stays its own, as a writable root.
+    spec.denied = workspace.denied.clone();
     // A cache in the temporary directory every turn of the backend shares
     // would outlive the run and reach the next one.
     if let Some(tmp) = &workspace.tmp {
@@ -1933,7 +1936,7 @@ pub async fn run_exec_opened(
         })
         .await
         .map_err(|e| match e {
-            MeterError::Exhausted(why) => AtomError::Budget(why.to_string()),
+            MeterError::Exhausted(why) => AtomError::Budget(why),
             e => AtomError::Runtime(format!("{}: meter its command: {e}", atom.name)),
         })?;
     let time = limit.time_within(EXEC_TIME_LIMIT);
@@ -2048,9 +2051,12 @@ fn cut_off_at_cap(
         bounded_by.unwrap_or("of its atom")
     );
     match atom.external() {
-        Some(_) => AtomError::Budget(format!(
-            "{stopped}; once the cap is raised, it runs again from the start"
-        )),
+        // Like a turn cut off at its reserved time, it names the allowance
+        // that ran out, so a release can raise it.
+        Some(_) => AtomError::Budget(crate::usage::Exhausted {
+            reason: format!("{stopped}; once the cap is raised, it runs again from the start"),
+            scope: bounded_by.map(str::to_owned),
+        }),
         None => AtomError::Runtime(format!(
             "{stopped}: stopped by the minutes cap, and whether its effects happened is \
              unknown. Declare `effects: {{ external: 'idempotent' }}` (or `'read-only'`) for its \

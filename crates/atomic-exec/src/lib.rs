@@ -520,6 +520,10 @@ pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
+    /// Directories its workspaces' commands are kept out of besides its own
+    /// scratch root, such as another backend's scratch root in the same
+    /// project.
+    denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
     checked: Arc<std::sync::OnceLock<()>>,
@@ -531,6 +535,7 @@ impl std::fmt::Debug for LocalBackend {
             .field("scratch_root", &self.scratch_root)
             .field("tmp", &self.tmp)
             .field("confined", &self.confine.is_some())
+            .field("denying", &self.denying)
             .finish()
     }
 }
@@ -563,8 +568,19 @@ impl LocalBackend {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
+    }
+
+    /// The same backend, keeping its workspaces' commands out of `dirs` as
+    /// well as its own scratch root: the scratch roots of the project's other
+    /// backends, so no command of one reads another's attempts. Each is
+    /// created, if missing, when a workspace opens, so it cannot appear
+    /// undenied while a command runs.
+    pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.denying.extend(dirs);
+        self
     }
 
     /// The same backend, running every command under `confine`.
@@ -636,6 +652,7 @@ impl Default for LocalBackend {
             )),
             tmp: base.join(".tmp"),
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
     }
@@ -685,7 +702,7 @@ impl ExecutionBackend for LocalBackend {
             confine.check(&self.tmp)?;
             let _ = self.checked.set(());
         }
-        workspace::open_local(&self.scratch_root, &self.tmp, request)
+        workspace::open_local(&self.scratch_root, &self.tmp, &self.denying, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {

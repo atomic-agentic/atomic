@@ -237,7 +237,8 @@ fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
     )
     .expect("resolves");
     assert_eq!(r.endpoint().expect("an endpoint").base_url, OPENAI_BASE_URL);
-    // A sign-in that cannot be read is said, and detection goes on.
+    // A sign-in that cannot be read is said, and resolution still detects;
+    // a run that calls a model is refused (see `engine::endpoint`).
     let r = resolved_signed_in(
         &d,
         &EngineArgs::default(),
@@ -2009,4 +2010,33 @@ fn a_projects_files_cannot_set_openai_base_url() {
         .unwrap_or_default();
         assert!(refused.contains(key), "{file} set {key}: {refused}");
     }
+}
+
+/// Only the wiring, and nothing about how the directory is read: that
+/// [`Surroundings::here`], which is what a person's run builds, asks
+/// [`atomic_core::state::user_config_dir`] for the person's own configuration
+/// directory — the same function the denial of that directory to every atom's
+/// commands and the refusal of a state directory inside it call — rather than
+/// putting a reading of `XDG_CONFIG_HOME` and `HOME` here.
+///
+/// Both sides read this process's own environment and its own password
+/// database, so what this can see is a person's run asking for a different
+/// *resolution* — other variables, another fallback, none at all — and not for a
+/// different *reading* of the same two, because two readings of one environment
+/// in which every variable is text agree. That the reading itself must be as the
+/// operating system gives it — see a configuration directory whose name is bytes
+/// that are not text as the directory it is, and source the settings in it — is
+/// pinned end to end by
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`
+/// in `crates/atomic/tests/state_cli.rs`, which is the test
+/// `scripts/controls/settings-user-config-dir.row` switches off and runs.
+#[test]
+fn a_persons_run_asks_the_state_for_its_own_configuration_directory() {
+    let here = Surroundings::here();
+    assert_eq!(
+        user_config(here.user_config_dir),
+        atomic_core::state::user_config_dir().map(|dir| dir.join("config.yaml")),
+        "settings do not read the configuration directory the denial and the state \
+         check are made from"
+    );
 }

@@ -750,6 +750,21 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+/// The store of the `notes` project whose state directory is `state`,
+/// opened as atomic opens it, for that project, by its manifest's name and
+/// its state id: what it lists of parks is the project's.
+async fn project_store(state: &Path) -> Durare {
+    let id = state.file_name().expect("a project id").to_string_lossy();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(database(state)),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("notes/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
 /// The database of the project whose state directory is `state`
 /// (`<home>/projects/<id>`): `<home>/private/<id>/atomic.db`.
 fn database(state: &Path) -> PathBuf {
@@ -2090,7 +2105,7 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
             &with(&env, &[]),
             &dir.join("resumed.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "budget-1")
@@ -2709,14 +2724,15 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         .await
         .expect("enrolled");
 
-        // A local serve recovers it.
-        let mut serve = spawn(
+        // A local serve recovers it. Reaped, so that an assertion that
+        // fails below does not leave `atomic serve` running.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         wait_until("serve to start", || {
             std::fs::read_to_string(dir.join("serve.log"))
                 .is_ok_and(|l| l.contains("recovered 1 unfinished run(s); serving until stopped"))
@@ -2743,11 +2759,28 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
         let started = Instant::now();
-        while rt.status("served-gate").await.expect("status") != Some(RunStatus::Succeeded) {
+        loop {
+            let status = rt.status("served-gate").await.expect("status");
+            if status == Some(RunStatus::Succeeded) {
+                break;
+            }
+            let log = || {
+                std::fs::read_to_string(dir.join("serve.log"))
+                    .unwrap_or_else(|e| format!("<no serve log: {e}>"))
+            };
+            // A run that has failed is finished, and not successfully: say
+            // so now, with what it failed as, instead of waiting out the
+            // deadline below.
+            if let Some(RunStatus::Failed(why)) = &status {
+                panic!(
+                    "serve failed the approved run ({status:?}): {why}\nserve log: {}",
+                    log()
+                );
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "serve did not finish the approved run: {}",
-                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+                "serve did not finish the approved run (last status {status:?}): {}",
+                log()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -3378,6 +3411,110 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
         );
         assert_eq!(model.calls(), 3);
     });
+}
+
+/// When Codex cannot make its links to atomic under its helpers' names, as
+/// when another atomic process sweeping the same Codex home takes their
+/// directory away, it runs atomic itself as its Linux sandbox helper: an
+/// exec atom's confined command still runs, rather than its run waiting for
+/// a sandbox that never starts.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
+    support::require_sandbox();
+    let dir = scratch("no-helper-links");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    // Where Codex makes its links, made unusable: a file where their
+    // directory goes.
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        // A sandbox that never starts fails the run soon, not after minutes.
+        &[("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    let said = text(&out);
+    assert!(
+        said.contains("could not create PATH aliases"),
+        "Codex made its links after all: {said}"
+    );
+    assert!(out.status.success(), "{said}");
+    assert_eq!(count_log(&dir), 1, "the command ran once");
+}
+
+/// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
+/// the helper's inner stage by the name it was started under, a program a
+/// command put on `PATH` under the helper's name is never run in its place:
+/// the name is a path that cannot exist, so the run fails at once instead,
+/// saying the helper could not be set up.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn a_helper_run_by_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    support::require_sandbox();
+    let dir = scratch("helper-by-name");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it
+    // is named, looking a bare name up along PATH.
+    script(
+        &dir.join("bwrap/bwrap"),
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(
+            "Codex's Linux sandbox helper could not be set up: what ran in its place was not \
+             the helper (a trial command exited with code 1: bwrap: execvp \
+             /dev/null/codex-linux-sandbox: Not a directory)"
+        ),
+        "{said}"
+    );
 }
 
 /// `atomic run` confines an exec atom's command: through the engine as it
@@ -5408,18 +5545,22 @@ fn signals_ignored_when_serve_starts_stay_ignored() {
     let log = dir.join("serve.log");
     // As `nohup`, and a shell starting a background job, leave them.
     let script = format!("trap '' HUP INT QUIT; exec '{ATOMIC}' serve");
-    let mut serve = command_as(
-        Path::new("/bin/sh"),
-        &dir,
-        &project,
-        &["-c", &script],
-        &UNUSED_MODEL,
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(std::fs::File::create(&log).expect("log"))
-    .spawn()
-    .expect("start serve");
+    // Reaped, so that an assertion that fails below does not leave `atomic
+    // serve` running: the shell execs it, so the child is serve itself.
+    let mut serve = Reaped(
+        command_as(
+            Path::new("/bin/sh"),
+            &dir,
+            &project,
+            &["-c", &script],
+            &UNUSED_MODEL,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("start serve"),
+    );
     wait_until("serve to start", || {
         std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
     });
@@ -6397,7 +6538,7 @@ fn a_budget_in_the_projects_configuration_reaches_its_runs() {
             &with(&env, &[]),
             &dir.join("run.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "configured-1")
@@ -6750,13 +6891,12 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     });
 }
 
-/// A spawned `atomic` process that is killed and reaped when this is
-/// dropped, if it has not ended by then: a test that fails part-way leaves
-/// nothing running on its schema once the schema's guard drops it.
-#[cfg(feature = "postgres-tests")]
+/// A spawned child process — `atomic` itself, or the shell that execs it —
+/// that is killed and reaped when this is dropped, if it has not ended by
+/// then: a test that fails part-way leaves nothing running behind it, and
+/// nothing holding its schema once the schema's guard drops it.
 struct Reaped(Child);
 
-#[cfg(feature = "postgres-tests")]
 impl std::ops::Deref for Reaped {
     type Target = Child;
     fn deref(&self) -> &Child {
@@ -6764,14 +6904,12 @@ impl std::ops::Deref for Reaped {
     }
 }
 
-#[cfg(feature = "postgres-tests")]
 impl std::ops::DerefMut for Reaped {
     fn deref_mut(&mut self) -> &mut Child {
         &mut self.0
     }
 }
 
-#[cfg(feature = "postgres-tests")]
 impl Drop for Reaped {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -7311,6 +7449,118 @@ fn the_debug_prompt_says_its_turn_is_not_metered() {
     });
 }
 
+/// Released parks whose wake-up was lost are redelivered wherever gate
+/// decisions are: when a run is resumed, after a gate decision, when
+/// `atomic serve` starts and every few seconds while it serves. Each
+/// reaches `release:redeliver`, which the failpoint log records.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn every_place_that_redelivers_gate_decisions_redelivers_park_releases() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("redelivered");
+        let project = project(&dir);
+        let mut env = model_env(&model.base_url()).to_vec();
+        env.push(("ATOMIC_CREDENTIAL_STORE", "file".into()));
+        let redelivered = |log: &Path| {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| *l == "release:redeliver")
+                .count()
+        };
+        // A run waiting at its gate, then stopped where it waits.
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "redelivered", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        wait_until("the run to wait at its gate", || {
+            std::fs::read_to_string(dir.join("run.log"))
+                .is_ok_and(|l| l.contains("decide it from a terminal"))
+        });
+        let _ = run.kill();
+        let _ = run.wait();
+        // Resumed.
+        let resumed_log = dir.join("resume.failpoints");
+        let resumed_at = resumed_log.to_string_lossy().into_owned();
+        let mut resumed = spawn(
+            &dir,
+            &project,
+            &["runs", "resume", "redelivered"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &resumed_at)]),
+            &dir.join("resume.log"),
+        );
+        wait_until("the resume to redeliver", || redelivered(&resumed_log) >= 1);
+        let _ = resumed.kill();
+        let _ = resumed.wait();
+        // A gate decided from the command line.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let enrolled = tokio::task::spawn_blocking(move || {
+            let mut script = command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
+            script
+                .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
+                .output()
+                .expect("script")
+        })
+        .await
+        .expect("child");
+        assert!(enrolled.status.success(), "{}", text(&enrolled));
+        let decided_log = dir.join("approve.failpoints");
+        let decided_at = decided_log.to_string_lossy().into_owned();
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let approved = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["gates", "approve", "redelivered:check"],
+                &with(&e, &[("ATOMIC_FAILPOINT_LOG", &decided_at)]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(approved.status.success(), "{}", text(&approved));
+        assert!(
+            redelivered(&decided_log) >= 1,
+            "the gate decision redelivered nothing"
+        );
+        // Served: at start, and again a few seconds later.
+        let served_log = dir.join("serve.failpoints");
+        let served_at = served_log.to_string_lossy().into_owned();
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &served_at)]),
+            &dir.join("serve.log"),
+        );
+        // Once at start, before it says it serves.
+        wait_until("serve to say it serves", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("serving until stopped"))
+        });
+        assert!(
+            redelivered(&served_log) >= 1,
+            "serve redelivered nothing at start"
+        );
+        // And again while it serves.
+        let at_start = redelivered(&served_log);
+        wait_until("serve to redeliver while serving", || {
+            redelivered(&served_log) > at_start
+        });
+        terminate(&serve);
+        let _ = wait_child(&mut serve, "serve");
+    });
+}
+
 /// A copy of `rank-note` named `name`, declaring `trust` if one is given.
 fn ranking_atom(project: &Path, name: &str, trust: Option<&str>) {
     let config = match trust {
@@ -7425,6 +7675,38 @@ fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
         }
         assert_eq!(model.calls(), 2);
     });
+}
+
+/// `atomic parks release` refuses a negative cap before anything, and a
+/// park that does not exist with how to find the ones that do.
+#[test]
+fn a_release_names_what_is_wrong_with_its_park_or_its_cap() {
+    let dir = scratch("parks-refused");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1", "--tokens=-5"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        t.contains("--tokens must be a whole number, zero or more"),
+        "{t}"
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no park no-such-run:1"), "{t}");
+    assert!(t.contains("`atomic parks list`"), "{t}");
 }
 
 /// What a run's input and output carry, as a model's or a command's text
@@ -7570,5 +7852,128 @@ fn the_debug_prompt_escapes_its_answer() {
             );
         }
         assert!(said.contains("Second line."), "{said}");
+    });
+}
+
+/// What the commands of the turn that answered `model`'s first call printed.
+fn first_command_output(model: &FakeModel) -> String {
+    let requests = model.requests();
+    let follow_up = requests.get(1).expect("Codex answered the tool call");
+    follow_up["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A turn of `atomic run` cannot read what an attempt of `atomic debug
+/// codex-prompt` keeps in its scratch directory, nor the other way round: as
+/// atomic wires each command's backend, each denies its turns both of the
+/// project's scratch roots. What each looks for is there all along.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("scratch-roots");
+        let project = project(&dir);
+        let state = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || state_dir(&d, &p))
+                .await
+                .expect("state")
+        };
+        let plant = |root: &str| {
+            let secret = state.join(root).join("planted").join("secret");
+            std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
+            std::fs::write(&secret, format!("secret-in-{root}")).expect("secret");
+            secret
+        };
+        let (in_run, in_debug) = (plant("scratch"), plant("scratch-debug"));
+        let look = |secret: &Path| Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({
+                "cmd": format!("cat '{}' 2>&1; echo cat-exit=$?", secret.display()),
+                "yield_time_ms": 10000,
+            }),
+        };
+
+        // A run's turn looks in the debug prompt's scratch root.
+        write_atom(
+            &project,
+            "look",
+            "description: 'Look.', kind: 'codex'",
+            "Look around.",
+            object(json!({})),
+            object(json!({"done": {"type": "boolean"}})),
+        );
+        let model = FakeModel::start(vec![
+            look(&in_debug),
+            Reply::Text(r#"{"done": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let env = model_env(&model.base_url());
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &["run", "look", "--data", "{}"],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-scratch-debug") && said.contains("cat-exit=1"),
+            "a run's turn read the debug prompt's scratch: {said}"
+        );
+
+        // A debug prompt's turn looks in the runs' scratch root.
+        let model = FakeModel::start(vec![look(&in_run), Reply::Text("Done.".into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &[
+                        "debug",
+                        "codex-prompt",
+                        "--base-url",
+                        &url,
+                        "--model",
+                        "synthetic",
+                        "Look.",
+                    ],
+                    &[],
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-scratch") && said.contains("cat-exit=1"),
+            "a debug prompt's turn read the runs' scratch: {said}"
+        );
+        // The denial kept them out, not the secrets' absence.
+        assert!(in_run.exists() && in_debug.exists());
     });
 }

@@ -1,0 +1,1 @@
+signin-git-out-of-reach|crates/atomic-core/src/state.rs|        Err(e) => !matches!(|        Err(e) => false /*CONTROL_OFF*/ && !matches!(|-p atomic-agentic-core --lib state::tests::a_hard_linked_git_refuses_nothing_and_one_out_of_reach_still_counts

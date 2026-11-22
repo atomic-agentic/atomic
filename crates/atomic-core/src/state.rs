@@ -231,11 +231,19 @@ impl ResolveSide {
                  would be inside your own configuration directory"
                     .into()
             }
+            // Not "missing": a name below the deepest directory that is there
+            // is what placing folds without asking, and is no reason to refuse.
+            // What cannot be placed is a directory no one may enter, a path
+            // through something that is not a directory, a link that leads
+            // nowhere, a link that leads round in a circle, and whatever else
+            // the filesystem says when asked — see [`real_path`], which refuses
+            // on every answer but "not there".
             ResolveSide::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
-                 placed: it, or a directory above it, is missing, cannot be read, or is a link \
-                 that leads nowhere; until then atomic cannot tell whether its state would be \
-                 inside that directory"
+                 placed: it, or a directory above it, cannot be entered, passes through \
+                 something that is not a directory, is a link that leads nowhere, or cannot \
+                 otherwise be looked up; until then atomic cannot tell whether its state \
+                 would be inside that directory"
                     .into()
             }
         }
@@ -379,6 +387,18 @@ impl ProjectState {
         &self.dir
     }
 
+    /// The project's id: its root's last component and a hash of its full
+    /// path, which names its state directory. A store several projects
+    /// share tells their records apart by `<manifest name>/<id>`, so the
+    /// same project checked out at another path, or renamed, is another
+    /// project there.
+    pub fn id(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     /// What is this project's alone: denied to every atom's commands.
     pub fn private_dir(&self) -> PathBuf {
         self.private.clone()
@@ -406,6 +426,30 @@ impl ProjectState {
     /// Codex's home for atom threads.
     pub fn codex_home(&self) -> PathBuf {
         self.dir.join("codex")
+    }
+
+    /// Every scratch root of the project's backends: `atomic run`, `atomic
+    /// serve` and `atomic eval`'s, and that of `atomic debug codex-prompt` and
+    /// `atomic debug probe`, which is apart because those commands take no
+    /// execution lock. Each backend denies its
+    /// workspaces' commands all of them, its own scratch directory excepted.
+    /// A backend with a scratch root of its own must be added here.
+    fn scratch_roots(&self) -> [PathBuf; 2] {
+        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+    }
+
+    /// The local backend `atomic run`, `atomic serve` and `atomic eval` run
+    /// atoms on, its scratch directories in the state directory.
+    pub fn run_backend(&self) -> atomic_exec::LocalBackend {
+        let [run, _] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())
+    }
+
+    /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
+    /// run their turn on, beside the one runs use.
+    pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
+        let [_, debug] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(debug).denying(self.scratch_roots())
     }
 
     /// The file the execution lock is held on.
@@ -657,15 +701,49 @@ pub fn as_it_really_is(path: &Path) -> PathBuf {
 /// Every checkout holding `dir`, a path as it really is: each directory
 /// around it with a `.git`, and for a linked worktree the checkout whose
 /// repository it shares, which its `.git` file names through the
-/// repository's `commondir`. A `.git` or `commondir` that is not a small
-/// regular file, as git writes them, is refused rather than read: the
-/// project supplies both, and a pipe or a device there would hang or fill
-/// memory.
+/// repository's `commondir`. Of this user's own `.git`, a `.git` or
+/// `commondir` that is not a small regular file, as git writes them, is
+/// refused rather than read: a pipe or a device there would hang or fill
+/// memory. Another user's is read through no link and refuses nothing (see
+/// [`checkouts_holding_as`]).
 pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    #[cfg(unix)]
+    let me = Some(effective_uid());
+    #[cfg(not(unix))]
+    let me = None;
+    checkouts_holding_as(dir, me)
+}
+
+/// [`checkouts_holding`], for the user `me` (`None` where files have no
+/// owner to compare).
+///
+/// A `.git` that is there, or that cannot be looked at, makes its directory
+/// a checkout. What a `.git` links to may refuse the project only when it is
+/// this user's own and no hard link another user could have made to a file
+/// of theirs. Any other `.git`, such as one planted in `/tmp` above every
+/// project there, is still followed when it is a regular file that reads as
+/// a worktree's link, so a real worktree written by another user (under
+/// `sudo`, or seen through a user namespace) still holds the project in its
+/// main checkout; but nothing wrong with it refuses anything. The trade-off:
+/// a well-formed plant that names a directory with a `.git` makes that
+/// directory count as a checkout too, refusing a sign-in or a configuration
+/// kept there.
+fn checkouts_holding_as(dir: &Path, me: Option<u32>) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
+    for checkout in dir.ancestors().filter(|d| present(&d.join(".git"))) {
         found.push(checkout.to_owned());
-        if let Some(main) = main_checkout(&checkout.join(".git"))?
+        let git = checkout.join(".git");
+        let main = if answerable(&git, me) {
+            main_checkout(&git, true)?
+        } else if std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_file()) {
+            // Opened through no link at all, the `.git` and its
+            // `commondir` alike: what another user's names is never opened,
+            // a device or a pipe included.
+            main_checkout(&git, false).unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(main) = main
             && !found.contains(&main)
         {
             found.push(main);
@@ -674,22 +752,70 @@ pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(found)
 }
 
+/// Whether there is something at `path`: anything but a lookup that finds
+/// nothing, so one this user cannot make counts.
+fn present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whether what the `.git` at `git` says may refuse the project: it is
+/// `me`'s own, and not a file with other hard links, which another user
+/// could have made to a file of `me`'s.
+fn answerable(git: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        owned_by(git, me)
+            && std::fs::symlink_metadata(git)
+                .is_ok_and(|meta| !(meta.is_file() && meta.nlink() > 1))
+    }
+    #[cfg(not(unix))]
+    owned_by(git, me)
+}
+
+/// Whether `path` itself, not what a link there leads to, is owned by `me`;
+/// with no owner to compare, it counts as owned.
+fn owned_by(path: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(me) = me {
+        use std::os::unix::fs::MetadataExt;
+        return std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == me);
+    }
+    let _ = (path, me);
+    true
+}
+
 /// The most a `.git` file or a `commondir` is read for: a path or two.
 const LINK_FILE_MAX: u64 = 4096;
 
 /// How a link file is opened: without waiting on a pipe's writer, and
 /// never as the process's controlling terminal.
 #[cfg(unix)]
-const LINK_OPEN_FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOCTTY;
+const LINK_OPEN_FLAGS: i32 = NOT_WAITING | libc::O_NOCTTY;
+
+/// What makes an open of a link file not wait on a pipe's writer.
+#[cfg(unix)]
+const NOT_WAITING: i32 = libc::O_NONBLOCK;
+
+/// What makes an open of another user's link file refuse a link where it
+/// ends, so it opens nothing that link names.
+#[cfg(unix)]
+const NOT_THROUGH_A_LINK: i32 = libc::O_NOFOLLOW;
 
 /// The main checkout of the linked worktree whose `.git` is `git`; `None`
 /// for a `.git` directory, a submodule's file (no `commondir`), or a bare
 /// repository.
-fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
+fn main_checkout(git: &Path, through_links: bool) -> Result<Option<PathBuf>, String> {
     if std::fs::metadata(git).is_ok_and(|m| m.is_dir()) {
         return Ok(None);
     }
-    let Some(text) = link_file(git)? else {
+    let Some(text) = link_file(git, through_links)? else {
         return Ok(None);
     };
     let Some(gitdir) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
@@ -699,7 +825,7 @@ fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     };
     let gitdir = parent.join(gitdir.trim());
-    let Some(common) = link_file(&gitdir.join("commondir"))? else {
+    let Some(common) = link_file(&gitdir.join("commondir"), through_links)? else {
         return Ok(None);
     };
     let Ok(common) = std::fs::canonicalize(gitdir.join(common.trim())) else {
@@ -715,7 +841,7 @@ fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
 /// opened without blocking, so a pipe there cannot hang the read, and
 /// refused when it is anything but a regular file of at most
 /// [`LINK_FILE_MAX`] bytes.
-fn link_file(path: &Path) -> Result<Option<String>, String> {
+fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String> {
     use std::io::Read;
     let refused = |why: &str| {
         Err(format!(
@@ -726,7 +852,16 @@ fn link_file(path: &Path) -> Result<Option<String>, String> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, LINK_OPEN_FLAGS);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut open,
+        if through_links {
+            LINK_OPEN_FLAGS
+        } else {
+            LINK_OPEN_FLAGS | NOT_THROUGH_A_LINK
+        },
+    );
+    #[cfg(not(unix))]
+    let _ = through_links;
     let file = match open.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -807,29 +942,45 @@ pub fn user_config_dir() -> Option<PathBuf> {
     user_config_dir_in(&process_env, &process_passwd_home())
 }
 
-/// A variable of this process's environment, as the operating system gives it.
-#[cfg(not(test))]
+// What [`process_env`] and [`process_passwd_home`] answer: this process's own
+// environment and password database, or, in a test run of this crate only, what
+// a test has said they are for its own thread — see [`as_process`], which says
+// it, and [`TestProcessGuard`], which puts this process's own back.
+//
+// The entry point above reads the environment and the password database
+// itself, so without this their *wiring* — that they ask the password database
+// for a home when the environment names none — could be tested only against
+// this machine's user and this process's real environment, which a test must
+// not depend on and must not change under the other tests running beside it.
+// A build that is not this crate's own tests compiles the override away:
+// nothing outside those tests can set it, and no variable, file or atom can.
+
+/// A variable of this process's environment, as the operating system gives it;
+/// for the thread a test runs on, what `as_process` said this thread's
+/// environment holds instead.
 fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .map(|process| process.env.get(name).cloned())
+    }) {
+        return said;
+    }
     std::env::var_os(name)
 }
 
-/// The home this process's user has in the password database.
-#[cfg(not(test))]
+/// The home this process's user has in the password database; for the thread a
+/// test runs on, what `as_process` said the password database gives instead.
 fn process_passwd_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| p.borrow().as_ref().map(|process| process.passwd.clone()))
+    {
+        return said;
+    }
     passwd_home()
 }
 
-// What [`process_env`] and [`process_passwd_home`] answer: this process's own
-// environment and password database, or, in a test run of this crate only, what
-// a test has said they are for its own thread.
-//
-// The two entry points above read the environment and the password database
-// themselves, so without this their *wiring* — that they ask the password
-// database for a home when the environment names none — could be tested only
-// against this machine's user and this process's real environment, which a test
-// must not depend on and must not change under the other tests running beside
-// it. A release build compiles the override away: nothing outside this crate's
-// own tests can set it, and no variable, file or atom can.
 #[cfg(test)]
 thread_local! {
     static PROCESS: std::cell::RefCell<Option<TestProcess>> = const {
@@ -842,22 +993,6 @@ thread_local! {
 struct TestProcess {
     env: std::collections::BTreeMap<String, std::ffi::OsString>,
     passwd: Option<PathBuf>,
-}
-
-#[cfg(test)]
-fn process_env(name: &str) -> Option<std::ffi::OsString> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.env.get(name).cloned(),
-        None => std::env::var_os(name),
-    })
-}
-
-#[cfg(test)]
-fn process_passwd_home() -> Option<PathBuf> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.passwd.clone(),
-        None => passwd_home(),
-    })
 }
 
 /// Say, for this test thread, that the environment holds exactly `vars` — a
@@ -1026,6 +1161,26 @@ pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
 /// needs before it can be compared with anything: [`std::path::absolute`],
 /// which joins the working directory without folding the names that are not
 /// there yet. `None` when the working directory cannot be read.
+///
+/// Most homes a command brings to [`outside_user_config`] are absolute before
+/// they get here: [`atomic_home`] reads a relative `ATOMIC_HOME` from the
+/// working directory itself, and the configuration directory is kept only when
+/// `XDG_CONFIG_HOME`, `HOME` or the password database names an absolute one.
+/// The default data directory is absolute too, except in one case: the platform
+/// rule [`base_dir`] falls back to — `dirs::data_dir` — takes a `HOME` that is
+/// not absolute as the home it gives, so a person who sets a relative `HOME`,
+/// sets no `ATOMIC_HOME` and sets no `XDG_DATA_HOME` gets
+/// `<relative HOME>/.local/share/atomic`, which is relative and comes here as it
+/// stands, read from the working directory like any other relative spelling. So
+/// this is the backstop for a relative
+/// `ATOMIC_HOME` and the live path for that one — and a backstop that must
+/// still work, because a spelling compared unresolved is the one thing that
+/// lets a state into the denied directory. The tests that keep it living are
+/// `a_relative_state_directory_is_placed_from_the_working_directory`, which asks
+/// [`outside_user_config`] itself, with the spelling relative, and
+/// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+/// in `crates/atomic/tests/state_cli.rs`, which is what a command does with a
+/// relative `HOME` and no `ATOMIC_HOME`.
 fn placed(path: &Path) -> Option<PathBuf> {
     std::path::absolute(path).ok()
 }
@@ -1110,6 +1265,36 @@ pub fn passwd_home() -> Option<PathBuf> {
     None
 }
 
+/// The name the password database gives `uid`; `None` when it has no entry
+/// or the name is not UTF-8.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn passwd_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value of the plain C struct.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, both of the
+    // sizes given and alive for the call, and sets `found` to null or to
+    // `entry`.
+    let code = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if code != 0 || found.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` points at a NUL-terminated string inside
+    // `buffer`, which is still alive.
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
+    name.to_str().ok().map(str::to_owned)
+}
+
 /// Make sure `dir` is readable by its owner only: create it so if it is
 /// missing, and close it if it is open to others. A directory already closed
 /// is left as it is, so one mounted read-only, such as a Kubernetes secret,
@@ -1117,6 +1302,23 @@ pub fn passwd_home() -> Option<PathBuf> {
 /// to: it is accepted only when its target is a directory the user owns and
 /// no one else can enter.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
+    if existing_private_dir(dir)? {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|source| StateError::Create {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// [`private_dir`]'s checks on `dir` where it is, made private as they
+/// make it, without making it: whether it is there. Not there, nothing is
+/// made.
+pub(crate) fn existing_private_dir(dir: &Path) -> Result<bool, StateError> {
     let fail = |source| StateError::Create {
         path: dir.to_owned(),
         source,
@@ -1126,13 +1328,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         why,
     };
     let meta = match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            return builder.create(dir).map_err(fail);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(fail(e)),
         Ok(meta) => meta,
     };
@@ -1142,7 +1338,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         if meta.file_type().is_symlink() {
             let target = std::fs::metadata(dir).map_err(fail)?;
             if target.is_dir() && target.uid() == effective_uid() && target.mode() & 0o077 == 0 {
-                return Ok(());
+                return Ok(true);
             }
             return Err(refuse(
                 "is a symbolic link to a directory that is not yours alone: make the target \
@@ -1167,7 +1363,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     if !meta.is_dir() {
         return Err(refuse("is not a directory".into()));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A readable, collision-resistant id: the root's last component, then the
@@ -1193,6 +1389,187 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither backend's commands may read the other's attempts: each
+    /// backend of the project denies its workspaces both scratch roots, which
+    /// it makes if they are missing, its own attempt's directory apart.
+    #[test]
+    fn the_run_and_debug_backends_deny_each_others_scratch() {
+        use atomic_exec::ExecutionBackend;
+        let home =
+            std::env::temp_dir().join(format!("atomic-scratch-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let roots = [
+            state.dir().join("scratch"),
+            state.dir().join("scratch-debug"),
+        ];
+        for (what, backend, own) in [
+            ("run", state.run_backend(), &roots[0]),
+            ("debug", state.debug_backend(), &roots[1]),
+        ] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: what.into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            let scratch = workspace.scratch.clone().expect("scratch");
+            assert!(scratch.starts_with(own), "{what}: {}", scratch.display());
+            let mut denied = workspace.denied.clone();
+            denied.sort();
+            assert_eq!(denied, roots.to_vec(), "{what}");
+            for dir in &roots {
+                assert!(dir.is_dir(), "{what}: {} was not made", dir.display());
+            }
+            backend.close(&workspace).expect("closes");
+            let _ = std::fs::remove_dir_all(&roots[0]);
+            let _ = std::fs::remove_dir_all(&roots[1]);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `.git` another user owns above a project, here a link to a device,
+    /// counts its directory as a checkout and refuses nothing: it is not a
+    /// regular file, so it is not read. The same link, this user's own, is
+    /// read, and refused.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_git_above_a_project_is_a_checkout_and_refuses_nothing() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::os::unix::fs::symlink("/dev/zero", dir.join(".git")).expect(".git");
+        let project = dir.join("project");
+        let me = effective_uid();
+        let held = checkouts_holding_as(&project, Some(me.wrapping_add(1))).expect("not read");
+        assert!(held.contains(&dir), "{held:?}");
+        let refused = checkouts_holding_as(&project, Some(me)).expect_err("read, and refused");
+        assert!(refused.contains("is not a regular file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another user's `.git` that is a worktree's link, well formed, is
+    /// still followed to its main checkout, which then holds the project;
+    /// one of theirs that is malformed refuses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_worktree_link_is_followed_and_a_malformed_one_ignored() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).expect("main");
+        std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect(".git");
+        let project = dir.join("wt/project");
+        let other = Some(effective_uid().wrapping_add(1));
+        let held = checkouts_holding_as(&project, other).expect("read");
+        assert!(
+            held.contains(&std::fs::canonicalize(&main).expect("main")),
+            "another user's worktree lost its main checkout: {held:?}"
+        );
+        std::fs::write(gitdir.join("commondir"), "x".repeat(5000)).expect("commondir");
+        let held = checkouts_holding_as(&project, other).expect("refuses nothing");
+        assert!(held.contains(&dir.join("wt")), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.git` that is a hard link to a file of this user's, which another
+    /// user could make where links are not protected, refuses nothing, and
+    /// one this user cannot look at still counts as a checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_git_refuses_nothing_and_one_out_of_reach_still_counts() {
+        let dir = std::env::temp_dir().join(format!("atomic-linked-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::fs::write(dir.join("mine"), "x".repeat(5000)).expect("a file of mine");
+        std::fs::hard_link(dir.join("mine"), dir.join(".git")).expect("hard link");
+        let me = Some(effective_uid());
+        let held = checkouts_holding_as(&dir.join("project"), me).expect("refuses nothing");
+        assert!(held.contains(&dir), "{held:?}");
+        // Out of reach: a directory this user cannot look in.
+        let closed = dir.join("closed");
+        std::fs::create_dir_all(closed.join("inner/project")).expect("closed");
+        std::fs::create_dir_all(closed.join("inner/.git")).expect(".git");
+        let mode = |m: u32| {
+            std::fs::set_permissions(
+                closed.join("inner"),
+                std::os::unix::fs::PermissionsExt::from_mode(m),
+            )
+            .expect("mode")
+        };
+        mode(0o000);
+        // Opened again however the test ends.
+        struct Reopened(PathBuf);
+        impl Drop for Reopened {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.0,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
+            }
+        }
+        let _reopened = Reopened(closed.join("inner"));
+        assert!(
+            std::fs::read_dir(closed.join("inner")).is_err(),
+            "mode 000 did not keep this user out (root?): run the test as a user"
+        );
+        let held =
+            checkouts_holding_as(&closed.join("inner/project"), me).expect("refuses nothing");
+        assert!(
+            held.contains(&closed.join("inner")),
+            "taken for absent: {held:?}"
+        );
+        drop(_reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another user's worktree link whose `commondir` is a link to a pipe
+    /// opens nothing the link names: the open is refused at the link, so the
+    /// pipe, or a device in its place, is never opened. This user's own is
+    /// opened, and refused as not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_link_file_is_opened_through_no_link() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gitdir = dir.join("att/wt");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        let fifo = dir.join("pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        std::os::unix::fs::symlink(&fifo, gitdir.join("commondir")).expect("commondir");
+        let foreign = link_file(&gitdir.join("commondir"), false).expect_err("refused");
+        assert!(
+            foreign.contains(&format!("os error {}", libc::ELOOP)),
+            "the link was followed: {foreign}"
+        );
+        let own = link_file(&gitdir.join("commondir"), true).expect_err("refused");
+        assert!(own.contains("is not a regular file"), "{own}");
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", gitdir.display())).expect(".git");
+        let held =
+            checkouts_holding_as(&dir.join("project"), Some(effective_uid().wrapping_add(1)))
+                .expect("refuses nothing");
+        assert!(held.contains(&dir), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A worktree's `.git` or its repository's `commondir` that is a device,
     /// or larger than git writes, is refused without being read to its end,
@@ -2014,15 +2391,23 @@ mod tests {
     /// configuration directory, and the state gets made inside the very
     /// directory every atom's command is denied. Only `NotFound` may be read as
     /// missing, so this home is refused for the lookup that failed.
+    ///
+    /// Mode 000 is no bar to the superuser, so this does not stop when the
+    /// tests run as root: it then asserts the refusal this shape exists to
+    /// bring about — the home is the configuration directory's own, which the
+    /// walk through the closed directory is what would have hidden — so a check
+    /// that let a state inside the denied directory fails here whoever runs it.
+    /// What only a process that cannot look in everything sees is *which*
+    /// answer the walk gave: the lookup that failed, and the configuration
+    /// directory as the side that cannot be placed. `scripts/controls-check.sh`
+    /// runs as the operator, never as root, so that is what
+    /// `scripts/controls/state-walk-notfound-only.row` is switched off and seen
+    /// failing under; the same rule where the superuser cannot undo it is
+    /// pinned by `a_home_that_walks_through_a_file_is_refused`, which the same
+    /// row runs.
     #[test]
     fn a_home_behind_a_directory_nobody_may_look_in_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        // A process that may look in any directory cannot make these lookups
-        // fail, so the refusal has nothing here to be seen in: mode 000 is no
-        // bar to the superuser.
-        if effective_uid() == 0 {
-            return;
-        }
         let scratch = setup("closed", &["closed", "settings/atomic"], &[]);
         std::os::unix::fs::symlink(
             scratch.join("settings/atomic"),
@@ -2037,6 +2422,7 @@ mod tests {
         // The home as its owner spelled it: `ATOMIC_HOME` names the link, which
         // is where the configuration directory really is.
         let home = scratch.join("closed/into-config/state");
+        let config = scratch.join("settings/atomic");
         let outcome = check(
             &scratch,
             &[
@@ -2047,6 +2433,26 @@ mod tests {
             None,
             None,
         );
+        if effective_uid() == 0 {
+            // Nothing failed to be looked up: the walk went through the closed
+            // directory, followed the link and read where the home really is,
+            // which is inside the configuration directory. That is the refusal
+            // this shape is for, so the comparison that refuses a directory
+            // inside the configuration one — the half mode 000 cannot hide — is
+            // seen failing for the superuser too, rather than passing because
+            // nothing here could be made to fail.
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(StateError::InsideConfig(outside))
+                        if outside.state == config.join("state") && outside.config == config
+                ),
+                "as the superuser the home behind the closed directory is the \
+                 configuration directory's own and was not refused for it: {:?}",
+                words(&outcome)
+            );
+            return;
+        }
         let why = words(&outcome);
         assert!(
             why.starts_with(&format!(
@@ -2062,7 +2468,11 @@ mod tests {
         );
         // The same closed door on the other side: with the configuration
         // directory itself unreachable, no home can be compared with it, and
-        // the refusal says which of the two directories it could not place.
+        // the refusal says which of the two directories it could not place. Not
+        // reached as the superuser, for whom the door opens: the target the link
+        // leads to is placed, `/elsewhere` is beside it, and there is nothing to
+        // refuse. A directory that cannot be placed for anyone at all is the
+        // shape `a_home_that_walks_through_a_file_is_refused` pins.
         let outcome = check(
             &scratch,
             &[("XDG_CONFIG_HOME", "/closed/into-config")],
@@ -2076,6 +2486,45 @@ mod tests {
                 Err(StateError::Resolve { side, .. }) if *side == ResolveSide::Config
             ),
             "a configuration directory nobody may look in was not the side named: {outcome:?}"
+        );
+    }
+
+    /// A name in the middle of a home's path that is a file and not a
+    /// directory, with one name below it and two `..` back over both. Asking
+    /// what is below a file is not the same as a name not being there: only
+    /// `NotFound` may be read as missing. Reading what the filesystem says about
+    /// a file as "missing" and walking on finds the file itself, and the home is
+    /// then placed by folding its own spelling over it — out of the file's name,
+    /// back out of the directory holding it, to the throwaway directory beside
+    /// the configuration directory, and accepted — while a directory below a
+    /// file cannot be anywhere at all. So the refusal is for the lookup that
+    /// failed, and it says what the filesystem said. The superuser sees this
+    /// shape too: nothing here needs a directory closed.
+    #[test]
+    fn a_home_that_walks_through_a_file_is_refused() {
+        let scratch = setup("notdir", &["home/.config/atomic"], &[]);
+        std::fs::write(scratch.join("gate"), "a file, not a directory").expect("the file");
+        let spelled = "/gate/x/../..";
+        let outcome = check(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", spelled)],
+            spelled,
+            None,
+            None,
+        );
+        let why = words(&outcome);
+        let home = scratch.join("gate/x/../..");
+        assert!(
+            why.starts_with(&format!(
+                "refused: cannot resolve atomic's state directory {}: ",
+                home.display()
+            )),
+            "not the refusal of a home below a file: {why}"
+        );
+        assert!(
+            why.contains(&format!("{} cannot be looked up: ", home.display()))
+                && why.contains("Not a directory"),
+            "the refusal does not say which lookup failed and what it said: {why}"
         );
     }
 
@@ -2110,6 +2559,50 @@ mod tests {
             ),
             "a state directory inside the password home was not refused by the check itself: \
              {outcome:?}"
+        );
+    }
+
+    /// A relative state directory is placed — read from the directory the
+    /// command was run in, the names below it that are not there yet kept as
+    /// they were spelled — before it is compared with anything. This asks
+    /// [`outside_user_config`], the one entry a command uses, because [`placed`]
+    /// is what does that on that path. A command brings an absolute home here
+    /// except with a relative `HOME` and no `ATOMIC_HOME` — see [`placed`] — so
+    /// this is where the placing of a relative spelling is kept working for the
+    /// caller that hands one over, which the command a person runs with a
+    /// relative `HOME` shows end to end:
+    /// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+    /// in `crates/atomic/tests/state_cli.rs`. Given the spelling unresolved here
+    /// there is nothing to compare, and the check refuses the run for a
+    /// directory it cannot place.
+    ///
+    /// Nothing is created in the working directory: the name is one no
+    /// directory holds, so placing it asks nothing of the filesystem beyond the
+    /// working directory itself.
+    #[test]
+    fn a_relative_state_directory_is_placed_from_the_working_directory() {
+        let scratch = setup("relative-home", &[], &[]);
+        // The configuration directory is `.config/atomic` below `HOME`, which
+        // the throwaway directory's parent gives — below the temporary
+        // directory, so a state below this process's working directory is not
+        // inside it and the placed case runs.
+        let _process = as_process(&scratch, &[("HOME", "/.."), ("ATOMIC_HOME", "state")], None);
+        let outcome = outside_user_config(Path::new("state"));
+        assert_eq!(
+            words(&outcome),
+            "accepted",
+            "a relative state directory was not placed from the working directory, and \
+             unresolved there is nothing to compare it with: {outcome:?}"
+        );
+        // The same directory spelled out from the working directory answers
+        // alike: placing is what makes the two spellings one directory.
+        let spelled = std::env::current_dir()
+            .expect("the working directory")
+            .join("state");
+        assert_eq!(
+            words(&outside_user_config(&spelled)),
+            words(&outcome),
+            "{spelled:?} is not what the relative spelling names: {outcome:?}"
         );
     }
 }

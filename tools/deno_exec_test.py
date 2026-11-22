@@ -14,17 +14,36 @@ empty string are refused by name instead of raising a Python error. So is a name
 with a NUL in it, which no file system can hold.
 
 Settling a path -- following the links above it before it is checked or read --
-is done here rather than by `Path.resolve` alone, because resolve answers a
-symlink loop differently by Python version, and leaves a name that is not there
-yet against whatever its directory links to. So a loop, a path with nothing at
-the end, a link to nothing outside the project, a project that is itself a
-symlink, a directory component that is one, and a neighbouring project whose
-name starts with the project's are each answered the same way on every Python --
-refused, or read -- even where the wording differs, because what a path that is
-not there settles to depends on the version. None of them ends in a Python error,
-and none in a lock taken on trust. A `..` that goes up from a directory the
-checker cannot see is refused outright, because putting it back on the settled
-path moves the path every caller compares against.
+is done here rather than by `Path.resolve` alone, because resolve has answered a
+symlink loop differently across Python versions -- as a missing file, as an
+OSError, and as a RuntimeError -- and leaves a name that is not there yet
+against whatever its directory links to. So a loop, a path with nothing at the
+end, a link to nothing outside the project, a project that is itself a symlink,
+a directory component that is one, and a neighbouring project whose name starts
+with the project's are each answered the same way on every Python -- refused, or
+read -- even where the wording differs, because what a path that is not there
+settles to depends on the version. None of them ends in a Python error, and none
+in a lock taken on trust. A `..` that goes up from a directory the checker
+cannot see, or from a name that is there but is no directory, is refused
+outright, because putting it back on the settled path moves the path every
+caller compares against.
+
+Whether the checker can see a file at all is asked of the file system directly,
+not of `Path.is_file`, which answers some errors as its own judgement of them
+rather than as the file system reported them, and has changed which between
+versions. Only a name that is not there, and a name whose directory is not a
+directory, count as absent. So a lock, an imported module or a named script
+behind a directory the checker may not enter is refused as unreadable, by its
+own name, and a name that is there but is no file at all -- a lockfile or a
+script that is a directory -- is refused too, never opened for its contents.
+
+What a lockfile holds is what every import is answered from, so its shape is
+checked before one import is answered from it. A body that is not an object, a
+`specifiers` that is not the map from each package to its version, and JSON
+nested deeper than this Python can read are each refused saying the lockfile and
+what is wrong with it. None is taken as a lock that records everything, which is
+what testing a substring of a string amounts to, and none is taken as one that
+records nothing; none ends in a Python error either.
 
 A lock the checker cannot get to is refused as what it is. A route through a
 directory it may not enter is a lock that cannot be read, not a lock that is
@@ -38,8 +57,12 @@ lockfile the project does not hold must never be read, whatever route leads
 there.
 
 The fixtures are inert: JSON, a manifest-shaped text and TypeScript-shaped text
-under a temporary directory, and a few directories whose mode shuts the checker
-out. Nothing here runs Deno, needs a provider or reaches the network.
+under a temporary directory, and a few directories and one file whose mode shuts
+the checker out. A mode of 000 shuts out everyone but root, and those cases are
+about what a checker does when the file system refuses it, so run as root they
+show a lock that reads: they are reported as skipped, each by name with why, and
+the run still reports everything it did check.
+Nothing here runs Deno, needs a provider or reaches the network.
 
     python3 tools/deno_exec_test.py
 """
@@ -62,10 +85,11 @@ import deno_exec
 TARGET = "npm:jsonc-parser@3.3.1"
 HOST = "example.com"
 OUTSIDE = "outside"  # the project's name for the directory beside it, holding a lockfile that passes
-# A refusal about how a lock is named closes with this, so that whoever is shown
-# it knows what to write instead of what was wrong. Two refusals do not carry it,
-# because the name in them is not the trouble: that the lockfile is missing, and
-# that it cannot be read.
+# A refusal about how a lock is named, or about where the name leads, closes
+# with this, so that whoever is shown it knows what to write instead of what was
+# wrong. Three refusals do not carry it, because the name in them is not the
+# trouble: that the lockfile is missing, that it cannot be read, and that what
+# it holds is not a lockfile's shape.
 FIX = "name a lockfile inside the project, such as deno.lock"
 NO_LOCK = object()  # an atom that names no lock at all, which is not the same as naming none
 
@@ -88,6 +112,8 @@ def link(target: Path | str, at: Path) -> Path:
 
 
 shut: list[Path] = []  # directories a case closed, opened again before the tree is removed
+skipped: list[str] = []  # cases whose fixture is a mode, and what stops them here
+AS_ROOT = os.geteuid() == 0  # what a mode of 000 does not shut out
 
 
 def close(directory: Path) -> Path:
@@ -100,6 +126,23 @@ def close(directory: Path) -> Path:
     directory.chmod(0o000)
     shut.append(directory)
     return directory
+
+
+def mode_case(what: str, run, refusal: str | None = None) -> None:
+    """Runs a case whose fixture is a mode 000, or reports it skipped as root.
+
+    These cases are about what the checker does where the file system refuses
+    it, and a mode of 000 refuses everyone but root. Run as root the lock reads,
+    the way through the closed directory is open, and the case would be shown
+    passing on an answer no one else can get. So it is said to be skipped, by
+    name and with why, rather than passed -- or failed, which would say the
+    checker is wrong for an answer the file system gave root.
+    """
+    if AS_ROOT:
+        skipped.append(what)
+        print(f"SKIP {what}\n     running as root, which a mode of 000 does not shut out")
+        return
+    case(what, run, refusal)
 
 
 @contextlib.contextmanager
@@ -169,15 +212,17 @@ def make_project(root: Path, deno: dict | None = None, default_lock: str | None 
     return root
 
 
-def check_atom(project: Path, lock: object = NO_LOCK) -> None:
+def check_atom(project: Path, lock: object = NO_LOCK, script: str = "../../src/index.ts") -> None:
     """The atom check: an exec atom whose script is src/index.ts, naming `lock` or naming none.
 
     `NO_LOCK` is an atom that names no lock of its own, which takes the
     manifest's or the default beside it; `None` is an atom that names `lock:`
-    with nothing after it, which is a name of its own and not a path.
+    with nothing after it, which is a name of its own and not a path. `script`
+    is what the atom names for its code, which is two levels down from the
+    project root the atom's own directory sits under.
     """
     deno = {} if lock is NO_LOCK else {"lock": lock}
-    fm = {"exec": {"script": "../../src/index.ts"}, "runtime": {"deno": deno},
+    fm = {"exec": {"script": script}, "runtime": {"deno": deno},
           "network": {"allow": [HOST]}, "effects": {"external": "read-only"}}
     path = write(project / "atoms/demo/atom.atom.astro", "---\n---\n")
     deno_exec.check_script(path, fm, project)
@@ -189,15 +234,17 @@ failures: list[str] = []
 def case(what: str, run, refusal: str | None = None) -> None:
     """Runs one case: the check takes it, or refuses it saying `refusal`.
 
-    A check that raises TypeError, OSError or RuntimeError where it should refuse
-    is a failure and not a refusal: it says nothing about the file or the key at
-    fault. RuntimeError is one of the ways a path library reports a symlink loop,
-    so a settling that stops converting it to a refusal fails here rather than
-    ending the run.
+    A check that raises TypeError, AttributeError, OSError or RuntimeError where
+    it should refuse is a failure and not a refusal: it says nothing about the
+    file or the key at fault. AttributeError is what asking a list or a nothing
+    for its keys comes to, RecursionError -- a RuntimeError -- is what json
+    answers a document nested deeper than this Python reads, and RuntimeError is
+    one of the ways a path library reports a symlink loop, so a check that stops
+    turning any of these into a refusal fails here rather than ending the run.
     """
     try:
         run()
-    except (ValueError, TypeError, OSError, RuntimeError) as error:
+    except (ValueError, TypeError, AttributeError, OSError, RuntimeError) as error:
         if not isinstance(error, ValueError):
             failures.append(f"{what}: raised {type(error).__name__} where it should have refused: {error}")
             print(f"FAIL {what}\n     raised {type(error).__name__} instead of refusing: {error}")
@@ -296,9 +343,9 @@ def run_cases(root: Path) -> None:
     up_shut = root / "manifest-up-shut"
     (up_shut / "shut").mkdir(parents=True)
     close(up_shut / "shut")
-    case("a manifest that reaches up through a directory it may not enter is refused, though no atom uses it",
-         lambda: check_manifest_only(up_shut, {"lock": f"shut/../../{OUTSIDE}/deno.lock"}),
-         "goes up from a directory that is not there")
+    mode_case("a manifest that reaches up through a directory it may not enter is refused, though no atom uses it",
+              lambda: check_manifest_only(up_shut, {"lock": f"shut/../../{OUTSIDE}/deno.lock"}),
+              "goes up from a directory that is not there")
     # The same answer about the project directory itself, which is where a name
     # like this has to be put right. The manifest is there; the way to it that
     # the caller handed over is not.
@@ -315,17 +362,19 @@ def run_cases(root: Path) -> None:
     shut_lock = root / "manifest-shut" / "shut"
     write(shut_lock / "deno.lock", lockfile(TARGET))
     close(shut_lock)
-    case("a manifest whose lock sits in a directory it may not enter is refused as unreadable, though no atom uses it",
-         lambda: check_manifest_only(root / "manifest-shut", {"lock": "shut/deno.lock"}),
-         "lockfile deno.lock cannot be read")
+    mode_case("a manifest whose lock sits in a directory it may not enter is refused as unreadable, though no atom uses it",
+              lambda: check_manifest_only(root / "manifest-shut", {"lock": "shut/deno.lock"}),
+              "lockfile deno.lock cannot be read")
 
     # The settling of a link that is not there settles links of its own, so a
     # path library that reports a loop there is answered with a loop, and not
-    # with a Python error. This Python answers it with the settled path, so that
-    # branch is reached by handing it the answers of a path library that does
-    # report one, for one file name, and running the manifest check over the
-    # link that really is there. Without the conversion a RuntimeError walks out
-    # of the check and `case` reports it as a failure.
+    # with a Python error. Pathlib's answer about that settling has been the
+    # settled path on some versions and a RuntimeError on others, so the branch
+    # is reached the same way whichever version this runs on: by handing it the
+    # answers of a path library that reports one, for one file name, and running
+    # the manifest check over the link that really is there. Without the
+    # conversion a RuntimeError walks out of the check and `case` reports it as a
+    # failure.
     tail_loop = root / "manifest-loop-tail"
     link("loop.lock", tail_loop / "loop.lock")
     link("gone/../loop.lock", tail_loop / "dangling.lock")
@@ -380,29 +429,29 @@ def run_cases(root: Path) -> None:
     up_shut_atom = make_project(root / "atom-up-shut", {}, default_lock=lockfile())
     write(up_shut_atom / "atoms/demo/shut/keep.txt", "shut\n")
     close(up_shut_atom / "atoms/demo/shut")
-    case("an atom that reaches up through a directory it may not enter is refused",
-         lambda: check_atom(up_shut_atom, f"shut/../../../../{OUTSIDE}/deno.lock"),
-         "goes up from a directory that is not there")
+    mode_case("an atom that reaches up through a directory it may not enter is refused",
+              lambda: check_atom(up_shut_atom, f"shut/../../../../{OUTSIDE}/deno.lock"),
+              "goes up from a directory that is not there")
     back_atom = make_project(root / "atom-up-inside", {}, default_lock=None)
     write(back_atom / "atoms/demo/here.lock", lockfile(TARGET))  # a lockfile that records the import
     write(back_atom / "atoms/demo/shut/keep.txt", "shut\n")
     close(back_atom / "atoms/demo/shut")
-    case("an atom that reaches its own lockfile up through a directory it may not enter is refused",
-         lambda: check_atom(back_atom, "shut/../../atoms/demo/here.lock"),
-         "goes up from a directory that is not there")
+    mode_case("an atom that reaches its own lockfile up through a directory it may not enter is refused",
+              lambda: check_atom(back_atom, "shut/../../atoms/demo/here.lock"),
+              "goes up from a directory that is not there")
 
     # A directory the checker may not enter is not a lockfile that is missing,
     # and a lockfile it may not open is not one that records nothing.
     shut_atom = make_project(root / "atom-shut", {}, default_lock=lockfile())
     write(shut_atom / "atoms/demo/shut/deno.lock", lockfile(TARGET))
     close(shut_atom / "atoms/demo/shut")
-    case("an atom whose lock sits in a directory it may not enter is refused as unreadable",
-         lambda: check_atom(shut_atom, "shut/deno.lock"), "lockfile deno.lock cannot be read")
+    mode_case("an atom whose lock sits in a directory it may not enter is refused as unreadable",
+              lambda: check_atom(shut_atom, "shut/deno.lock"), "lockfile deno.lock cannot be read")
     shut_lock_atom = make_project(root / "atom-unreadable", {}, default_lock=None)
     secret = write(shut_lock_atom / "atoms/demo/secret.lock", lockfile(TARGET))
     secret.chmod(0o000)  # the lock is there, and records the import; opening it is refused
-    case("an atom whose lock it may not open is refused as unreadable, not as one that records nothing",
-         lambda: check_atom(shut_lock_atom, "secret.lock"), "lockfile secret.lock cannot be read")
+    mode_case("an atom whose lock it may not open is refused as unreadable, not as one that records nothing",
+              lambda: check_atom(shut_lock_atom, "secret.lock"), "lockfile secret.lock cannot be read")
 
     # How the project is found when the way to it is not a plain directory.
     aliased = link(make_project(root / "real-project"), root / "aliased-project")
@@ -457,6 +506,136 @@ def run_cases(root: Path) -> None:
     case("an in-project lockfile that does not record the import is refused",
          lambda: check_atom(thin), "is not recorded in")
 
+    # What a lockfile is allowed to hold. Its contents are what every import is
+    # answered from, so a body that is not an object, and a specifiers that is
+    # not the map from each package to its version, are refused saying this
+    # lockfile and what is wrong with it. None is answered as a lock that
+    # records everything -- which is what asking whether an import is a
+    # substring of a string comes to -- and none ends in a Python error about a
+    # list or a nothing having no keys. A record whose version is nothing still
+    # records the package, and JSON nested deeper than this Python reads is
+    # refused rather than raising.
+    bodies = [
+        ("[]", "lockfile deno.lock is a list, not a JSON object"),
+        ("null", "lockfile deno.lock is nothing, not a JSON object"),
+        (f'"{TARGET}"', "lockfile deno.lock is a string, not a JSON object"),
+        (f'["{TARGET}"]', "lockfile deno.lock is a list, not a JSON object"),
+        ("42", "lockfile deno.lock is a number, not a JSON object"),
+        ("true", "lockfile deno.lock is true or false, not a JSON object"),
+        ("not JSON at all", "lockfile deno.lock cannot be read as JSON"),
+        ("[" * 200_000, "lockfile deno.lock cannot be read as JSON"),
+        ('{"specifiers": null}', "records specifiers as nothing, not as the map"),
+        (f'{{"specifiers": "{TARGET}"}}', "records specifiers as a string, not as the map"),
+        ('{"specifiers": "npm:"}', "records specifiers as a string, not as the map"),
+        (f'{{"specifiers": ["{TARGET}"]}}', "records specifiers as a list, not as the map"),
+        ('{"specifiers": true}', "records specifiers as true or false, not as the map"),
+        ('{"specifiers": []}', "records specifiers as a list, not as the map"),
+        (f'{{"specifiers": {{"{TARGET}": null}}}}', None),  # the package is recorded; no version is read
+        ('{"version": 4, "remote": {}}', "is not recorded in deno.lock"),  # a lock that records no specifiers
+    ]
+    for n, (body, refusal) in enumerate(bodies):
+        shown = body if len(body) <= 40 else f"{body[:20]}… ({len(body)} characters)"
+        shaped = make_project(root / f"body-{n}", default_lock=f"{body}\n")
+        answer = "is read" if refusal is None else "is refused saying the file and what is wrong with it"
+        case(f"a lockfile holding {shown!r} {answer}",
+             lambda shaped=shaped: check_atom(shaped), refusal)
+
+    # What the checker reads and what it may not. A lock, an imported module and
+    # a named script are asked the same way: is there a regular file at the
+    # settled path, and where the file system will not say, what did it say. A
+    # name behind a directory the checker may not enter is refused by that name,
+    # not as missing and not as a Python error; a queue where a lockfile should
+    # be is refused as no regular file, because opening it would wait for a
+    # writer; and a lockfile or a script that is a directory is refused, never
+    # opened. A name the kernel will not look through -- a file with something
+    # under it -- leaves nothing at the end, which is what those refusals say,
+    # and a `..` that reaches back up through one is refused where the manifest
+    # is read, saying that the name is no directory. A script that is not there
+    # says it is not there, which is not what one that is no script says; and a
+    # script outside the project is refused as outside it whoever holds it.
+    closed_import = make_project(root / "import-shut", default_lock=lockfile())
+    module = write(closed_import / "src/module.ts", f'import {{ parse }} from "{TARGET}"\n')
+    write(closed_import / "src/index.ts", 'import "./module.ts"\n')
+    module.chmod(0o000)  # index.ts imports it; opening it is refused
+    mode_case("a script whose import the checker may not open is refused by that import's name",
+              lambda: check_atom(closed_import), "import module.ts cannot be read")
+    # A named script the same way: the route is what is shut, so the refusal
+    # names the script rather than saying it is not there.
+    closed_script = make_project(root / "script-shut", default_lock=lockfile())
+    (closed_script / "src/index.ts").unlink()
+    write(closed_script / "src/closed/index.ts", f'import {{ parse }} from "{TARGET}"\n')
+    close(closed_script / "src/closed")
+    mode_case("a script the checker may not open is refused by its name, not as missing",
+              lambda: check_atom(closed_script, script="../../src/closed/index.ts"),
+              "exec.script index.ts cannot be read")
+    # The same refusal where the way to the script is open and the script is
+    # not: its name reads as a script, so what is refused is the contents, and
+    # a script read as none is a script that imports nothing.
+    unreadable_script = make_project(root / "script-unreadable", default_lock=lockfile())
+    (unreadable_script / "src/index.ts").chmod(0o000)
+    mode_case("a script whose contents the checker may not have is refused as unreadable, not as one that imports nothing",
+              lambda: check_atom(unreadable_script), "exec.script index.ts cannot be read")
+    through_file = make_project(root / "import-through-file", default_lock=lockfile())
+    write(through_file / "src/module.ts", f'import {{ parse }} from "{TARGET}"\n')
+    write(through_file / "src/index.ts", 'import "./module.ts/not.ts"\n')
+    case("a script whose import goes through a module that holds no directory is refused",
+         lambda: check_atom(through_file), "import ./module.ts/not.ts is missing or leaves the project")
+    lock_used_as_dir = make_project(root / "lock-through-file", default_lock=lockfile(TARGET))
+    write(lock_used_as_dir / "atoms/demo/deno.lock", lockfile(TARGET))  # and one where the atom looks
+    case("an atom whose lock goes through a lockfile that holds no directory is refused as missing",
+         lambda: check_atom(lock_used_as_dir, "deno.lock/deno.lock"), "lockfile deno.lock is missing")
+    case("a manifest that reaches back up through its own lockfile is refused, and told it is no directory",
+         lambda: deno_exec.check_manifest(manifest_config({"lock": "deno.lock/../deno.lock"}),
+                                          lock_used_as_dir / "atomic.yaml"),
+         "goes up from a directory that is not there, cannot be read, or is not a directory")
+    lock_dir = make_project(root / "lock-is-dir", default_lock=None)
+    (lock_dir / "deno.lock").mkdir()
+    case("a default lockfile that is a directory is refused as missing, not opened",
+         lambda: check_atom(lock_dir), "lockfile deno.lock is missing")
+    manifest_lock_dir = root / "manifest-lock-dir"
+    (manifest_lock_dir / "deno.lock").mkdir(parents=True)
+    case("a manifest's own default lockfile that is a directory is refused as no regular file, though no atom uses it",
+         lambda: check_manifest_only(manifest_lock_dir, {}), "lockfile deno.lock is not a regular file")
+    # Neither of these reads anything off the lock: the manifest is refused as
+    # it is read, on its own name, before any atom that needs the lock is
+    # checked. And a queue is refused without being opened, because opening one
+    # waits for a writer that never comes.
+    manifest_lock_fifo = root / "manifest-lock-fifo"
+    manifest_lock_fifo.mkdir(parents=True)
+    os.mkfifo(manifest_lock_fifo / "deno.lock")
+    case("a manifest's own default lockfile that is a queue is refused as no regular file, and is not opened",
+         lambda: check_manifest_only(manifest_lock_fifo, {}), "lockfile deno.lock is not a regular file")
+    lock_fifo = make_project(root / "lock-is-fifo", default_lock=None)
+    os.mkfifo(lock_fifo / "deno.lock")  # opening this waits for a writer, so nothing opens it
+    case("a default lockfile that is a queue is refused as no regular file, and is not opened",
+         lambda: check_atom(lock_fifo), "lockfile deno.lock is not a regular file")
+    # A lock whose bytes are no text is refused as one that cannot be read,
+    # which is not what one that records nothing says, and not a codec error
+    # escaping the check.
+    not_text = make_project(root / "lock-not-text", default_lock=None)
+    (not_text / "deno.lock").write_bytes(b"\xff\xfe not a lockfile\n")
+    case("a lockfile that is no text is refused as unreadable, not as one that records nothing",
+         lambda: check_atom(not_text), "lockfile deno.lock cannot be read")
+
+    absent_script = make_project(root / "script-absent", default_lock=lockfile())
+    case("a script that is not there says so, which is not what a script that is no script says",
+         lambda: check_atom(absent_script, script="../../src/gone.ts"),
+         "exec.script '../../src/gone.ts' is missing or cannot be read")
+    dir_script = make_project(root / "script-is-dir", default_lock=lockfile())
+    (dir_script / "src/whatever.ts").mkdir()
+    case("a script that is a directory is refused as not there to read",
+         lambda: check_atom(dir_script, script="../../src/whatever.ts"),
+         "exec.script '../../src/whatever.ts' is missing or cannot be read")
+    write(dir_script / "src/index.js", f'import {{ parse }} from "{TARGET}"\n')
+    case("a script that is no TypeScript says what it is not",
+         lambda: check_atom(dir_script, script="../../src/index.js"), "is not a TypeScript file")
+    # The settled script is compared to the project as it settled, whoever the
+    # file system will let the checker ask.
+    outside_script = make_project(root / "script-outside", default_lock=lockfile())
+    write(root / "elsewhere" / "index.ts", f'import {{ parse }} from "{TARGET}"\n')
+    case("a script outside the project is refused as outside it, whoever holds it",
+         lambda: check_atom(outside_script, script="../../../elsewhere/index.ts"), "is outside the project")
+
 
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="atomic-deno-exec-test-") as tmp:
@@ -465,12 +644,20 @@ def main() -> int:
         finally:
             for directory in shut:  # a closed directory is opened again before the tree goes away
                 directory.chmod(0o700)
+    # A skipped case is said by name, and counted on the way out, so that a run
+    # which checked less than it knows how to is never mistaken for one that
+    # checked all of it.
+    if skipped:
+        print(f"\n{len(skipped)} skipped, each one a case whose fixture is a mode 000:")
+        for one in skipped:
+            print(f"  {one}")
     if failures:
         print(f"\n{len(failures)} failed:")
         for one in failures:
             print(f"  {one}")
         return 1
-    print("\nPASS lockfile boundary: the default, the manifest's and the atom's all stay in the project")
+    print("\nPASS lockfile boundary: the default, the manifest's and the atom's all stay in the project"
+          + (f", {len(skipped)} mode-000 cases skipped" if skipped else ""))
     return 0
 
 

@@ -1,0 +1,1 @@
+aws-token-plain-name|crates/atomic-core/src/codex.rs|        let file: PathBuf = file.components().collect();|        let file: PathBuf = file;|-p atomic-agentic-core --lib --features fake-model a_token_named_with_a_trailing_slash_is_still_found_in_its_volume

@@ -477,18 +477,29 @@ or when, on such a filesystem, the place is there and its second place is
 missing, is another file or directory, or is a link, which is not
 followed, or the place, or the part of it a second mount shows, cannot be
 looked at for a reason other than not being there. A second mount of part
-of a place is checked against that part. Otherwise FUSE (`fuse.*`), 9p,
-virtiofs and other mounts are followed as local ones are. The
-links followed and the second mounts found together come to at most 512;
+of a place is checked against that part. On any filesystem, nothing runs
+when another of its mounts is the same directory as a denied place, or as
+a directory above it on the mount the place is under, and the mount
+table's root for it does not say so: the root has gone stale with nothing
+to mark it, as an overlay's does when a lower directory under a bound
+overlay directory is renamed. A mount point that is not there is passed
+over, and so is one behind a directory you may not search that someone
+else owns, by a uid you cannot map (`/etc/subuid`, or any uid when
+`/etc/nsswitch.conf` takes subordinate uids from a directory service);
+behind one of your own, or of a uid you may map, which a command could
+step around from a user namespace of its own, nothing runs, and nor does
+it for a denied place that cannot be looked at. Otherwise FUSE
+(`fuse.*`), 9p, virtiofs and other mounts are followed as local ones are.
+The links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
 inside another, mounted twice as two filesystems, each with a device of its
 own, such as with 9p, NFS with `nosharecache` or with mount options that
 differ (each gets a superblock of its own), Ceph (one per server path), two
 SMB sessions or two FUSE daemons, neither of which is denied for the other;
 a stale root, off a local filesystem, for a place that is not there yet,
-and one, on any filesystem, that makes a second mount look unrelated to a
-denied place, such as a bound overlay directory whose lower directory was
-renamed beneath it;
+and one, on any filesystem, that makes a mount of a directory inside a
+denied place look unrelated to it, or, being the root of the place's own
+mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
@@ -499,11 +510,17 @@ denied to the command that runs then. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
-a command could move the directory above it away from its denial, or when
-a denied place is a link atomic cannot resolve for a reason other than
-leading nowhere yet, such as a link to itself or into a directory you may
-not search: remove the link, or point it at something atomic can reach.
-The model
+a command could move the directory above it away from its denial. Nor
+does it start when a denied place is named through a link inside a
+directory it may write, which a command could point elsewhere; when a
+denied place lies in a directory it may write that it is given through a
+link, rather than by its real path; or when a token file is named relative
+while atomic's own working directory is unknown. Each place is denied under
+its real path, which denies it under every spelling. Nor does it start
+when a denied place is a link atomic cannot resolve for a reason other
+than leading nowhere yet, such as a link to itself or into a directory you
+may not search: remove the link, or point it at something atomic can
+reach. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is

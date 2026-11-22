@@ -1,0 +1,1 @@
+skill-dir-read-at|crates/atomic/src/setup.rs|    const READ_NOT_THROUGH_A_LINK: libc::c_int = libc::O_NOFOLLOW;|    const READ_NOT_THROUGH_A_LINK: libc::c_int = 0;|-p atomic-agentic --bin atomic -- a_file_is_never_read_through_a_link
