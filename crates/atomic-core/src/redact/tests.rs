@@ -3263,7 +3263,8 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
 fn held_json_duplicates_are_refused_before_normalization() {
     let header = concat!("Qk9L", "x3sR2tY7uV8w");
     let hidden = "sample-private-value";
-    let pair = format!(r#"{{"name":"X-Api-Key","value":"{header}"}}"#);
+    // The intervening object leaves the header for parsed redaction to hide.
+    let pair = format!(r#"{{"name":"X-Api-Key","note":{{}},"value":"{header}"}}"#);
     for (case, document) in [
         format!(
             "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"key\": \"note\"\n}}"
@@ -3304,6 +3305,7 @@ fn held_json_duplicates_are_refused_before_normalization() {
         let parsed: Value = serde_json::from_str(held).expect("unique JSON remains JSON");
         assert_eq!(parsed["value"], "ordinary");
         assert_eq!(parsed["h"]["value"], REDACTED);
+        assert_eq!(parsed["h"]["note"], json!({}));
     }
 }
 
