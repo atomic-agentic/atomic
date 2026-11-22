@@ -1,0 +1,1 @@
+gcp-certificate-config-var|crates/atomic-core/src/codex.rs|    (GOOGLE_CERTIFICATES, "certificate configuration"),|    ("", "certificate configuration"),|-p atomic-agentic-core --lib --features fake-model the_key_googles_certificate_configuration_names_is_denied
