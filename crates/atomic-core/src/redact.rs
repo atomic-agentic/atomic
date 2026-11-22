@@ -1725,7 +1725,7 @@ fn redact_string(string: &mut String, nested: usize) {
         // into `https://u:[REDACTED]@h`): a parse keeps only the last
         // value, so the others are read by no rule that reads names and
         // pairs, and the string as it stands shows them. Hidden whole.
-        if gives_a_key_twice(string) {
+        if gives_a_key_twice(string) || (opened && gives_a_key_twice(&written)) {
             *string = REDACTED.to_owned();
             return;
         }
@@ -1980,7 +1980,13 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     // keeps only the last duplicate field, which can erase the name that
     // classified another field as private. Text redaction can also make
     // previously different names equal.
-    if gives_a_key_twice(&texted) {
+    // Equivalent escaped names can also become different raw-text names:
+    // retain the original JSON's duplicate decision when text changed it.
+    // An originally invalid document may become valid after text redaction.
+    let originally_duplicated = texted != *string
+        && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
+        && gives_a_key_twice(string);
+    if gives_a_key_twice(&texted) || originally_duplicated {
         *string = REDACTED.to_owned();
         return true;
     }

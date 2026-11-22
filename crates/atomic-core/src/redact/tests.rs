@@ -3303,3 +3303,54 @@ fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
         "the renamed key's value showed"
     );
 }
+
+#[test]
+fn original_duplicate_spellings_under_a_hint_are_refused() {
+    original_duplicate_spellings("key");
+}
+
+#[test]
+fn original_duplicate_spellings_in_an_ordinary_string_are_refused() {
+    original_duplicate_spellings("note");
+}
+
+fn original_duplicate_spellings(parent: &str) {
+    let pretty = |s: &str| {
+        s.replace('{', "{\n")
+            .replace(',', ",\n")
+            .replace('}', "\n}")
+    };
+    let document = pretty(r#"{"https:\/\/u:pw@h":"alpha","https://u:pw@h":"beta"}"#);
+    let mut out = json!({ parent: document });
+    value(&mut out);
+    assert_eq!(
+        out[parent], REDACTED,
+        "original equal decoded keys must be refused"
+    );
+    let mut twice = out.clone();
+    value(&mut twice);
+    assert_eq!(twice, out);
+
+    let mut unique = json!({ parent: pretty(r#"{"https:\/\/u:pw@h":"alpha"}"#) });
+    value(&mut unique);
+    let kept: Value = serde_json::from_str(unique[parent].as_str().expect("unique JSON"))
+        .expect("unique document remains JSON");
+    assert!(
+        kept.as_object()
+            .expect("object")
+            .values()
+            .any(|v| v == "alpha")
+    );
+
+    // Text redaction may repair invalid original JSON. An invalid escape
+    // in a URL password disappears with that password, leaving valid JSON.
+    let mut repaired = json!({ parent: pretty(r#"{"url":"https://u:p\q@h","value":"ordinary"}"#) });
+    value(&mut repaired);
+    let kept: Value = serde_json::from_str(repaired[parent].as_str().expect("repaired JSON"))
+        .expect("text-repaired document remains JSON");
+    assert_eq!(kept["value"], "ordinary");
+    assert!(
+        kept["url"] == REDACTED || kept["url"] == "https://u:[REDACTED]@h",
+        "the repaired URL field still needs redaction"
+    );
+}
