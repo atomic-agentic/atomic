@@ -1,0 +1,1 @@
+telemetry-child-killed-on-drop|crates/atomic/tests/telemetry_common/mod.rs|            let _ = self.0.kill();|            let _ = (); /*CONTROL_OFF*/|-p atomic-agentic --test telemetry a_line_is_read_off_a_run_as_it_writes_it

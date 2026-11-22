@@ -12,7 +12,25 @@ import { fileURLToPath } from 'node:url';
 // crashed before it could answer. While it works, the worker may ask the host
 // to run a captured helper: it writes a `call` line and reads the host's
 // one-line reply from stdin.
-function respond(body) { console.log(JSON.stringify(body)); }
+//
+// The compiler's Go runtime calls what it believes a process's stdout to be
+// its own, and the wasm shim hands every line of it to console.log. This
+// process's stdout is the protocol: a fault inside the compiler would land
+// between the host and its reply. So console.log goes to stderr, where the
+// host reports it, and replies are written to stdout here.
+console.log = (...args) => console.error(...args);
+function respond(body) {
+  const bytes = new TextEncoder().encode(`${JSON.stringify(body)}\n`);
+  let written = 0;
+  while (written < bytes.length) {
+    const n = Deno.stdout.writeSync(bytes.subarray(written));
+    // A write that takes nothing is a closed pipe rather than a short one,
+    // and spinning on it would leave the host waiting for a line that never
+    // comes. The exit says what happened.
+    if (n <= 0) throw new Error('the protocol line could not be written');
+    written += n;
+  }
+}
 function failure(error) {
   const body = { message: String(error?.message ?? error) };
   if (typeof error?.file === 'string') body.file = error.file;

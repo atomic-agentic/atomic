@@ -2,8 +2,8 @@
   "version": 1,
   "sources": {
     "authoring/src/build-worker.mjs": "c97b0f74ff930143f34d017efde55f869935ef95f076cd10536a6631524fa4bb",
-    "authoring/src/worker.mjs": "386449f01893d8afb0911e975cc9762a7d583890b761e46f1aef827351198657",
-    "authoring/src/renderer.mjs": "d8162f7f4164c1473e771459217b1b8d9aacf9d73a66fc8ca53fc68dbf35766b",
+    "authoring/src/worker.mjs": "fb1b5f029389c4ea07d7eb482e85c14ab38b60703a3b52d1f2d0544e141c5635",
+    "authoring/src/renderer.mjs": "df7fd95ca5f7d20310032158e97d8face2136d60118322fc79a656387e29626a",
     "authoring/src/typecheck.mjs": "9f034a740c63c5e4faf04a7b07d915eeb0005511f622e2e0a45b39d91c34ec8e",
     "authoring/src/platform.mjs": "fb8e01afb7067a1a3c5a552f83f394d7b6c0403cfc3cd6796bf671259fb13de0",
     "authoring/src/context.mjs": "f778318f9b86c07e7fd799306d2bcc8de51ac4e13065cedcb92986c93d9b0eec",
@@ -11,13 +11,13 @@
     "authoring/src/intrinsics.mjs": "1998f7bcfb276501618e48635e9f26731197a29fab362727eb0682e60f3b6995",
     "authoring/src/capture.mjs": "d667165af6d3803738aa71a3e1d344727c95f96468d57376e187280c2c0d1cd7",
     "authoring/src/fences.mjs": "90fa798848e0db3b538466bf88d26eaa2bda9dad8991727b6e518785b9f627c0",
-    "authoring/src/balance.mjs": "b28995c6eaabf58eb9ffdee04db1363bf720565cacacddb60881d4995cc73a0c",
+    "authoring/src/balance.mjs": "6d3b86bdca989b51f21fb1088d93dfe36b2bbaf2d8431c83e3bd3cd92286c1c8",
     "authoring/authoring.d.ts": "0fc50932695142a995e3ab3f02cf3690c44d7e9b0b9df021dfcb64c920cf394a",
     "authoring/package.json": "6e093c23679caafc5c476e18c2b903a64eaecbf0437d4fe01d38ed74989b6036",
     "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
   },
   "assets": {
-    "worker.mjs": "984113f02a6318404920c9c5f0102fcc7bbe1dc1a7819aa5c02597e4ba74136b",
+    "worker.mjs": "3d96ed8cfc5e0286ecbd6c92dd428d82f11731112f4e337a1ac8860b6b827e87",
     "worker.mjs.LEGAL.txt": "ab1fbb4a8cd93f8da2ecaf67e418c748cd6c2ef00609e7d60923fc46aa5745da",
     "astro.wasm": "a4ed5ef260d401dba6f172d52a3c27dbd933bfcd9b1698e91b430214c9701313",
     "TYPESCRIPT-LICENSE.txt": "a7d00bfd54525bc694b6e32f64c7ebcf5e6b7ae3657be5cc12767bce74654a47",
