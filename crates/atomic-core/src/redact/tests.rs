@@ -2581,8 +2581,36 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
         let mut held = out["arguments"].clone();
         for _ in 0..depth {
             let text = held.as_str().expect("a string").to_owned();
-            let parsed: Value = serde_json::from_str(&text).expect("still JSON");
+            let parsed: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|_| panic!("DBGJSON depth {depth}: {text}"));
             held = parsed.get("body").cloned().unwrap_or(parsed);
         }
+    }
+}
+
+/// A secret-named flag whose value no reading takes as one clean value,
+/// one starting with a bracket, or a quote no quote escaped alike closes,
+/// is hidden from the flag on, as text and in JSON held in a string.
+#[test]
+fn a_flag_value_no_reading_takes_whole_is_hidden_on() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("--api-key [\\\"-p, \\\"{credential}]"),
+        format!("sh --api-key \\\"login \\\"[--secret,{credential}]\\\" --cmd"),
+        format!("--password [\\\"--api-key, \\\"{credential}]"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: the value showed as text"
+        );
+        let mut out = json!({"arguments": json!({"cmd": line}).to_string()});
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in JSON"
+        );
     }
 }

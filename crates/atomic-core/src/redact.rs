@@ -299,12 +299,16 @@ fn regex(pattern: &str) -> Regex {
 /// an argument list, `"--token", "abc"`. A value may be quoted with escaped
 /// quotes, `--password \"x\"`, as in a command held in JSON in a string, at
 /// any depth of escaping.
-static FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    regex(&format!(
+static FLAG: LazyLock<Regex> = LazyLock::new(|| regex(&flag_pattern()));
+/// [`FLAG`] where a text starts, and nowhere after.
+static FLAG_AT_START: LazyLock<Regex> =
+    LazyLock::new(|| regex(&format!("^(?:{})", flag_pattern())));
+fn flag_pattern() -> String {
+    format!(
         r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["']))({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
         escaped = escaped_quoted(),
-    ))
-});
+    )
+}
 /// The alternatives of [`FLAG`]'s value for one in escaped quotes, `\"x\"`
 /// or `\\\"x\\\"`, tried before a bare value would take the backslash:
 /// closed by the first quote after it, which must be escaped as the opening
@@ -331,6 +335,10 @@ static FLAG_UNESCAPED: LazyLock<Regex> = LazyLock::new(|| {
     regex(
         r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
     )
+});
+/// A flag and what separates it from its value, as [`FLAG`] reads them.
+static FLAG_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r#"(?:^|[\s"'\[,])--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["'])"#)
 });
 /// An authorization, cookie or API key header and its value, to the end of
 /// the line or the quote around it.
@@ -1212,6 +1220,137 @@ fn redact_unescaped_flag(captures: &Captures<'_>) -> String {
     redact_flag_within(captures, 0)
 }
 
+/// Read once more each secret-named flag's value, and hide what follows
+/// the flag where the flag readings left no clean value: one that starts with a bracket or a comma, opens a quote
+/// that no quote escaped alike closes, or runs on into more than a value.
+/// What no reading can tell apart is hidden from the flag up to the next
+/// flag, the end of the line or the end of the string the flag is in, so
+/// JSON around it still parses.
+fn unclean_flag_values(input: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last = 0;
+    for head in FLAG_HEAD.captures_iter(input) {
+        let Some(whole) = head.get(0) else { continue };
+        if whole.start() < last || strength(&head[1]) == Strength::None {
+            continue;
+        }
+        let at = whole.end();
+        let rest = &input[at..];
+        if clean_value(rest) {
+            // One the readings before may not have reached, inside a value
+            // they read whole: read it here.
+            let from = &input[whole.start()..];
+            if let Some(flag) = FLAG_AT_START.captures(from)
+                && let Some(read) = flag.get(0)
+            {
+                let redacted = redact_flag(&flag);
+                if redacted != read.as_str() {
+                    out.push_str(&input[last..whole.start()]);
+                    out.push_str(&redacted);
+                    last = whole.start() + read.end();
+                }
+            }
+            continue;
+        }
+        let end = at + unclean_len(&input[..whole.start()], rest);
+        if end == at {
+            continue;
+        }
+        out.push_str(&input[last..at]);
+        out.push_str(REDACTED);
+        last = end;
+    }
+    (last > 0).then(|| {
+        out.push_str(&input[last..]);
+        out
+    })
+}
+
+/// Whether `rest`, after a flag, starts with one clean value: hidden
+/// already, a bare word, or a quote closed by the first quote after it,
+/// escaped alike; then nothing but closing quotes, brackets and commas
+/// before a space or the end.
+fn clean_value(rest: &str) -> bool {
+    let after = if let Some(after) = rest.strip_prefix(REDACTED) {
+        after
+    } else {
+        let escapes = rest.len() - rest.trim_start_matches('\\').len();
+        match rest[escapes..].chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let inner = &rest[escapes + 1..];
+                // Looked for no further than the value can run.
+                let inner = &inner[..value_reach(inner)];
+                let Some(close) = inner.find(quote) else {
+                    return false;
+                };
+                let run = inner[..close].len() - inner[..close].trim_end_matches('\\').len();
+                if run != escapes {
+                    return false;
+                }
+                &inner[close + 1..]
+            }
+            Some(c) if escapes == 0 && !matches!(c, '[' | '{' | ',' | ']' | '}') => {
+                let word = rest
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+                    .unwrap_or(rest.len());
+                &rest[word..]
+            }
+            _ => return false,
+        }
+    };
+    after
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .all(|c| matches!(c, '"' | '\'' | '\\' | ']' | '}' | ',' | ')'))
+}
+
+/// How far a flag's value can run in `rest`: to the end of the line or
+/// the next flag after a space.
+fn value_reach(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    (0..bytes.len())
+        .find(|&i| {
+            bytes[i] == b'\n' || (matches!(bytes[i], b' ' | b'\t') && starts_flag(&bytes[i + 1..]))
+        })
+        .unwrap_or(bytes.len())
+}
+
+/// Whether `bytes` starts with a flag: `-x` or `--x`.
+fn starts_flag(bytes: &[u8]) -> bool {
+    match bytes {
+        [b'-', b'-', c, ..] | [b'-', c, ..] => c.is_ascii_alphanumeric(),
+        _ => false,
+    }
+}
+
+/// How much of `rest` an unclean flag value takes: up to the next flag
+/// after a space, the end of the line, or the quote that ends the string
+/// the flag is in, escaped as the nearest quote before the flag (`before`)
+/// is or less, and not its backslashes; to the end if there is none.
+fn unclean_len(before: &str, rest: &str) -> usize {
+    let enclosing = before.rfind(['"', '\'']).map(|at| {
+        let run = &before[..at];
+        run.len() - run.trim_end_matches('\\').len()
+    });
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => return i,
+            b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return i,
+            b'"' | b'\'' => {
+                let run = rest[..i].len() - rest[..i].trim_end_matches('\\').len();
+                if enclosing.is_some_and(|level| run <= level) {
+                    return i - run;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
 /// Whether a quoted value reads as more than one: it assigns a name,
 /// holds a flag or a quote, so the quote closing it may open a value
 /// inside it.
@@ -1374,6 +1513,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
     apply(&FLAG_UNESCAPED, &redact_unescaped_flag);
+    if let Some(hidden) = unclean_flag_values(&output) {
+        output = Cow::Owned(hidden);
+    }
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }
