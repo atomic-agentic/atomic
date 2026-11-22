@@ -239,6 +239,12 @@ fn real_main() -> anyhow::Result<()> {
     {
         std::process::exit(atomic_core::helper_runtime::serve());
     }
+    // So does the Astro compiler's child, which runs the bundled compiler on
+    // the embedded V8.
+    if std::env::args_os().nth(1).as_deref() == Some(atomic_core::compiler_host::CHILD_ARG.as_ref())
+    {
+        std::process::exit(atomic_core::compiler_host::serve());
+    }
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
     if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {

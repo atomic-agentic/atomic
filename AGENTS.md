@@ -179,7 +179,7 @@ first.
    change covers every path it claims: lite, Codex and exec atoms, plain and
    `--json` output, every call site. When something becomes built, update
    `docs/reference/availability.md`; when an example changes, run the
-   example checker as CI's examples job does (its virtualenv and pinned Deno
+   example checker as CI's examples job does (its virtualenv and a built atomic
    included).
 4. **Fail closed.** No error path, empty set, unknown value or missing
    component ends up allowing, showing or passing what it should refuse.

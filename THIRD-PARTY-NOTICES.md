@@ -114,6 +114,6 @@ required. The bundled libraries are:
 Original licenses and generated bundle notices are retained under
 `crates/atomic-core/assets` and included in release archives under `licenses/`.
 Compiler dependency versions and payload hashes are included in the SBOM.
-Deno 2.9.8 is a separately provisioned host, pinned in `deps/deno.json`; it is not
-linked into this binary. Contributor-only npm dependencies are pinned in the
+The compiler runs on the V8 linked into this binary through `deno_core`; no Deno
+executable is needed or shipped. Contributor-only npm dependencies are pinned in the
 authoring package lockfile.

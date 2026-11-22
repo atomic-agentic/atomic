@@ -1,0 +1,1 @@
+compiler-heap-terminate|crates/atomic-core/src/compiler_host.rs|handle.terminate_execution();|let _ = &handle; // CONTROL_OFF|-p atomic-agentic-core --lib -- compiler_host::tests::a_heap_blow_up_is_refused_at_the_limit

@@ -109,15 +109,19 @@ addresses an S3 bucket by the bucket's own host name, such as
 endpoint. See
 [call AWS and other services with an SDK](../guides/scripts-and-cloud-sdks.md).
 
-## The Astro compiler needs Deno 2.9.8
+## The Astro compiler fails or runs out of time or memory
 
-`atomic check` and `atomic render` run atomic's bundled Astro compiler on Deno
-2.9.8, and say so when they find no Deno or another version. Install that
-version and put it on your `PATH`, or set `ATOMIC_DENO` to its executable. In a
-checkout of this repository, `python3 scripts/setup-deno.py <dir>` downloads it
-and checks it against the checksum in `deps/deno.json`. The compiler unpacks
-itself under `ATOMIC_HOME` when that is set, and otherwise in your cache
-directory; set `ATOMIC_HOME` when there is no writable home directory.
+`atomic check` and `atomic render` run Atomic's bundled Astro compiler in a
+child process of Atomic itself, on its embedded V8; no Deno is needed. A compile
+that runs past 30 seconds is stopped with `the Astro compiler exceeded 30
+seconds`, and one that uses 32 seconds of CPU time with `the Astro compiler
+exceeded its CPU time limit`. One that outgrows its 1 GiB JavaScript heap, or
+2.5 GiB of memory in all (the heap, twice over while it unwinds, and 512 MiB
+outside it for V8, the parser's WebAssembly memory and buffers), fails, usually
+with `the Astro compiler exceeded its memory limit` in the error. Checking the whole
+example catalog needs about 800 MiB. A smaller component graph or simpler types
+bring an atom within these limits. A compiler that crashes is reported with what
+it wrote to stderr, and leaves no core file; report it as a bug.
 
 ## Deno cannot be downloaded
 

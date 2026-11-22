@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Tests for the armed-binary check in scripts/release-package.sh: a binary
-# with the crash tests' failpoints compiled in is refused before anything is
-# packaged, and one without them gets past the check. A stand-in for cargo
+# with the crash tests' failpoints, or the test-only compiler dispatch,
+# compiled in is refused before anything is packaged, and one without them
+# gets past the check. A stand-in for cargo
 # stops the script right after it; no toolchain is needed.
 #
 #   scripts/release-package-test.sh
@@ -36,8 +37,15 @@ if [ "${code}" -eq 0 ] || ! grep -q "has crash-test failpoints compiled in" <<<"
     failures=$((failures + 1))
 fi
 
+package $'\x7fELF...ATOMIC_COMPILER_TEST_DISPATCH...'
+if [ "${code}" -eq 0 ] || ! grep -q "has the compiler-in-tests feature compiled in" <<<"${out}" ||
+    grep -q "stand-in cargo was reached" <<<"${out}"; then
+    echo "FAIL a binary with the test compiler dispatch was not refused first: exit ${code}: ${out}" >&2
+    failures=$((failures + 1))
+fi
+
 package $'\x7fELF...an ordinary release binary...'
-if grep -q "failpoints compiled in" <<<"${out}" || ! grep -q "stand-in cargo was reached" <<<"${out}"; then
+if grep -q "compiled in" <<<"${out}" || ! grep -q "stand-in cargo was reached" <<<"${out}"; then
     echo "FAIL an unarmed binary did not get past the check: exit ${code}: ${out}" >&2
     failures=$((failures + 1))
 fi
