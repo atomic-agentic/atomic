@@ -100,6 +100,48 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     }
 }
 
+// While something is at the home a read-only turn's commands are given,
+// which must not exist, the turn does not start: nothing reaches the
+// model, and the failure is the machine's, so a durable run stops without
+// recording one.
+#[test]
+fn a_read_only_turn_does_not_start_while_its_home_is_there() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text("{}".into())])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "home-there");
+        let there = std::env::temp_dir().join(format!("atomic-home-there-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&there);
+        std::fs::create_dir_all(&there).expect("home");
+        let failed = {
+            let _home = codex::ShellHomeAt::new(&there);
+            run_codex_atom(
+                &Classify,
+                &Note {
+                    text: "Export crashes.".into(),
+                },
+                &rt,
+                &helperless(),
+            )
+            .await
+        };
+        let _ = std::fs::remove_dir_all(&there);
+        match failed {
+            Err(AtomError::Unconfinable(why)) => assert!(
+                why.starts_with(&format!(
+                    "{} is the home atomic gives commands",
+                    there.display()
+                )),
+                "{why}"
+            ),
+            Err(e) => panic!("the turn was not refused as the machine's: {e:?}"),
+            Ok(_) => panic!("the turn ran"),
+        }
+        assert_eq!(model.calls(), 0, "the turn reached the model");
+    });
+}
+
 #[test]
 fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
     on_codex_runtime(async {
@@ -2802,6 +2844,65 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
         let refused = turn_in(&linked, &mut TurnSpec::default()).expect_err("linked");
         assert!(refused.to_string().contains("XDG_CACHE_HOME"), "{refused}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A read-only turn's own scratch directory is denied to it with the rest of
+// the backend's scratch, so its shell's HOME is a path that does not exist,
+// where it starts silently, and nothing in the denied scratch is reopened
+// for it: not its own directory, nor any other turn's. A workspace-write
+// turn's HOME stays its scratch directory, which it may write.
+#[test]
+fn a_read_only_turns_home_does_not_exist_and_the_scratch_stays_denied() {
+    use crate::typed::Sandbox::{ReadOnly, WorkspaceWrite};
+    let dir = std::env::temp_dir().join(format!("atomic-ro-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let root = dir.join("scratch");
+    let own = root.join("debug/turn-a/1");
+    for sub in [
+        &dir.join("tree"),
+        &own,
+        &root.join("debug/turn-b/2"),
+        &dir.join("tmp"),
+    ] {
+        std::fs::create_dir_all(sub).expect("dir");
+    }
+    let workspace = |sandbox| atomic_exec::Workspace {
+        label: "fix".into(),
+        root: Some(dir.join("tree")),
+        scratch: Some(own.clone()),
+        tmp: Some(dir.join("tmp")),
+        shell: Shell::Local,
+        sandbox,
+        writable_roots: Vec::new(),
+        env: [("ZDOTDIR".to_owned(), own.display().to_string())].into(),
+        denied: vec![root.clone()],
+    };
+    let mut spec = TurnSpec::default();
+    turn_in(&workspace(ReadOnly), &mut spec).expect("read-only");
+    assert_eq!(spec.env["HOME"], codex::SHELL_HOME);
+    assert!(
+        !spec.env.contains_key("ZDOTDIR"),
+        "ZDOTDIR is in the scratch"
+    );
+    // The whole scratch stays denied, and nothing in it is reopened.
+    assert_eq!(spec.denied, std::slice::from_ref(&root));
+    assert!(
+        !spec.writable_roots.iter().any(|w| w.starts_with(&root)),
+        "a read-only turn may write in the scratch"
+    );
+    let mut spec = TurnSpec::default();
+    turn_in(&workspace(WorkspaceWrite), &mut spec).expect("workspace-write");
+    assert_eq!(spec.env["HOME"], own.display().to_string());
+    assert_eq!(spec.env["ZDOTDIR"], own.display().to_string());
+    assert_eq!(spec.denied, std::slice::from_ref(&root));
+    // Its own directory alone is reopened, for it to write.
+    let reopened: Vec<_> = spec
+        .writable_roots
+        .iter()
+        .filter(|w| w.starts_with(&root))
+        .collect();
+    assert_eq!(reopened, [&own]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

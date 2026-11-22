@@ -2060,8 +2060,9 @@ const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_*"];
 /// variables from this process (`PATH`, `USER` and the like), except any
 /// whose name holds `KEY`, `SECRET` or `TOKEN`, any of atomic's own and any
 /// in [`SHELL_EXCLUDES`], with `HOME` at [`SHELL_HOME`], and then exactly
-/// what the atom declares (`declared`), which the runtime gives the
-/// attempt's own `HOME`. Nothing else of atomic's environment reaches the
+/// what the atom declares (`declared`), in which the runtime gives a
+/// `workspace-write` turn the attempt's own `HOME` and leaves a `read-only`
+/// turn's at [`SHELL_HOME`]. Nothing else of atomic's environment reaches the
 /// command, and through its output, the model.
 pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellEnvironmentPolicy {
     use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
@@ -2544,7 +2545,8 @@ where
 /// as atomic: under a helper's name (the Linux sandbox, `apply_patch`) or with
 /// a helper's first argument. A helper must run before atomic touches
 /// anything, such as its state directory: it runs inside a turn, where
-/// `HOME` is the turn's scratch directory, which the turn may write.
+/// `HOME` is the turn's scratch directory, which a `workspace-write` turn
+/// may write, or [`SHELL_HOME`] for a `read-only` turn.
 pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     let name = args
         .next()
@@ -4377,6 +4379,15 @@ where
 {
     let spec = first;
     refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
+    // A command whose HOME is the one that must not exist, as a read-only
+    // turn's is, runs only while it does not: refused before anything
+    // reaches the model.
+    // `scripts/controls/turn-home-absent.row` switches this off.
+    let home = spec.env.get("HOME").map(String::as_str);
+    let home_held = home.unwrap_or(SHELL_HOME) == SHELL_HOME;
+    if home_held {
+        shell_home_absent().map_err(|why| anyhow::Error::new(HomeThere(why)))?;
+    }
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -5113,12 +5124,78 @@ pub const SHELL_EXCLUDES: &[&str] = &[
     "*_API_KEY",
 ];
 
-/// The home directory an atom's shell is given: one that does not exist.
-/// Codex runs commands in the person's own shell, which reads startup files
-/// from the home directory even when it is not a login shell (bash's
-/// `.bashrc` when its input is a socket, zsh's `.zshenv` always), and those
-/// can export anything.
+/// The home directory an atom's shell is given where no attempt gives it
+/// one of its own, as for a `read-only` turn, and atomic's own git: one
+/// that does not exist, which [`shell_home_absent`] holds it to. Codex runs
+/// commands in the person's own shell, which reads startup files from the
+/// home directory even when it is not a login shell (bash's `.bashrc` when
+/// its input is a socket, zsh's `.zshenv` always), and those can export
+/// anything.
 pub const SHELL_HOME: &str = "/nonexistent";
+
+/// Refused unless [`SHELL_HOME`] is not there: a shell given it as its home
+/// would read startup files from it, so one put there, by whoever may make
+/// it, would run in every such command, and git would read its settings.
+pub fn shell_home_absent() -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(path) = SHELL_HOME_LOOKED_AT.with(|p| p.borrow().clone()) {
+        return absent_home(&path);
+    }
+    absent_home(Path::new(SHELL_HOME))
+}
+
+/// Why a command whose home must not exist cannot start
+/// ([`shell_home_absent`]): a fault of the machine's, which nothing sent to
+/// the model caused.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct HomeThere(pub String);
+
+#[cfg(test)]
+thread_local! {
+    /// Where [`shell_home_absent`] looks on this thread instead of
+    /// [`SHELL_HOME`], for the tests of what calls it.
+    static SHELL_HOME_LOOKED_AT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While held, [`shell_home_absent`] looks at another path on this thread.
+#[cfg(test)]
+pub(crate) struct ShellHomeAt;
+
+#[cfg(test)]
+impl ShellHomeAt {
+    /// Look at `path` on this thread until the value is dropped.
+    pub(crate) fn new(path: &Path) -> Self {
+        SHELL_HOME_LOOKED_AT.with(|p| *p.borrow_mut() = Some(path.to_owned()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShellHomeAt {
+    fn drop(&mut self) {
+        SHELL_HOME_LOOKED_AT.with(|p| *p.borrow_mut() = None);
+    }
+}
+
+/// [`shell_home_absent`] for `path`: only a true "not there" passes; a file,
+/// a directory or a link there, or an error looking, such as a directory
+/// above it this user may not search, refuses.
+fn absent_home(path: &Path) -> Result<(), String> {
+    let found = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        // `scripts/controls/shell-home-absent.row` switches this off.
+        Ok(_) => "something is there".to_owned(),
+        // `scripts/controls/shell-home-unreadable.row` switches this off.
+        Err(e) => format!("atomic cannot tell whether anything is there ({e})"),
+    };
+    Err(format!(
+        "{} is the home atomic gives commands so that their shell reads no startup files \
+         and git no settings, but {found}; remove it",
+        path.display()
+    ))
+}
 
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
@@ -8289,6 +8366,49 @@ mod tests {
         ] {
             assert!(!is_openai_default(other), "{other}");
         }
+    }
+
+    /// The home a command's shell is given where it has none of its own
+    /// passes only where nothing is there: a file, a directory, a link,
+    /// even one that leads nowhere, or a place that cannot be looked at
+    /// refuses, naming it.
+    #[cfg(unix)]
+    #[test]
+    fn the_home_that_must_not_exist_refuses_whatever_is_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Scratch::new("shell-home");
+        let home = dir.0.join("nonexistent");
+        assert_eq!(absent_home(&home), Ok(()));
+        let refused = |what: &str| {
+            let why = absent_home(&home).expect_err(what);
+            assert!(
+                why.starts_with(&format!(
+                    "{} is the home atomic gives commands so that their shell reads no startup \
+                     files and git no settings, but something is there",
+                    home.display()
+                )),
+                "{what}: {why}"
+            );
+        };
+        std::fs::create_dir(&home).expect("dir");
+        refused("a directory");
+        std::fs::remove_dir(&home).expect("rmdir");
+        std::fs::write(&home, "").expect("file");
+        refused("a file");
+        std::fs::remove_file(&home).expect("rm");
+        link(&dir.0.join("nowhere"), &home);
+        refused("a link that leads nowhere");
+        std::fs::remove_file(&home).expect("rm");
+        // Under a directory this user may not search: not "not there".
+        let shut = dir.0.join("shut");
+        std::fs::create_dir(&shut).expect("dir");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).expect("mode");
+        let why = absent_home(&shut.join("nonexistent")).expect_err("unsearchable");
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        assert!(
+            why.contains("atomic cannot tell whether anything is there"),
+            "{why}"
+        );
     }
 
     #[test]

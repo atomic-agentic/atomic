@@ -199,18 +199,23 @@ fn atom_commands_get_only_core_and_declared_variables_on_every_backend() {
             assert!(!seen.contains(MARKER), "{what}: a profile ran: {seen}");
         }
         #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
-        codex_turn().await;
+        for sandbox in [
+            atomic_core::Sandbox::ReadOnly,
+            atomic_core::Sandbox::WorkspaceWrite,
+        ] {
+            codex_turn(sandbox).await;
+        }
     });
 }
 
-/// A command the model runs in a Codex turn, as its tool output reached the
-/// model.
+/// A command the model runs in a Codex turn under `sandbox`, as its tool
+/// output reached the model.
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
-async fn codex_turn() {
+async fn codex_turn(sandbox: atomic_core::Sandbox) {
     use atomic_core::codex::{CodexPaths, ModelEndpoint, TurnSpec};
     use atomic_core::runtime::{Artifacts, CodexRuntime, run_turn};
     use atomic_core::testing::{FakeModel, Reply};
-    let dir = scratch("codex");
+    let dir = scratch(&format!("codex-{sandbox:?}"));
     for sub in ["cwd", "codex-home", "bin"] {
         std::fs::create_dir_all(dir.join(sub)).expect("scratch");
     }
@@ -272,6 +277,7 @@ async fn codex_turn() {
         &TurnSpec {
             prompt: "Show the environment.".into(),
             env: [("DECLARED".to_owned(), "yes".to_owned())].into(),
+            sandbox,
             ..TurnSpec::default()
         },
     )
@@ -320,18 +326,31 @@ async fn codex_turn() {
         "the command did not run in bash: {output}"
     );
     assert!(output.contains("login=no"), "a login shell ran: {output}");
-    // HOME and ZDOTDIR are the attempt's own scratch directory, so no
-    // shell, zsh included, finds startup files there; TMPDIR is the turn's
-    // own too, inside it, and not the backend's shared one.
-    let (home, zdotdir, tmp) = (value("HOME"), value("ZDOTDIR"), value("TMPDIR"));
-    assert_eq!(home, zdotdir);
-    assert_eq!(tmp, format!("{home}/tmp"));
-    assert!(!output.contains("ATOMIC_TURN_TMPDIR"), "{output}");
-    for dir in [&home, &tmp] {
-        assert!(
-            Path::new(dir).starts_with(&scratch_root),
-            "{dir} is not under {}",
-            scratch_root.display()
-        );
+    // A workspace-write turn's HOME and ZDOTDIR are the attempt's own
+    // scratch directory, so no shell, zsh included, finds startup files
+    // there; a read-only turn's HOME is one that does not exist, since its
+    // scratch directory is out of its reach, and it has no ZDOTDIR. TMPDIR
+    // is the turn's own either way, in its scratch directory, and not the
+    // backend's shared one.
+    let (home, tmp) = (value("HOME"), value("TMPDIR"));
+    let zdotdir = output.split("\\n").find_map(|l| l.strip_prefix("ZDOTDIR="));
+    let own = Path::new(&tmp).parent().expect("TMPDIR's directory");
+    assert_eq!(tmp, own.join("tmp").display().to_string());
+    match sandbox {
+        atomic_core::Sandbox::WorkspaceWrite => {
+            assert_eq!(Path::new(&home), own, "{output}");
+            assert_eq!(zdotdir, Some(home.as_str()), "{output}");
+        }
+        atomic_core::Sandbox::ReadOnly => {
+            assert_eq!(home, atomic_core::codex::SHELL_HOME, "{output}");
+            assert_eq!(zdotdir, None, "{output}");
+        }
     }
+    assert!(!output.contains("ATOMIC_TURN_TMPDIR"), "{output}");
+    assert!(
+        own.starts_with(&scratch_root),
+        "{} is not under {}",
+        own.display(),
+        scratch_root.display()
+    );
 }

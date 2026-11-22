@@ -1024,8 +1024,18 @@ async fn run_contract(
 }
 
 /// What a turn that failed failed of: the model, or, when the sandbox's
-/// deny list could not be made, the machine it would have run on.
+/// deny list could not be made or the home its commands must not have is
+/// there ([`crate::codex::HomeThere`]), the machine it would have run on.
 fn turn_failure(e: &anyhow::Error) -> AtomError {
+    // A home that must not exist is there: the machine's to fix, and the
+    // step's to run again once it is.
+    // `scripts/controls/turn-home-unconfinable.row` switches this off.
+    let home = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::HomeThere>());
+    if let Some(there) = home {
+        return AtomError::Unconfinable(there.to_string());
+    }
     match e
         .chain()
         .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())
@@ -1063,11 +1073,13 @@ fn resolved(path: &std::path::Path) -> PathBuf {
 
 /// Set `spec` up to run in `workspace` and return the directory its thread
 /// runs in: the sandbox, the writable roots and the environment are the
-/// workspace's, and its shell must be one this process can drive. Its
-/// commands' `HOME` and `ZDOTDIR` are the workspace's scratch directory and
-/// their `TMPDIR` a directory inside it, so no shell reads the developer's
-/// startup files, and no other turn can write what a turn leaves in its
-/// temporary directory; a `workspace-write` turn may write them.
+/// workspace's, and its shell must be one this process can drive. A
+/// `workspace-write` turn's commands' `HOME` and `ZDOTDIR` are the
+/// workspace's scratch directory, which it may write; a `read-only` turn's
+/// `HOME` is [`codex::SHELL_HOME`], since its scratch directory is denied to
+/// it. Their `TMPDIR` is a directory inside the scratch directory. So no
+/// shell reads the developer's startup files, and no other turn can write
+/// what a turn leaves in its temporary directory.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -1095,8 +1107,23 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
             }
         }
     };
-    private("HOME", &workspace.scratch, spec);
-    private("ZDOTDIR", &workspace.scratch, spec);
+    // A `read-only` turn's own scratch directory is denied to it with the
+    // rest of the backend's scratch (Codex's Linux sandbox reopens only
+    // writable directories inside a denied one), so a shell there could not
+    // read its HOME and would say so as it starts. Its HOME is
+    // `codex::SHELL_HOME` instead, a path that does not exist: every shell
+    // starts there silently, reading nothing, and nothing inside a denied
+    // directory is reopened for it.
+    // `scripts/controls/read-only-home.row` switches this off.
+    let own_home = workspace.sandbox == crate::typed::Sandbox::WorkspaceWrite;
+    if own_home {
+        private("HOME", &workspace.scratch, spec);
+        private("ZDOTDIR", &workspace.scratch, spec);
+    } else {
+        spec.env
+            .insert("HOME".to_owned(), codex::SHELL_HOME.to_owned());
+        spec.env.remove("ZDOTDIR");
+    }
     // Cargo's home is the attempt's own, never shared and never the
     // person's, unless the atom declares one.
     if let Some(scratch) = &workspace.scratch {
