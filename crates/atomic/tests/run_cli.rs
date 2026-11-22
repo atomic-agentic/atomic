@@ -6700,9 +6700,10 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
         let base = "1111111111111111111111111111111111111111";
         let data = json!({"base": base, "task": "multiply"}).to_string();
 
-        // Refused, with git's news about the project in the refusal: no
-        // repository there, which the person can act on, and not that atomic
-        // could not tell — which would be the other news, and false here.
+        // Refused, with what was found about the project in the refusal: that
+        // git was asked about its directory and said no, in git's own words,
+        // which the person can act on — and not that git could not be asked,
+        // which would be the other news, and false here.
         let out = atomic(
             &dir,
             &project,
@@ -6715,7 +6716,7 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
         assert_eq!(error["kind"], "fixture.required", "{error}");
         let description = error["description"].as_str().expect("a description");
         assert!(
-            description.contains("git finds no repository in the project's directory"),
+            description.contains("git refused the project's directory"),
             "{description}"
         );
         assert!(
@@ -6734,10 +6735,11 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
 
         // The workflow that needs no worktree runs on the same project: the
         // gate's own mapping ran, the decision came from a human credential,
-        // and the run's result is its input. Nothing was asked of git about
-        // the project, which is in no repository.
+        // and the run carried itself to its end and printed its result.
+        // Nothing was asked of git about the project, which is in no
+        // repository.
         let state = state_dir(&dir, &project);
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let log = dir.join("ask.log");
         let out_file = dir.join("ask.json");
         let said = |what: &str| {
@@ -6766,28 +6768,22 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
             g.title, "Check the note Export crashes on accents",
             "the gate step ran, and mapped its title from the input: {g:?}"
         );
-        // A person decides, from another terminal than the run's; the run's
-        // own command is stopped at its gate, as any run may be, and a second
-        // command carries the decided run to its end.
+        // A person decides, from another terminal than the run's, and the
+        // run's own command carries it the rest of the way and prints its
+        // result: the gate is all the waiting this workflow does.
         approve(&rt, &g).await;
-        terminate(&child);
-        wait_child(&mut child, "the run stopped at its gate");
-        let out = atomic(
-            &dir,
-            &project,
-            &["--json", "runs", "resume", "ask-1"],
-            &UNUSED_MODEL,
-            "",
-        );
-        assert!(out.status.success(), "{}", text(&out));
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut child, "the run"))
+            .await
+            .expect("child");
+        let shown = std::fs::read_to_string(&log).unwrap_or_default();
+        let printed = std::fs::read_to_string(&out_file).unwrap_or_default();
+        assert!(status.success(), "{shown}\n{printed}");
         let given: Value = serde_json::from_str(RANK_INPUT).expect("input");
-        assert_eq!(stdout_json(&out)["output"], given, "{}", text(&out));
-        assert!(
-            std::fs::read_to_string(&out_file)
-                .expect("stdout")
-                .is_empty(),
-            "the stopped command wrote no result"
-        );
+        let doc: Value =
+            serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {shown}\n{printed}"));
+        assert_eq!(doc["run"], "ask-1", "{doc}");
+        assert_eq!(doc["status"], "succeeded", "{shown}\n{doc}");
+        assert_eq!(doc["output"], given, "{doc}: the run returned its input");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

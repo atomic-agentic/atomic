@@ -505,15 +505,24 @@ async fn engine_built_with(
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    // What the project offers its worktree steps, asked the way `atomic`
-    // asks it before a run starts: a project in no repository, or one git
-    // cannot read, is said as what it is and never stops a run that needs no
-    // worktree.
+    // What the project offers its worktree steps, which is what an embedder
+    // of the pipeline gives: `atomic` itself always says it makes none, and
+    // asks git only inside the fixture a run is bound to. A project in no
+    // repository is said as that and never stops a run that needs no worktree.
+    // git searches upward from the directory it is asked about, so it is asked
+    // only of a project holding a repository of its own: asked beside one, a
+    // scratch directory sitting inside some unrelated repository would have
+    // worktrees and refs made there.
     let project = dir.join("project");
-    let worktrees = ProjectWorktrees::at(&project, dir.join("state/worktrees"));
+    let owns_a_repository = project.join(".git").exists();
+    let worktrees = if owns_a_repository {
+        ProjectWorktrees::at(&project, dir.join("state/worktrees"))
+    } else {
+        ProjectWorktrees::FixtureOnly
+    };
     let runtimes = runtimes_on(
         dir,
-        &if project.join(".git").exists() {
+        &if owns_a_repository {
             project
         } else {
             dir.join("cwd")

@@ -81,9 +81,9 @@ fn bind_fixture(
             // from the project's checkout, so what was found about the project
             // changes nothing about the refusal. It is still said, because a
             // step that needs a worktree is asking why there is none — and
-            // "git could not be asked about it" is different news from "the
-            // project is in no repository". A project with a repository gets
-            // the plain refusal.
+            // "git refused the project's directory" is different news from
+            // "atomic cannot tell whether it is in a repository". A project
+            // with a repository gets the plain refusal.
             let found = match ProjectWorktrees::find(state) {
                 ProjectWorktrees::Found(_) => String::new(),
                 found => format!(", and {}", found.describe()),

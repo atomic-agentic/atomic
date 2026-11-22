@@ -443,25 +443,30 @@ fn worktrees_for(pipeline: &Pipeline, services: &Services) -> WorktreesForRun {
 /// What the project offers a `worktree: true` step whose run is bound to no
 /// fixture: its repository, or why it has none.
 ///
-/// The ways there are none are kept apart on purpose, each with what said it.
-/// A project outside every repository and a repository git could not read are
-/// different news, and only the first is the person's own to act on; neither
-/// lets a worktree step run. `atomic` makes no worktrees of a project's own
-/// checkout — a run that changes code is bound to the repository its
-/// `--fixture` names — so it never hands out [`Self::Found`]; that is what an
-/// embedder that means it gives. What git said about the project is asked
-/// where a run that changes code is refused for naming no fixture (see
-/// `runs::bind_fixture`), so that the refusal says what was found instead of
-/// the same words for every project.
+/// The ways there are none are kept apart on purpose, each with what said it,
+/// since they are different news. git running on the project's directory and
+/// refusing it is news about the directory, though not about why it said no:
+/// git refuses alike a directory holding no repository, a repository it cannot
+/// read, and a repository whose configuration it cannot read afterwards. git
+/// never getting to answer at all is news that nothing was learned about the
+/// directory. Neither lets a worktree step run. `atomic` makes no worktrees of
+/// a project's own checkout — a run that changes code is bound to the
+/// repository its `--fixture` names — so it never hands out [`Self::Found`];
+/// that is what an embedder that means it gives. What git said about the
+/// project is asked where a run that changes code is refused for naming no
+/// fixture (see `runs::bind_fixture`), so that the refusal says what was found
+/// instead of the same words for every project.
 #[derive(Clone, Debug)]
 pub enum ProjectWorktrees {
     /// The project's repository, found; such a step works in a worktree of
     /// it, kept under the state directory.
     Found(Arc<Worktrees>),
     /// git ran on the project's directory and refused it, which is what git
-    /// does both with a directory that holds no repository and with one it
-    /// cannot read. What it printed is kept, since its words name the
-    /// directory and are what a person needs to go on.
+    /// does both with a directory that holds no repository and with a
+    /// repository it cannot read, and the same for a repository whose own
+    /// configuration it cannot read afterwards. Which of these it was is not
+    /// learned, so it is not said: what git printed is kept, since its words
+    /// name the directory and are what a person needs to go on.
     Refused(String),
     /// git never answered for the project at all: no git at the paths atomic
     /// looks at, git not startable, stopped, or printing what atomic cannot
@@ -503,17 +508,16 @@ impl ProjectWorktrees {
 
     /// Why the project offers no worktree, as a clause. What git or the file
     /// system said is kept in it, and a project git refused is never reported
-    /// as one git could not read, nor the other way round. A caller that must
-    /// tell [`Self::Found`] from the rest matches on it first; the sentence
-    /// for `Found` is only what its worktrees are.
+    /// as one git could not be asked about, nor the other way round; why git
+    /// refused is left to what it printed, since atomic did not learn it. A
+    /// caller that must tell [`Self::Found`] from the rest matches on it first;
+    /// the sentence for `Found` is only what its worktrees are.
     pub fn describe(&self) -> String {
         match self {
             Self::Found(_) => "the project's repository was found, and its worktrees are kept \
                  under its state directory"
                 .into(),
-            Self::Refused(why) => {
-                format!("git finds no repository in the project's directory: {why}")
-            }
+            Self::Refused(why) => format!("git refused the project's directory: {why}"),
             Self::Unknown(why) => {
                 format!("atomic cannot tell whether the project is in a git repository: {why}")
             }
@@ -2733,10 +2737,11 @@ mod tests {
 
     /// Why a project has no worktrees is what was found about it, and the
     /// two findings are different news: git ran on the directory and refused
-    /// it, which is also what git does with a repository it cannot read; and
-    /// git never got to answer at all, which proves nothing about it. Neither
-    /// lets a worktree step go without one, and neither is reported as the
-    /// other.
+    /// it, which is what git does with a directory holding no repository and
+    /// with a repository it cannot read alike, so which of them it was goes
+    /// unsaid; and git never got to answer at all, which proves nothing about
+    /// the directory. Neither lets a worktree step go without one, and neither
+    /// is reported as the other.
     #[test]
     fn a_project_with_no_worktrees_says_whether_git_refused_it_or_never_answered() {
         // Outside every repository, as the suites that need one check: the
@@ -2752,12 +2757,16 @@ mod tests {
         };
         assert!(why.contains("not a git repository"), "{why}");
         let said = refused.describe();
-        assert!(said.contains("git finds no repository"), "{said}");
+        assert!(
+            said.contains("git refused the project's directory"),
+            "{said}"
+        );
         assert!(!said.contains("cannot tell"), "{said}");
 
         // A directory that cannot be entered: git is not asked anything, so
         // nothing is known, and the refusal says so instead of naming a
-        // repository that may well be there.
+        // repository that may well be there. What comes back is the file
+        // system's own `Permission denied`, not git's words: git never ran.
         std::fs::create_dir_all(root.join("blind")).expect("blind");
         let blind = root.join("blind");
         std::fs::set_permissions(&blind, std::fs::Permissions::from_mode(0o000))
@@ -2770,7 +2779,7 @@ mod tests {
         assert!(why.contains("Permission denied"), "{why}");
         let said = unknown.describe();
         assert!(said.contains("cannot tell"), "{said}");
-        assert!(!said.contains("no repository"), "{said}");
+        assert!(!said.contains("git refused"), "{said}");
 
         // The reason reaches the run that needs a worktree, with the words
         // that said it, and with the way out.

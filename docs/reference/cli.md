@@ -130,7 +130,7 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 
 | Kind | When |
 | --- | --- |
-| `fixture.required` | The workflow changes code and no fixture is named. When the project's own directory holds no repository, or git could not be asked about it, the refusal says which |
+| `fixture.required` | The workflow changes code and no fixture is named. When the project's own directory offers no worktree, the refusal says what was found about it: that git refused it — which it says alike of a directory holding no repository and of a repository it cannot read — or that git never got to answer for it |
 | `fixture.path` | git finds no repository at `--fixture`, or it names a directory inside a repository rather than that repository's top |
 | `fixture.unreadable` | Nothing was learned about `--fixture`, because git never got to answer for it: it could not be run on that directory, was stopped, or printed what atomic cannot read. The description carries what stopped git, and atomic does not guess whether a repository is there |
 | `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
