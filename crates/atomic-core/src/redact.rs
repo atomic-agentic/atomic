@@ -1485,24 +1485,31 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
-    // JSON as written, before text redaction rewrites any of it, when text
-    // redaction changed it: whether it read as JSON, and, read as written,
-    // a secret's name in a name and value pair, such as
-    // `"key": "DB_PASSWORD"`, which reads as one only until text redaction
-    // hides the name itself.
+    // When text redaction changed the string: whether it read as JSON
+    // before (`opened`, read without building a value, as `IgnoredAny`
+    // reads it, so a lone surrogate escape or nesting past serde_json's
+    // depth limit counts), and the JSON as written (`written`, where
+    // serde_json builds a value of it). Read as written, a secret's name in
+    // a name and value pair, such as
+    // `"key": "DB_PASSWORD"`, reads as one only until text redaction hides
+    // the name itself.
     let mut written: Option<Value> = None;
+    let mut opened = false;
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string)
         && redacted != *string
     {
-        written = (nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']))
-            .then(|| serde_json::from_str::<Value>(string).ok())
-            .flatten();
+        if nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) {
+            // Read without building a value (`IgnoredAny`), JSON is
+            // accepted that a value is not built from; any value is.
+            let parsed = serde_json::from_str::<Value>(string);
+            let read_any = serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok();
+            opened = read_any;
+            written = parsed.ok();
+        }
         *string = redacted;
     }
-    // Whether the string read as JSON before text redaction touched it.
-    let opened = written.is_some();
     let pairs = written
         .as_ref()
         .filter(|_| reads_pairs_as_written())

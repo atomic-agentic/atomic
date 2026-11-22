@@ -2524,6 +2524,25 @@ fn json_that_text_redaction_breaks_is_hidden_whole() {
             "under {parent}: neither hidden whole nor JSON"
         );
     }
+    // JSON that reads as JSON to any reader but not as a value to
+    // serde_json, a lone surrogate escape or nesting past its depth limit,
+    // that text redaction changes and leaves unreadable: hidden whole.
+    let pair = r#""key":"DB_PASSWORD","value":"hunter2hunter2""#;
+    let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+    for (case, held) in [
+        format!(r#"{{"s":"\ud800","a":"{SAMPLE}",{pair}}}"#),
+        format!(r#"{{"d":{deep},"a":"{SAMPLE}",{pair}}}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = json!({ "args": held });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2hunter2"),
+            "case {case}: the pair's value showed"
+        );
+    }
 }
 
 /// JSON that text redaction breaks deeper in, in a string the JSON it
@@ -2855,18 +2874,17 @@ fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
 }
 
 /// Held JSON whose value is a chain of assignments, each read only once
-/// text around it is redacted, `password=pass =secret: pass =…`, hides the
-/// last one's value in one pass, under a hint and under a secret's name.
+/// text around it is redacted, `password=pass =secret: pass =…`, is still
+/// changing when text redaction's readings run out, so the string is
+/// hidden whole, under a hint and under a secret's name, and a second pass
+/// changes nothing.
 #[test]
-fn a_chain_of_assignments_in_held_json_settles_hidden() {
+fn a_chain_of_assignments_that_never_settles_is_hidden_whole() {
     let chain = format!("password=pass{} hunter2", " =secret: pass".repeat(5));
     for parent in ["key", "token"] {
         let mut once = json!({ parent: json!({"a": chain}).to_string() });
         value(&mut once);
-        assert!(
-            !once.to_string().contains("hunter2"),
-            "under {parent}: the last value showed"
-        );
+        assert_eq!(once[parent], REDACTED, "under {parent}: not hidden whole");
         let mut twice = once.clone();
         value(&mut twice);
         assert_eq!(twice, once, "under {parent}: a second pass changed it");
