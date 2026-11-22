@@ -304,6 +304,30 @@ read, and on a row file deleted while its switch's text is still in some
 file, rows aside, that no other row switches it in: a control whose code
 remains, renamed or moved included, keeps its row.
 
+Before applying those rules, the selector follows one level of literal Rust
+`include_bytes!`, `include_str!`, `include!` and top-level `#[path]` references,
+at both the base and the head. Paths resolve from the source file that names
+them, following committed symlinks before parent components and retaining both
+the link and its final input. Legal Rust comments between tokens do not hide
+references. Equal basenames elsewhere do not claim the same input. Literal
+crate-relative `tests` paths named by integration targets retain every reader,
+including equivalent spellings such as `tests`, `./tests/data`, and Rust
+escapes. Runtime file and directory symlinks also resolve against committed
+trees, retaining their link names and final inputs. A concrete `tests/...`
+directory named by an integration target belongs to every target that names
+it. An unowned directory, a compiled shared Rust module, or an includer whose
+further users were not followed keeps the crate-wide shared-test fallback.
+Root-wide test scans and individual runtime filenames do not narrow that
+fallback.
+
+This is a literal, one-level dependency scan, not the Cargo dependency graph.
+Computed include arguments, nested inline-module `#[path]` bases, changes to
+Cargo features, `build.rs`, lockfiles and dependency pins, and runtime-opened
+data not covered by a literal reference or the shared-helper list still need
+the full sweep. Cross-module test helpers not named by those rules need it too.
+The ordinary Rust test jobs still run for those changes; the sweep additionally
+checks the guard-removed twins that selective Controls may not select.
+
 A few rows switch text that also appears in another file, such as
 `held: true,` or a `NotFound` arm, so deleting one of them can be refused for
 a copy that has nothing to do with it; the refusal names the files. Then take

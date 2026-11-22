@@ -1,0 +1,1 @@
+read-only-home|crates/atomic-core/src/runtime.rs|    let own_home = workspace.sandbox == crate::typed::Sandbox::WorkspaceWrite;|    let own_home = true;|-p atomic-agentic-core --lib --features fake-model a_read_only_turns_home_does_not_exist_and_the_scratch_stays_denied

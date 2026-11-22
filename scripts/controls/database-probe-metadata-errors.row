@@ -1,0 +1,1 @@
+database-probe-metadata-errors|crates/atomic-core/src/state.rs|database_probe_regular(&file).map_err(fail)?|database_probe_regular(&file).unwrap_or(true)|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_metadata_errors_refuse_migration

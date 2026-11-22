@@ -206,6 +206,36 @@ fn a_bare_repository_starts_from_no_template() {
     assert_eq!(repo.object_format().expect("format"), "sha1");
 }
 
+/// While something is at the home git is given, which must not exist, no
+/// git runs: not one run through `Git::run`, nor the two `copy_reachable`
+/// starts itself, which copies nothing.
+#[test]
+fn no_git_runs_while_its_home_is_there() {
+    let dir = scratch("home-there");
+    let (source, first, _) = history(&dir);
+    let git = Git::find().expect("git");
+    let from = git.discover(&source).expect("source");
+    let to = git.init_bare(&dir.join("copy.git")).expect("init");
+    let there = dir.join("home");
+    std::fs::create_dir(&there).expect("home");
+    let refused = |result: Result<(), GitError>, what: &str| match result {
+        Err(GitError::Home(why)) => assert!(
+            why.starts_with(&format!(
+                "{} is the home atomic gives commands",
+                there.display()
+            )),
+            "{what}: {why}"
+        ),
+        other => panic!("{what}: git ran: {other:?}"),
+    };
+    {
+        let _home = crate::codex::ShellHomeAt::new(&there);
+        refused(from.object_format().map(|_| ()), "a run");
+        refused(from.copy_reachable(&first, &to), "a copy");
+    }
+    assert!(!to.has_everything(&first).expect("walk"), "the copy ran");
+}
+
 #[test]
 fn every_object_a_commit_reaches_is_copied_and_nothing_else() {
     let dir = scratch("copy");

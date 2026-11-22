@@ -1,0 +1,1 @@
+database-probe-unknown-type|crates/atomic-core/src/state.rs|Err(fail(unknown))|{ let _ = unknown; Ok(false) } // CONTROL_OFF: unknown lock type admitted|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_unknown_lock_types_refuse_migration

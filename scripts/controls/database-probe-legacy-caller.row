@@ -1,0 +1,1 @@
+database-probe-legacy-caller|crates/atomic-core/src/state.rs|if database_in_use(&database)? {|if database_in_use(&database).unwrap_or(false) { // CONTROL_OFF: caller ignores unknown probe|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_loop_errors_refuse_legacy_migration

@@ -1,0 +1,1 @@
+exec-relay-connect-deferred|crates/atomic-core/src/network/relay.rs|        if self.head.len() == CONNECT.len() {|        if /*CONTROL_OFF*/ true {|-p atomic-agentic-core --lib --features fake-model -- network::relay::tests::a_connect_split_across_reads_is_a_tunnels

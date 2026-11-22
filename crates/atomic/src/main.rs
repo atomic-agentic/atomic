@@ -221,7 +221,8 @@ fn error_line(e: &anyhow::Error) -> String {
 fn real_main() -> anyhow::Result<()> {
     // A Codex helper, such as the Linux sandbox inside a turn, runs before
     // anything else: no state directory is resolved or created, since its
-    // HOME is the turn's own scratch directory.
+    // HOME is the turn's own scratch directory, or for a read-only turn one
+    // that does not exist.
     if codex::is_helper(std::env::args_os()) {
         return codex::run_helper();
     }

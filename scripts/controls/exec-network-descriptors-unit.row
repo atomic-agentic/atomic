@@ -1,1 +1,1 @@
-exec-network-descriptors-unit|crates/atomic-core/src/network.rs|        if *reserved + DESCRIPTORS_PER_COMMAND > share {|        if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::commands_share_half_the_descriptor_limit
+exec-network-descriptors-unit|crates/atomic-core/src/network.rs|        if *reserved + each > share {|        if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::commands_share_half_the_descriptor_limit

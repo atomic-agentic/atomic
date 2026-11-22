@@ -232,9 +232,7 @@ printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
 commit
 run
 expect "a change to a crate's shared test code" "$(printf 'c\nf')"
-off shared 'crates.add(parts[1])
-    return crates' 'pass
-    return crates'
+off shared 'return crates' 'return set()'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the shared test code rule off, a change to it still selected: ${OUT}"
 unset SCRIPT
@@ -247,9 +245,7 @@ printf '{"changed": true}\n' >crates/k/tests/data.json
 commit
 run
 expect "a change to a non-Rust file at the top of a crate's tests" "$(printf 'c\nf')"
-off shared-file 'if not parts[3].endswith(".rs"):
-                crates.add(parts[1])' 'if not parts[3].endswith(".rs"):
-                pass'
+off shared-file 'if len(parts) > 4 or not parts[3].endswith(".rs"):' 'if len(parts) > 4:'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the top-level shared file rule off, a change to it still selected: ${OUT}"
 unset SCRIPT
@@ -347,6 +343,445 @@ printf 'fn main() { 1; }\n' >crates/k/tests/u/main.rs
 commit
 run
 expect "a change to a target's own directory" "f"
+
+# Literal Rust includes select the source that consumes the changed bytes.
+include_fixture() {
+    fresh
+    mkdir -p crates/k/src/mounts
+    printf '%s\n' "$1" >crates/k/src/mounts/tests.rs
+    printf 'before\n' >crates/k/src/mounts/host.mountinfo
+    echo 'e|src/other.rs|fn other|fn nothing|-p k --lib -- include_guard' >scripts/controls/e.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+for kind in include_bytes include_str include; do
+    include_fixture "fn include_guard() { ${kind}!(\"host.mountinfo\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    expect "${kind} data selects the guarding includer" "e"
+done
+include_fixture 'fn include_guard() { include_bytes!(r##"host.mountinfo"##); }'
+printf '\377after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+expect "raw Rust path and binary included bytes" "e"
+
+fresh
+mkdir -p crates/k/tests/model_auth
+printf 'fn model_auth_test() {}\n' >crates/k/tests/model_auth.rs
+printf 'fn helper() { let close = '\''}'\''; }\n#[path = "model_auth/fixture.rs"]\nmod fixture;\n' >crates/k/tests/model_auth_sandbox.rs
+printf 'pub fn fixture() {}\n' >crates/k/tests/model_auth/fixture.rs
+printf 'm|src/other.rs|fn other|fn a|-p k --test model_auth -- model_auth_test\n' >scripts/controls/m.row
+printf 'n|src/other.rs|fn other|fn b|-p k --test model_auth_sandbox -- sandbox_test\n' >scripts/controls/n.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn fixture() { 1; }\n' >crates/k/tests/model_auth/fixture.rs
+commit
+run
+expect "path-included helper selects both integration targets" "$(printf 'm\nn')"
+off path-attribute 'top_level_path = depth == 0 and attribute.search(before)' 'top_level_path = False'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = m ] || fail "with path attributes off, another target still selected: ${OUT}"
+unset SCRIPT
+
+# A library includes data under tests/: that is not shared integration data.
+fresh
+mkdir -p crates/k/src crates/k/tests/typescript
+printf 'fn include_guard() { include_str!("../tests/typescript/projection.json"); }\n' >crates/k/src/typescript.rs
+printf 'fn main() {}\n' >crates/k/tests/t.rs
+printf '{}\n' >crates/k/tests/typescript/projection.json
+echo 'e|src/other.rs|fn other|fn a|-p k --lib -- include_guard' >scripts/controls/e.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf '{"new": true}\n' >crates/k/tests/typescript/projection.json
+commit
+run
+expect "library's included test data selects library rows only" "e"
+
+# Resolve from the includer's directory, not from a matching basename.
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+mkdir -p crates/k/src/elsewhere
+printf 'fn unrelated_guard() { include_str!("host.mountinfo"); }\n' >crates/k/src/elsewhere/tests.rs
+printf 'elsewhere\n' >crates/k/src/elsewhere/host.mountinfo
+echo 'z|src/other.rs|fn other|fn z|-p k --lib -- unrelated_guard' >scripts/controls/z.row
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+expect "equal included basenames do not confuse ownership" "e"
+off includers 'changed |= included' 'pass'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with includer expansion off, included data still selected: ${OUT}"
+unset SCRIPT
+
+# Rust escaped path spellings resolve to the same tracked file.
+for path in 'host\x2emountinfo' 'host\u{2e}mountinfo'; do
+    include_fixture "fn include_guard() { include_str!(\"${path}\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    expect "escaped Rust path ${path}" "e"
+done
+
+owned_data_fixture() {
+    shared_fixture
+    mkdir -p crates/k/tests/coding-tasks/tasks crates/k/tests/fixtures/project
+    printf 'fn main() { std::path::Path::new("tests/coding-tasks/tasks"); }\n' >crates/k/tests/coding_tasks.rs
+    printf 'fn main() { std::path::Path::new("tests/fixtures/project"); }\n' >crates/k/tests/t.rs
+    printf 'data\n' >crates/k/tests/coding-tasks/tasks/input.txt
+    printf 'data\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+owned_data_fixture
+printf 'new\n' >crates/k/tests/coding-tasks/tasks/input.txt
+commit
+run
+expect "directory read by a target with no rows selects no unrelated rows" ""
+owned_data_fixture
+printf 'new\n' >crates/k/tests/fixtures/project/input.txt
+commit
+run
+expect "fixture directory selects the target that names it" "c"
+off data-readers 'if target:' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with named data readers off, shared fallback was not retained: ${OUT}"
+unset SCRIPT
+off data-ownership 'if owners and owners <= changed:' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with data ownership off, shared fallback was not retained: ${OUT}"
+unset SCRIPT
+owned_data_fixture
+printf 'fn main() { std::path::Path::new("tests/fixtures/project"); }\n' >crates/k/tests/u/main.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'new\n' >crates/k/tests/fixtures/project/input.txt
+commit
+run
+expect "a directory shared by two named targets selects both" "$(printf 'c\nf')"
+
+# A root-wide scan or one named runtime file is not proof that all of a
+# crate's shared data belongs exclusively to that reader.
+for path in 'tests/' 'tests/data.json'; do
+    shared_fixture
+    printf 'fn main() { std::path::Path::new("%s"); }\n' "${path}" >crates/k/tests/u/main.rs
+    printf '{}\n' >crates/k/tests/data.json
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf '{"changed": true}\n' >crates/k/tests/data.json
+    commit
+    run
+    expect "a broad root or runtime-file read keeps shared ownership" "$(printf 'c\nf')"
+done
+
+# Naming a compiled shared-module directory as data must not hide its
+# other users. A second include level likewise retains broad selection.
+shared_fixture
+printf 'fn main() { std::path::Path::new("tests/support"); }\n' >crates/k/tests/u/main.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
+commit
+run
+expect "a named data directory does not privatize shared Rust modules" "$(printf 'c\nf')"
+off compiled-shared 'if compiled:' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = f ] || fail "with shared modules privatized, the missing target was not exposed: ${OUT}"
+unset SCRIPT
+
+shared_fixture
+mkdir -p crates/k/tests/shared
+printf 'include_str!("data.txt");\n' >crates/k/tests/shared/helper.rs
+printf '#[path = "../shared/helper.rs"]\nmod helper;\n' >crates/k/tests/u/main.rs
+printf 'before\n' >crates/k/tests/shared/data.txt
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/shared/data.txt
+commit
+run
+expect "a second include level retains shared fallback" "$(printf 'c\nf')"
+off dependency-depth 'if owners and owners <= changed:' 'if owners:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with second-level readers ignored, missing selection was not exposed: ${OUT}"
+unset SCRIPT
+
+# A nested path attribute has a different Rust base. Never guess that it
+# owns an unrelated shared fixture with the same literal suffix.
+shared_fixture
+mkdir -p crates/k/tests/fixtures/project
+printf 'mod nested { #[path = "fixtures/project/data.rs"] mod data; }\n' >crates/k/tests/other.rs
+printf 'pub fn data() {}\n' >crates/k/tests/fixtures/project/data.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn data() { 1; }\n' >crates/k/tests/fixtures/project/data.rs
+commit
+run
+expect "nested path attributes do not claim an unrelated shared fixture" "$(printf 'c\nf')"
+off nested-attribute 'top_level_path = depth == 0 and attribute.search(before)' 'top_level_path = attribute.search(before)'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the nested attribute restriction off, false ownership was not exposed: ${OUT}"
+unset SCRIPT
+
+# Comments cannot turn shared data into one target's private data.
+for comment in '// "tests/fixtures/project"' '/* outer /* "tests/fixtures/project" */ end */'; do
+    shared_fixture
+    mkdir -p crates/k/tests/fixtures/project
+    printf '%s\nfn main() {}\n' "${comment}" >crates/k/tests/t.rs
+    printf 'before\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf 'after\n' >crates/k/tests/fixtures/project/input.txt
+    commit
+    run
+    expect "a Rust comment does not claim a data directory" "$(printf 'c\nf')"
+    if [[ "${comment}" == //* ]]; then
+        off comment 'if text.startswith("//", i):' 'if False:'
+    else
+        off comment 'if text.startswith("/*", i):
+            depth, i = 1, i + 2' 'if False:
+            depth, i = 1, i + 2'
+    fi
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = c ] || fail "with comment exclusion off, comment did not expose false ownership: ${OUT} (${ERR})"
+    unset SCRIPT
+done
+
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+ln -s loop.rs crates/k/src/loop.rs
+commit
+run
+refused "a looping Rust source cannot silently lose its includers" "crates/k/src/loop.rs is a link that does not end"
+include_fixture 'fn include_guard() { include_str!("host.mountinfo"); }'
+printf '\377\n' >crates/k/src/mounts/tests.rs
+commit
+run
+refused "non-UTF-8 Rust source refuses dependency discovery" "is not UTF-8"
+for path in 'host\q.mountinfo' 'host\u{D800}.mountinfo' 'host\u{110000}.mountinfo'; do
+    include_fixture "fn include_guard() { include_str!(\"${path}\"); }"
+    printf 'after\n' >crates/k/src/mounts/host.mountinfo
+    commit
+    run
+    refused "an undecodable Rust include path is not guessed" "Rust path escape"
+done
+include_fixture 'fn include_guard() { include_str!("host\0mountinfo"); }'
+printf 'after\n' >crates/k/src/mounts/host.mountinfo
+commit
+run
+refused "a NUL in an include path is refused" "has a NUL in a Rust path"
+
+# Independent review regressions: every literal reader remains selected
+# when one of them also owns a directory; legal trivia cannot hide syntax.
+review_fixture() {
+    fresh
+    git rm -q scripts/controls/a.row scripts/controls/b.row scripts/controls/c.row
+    mkdir -p scripts/controls crates/k/tests/data crates/k/src
+    printf '%s\n' "$1" >crates/k/tests/alpha.rs
+    printf '%s\n' "${2:-fn beta() {}}" >crates/k/tests/beta.rs
+    printf 'before\n' >crates/k/tests/data/word
+    printf 'before\n' >crates/k/src/word
+    printf 'pub fn helper() {}\n' >crates/k/src/helper.rs
+    echo 'alpha|src/other.rs|fn other|off|-p k --test alpha -- guard_alpha' >scripts/controls/alpha.row
+    echo 'beta|src/other.rs|fn other|off|-p k --test beta -- guard_beta' >scripts/controls/beta.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+for read in 'tests/data/word' 'tests/'; do
+    review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' "fn b() { let _ = std::fs::read(\"${read}\"); }"
+    printf 'after\n' >crates/k/tests/data/word
+    commit
+    run
+    expect "directory ownership retains the other literal reader ${read}" "$(printf 'alpha\nbeta')"
+    off runtime-readers 'readers.append((dependency, name))' 'pass'
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with other runtime readers off, missing selection was not exposed: ${OUT}"
+    unset SCRIPT
+done
+
+for source in 'const V: &str = include_str /* trivia */ !("../src/word");' '#[ /* trivia */ path = "../src/helper.rs"] mod helper;'; do
+    review_fixture "${source}"
+    printf 'after\n' >crates/k/src/word
+    printf 'pub fn helper() { 1; }\n' >crates/k/src/helper.rs
+    commit
+    run
+    expect "comments between Rust tokens preserve an includer" "alpha"
+    off literal-trivia 'if not candidate and not target:' 'if not re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source) and not (target and "tests/" in source):'
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with comment-aware discovery off, missing selection was not exposed: ${OUT}"
+    unset SCRIPT
+done
+
+# Only the target changes, not the symlink spelling the includer reads.
+review_fixture 'const V: &str = include_str!("../src/alias");'
+ln -s word crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/word
+commit
+run
+expect "a literal include follows its committed symlink target" "alpha"
+off include-links 'for dependency in included_paths(commit, name, path, modes):' 'for dependency in (posixpath.normpath(path),):'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with link resolution off, the missing target was not exposed: ${OUT}"
+unset SCRIPT
+BASE="$(git rev-parse HEAD)"
+git rm -q crates/k/src/word
+commit
+run
+expect "deleting a linked input retains the base-tree reader" "alpha"
+BASE="$(git rev-parse HEAD)"
+printf 'restored\n' >crates/k/src/word
+commit
+run
+expect "adding a missing linked input retains its reader" "alpha"
+
+review_fixture 'const V: &str = include_str!("../src/alias/word");'
+mkdir -p crates/k/src/real
+printf 'before\n' >crates/k/src/real/word
+ln -s real crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/real/word
+commit
+run
+expect "an intermediate directory link retains the real input" "alpha"
+
+# Changing an intermediate link must select the reader too.
+BASE="$(git rev-parse HEAD)"
+mkdir -p crates/k/src/other
+printf 'other\n' >crates/k/src/other/word
+rm crates/k/src/alias
+ln -s other crates/k/src/alias
+commit
+run
+expect "retargeting an intermediate link selects its includer" "alpha"
+off link-retarget 'for dependency in included_paths(commit, name, path, modes):' 'for dependency in (posixpath.normpath(path),):'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with link paths discarded, a retarget still selected: ${OUT}"
+unset SCRIPT
+
+# Resolve links before .., as a filesystem would, rather than guessing
+# from a lexical normalization of the spelling.
+review_fixture 'const V: &str = include_str!("../src/alias/../word");'
+mkdir -p crates/k/src/real/sub
+printf 'marker\n' >crates/k/src/real/sub/marker
+printf 'before\n' >crates/k/src/real/word
+ln -s real/sub crates/k/src/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/src/real/word
+commit
+run
+expect "a parent component follows the resolved directory link" "alpha"
+BASE="$(git rev-parse HEAD)"
+printf 'unrelated\n' >crates/k/src/word
+commit
+run
+expect "the lexical sibling is not the linked input" ""
+
+for link in alias ../../../../outside /outside; do
+    review_fixture 'const V: &str = include_bytes!("../src/alias");'
+    ln -s "${link}" crates/k/src/alias
+    commit
+    run
+    if [ "${link}" = alias ]; then
+        refused "an included data link loop refuses selection" "link that does not end"
+    else
+        refused "an included data link out of the repository refuses selection" "out of the repository"
+    fi
+done
+review_fixture 'const V: &str = include_bytes!("../src/word/child");'
+printf 'after\n' >crates/k/src/word
+commit
+run
+refused "an included input cannot traverse a regular file" "not a directory"
+
+review_fixture 'const V: &str = include_bytes!("../src/alias");'
+ln -s . crates/k/src/alias
+commit
+run
+refused "an included link ending at a directory refuses selection" "not a regular file"
+review_fixture 'const V: &str = include_bytes!("../src/real/.");'
+mkdir -p crates/k/src/real
+printf 'marker\n' >crates/k/src/real/marker
+commit
+run
+refused "an included trailing parent component cannot hide a directory" "not a regular file"
+
+# Equivalent spellings and tracked runtime links cannot be privatized away.
+for read in 'tests' './tests/data/word' 't\x65sts/data/word'; do
+    review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' "fn b() { let _ = std::fs::read(\"${read}\"); }"
+    printf 'after\n' >crates/k/tests/data/word
+    commit
+    run
+    expect "equivalent runtime path ${read} retains its reader" "$(printf 'alpha\nbeta')"
+    if [ "${read}" = './tests/data/word' ]; then
+        off runtime-spelling 'if runtime != "tests" and not runtime.startswith("tests/") and first != "tests":' 'if not literal.startswith("tests/"):'
+    else
+        off runtime-discovery 'if not candidate and not target:' 'if not candidate and not (target and "tests/" in source):'
+    fi
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with equivalent runtime discovery off, omitted reader was not exposed: ${OUT}"
+    unset SCRIPT
+done
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias"); }'
+ln -s word crates/k/tests/data/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/data/word
+commit
+run
+expect "runtime file link retains target-only reader" "$(printf 'alpha\nbeta')"
+off runtime-links 'dependencies = included_paths(commit, name, path, modes, allow_directory=True)' 'dependencies = {path}'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with runtime links off, target-only reader was not omitted: ${OUT}"
+unset SCRIPT
+BASE="$(git rev-parse HEAD)"
+git rm -q crates/k/tests/data/word
+commit
+run
+expect "runtime linked input deletion retains both readers" "$(printf 'alpha\nbeta')"
+BASE="$(git rev-parse HEAD)"
+printf 'restored\n' >crates/k/tests/data/word
+commit
+run
+expect "runtime linked input restoration retains both readers" "$(printf 'alpha\nbeta')"
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias/word"); }'
+mkdir -p crates/k/tests/data/real
+printf 'before\n' >crates/k/tests/data/real/word
+ln -s real crates/k/tests/data/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/data/real/word
+commit
+run
+expect "runtime directory link retains target-only reader" "$(printf 'alpha\nbeta')"
+BASE="$(git rev-parse HEAD)"
+mkdir -p crates/k/tests/data/other
+printf 'other\n' >crates/k/tests/data/other/word
+rm crates/k/tests/data/alias
+ln -s other crates/k/tests/data/alias
+commit
+run
+expect "runtime directory link retarget retains its reader" "$(printf 'alpha\nbeta')"
+off runtime-retarget 'dependencies = included_paths(commit, name, path, modes, allow_directory=True)' 'dependencies = {path}'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with runtime links off, retargeted reader was not omitted: ${OUT}"
+unset SCRIPT
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = "\0"; let _ = b"\xff"; let _ = "/tests/"; }'
+printf 'after\n' >crates/k/tests/data/word
+commit
+run
+expect "unrelated NUL and byte literals do not become paths" "alpha"
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias"); }'
+ln -s alias crates/k/tests/data/alias
+commit
+run
+refused "runtime link loops cannot silently lose a reader" "link that does not end"
 
 # Every row, for a full sweep.
 fresh
