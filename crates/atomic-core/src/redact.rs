@@ -856,6 +856,7 @@ fn bare_value_len(rest: &str) -> usize {
     let mut end = rest.len();
     let mut i = 0;
     while i < bytes.len() {
+        step(1);
         match bytes[i] {
             b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'`' => {
                 end = i;
@@ -1009,15 +1010,58 @@ fn value_after(input: &str, at: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// How many values left as written, one inside another, [`assigned`] reads
+/// on inside: past them, a value is passed over whole, so each character
+/// is read at most this many times and once more.
+const VALUES_WITHIN: usize = 8;
+
 /// Redact the values assigned to secret names in `input`: `name=value`,
-/// `name: value`, `name := value`, `'name' => 'value'`. One pass: each
-/// separator is looked at once, a name at most 128 characters back, and a
-/// value once, after which the search goes on past it.
+/// `name: value`, `name := value`, `'name' => 'value'`. A value left as
+/// written is read on inside (see [`assigned_spans`]). What that finds is
+/// hidden together with what a reading that passes such a value over whole
+/// hides, so reading on never shows what passing over would hide: a value
+/// found inside can run on past the one it was found in and take a name
+/// that reading would see for part of its own.
 fn assigned(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
+    let (mut spans, read_on) = assigned_spans(input, VALUES_WITHIN);
+    if read_on {
+        spans.extend(assigned_spans(input, 0).0);
+        spans.sort_unstable();
+    }
     let mut out = String::new();
     let mut copied = 0;
+    for (from, to) in spans {
+        if to <= copied {
+            continue;
+        }
+        if from >= copied {
+            out.push_str(&input[copied..from]);
+            out.push_str(REDACTED);
+        }
+        copied = to;
+    }
+    if copied == 0 {
+        return None;
+    }
+    out.push_str(&input[copied..]);
+    Some(out)
+}
+
+/// The values [`assigned`] hides in `input`, in order and apart, and
+/// whether any was found inside a value left as written. One pass: each
+/// separator is looked at once, a name at most 128 characters back, and a
+/// value once; a hidden value is passed over, and one left as written is
+/// read on inside, `depth` deep, a value that starts there ending within
+/// it. Past `depth`, a value left as written is passed over whole, so each
+/// character is read at most `depth` times and once more.
+fn assigned_spans(input: &str, depth: usize) -> (Vec<(usize, usize)>, bool) {
+    let bytes = input.as_bytes();
+    let mut spans = Vec::new();
+    let mut read_on = false;
     let mut at = 0;
+    // Where each value left as written that holds `at` ends, the innermost
+    // last.
+    let mut within: Vec<usize> = Vec::new();
     while let Some(found) = input[at..].find(['=', ':']) {
         let sep = at + found;
         let next = bytes.get(sep + 1).copied();
@@ -1035,6 +1079,9 @@ fn assigned(input: &str) -> Option<String> {
             _ => 1,
         };
         at = sep + sep_len;
+        while within.last().is_some_and(|&end| end <= sep) {
+            within.pop();
+        }
         let Some((name_start, name_end)) = name_before(input, sep) else {
             continue;
         };
@@ -1058,8 +1105,20 @@ fn assigned(input: &str) -> Option<String> {
         if strength == Strength::None {
             continue;
         }
-        let start = value_start(input, sep + sep_len);
-        let Some((value_from, mut value_to)) = value_after(input, start) else {
+        // A value that starts inside one left as written ends within it,
+        // so it never takes that value's closing quote, or what follows,
+        // for its own: `auth: "x password='abc" api_key: '…'`. One that
+        // starts past its end, as after `token: password:`, ends within the
+        // next one out.
+        let first = value_start(input, at);
+        let limit = within
+            .iter()
+            .rev()
+            .find(|end| **end > first)
+            .map_or(input.len(), |end| (*end).max(at));
+        let scope = &input[..limit];
+        let start = value_start(scope, sep + sep_len);
+        let Some((value_from, mut value_to)) = value_after(scope, start) else {
             continue;
         };
         // What the operating system said of the path before it, as Rust
@@ -1077,35 +1136,75 @@ fn assigned(input: &str) -> Option<String> {
         // one hid as the header's credential and hides the rest with it.
         let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
         let header = ends_in_header(&input[name_start..name_end]);
-        let bare = value_from == start && set_off && !header;
-        if bare && is_os_error(&input[value_from..]) {
+        let bare = set_off && !header;
+        let error_len = if value_from == start {
+            os_error_len(&scope[value_from..])
+        } else {
+            None
+        };
+        let found = spans.len();
+        if !(bare && error_len.is_some()) {
+            // `authorization=Bearer abc`: the scheme and its credential.
+            let value = &input[value_from..value_to];
+            if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
+                && scope[value_to..].starts_with(' ')
+                && let Some((credential_from, credential_to)) = value_after(scope, value_to + 1)
+                && !is_not_a_secret(&input[credential_from..credential_to])
+            {
+                value_to = credential_to;
+                strength = Strength::Strong;
+            }
+            let value = &input[value_from..value_to];
+            let quoted = value_from > start;
+            if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
+                spans.push((value_from, value_to));
+            }
+        }
+        // What follows an operating system's error under a secret's name,
+        // `password: Permission denied (os error 13) <secret>`, is no part of
+        // the error, and the error took the place where the name's value is
+        // looked for: each word after it that looks like a credential is
+        // hidden, to the end of the line or the quote around it. Words such
+        // as `; try again`, paths, times, URLs, addresses and upper-case
+        // identifiers are kept. The words stop at the first one that starts
+        // an assignment, `DB_PASSWORD= …`, `api_key => …`, `secret: …`: that
+        // is read from there by its own name, as without an error before it.
+        if let Some(len) = error_len {
+            let after = value_from + len;
+            let end = scope[after..]
+                .find(['\n', '"', '\'', '\\'])
+                .map_or(scope.len(), |i| after + i);
+            let mut hidden_to = 0;
+            for (from, to) in words(scope, after, end) {
+                if word_starts_assignment(scope, from, to) {
+                    break;
+                }
+                let word = &input[from..to];
+                if !is_not_a_secret(word)
+                    && !reads_as_no_credential(word)
+                    && looks_like_credential(word)
+                {
+                    spans.push((from, to));
+                    hidden_to = to;
+                }
+            }
+            // Read on from past the error and what was hidden.
+            value_to = value_to.max(after).max(hidden_to);
+        }
+        if spans.len() > found || error_len.is_some() {
+            read_on |= spans.len() > found && !within.is_empty();
             at = at.max(value_to);
-            continue;
+        } else if within.len() < depth {
+            // A value left as written is read on, from just past its
+            // name's separator: what it holds may be an assignment of its
+            // own, as in `token: password: hunter2` or
+            // `auth: "password=hunter2 foo"`.
+            within.push(value_to);
+        } else {
+            at = at.max(value_to);
         }
-        // `authorization=Bearer abc`: the scheme and its credential.
-        let value = &input[value_from..value_to];
-        if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
-            && input[value_to..].starts_with(' ')
-            && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
-            && !is_not_a_secret(&input[credential_from..credential_to])
-        {
-            value_to = credential_to;
-            strength = Strength::Strong;
-        }
-        let value = &input[value_from..value_to];
-        let quoted = value_from > start;
-        if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
-            out.push_str(&input[copied..value_from]);
-            out.push_str(REDACTED);
-            copied = value_to;
-        }
-        at = at.max(value_to);
     }
-    if copied == 0 {
-        return None;
-    }
-    out.push_str(&input[copied..]);
-    Some(out)
+    (spans, read_on)
 }
 
 /// What the operating system says of a failed file or socket operation, as
@@ -1140,16 +1239,95 @@ fn is_blank(byte: &u8) -> bool {
     matches!(byte, b' ' | b'\t')
 }
 
-/// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
-fn is_os_error(text: &str) -> bool {
-    OS_ERRORS.iter().any(|words| {
-        text.strip_prefix(words)
-            .and_then(|rest| rest.strip_prefix(" (os error "))
-            .is_some_and(|rest| {
-                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-                digits > 0 && rest.as_bytes().get(digits) == Some(&b')')
-            })
+/// How long the one of [`OS_ERRORS`] and its ` (os error N)` that `text`
+/// starts with is, if it starts with one.
+fn os_error_len(text: &str) -> Option<usize> {
+    OS_ERRORS.iter().find_map(|words| {
+        let rest = text.strip_prefix(words)?.strip_prefix(" (os error ")?;
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && rest.as_bytes().get(digits) == Some(&b')'))
+            .then(|| text.len() - rest.len() + digits + 1)
     })
+}
+
+/// The words of `input` between `from` and `to`, as byte ranges: what lies
+/// between blanks and the punctuation that sets a word off, `;,()[]{}<>`,
+/// without a `:` at either end. A credential's own `.`, `/`, `+`, `=`, `-`
+/// and `_` stay in its word, and so do a time's `:`.
+fn words(input: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let apart = |c: char| c.is_whitespace() || ";,()[]{}<>".contains(c);
+    let mut found = Vec::new();
+    let mut push = |s: usize, e: usize| {
+        let word = &input[s..e];
+        let trimmed = word.trim_start_matches(':');
+        let s = s + (word.len() - trimmed.len());
+        let e = s + trimmed.trim_end_matches(':').len();
+        if s < e {
+            found.push((s, e));
+        }
+    };
+    let mut start = None;
+    for (i, c) in input[from..to].char_indices() {
+        match (apart(c), start) {
+            (true, Some(s)) => {
+                push(from + s, from + i);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        push(from + s, to);
+    }
+    found
+}
+
+/// Whether the word of `input` from `from` to `to` starts an assignment: a
+/// name, letters, digits, `_`, `-` and `.`, then `=` or `:`, in the word or
+/// after blanks past it, as in `DB_PASSWORD=`, `api_key => x`,
+/// `client_secret := x`, `token: x`, even with nothing after it.
+fn word_starts_assignment(input: &str, from: usize, to: usize) -> bool {
+    let name = input[from..to]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        .count();
+    let next = if from + name < to {
+        input[from + name..].bytes().next()
+    } else {
+        input[to..].bytes().find(|b| !is_blank(b))
+    };
+    name > 0 && matches!(next, Some(b'=' | b':'))
+}
+
+/// Whether `word`, after an operating system's error, is plainly something
+/// else than a credential: an absolute or relative path, `/var/lib/x`,
+/// `./x`, `~/x`; a time, digits and `-:.+TZ` with eight digits or more; a
+/// URL, `https://…`; an address, `ops@example.com`; or an upper-case
+/// identifier, `ERR_CONN_RESET`.
+fn reads_as_no_credential(word: &str) -> bool {
+    let path = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
+    let time = word.bytes().filter(u8::is_ascii_digit).count() >= 8
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
+    let url = word.contains("://");
+    let address = word.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty()
+            && local
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+            && domain.contains('.')
+            && domain
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+    });
+    let identifier = word.contains('_')
+        && word.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && word.split('_').all(|part| {
+            part.bytes().all(|b| b.is_ascii_uppercase()) || part.bytes().all(|b| b.is_ascii_digit())
+        });
+    path || time || url || address || identifier
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
@@ -1260,6 +1438,28 @@ fn read_strength(name: &str, written: bool) -> Strength {
     surest
 }
 
+/// How many headers inside one another's values [`headers`] reads.
+const HEADERS_WITHIN: usize = 8;
+
+/// `text` with each credential header's value hidden. A header whose value
+/// holds no credential is read on inside its value, `levels` deep, so a
+/// header written there, as in `Cookie: x-api-key: hunter2abc`, is found
+/// too.
+fn headers(text: &str, levels: usize) -> Cow<'_, str> {
+    HEADER.replace_all(text, |c: &Captures<'_>| header_read(c, levels))
+}
+
+/// What [`headers`] makes of one header and its value.
+fn header_read(c: &Captures<'_>, levels: usize) -> String {
+    if is_header_secret(&c[1], &c[3]) {
+        format!("{}{}{REDACTED}", &c[1], &c[2])
+    } else if levels > 0 {
+        format!("{}{}{}", &c[1], &c[2], headers(&c[3], levels - 1))
+    } else {
+        c[0].to_string()
+    }
+}
+
 /// One reading of `input` by every text rule (see [`text`]).
 fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
@@ -1288,13 +1488,7 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
-    apply(&HEADER, &|c| {
-        if is_header_secret(&c[1], &c[3]) {
-            format!("{}{}{REDACTED}", &c[1], &c[2])
-        } else {
-            c[0].to_string()
-        }
-    });
+    apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
     if let Some(replaced) = assigned(&output) {

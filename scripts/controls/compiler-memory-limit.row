@@ -1,0 +1,1 @@
+compiler-memory-limit|crates/atomic-core/src/compiler_host/limits.rs|("memory", libc::RLIMIT_DATA, memory, 0),|("memory", libc::RLIMIT_DATA, libc::RLIM_INFINITY as u64 + 0 * memory, 0),|-p atomic-agentic-core --lib -- compiler_host::tests::memory_outside_the_heap_is_refused_past_the_limit

@@ -1170,11 +1170,12 @@ impl Durare {
                     if let Some(suffix) = id {
                         tx.execute(
                             "UPDATE atomic_run_projects SET project = ? \
-                             WHERE project <> ? AND substr(project, -?) = ?",
+                             WHERE atomic_run_projects.project <> ? \
+                             AND substr(atomic_run_projects.project, -length(?)) = ?",
                             &[
                                 Param::Text(project.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(suffix.len()).unwrap_or(i64::MAX)),
+                                Param::Text(suffix.clone()),
                                 Param::Text(suffix),
                             ],
                         )
@@ -1202,11 +1203,11 @@ impl Durare {
                     if let Some(id) = id {
                         tx.execute(
                             "UPDATE atomic_park_projects SET project = ? \
-                             WHERE project <> ? AND substr(project, -?) = ?",
+                             WHERE project <> ? AND substr(project, -length(?)) = ?",
                             &[
                                 Param::Text(project.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )
@@ -1235,11 +1236,11 @@ impl Durare {
                             "SELECT w.workflow_uuid AS id FROM workflow_status w \
                              LEFT JOIN atomic_run_projects rp ON rp.run_id = w.workflow_uuid \
                              WHERE rp.project IS NULL OR (? <> '' AND rp.project <> ? \
-                             AND substr(rp.project, -?) = ?) LIMIT 1",
+                             AND substr(rp.project, -length(?)) = ?) LIMIT 1",
                             &[
                                 Param::Text(id.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )
@@ -1264,11 +1265,11 @@ impl Durare {
                             "SELECT p.park_id AS park_id FROM atomic_parks p \
                              LEFT JOIN atomic_park_projects pp ON pp.park_id = p.park_id \
                              WHERE pp.project IS NULL OR (? <> '' AND pp.project <> ? \
-                             AND substr(pp.project, -?) = ?) LIMIT 1",
+                             AND substr(pp.project, -length(?)) = ?) LIMIT 1",
                             &[
                                 Param::Text(id.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )
@@ -1327,8 +1328,10 @@ impl Durare {
         let queues: Vec<String> = match only {
             Some(run) => vec![self.resume_queue(run)],
             None => {
+                // Only this project's: another's run on a queue of the same
+                // executor identity is not this engine's to run.
                 let mine = format!("{RESUME_QUEUES}{}/", self.engine.executor_id());
-                self.unfinished()
+                self.own_unfinished()
                     .await?
                     .into_iter()
                     .filter_map(|r| r.queue.filter(|q| q.starts_with(&mine)))
@@ -1361,12 +1364,21 @@ impl Durare {
     /// project's run is, to this one, no run at all. A run for no project is
     /// seen only by a runtime for none.
     pub async fn own_run_record(&self, id: &str) -> Result<Option<RunRecord>> {
+        let own = self.owns_run(id).await?;
+        if !own {
+            return Ok(None);
+        }
+        self.run_record(id).await
+    }
+
+    /// Whether run `id` is of this runtime's project (see
+    /// [`own_run_record`](Self::own_run_record)).
+    async fn owns_run(&self, id: &str) -> Result<bool> {
         let (run, project) = (
             id.to_owned(),
             self.project.as_deref().unwrap_or_default().to_owned(),
         );
-        let own = self
-            .reads
+        self.reads
             .read(move |mut tx| {
                 let (run, project) = (run.clone(), project.clone());
                 Box::pin(async move {
@@ -1382,11 +1394,7 @@ impl Durare {
                     })
                 })
             })
-            .await?;
-        if !own {
-            return Ok(None);
-        }
-        self.run_record(id).await
+            .await
     }
 
     /// Whether `id` is taken in the store by another project than this
@@ -1539,6 +1547,58 @@ impl Durare {
                 ))
             })
             .collect())
+    }
+
+    /// Every unfinished run of this runtime's project, whoever owns it and
+    /// whatever its version: on a store several projects share, another
+    /// project's run is not one, even under the same executor identity.
+    pub async fn own_unfinished(&self) -> Result<Vec<RunRecord>> {
+        let mut own = Vec::new();
+        for run in self.unfinished().await? {
+            if self.owns_run(&run.id).await? {
+                own.push(run);
+            }
+        }
+        Ok(own)
+    }
+
+    /// This project's unfinished runs this executor identity owns that an
+    /// atomic of another durable step layout started, which this one cannot
+    /// continue: what `atomic serve` names as stranded.
+    pub async fn stranded(&self) -> Result<Vec<RunRecord>> {
+        let runs = self.own_unfinished().await?;
+        Ok(runs
+            .into_iter()
+            .filter(|r| r.executor == self.executor_id() && r.version != self.version())
+            .collect())
+    }
+
+    /// How many of the runs recovery would take, those `PENDING` at this
+    /// engine's version under its executor identity, are another project's.
+    async fn foreign_pending(&self) -> Result<usize> {
+        let version = self.engine.app_version();
+        let pending = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                status: vec!["PENDING".into()],
+                executor_ids: vec![self.engine.executor_id().to_owned()],
+                // As recovery selects them: an unset version selects any.
+                app_version: if version.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![version.to_owned()]
+                },
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        let mut theirs = 0;
+        for run in pending {
+            if !self.owns_run(&run.id).await? {
+                theirs += 1;
+            }
+        }
+        Ok(theirs)
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its
@@ -1744,12 +1804,13 @@ impl DurableRuntime for Durare {
                 self.control_transaction(move |mut tx| {
                     let (run, project) = (run.clone(), project.clone());
                     Box::pin(async move {
-                        tx.execute(
-                            "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, ?) \
-                             ON CONFLICT (run_id) DO NOTHING",
-                            &[Param::Text(run.clone()), Param::Text(project.clone())],
-                        )
-                        .await?;
+                        let claimed = tx
+                            .execute(
+                                "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, ?) \
+                                 ON CONFLICT (run_id) DO NOTHING",
+                                &[Param::Text(run.clone()), Param::Text(project.clone())],
+                            )
+                            .await?;
                         // Whoever recorded it first: a row another project
                         // left, even with no run behind it, keeps the id
                         // theirs.
@@ -1760,13 +1821,30 @@ impl DurableRuntime for Durare {
                             )
                             .await?
                             .text("project")?;
-                        if recorded == project {
-                            Ok(())
-                        } else {
+                        // A run already in the store that had no project's
+                        // row, one recorded before runs had projects, is no
+                        // project's: claiming its id would make it this one's.
+                        let unowned = claimed > 0
+                            && tx
+                                .query_opt(
+                                    "SELECT workflow_uuid AS id FROM workflow_status \
+                                     WHERE workflow_uuid = ?",
+                                    &[Param::Text(run.clone())],
+                                )
+                                .await?
+                                .is_some();
+                        if recorded != project {
                             Err(DurableError::Failed(format!(
                                 "the run id {run} is taken in this store by another project; \
                                  give another id"
                             )))
+                        } else if unowned {
+                            Err(DurableError::Failed(format!(
+                                "the run id {run} is taken in this store by a run of no \
+                                 project, recorded before runs had projects; give another id"
+                            )))
+                        } else {
+                            Ok(())
                         }
                     })
                 })
@@ -1857,6 +1935,19 @@ impl DurableRuntime for Durare {
 
     async fn recover(&self) -> Result<usize> {
         let own = [self.engine.executor_id().to_owned()];
+        // Recovery takes every unfinished run this executor identity owns at
+        // this version, whichever project's. On a store several projects
+        // share, another project's among them would run here, in this
+        // project's code: refused before any is taken.
+        let theirs = self.foreign_pending().await?;
+        if theirs > 0 {
+            return Err(DurableError::Engine(format!(
+                "executor {} owns {theirs} unfinished run(s) of another project in this store, \
+                 which recovering would run here; give each project's processes an executor \
+                 identity of their own (ATOMIC_EXECUTOR_ID)",
+                self.engine.executor_id()
+            )));
+        }
         Ok(self
             .engine
             .recover_pending_for(&own)

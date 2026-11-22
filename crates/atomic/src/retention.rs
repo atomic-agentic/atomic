@@ -15,7 +15,12 @@
 //!   finished or not: a run's pinned definitions (its snapshot) and the
 //!   results its steps hand on by reference among them;
 //! - every gate's pinned evidence, open or resolved, read from the gate
-//!   store itself.
+//!   store itself;
+//! - every gate and every entry of the feedback log, whole, of every
+//!   project in the store, whichever the sweeping runtime is for, also read
+//!   from the gate store: a question's answer and an approval's comment are
+//!   there from the decision, before the run that asked wakes and records
+//!   them, and a default before its deadline makes it the answer.
 //!
 //! It also keeps anything written within the grace period before it began
 //! reading these, however long the reading and the wait for the store's
@@ -31,7 +36,11 @@
 //! the input is recorded, no reading of the runs finds it, so a sweep that
 //! read the runs before then could remove it: [`start_keeping_input`] holds
 //! what the input names, and marks it as just written, while the run is
-//! admitted and its input recorded.
+//! admitted and its input recorded. A decision's answer and comment come
+//! from outside the run in the same way, and a sweep that read the gate
+//! store before the decision would remove what they name:
+//! [`deciding_keeping_named`] holds and marks it while the decision is
+//! recorded.
 //!
 //! Nothing sweeps on its own: a caller decides when.
 
@@ -158,43 +167,99 @@ fn references(value: &Value, present: &HashSet<String>, into: &mut BTreeSet<Arti
     }
 }
 
-/// What the store's runs and gates refer to: [`recorded`] and [`pinned`].
+/// What the store's runs and gates refer to: [`recorded`], [`pinned`] and
+/// [`answered`].
 pub async fn referenced(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
-    let mut found = recorded(store, rt).await?;
-    found.extend(pinned(rt).await?);
+    // Listed once, for every reading that looks for what the store holds.
+    let present = present(store).await?;
+    let mut found = recorded(&present, rt).await?;
+    // Every project's gates, whichever the sweeping runtime is for, read
+    // once for what they pin and what they name.
+    let gates = atomic_durable::gate::every_gate(rt).await?;
+    found.extend(pinned_in(&gates)?);
+    found.extend(answered_in(&present, &gates, rt).await?);
     Ok(found)
+}
+
+/// The digests of everything in `store`, read off the async workers.
+async fn present(store: &LocalStore) -> anyhow::Result<HashSet<String>> {
+    let store = store.clone();
+    Ok(tokio::task::spawn_blocking(move || store.stored())
+        .await??
+        .into_iter()
+        .map(|a| a.digest().to_owned())
+        .collect())
+}
+
+/// Every blob of `present` that the gate store names, open gates and
+/// resolved ones alike: anywhere in a gate, such as its title, what it
+/// shows, its question, the question's default, and the answer and comment
+/// it was decided with, which later steps are handed; and anywhere in an
+/// entry of the feedback log.
+/// Every project's gates are read, whichever the runtime is for: a store's
+/// content is kept for all of them.
+pub async fn answered(
+    present: &HashSet<String>,
+    rt: &Durare,
+) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    answered_in(present, &atomic_durable::gate::every_gate(rt).await?, rt).await
+}
+
+/// [`answered`], of `gates` and the store's feedback log.
+async fn answered_in(
+    present: &HashSet<String>,
+    gates: &[atomic_durable::gate::Gate],
+    rt: &Durare,
+) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let feedback = atomic_durable::gate::feedback(rt).await?;
+    let mut found = BTreeSet::new();
+    for record in answers(gates, &feedback)? {
+        references(&record, present, &mut found);
+    }
+    Ok(found)
+}
+
+/// Each gate and each feedback entry the gate store holds, whole, as JSON:
+/// whatever part of one names content is read.
+fn answers(
+    gates: &[atomic_durable::gate::Gate],
+    feedback: &[atomic_durable::gate::Feedback],
+) -> anyhow::Result<Vec<Value>> {
+    let mut all = Vec::with_capacity(gates.len() + feedback.len());
+    for gate in gates {
+        all.push(serde_json::to_value(gate)?);
+    }
+    for entry in feedback {
+        all.push(serde_json::to_value(entry)?);
+    }
+    Ok(all)
 }
 
 /// Every blob in `store` any run in the store names, finished or not: in its
 /// input, its result or error, and every step's recorded output or error.
 /// Runs are read a page at a time, in order of creation and id.
-pub async fn recorded(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
-    let present: HashSet<String> = {
-        let store = store.clone();
-        tokio::task::spawn_blocking(move || store.stored())
-            .await??
-            .into_iter()
-            .map(|a| a.digest().to_owned())
-            .collect()
-    };
+pub async fn recorded(
+    present: &HashSet<String>,
+    rt: &Durare,
+) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let mut found = BTreeSet::new();
     let mut after = None;
     loop {
         let page = rt.runs_after(after.as_ref(), PAGE).await?;
         for (_, run) in &page {
-            references(&run.input, &present, &mut found);
+            references(&run.input, present, &mut found);
             if let Some(output) = &run.output {
-                references(output, &present, &mut found);
+                references(output, present, &mut found);
             }
             if let Some(error) = &run.error {
-                named_in(error, &present, &mut found);
+                named_in(error, present, &mut found);
             }
             for step in rt.steps(&run.record.id).await? {
                 if let Some(output) = &step.output {
-                    references(output, &present, &mut found);
+                    references(output, present, &mut found);
                 }
                 if let Some(error) = &step.error {
-                    named_in(error, &present, &mut found);
+                    named_in(error, present, &mut found);
                 }
             }
         }
@@ -209,8 +274,13 @@ pub async fn recorded(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSe
 /// gate store keeps these apart from the run's own records, which a run's
 /// gate step may not repeat, so they are read from it directly.
 pub async fn pinned(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    pinned_in(&atomic_durable::gate::every_gate(rt).await?)
+}
+
+/// [`pinned`], of `gates`.
+fn pinned_in(gates: &[atomic_durable::gate::Gate]) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let mut found = BTreeSet::new();
-    for pin in atomic_durable::gate::pinned_evidence(rt).await? {
+    for pin in atomic_durable::gate::evidence_of(gates) {
         let digest = pin
             .strip_prefix("sha256:")
             .ok_or_else(|| anyhow::anyhow!("a gate pins {pin}, which is not a content digest"))?;
@@ -313,7 +383,9 @@ where
     let named = serde_json::to_value(&input)?;
     let began = std::time::Instant::now();
     let wait = Wait {
-        run: id.to_owned(),
+        what: "run",
+        who: id.to_owned(),
+        before: "starts",
         for_at_most: store.lock_wait(),
         began,
         until: began + store.lock_wait(),
@@ -338,9 +410,130 @@ where
     Ok(())
 }
 
-/// The one wait for the store's lock that admitting a run shares.
+/// Why a decision whose answer or comment names stored content was not
+/// recorded: nothing of it is.
+#[derive(Debug, thiserror::Error)]
+pub enum DecisionRefused {
+    /// A sweep removed content the answer or comment names after the store
+    /// was listed.
+    #[error("the decision names {0}, which the artifact store no longer holds")]
+    Absent(ArtifactRef),
+    /// A sweep held the store's lock for longer than a write waits for it.
+    #[error(
+        "a sweep of the artifact store held its lock for more than {} s while the decision \
+         was recorded",
+        .0.as_secs()
+    )]
+    Locked(std::time::Duration),
+    /// The process was told to stop while it waited for the store's lock.
+    #[error("the decision was stopped while it waited for the artifact store")]
+    Stopped,
+    /// What the decision names does not fit a contract. Nothing gives a
+    /// decision's content one today, so no decision is refused this way;
+    /// it is here so that one never is quietly taken for another refusal.
+    #[error("the decision does not fit its contract: {0}")]
+    Invalid(String),
+}
+
+impl From<InputRefused> for DecisionRefused {
+    fn from(refused: InputRefused) -> Self {
+        match refused {
+            InputRefused::Absent(artifact) => Self::Absent(artifact),
+            InputRefused::Locked(waited) => Self::Locked(waited),
+            InputRefused::Stopped => Self::Stopped,
+            InputRefused::Invalid(why) => Self::Invalid(why),
+        }
+    }
+}
+
+/// Record a decision on gate `gate` through `decide`, keeping every
+/// artifact `store` holds that `answer` or `comment` names from every sweep
+/// until it is recorded. An answer comes from outside the run, as a run's
+/// input does, and is only in the gate store until its run wakes: a sweep
+/// that read the gate store before the decision and sweeps after it would
+/// remove what the answer names. So each is held first, so a sweep that
+/// takes the store's lock from then on keeps it; then marked as just
+/// written, under the store's shared lock, so a sweep that read the gate
+/// store before keeps it by its grace; then `decide` runs, and the holds
+/// go once it has. It is refused, with nothing recorded, when a sweep
+/// removed what they name after the store was listed, or held the lock
+/// past the wait, or when the process is told to stop while it waits.
+pub async fn deciding_keeping_named<T, F, Fut>(
+    store: &LocalStore,
+    gate: &str,
+    answer: Option<&Value>,
+    comment: Option<&str>,
+    decide: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    deciding_keeping_named_then(store, gate, answer, comment, || {}, decide).await
+}
+
+/// [`deciding_keeping_named`], calling `once_held` once the content is held
+/// and before it is marked: [`deciding_keeping_named`] calls nothing there,
+/// and this module's tests remove content there, as a sweep that finished
+/// just before the hold was taken would have.
+async fn deciding_keeping_named_then<T, F, Fut>(
+    store: &LocalStore,
+    gate: &str,
+    answer: Option<&Value>,
+    comment: Option<&str>,
+    once_held: impl FnOnce(),
+    decide: F,
+) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let named = serde_json::json!([answer, comment]);
+    let began = std::time::Instant::now();
+    let wait = std::sync::Arc::new(Wait {
+        what: "the decision on gate",
+        who: gate.to_owned(),
+        before: "is recorded",
+        for_at_most: store.lock_wait(),
+        began,
+        until: began + store.lock_wait(),
+        said: std::sync::atomic::AtomicBool::new(false),
+        halt: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    });
+    let refused = |e: anyhow::Error| match e.downcast::<InputRefused>() {
+        Ok(refused) => anyhow::Error::from(DecisionRefused::from(refused)),
+        Err(e) => e,
+    };
+    let held = {
+        let (store, wait) = (store.clone(), wait.clone());
+        tokio::task::spawn_blocking(move || hold_named(&store, &named, None, &wait))
+            .await?
+            .map_err(refused)?
+    };
+    once_held();
+    {
+        let store = store.clone();
+        let decision_names: Vec<ArtifactRef> = held.iter().map(|(a, _)| a.clone()).collect();
+        tokio::task::spawn_blocking(move || mark_named(&store, &decision_names, &wait))
+            .await?
+            .map_err(refused)?;
+    }
+    let decided = decide().await;
+    // Recorded, so a reading of the gate store finds what it names from
+    // now on; or not, so nothing needs keeping.
+    drop(held);
+    decided
+}
+
+/// The one wait for the store's lock that admitting a run, or recording a
+/// decision, shares.
 struct Wait {
-    run: String,
+    /// What waits, as said: `run`, or `the decision on gate`.
+    what: &'static str,
+    /// Its id: the run's, or the gate's.
+    who: String,
+    /// What it waits to do: `starts`, or `is recorded`.
+    before: &'static str,
     for_at_most: std::time::Duration,
     began: std::time::Instant,
     until: std::time::Instant,
@@ -366,14 +559,17 @@ impl Wait {
             && !self.said.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             atomic_core::redact::Line::new()
-                .plain("atomic: run ")
-                .shown(&self.run)
+                .plain("atomic: ")
+                .plain(self.what)
+                .plain(" ")
+                .shown(&self.who)
                 .plain(
-                    ": the artifact store is held by another process, such as a sweep; the run \
+                    ": the artifact store is held by another process, such as a sweep; it \
                      waits for it, up to ",
                 )
                 .shown(&self.for_at_most.as_secs().to_string())
-                .plain(" s, before it starts")
+                .plain(" s, before it ")
+                .plain(self.before)
                 .log();
         }
     }
@@ -482,6 +678,185 @@ fn mark_named(store: &LocalStore, artifacts: &[ArtifactRef], wait: &Wait) -> any
 mod tests {
     use super::*;
     use atomic_core::artifact::{ArtifactStore, Provenance};
+
+    /// Every part of each gate and feedback entry the gate store keeps is
+    /// read: a question's default and schema, the answer and comment a gate
+    /// was decided with, a defaulted answer, a gate's title and what it
+    /// shows, and an entry of the feedback log.
+    #[test]
+    fn every_part_of_what_the_gate_store_keeps_is_read() {
+        use atomic_durable::gate::{
+            Decision, Feedback, Gate, OnTimeout, Principal, Question, Resolution, Tier, Verdict,
+        };
+        // One digest for each place, each a blob the store holds.
+        let digest = |n: u8| format!("{:064x}", u64::from(n) + 0xd1d1);
+        let named = |n: u8| format!("sha256:{}", digest(n));
+        let gate = |question: Option<Question>, resolution: Option<Resolution>, n: u8| Gate {
+            id: "run:ask".into(),
+            run: "run".into(),
+            workflow: "w".into(),
+            step: "ask".into(),
+            title: format!("Which file? {}", named(n)),
+            show: serde_json::json!({"shown": named(n + 1)}),
+            evidence: Vec::new(),
+            proposal: "p".into(),
+            approvers: Vec::new(),
+            tier: Tier::High,
+            opened_at: 0,
+            deadline: None,
+            on_timeout: OnTimeout::Default,
+            question,
+            resolution,
+        };
+        let question = |default: Option<Value>, n: u8| Question {
+            answer: serde_json::json!({"description": named(n)}),
+            remember: true,
+            default,
+        };
+        let decided = Resolution::Decided(Decision {
+            verdict: Verdict::Approve,
+            by: Principal::local("dev"),
+            comment: Some(format!("see {}", named(20))),
+            answer: Some(serde_json::json!({"file": named(21)})),
+            command: "c".into(),
+            at: 1,
+        });
+        let gates = [
+            gate(
+                Some(question(Some(serde_json::json!(named(3))), 4)),
+                None,
+                1,
+            ),
+            gate(Some(question(None, 5)), Some(decided), 6),
+            gate(
+                Some(question(None, 8)),
+                Some(Resolution::Defaulted {
+                    at: 1,
+                    answer: serde_json::json!(named(9)),
+                }),
+                10,
+            ),
+            gate(None, None, 12),
+        ];
+        let feedback = [Feedback {
+            gate: "run:ask".into(),
+            workflow: "w".into(),
+            step: "ask".into(),
+            ask: "Which file?".into(),
+            answer: serde_json::json!(named(30)),
+            by: None,
+            at: 1,
+        }];
+        let places: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 20, 21, 30];
+        let present: HashSet<String> = places.iter().map(|n| digest(*n)).collect();
+        let mut found = BTreeSet::new();
+        for record in answers(&gates, &feedback).expect("serialized") {
+            references(&record, &present, &mut found);
+        }
+        let found: BTreeSet<String> = found.iter().map(|a| a.digest().to_owned()).collect();
+        let missed: Vec<u8> = places
+            .into_iter()
+            .filter(|n| !found.contains(&digest(*n)))
+            .collect();
+        assert!(missed.is_empty(), "not read: {missed:?}");
+    }
+
+    /// A decision naming content a sweep removed just before it was held is
+    /// refused, with nothing recorded: the gate stays open, and no hold is
+    /// left.
+    #[test]
+    fn a_decision_naming_swept_content_is_refused_and_the_gate_stays_open() {
+        use atomic_durable::gate::{
+            self, DecisionCommand, Deployment, GateSpec, HumanCredential, OnTimeout, Principal,
+            Question, Tier, Verdict,
+        };
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, _, store, chosen) = racing("decision-swept").await;
+            let mut rt = Durare::sqlite(&dir.join("gates.db")).await.expect("store");
+            rt.register(
+                "asking",
+                |ctx: atomic_durable::DurareContext, (): ()| async move {
+                    let spec = GateSpec {
+                        workflow: "asking".into(),
+                        title: "Which file?".into(),
+                        show: serde_json::json!({}),
+                        evidence: Vec::new(),
+                        approvers: gate::resolve(
+                            "accept",
+                            None,
+                            &Deployment::Local {
+                                operator: Principal::local("dev"),
+                            },
+                        )
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))?,
+                        tier: Tier::High,
+                        timeout: None,
+                        on_timeout: OnTimeout::Reject,
+                        question: Some(Question {
+                            answer: serde_json::json!({"type": "object"}),
+                            remember: false,
+                            default: None,
+                        }),
+                    };
+                    gate::gate(&ctx, "accept", spec).await
+                },
+            );
+            rt.launch().await.expect("launch");
+            rt.start("asking", "asking-run", ()).await.expect("start");
+            let id = gate::gate_id("asking-run", "accept");
+            let found = loop {
+                if let Some(g) = gate::find(&rt, &id).await.expect("find") {
+                    break g;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+            gate::enroll(&rt, &me).await.expect("enroll");
+            let answer = serde_json::json!({"file": chosen.to_string()});
+            let command = DecisionCommand {
+                command_id: "swept".into(),
+                gate: found.id.clone(),
+                verdict: Verdict::Approve,
+                comment: None,
+                proposal: found.proposal.clone(),
+                answer: Some(answer.clone()),
+            };
+            let error = deciding_keeping_named_then(
+                &store,
+                &found.id,
+                Some(&answer),
+                None,
+                || {
+                    // As if a sweep finished just before the hold was taken.
+                    let blob = dir
+                        .join("artifacts/blobs/sha256")
+                        .join(&chosen.digest()[..2])
+                        .join(&chosen.digest()[2..]);
+                    std::fs::remove_file(blob).expect("remove");
+                },
+                || async { Ok(gate::decide(&rt, &me, command).await?) },
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(
+                    error.downcast_ref::<DecisionRefused>(),
+                    Some(DecisionRefused::Absent(a)) if *a == chosen
+                ),
+                "{error}"
+            );
+            let still = gate::find(&rt, &found.id)
+                .await
+                .expect("find")
+                .expect("the gate");
+            assert!(still.resolution.is_none(), "recorded: {still:?}");
+            assert!(store.held().expect("held").is_empty(), "a hold outlived it");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     /// A store with one artifact in it written an hour ago, and a durable
     /// runtime with a workflow that does nothing, launched.

@@ -589,3 +589,231 @@ fn a_digest_is_found_within_longer_hex_and_in_the_stores_path_form() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// A question gate's answer can name stored content. From its decision
+/// until the run that asked wakes and records it, the answer is only in the
+/// gate store, and a sweep keeps what it names: here the run's runtime has
+/// stopped, so the run never wakes, and the decision is made through
+/// another.
+#[test]
+fn a_question_gates_answer_keeps_what_it_names_before_the_run_records_it() {
+    on_codex_runtime(async {
+        let dir = scratch("answer");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let chosen = put(&store, b"the file the person chose");
+        let loose = put(&store, b"nothing refers to this");
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        rt.register("asking", |ctx: DurareContext, (): ()| async move {
+            let mut asked = spec(Vec::new())?;
+            asked.question = Some(gate::Question {
+                answer: json!({"type": "object"}),
+                remember: true,
+                default: None,
+            });
+            gate::gate(&ctx, "accept", asked).await
+        });
+        rt.launch().await.unwrap();
+        rt.start("asking", "asking-run", ()).await.unwrap();
+        let g = opened(&rt, "asking-run").await;
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+
+        let other = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+        gate::enroll(&other, &me).await.unwrap();
+        gate::decide(
+            &other,
+            &me,
+            DecisionCommand {
+                command_id: "answer".into(),
+                gate: g.id.clone(),
+                verdict: Verdict::Approve,
+                comment: None,
+                proposal: g.proposal.clone(),
+                answer: Some(json!({"file": format!("sha256:{}", chosen.digest())})),
+            },
+        )
+        .await
+        .unwrap();
+        let swept = retention::sweep(&store, &other, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        assert!(held(&store, &chosen), "the answer's content was swept");
+
+        // An answer the feedback log keeps that the sweep cannot read is not
+        // taken as naming nothing:
+        // the sweep fails, and removes nothing.
+        let unread = put(&store, b"nothing refers to this either");
+        {
+            use sqlx::Connection;
+            let mut c = sqlx::SqliteConnection::connect(&format!(
+                "sqlite://{}",
+                dir.join("atomic.db").display()
+            ))
+            .await
+            .unwrap();
+            sqlx::query("UPDATE atomic_feedback SET answer = 'not json' WHERE gate_id = ?")
+                .bind(&g.id)
+                .execute(&mut c)
+                .await
+                .unwrap();
+        }
+        let failed = retention::sweep(&store, &other, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .expect_err("an unreadable answer");
+        assert!(
+            format!("{failed:#}").contains("the gate store: expected ident"),
+            "{failed:#}"
+        );
+        assert!(held(&store, &unread) && held(&store, &chosen));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// A decision made while a sweep is between its reading of the gate store
+/// and its delete keeps what the answer names: the sweep read the gate
+/// open, with no answer, but the decision marked the content it names as
+/// just written, so the sweep keeps it by its grace.
+#[test]
+fn an_answer_decided_while_a_sweep_reads_keeps_what_it_names() {
+    on_codex_runtime(async {
+        let dir = scratch("answer-window");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let chosen = put(&store, b"the file the person chose, long ago");
+        let loose = put(&store, b"nothing refers to this");
+        backdate(&dir.join("artifacts"));
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        rt.register("asking", |ctx: DurareContext, (): ()| async move {
+            let mut asked = spec(Vec::new())?;
+            asked.question = Some(gate::Question {
+                answer: json!({"type": "object"}),
+                remember: false,
+                default: None,
+            });
+            gate::gate(&ctx, "accept", asked).await
+        });
+        rt.launch().await.unwrap();
+        rt.start("asking", "window-run", ()).await.unwrap();
+        let g = opened(&rt, "window-run").await;
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let other = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+        gate::enroll(&other, &me).await.unwrap();
+
+        // The sweep reads what to keep while the gate is still open...
+        let kept = retention::read_kept(&store, &other, &BTreeSet::new())
+            .await
+            .unwrap();
+        assert!(!kept.artifacts.contains(&chosen));
+        // ...the operator answers, naming content stored long before...
+        let answer = json!({"file": format!("sha256:{}", chosen.digest())});
+        let command = DecisionCommand {
+            command_id: "window".into(),
+            gate: g.id.clone(),
+            verdict: Verdict::Approve,
+            comment: None,
+            proposal: g.proposal.clone(),
+            answer: Some(answer.clone()),
+        };
+        retention::deciding_keeping_named(&store, &g.id, Some(&answer), None, || async move {
+            Ok(gate::decide(&other, &me, command).await?)
+        })
+        .await
+        .unwrap();
+        // ...and the sweep deletes, with a grace that covers what was just
+        // written.
+        let swept = store
+            .sweep(
+                &kept.artifacts,
+                Grace::at_least(Duration::from_secs(60)),
+                kept.read_at,
+            )
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        assert!(held(&store, &chosen), "the answer's content was swept");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// A sweep keeps what every project's gates name, whichever project the
+/// sweeping runtime is for: here a project's run asks, an approval's
+/// comment and the answer name content, and a sweep through a runtime for
+/// no project, as this file's others are, keeps both.
+#[test]
+fn a_sweep_keeps_what_another_projects_gates_name() {
+    on_codex_runtime(async {
+        let dir = scratch("another-project");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let answered = put(&store, b"the file another project's person chose");
+        let commented = put(&store, b"the file another project's comment names");
+        let loose = put(&store, b"nothing refers to this");
+        let database = atomic_durable::Database::Sqlite(dir.join("atomic.db"));
+        let mut theirs = Durare::open(
+            &database,
+            None,
+            atomic_durable::DEFAULT_VERSION,
+            "notes/p-0123",
+        )
+        .await
+        .unwrap();
+        theirs.register("asking", |ctx: DurareContext, (): ()| async move {
+            let mut asked = spec(Vec::new())?;
+            asked.question = Some(gate::Question {
+                answer: json!({"type": "object"}),
+                remember: false,
+                default: None,
+            });
+            gate::gate(&ctx, "accept", asked).await
+        });
+        theirs.launch().await.unwrap();
+        theirs.start("asking", "their-run", ()).await.unwrap();
+        let g = opened(&theirs, "their-run").await;
+        theirs.shutdown(Duration::from_secs(5)).await.unwrap();
+        let theirs = Durare::open(
+            &database,
+            None,
+            atomic_durable::DEFAULT_VERSION,
+            "notes/p-0123",
+        )
+        .await
+        .unwrap();
+        let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+        gate::enroll(&theirs, &me).await.unwrap();
+        gate::decide(
+            &theirs,
+            &me,
+            DecisionCommand {
+                command_id: "theirs".into(),
+                gate: g.id.clone(),
+                verdict: Verdict::Approve,
+                comment: Some(format!("see sha256:{}", commented.digest())),
+                proposal: g.proposal.clone(),
+                answer: Some(json!({"file": format!("sha256:{}", answered.digest())})),
+            },
+        )
+        .await
+        .unwrap();
+        let sweeper = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        assert!(
+            gate::gates(&sweeper, gate::GateFilter::default())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the sweeper's own project has no gates"
+        );
+        let swept = retention::sweep(&store, &sweeper, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        assert!(
+            held(&store, &answered),
+            "another project's answer was swept"
+        );
+        assert!(
+            held(&store, &commented),
+            "another project's comment was swept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
