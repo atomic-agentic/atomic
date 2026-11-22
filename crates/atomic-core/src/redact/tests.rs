@@ -3579,9 +3579,9 @@ fn original_duplicate_spellings(parent: &str) {
 fn a_pair_in_json_in_a_string_is_read_by_the_name_written() {
     let secret = "correct horse";
     let shapes = [
-        json!([{"key": "DB_PASSWORD", "value": secret}]),
-        json!({"items": [{"value": secret, "key": "GITHUB_TOKEN"}]}),
-        json!({"env": [{"header": "DB_PASSWORD", "value": secret}]}),
+        json!([{"key": "DB_PASSWORD", "note": 1, "value": secret}]),
+        json!({"items": [{"value": secret, "note": 1, "key": "GITHUB_TOKEN"}]}),
+        json!({"env": [{"header": "DB_PASSWORD", "note": 1, "value": secret}]}),
     ];
     for (case, shape) in shapes.iter().enumerate() {
         // As a real object, for the record.
@@ -3641,7 +3641,7 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
     ];
     const PARENTS: &[&str] = &["key", "note", "token", "data", "args"];
     let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
-    for _ in 0..3000 {
+    for case in 0..3000 {
         let mut planted = Vec::new();
         let mut secret = |next: &mut dyn FnMut(u64) -> u64| {
             let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -3656,6 +3656,10 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
         for _ in 0..=next(3) {
             let name = NAMES[next(NAMES.len() as u64) as usize];
             items.push(match next(4) {
+                // Exercise pairs that require the parsed reading as well as
+                // adjacent fields the text rule can read.
+                0 if case % 2 == 0 => json!({"name": name, "note": 1, "value": secret(&mut next)}),
+                1 if case % 2 == 0 => json!({"key": name, "note": 1, "value": secret(&mut next)}),
                 0 => json!({"name": name, "value": secret(&mut next)}),
                 1 => json!({"key": name, "value": secret(&mut next)}),
                 2 => json!([name, secret(&mut next)]),
@@ -3705,7 +3709,7 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
 /// as written too, two and three levels deep.
 #[test]
 fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
-    let pair = json!({"env": [{"key": "DB_PASSWORD", "value": "hunter2 x"}]}).to_string();
+    let pair = json!({"env": [{"key": "DB_PASSWORD", "note": 1, "value": "hunter2 x"}]}).to_string();
     let two = json!({"body": pair}).to_string();
     let three = json!({"body": two.clone()}).to_string();
     for (depth, doc) in [
@@ -3729,7 +3733,7 @@ fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
 #[test]
 fn held_json_is_read_by_the_names_written() {
     let doc = json!({"key": json!([
-        {"key": "DB_PASSWORD", "value": "correct horse"},
+        {"key": "DB_PASSWORD", "note": 1, "value": "correct horse"},
         {"note": concat!("Zx81", "kQ0pL2mN4bV6")},
     ]).to_string()});
     let mut out = doc;
