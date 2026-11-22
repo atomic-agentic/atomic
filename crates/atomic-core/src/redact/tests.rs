@@ -3996,6 +3996,10 @@ fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
     for parent in ["args", "key"] {
         let mut out = json!({ parent: held.clone() });
         value(&mut out);
+        assert_eq!(
+            out[parent], REDACTED,
+            "under {parent}: the string stayed open"
+        );
         assert!(
             !out.to_string().contains("hunter2hunter2"),
             "under {parent}: the pair's value showed"
@@ -4016,6 +4020,10 @@ fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
     for parent in ["body", "key"] {
         let mut out = json!({ parent: doc.clone() });
         value(&mut out);
+        assert_eq!(
+            out[parent], REDACTED,
+            "under {parent}: the string stayed open"
+        );
         assert!(
             !out.to_string().contains(&key[4..]),
             "under {parent}: the header's value showed"
