@@ -5036,11 +5036,7 @@ mod tests {
         .expect("homes");
         // Where Kubernetes and container engines mount secrets, whole.
         for root in ["/var/run/secrets", "/run/secrets"] {
-            assert!(
-                has(&secrets, root),
-                "{root} is not among the {} places",
-                secrets.len()
-            );
+            assert!(has(&secrets, root), "{root} is not among the denied places");
         }
         for path in [
             "/cfg/gh",
@@ -5170,15 +5166,13 @@ mod tests {
             let found = token_files(&env, &here).expect("found");
             assert!(
                 found.contains(&dir.join(config)),
-                "the credentials are not among the {} places",
-                found.len()
+                "the credentials are not among the denied places"
             );
             for file in &wanted {
                 assert!(
                     found.contains(file),
-                    "{} is not among the {} places",
-                    file.display(),
-                    found.len()
+                    "{} is not among the denied places",
+                    file.display()
                 );
             }
         }
@@ -5237,9 +5231,8 @@ mod tests {
             for file in &wanted {
                 assert!(
                     found.contains(file),
-                    "{variable}: {} is not among the {} places",
-                    file.display(),
-                    found.len()
+                    "{variable}: {} is not among the denied places",
+                    file.display()
                 );
             }
         }
@@ -5342,9 +5335,8 @@ mod tests {
         ] {
             assert!(
                 places.contains(&file),
-                "{} is not among the {} places",
-                file.display(),
-                places.len()
+                "{} is not among the denied places",
+                file.display()
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5382,8 +5374,7 @@ mod tests {
         for name in ["adc-token", "default-key.pem"] {
             assert!(
                 places.contains(&dir.join(name)),
-                "{name} is not among the {} places",
-                places.len()
+                "{name} is not among the denied places"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
