@@ -104,7 +104,8 @@ otherwise left alone. Either way nothing is recorded.
 A sweep also keeps the content a gate's decision names, in a question's answer
 or an approval's comment, from the moment it is decided, before the run that
 asked wakes and records it, and anything else a gate or an entry of the
-feedback log names, such as a question's default. `atomic gates answer` and
+feedback log names, such as a question's default, for every project's gates
+in the store, not only the project that sweeps. `atomic gates answer` and
 the other deciding commands hold what the decision names, and mark it as just
 written, while the decision is recorded, so a sweep that read the gate store
 just before keeps it too; a decision naming content a sweep removed meanwhile

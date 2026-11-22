@@ -16,8 +16,9 @@
 //!   results its steps hand on by reference among them;
 //! - every gate's pinned evidence, open or resolved, read from the gate
 //!   store itself;
-//! - every gate and every entry of the feedback log, whole, also read from
-//!   the gate store: a question's answer and an approval's comment are
+//! - every gate and every entry of the feedback log, whole, of every
+//!   project in the store, whichever the sweeping runtime is for, also read
+//!   from the gate store: a question's answer and an approval's comment are
 //!   there from the decision, before the run that asked wakes and records
 //!   them, and a default before its deadline makes it the answer.
 //!
@@ -172,8 +173,11 @@ pub async fn referenced(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTree
     // Listed once, for every reading that looks for what the store holds.
     let present = present(store).await?;
     let mut found = recorded(&present, rt).await?;
-    found.extend(pinned(rt).await?);
-    found.extend(answered(&present, rt).await?);
+    // Every project's gates, whichever the sweeping runtime is for, read
+    // once for what they pin and what they name.
+    let gates = atomic_durable::gate::every_gate(rt).await?;
+    found.extend(pinned_in(&gates)?);
+    found.extend(answered_in(&present, &gates, rt).await?);
     Ok(found)
 }
 
@@ -192,15 +196,24 @@ async fn present(store: &LocalStore) -> anyhow::Result<HashSet<String>> {
 /// shows, its question, the question's default, and the answer and comment
 /// it was decided with, which later steps are handed; and anywhere in an
 /// entry of the feedback log.
+/// Every project's gates are read, whichever the runtime is for: a store's
+/// content is kept for all of them.
 pub async fn answered(
     present: &HashSet<String>,
     rt: &Durare,
 ) -> anyhow::Result<BTreeSet<ArtifactRef>> {
-    let gates =
-        atomic_durable::gate::gates(rt, atomic_durable::gate::GateFilter::default()).await?;
+    answered_in(present, &atomic_durable::gate::every_gate(rt).await?, rt).await
+}
+
+/// [`answered`], of `gates` and the store's feedback log.
+async fn answered_in(
+    present: &HashSet<String>,
+    gates: &[atomic_durable::gate::Gate],
+    rt: &Durare,
+) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let feedback = atomic_durable::gate::feedback(rt).await?;
     let mut found = BTreeSet::new();
-    for record in answers(&gates, &feedback)? {
+    for record in answers(gates, &feedback)? {
         references(&record, present, &mut found);
     }
     Ok(found)
@@ -261,8 +274,13 @@ pub async fn recorded(
 /// gate store keeps these apart from the run's own records, which a run's
 /// gate step may not repeat, so they are read from it directly.
 pub async fn pinned(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    pinned_in(&atomic_durable::gate::every_gate(rt).await?)
+}
+
+/// [`pinned`], of `gates`.
+fn pinned_in(gates: &[atomic_durable::gate::Gate]) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let mut found = BTreeSet::new();
-    for pin in atomic_durable::gate::pinned_evidence(rt).await? {
+    for pin in atomic_durable::gate::evidence_of(gates) {
         let digest = pin
             .strip_prefix("sha256:")
             .ok_or_else(|| anyhow::anyhow!("a gate pins {pin}, which is not a content digest"))?;
@@ -410,6 +428,11 @@ pub enum DecisionRefused {
     /// The process was told to stop while it waited for the store's lock.
     #[error("the decision was stopped while it waited for the artifact store")]
     Stopped,
+    /// What the decision names does not fit a contract. Nothing gives a
+    /// decision's content one today, so no decision is refused this way;
+    /// it is here so that one never is quietly taken for another refusal.
+    #[error("the decision does not fit its contract: {0}")]
+    Invalid(String),
 }
 
 impl From<InputRefused> for DecisionRefused {
@@ -417,8 +440,8 @@ impl From<InputRefused> for DecisionRefused {
         match refused {
             InputRefused::Absent(artifact) => Self::Absent(artifact),
             InputRefused::Locked(waited) => Self::Locked(waited),
-            // Nothing types a decision's content, so nothing is invalid.
-            InputRefused::Stopped | InputRefused::Invalid(_) => Self::Stopped,
+            InputRefused::Stopped => Self::Stopped,
+            InputRefused::Invalid(why) => Self::Invalid(why),
         }
     }
 }
@@ -451,7 +474,8 @@ where
 
 /// [`deciding_keeping_named`], calling `once_held` once the content is held
 /// and before it is marked: [`deciding_keeping_named`] calls nothing there,
-/// and this module's tests sweep there.
+/// and this module's tests remove content there, as a sweep that finished
+/// just before the hold was taken would have.
 async fn deciding_keeping_named_then<T, F, Fut>(
     store: &LocalStore,
     gate: &str,
@@ -735,6 +759,103 @@ mod tests {
             .filter(|n| !found.contains(&digest(*n)))
             .collect();
         assert!(missed.is_empty(), "not read: {missed:?}");
+    }
+
+    /// A decision naming content a sweep removed just before it was held is
+    /// refused, with nothing recorded: the gate stays open, and no hold is
+    /// left.
+    #[test]
+    fn a_decision_naming_swept_content_is_refused_and_the_gate_stays_open() {
+        use atomic_durable::gate::{
+            self, DecisionCommand, Deployment, GateSpec, HumanCredential, OnTimeout, Principal,
+            Question, Tier, Verdict,
+        };
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, _, store, chosen) = racing("decision-swept").await;
+            let mut rt = Durare::sqlite(&dir.join("gates.db")).await.expect("store");
+            rt.register(
+                "asking",
+                |ctx: atomic_durable::DurareContext, (): ()| async move {
+                    let spec = GateSpec {
+                        workflow: "asking".into(),
+                        title: "Which file?".into(),
+                        show: serde_json::json!({}),
+                        evidence: Vec::new(),
+                        approvers: gate::resolve(
+                            "accept",
+                            None,
+                            &Deployment::Local {
+                                operator: Principal::local("dev"),
+                            },
+                        )
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))?,
+                        tier: Tier::High,
+                        timeout: None,
+                        on_timeout: OnTimeout::Reject,
+                        question: Some(Question {
+                            answer: serde_json::json!({"type": "object"}),
+                            remember: false,
+                            default: None,
+                        }),
+                    };
+                    gate::gate(&ctx, "accept", spec).await
+                },
+            );
+            rt.launch().await.expect("launch");
+            rt.start("asking", "asking-run", ()).await.expect("start");
+            let id = gate::gate_id("asking-run", "accept");
+            let found = loop {
+                if let Some(g) = gate::find(&rt, &id).await.expect("find") {
+                    break g;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            };
+            let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+            gate::enroll(&rt, &me).await.expect("enroll");
+            let answer = serde_json::json!({"file": chosen.to_string()});
+            let command = DecisionCommand {
+                command_id: "swept".into(),
+                gate: found.id.clone(),
+                verdict: Verdict::Approve,
+                comment: None,
+                proposal: found.proposal.clone(),
+                answer: Some(answer.clone()),
+            };
+            let error = deciding_keeping_named_then(
+                &store,
+                &found.id,
+                Some(&answer),
+                None,
+                || {
+                    // As if a sweep finished just before the hold was taken.
+                    let blob = dir
+                        .join("artifacts/blobs/sha256")
+                        .join(&chosen.digest()[..2])
+                        .join(&chosen.digest()[2..]);
+                    std::fs::remove_file(blob).expect("remove");
+                },
+                || async { Ok(gate::decide(&rt, &me, command).await?) },
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(
+                    error.downcast_ref::<DecisionRefused>(),
+                    Some(DecisionRefused::Absent(a)) if *a == chosen
+                ),
+                "{error}"
+            );
+            let still = gate::find(&rt, &found.id)
+                .await
+                .expect("find")
+                .expect("the gate");
+            assert!(still.resolution.is_none(), "recorded: {still:?}");
+            assert!(store.held().expect("held").is_empty(), "a hold outlived it");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// A store with one artifact in it written an hour ago, and a durable

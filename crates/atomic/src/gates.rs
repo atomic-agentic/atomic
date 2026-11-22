@@ -249,8 +249,6 @@ pub(crate) async fn decide_as_operator(
             credential::fresh_secret()?.get(..32).unwrap_or_default()
         ),
     };
-    // What the answer and the comment name is kept from a sweep until the
-    // decision, which a sweep reads, is recorded.
     let store =
         atomic_core::artifact::LocalStore::for_project(state).context("the artifact store")?;
     let command = DecisionCommand {
@@ -261,15 +259,7 @@ pub(crate) async fn decide_as_operator(
         proposal: proposal.unwrap_or_else(|| found.proposal.clone()),
         answer,
     };
-    let (answer, comment) = (command.answer.clone(), command.comment.clone());
-    let decision = atomic_app::retention::deciding_keeping_named(
-        &store,
-        &found.id,
-        answer.as_ref(),
-        comment.as_deref(),
-        || async move { Ok(gate::decide(rt, &credential, command).await?) },
-    )
-    .await?;
+    let decision = decide_keeping_what_it_names(rt, &store, &credential, command).await?;
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
@@ -288,6 +278,30 @@ pub(crate) async fn decide_as_operator(
         atomic_core::log_line!("warning: waking runs whose parks were released failed: {e}");
     }
     Ok(decision)
+}
+
+/// Record `command` as `credential`, keeping what its answer and comment
+/// name from a sweep until it is recorded: a sweep reads the decision from
+/// then on (see [`atomic_app::retention::deciding_keeping_named`]).
+async fn decide_keeping_what_it_names(
+    rt: &Durare,
+    store: &atomic_core::artifact::LocalStore,
+    credential: &HumanCredential,
+    command: DecisionCommand,
+) -> anyhow::Result<gate::Decision> {
+    let (gate_id, answer, comment) = (
+        command.gate.clone(),
+        command.answer.clone(),
+        command.comment.clone(),
+    );
+    atomic_app::retention::deciding_keeping_named(
+        store,
+        &gate_id,
+        answer.as_ref(),
+        comment.as_deref(),
+        || async move { Ok(gate::decide(rt, credential, command).await?) },
+    )
+    .await
 }
 
 async fn decide(
@@ -328,4 +342,120 @@ async fn decide(
         shown::line(&decision.command)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use atomic_core::artifact::{ArtifactStore, Grace, LocalStore, Provenance};
+    use atomic_durable::gate::{Deployment, GateSpec, OnTimeout, Question, Tier};
+    use atomic_durable::{DurableRuntime, DurareContext};
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    /// The deciding commands keep what an answer names from a sweep that
+    /// read the gate store before the decision: here the sweep reads the
+    /// gate open, the operator answers naming content stored long ago, and
+    /// the sweep's delete, with a grace that covers what was just written,
+    /// keeps it.
+    #[test]
+    fn an_answer_the_deciding_commands_record_is_kept_from_a_sweep_already_reading() {
+        atomic_core::testing::on_codex_runtime(async {
+            let dir = std::env::temp_dir()
+                .join(format!("atomic-gates-answer-kept-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("scratch");
+            let store = LocalStore::open(dir.join("artifacts")).expect("artifacts");
+            let put = |bytes: &'static [u8]| {
+                store
+                    .put(&mut &bytes[..], Provenance::default())
+                    .expect("put")
+                    .artifact
+            };
+            let (chosen, loose) = (put(b"the file chosen long ago"), put(b"nothing names this"));
+            for blob in store.stored().expect("stored") {
+                let path = dir
+                    .join("artifacts/blobs/sha256")
+                    .join(&blob.digest()[..2])
+                    .join(&blob.digest()[2..]);
+                std::fs::File::open(&path)
+                    .and_then(|f| {
+                        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+                    })
+                    .expect("backdate");
+            }
+            let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            rt.register("asking", |ctx: DurareContext, (): ()| async move {
+                let spec = GateSpec {
+                    workflow: "asking".into(),
+                    title: "Which file?".into(),
+                    show: serde_json::json!({}),
+                    evidence: Vec::new(),
+                    approvers: gate::resolve(
+                        "accept",
+                        None,
+                        &Deployment::Local {
+                            operator: Principal::local("dev"),
+                        },
+                    )
+                    .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))?,
+                    tier: Tier::High,
+                    timeout: None,
+                    on_timeout: OnTimeout::Reject,
+                    question: Some(Question {
+                        answer: serde_json::json!({"type": "object"}),
+                        remember: false,
+                        default: None,
+                    }),
+                };
+                gate::gate(&ctx, "accept", spec).await
+            });
+            rt.launch().await.expect("launch");
+            rt.start("asking", "asking-run", ()).await.expect("start");
+            let id = gate::gate_id("asking-run", "accept");
+            let found = loop {
+                if let Some(g) = gate::find(&rt, &id).await.expect("find") {
+                    break g;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            };
+            let me = HumanCredential::new(Principal::local("dev"), "the operator's secret");
+            gate::enroll(&rt, &me).await.expect("enroll");
+
+            let kept = atomic_app::retention::read_kept(&store, &rt, &BTreeSet::new())
+                .await
+                .expect("read");
+            assert!(!kept.artifacts.contains(&chosen));
+            let answer = serde_json::json!({"file": format!("sha256:{}", chosen.digest())});
+            decide_keeping_what_it_names(
+                &rt,
+                &store,
+                &me,
+                DecisionCommand {
+                    command_id: "kept".into(),
+                    gate: found.id.clone(),
+                    verdict: Verdict::Approve,
+                    comment: None,
+                    proposal: found.proposal.clone(),
+                    answer: Some(answer),
+                },
+            )
+            .await
+            .expect("decided");
+            let swept = store
+                .sweep(
+                    &kept.artifacts,
+                    Grace::at_least(Duration::from_secs(60)),
+                    kept.read_at,
+                )
+                .expect("sweep");
+            assert_eq!(swept.removed, [loose]);
+            assert!(
+                store.stored().expect("stored").contains(&chosen),
+                "the answer's content was swept"
+            );
+            rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 }
