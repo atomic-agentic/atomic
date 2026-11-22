@@ -43,11 +43,19 @@
 //!
 //! A tool's `output` describes what a reply may look like, which is more than
 //! one response's schema whenever the operation's successes describe
-//! different bodies: it is the distinct schema of every response a success can
-//! reach, one schema where they all say the same thing and `anyOf` of them
-//! where they differ. A response declaring no schema contributes nothing to
-//! it, and a response no success can reach — a `default` behind a `2XX` range
-//! — is never asked, so it never describes the output either.
+//! different bodies: it is every distinct schema of every response a success
+//! can reach, one per media type that response names a schema under, since a
+//! reply says which of them it is by its `Content-Type` — one schema where they
+//! all say the same thing and `anyOf` of them where they differ. A response
+//! declaring no schema contributes nothing to it. A `default` describes the
+//! output only when the spec declares no code from `200` to `299` and no `2XX`
+//! range beside it: behind a named success a `default` is what its failures
+//! fall back to and no success is ever checked against it, while a spec
+//! declaring no success at all means its `default` as the shape a success
+//! takes. Where the union holds more than one schema, each member carries an
+//! `$id` of its own, because the union is a document nothing compiles a reply
+//! against and a reference inside a member — `#`, or `#/$defs/…` into the
+//! `$defs` the member carries — must mean the member it is written in.
 //!
 //! A response declared for a
 //! status that is not a success is kept as a key with nothing beside it: what
@@ -92,16 +100,18 @@ pub enum ResponseBody {
         /// reads no body from. They are declared, and they say nothing about a
         /// shape atomic holds a reply to — a reply whose `Content-Type` names
         /// one is not governed by another media type's schema, least of all a
-        /// wildcard written beside them.
+        /// wildcard written beside them, and the executor holds it to no schema
+        /// at all, as it holds a reply of a response naming no schema.
         declared_media: Vec<String>,
     },
 }
 
 impl ResponseBody {
     /// The first schema it declares, in the sorted order of the media types
-    /// they are declared under, when it declares one. That one is what the
-    /// tool's `output` describes; a reply is checked against whichever of
-    /// them its `Content-Type` names, see [`ResponseBody::schemas`].
+    /// they are declared under, when it declares one. What the tool's `output`
+    /// describes is every schema it declares, and what a reply is held to is
+    /// whichever of them its `Content-Type` names, see
+    /// [`ResponseBody::schemas`].
     pub fn schema(&self) -> Option<&Value> {
         match self {
             ResponseBody::Json { schemas, .. } => schemas.values().next(),
@@ -165,13 +175,17 @@ pub struct Operation {
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
-    /// What its successes describe a reply's body as: the schema each one's
-    /// response declares, distinct and in status order — that one schema where
-    /// they agree, `anyOf` of them where they differ, `None` when none of them
-    /// declares one. A tool's output, for what describes it; what a reply is
-    /// checked against is [`Operation::response`], and within it whichever
-    /// schema the reply's `Content-Type` names. `declared_output` says which
-    /// responses are asked and what each contributes.
+    /// What its successes describe a reply's body as: every schema each one's
+    /// response declares, one per media type it names one under, distinct and
+    /// in status order — that one schema where they agree, `anyOf` of them
+    /// where they differ, `None` when none of them declares one. A `default`
+    /// is asked only when no code from `200` to `299` and no `2XX` range is
+    /// declared beside it. Where it is an `anyOf`, each member carries an
+    /// `$id`, so a reference inside it means that member. A tool's output, for
+    /// what describes it; what a reply is checked against is
+    /// [`Operation::response`], and within it whichever schema the reply's
+    /// `Content-Type` names. `declared_output` says which responses are asked
+    /// and what each contributes.
     pub output: Option<Value>,
     /// Each response it declares, by the key the spec lists it under: a code
     /// such as `200` or `404`, a range such as `2XX`, or `default`. A success's,
@@ -228,54 +242,82 @@ fn response_declared(
     Some((key.as_str(), body.as_ref()?))
 }
 
-/// What a tool's `output` describes: the distinct schema of every response a
-/// success can reach, each taken as [`ResponseBody::schema`] takes it — the
-/// schema of the first media type that names one, which is all a response has
-/// ever described about the tool.
+/// What a tool's `output` describes: every distinct schema of every response a
+/// success can reach, which is one schema per media type that response names
+/// one under, as [`ResponseBody::schemas`] keeps them — a reply says which of
+/// them it is by its `Content-Type`, so each describes a reply the tool may
+/// get.
 ///
 /// Each success status is asked, and selects its response exactly as
-/// [`Operation::response`] does, so a response no success can reach never
-/// describes the output: a `default` behind a `2XX` range is never selected,
-/// and one with nothing shading it is the response a success the spec gives no
-/// code for is checked against. A response that declares no schema — no
+/// [`Operation::response`] does, and each response is asked once however many
+/// statuses select it. A `default` is asked only when no code from `200` to
+/// `299` and no `2XX` range is declared beside it: behind a named success a
+/// `default` describes what the spec's failures carry, and a success is never
+/// checked against it, while a spec declaring nothing but a `default` means it
+/// as the shape every success takes. A response that declares no schema — no
 /// `content` map, or a map that names none — contributes nothing, so it neither
-/// describes the output nor widens it. The same schema written under two
-/// statuses is one schema. Where the successes agree, that one schema is the
-/// output as it stands; where they differ, `anyOf` of them is, in status order,
-/// so a reply is described whichever of them it answers with; and where none
-/// declares a shape, there is no output at all.
+/// describes the output nor widens it. The same schema written under two media
+/// types or two statuses is one schema. Where the successes agree, that one
+/// schema is the output as it stands; where they differ, `anyOf` of them is, in
+/// status order and then in the order the response names its media types, so a
+/// reply is described whichever of them it answers with; and where none declares
+/// a shape, there is no output at all.
 fn declared_output(
     responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
-    defs: &Map<String, Value>,
 ) -> Option<Value> {
+    // What a `200`-`299` code or a `2XX` range declares shades the `default`:
+    // every success is covered by one or the other, and only a spec that names
+    // no success at all leaves one to fall back to the `default`.
+    let named = responses
+        .keys()
+        .any(|code| code != "default" && success_key(code));
     let mut schemas: Vec<Value> = Vec::new();
+    let mut asked = std::collections::BTreeSet::new();
     for status in 200..300u16 {
-        let Some((_, body)) = response_declared(responses, status) else {
+        let Some((code, body)) = response_declared(responses, status) else {
             continue;
         };
-        // A response that declares no schema — no `content` map at all, or a
-        // map naming none — says nothing about a shape, so it contributes
+        if code == "default" && named {
+            continue;
+        }
+        // One response answers every status that selects it, so it is asked
+        // once. A response that declares no schema — no `content` map at all,
+        // or a map naming none — says nothing about a shape, so it contributes
         // nothing to the union, and not even a schema that would accept
         // anything in its place.
-        let Some(one) = body.schema() else { continue };
-        if !schemas.contains(one) {
-            schemas.push(one.clone());
+        if !asked.insert(code) {
+            continue;
+        }
+        for (_, schema) in body.schemas() {
+            if !schemas.contains(schema) {
+                schemas.push(schema.clone());
+            }
         }
     }
     match schemas.len() {
         0 => None,
         1 => schemas.pop(),
         _ => {
+            // The union is a document nothing else holds a reply to, so each
+            // member is given a base URI of its own: a reference inside a
+            // member — `#`, or `#/$defs/…` into the `$defs` it carries beside
+            // its own components — then means the member it is written in,
+            // exactly as it does when the executor holds a reply to that member
+            // alone. A boolean schema holds no keyword and so no id, and
+            // declares nothing a reference could reach.
+            let members: Vec<Value> = schemas
+                .into_iter()
+                .enumerate()
+                .map(|(index, schema)| match schema {
+                    Value::Object(mut member) => {
+                        member.insert("$id".into(), json!(format!("urn:atomic:response:{index}")));
+                        Value::Object(member)
+                    }
+                    other => other,
+                })
+                .collect();
             let mut union = Map::new();
-            // The union carries the component schemas too: a reference inside
-            // a member points at the document it sits in, which is now the
-            // union. Each member keeps its own copy as well, because what the
-            // executor holds a reply to is one member alone, and there that
-            // member is the whole document.
-            if !defs.is_empty() {
-                union.insert("$defs".into(), Value::Object(defs.clone()));
-            }
-            union.insert("anyOf".into(), Value::Array(schemas));
+            union.insert("anyOf".into(), Value::Array(members));
             Some(Value::Object(union))
         }
     }
@@ -686,18 +728,18 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 let body = resolve(spec, body, &at)?;
                 let json = body.get("content").and_then(json_content);
                 if json.is_none() && body["required"] == true {
-                    let mut types: Vec<&String> = body["content"]
+                    let mut declared: Vec<&String> = body["content"]
                         .as_object()
                         .map(|c| c.keys().collect())
                         .unwrap_or_default();
-                    types.sort();
-                    let types: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
+                    declared.sort();
+                    let declared: Vec<&str> = declared.iter().map(|t| t.as_str()).collect();
                     unsupported = Some(format!(
                         "its required request body is {}; atomic sends JSON request bodies only",
-                        if types.is_empty() {
+                        if declared.is_empty() {
                             "untyped".to_owned()
                         } else {
-                            types.join(", ")
+                            declared.join(", ")
                         }
                     ));
                 }
@@ -769,7 +811,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             // first: a `200` and a `202` of different shapes both describe the
             // tool's output, as `anyOf`. A key naming no status, such as a
             // bare `2`, is what no status selects, so it describes nothing.
-            let output = declared_output(&kept, &defs);
+            let output = declared_output(&kept);
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())

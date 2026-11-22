@@ -461,6 +461,44 @@ fn atomic_check_reads_openapi_toolsets() {
         String::from_utf8_lossy(&output.stdout)
     );
     std::fs::remove_file(dir.join("toolsets/failed.openapi.yaml")).expect("remove");
+    // A tool's `output` is a document of its own: where its successes describe
+    // different bodies it is an `anyOf`, and here each of its members defines
+    // its own `$defs` under the one name `Leaf`. Each member is a schema
+    // resource of its own, so a member's `#/$defs/Leaf` reaches the `$defs` it
+    // carries, and the union — which holds none — compiles. Read in the union's
+    // document instead, each member's reference would reach a `$defs` the union
+    // does not hold, and the tool's output would be a schema that does not
+    // compile; `atomic check` compiles it, so that is said here and not on the
+    // first call that reads a reply.
+    std::fs::write(
+        dir.join("toolsets/union.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing, defined beside the response\n          content:\n            application/json:\n              schema:\n                $ref: '#/$defs/Leaf'\n                $defs:\n                  Leaf: { type: object, required: [thing], properties: { thing: { type: string } } }\n        '202':\n          description: a leaf, defined the same way under the same name\n          content:\n            application/json:\n              schema:\n                $ref: '#/$defs/Leaf'\n                $defs:\n                  Leaf: { type: object, required: [ticket], properties: { ticket: { type: integer } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        output.status.success(),
+        "a union whose members are each their own document failed the check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The union is what gets compiled, and a member of it that reaches for a
+    // `$defs` name nothing holds is refused with its file and its operation.
+    std::fs::write(
+        dir.join("toolsets/union.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing\n          content:\n            application/json:\n              schema: { $ref: '#/$defs/Nowhere' }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a tool whose output reaches for a `$defs` that is not there passed the check"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("union.openapi.yaml") && error.contains("operation `thing`"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/union.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",

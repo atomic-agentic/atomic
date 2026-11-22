@@ -596,11 +596,19 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         for tool in &tools {
             // The executor checks each success against the schema of the
             // media type its reply names, so every schema a response declares
-            // must compile, not only the first. The tool's own `output` is one
-            // of these same schemas or an `anyOf` of them, each one listed
-            // here, and the components they reference travel in the input's
+            // must compile, not only the first. The tool's `output` is compiled
+            // as the document it is: one schema where the successes agree, an
+            // `anyOf` where they differ, and a member of it is a schema
+            // resource of its own. So a reference of a member that reaches
+            // outside the member — into a `$defs` the union does not hold, or
+            // at a `#` that would then name the union — fails here, where it
+            // can be named, and not on the first call that reads a reply. The
+            // components the response schemas reference travel in the input's
             // `$defs`, which is listed too.
             let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
+            if let Some(output) = &tool.output {
+                schemas.push(output);
+            }
             for body in tool.responses.values().flatten() {
                 for (_media, schema) in body.schemas() {
                     schemas.push(schema);
