@@ -1099,10 +1099,123 @@ fn address_of(model: &FakeModel) -> String {
         .to_owned()
 }
 
+/// A Codex atom whose key would go to a proxy in cleartext, to an endpoint
+/// on this machine over plain http, is refused before its turn, saying how
+/// to fix it; with the host in NO_PROXY it runs.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_codex_atoms_key_is_never_sent_to_a_proxy_in_cleartext() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done": true}"#.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("proxied-key");
+        let project = project(&dir);
+        write_atom(
+            &project,
+            "look-note",
+            "description: 'Look at the note.', kind: 'codex', sandbox: 'read-only'",
+            "Look at this note: {input.text}",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"done": {"type": "boolean"}})),
+        );
+        let url = model.base_url();
+        let run = |extra: Vec<(&'static str, &'static str)>| {
+            let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut env = vec![
+                    ("ATOMIC_MODEL_BASE_URL", u.as_str()),
+                    ("ATOMIC_MODEL", "synthetic"),
+                    ("ATOMIC_MODEL_API_KEY_ENV", "LOOK_KEY"),
+                    ("LOOK_KEY", "sk-look-secret"),
+                    ("HTTP_PROXY", "http://127.0.0.1:9"),
+                    ("NO_PROXY", ""),
+                    ("no_proxy", ""),
+                ];
+                env.extend(extra);
+                atomic(
+                    &d,
+                    &p,
+                    &["--json", "run", "look-note", "--data", r#"{"text": "hi"}"#],
+                    &env,
+                    "",
+                )
+            })
+        };
+        let out = run(Vec::new()).await.expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("set NO_PROXY to include 127.0.0.1, or use an https endpoint"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("sk-look-secret"), "{}", text(&out));
+        assert_eq!(model.calls(), 0, "nothing was sent");
+
+        let out = run(vec![("NO_PROXY", "127.0.0.1")]).await.expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(stdout_json(&out)["output"], json!({"done": true}));
+        assert_eq!(model.calls(), 1, "sent straight to the endpoint");
+    });
+}
+
 /// The person's own configuration, at `~/.config/atomic/config.yaml`, caps a
 /// run made with `atomic run`: the project's larger cap, and its `null` for
 /// their dollar cap, leave their caps the ones the run's plan records, with
 /// their ceilings beside them.
+/// `--run-id` outside its characters or its length is refused before
+/// anything is read or recorded, with the rule and without the id: what was
+/// pasted by mistake, such as a token, is not repeated.
+#[test]
+fn a_run_id_outside_its_characters_or_length_is_refused() {
+    let dir = scratch("run-id-refused");
+    let project = project(&dir);
+    let pasted = concat!("Bearer ghp_", "SAMPLE0123456789abcdefghijklmnopqrstuv");
+    let long = "a".repeat(129);
+    // `--run-id=<id>`, so an id that starts with `-` reaches atomic.
+    for id in [pasted, long.as_str(), "-x", "a\u{1b}[2Jb", "caf\u{e9}"] {
+        let given = format!("--run-id={id}");
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "count-note", &given, "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(!out.status.success(), "{id:?}: {}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.id_invalid", "{id:?}: {error}");
+        assert_eq!(
+            error["description"].as_str(),
+            Some(
+                "the run id given with --run-id is refused: a run id is 1 to 128 characters, \
+                 each an ASCII letter, a digit, `.`, `_`, `:` or `-`, and starts with a letter \
+                 or a digit"
+            ),
+            "{id:?}: {error}"
+        );
+    }
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--run-id", pasted, "--data", NOTE],
+        &[],
+        "",
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("error: the run id given with --run-id is refused"),
+        "{}",
+        text(&out)
+    );
+    assert!(!said.contains("SAMPLE0123456789"), "{said}");
+    assert!(stores(&dir).is_empty(), "a store was made");
+    assert_eq!(count_log(&dir), 0, "nothing ran");
+}
+
 #[test]
 fn your_own_configuration_caps_what_atomic_run_records() {
     on_codex_runtime(async {
