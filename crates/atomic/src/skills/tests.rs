@@ -579,6 +579,14 @@ async fn eval_the_example(
 /// recordings beside the cases with that server sent no request at all: the
 /// replay needs no provider, no key and no network, which is what a person
 /// running `atomic eval <name>` over a checked-in cassette gets.
+///
+/// This is the engine under the command, not the command: the case selection,
+/// the endpoint it resolves, the cassette setup, the flags and the exit status
+/// are the ones this test builds rather than the ones `atomic eval` chooses.
+/// `crates/atomic/tests/eval_cli.rs` runs these same worked-example files
+/// through the real `atomic eval` argv, with `HOME` and `ATOMIC_HOME` in its
+/// own scratch, and holds the two-case count, the replay counters and the
+/// stand-in's request log there as well.
 #[test]
 fn the_worked_examples_eval_replays_from_its_cassette_with_no_model_call() {
     use atomic_core::testing::{FakeModel, on_codex_runtime};

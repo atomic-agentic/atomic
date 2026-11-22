@@ -52,21 +52,43 @@ Read these before writing, and again when a check fails:
    and run `atomic render atoms/<name>.atom.astro --input fixtures/<name>/<case>.input.json`.
    No model is called. The `developer` part must hold your instructions and the
    `user` part the input values.
-9. **Eval.** Run `atomic eval <name>` from the project root. It answers each
-   case's model call from the recording beside the cases, in
-   `evals/<name>/cassettes/`, and says whether the atom's pass rate reaches
-   its threshold; a replayed run is a historical check of recorded answers, not
-   a live pass. A replay is keyed by the endpoint and model its recordings were
-   made for, so those are configured as a run would configure them, and it
-   reads no key and sends no call. A case with no
-   recording fails, saying to record it with `atomic eval <name> --live`, which
-   calls the model, so record only when the person has said which endpoint and
-   model to use and that a call is wanted. Read the failing cases it names,
-   then fix the atom, its prompt or the case and run it again.
+9. **Eval.** Run `atomic eval <name>` from the project root. What it can run
+   depends on the kind you chose in step 2. What it will not run is named: in
+   plain output as `REFUSED <name>`, with its reason and what to do instead,
+   and in `atomic eval <name> --json` under `refused`:
+   - `lite`, with recordings beside the cases in `evals/<name>/cassettes/`:
+     each case's model call is answered from its recording and the run says
+     whether the atom's pass rate reaches its threshold. A replayed run is a
+     historical check of recorded answers, not a live pass. A replay is keyed
+     by the endpoint and model its recordings were made for, so those are
+     configured as a run would configure them, and it reads no key and sends
+     no call.
+   - `lite`, with a case that has no recording: that case fails and says to
+     record it with `atomic eval <name> --live`, which calls the model and
+     records each answer, so record only when the person has said which
+     endpoint and model to use and that a call is wanted.
+   - `codex`: refused as it stands, because cassettes do not yet record a
+     Codex thread's calls. `atomic eval <name> --no-cassettes` is the form
+     that runs it: it calls the model for every case and records nothing, so
+     it needs the same permission as recording, and the person's say-so that
+     the call is wanted. An atom with `sandbox: 'workspace-write'` is refused
+     whatever flags you give it, because it could write in the project's own
+     checkout: report that refusal and what it says for itself.
+   - `exec`: it runs the command for every case, in the project. It refuses a
+     command that declares no effects, because nothing tells it the command
+     only reads, and one that writes to an outside system, which eval never
+     runs. Declare `effects: { external: 'read-only' }` when the command only
+     reads, and cover an effectful command with code tests instead of eval
+     cases.
+   `--live` only says where model calls come from; it lifts no refusal.
+   `--skip-refused` prints a refusal as `SKIPPED` and runs that atom no more
+   than without it. Read the failing cases it names, then fix the atom, its
+   prompt or the case and run it again.
 10. **Report** the files you wrote, what the last `atomic check --json` and the
     last `atomic eval <name>` answered, and what each means for the atom. Say
-    plainly whether the eval replayed recordings, recorded new ones or ran no
-    case, and never call a case passing from your own reading of the prompt.
+    plainly whether the eval replayed recordings, recorded new ones, ran no
+    case, or refused the atom and with what reason, and never call a case
+    passing from your own reading of the prompt.
 
 ## Worked example
 
@@ -182,7 +204,10 @@ From the project root `atomic check --json` prints
 Neither case has a recording yet: with the endpoint and model configured,
 `atomic eval extract-actions` fails both of them and says to record them with
 `atomic eval extract-actions --live`, which calls the model, and with no
-endpoint configured it says what it needs before it runs either.
+endpoint configured it says what it needs before it runs either. Once both are
+recorded, the same command without `--live` answers both cases off those two
+recordings, says its model calls are a historical check, and sends the endpoint
+no request at all.
 
 ## Rules that matter most
 
