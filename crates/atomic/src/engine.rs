@@ -147,8 +147,8 @@ pub fn store_project(state: &ProjectState) -> anyhow::Result<String> {
 /// The backend on this machine that `atomic run`, `atomic serve` and the
 /// evals run turns and exec atoms' commands on, unconfined and unconnected
 /// (see [`ProjectState::run_backend`]): scratch outside every directory a
-/// sandboxed turn may write, and the project's other backends' denied to
-/// its commands.
+/// sandboxed turn may write, and every other scratch directory in the
+/// atomic home's `scratch/` denied to its commands.
 pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
     state.run_backend()
 }
@@ -163,8 +163,8 @@ pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
 }
 
 /// The backend exec atoms' commands run on with `runner`: scratch in the
-/// project's state, confined like turns' commands where that is verified,
-/// each command that declares hosts holding at most
+/// atomic home's `scratch/`, confined like turns' commands where that is
+/// verified, each command that declares hosts holding at most
 /// `connections_per_command` connections through its proxy at once,
 /// connected once.
 pub fn exec_backend(
@@ -173,8 +173,9 @@ pub fn exec_backend(
     runner: RunnerKind,
     connections_per_command: u32,
 ) -> anyhow::Result<atomic_exec::Backend> {
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
+    // Scratch directories live in the atomic home's `scratch/`, beside
+    // every other project's, outside every directory a sandboxed turn may
+    // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = local_backend(state);

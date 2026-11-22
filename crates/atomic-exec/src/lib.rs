@@ -59,7 +59,7 @@ pub(crate) fn log(line: &str) {
     }
 }
 
-pub use workspace::{Open, Sandbox, Shell, Workspace};
+pub use workspace::{Open, Sandbox, Shell, Workspace, retire_scratch_root};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -521,15 +521,15 @@ impl ExecutionBackend for Backend {
 /// Each attempt's scratch directory is a private one under
 /// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
 /// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
-/// as one in the project's state directory: [`LocalBackend::in_dir`].
+/// as one in the atomic home's `scratch/`: [`LocalBackend::in_dir`].
 #[derive(Clone)]
 pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
     /// Directories its workspaces' commands are kept out of besides its own
-    /// scratch root, such as another backend's scratch root in the same
-    /// project.
+    /// scratch root, such as the directory that holds every backend's
+    /// scratch roots.
     denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
@@ -581,10 +581,10 @@ impl LocalBackend {
     }
 
     /// The same backend, keeping its workspaces' commands out of `dirs` as
-    /// well as its own scratch root: the scratch roots of the project's other
-    /// backends, so no command of one reads another's attempts. Each is
-    /// created, if missing, when a workspace opens, so it cannot appear
-    /// undenied while a command runs.
+    /// well as its own scratch root, such as the directory that holds every
+    /// backend's scratch roots, of every project, so no command of one reads
+    /// another's attempts. Each is created, if missing, when a workspace
+    /// opens, so it cannot appear undenied while a command runs.
     pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         self.denying.extend(dirs);
         self
@@ -639,7 +639,7 @@ impl Default for LocalBackend {
     /// directory every such backend of this user shares. Sandboxed turns may
     /// write there, so [`connect`](ExecutionBackend::connect) refuses it:
     /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
-    /// in the project's state directory, and this one is for tests that
+    /// in the atomic home's `scratch/`, and this one is for tests that
     /// open workspaces without connecting. Each has its own scratch root,
     /// since runs of different stores may share a run and step name.
     fn default() -> Self {
