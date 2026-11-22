@@ -1,0 +1,183 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Controls are tested by removing them (docs/development.md). On every pull
+# request this runs the controls rows the pull request touches: each row file
+# it adds or changes, and each row whose file it changes
+# (scripts/controls-touched.py). The rows run in parallel shards, each a job
+# that builds once and runs its rows in turn with scripts/controls-check.sh,
+# which switches the control off, requires its tests to fail, puts it back and
+# requires them to pass. "Controls" passes only when every row passed.
+#
+# A merge group does not run the rows again: its pull request could only join
+# the queue once they had passed on it, and running them twice would double
+# the queue's wait. Actions are pinned by commit SHA.
+
+name: Controls
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: controls-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A row rebuilds its crate twice, once with the control off and once with it
+  # back, so the workspace's own crates build incrementally here.
+  CARGO_INCREMENTAL: "1"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+  # How the touched rows are cut into shards: one shard for every ROWS_PER_SHARD
+  # rows, up to MAX_SHARDS.
+  ROWS_PER_SHARD: "6"
+  MAX_SHARDS: "8"
+
+jobs:
+  plan:
+    name: Touched controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: plan
+        name: The rows this pull request touches
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -uo pipefail
+          summary="${GITHUB_STEP_SUMMARY}"
+          if [ "${EVENT}" = merge_group ]; then
+            echo "A merge group runs no rows: they passed on its pull request before it joined the queue." | tee -a "${summary}"
+            echo "count=0" >>"${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # A pull request's checkout is its merge onto the base branch, so the
+          # change is what that merge adds to its first parent.
+          git rev-parse --verify --quiet HEAD^2 >/dev/null ||
+            { echo "::error::HEAD is not the pull request's merge commit"; exit 1; }
+          base="$(git rev-parse HEAD^1)"
+          rows="$(scripts/controls-touched.py "${base}" HEAD)" || exit 1
+          report="$(scripts/controls-touched.py "${base}" HEAD --report)" || exit 1
+          count="$(grep -c . <<<"${rows}" || true)"
+          shards=$(( (count + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
+          [ "${shards}" -le "${MAX_SHARDS}" ] || shards="${MAX_SHARDS}"
+          matrix="[]"
+          for i in $(seq 1 "${shards}"); do
+            names="$(scripts/controls-touched.py "${base}" HEAD --shards "${shards}" --shard "${i}" | paste -sd' ')" || exit 1
+            matrix="$(jq -c --argjson i "${i}" --argjson of "${shards}" --arg rows "${names}" '. + [{shard: $i, of: $of, rows: $rows}]' <<<"${matrix}")"
+          done
+          {
+            echo "### Touched controls"
+            echo
+            echo "${count} rows touched, in ${shards} shards."
+            if [ -n "${report}" ]; then
+              echo
+              echo '```'
+              echo "${report}"
+              echo '```'
+            fi
+          } >>"${summary}"
+          [ -z "${report}" ] || echo "${report}"
+          echo "count=${count}" >>"${GITHUB_OUTPUT}"
+          echo "matrix={\"include\":${matrix}}" >>"${GITHUB_OUTPUT}"
+
+  # Each shard is set up as the test jobs are, with Postgres and the user
+  # namespaces the sandbox tests need, so the sandbox rows run here too.
+  shard:
+    name: Controls (${{ matrix.shard }}/${{ matrix.of }})
+    needs: plan
+    if: ${{ needs.plan.outputs.count != '0' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          target-cache: test
+          backends: "true"
+      - name: Run the rows
+        env:
+          ROWS: ${{ matrix.rows }}
+          SHARD: ${{ matrix.shard }}/${{ matrix.of }}
+          # The runner's /tmp belongs to this job alone, as in the test jobs.
+          ATOMIC_TEST_PRIVATE_TMP: "1"
+        run: |
+          set -uo pipefail
+          results="${RUNNER_TEMP}/results.txt"
+          : >"${results}"
+          status=0
+          for row in ${ROWS}; do
+            echo "::group::${row}"
+            code=0
+            # A row that hangs is stopped, and its files put back, rather than
+            # taking the rest of the shard with it.
+            timeout --kill-after=60s 45m scripts/controls-check.sh "${row}" 2>&1 | tee "${RUNNER_TEMP}/row.log" || code=$?
+            echo "::endgroup::"
+            line="$(grep -E "^(ok|FAIL) ${row}: " "${RUNNER_TEMP}/row.log" | tail -n 1)"
+            # A row passes only on a clean exit with its ok line; any other
+            # end is a FAIL line, the script's own when it gave one.
+            if [ "${code}" -ne 0 ]; then
+              case "${line}" in
+              "FAIL "*) ;;
+              *) line="FAIL ${row}: scripts/controls-check.sh exited ${code}${line:+ after: ${line}}" ;;
+              esac
+            else
+              case "${line}" in
+              "ok ${row}: "*) ;;
+              *) line="FAIL ${row}: scripts/controls-check.sh exited 0 without its ok line" ;;
+              esac
+            fi
+            echo "${line}" >>"${results}"
+            case "${line}" in
+            "FAIL "*) echo "::error::${line}"; status=1 ;;
+            *) echo "${line}" ;;
+            esac
+          done
+          {
+            echo "### Controls, shard ${SHARD}"
+            echo
+            echo '```'
+            cat "${results}"
+            echo '```'
+          } >>"${GITHUB_STEP_SUMMARY}"
+          exit "${status}"
+      - name: Keep the failing rows' cargo output
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: controls-logs-${{ matrix.shard }}
+          path: target/controls-check-*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # The one check that stands for the shards, which pass or fail as a set.
+  controls:
+    name: Controls
+    # always(), not !cancelled(): a cancelled run must end this check as a
+    # failure, not as skipped, which a required check would count as passed.
+    if: ${{ always() }}
+    needs: [plan, shard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every touched row passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${NEEDS}"
+          # No rows: the plan passed and the shards were skipped. Otherwise
+          # both passed.
+          jq -e '.plan.result == "success" and (.shard.result == "success" or (.shard.result == "skipped" and .plan.outputs.count == "0"))' <<<"${NEEDS}" >/dev/null

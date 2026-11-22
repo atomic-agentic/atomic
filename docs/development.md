@@ -213,10 +213,13 @@ store does not hold, and waiting for the store's lock within one bounded wait
 that a stop signal ends; and
 that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
-puts the source back and requires the test to pass. Each control costs a rebuild, so it
-runs by hand rather than in CI:
+puts the source back and requires the test to pass. Each control costs a
+rebuild, so CI runs only the rows a pull request touches (see
+[The Controls workflow](#the-controls-workflow)). To run a row by hand, or all
+of them:
 
 ```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 ```
 
@@ -251,6 +254,35 @@ control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
+
+### The Controls workflow
+
+On every pull request, `.github/workflows/controls.yml` runs the rows the pull
+request touches: each row file it adds or changes, and each row whose `file`
+it changes, since a code change can move a switch's text or stop its test
+biting. `scripts/controls-touched.py <base> <head>` lists them. It fails on a
+row file it cannot read, and on a row file deleted while its switch still
+applies, its text still in its file and held by no other row: a control whose
+code remains keeps its row. The "Touched controls" job lists the rows and
+cuts them into shards, one for every six rows and at most eight; each shard,
+"Controls (i/n)", is set up as the test jobs are, sandbox and Postgres
+included, builds once and runs its rows in turn with `controls-check.sh`. A
+shard's summary holds one result line per row, the script's own:
+
+```
+ok run-keeps-input: its test fails with the control off and passes with it on
+FAIL serve-line-names: its test passed with the control off
+```
+
+A row that ends any other way, or runs past 45 minutes, gets a `FAIL` line
+too, and a failing row's cargo output is kept as the shard's
+`controls-logs-<i>` artifact. "Controls" passes only when every touched row
+passed, and in seconds when none is touched. A merge group runs no rows: its
+pull request passed them before it joined the queue.
+
+A row a GitHub runner cannot run is listed, with its reason, in
+`scripts/controls-local.txt`. CI reports it as "not run in CI" and leaves it
+to a local run.
 
 ## Milestone acceptance
 
@@ -392,7 +424,9 @@ in turn:
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it.
+requests too, and nothing in CI waits for it. The Controls workflow runs the
+controls rows a pull request touches
+([The Controls workflow](#the-controls-workflow)).
 
 Main is merged through a merge queue. Once a pull request's checks pass, it can
 be added to the queue, which runs CI again on the pull request merged onto main
