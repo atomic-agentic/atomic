@@ -1988,8 +1988,8 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     let originally_duplicated = texted != *string
         && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
         && gives_a_key_twice(string);
-    let duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
-    if duplicate_keys {
+    let held_duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
+    if held_duplicate_keys {
         *string = REDACTED.to_owned();
         return true;
     }
