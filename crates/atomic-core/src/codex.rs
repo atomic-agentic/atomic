@@ -752,13 +752,24 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist. The entry
-        // from `dirs` is where that other atomic would keep its credentials
-        // (see [`crate::state::credentials_dir`]), which is not always the
-        // directory denied above: that one comes from
-        // [`crate::state::user_config_dir`], the same function
-        // [`crate::state::outside_user_config`] reads, so the directory a
-        // state directory is refused for sitting inside is denied outright.
+        // keys are another atomic's: denied too, where they exist. That
+        // atomic's credentials and keys sit under
+        // [`crate::state::user_config_dir`], the directory denied above and
+        // the same function [`crate::state::outside_user_config`] reads, so
+        // the directory a state directory is refused for sitting inside is
+        // denied outright. The entries from `dirs` are denied beside it: the
+        // state directory `base_dir` falls back to, and the configuration
+        // directory `dirs` names. That is not always the same one: on macOS
+        // (`~/Library/Application Support`) and Windows (`%APPDATA%`) it
+        // never is, and on Linux it differs only for a relative `HOME`,
+        // which `user_config_dir` gives way from (`dirs` ignores a relative
+        // `XDG_CONFIG_HOME` itself).
+        // An older atomic's credentials and checkpoint key, `ATOMIC_HOME`
+        // set or not and whether they exist yet or not: on macOS and Windows
+        // that place was never the configuration directory above.
+        also.extend(crate::state::legacy_secret_dirs(
+            crate::state::legacy_config_dir().as_deref(),
+        ));
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1868,6 +1879,9 @@ fn refuse_uncovered_store(
     }
     let mut stores = vec![crate::state::base_dir()?, crate::state::credentials_dir()?];
     stores.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+    stores.extend(crate::state::legacy_secret_dirs(
+        crate::state::legacy_config_dir().as_deref(),
+    ));
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     for root in roots {
         let root = real(root);
@@ -5272,6 +5286,69 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older atomic's credentials and checkpoint key, kept in the
+    /// configuration directory `dirs` names (on macOS not the one atomic
+    /// uses now), are denied to atoms' commands, with `ATOMIC_HOME` set as
+    /// with it unset, both of them whether they exist yet or not: an older
+    /// atomic can still make one after the guard is built, and a place
+    /// missing when a command starts is denied once it exists. With no such
+    /// directory, nothing is added for them. Every place the guard makes or
+    /// reads is below the case's own throwaway directory.
+    #[test]
+    fn an_older_atomics_credentials_and_keys_are_denied_where_they_are() {
+        let scratch = crate::state::TestScratch::new("legacy-denied");
+        for dir in ["home", "legacy-config/atomic/credentials", "state"] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let also = || match StateGuard::deny_state_dir(scratch.join("state")).expect("a guard") {
+            StateGuard::Deny(private) => private.also,
+            StateGuard::NoProjectState => panic!("no denial"),
+        };
+        let old =
+            ["credentials", "keys"].map(|name| scratch.join("legacy-config/atomic").join(name));
+        assert!(
+            !old[1].exists(),
+            "the older atomic's key directory is here already"
+        );
+        for atomic_home in [Some("/atomic-home"), None] {
+            let mut vars = vec![("HOME", "/home")];
+            vars.extend(atomic_home.map(|home| ("ATOMIC_HOME", home)));
+            let _process = crate::state::as_process_with_dirs(
+                &scratch,
+                &vars,
+                None,
+                Some("legacy-config"),
+                Some("data"),
+            );
+            let denied = also();
+            for place in &old {
+                assert!(
+                    denied.contains(place),
+                    "{} is not denied with ATOMIC_HOME {atomic_home:?}: {denied:?}",
+                    place.display()
+                );
+            }
+        }
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/atomic-home")],
+            None,
+            None,
+            None,
+        );
+        let none = also();
+        assert!(
+            !none
+                .iter()
+                .any(|d| d.starts_with(scratch.join("legacy-config"))),
+            "{none:?}"
+        );
+        assert!(
+            scratch.join("data/atomic/private").is_dir(),
+            "without ATOMIC_HOME the guard did not make the state home the case named"
+        );
+    }
     use crate::testing::{FakeModel, Reply};
 
     #[cfg(unix)]
