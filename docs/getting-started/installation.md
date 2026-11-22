@@ -38,6 +38,33 @@ Read [subscriptions and authentication](authentication.md) for model access:
 serves any atom. Keep credentials out of atom files and committed configuration.
 Local-model setup instructions will accompany the matching release.
 
+## Verifying a download
+
+Each release archive and SBOM is signed with [Sigstore](https://www.sigstore.dev/)
+by the repository's release workflow, with no long-lived key: the signature's
+certificate names the workflow file and the tag it ran on, and the signature is
+recorded in Sigstore's public transparency log. The signature bundle sits beside
+each file on the release page as `<file>.sigstore.json`.
+
+To check an archive before unpacking it, download it and its bundle and run
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or
+later, with the release's tag in place of `v<version>`:
+
+```sh
+cosign verify-blob \
+  --bundle atomic-<version>-<target>.tar.gz.sigstore.json \
+  --certificate-identity https://github.com/atomic-agentic/atomic/.github/workflows/release.yml@refs/tags/v<version> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  atomic-<version>-<target>.tar.gz
+```
+
+It prints `Verified OK` and exits 0 only when the archive is the one the
+workflow signed at that tag. On any other result, do not use the file. The SBOM, `atomic-<version>-<target>.cdx.json`, checks
+the same way with its own bundle, and it records the SHA-256 of the `atomic`
+binary inside the archive ([checking an SBOM](../development.md#releases)).
+`SHA256SUMS` lists every file's checksum but is not itself signed; the bundles
+are what tie a file to the release.
+
 ## After installation
 
 For the **v0.5 interactive CLI**, open a directory and start Atomic:

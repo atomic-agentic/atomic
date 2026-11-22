@@ -1,0 +1,1 @@
+sandbox-place-link-climbs-out|crates/atomic-core/src/codex.rs|            if let Some(root) = climbing_out(writable, masked, &done) {|            if let Some(root) = None::<&PathBuf> { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_dangling_place_link_into_what_the_thread_may_write_refuses_it
