@@ -194,12 +194,17 @@ a replay in CI can find another endpoint than the recording did and miss. The
 budget's call bound and price table set the output cap each request carries, so a
 different call bound or price table in CI than when the answers were recorded
 also makes replays miss.
-A recording holds the request body and the response, never a header, so not the
-endpoint's key; an endpoint whose URL holds credentials or a query is refused. A
-recording is written whole, never through a symbolic link, and a cassette
-directory reached through one is refused. The body holds
-what the atom was asked, case inputs included: review a cassette like any other
-test data before you commit it. A hand-authored fixture is never a live-model pass.
+A recording holds copies of both bodies and excludes headers. Atomic refuses
+endpoints whose URL holds credentials or a query. Before writing a recording,
+atomic applies its log redaction to the bodies and serializes JSON responses from
+the parsed value. The recording sets `redacted` to `true` if either body changed
+during that process. Lookup still uses the original, unredacted request identity.
+Replay evaluates the stored response with the normal schema and case assertions,
+so replacing a sensitive value can change an eval's result. Use synthetic values
+if your eval depends on the exact output. Older recordings can still replay and
+may contain sensitive data. Review every cassette before committing it as a
+fixture. Recordings are written whole, and atomic refuses cassette directories
+reached through symbolic links. A hand-authored fixture is never a live-model pass.
 `--compare` is a v0.5 feature.
 
 A live eval, `--live` or `--no-cassettes`, is metered as a workflow step is: each

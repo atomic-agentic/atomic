@@ -1,0 +1,1 @@
+cassette-request-redaction|crates/atomic-core/src/cassette.rs|crate::redact::value(&mut stored_request);|let _ = &mut stored_request;|-p atomic-agentic-core --lib --features fake-model -- cassette_redacts_bodies_but_replays_by_the_raw_request

@@ -1,0 +1,1 @@
+cassette-redacted-identity|crates/atomic-core/src/cassette.rs|!identity_matches|!identity_matches && !recording.redacted|-p atomic-agentic-core --lib --features fake-model -- cassette_redacts_bodies_but_replays_by_the_raw_request

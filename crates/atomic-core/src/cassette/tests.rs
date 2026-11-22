@@ -295,6 +295,202 @@ async fn post(cassette: &Cassette, path: &str, body: &str, key: Option<&str>) ->
 const ASK: &str = r#"{"model": "m", "messages": [{"role": "user", "content": "hi"}]}"#;
 
 #[tokio::test]
+async fn cassette_redacts_bodies_but_replays_by_the_raw_request() {
+    const INPUT: &str = concat!("sk-ant-", "api03-inputabcdefghijklmnop1234567890");
+    const OUTPUT: &str = concat!("sk-ant-", "api03-outputabcdefghijklmnop1234567890");
+    const OTHER: &str = concat!("sk-ant-", "api03-otherabcdefghijklmnop1234567890");
+    const PATH: &str = "/v1/chat/completions";
+
+    let root = root("redacted-bodies");
+    let tapes = root.join("tapes");
+    let model = FakeModel::start(vec![Reply::Text(
+        json!({"ticket": "BUG-1", "note": OUTPUT}).to_string(),
+    )])
+    .await
+    .expect("fake model");
+    let upstream = model.base_url();
+    let endpoint = normalize(&upstream).expect("endpoint");
+    let ask = |secret: &str| {
+        json!({"model": "m", "messages": [{"role": "user", "content": secret}]}).to_string()
+    };
+    let ask_input = ask(INPUT);
+    let ask_other = ask(OTHER);
+    let key = |body: &str| {
+        identity(
+            &endpoint,
+            PATH,
+            &serde_json::from_str(body).expect("request"),
+        )
+        .0
+    };
+    let input_file = file_for(&tapes, &key(&ask_input), 1);
+    let other_file = file_for(&tapes, &key(&ask_other), 1);
+    assert_ne!(input_file, other_file);
+
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let (status, live) = post(&recorder, PATH, &ask_input, None).await;
+    assert_eq!(status, 200);
+    assert!(live.contains(OUTPUT), "live response was changed");
+    assert_eq!(model.requests()[0]["messages"][0]["content"], INPUT);
+    assert_eq!(recorder.tally().recorded, 1);
+    drop(recorder);
+
+    let text = std::fs::read_to_string(&input_file).expect("recording at raw identity");
+    assert!(
+        !text.contains(INPUT),
+        "request secret persisted in cassette"
+    );
+    assert!(
+        !text.contains(OUTPUT),
+        "response secret persisted in cassette"
+    );
+    let record: Value = serde_json::from_str(&text).expect("recording JSON");
+    assert_eq!(
+        record["redacted"], true,
+        "the recording must mark redaction"
+    );
+    assert_eq!(record["request"]["messages"][0]["content"], "[REDACTED]");
+
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    let (status, replay) = post(&player, PATH, &ask_input, None).await;
+    assert_eq!(status, 200);
+    let response: Value = serde_json::from_str(&replay).expect("response JSON");
+    let output = response["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("model output");
+    let output: Value = serde_json::from_str(output).expect("structured model output");
+    assert_eq!(output, json!({"ticket": "BUG-1", "note": "[REDACTED]"}));
+    assert_eq!(player.tally().replayed, 1);
+
+    let (status, miss) = post(&player, PATH, &ask_other, None).await;
+    assert_eq!(status, 502);
+    assert!(miss.contains("no recording answers this request"));
+    drop(player);
+
+    let mut missing_key = record;
+    missing_key
+        .as_object_mut()
+        .expect("object")
+        .remove("request_sha256");
+    std::fs::write(&input_file, missing_key.to_string()).expect("write recording");
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    let (status, corrupt) = post(&player, PATH, &ask_input, None).await;
+    assert_eq!(status, 502);
+    assert!(corrupt.contains("not this one"));
+    drop(player);
+
+    // Both requests sanitize to the same text. Copying a file into the
+    // other request's slot must still be detected as corruption.
+    std::fs::write(&other_file, text).expect("copy recording");
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    let (status, corrupt) = post(&player, PATH, &ask_other, None).await;
+    assert_eq!(status, 502);
+    assert!(corrupt.contains("not this one"));
+    assert_eq!(player.tally().corrupt, 1);
+    assert_eq!(model.calls(), 1, "replay contacted the model");
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
+async fn a_non_json_body_uses_text_redaction() {
+    const SECRET: &str = concat!("sk-ant-", "api03-outputabcdefghijklmnop1234567890");
+    let root = root("non-json-response");
+    let tapes = root.join("tapes");
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 200,
+        body: format!("upstream text {SECRET}"),
+    }])
+    .await
+    .expect("fake model");
+    let upstream = model.base_url();
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let path = "/v1/chat/completions";
+    assert_eq!(post(&recorder, path, ASK, None).await.0, 200);
+    assert_eq!(recorder.tally().recorded, 1);
+    drop(recorder);
+
+    let key = identity(
+        &upstream,
+        path,
+        &serde_json::from_str(ASK).expect("request"),
+    )
+    .0;
+    let fixture = std::fs::read_to_string(file_for(&tapes, &key, 1)).expect("recording");
+    assert!(
+        !fixture.contains(SECRET),
+        "response secret persisted in text cassette"
+    );
+    let recording: Recording = serde_json::from_str(&fixture).expect("recording JSON");
+    assert!(
+        recording.redacted,
+        "response redaction alone must be marked"
+    );
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    assert_eq!(
+        post(&player, path, ASK, None).await,
+        (200, "upstream text [REDACTED]".into())
+    );
+    assert_eq!(model.calls(), 1);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
+async fn a_shadowed_json_field_is_not_written_to_the_cassette() {
+    const SECRET_TAIL: &str = "api03-shadowedabcdefghijklmnop1234567890";
+    let body = format!(r#"{{"value":"sk\u002dant-{SECRET_TAIL}","value":"public"}}"#);
+    let root = root("shadowed-response");
+    let tapes = root.join("tapes");
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 200,
+        body: body.clone(),
+    }])
+    .await
+    .expect("fake model");
+    let upstream = model.base_url();
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let path = "/v1/chat/completions";
+    assert_eq!(post(&recorder, path, ASK, None).await, (200, body));
+    drop(recorder);
+
+    let key = identity(
+        &upstream,
+        path,
+        &serde_json::from_str(ASK).expect("request"),
+    )
+    .0;
+    let fixture = std::fs::read_to_string(file_for(&tapes, &key, 1)).expect("recording");
+    assert!(
+        !fixture.contains(SECRET_TAIL),
+        "shadowed response field persisted in cassette"
+    );
+    let recording: Recording = serde_json::from_str(&fixture).expect("recording JSON");
+    assert!(recording.redacted);
+    let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
+        .await
+        .expect("player");
+    assert_eq!(
+        post(&player, path, ASK, None).await,
+        (200, r#"{"value":"public"}"#.into())
+    );
+    assert_eq!(model.calls(), 1);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
 async fn the_same_request_twice_is_recorded_twice_and_replayed_in_order() {
     let root = root("repeat");
     let tapes = root.join("evals/cassettes");
@@ -319,6 +515,21 @@ async fn the_same_request_twice_is_recorded_twice_and_replayed_in_order() {
     assert_ne!(first.1, second.1, "two answers to the same request");
     assert_eq!(recorder.tally().recorded, 2);
     drop(recorder);
+    let endpoint = normalize(&upstream).expect("endpoint");
+    let path = "/v1/chat/completions";
+    let (key, _) = identity(
+        &endpoint,
+        path,
+        &serde_json::from_str(ASK).expect("request"),
+    );
+    let file = file_for(&tapes, &key, 1);
+    let mut fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(&file).expect("tape")).expect("JSON");
+    assert_eq!(fixture["redacted"], false);
+    let fields = fixture.as_object_mut().expect("object");
+    fields.remove("redacted");
+    fields.remove("request_sha256");
+    std::fs::write(file, fixture.to_string()).expect("legacy recording");
     let player = Cassette::start(&tapes, &root, &upstream, Mode::Replay)
         .await
         .expect("cassette");
@@ -345,7 +556,7 @@ async fn the_same_request_twice_is_recorded_twice_and_replayed_in_order() {
 async fn a_bad_recording_is_corrupt_not_missing_and_links_are_refused() {
     let root = root("corrupt");
     let tapes = root.join("cassettes");
-    let model = FakeModel::start(vec![Reply::Text("one".into())])
+    let model = FakeModel::start(vec![Reply::Text("one".into()), Reply::Text("two".into())])
         .await
         .expect("fake model");
     let upstream = model.base_url();
@@ -390,6 +601,15 @@ async fn a_bad_recording_is_corrupt_not_missing_and_links_are_refused() {
     std::fs::remove_file(&tape).expect("remove");
     std::os::unix::fs::symlink(&elsewhere, &tape).expect("link");
     replayed("a link").await;
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let (status, reply) = post(&recorder, "/v1/chat/completions", ASK, None).await;
+    assert_eq!(status, 500);
+    assert!(reply.contains("it is a link or not a file"));
+    assert_eq!(recorder.tally().recorded, 0);
+    assert_eq!(std::fs::read_to_string(&elsewhere).expect("target"), whole);
+    drop(recorder);
     // A cassette directory reached through a link is refused outright.
     let linked = root.join("linked");
     std::os::unix::fs::symlink(&tapes, &linked).expect("link");

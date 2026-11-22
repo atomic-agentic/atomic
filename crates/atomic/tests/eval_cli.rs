@@ -351,6 +351,57 @@ fn text(out: &Output) -> String {
 }
 
 #[test]
+fn atomic_eval_replays_a_redacted_model_answer() {
+    const INPUT: &str = concat!("sk-ant-", "api03-inputabcdefghijklmnop1234567890");
+    const OUTPUT: &str = concat!("sk-ant-", "api03-outputabcdefghijklmnop1234567890");
+    on_codex_runtime(async {
+        let dir = scratch("redacted-cassette");
+        let project = project(&dir, None);
+        let eval_dir = project.join("evals/note");
+        std::fs::write(
+            eval_dir.join("cases.jsonl"),
+            json!({"input": {"text": INPUT}, "expect": ["output.ticket.startsWith('BUG-1 ')"]})
+                .to_string(),
+        )
+        .expect("case");
+        let model = FakeModel::start(vec![Reply::Text(
+            json!({"ticket": format!("BUG-1 {OUTPUT}")}).to_string(),
+        )])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let live = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(live.status.success(), "{}", text(&live));
+        assert_eq!(model.calls(), 1);
+        let files: Vec<_> = std::fs::read_dir(eval_dir.join("cassettes"))
+            .expect("cassettes")
+            .map(|entry| entry.expect("cassette entry").path())
+            .collect();
+        assert_eq!(files.len(), 1);
+        let fixture = std::fs::read_to_string(&files[0]).expect("cassette file");
+        assert!(
+            !fixture.contains(INPUT),
+            "request secret persisted in cassette"
+        );
+        assert!(
+            !fixture.contains(OUTPUT),
+            "response secret persisted in cassette"
+        );
+
+        let replay = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+        assert!(replay.status.success(), "{}", text(&replay));
+        let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["replayed"], 1);
+        assert_eq!(report["cassettes"][0]["corrupt"], 0);
+        assert_eq!(
+            report["reports"][0]["cases"][0]["output"]["ticket"],
+            "BUG-1 [REDACTED]"
+        );
+        assert_eq!(model.calls(), 1, "the replay contacted the model");
+    });
+}
+
+#[test]
 fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
     on_codex_runtime(async {
         let dir = scratch("ci");
