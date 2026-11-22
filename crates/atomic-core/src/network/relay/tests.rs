@@ -266,7 +266,11 @@ async fn a_tunnel_closed_at_the_timeout_is_held_while_the_proxy_holds_it() {
     assert!(refused(&relay).await, "held past the linger");
     stand.let_go();
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let _again = open(relay.addr(), Some("relay-one")).await;
+    let mut again = open(relay.addr(), Some("relay-one")).await;
+    again
+        .write_all(b"CONNECT 127.0.0.1:443 HTTP/1.1\r\n\r\n")
+        .await
+        .expect("sent");
     assert_eq!(stand.until(2).await, 2, "room again once the proxy let go");
 }
 
