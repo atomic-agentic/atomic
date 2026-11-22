@@ -414,12 +414,16 @@ impl Wait {
         if self.began.elapsed() >= SAY_AFTER
             && !self.said.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            atomic_core::log_line!(
-                "atomic: run {}: the artifact store is held by another process, such as a \
-                 sweep; the run waits for it, up to {} s, before it starts",
-                self.run,
-                self.for_at_most.as_secs()
-            );
+            atomic_core::redact::Line::new()
+                .plain("atomic: run ")
+                .shown(&self.run)
+                .plain(
+                    ": the artifact store is held by another process, such as a sweep; the run \
+                     waits for it, up to ",
+                )
+                .shown(&self.for_at_most.as_secs().to_string())
+                .plain(" s, before it starts")
+                .log();
         }
     }
 

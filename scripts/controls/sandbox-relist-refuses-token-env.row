@@ -1,0 +1,1 @@
+sandbox-relist-refuses-token-env|crates/atomic-core/src/codex.rs|            && std::env::var_os(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY).is_some()|            && std::hint::black_box(false)|-p atomic-agentic --features atomic-agentic/sandbox-tests --test exec_network_relist a_command_whose_helper_starts_again_for_a_late_link_never_holds_its_proxy_token

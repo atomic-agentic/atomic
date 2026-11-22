@@ -777,6 +777,18 @@ fn bounded(mut run: Command, at: &Path) -> std::process::Output {
 /// own, named after `dir`:
 /// the tests that call this run at once, and each removes its home first.
 async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
+    look_once_prepared(dir, home, command, env, &|_| {}).await
+}
+
+/// [`look_once`], with `prepare` given the project's state directory, made
+/// by an earlier command, before the run.
+async fn look_once_prepared(
+    dir: &Path,
+    home: &Path,
+    command: &str,
+    env: &[(&str, &str)],
+    prepare: &(dyn Fn(&Path) + Sync),
+) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
             name: "exec_command".into(),
@@ -793,27 +805,34 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
         dir.file_name().unwrap().to_string_lossy()
     ));
     let _ = std::fs::remove_dir_all(&atomic_home);
-    let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
-    run.args(["run", "look", "--data", r#"{"text": "the note"}"#])
-        .current_dir(&project)
-        .env("HOME", home)
-        .env("XDG_DATA_HOME", &atomic_home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
-        .env("ATOMIC_MODEL_BASE_URL", model.base_url())
-        .env("ATOMIC_MODEL", "synthetic")
-        .stdin(Stdio::null());
-    for name in [
-        "CODEX_HOME",
-        "ATOMIC_HOME",
-        "ATOMIC_DATABASE_URL",
-        "ATOMIC_EXECUTOR_ID",
-    ] {
-        run.env_remove(name);
-    }
-    for (name, value) in env {
-        run.env(name, value);
-    }
+    let atomic = |args: &[&str]| {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+        run.args(args)
+            .current_dir(&project)
+            .env("HOME", home)
+            .env("XDG_DATA_HOME", &atomic_home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env("ATOMIC_MODEL_BASE_URL", model.base_url())
+            .env("ATOMIC_MODEL", "synthetic")
+            .stdin(Stdio::null());
+        for name in [
+            "CODEX_HOME",
+            "ATOMIC_HOME",
+            "ATOMIC_DATABASE_URL",
+            "ATOMIC_EXECUTOR_ID",
+        ] {
+            run.env_remove(name);
+        }
+        for (name, value) in env {
+            run.env(name, value);
+        }
+        run
+    };
+    let state = atomic(&["debug", "state-dir"]).output().unwrap();
+    assert!(state.status.success(), "{state:?}");
+    prepare(Path::new(String::from_utf8_lossy(&state.stdout).trim()));
+    let run = atomic(&["run", "look", "--data", r#"{"text": "the note"}"#]);
     let at = dir.join("look");
     let out = tokio::task::spawn_blocking(move || bounded(run, &at))
         .await
@@ -833,6 +852,143 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
         .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The state directory [`look_once`] runs `look` in for `dir`, made now by
+/// `atomic debug state-dir` as it would be.
+fn state_dir_of_look(dir: &Path, home: &Path) -> PathBuf {
+    let project = dir.join("project");
+    write_project(&project);
+    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-shell-env-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
+    let out = Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .args(["debug", "state-dir"])
+        .current_dir(&project)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", &atomic_home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env_remove("ATOMIC_HOME")
+        .env_remove("CODEX_HOME")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+}
+
+/// The link to atomic that Codex runs as its Linux sandbox helper, made in
+/// the state of the project, which a command started there runs.
+fn own_helper(state: &Path) -> PathBuf {
+    let dir = state.join("codex/tmp/atomic-helper");
+    let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path().join("codex-linux-sandbox"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    found.remove(0)
+}
+
+/// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
+/// the helper's inner stage by the name its outer stage was started under,
+/// a turn's command still runs, under atomic's own link to itself by its
+/// path, and a program a command put on `PATH` under the helper's name is
+/// never run in the inner stage's place.
+#[test]
+fn a_turns_command_runs_under_an_old_bubblewrap_and_never_a_planted_helper() {
+    use std::os::unix::fs::PermissionsExt;
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-old-bwrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let script = |path: &Path, text: &str| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let bwrap_ran = dir.join("bwrap-ran");
+        script(
+            &dir.join("bwrap/bwrap"),
+            &format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+                 touch '{}'\n\
+                 while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+                 shift\n\
+                 if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+                 echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+                 exit 1\n",
+                bwrap_ran.display()
+            ),
+        );
+        let ran = dir.join("planted-ran");
+        script(
+            &dir.join("planted/codex-linux-sandbox"),
+            &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+        );
+        let path = format!(
+            "{}:{}:{}",
+            dir.join("bwrap").display(),
+            dir.join("planted").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        // Codex's links made unmakeable: a file where their directory goes.
+        let unlink = |state: &Path| {
+            let links = state.join("codex/tmp/arg0-linux");
+            let _ = std::fs::remove_dir_all(&links);
+            std::fs::write(&links, "not a directory").unwrap();
+        };
+        let printed = look_once_prepared(
+            &dir,
+            &home,
+            "echo command-ran",
+            &[("PATH", path.as_str())],
+            &unlink,
+        )
+        .await;
+        assert!(!ran.exists(), "the planted program ran: {printed}");
+        assert!(
+            bwrap_ran.exists(),
+            "the old bubblewrap never ran: {printed}"
+        );
+        assert!(printed.contains("command-ran"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// The link Codex runs as its helper sits where no command can write: a
+/// turn's command can neither put a file beside it nor point it elsewhere.
+#[test]
+fn the_helpers_link_is_out_of_every_commands_reach() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-helper-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // The link's path, which the state `look_once` makes names.
+        let link = own_helper(&state_dir_of_look(&dir, &home));
+        let to_run = format!(
+            "touch '{0}.planted' 2>&1; ln -sf /bin/true '{0}' 2>&1; \
+             test -e '{0}.planted' && echo was-planted; echo \"leads=$(readlink '{0}')\"; \
+             echo tried",
+            link.display()
+        );
+        let printed = look_once(&dir, &home, &to_run, &[]).await;
+        assert!(printed.contains("tried"), "{printed}");
+        assert!(!printed.contains("was-planted"), "{printed}");
+        assert!(printed.contains("Read-only file system"), "{printed}");
+        let atomic = std::fs::canonicalize(env!("CARGO_BIN_EXE_atomic")).unwrap();
+        assert_eq!(
+            printed_value(&printed, "leads"),
+            atomic.display().to_string(),
+            "the helper's link was pointed elsewhere: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]
@@ -1134,6 +1290,99 @@ fn aws_workload_token_files_stay_denied_whether_plain_or_mounted() {
     });
 }
 
+/// The workload credentials beside AWS's stay denied to a turn's commands,
+/// and every command still starts: the token Azure workload identity's
+/// variable names, Google's application credentials and the token files
+/// they name, and the web identity token file an AWS profile names rather
+/// than a variable. Each token is in a projected volume, as Kubernetes
+/// mounts one, so the version it rotates in next is denied too.
+#[test]
+fn workload_credentials_beside_aws_stay_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir =
+            std::env::temp_dir().join(format!("atomic-workload-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        let mut reads = Vec::new();
+        for volume in ["azure", "gke", "eks"] {
+            let at = dir.join(volume);
+            for version in [now, next] {
+                std::fs::create_dir_all(at.join(version)).unwrap();
+                std::fs::write(
+                    at.join(version).join("token"),
+                    format!("canary-{volume}{version}\n"),
+                )
+                .unwrap();
+                reads.push(at.join(version).join("token"));
+            }
+            std::os::unix::fs::symlink(now, at.join("..data")).unwrap();
+            std::os::unix::fs::symlink("..data/token", at.join("token")).unwrap();
+            reads.push(at.join("token"));
+        }
+        std::fs::create_dir_all(dir.join("gcp-cache")).unwrap();
+        std::fs::write(dir.join("gcp-cache/token.json"), "canary-gcp-cached\n").unwrap();
+        std::fs::write(dir.join("gcp-cache/readme"), "readable-beside\n").unwrap();
+        std::fs::create_dir_all(dir.join("gcp")).unwrap();
+        let google = serde_json::json!({
+            "type": "external_account",
+            "audience": "canary-gcp-config",
+            "credential_source": {
+                "file": dir.join("gke/token"),
+                "executable": {
+                    "command": "/bin/true",
+                    "output_file": dir.join("gcp-cache/token.json"),
+                },
+            },
+        });
+        std::fs::write(dir.join("gcp/credentials.json"), google.to_string()).unwrap();
+        std::fs::create_dir_all(dir.join("aws")).unwrap();
+        std::fs::write(
+            dir.join("aws/config"),
+            format!(
+                "[profile pod]\nweb_identity_token_file = {}\n",
+                dir.join("eks/token").display()
+            ),
+        )
+        .unwrap();
+        reads.push(dir.join("gcp/credentials.json"));
+        reads.push(dir.join("gcp-cache/token.json"));
+        let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
+        let command = format!(
+            "cat {} 2>/dev/null; cat {}/gcp-cache/readme; echo looked",
+            reads.join(" "),
+            dir.display()
+        );
+        let azure = dir.join("azure/token").display().to_string();
+        let google = dir.join("gcp/credentials.json").display().to_string();
+        let aws = dir.join("aws/config").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("AZURE_FEDERATED_TOKEN_FILE", azure.as_str()),
+                ("GOOGLE_APPLICATION_CREDENTIALS", google.as_str()),
+                ("AWS_CONFIG_FILE", aws.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            printed.contains("readable-beside"),
+            "a file beside a token stays readable: {printed}"
+        );
+        assert!(
+            !printed.contains("canary"),
+            "a credential was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// Codex's file helper, which applies a turn's patches under the turn's
 /// sandbox, keeps that sandbox's registry of mount points where the turn's
 /// commands keep theirs: in the backend's shared directory in atomic's
@@ -1200,8 +1449,18 @@ async fn patch_keeps_its_registry(tag: &str, relative: bool) {
         .into_iter()
         .map(|r| r.parent().unwrap().to_owned())
         .collect();
+    // In the shared directory of the backend runs use: the project's `run`
+    // root in the home's `scratch/`. The home is the state given as
+    // `ATOMIC_HOME`, or else `atomic` in the `XDG_DATA_HOME` it was given.
+    let atomic = if relative {
+        state.clone()
+    } else {
+        state.join("atomic")
+    };
     assert!(
-        shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
+        shared.len() == 1
+            && shared[0].ends_with("run/.tmp")
+            && shared[0].starts_with(atomic.join("scratch")),
         "registries: {shared:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);

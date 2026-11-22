@@ -257,21 +257,42 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
+    ("CLOUDSDK_CONFIG", &[""]),
 ];
 
-/// Where AWS's workload identities put their token files on Kubernetes when
-/// no variable says otherwise (IAM roles for service accounts, and EKS Pod
-/// Identity): denied whether or not atomic's environment names them.
-const AWS_TOKEN_DIRS: &[&str] = &[
+/// Where workload identities put their token files on Kubernetes when no
+/// variable says otherwise: AWS's (IAM roles for service accounts, and EKS
+/// Pod Identity), the pod's own service account, and Azure workload
+/// identity's. Denied whether or not atomic's environment names them.
+const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     "/var/run/secrets/eks.amazonaws.com/serviceaccount",
     "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
+    // `scripts/controls/k8s-token-dir.row` switches this off.
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+    // `scripts/controls/azure-token-dir.row` switches this off.
+    "/var/run/secrets/azure/tokens",
 ];
 
-/// The variables that name a workload token file an AWS SDK reads.
-const AWS_TOKEN_FILES: &[&str] = &[
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+/// The variables that name a workload credential file an SDK reads, each
+/// with what the file is called in a refusal: AWS's token files, Azure
+/// workload identity's, and Google's application credentials, which may be
+/// a key or a configuration naming a token file of its own (see
+/// [`google_token_files`]).
+const WORKLOAD_TOKEN_FILES: &[(&str, &str)] = &[
+    ("AWS_WEB_IDENTITY_TOKEN_FILE", "token file"),
+    ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "token file"),
+    // `scripts/controls/azure-token-file.row` switches this off.
+    ("AZURE_FEDERATED_TOKEN_FILE", "token file"),
+    // `scripts/controls/gcp-credentials-file.row` switches this off.
+    (GOOGLE_CREDENTIALS, "credentials file"),
 ];
+
+/// The variable that names Google's application credentials.
+const GOOGLE_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+
+/// The most of a credential configuration atomic reads to find the token
+/// files it names: far more than any holds.
+const CONFIG_BYTES_MAX: u64 = 1 << 20;
 
 /// The projected volume `file` is in, if it is in one, as Kubernetes mounts
 /// a service account's token: the volume holds a `..data` link to its
@@ -327,17 +348,18 @@ fn projected_volume(file: PathBuf) -> Option<PathBuf> {
     None
 }
 
-/// AWS's workload token files the variables in `env` name, a relative one
-/// resolved against the working directory `here` gives, as an AWS SDK
+/// The workload credential files the variables in `env` name, a relative
+/// one resolved against the working directory `here` gives, as an SDK
 /// started there resolves it, and, for one in a projected volume, the
-/// volume itself. An error, so nothing runs, when a name is relative and
-/// the working directory is unknown.
+/// volume itself; with the token files Google's application credentials
+/// name. An error, so nothing runs, when a name is relative and the working
+/// directory is unknown, or when Google's credentials cannot be read whole.
 fn token_files(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for name in AWS_TOKEN_FILES {
+    for (name, what) in WORKLOAD_TOKEN_FILES {
         let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
             continue;
         };
@@ -349,17 +371,248 @@ fn token_files(
         } else {
             let refused = |e: std::io::Error| {
                 format!(
-                    "{name} names the token file {} relative to the working directory, which \
-                     is unknown ({e}), so the token could not be denied to atoms' commands",
+                    "{name} names the {what} {} relative to the working directory, which \
+                     is unknown ({e}), so it could not be denied to atoms' commands",
                     file.display()
                 )
             };
             here().map_err(refused)?.join(&file)
         };
+        if *name == GOOGLE_CREDENTIALS {
+            // `scripts/controls/gcp-external-token.row` switches this off.
+            out.extend(google_token_files(&file, here)?);
+        }
         out.extend(projected_volume(file.clone()));
         out.push(file);
     }
     Ok(out)
+}
+
+/// `file` read as plainly as a name in a configuration reads, resolved
+/// against the working directory `here` gives when it is relative.
+fn named_path(file: &str, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let file: PathBuf = Path::new(file).components().collect();
+    if file.is_absolute() {
+        return Ok(file);
+    }
+    here().map(|here| here.join(&file)).map_err(|e| {
+        format!(
+            "it names {} relative to the working directory, which is unknown ({e})",
+            file.display()
+        )
+    })
+}
+
+/// The bytes of the credential configuration at `path`, followed through
+/// links as its SDK follows them, read without waiting, as opening a fifo
+/// would, and no further than [`CONFIG_BYTES_MAX`]: `None` when it is not
+/// there, or is a device, as `/dev/null` is when a variable names it to
+/// turn the configuration off, which is never opened; and an error for
+/// anything else that keeps it from being read whole.
+fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read as _;
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => format!("this user may not read it: {e}"),
+        _ => e.to_string(),
+    };
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // Only a file that is not there names nothing: any other error
+        // refuses. `scripts/controls/workload-config-not-there.row` switches
+        // this off.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+    };
+    // `scripts/controls/workload-config-device.row` switches this off.
+    let device = is_device(&meta);
+    if device {
+        return Ok(None);
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).map_err(unreadable)?;
+    // What was opened, which may not be what was looked at.
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    // `scripts/controls/workload-config-plain.row` switches this off.
+    let plain = meta.is_file();
+    if !plain {
+        return Err("it is not a plain file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(CONFIG_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > CONFIG_BYTES_MAX {
+        return Err(format!("it holds more than {CONFIG_BYTES_MAX} bytes"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Whether `meta` is a device's: a character or a block device.
+fn is_device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        meta.file_type().is_char_device() || meta.file_type().is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The token files the Google credentials file at `config` names, each
+/// with its projected volume where it is in one: an external account's
+/// `credential_source.file`, and the `output_file` its executable keeps a
+/// token in, as for the `source_credentials` an impersonated account is
+/// configured with. A key, or an account that names no file, names none,
+/// and so does a file that is not there. Anything that cannot be read whole
+/// and as JSON is refused, naming the file, so nothing runs rather than a
+/// token it may name being left readable.
+fn google_token_files(
+    config: &Path,
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as Google credentials ({why}), so a token file they name \
+             could not be denied to atoms' commands; fix it, or point {GOOGLE_CREDENTIALS} at \
+             a file that can be read",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    // `scripts/controls/gcp-config-refused.row` switches this off.
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
+    };
+    let mut names = Vec::new();
+    google_named(&value, 0, &mut names).map_err(refused)?;
+    let mut out = Vec::new();
+    for name in names {
+        let file = named_path(&name, here).map_err(refused)?;
+        out.extend(projected_volume(file.clone()));
+        out.push(file);
+    }
+    Ok(out)
+}
+
+/// What Google credentials `value` name as files holding a token, into
+/// `out`, and those of the credentials they are configured with, no deeper
+/// than a few: an error when a field that names a file is not text, or one
+/// that holds others is not an object.
+fn google_named(
+    value: &serde_json::Value,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    use serde_json::Value;
+    let Some(object) = value.as_object() else {
+        return Err("they are not a JSON object".into());
+    };
+    if depth > 4 {
+        return Err("their source credentials nest too deeply".into());
+    }
+    let named = |value: Option<&Value>, field: &str| match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone()).filter(|n| !n.is_empty())),
+        Some(_) => Err(format!("{field} is not text")),
+    };
+    let fields = |value: &Value, field: &str| {
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("{field} is not an object"))
+    };
+    if let Some(source) = object.get("credential_source") {
+        let source = fields(source, "credential_source")?;
+        out.extend(named(source.get("file"), "credential_source.file")?);
+        if let Some(executable) = source.get("executable") {
+            let executable = fields(executable, "credential_source.executable")?;
+            out.extend(named(
+                executable.get("output_file"),
+                "credential_source.executable.output_file",
+            )?);
+        }
+    }
+    if let Some(inner) = object.get("source_credentials") {
+        google_named(inner, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// The web identity token files the AWS configuration file at `config`
+/// names in any of its profiles, each with its projected volume where it is
+/// in one: one named relative to the working directory `here` gives, as an
+/// AWS SDK reads it, and one under `~/` in each of `homes` as well. A file
+/// that is not there names none; one that cannot be read whole as text is
+/// refused, naming it, so nothing runs.
+fn aws_profile_token_files(
+    config: &Path,
+    homes: &[PathBuf],
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as an AWS configuration file ({why}), so a web identity \
+             token file it names could not be denied to atoms' commands; make it a file this \
+             user can read, or move it",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    let text = String::from_utf8(bytes).map_err(|_| refused("it is not UTF-8 text".into()))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // A key ends at `=` or, as Python's configuration parser reads it,
+        // at `:`, whichever comes first.
+        // `scripts/controls/aws-profile-colon.row` switches this off.
+        let Some(at) = line.find(['=', ':']) else {
+            continue;
+        };
+        let (key, value) = (&line[..at], line[at + 1..].trim());
+        if !key.trim().eq_ignore_ascii_case("web_identity_token_file") || value.is_empty() {
+            continue;
+        }
+        // Some SDKs end a value at a `#` or `;` after white space, as a
+        // comment, and others keep it: both readings are denied.
+        // `scripts/controls/aws-profile-comment.row` switches this off.
+        let comment = comment_start(value);
+        let mut values = vec![value];
+        values.extend(
+            comment
+                .map(|at| value[..at].trim_end())
+                .filter(|v| !v.is_empty()),
+        );
+        for value in values {
+            let mut files = vec![named_path(value, here).map_err(refused)?];
+            if let Some(rest) = value.strip_prefix("~/") {
+                files.extend(homes.iter().map(|home| home.join(rest)));
+            }
+            for file in files {
+                out.extend(projected_volume(file.clone()));
+                out.push(file);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Where a comment starts in a configuration value, as the SDKs that allow
+/// one read it: at the first `#` or `;` that follows white space.
+fn comment_start(value: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .find(|&(at, c)| matches!(c, '#' | ';') && value[..at].ends_with(char::is_whitespace))
+        .map(|(at, _)| at)
 }
 
 /// The home directories whose credential places are denied, as `env` reads
@@ -401,7 +654,8 @@ pub fn home_secrets(
 ) -> Result<Vec<PathBuf>, String> {
     let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
     let mut out = Vec::new();
-    for home in real_homes(env, passwd)? {
+    let homes = real_homes(env, passwd)?;
+    for home in &homes {
         out.extend(HOME_SECRETS.iter().map(|p| home.join(p)));
     }
     for (prefix, variable) in [
@@ -433,12 +687,36 @@ pub fn home_secrets(
     if let Some(list) = env("KUBECONFIG") {
         out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
     }
-    // AWS's workload token files: where they usually are, those the
-    // variables name, a relative one resolved against atomic's working
-    // directory as an AWS SDK resolves it, and, for one in a projected
-    // volume, the volume itself.
-    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
+    // Workload token files: where they usually are, those the variables
+    // name, a relative one resolved against atomic's working directory as
+    // an SDK resolves it, and, for one in a projected volume, the volume
+    // itself.
+    out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
     out.extend(token_files(env, &std::env::current_dir)?);
+    // Those named inside a configuration rather than by a variable: an AWS
+    // profile's web identity token file, and what the application default
+    // credentials gcloud writes name.
+    let mut aws: Vec<PathBuf> = homes
+        .iter()
+        .flat_map(|home| [home.join(".aws/config"), home.join(".aws/credentials")])
+        .collect();
+    aws.extend(absolute("AWS_CONFIG_FILE"));
+    aws.extend(absolute("AWS_SHARED_CREDENTIALS_FILE"));
+    let here = &std::env::current_dir;
+    for config in &aws {
+        // `scripts/controls/aws-profile-token.row` switches this off.
+        out.extend(aws_profile_token_files(config, &homes, here)?);
+    }
+    let mut gcloud: Vec<PathBuf> = homes
+        .iter()
+        .map(|home| home.join(".config/gcloud"))
+        .collect();
+    gcloud.extend(absolute("CLOUDSDK_CONFIG"));
+    for dir in &gcloud {
+        let defaults = dir.join("application_default_credentials.json");
+        // `scripts/controls/gcp-default-credentials.row` switches this off.
+        out.extend(google_token_files(&defaults, &std::env::current_dir)?);
+    }
     out.sort();
     out.dedup();
     Ok(out)
@@ -818,7 +1096,12 @@ fn denied_paths(
     let mut own = Vec::new();
     for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
-            own.extend(children(&entry, &arg0));
+            // Codex's links, and atomic's own link to itself under the
+            // helper's name, which every sandbox runs; they stay readable.
+            let helpers = children(&entry, &arg0)
+                .into_iter()
+                .filter(|p| not_the_helpers_link(p));
+            own.extend(helpers);
         } else {
             own.push(entry);
         }
@@ -841,7 +1124,14 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would refuse it.
+            if !found && let Err(e) = resolved(&path) {
+                return Err(refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                )));
+            }
             let Some(target) = std::fs::canonicalize(&path)
                 .ok()
                 .filter(|t| deniable(t, !found))
@@ -947,16 +1237,21 @@ fn denied_paths(
     // The sandbox finds the denials inside a writable directory by the
     // spelling it is given that directory under: one given through a link
     // would not keep a denial inside it, under its real spelling, in force.
+    let codex = real_spelling(codex_home);
     for (named, root) in given.iter().zip(&roots) {
         if named.as_path() == root.as_path() {
             continue;
         }
-        let codex = real_spelling(codex_home);
-        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
+        // Codex's home, whose databases a pattern denies, is weighed with the
+        // places listed. The files planted in it at start are listed as well,
+        // so this is defence in depth for a home that holds them.
+        // `scripts/controls/deny-linked-codex-home.row` switches this off.
+        let mut weighed = all.iter().chain([&codex]);
+        if let Some(place) = weighed.find(|p| p.starts_with(root)) {
             return Err(refuse(format!(
                 "{} is inside {}, which atoms' commands may write, named {} through a link, so \
-                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
-                 their real paths, with no link above them",
+                 its denial would not hold; point ATOMIC_HOME (or XDG_DATA_HOME, or HOME) and \
+                 the project at their real paths, with no link above them",
                 place.display(),
                 root.display(),
                 named.display()
@@ -967,12 +1262,59 @@ fn denied_paths(
     // the list above is made: a pattern, expanded when each command starts,
     // covers it, under the home's real spelling, as every place is, and so
     // at each second mount of Codex's home.
-    let mut globs = vec![format!("{}/*.sqlite*", real_spelling(codex_home).display())];
+    let home_spelled = real_spelling(codex_home);
+    let mut globs = vec![sqlite_glob(&home_spelled).map_err(|e| refuse(format!("{e:#}")))?];
     for alias in home_aliases {
-        globs.push(format!("{}/*.sqlite*", alias.display()));
+        globs.push(sqlite_glob(alias).map_err(|e| refuse(format!("{e:#}")))?);
+    }
+    // The cap again, counted as each command's sandbox helper counts it
+    // (see `late_targets`): the second mounts of all the list denies, its
+    // second mounts among them, and of each directory whose databases it
+    // denies; so a list a thread starts with does not refuse its commands.
+    let homes: Vec<PathBuf> = std::iter::once(home_spelled)
+        .chain(home_aliases.iter().cloned())
+        .collect();
+    let counted =
+        crate::mounts::second_mounts(&[&all, &homes]).map_err(|e| refuse(format!("{e:#}")))?;
+    let (mounted, home_mounts) = (counted[0].len(), counted[1].len());
+    let as_commands_count = link_count + mounted + home_mounts;
+    if as_commands_count > MAX_LINK_TARGETS {
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {link_count} links to files elsewhere, \
+             with {mounted} second mounts of what they deny, counted from each side, and \
+             {home_mounts} of Codex's home, more than the {MAX_LINK_TARGETS} atomic follows"
+        )));
     }
     Ok((all, globs))
 }
+
+/// The pattern that denies the databases Codex keeps in `home`; refused
+/// when `home` holds a character a pattern gives a meaning to, or is not
+/// UTF-8, since then the pattern may not match it and the databases would
+/// go undenied.
+fn sqlite_glob(home: &Path) -> anyhow::Result<String> {
+    let Some(text) = home.to_str() else {
+        bail!(
+            "{} is not UTF-8, so atomic cannot deny Codex's databases there",
+            home.display()
+        );
+    };
+    let special = text.matches(GLOB_SPECIAL).next();
+    if let Some(c) = special {
+        bail!(
+            "{text} holds `{c}`, which a pattern gives a meaning to, so atomic cannot deny \
+             Codex's databases there; keep Codex's home, and any second mount of it, at a path \
+             without one"
+        );
+    }
+    Ok(format!("{text}/{SQLITE_FILES}"))
+}
+
+/// The characters a sandbox pattern gives a meaning to.
+const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
+
+/// The databases Codex keeps in its home, as a pattern inside it.
+const SQLITE_FILES: &str = "*.sqlite*";
 
 /// `path` with the links among the directories above it, and itself,
 /// resolved as far as it exists, and the rest as it is named.
@@ -1125,6 +1467,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
 }
 
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
@@ -1359,7 +1721,7 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    // Before anything that could re-execute this process: see run_helper.
+    // Before anything that could re-execute this process: see [`as_any_helper`].
     as_any_helper();
     harden();
     // The person's own Codex home stays denied to atoms' commands.
@@ -1372,10 +1734,227 @@ where
     }
     scrub_overrides();
     let links = hold_helper_links(codex_home);
+    #[cfg(target_os = "linux")]
+    let helper = own_helper_link(codex_home);
     arg0_dispatch_or_else(move |paths| {
         drop(links);
+        // Codex's sandbox runs atomic's own link to itself as its helper,
+        // which every bubblewrap can run by its path; without one, Codex's.
+        #[cfg(target_os = "linux")]
+        let paths = match helper {
+            Some(helper) => Arg0DispatchPaths {
+                codex_linux_sandbox_exe: Some(helper),
+                ..paths
+            },
+            None => paths,
+        };
         main_fn(CodexPaths(paths))
     })
+}
+
+/// Whether `path`, in a Codex home's `tmp/`, is anything but the real directory
+/// of atomic's own link to itself, which every sandbox must run.
+/// `scripts/controls/sandbox-helper-link-readable.row` switches this off.
+fn not_the_helpers_link(path: &Path) -> bool {
+    let named = path.file_name() == Some(HELPER_DIR.as_ref());
+    // Only a real directory by that name: a link planted under it is denied
+    // as what it points at, as every other entry is.
+    // `scripts/controls/sandbox-helper-link-real-dir.row` switches this off.
+    let real_dir = std::fs::symlink_metadata(path)
+        .ok()
+        .as_ref()
+        .map(std::fs::Metadata::is_dir)
+        == Some(true);
+    !(named && real_dir)
+}
+
+/// The directory below a Codex home's `tmp/` where atomic keeps its own
+/// link to itself under the Linux sandbox helper's name.
+const HELPER_DIR: &str = "atomic-helper";
+
+/// atomic's own link to this executable under the Linux sandbox helper's
+/// name, `<codex_home>/tmp/atomic-helper/<key>/codex-linux-sandbox`, made
+/// or mended now, while this process has one thread: `None` when it cannot
+/// be, and when what stands on the way is not what atomic made.
+///
+/// Codex runs it as the helper, by that absolute path, for every turn's and
+/// exec atom's command. A bubblewrap without `--argv0` runs the helper's
+/// inner stage by the name its outer stage was started under, and this one
+/// is a path it can run inside the sandbox, never a name it looks for along
+/// PATH. The directory is readable by every sandbox and writable by none:
+/// atoms' commands never write the Codex home, and this directory, like
+/// Codex's own links, is left out of what is denied them (see
+/// [`denied_paths`]). `<key>` names this executable's path, so processes run
+/// from two paths sharing a Codex home never run each other's.
+///
+/// `tmp`, `atomic-helper` and `<key>` are opened one at a time, never
+/// through a link, each made only when it is not there, and each, like the
+/// Codex home, must be a directory of this user's that no one else may
+/// write: one of this user's that others may write, as a umask such as 002
+/// leaves one, is narrowed first, and anything else falls back to Codex's
+/// own helper. The link is made in the `<key>` directory held open, beside
+/// its place, and renamed into it.
+#[cfg(target_os = "linux")]
+fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
+    use sha2::Digest as _;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let exe = std::env::current_exe().ok()?;
+    let key = sha2::Sha256::digest(exe.as_os_str().as_bytes());
+    let key: String = key[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let home = std::ffi::CString::new(codex_home.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `home` is valid for the call; the result is owned below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::open(
+            home.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just returned open, and nothing else owns it.
+    #[allow(unsafe_code)]
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    if !tightened(&dir) || !private_dir(&dir) {
+        return None;
+    }
+    for part in ["tmp", HELPER_DIR, key.as_str()] {
+        let name = std::ffi::CString::new(part).ok()?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: `name` is valid for the calls, and `dir` is open.
+        #[allow(unsafe_code)]
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        let mut made = false;
+        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            let r = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) };
+            made = r == 0;
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            {
+                fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+            }
+        }
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` was just returned open, and nothing else owns it.
+        #[allow(unsafe_code)]
+        let next = unsafe { OwnedFd::from_raw_fd(fd) };
+        if made {
+            // SAFETY: fchmod takes an open descriptor and a mode.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::fchmod(next.as_raw_fd(), 0o700);
+            }
+        }
+        if !tightened(&next) || !private_dir(&next) {
+            return None;
+        }
+        dir = next;
+    }
+    let link = codex_home
+        .join("tmp")
+        .join(HELPER_DIR)
+        .join(&key)
+        .join("codex-linux-sandbox");
+    let name = std::ffi::CString::new("codex-linux-sandbox").ok()?;
+    let mut leads = vec![0u8; 4096];
+    // SAFETY: `leads` is valid for its length, and `dir` is open.
+    #[allow(unsafe_code)]
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            leads.as_mut_ptr().cast(),
+            leads.len(),
+        )
+    };
+    if n >= 0 && &leads[..n as usize] == exe.as_os_str().as_bytes() {
+        return Some(link);
+    }
+    // Made beside it and renamed over it, so another process never finds
+    // it half made, and one leading elsewhere is replaced.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = std::ffi::CString::new(format!(
+        ".codex-linux-sandbox.{}.{nanos}",
+        std::process::id()
+    ))
+    .ok()?;
+    let target = std::ffi::CString::new(exe.as_os_str().as_bytes()).ok()?;
+    // SAFETY: both strings are valid for the calls, and `dir` is open.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), temp.as_ptr()) != 0 {
+            return None;
+        }
+        if libc::renameat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+        ) != 0
+        {
+            libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+            return None;
+        }
+    }
+    Some(link)
+}
+
+/// Take group and other write off the directory held open as `dir` when it
+/// is this user's own, as a umask such as 002 leaves one another program
+/// made: `false` only when that fails. One that is not this user's is left
+/// as it is, for [`private_dir`] to refuse.
+/// `scripts/controls/sandbox-helper-link-tighten.row` switches this off.
+#[cfg(target_os = "linux")]
+fn tightened(dir: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed stat is a valid value of a plain C struct.
+    #[allow(unsafe_code)]
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is valid for the call, and `dir` is open.
+    #[allow(unsafe_code)]
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // SAFETY: geteuid takes nothing and cannot fail.
+    #[allow(unsafe_code)]
+    let ours = st.st_uid == unsafe { libc::geteuid() };
+    let narrow = ours && st.st_mode & 0o022 != 0;
+    if !narrow {
+        return true;
+    }
+    // SAFETY: fchmod takes an open descriptor and a mode.
+    #[allow(unsafe_code)]
+    let r = unsafe { libc::fchmod(dir.as_raw_fd(), st.st_mode & 0o7777 & !0o022) };
+    r == 0
+}
+
+/// Whether the directory held open as `dir` is this user's own, which no
+/// one else may write. `scripts/controls/sandbox-helper-link-private.row`
+/// switches this off.
+#[cfg(target_os = "linux")]
+fn private_dir(dir: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed stat is a valid value of a plain C struct.
+    #[allow(unsafe_code)]
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is valid for the call, and `dir` is open.
+    #[allow(unsafe_code)]
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // SAFETY: geteuid takes nothing and cannot fail.
+    #[allow(unsafe_code)]
+    let me = unsafe { libc::geteuid() };
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == me && st.st_mode & 0o022 == 0
 }
 
 /// How long one atomic process waits for another to finish making Codex's
@@ -1400,6 +1979,13 @@ const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// is full.
 fn hold_helper_links(codex_home: &Path) -> Option<std::fs::File> {
     let dir = codex_home.join("tmp");
+    // Private, as atomic's own link to itself requires of it, whatever the
+    // umask (see `own_helper_link`).
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(&dir)
+        .ok()?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).ok()?;
     let lock = std::fs::OpenOptions::new()
         .write(true)
@@ -1526,7 +2112,7 @@ pub fn run_helper() -> anyhow::Result<()> {
 
 /// When this process is the outer stage of Codex's Linux sandbox helper,
 /// starting one command, deny what links made since its profile's deny list
-/// was built point at (see [`late_link_targets`]), or exit. A turn's list
+/// was built point at (see [`late_targets`]), or exit. A turn's list
 /// is built when its thread starts, and each of its commands starts the
 /// helper with it: a link a later process made inside a denied place, such
 /// as `~/.aws/credentials` leading to a file kept elsewhere, would leave
@@ -1550,6 +2136,20 @@ fn deny_links_made_since_the_list() {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         // Started again once already: what it adds is its last chance.
         let again_already = take_env(RELISTED).is_some();
+        // Started again, it must not have been handed the proxy token in its
+        // environment: the token goes to the helper only on a socket, read
+        // after this walk, so a token here means it was read before a start
+        // again put it in the environment of a process that was dumpable
+        // until its first step. The command does not run.
+        if again_already
+            && std::env::var_os(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY).is_some()
+        {
+            crate::log_line!(
+                "atomic: the sandbox helper was started again with the proxy token in its \
+                 environment, where another process could have read it; the command does not run"
+            );
+            std::process::exit(1);
+        }
         let carried = take_env(PLACES);
         let places = match carried.as_ref().map(|v| {
             v.to_str()
@@ -1569,8 +2169,8 @@ fn deny_links_made_since_the_list() {
             Ok(None) => {}
             Ok(Some(_)) if again_already => {
                 crate::log_line!(
-                    "atomic: links in the places denied to atoms' commands kept changing while \
-                     the sandbox started; the command does not run"
+                    "atomic: links in the places denied to atoms' commands, or their mounts, kept \
+                     changing while the sandbox started; the command does not run"
                 );
                 std::process::exit(1);
             }
@@ -1611,7 +2211,7 @@ pub(crate) const RELISTED: &str = "ATOMIC_SANDBOX_RELISTED";
 
 /// Carries the places a command's deny list was built with, as JSON, to the
 /// sandbox helper that starts the command, which walks them again (see
-/// [`late_link_targets`]) and takes it off before anything else sees it. An
+/// [`late_targets`]) and takes it off before anything else sees it. An
 /// atom cannot declare it.
 pub(crate) const PLACES: &str = "ATOMIC_SANDBOX_PLACES";
 
@@ -1740,8 +2340,21 @@ fn relisted(
     needed.extend(cwd);
     needed.extend(paths(FileSystemAccessMode::Read));
     needed.extend(std::env::current_exe().ok());
-    let late = late_link_targets(&denied, places, &needed, &writable)?;
-    if late.targets.is_empty() && late.replaced.is_empty() {
+    // The directories whose databases the list denies by a pattern.
+    let homes: Vec<PathBuf> = policy
+        .entries
+        .iter()
+        .filter(|e| e.access == FileSystemAccessMode::Deny)
+        .filter_map(|e| match &e.path {
+            FileSystemPath::GlobPattern { pattern } => pattern
+                .strip_suffix(SQLITE_FILES)
+                .and_then(|dir| dir.strip_suffix('/'))
+                .map(PathBuf::from),
+            _ => None,
+        })
+        .collect();
+    let late = late_targets(&denied, places, &homes, &needed, &writable)?;
+    if late.targets.is_empty() && late.replaced.is_empty() && late.globs.is_empty() {
         return Ok(None);
     }
     // A place that has become a link is denied as what it points at, as
@@ -1765,6 +2378,12 @@ fn relisted(
             FileSystemAccessMode::Deny,
         ));
     }
+    for pattern in late.globs {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::GlobPattern { pattern },
+            FileSystemAccessMode::Deny,
+        ));
+    }
     let profile = PermissionProfile::from_runtime_permissions(&policy, network);
     let mut again = args.to_vec();
     again[at] = serde_json::to_string(&profile)
@@ -1777,7 +2396,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -1790,7 +2408,7 @@ fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     }
 }
 
-/// What [`late_link_targets`] found to deny since the list was built.
+/// What [`late_targets`] found to deny since the list was built.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Late {
@@ -1799,6 +2417,21 @@ struct Late {
     /// Denied places that have become links, whose denial is now that of
     /// what they point at.
     replaced: Vec<PathBuf>,
+    /// Patterns for Codex's databases at the second mounts of its home made
+    /// since, to deny.
+    globs: Vec<String>,
+}
+
+/// [`late_targets`] with no directories of databases to watch: what the
+/// tests of the walk itself call.
+#[cfg(test)]
+fn late_link_targets(
+    denied: &[PathBuf],
+    places: Option<&[PathBuf]>,
+    needed: &[PathBuf],
+    writable: &[PathBuf],
+) -> anyhow::Result<Late> {
+    late_targets(denied, places, &[], needed, writable)
 }
 
 /// What links made since a list was built point at, by the rules the list
@@ -1808,15 +2441,24 @@ struct Late {
 /// up to [`LINK_DEPTH`] levels inside a place, or a place that is now a
 /// link, is followed; one that a denial covers already, or that
 /// [`deniable`] leaves alone, needs nothing, and what is found is denied at
-/// its second mounts too. Nothing runs when a place now leads to what the
-/// command needs (`needed`), or two or more levels inside a directory of
+/// its second mounts too, as is each second mount of what `denied` holds
+/// made since the list was built, and the databases at each new second
+/// mount of `homes`, the directories whose databases the list denies by a
+/// pattern (Codex's home and its second mounts as the list was built)
+/// ([`Late::globs`]), from one read of the mount table
+/// (two where the places are inferred, which needs the table too). Nothing
+/// runs when a place, or a new second mount, now leads to what the command
+/// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold come
-/// to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
-fn late_link_targets(
+fn late_targets(
     denied: &[PathBuf],
     places: Option<&[PathBuf]>,
+    homes: &[PathBuf],
     needed: &[PathBuf],
     writable: &[PathBuf],
 ) -> anyhow::Result<Late> {
@@ -1935,32 +2577,78 @@ fn late_link_targets(
         }
     }
     collapse(&mut late.targets);
-    // Their second mounts too, held to the same rules.
-    if !late.targets.is_empty() {
-        let mut found = crate::mounts::second_mounts(&[&late.targets])
-            .map_err(|e| DenyRefused(format!("{e:#}")))?;
-        for alias in &found[0] {
-            refuse(alias, alias)?;
-        }
-        let aliases = found[0].len();
-        // A second mount a denial covers already needs none of its own.
-        let uncovered = |a: &PathBuf| !covered.iter().any(|c| real(a).starts_with(c));
-        found[0].retain(uncovered);
-        late.targets.extend(found.into_iter().flatten());
-        collapse(&mut late.targets);
-        let count = held.len() + aliases;
-        if count > MAX_LINK_TARGETS {
+    // One read of the mount table as the command starts: the second mounts
+    // of what is new, those of what the list denies already, which a mount
+    // made since the list was built may have added to, and those of Codex's
+    // home, whose databases a pattern denies at each. Each is held to the
+    // rules the list's builder holds a second mount to.
+    let found = crate::mounts::second_mounts(&[&late.targets, &covered, homes])
+        .map_err(|e| DenyRefused(format!("{e:#}")))?;
+    let refuse_mount = |alias: &Path| -> anyhow::Result<()> {
+        if let Some(holds) = held_in(&needed, alias) {
             bail!(DenyRefused(format!(
-                "the places denied to atoms' commands now hold {} links to files elsewhere, with \
-                 {aliases} second mounts of what the new ones point at, more than the \
-                 {MAX_LINK_TARGETS} atomic follows",
-                held.len()
+                "{} is a second mount of what this command is denied, and holds {}, which it \
+                 needs; atomic cannot deny it there",
+                alias.display(),
+                holds.display()
             )));
         }
-    } else if held.len() > MAX_LINK_TARGETS {
+        if let Some(root) = deep_inside(&writable, alias) {
+            bail!(DenyRefused(format!(
+                "{} is a second mount of what this command is denied, two or more levels inside \
+                 {}, which it may write, so it could move it out from under its denial",
+                alias.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
+    // Counted as the list's builder counts them (see `denied_paths`).
+    let aliases = found[0].len();
+    let mounted = found[1].len();
+    let home_mounts = found[2].len();
+    // A second mount a denial covers already needs none of its own, and one
+    // the list was built with was held to these rules then: only what is new
+    // is held to them now.
+    let uncovered = |a: &PathBuf| !covered.iter().any(|c| real(a).starts_with(c));
+    let mut found = found.into_iter();
+    let mut of_new: Vec<PathBuf> = found.next().unwrap_or_default();
+    of_new.retain(uncovered);
+    let mut since: Vec<PathBuf> = found.next().unwrap_or_default();
+    since.retain(uncovered);
+    let made_since = since.len();
+    // A second mount of Codex's home its databases are not denied at yet.
+    let known: Vec<PathBuf> = homes.iter().map(|h| real(h)).collect();
+    let new_homes: Vec<PathBuf> = found
+        .next()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| !known.contains(&real(a)))
+        .collect();
+    for alias in &of_new {
+        refuse_mount(alias)?;
+    }
+    for alias in &since {
+        refuse_mount(alias)?;
+    }
+    for alias in &new_homes {
+        refuse_mount(alias)?;
+    }
+    let mut new_globs = Vec::new();
+    for home in &new_homes {
+        new_globs.push(sqlite_glob(home).map_err(|e| DenyRefused(format!("{e:#}")))?);
+    }
+    late.globs.extend(new_globs);
+    late.targets.extend(of_new);
+    late.targets.extend(since);
+    collapse(&mut late.targets);
+    let count = held.len() + aliases + mounted + home_mounts;
+    if count > MAX_LINK_TARGETS {
         bail!(DenyRefused(format!(
-            "the places denied to atoms' commands now hold {} links to files elsewhere, more \
-             than the {MAX_LINK_TARGETS} atomic follows",
+            "the places denied to atoms' commands now hold {} links to files elsewhere, with \
+             {aliases} second mounts of what the new ones point at, {mounted} second mounts of \
+             what they deny ({made_since} made since the list was built) and {home_mounts} of \
+             Codex's home, more than the {MAX_LINK_TARGETS} atomic follows",
             held.len()
         )));
     }
@@ -2060,6 +2748,10 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// command its own `TMPDIR`.
 fn as_any_helper() {
     helper_not_dumpable();
+    // The walk may start the helper again, so it comes before the token is
+    // read: read first, the token would pass through `exec` in the
+    // environment of a process that is dumpable until its first step, which
+    // the walk then refuses.
     deny_links_made_since_the_list();
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
@@ -2230,7 +2922,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -2311,12 +3004,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -2344,6 +3040,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -2403,7 +3109,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -2505,6 +3216,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 secret_env: secret,
                 ..command.clone()
             },
@@ -3108,6 +3820,16 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
@@ -4219,10 +4941,21 @@ mod tests {
                 ),
                 ("NETRC", "/n/netrc"),
                 ("PASSWORD_STORE_DIR", "/pass"),
+                ("AZURE_FEDERATED_TOKEN_FILE", "/az/federated-token"),
+                ("GOOGLE_APPLICATION_CREDENTIALS", "/gcp/credentials.json"),
+                ("CLOUDSDK_CONFIG", "/gcloud"),
             ]),
             None,
         )
         .expect("homes");
+        // Where workload identities keep their tokens on Kubernetes.
+        let pod = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let azure = "/var/run/secrets/azure/tokens";
+        assert!(has(&secrets, pod), "{pod} is not among the denied places");
+        assert!(
+            has(&secrets, azure),
+            "{azure} is not among the denied places"
+        );
         for path in [
             "/cfg/gh",
             "/cfg/git/credentials",
@@ -4246,6 +4979,9 @@ mod tests {
             "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
+            "/az/federated-token",
+            "/gcp/credentials.json",
+            "/gcloud",
         ] {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
@@ -4293,6 +5029,244 @@ mod tests {
         assert!(
             !places.contains(&dir),
             "an ordinary token's directory stays readable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A token file Google's application credentials name is denied with the
+    /// credentials: an external account's source file, with its projected
+    /// volume, the file its executable keeps a token in, and the source file
+    /// of the credentials an impersonated account is configured with.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_files_googles_credentials_name_are_denied() {
+        let dir = std::fs::canonicalize(scratch("gcp-external")).expect("real");
+        let volume = dir.join("gke");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let external = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {
+                "file": volume.join("token"),
+                "executable": {"command": "/bin/true", "output_file": dir.join("cached.json")},
+            },
+        });
+        std::fs::write(dir.join("external.json"), external.to_string()).expect("config");
+        let impersonated = serde_json::json!({
+            "type": "impersonated_service_account",
+            "source_credentials": {
+                "type": "external_account",
+                "credential_source": {"file": "relative/inner-token"},
+            },
+        });
+        std::fs::write(dir.join("impersonated.json"), impersonated.to_string()).expect("config");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        for (config, wanted) in [
+            (
+                "external.json",
+                vec![
+                    volume.clone(),
+                    volume.join("token"),
+                    dir.join("cached.json"),
+                ],
+            ),
+            (
+                "impersonated.json",
+                vec![PathBuf::from("/work/relative/inner-token")],
+            ),
+        ] {
+            let named = dir.join(config).display().to_string();
+            let env =
+                |name: &str| (name == GOOGLE_CREDENTIALS).then(|| std::ffi::OsString::from(&named));
+            let found = token_files(&env, &here).expect("found");
+            assert!(
+                found.contains(&dir.join(config)),
+                "the credentials: {found:?}"
+            );
+            for file in &wanted {
+                assert!(found.contains(file), "{}: {found:?}", file.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The web identity token file an AWS profile names, and not a variable,
+    /// is denied, with its projected volume: one under `~/` in each home as
+    /// well as from the working directory, in any profile.
+    #[cfg(unix)]
+    #[test]
+    fn the_web_identity_token_file_an_aws_profile_names_is_denied() {
+        let dir = std::fs::canonicalize(scratch("aws-profile")).expect("real");
+        let volume = dir.join("eks");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".aws")).expect("home");
+        std::fs::write(
+            home.join(".aws/config"),
+            format!(
+                "[default]\nregion = eu-west-1\n[profile pod]\nweb_identity_token_file = {}\n",
+                volume.join("token").display()
+            ),
+        )
+        .expect("config");
+        std::fs::write(
+            dir.join("moved-config"),
+            format!(
+                "[profile other]\n  Web_Identity_Token_File=~/tokens/web\n\
+                 [profile colon]\nweb_identity_token_file: {d}/colon-token\n\
+                 [profile commented]\nWEB_IDENTITY_TOKEN_FILE = {d}/commented-token  # eks\n\
+                 [profile both]\nweb_identity_token_file\t:\t{d}/both-token ;note\n",
+                d = dir.display()
+            ),
+        )
+        .expect("moved");
+        let (home_s, moved) = (home.display().to_string(), dir.join("moved-config"));
+        let moved_s = moved.display().to_string();
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some(home_s.clone()),
+                "AWS_CONFIG_FILE" => Some(moved_s.clone()),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let places = home_secrets(&env, None).expect("homes");
+        for file in [
+            volume.clone(),
+            volume.join("token"),
+            home.join("tokens/web"),
+            dir.join("colon-token"),
+            dir.join("commented-token"),
+            dir.join("commented-token  # eks"),
+            dir.join("both-token"),
+        ] {
+            assert!(
+                places.contains(&file),
+                "{} is not among the denied places",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The application default credentials gcloud writes are read for the
+    /// token files they name, as Google's libraries read them with no
+    /// variable set.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_google_credentials_are_read_for_the_token_files_they_name() {
+        let dir = std::fs::canonicalize(scratch("gcp-default")).expect("real");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".config/gcloud")).expect("gcloud");
+        let config = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {"file": dir.join("adc-token")},
+        });
+        std::fs::write(
+            home.join(".config/gcloud/application_default_credentials.json"),
+            config.to_string(),
+        )
+        .expect("config");
+        let home_s = home.display().to_string();
+        let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(&home_s));
+        let places = home_secrets(&env, None).expect("homes");
+        assert!(
+            places.contains(&dir.join("adc-token")),
+            "adc-token is not among the denied places"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A credential configuration that cannot be read whole is refused,
+    /// naming it, so nothing runs: only one that is not there names nothing.
+    /// Google's credentials that are not JSON, or whose file field is not
+    /// text; a directory, a fifo (without waiting on it), a file past the
+    /// bound, a path through a file, and an AWS file that is not text.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_configuration_that_cannot_be_read_whole_is_refused() {
+        let dir = std::fs::canonicalize(scratch("config-refused")).expect("real");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        let google = |name: &str| {
+            google_token_files(&dir.join(name), &here)
+                .err()
+                .unwrap_or_default()
+        };
+        let aws = |name: &str| {
+            aws_profile_token_files(&dir.join(name), &[], &here)
+                .err()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            google_token_files(&dir.join("missing"), &here),
+            Ok(Vec::new())
+        );
+        // A device, as /dev/null is when a variable turns a configuration
+        // off, names nothing and is not opened.
+        let null = Path::new("/dev/null");
+        assert_eq!(aws_profile_token_files(null, &[], &here), Ok(Vec::new()));
+        assert_eq!(google_token_files(null, &here), Ok(Vec::new()));
+        // One this user may not read is refused, saying so.
+        std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
+        std::fs::set_permissions(
+            dir.join("theirs"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("mode");
+        assert!(
+            aws("theirs").contains("this user may not read it"),
+            "{}",
+            aws("theirs")
+        );
+        std::fs::write(dir.join("broken.json"), "{\"credential_source\": ").expect("broken");
+        assert!(
+            google("broken.json").contains("it is not JSON"),
+            "{}",
+            google("broken.json")
+        );
+        std::fs::write(
+            dir.join("number.json"),
+            r#"{"credential_source": {"file": 7}}"#,
+        )
+        .expect("number");
+        assert!(
+            google("number.json").contains("credential_source.file is not text"),
+            "{}",
+            google("number.json")
+        );
+        std::fs::create_dir_all(dir.join("a-directory")).expect("dir");
+        assert!(google("a-directory").contains("not a plain file"));
+        let fifo = std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes())
+            .expect("name");
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        assert!(aws("fifo").contains("not a plain file"), "{}", aws("fifo"));
+        let big = vec![b' '; CONFIG_BYTES_MAX as usize + 1];
+        std::fs::write(dir.join("big"), big).expect("big");
+        assert!(aws("big").contains("more than"), "{}", aws("big"));
+        // An error other than not being there: a path through a file.
+        std::fs::write(dir.join("plain"), "").expect("plain");
+        let through = google("plain/credentials.json");
+        assert!(through.contains("Not a directory"), "{through}");
+        std::fs::write(dir.join("latin1"), b"web_identity_token_file = /t\xff\n").expect("bytes");
+        assert!(
+            aws("latin1").contains("not UTF-8 text"),
+            "{}",
+            aws("latin1")
+        );
+        assert!(
+            aws("latin1").starts_with(&format!(
+                "{} could not be read",
+                dir.join("latin1").display()
+            )),
+            "the file is named"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4635,6 +5609,7 @@ mod tests {
             Late {
                 targets: vec![std::fs::canonicalize(&kept).expect("real")],
                 replaced: vec![netrc.clone()],
+                globs: Vec::new(),
             }
         );
         // As the list was built while the place was a link: what it pointed
@@ -4734,7 +5709,7 @@ mod tests {
             .to_string();
         assert!(
             refused
-                .contains("with 0 second mounts of what the new ones point at, more than the 512"),
+                .contains("links to files elsewhere, with 0 second mounts of what the new ones point at, 0 second mounts of what they deny (0 made since the list was built) and 0 of Codex's home, more than the 512"),
             "{refused}"
         );
     }
@@ -4784,7 +5759,9 @@ mod tests {
         assert!(late.targets.contains(&creds), "{late:?}");
         assert!(late.targets.contains(&again), "{late:?}");
         // A second mount a denial covers already needs none of its own.
-        let built = [place.clone(), PathBuf::from("/again")];
+        // As the builder would: the place at its own second mount too.
+        let again_place = Path::new("/again").join(place.strip_prefix("/").expect("absolute"));
+        let built = [place.clone(), again_place, again.clone()];
         let late = late_link_targets(&built, Some(only), &[], &[]).expect("walked");
         assert_eq!(late.targets, [creds], "{late:?}");
     }
@@ -4827,6 +5804,7 @@ mod tests {
             Late {
                 targets: vec![real(&kept)],
                 replaced: vec![entry.clone()],
+                globs: Vec::new(),
             }
         );
         // Leading to what the command needs, with no place to walk: the
@@ -4887,8 +5865,438 @@ mod tests {
             Late {
                 targets: Vec::new(),
                 replaced: vec![netrc.clone()],
+                globs: Vec::new(),
             }
         );
+    }
+
+    /// A second mount of what the list denies, made after it was built, is
+    /// denied at its new place for the next command, held to the same rules
+    /// as the rest.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_made_since_the_list_is_denied_for_the_next_command() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+        let dir = Scratch::new("mounted-since");
+        let home = dir.0.join("home");
+        let place = home.join(".aws");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        for d in [&place, &work, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        });
+        // The list, built while the home is mounted once.
+        let built = crate::mounts::with_table(ONE_MOUNT);
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let args: Vec<std::ffi::OsString> = [
+            "codex-linux-sandbox".to_owned(),
+            "--command-cwd".to_owned(),
+            work.display().to_string(),
+            "--permission-profile".to_owned(),
+            serde_json::to_string(&profile).expect("json"),
+            "--".to_owned(),
+            "true".to_owned(),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let places = [place.clone()];
+        assert_eq!(relisted(&args, Some(&places)).expect("nothing new"), None);
+        drop(built);
+        // The home bound at a second path since.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again rw - ext4 /dev/sda1 rw\n",
+            home.display()
+        );
+        let _since = crate::mounts::with_table(table.as_bytes());
+        let again = relisted(&args, Some(&places))
+            .expect("relisted")
+            .expect("more denied");
+        let at = again
+            .iter()
+            .position(|a| a == "--permission-profile")
+            .expect("flag");
+        let profile: PermissionProfile =
+            serde_json::from_str(again[at + 1].to_str().expect("text")).expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let denied: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        assert!(denied.contains(&PathBuf::from("/again/.aws")), "{denied:?}");
+        // Where the new mount of it holds what the command needs: refused.
+        let refused = late_link_targets(
+            &places,
+            Some(&places),
+            &[PathBuf::from("/again/.aws/needed")],
+            &[],
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            refused.contains(
+                "/again/.aws is a second mount of what this command is denied, and holds"
+            ) && refused.contains("which it needs"),
+            "{refused}"
+        );
+    }
+
+    /// A table of the root and `n` binds of `dir`, at /again0 and on.
+    fn binds_of(dir: &Path, n: usize) -> Vec<u8> {
+        let mut table = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..n {
+            table.push_str(&format!(
+                "{} 1 8:1 {} /again{i} rw - ext4 /dev/sda1 rw\n",
+                i + 2,
+                dir.display()
+            ));
+        }
+        table.into_bytes()
+    }
+
+    /// A second mount of Codex's home made since the list was built has its
+    /// databases denied there for the next command, as the list denies them
+    /// at each second mount of the home it was built with.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_of_codex_home_made_since_has_its_databases_denied() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+        let dir = Scratch::new("home-mounted-since");
+        let place = dir.0.join("home/.aws");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        for d in [&place, &work, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        });
+        let built = crate::mounts::with_table(ONE_MOUNT);
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let args: Vec<std::ffi::OsString> = [
+            "codex-linux-sandbox".to_owned(),
+            "--command-cwd".to_owned(),
+            work.display().to_string(),
+            "--permission-profile".to_owned(),
+            serde_json::to_string(&profile).expect("json"),
+            "--".to_owned(),
+            "true".to_owned(),
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        let places = [place.clone()];
+        assert_eq!(relisted(&args, Some(&places)).expect("nothing new"), None);
+        drop(built);
+        // The directory that holds both bound at a second path since.
+        let _since = crate::mounts::with_table(&binds_of(&dir.0, 1));
+        let again = relisted(&args, Some(&places))
+            .expect("relisted")
+            .expect("more denied");
+        let at = again
+            .iter()
+            .position(|a| a == "--permission-profile")
+            .expect("flag");
+        let profile: PermissionProfile =
+            serde_json::from_str(again[at + 1].to_str().expect("text")).expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let globs: Vec<String> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::GlobPattern { pattern } => Some(pattern.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            globs.contains(&"/again0/codex/*.sqlite*".to_owned()),
+            "{globs:?}"
+        );
+        // Started again with it, the helper finds nothing more.
+        assert_eq!(relisted(&again, Some(&places)).expect("nothing more"), None);
+    }
+
+    /// A list built with Codex's home seen at two paths, as inside toolbox
+    /// or distrobox, refuses none of its commands: what the list was built
+    /// with was held to the rules then, and only what is new is now.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_mounted_twice_when_the_list_was_built_refuses_no_command() {
+        let dir = Scratch::new("home-twice");
+        let place = dir.0.join("home/.aws");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        for d in [&place, &work, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        });
+        let _table = crate::mounts::with_table(&binds_of(&dir.0, 1));
+        for sandbox in [
+            crate::typed::Sandbox::ReadOnly,
+            crate::typed::Sandbox::WorkspaceWrite,
+        ] {
+            let writable = match sandbox {
+                crate::typed::Sandbox::WorkspaceWrite => vec![work.clone()],
+                crate::typed::Sandbox::ReadOnly => Vec::new(),
+            };
+            let profile = permission_profile(sandbox, &guard, &codex, Some(&work), &writable)
+                .expect("profile");
+            let args: Vec<std::ffi::OsString> = [
+                "codex-linux-sandbox".to_owned(),
+                "--command-cwd".to_owned(),
+                work.display().to_string(),
+                "--permission-profile".to_owned(),
+                serde_json::to_string(&profile).expect("json"),
+                "--".to_owned(),
+                "true".to_owned(),
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect();
+            let places = [place.clone()];
+            assert_eq!(relisted(&args, Some(&places)).expect("nothing new"), None);
+        }
+    }
+
+    /// A second mount of Codex's home made since, two or more levels inside
+    /// what the command may write, refuses it; and so does a second mount of
+    /// what a new link points at there.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_home_or_target_mount_deep_inside_what_the_command_may_write_refuses() {
+        let dir = Scratch::new("home-deep");
+        let codex = dir.0.join("codex");
+        let work = dir.0.join("work");
+        std::fs::create_dir_all(&codex).expect("dir");
+        std::fs::create_dir_all(work.join("a/b")).expect("dir");
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            codex.display(),
+            work.join("a/b").display()
+        );
+        let home_table = crate::mounts::with_table(table.as_bytes());
+        let refused = late_targets(
+            &[],
+            Some(&[]),
+            std::slice::from_ref(&codex),
+            &[],
+            std::slice::from_ref(&work),
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a second mount of what this command is denied, two or more levels inside",
+                work.join("a/b").display()
+            )),
+            "{refused}"
+        );
+        drop(home_table);
+        // A new link's target, seen again deep inside what it may write.
+        let place = dir.0.join("home/.aws");
+        let elsewhere = dir.0.join("elsewhere");
+        std::fs::create_dir_all(&place).expect("dir");
+        std::fs::create_dir_all(&elsewhere).expect("dir");
+        std::fs::write(elsewhere.join("creds"), "x").expect("creds");
+        link(&elsewhere.join("creds"), &place.join("credentials"));
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            elsewhere.display(),
+            work.join("a/b").display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        let only = std::slice::from_ref(&place);
+        let refused = late_link_targets(only, Some(only), &[], std::slice::from_ref(&work))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a second mount of what this command is denied, two or more levels inside",
+                work.join("a/b/creds").display()
+            )),
+            "{refused}"
+        );
+    }
+
+    /// A Codex home, or a second mount of it, at a path holding a character
+    /// a pattern gives a meaning to refuses: the pattern that denies its
+    /// databases might not match it.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_whose_path_a_pattern_would_misread_refuses() {
+        let dir = Scratch::new("home-special");
+        let codex = dir.0.join("co[dex]");
+        std::fs::create_dir_all(&codex).expect("dir");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: Vec::new(),
+        };
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        let refused = denied_paths(&private, &codex, None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("holds `[`, which a pattern gives a meaning to"),
+            "{refused}"
+        );
+        drop(one);
+        // A second mount of a plain one, made since at such a path.
+        let plain = dir.0.join("codex");
+        std::fs::create_dir_all(&plain).expect("dir");
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again* rw - ext4 /dev/sda1 rw\n",
+            plain.display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        let refused = late_targets(&[], Some(&[]), std::slice::from_ref(&plain), &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("holds `*`, which a pattern gives a meaning to"),
+            "{refused}"
+        );
+    }
+
+    /// The cap counts the second mounts of what the list denies and those
+    /// of Codex's home, each part on its own, as the builder counts them.
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_counts_the_second_mounts_of_what_is_denied_and_of_codex_home() {
+        let dir = Scratch::new("cap-mounts");
+        let home = dir.0.join("home");
+        let place = home.join(".aws");
+        let codex = dir.0.join("codex");
+        for d in [&place, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let only = std::slice::from_ref(&place);
+        {
+            let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS + 1));
+            let refused = late_link_targets(only, Some(only), &[], &[])
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                refused.contains(
+                    "513 second mounts of what they deny (513 made since the list was built)"
+                ),
+                "{refused}"
+            );
+        }
+        let _table = crate::mounts::with_table(&binds_of(&codex, MAX_LINK_TARGETS + 1));
+        let refused = late_targets(&[], Some(&[]), std::slice::from_ref(&codex), &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("and 513 of Codex's home, more than the 512"),
+            "{refused}"
+        );
+    }
+
+    /// A mount table the helper cannot read as one refuses the command,
+    /// whatever else it finds: it cannot tell where what it denies is
+    /// mounted now.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_table_that_cannot_be_read_refuses_the_command() {
+        let dir = Scratch::new("table-unread");
+        let place = dir.0.join("home/.aws");
+        std::fs::create_dir_all(&place).expect("dir");
+        let _table = crate::mounts::with_table(b"not a mount table\n");
+        let only = std::slice::from_ref(&place);
+        assert!(
+            late_link_targets(only, Some(only), &[], &[])
+                .is_err_and(|e| e.downcast_ref::<DenyRefused>().is_some())
+        );
+    }
+
+    /// A second mount made since, two or more levels inside a directory the
+    /// command may write, refuses it: it could move it out from under its
+    /// denial.
+    #[cfg(unix)]
+    #[test]
+    fn a_mount_made_since_deep_inside_what_the_command_may_write_refuses() {
+        let dir = Scratch::new("mounted-deep");
+        let home = dir.0.join("home");
+        let place = home.join(".aws");
+        let work = dir.0.join("work");
+        std::fs::create_dir_all(&place).expect("dir");
+        std::fs::create_dir_all(work.join("a/b")).expect("dir");
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            home.display(),
+            work.join("a/b").display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        let only = std::slice::from_ref(&place);
+        let refused = late_link_targets(only, Some(only), &[], std::slice::from_ref(&work))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a second mount of what this command is denied, two or more levels inside",
+                work.join("a/b/.aws").display()
+            )),
+            "{refused}"
+        );
+    }
+
+    /// The builder counts second mounts as each command does: from each
+    /// side, so a list it starts a thread with never refuses its commands
+    /// for the cap alone.
+    #[cfg(unix)]
+    #[test]
+    fn the_builder_counts_second_mounts_as_each_command_does() {
+        let dir = Scratch::new("builder-cap");
+        let home = dir.0.join("home");
+        let place = home.join(".aws");
+        let codex = dir.0.join("codex");
+        for d in [&place, &codex] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        // As many binds as the cap: the place's 512 second mounts and the
+        // place itself as theirs make 513 as a command counts them.
+        let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS));
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let refused = denied_paths(&private, &codex, None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("counted from each side"), "{refused}");
     }
 
     /// The helper, given a profile for a place named through a linked
@@ -5109,6 +6517,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_helper_relists_a_turns_profile() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
         let dir = scratch("relisted");
         let place = dir.join("home/.aws");
         let work = dir.join("work");
@@ -5436,6 +6845,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
         let dir = scratch("linked-secrets");
         let home = dir.join("home");
@@ -5610,11 +7050,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 
@@ -6308,6 +7759,102 @@ mod tests {
             "the profile grew with the projects"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// atomic's own link to itself is made in directories of this user's
+    /// that no one else may write, reached never through a link: a link
+    /// planted where one of them goes, or one someone else may write, leaves
+    /// none, and Codex's own helper is used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helpers_link_is_made_only_in_this_users_own_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = scratch("own-helper");
+        let link = own_helper_link(&home).expect("made");
+        assert_eq!(
+            std::fs::read_link(&link).expect("a link"),
+            std::env::current_exe().expect("this test")
+        );
+        assert_eq!(
+            own_helper_link(&home),
+            Some(link.clone()),
+            "mended, not made twice"
+        );
+        // Directories of this user's that others may write, as a umask of
+        // 002 leaves them, are narrowed and used.
+        let tmp = home.join("tmp");
+        let helpers = tmp.join(HELPER_DIR);
+        for dir in [&home, &tmp, &helpers] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        }
+        assert_eq!(own_helper_link(&home), Some(link.clone()), "a umask of 002");
+        for dir in [&home, &tmp, &helpers] {
+            let mode = std::fs::metadata(dir).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o022, 0, "{} is writable by others", dir.display());
+        }
+        std::fs::remove_dir_all(&helpers).expect("removed");
+        let elsewhere = scratch("own-helper-elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &helpers).expect("link");
+        assert_eq!(
+            own_helper_link(&home),
+            None,
+            "a link where a directory goes"
+        );
+        assert!(
+            std::fs::read_dir(&elsewhere)
+                .expect("elsewhere")
+                .next()
+                .is_none(),
+            "something was made where the link leads"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A directory others may write is not private, whoever owns it, so one
+    /// atomic cannot narrow is never used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_others_may_write_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("not-private");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        let held: std::os::fd::OwnedFd = std::fs::File::open(&dir).expect("open").into();
+        assert!(!private_dir(&held), "group write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o757)).expect("mode");
+        assert!(!private_dir(&held), "other write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(private_dir(&held));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The helper's directory is left readable only when it is a real
+    /// directory: a link planted under its name is denied as what it points
+    /// at, as every other entry of the Codex home's `tmp/` is.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_as_the_helpers_directory_is_denied() {
+        let dir = std::fs::canonicalize(scratch("helper-dir-link")).expect("real");
+        let codex = dir.join("codex");
+        std::fs::create_dir_all(codex.join("tmp")).expect("codex home");
+        let theirs = dir.join("theirs");
+        std::fs::create_dir_all(&theirs).expect("theirs");
+        std::os::unix::fs::symlink(&theirs, codex.join("tmp").join(HELPER_DIR)).expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: Vec::new(),
+        };
+        let (denied, _) = denied_paths(&private, &codex, None, &[]).expect("denied");
+        assert!(denied.contains(&theirs), "{denied:?}");
+        std::fs::remove_file(codex.join("tmp").join(HELPER_DIR)).expect("unlinked");
+        std::fs::create_dir_all(codex.join("tmp").join(HELPER_DIR)).expect("real");
+        let (denied, _) = denied_paths(&private, &codex, None, &[]).expect("denied");
+        assert!(
+            !denied.iter().any(|d| d.ends_with(HELPER_DIR)),
+            "the real directory was denied: {denied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
