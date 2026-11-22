@@ -1105,6 +1105,9 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
             .or_insert_with(|| scratch.join(".cargo").display().to_string());
     }
     turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
+    // The backend's scratch directories are no turn's to read; a
+    // `workspace-write` turn's own stays its own, as a writable root.
+    spec.denied = workspace.denied.clone();
     // A cache in the temporary directory every turn of the backend shares
     // would outlive the run and reach the next one.
     if let Some(tmp) = &workspace.tmp {
@@ -2294,6 +2297,9 @@ async fn run_command(
         // Inside it, the inputs it is given, which it only reads.
         read_only: reach.read_only,
         network: reach.network,
+        // Every other attempt's scratch directory, a turn's or another exec
+        // step's: its own stays writable inside them.
+        denied: workspace.denied.clone(),
         secret_env: Default::default(),
     };
     // The command holds its workspace open until it ends, even when the run

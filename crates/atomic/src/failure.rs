@@ -25,6 +25,10 @@ pub struct Failure {
     pub description: String,
     /// What to change or do to fix it.
     pub action: String,
+    /// The description and the action as they were put together, names
+    /// apart from text, for a failure made with [`Failure::named`].
+    #[serde(skip)]
+    said: Option<Box<[Said; 2]>>,
 }
 
 impl Failure {
@@ -34,7 +38,83 @@ impl Failure {
             kind: kind.to_owned(),
             description: description.into(),
             action: action.into(),
+            said: None,
         }
+    }
+
+    /// A failure of `kind` whose description and action name something a
+    /// person or a workflow chose, such as a run's id: reported, the names
+    /// are written as they are, and only the text around them is redacted.
+    pub fn named(kind: &str, description: Said, action: Said) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            description: description.joined(),
+            action: action.joined(),
+            said: Some(Box::new([description, action])),
+        }
+    }
+}
+
+/// A failure's description or action put together from names, written as
+/// they are, and text, redacted when it is reported. Text next to text is
+/// redacted together, so a secret's name and its value in it stay read as
+/// one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Said(Vec<Part>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Part {
+    Text(String),
+    Name(String),
+}
+
+impl Said {
+    /// Nothing yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// atomic's words, or what an error or a model said: redacted.
+    pub fn text(mut self, text: impl Into<String>) -> Self {
+        self.0.push(Part::Text(text.into()));
+        self
+    }
+
+    /// A name a person or a workflow chose, such as a run's id: written as
+    /// it is.
+    pub fn name(mut self, name: &str) -> Self {
+        self.0.push(Part::Name(name.to_owned()));
+        self
+    }
+
+    /// The whole of it, as text.
+    fn joined(&self) -> String {
+        self.0
+            .iter()
+            .map(|p| match p {
+                Part::Text(t) | Part::Name(t) => t.as_str(),
+            })
+            .collect()
+    }
+
+    /// The whole of it as it is reported: each stretch of text between names
+    /// redacted on its own, and the names as they are.
+    fn redacted(&self) -> String {
+        let mut out = String::new();
+        let mut text = String::new();
+        for part in &self.0 {
+            match part {
+                Part::Text(t) => text.push_str(t),
+                Part::Name(name) => {
+                    out.push_str(&atomic_core::redact::text(&text));
+                    text.clear();
+                    out.push_str(name);
+                }
+            }
+        }
+        let rest = atomic_core::redact::text(&text);
+        out.push_str(&rest);
+        out
     }
 }
 
@@ -228,9 +308,10 @@ pub fn report(failure: &Failure, json: bool) {
     // escape sequence around a token as it is and not as it is shown. An
     // error keeps its own line breaks.
     if json {
-        let mut doc = serde_json::json!({ "error": failure });
-        atomic_core::redact::value(&mut doc);
-        println!("{}", crate::shown::compact(&doc).unwrap_or_default());
+        println!(
+            "{}",
+            crate::shown::compact(&document(failure)).unwrap_or_default()
+        );
     } else {
         use atomic_core::redact::Line;
         let [description, action] = shown(failure);
@@ -239,9 +320,34 @@ pub fn report(failure: &Failure, json: bool) {
     }
 }
 
+/// `failure` as `--json` reports it: `{"error": {kind, description,
+/// action}}`, redacted.
+fn document(failure: &Failure) -> serde_json::Value {
+    match &failure.said {
+        // Redacted part by part already: redacting the whole again would take
+        // a name for a secret.
+        Some(said) => serde_json::json!({ "error": {
+            "kind": failure.kind,
+            "description": said[0].redacted(),
+            "action": said[1].redacted(),
+        }}),
+        None => {
+            let mut doc = serde_json::json!({ "error": failure });
+            atomic_core::redact::value(&mut doc);
+            doc
+        }
+    }
+}
+
 /// `failure`'s description and action for a person: each redacted, then
 /// escaped for the terminal on as many lines as it has.
 fn shown(failure: &Failure) -> [String; 2] {
+    if let Some(said) = &failure.said {
+        return [
+            crate::shown::block(&said[0].redacted()),
+            crate::shown::block(&said[1].redacted()),
+        ];
+    }
     let safe = |text: &str| crate::shown::block(&atomic_core::redact::text(text));
     [safe(&failure.description), safe(&failure.action)]
 }
@@ -249,6 +355,44 @@ fn shown(failure: &Failure) -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure that names a run reports the run's id as it is, in text and
+    /// in JSON, while the text around it is still redacted, before the name
+    /// and after it. Redacted whole, `rotate-secret:2026-11` reads as a
+    /// secret's name and value, and the id is lost.
+    #[test]
+    fn a_named_failure_keeps_its_names_and_redacts_its_text() {
+        let token = concat!("ghp_", "SAMPLE0123456789", "abcdefghijklmnopqrstuv");
+        let id = "rotate-secret:2026-11";
+        let failure = Failure::named(
+            "run.failed",
+            Said::new()
+                .text(format!("the push said {token}; run "))
+                .name(id)
+                .text(format!(" failed: {token}")),
+            Said::new()
+                .text("continue it with `atomic runs resume ")
+                .name(id)
+                .text("`"),
+        );
+        let [description, action] = shown(&failure);
+        assert_eq!(
+            description,
+            format!("the push said [REDACTED]; run {id} failed: [REDACTED]")
+        );
+        assert_eq!(
+            action,
+            format!("continue it with `atomic runs resume {id}`")
+        );
+        let doc = document(&failure);
+        assert_eq!(doc["error"]["kind"], "run.failed");
+        assert_eq!(doc["error"]["description"], description.as_str());
+        assert_eq!(doc["error"]["action"], action.as_str());
+        // What the same text, put together with no names, still loses.
+        let whole = Failure::new("run.failed", failure.description.clone(), "x");
+        assert!(!shown(&whole)[0].contains(id), "{}", shown(&whole)[0]);
+        assert!(!document(&whole).to_string().contains(id));
+    }
 
     #[test]
     fn a_coloured_token_in_an_error_is_redacted_before_it_is_escaped() {

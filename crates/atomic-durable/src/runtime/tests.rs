@@ -914,3 +914,145 @@ async fn a_newer_postgres_store_is_refused_untouched() {
     );
     pool.close().await;
 }
+
+/// A run waiting on a resume queue of an executor identity two projects
+/// share is taken only by its own project's engine: another project's
+/// takes no queue of it, and so never runs it.
+async fn a_project_takes_only_its_own_resumed_runs(database: Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, Some("shared-executor"), DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    mine.register("quick", |_ctx: DurareContext, (): ()| async move { Ok(()) });
+    mine.launch().await.expect("launch");
+    let run = unique("resumed");
+    mine.start("quick", &run, ()).await.expect("start");
+    mine.result::<()>(&run).await.expect("finished");
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    // As resuming leaves it: waiting on its own queue of the executor.
+    let queue = mine.resume_queue(&run);
+    let (id, q) = (run.clone(), queue.clone());
+    mine.control_transaction(move |mut tx| {
+        let (id, q) = (id.clone(), q.clone());
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE workflow_status SET status = 'ENQUEUED', queue_name = ? \
+                 WHERE workflow_uuid = ?",
+                &[Param::Text(q), Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("on its queue");
+    let mut theirs = open("project-b").await;
+    theirs.take_resumed_runs(None).await.expect("take");
+    assert!(
+        !theirs.resume_queues.contains(&queue),
+        "project B took project A's resumed run"
+    );
+    let mut again = open("project-a").await;
+    again.take_resumed_runs(None).await.expect("take");
+    assert!(again.resume_queues.contains(&queue), "project A did not");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    again
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_takes_only_its_own_resumed_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_resumed_own")));
+    a_project_takes_only_its_own_resumed_runs(Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_takes_only_its_own_resumed_runs_on_postgres() {
+    let schema = crate::testing::schema("resumed_own").await;
+    a_project_takes_only_its_own_resumed_runs(Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// The stranded runs `atomic serve` names, those of its executor identity
+/// that an atomic of another step layout started, are its project's only:
+/// another project's under a shared identity is not named.
+async fn only_a_projects_own_runs_are_stranded(database: Database) {
+    let open = |project: &'static str, version: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, Some("shared-executor"), version, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut older = open("project-a", "older-layout").await;
+    older.register("quick", |_ctx: DurareContext, (): ()| async move { Ok(()) });
+    older.launch().await.expect("launch");
+    let run = unique("stranded");
+    older.start("quick", &run, ()).await.expect("start");
+    older.result::<()>(&run).await.expect("finished");
+    older
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    // As a crash leaves it: unfinished.
+    let id = run.clone();
+    older
+        .control_transaction(move |mut tx| {
+            let id = id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?",
+                    &[Param::Text(id)],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .expect("unfinished");
+    let ids = |runs: Vec<RunRecord>| runs.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    let theirs = open("project-b", DEFAULT_VERSION).await;
+    assert!(
+        !ids(theirs.stranded().await.expect("stranded")).contains(&run),
+        "project B names project A's run"
+    );
+    let mine = open("project-a", DEFAULT_VERSION).await;
+    assert!(ids(mine.stranded().await.expect("stranded")).contains(&run));
+    for rt in [theirs, mine] {
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_projects_own_runs_are_stranded_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_stranded_own")));
+    only_a_projects_own_runs_are_stranded(Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_projects_own_runs_are_stranded_on_postgres() {
+    let schema = crate::testing::schema("stranded_own").await;
+    only_a_projects_own_runs_are_stranded(Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}

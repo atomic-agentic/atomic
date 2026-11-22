@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+use git_repo::{git_in, git_state};
+
+mod git_repo;
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
 
@@ -685,26 +688,43 @@ fn atomic_as(
     }
 }
 
-/// `atomic` in the background, its stderr in `log`.
-fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path) -> Child {
-    spawn_as(Path::new(ATOMIC), dir, cwd, args, env, log)
-}
-
-/// [`spawn`], from the executable at `program`.
-fn spawn_as(
+/// `program` in the background from `cwd`, with a throwaway home and state:
+/// its stderr in `log` and, when `out` is given, its stdout in `out`, each
+/// created fresh; stdin and, without `out`, its stdout are null.
+fn spawn_streams(
     program: &Path,
     dir: &Path,
     cwd: &Path,
     args: &[&str],
     env: &[(&str, &str)],
     log: &Path,
+    out: Option<&Path>,
 ) -> Child {
-    command_as(program, dir, cwd, args, env)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(log).expect("log"))
-        .spawn()
-        .expect("start atomic")
+    let mut cmd = command_as(program, dir, cwd, args, env);
+    cmd.stdin(Stdio::null())
+        .stdout(match out {
+            Some(out) => Stdio::from(std::fs::File::create(out).expect("stdout")),
+            None => Stdio::null(),
+        })
+        .stderr(std::fs::File::create(log).expect("stderr"));
+    cmd.spawn().expect("start the command")
+}
+
+/// `atomic` in the background, its stderr in `log`.
+fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path) -> Child {
+    spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, None)
+}
+
+/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
+fn spawn_logged(
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    log: &Path,
+    out: &Path,
+) -> Child {
+    spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, Some(out))
 }
 
 fn text(out: &Output) -> String {
@@ -754,9 +774,60 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
 /// opened as atomic opens it, for that project, by its manifest's name and
 /// its state id: what it lists of parks is the project's.
 async fn project_store(state: &Path) -> Durare {
+    project_store_at(&database(state)).await
+}
+
+/// [`project_store`] for a project whose manifest names it `name`.
+async fn named_project_store(state: &Path, name: &str) -> Durare {
     let id = state.file_name().expect("a project id").to_string_lossy();
     Durare::open(
         &atomic_durable::Database::Sqlite(database(state)),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("{name}/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
+/// [`project_store`] by the database's path, `<home>/private/<id>/atomic.db`.
+async fn project_store_at(db: &Path) -> Durare {
+    let id = db
+        .parent()
+        .and_then(Path::file_name)
+        .expect("a project id")
+        .to_string_lossy()
+        .into_owned();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(db.to_owned()),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("notes/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
+/// The `notes` project's store on PostgreSQL at `url` and `schema`, as
+/// atomic opens it with `env`, whose `ATOMIC_HOME` gives the project's
+/// state id: what it lists of gates, runs and parks is that project's.
+#[cfg(feature = "postgres-tests")]
+async fn postgres_project_store(
+    dir: &Path,
+    project: &Path,
+    env: &[(&str, &str)],
+    url: &str,
+    schema: &str,
+) -> Durare {
+    let out = atomic(dir, project, &["debug", "state-dir"], env, "");
+    assert!(out.status.success(), "{}", text(&out));
+    let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let id = state.file_name().expect("a project id").to_string_lossy();
+    Durare::open(
+        &atomic_durable::Database::Postgres {
+            url: url.to_owned(),
+            schema: schema.to_owned(),
+        },
         None,
         atomic_app::pipeline::LAYOUT_VERSION,
         &format!("notes/{id}"),
@@ -812,6 +883,12 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
+/// Run `run`'s first open gate, waiting for it while reading the run's
+/// status: a run that ends on the way says so at once, with the status it
+/// ended on, rather than the wait running out for a gate that could never
+/// open. A run still being admitted has no row yet — its admission line is
+/// printed before the row is written — and is waited for like any run that
+/// has not finished.
 async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
     let started = Instant::now();
     loop {
@@ -827,34 +904,6 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
         if let Some(g) = open.into_iter().next() {
             return g;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "{run} never opened a gate"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-/// [`open_gate`] while reading the run's status: a run that ends on the way
-/// says so at once, with the status it ended on, rather than the wait running
-/// out for a gate that could never open.
-async fn await_gate(rt: &Durare, run: &str) -> gate::Gate {
-    let started = Instant::now();
-    loop {
-        let open = gate::gates(
-            rt,
-            GateFilter {
-                open_only: true,
-                run: Some(run.to_owned()),
-            },
-        )
-        .await
-        .expect("gates");
-        if let Some(g) = open.into_iter().next() {
-            return g;
-        }
-        // No row yet is a run still being admitted: its admission line is
-        // printed before the row is written.
         let status = rt.status(run).await.expect("status");
         assert!(
             matches!(status, None | Some(RunStatus::Pending)),
@@ -907,12 +956,54 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
         }
         if started.elapsed() >= Duration::from_secs(120) {
             // Not left running after the test.
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_and_reap(child);
             panic!("{what} did not exit");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Kill `child` and reap it, ignoring that it may have ended already: what a
+/// test that will not wait for a process any more owes it.
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// A process a test must not leave running: killed and reaped when this is
+/// dropped, which is what an assertion that fails between spawning a run and
+/// waiting for it does. A test that waits for its process on purpose carries
+/// this along with it: the wait reaps the process first, so the drop that
+/// follows finds nothing left to kill.
+struct Reaped(Child);
+
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        kill_and_reap(&mut self.0);
+    }
+}
+
+/// Whether the process `pid` is there: a signal of none asks only whether it
+/// could be signalled. A process that was waited for is not there; one that
+/// was killed but never waited for is a zombie, which is.
+#[allow(unsafe_code)]
+fn still_running(pid: u32) -> bool {
+    // SAFETY: signal 0 sends nothing; this only asks whether `pid` exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
 // needs_sandbox
@@ -1048,10 +1139,123 @@ fn address_of(model: &FakeModel) -> String {
         .to_owned()
 }
 
+/// A Codex atom whose key would go to a proxy in cleartext, to an endpoint
+/// on this machine over plain http, is refused before its turn, saying how
+/// to fix it; with the host in NO_PROXY it runs.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_codex_atoms_key_is_never_sent_to_a_proxy_in_cleartext() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done": true}"#.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("proxied-key");
+        let project = project(&dir);
+        write_atom(
+            &project,
+            "look-note",
+            "description: 'Look at the note.', kind: 'codex', sandbox: 'read-only'",
+            "Look at this note: {input.text}",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"done": {"type": "boolean"}})),
+        );
+        let url = model.base_url();
+        let run = |extra: Vec<(&'static str, &'static str)>| {
+            let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut env = vec![
+                    ("ATOMIC_MODEL_BASE_URL", u.as_str()),
+                    ("ATOMIC_MODEL", "synthetic"),
+                    ("ATOMIC_MODEL_API_KEY_ENV", "LOOK_KEY"),
+                    ("LOOK_KEY", "sk-look-secret"),
+                    ("HTTP_PROXY", "http://127.0.0.1:9"),
+                    ("NO_PROXY", ""),
+                    ("no_proxy", ""),
+                ];
+                env.extend(extra);
+                atomic(
+                    &d,
+                    &p,
+                    &["--json", "run", "look-note", "--data", r#"{"text": "hi"}"#],
+                    &env,
+                    "",
+                )
+            })
+        };
+        let out = run(Vec::new()).await.expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("set NO_PROXY to include 127.0.0.1, or use an https endpoint"),
+            "{}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("sk-look-secret"), "{}", text(&out));
+        assert_eq!(model.calls(), 0, "nothing was sent");
+
+        let out = run(vec![("NO_PROXY", "127.0.0.1")]).await.expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(stdout_json(&out)["output"], json!({"done": true}));
+        assert_eq!(model.calls(), 1, "sent straight to the endpoint");
+    });
+}
+
 /// The person's own configuration, at `~/.config/atomic/config.yaml`, caps a
 /// run made with `atomic run`: the project's larger cap, and its `null` for
 /// their dollar cap, leave their caps the ones the run's plan records, with
 /// their ceilings beside them.
+/// `--run-id` outside its characters or its length is refused before
+/// anything is read or recorded, with the rule and without the id: what was
+/// pasted by mistake, such as a token, is not repeated.
+#[test]
+fn a_run_id_outside_its_characters_or_length_is_refused() {
+    let dir = scratch("run-id-refused");
+    let project = project(&dir);
+    let pasted = concat!("Bearer ghp_", "SAMPLE0123456789abcdefghijklmnopqrstuv");
+    let long = "a".repeat(129);
+    // `--run-id=<id>`, so an id that starts with `-` reaches atomic.
+    for id in [pasted, long.as_str(), "-x", "a\u{1b}[2Jb", "caf\u{e9}"] {
+        let given = format!("--run-id={id}");
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "count-note", &given, "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(!out.status.success(), "{id:?}: {}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.id_invalid", "{id:?}: {error}");
+        assert_eq!(
+            error["description"].as_str(),
+            Some(
+                "the run id given with --run-id is refused: a run id is 1 to 128 characters, \
+                 each an ASCII letter, a digit, `.`, `_`, `:` or `-`, and starts with a letter \
+                 or a digit"
+            ),
+            "{id:?}: {error}"
+        );
+    }
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--run-id", pasted, "--data", NOTE],
+        &[],
+        "",
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("error: the run id given with --run-id is refused"),
+        "{}",
+        text(&out)
+    );
+    assert!(!said.contains("SAMPLE0123456789"), "{said}");
+    assert!(stores(&dir).is_empty(), "a store was made");
+    assert_eq!(count_log(&dir), 0, "nothing ran");
+}
+
 #[test]
 fn your_own_configuration_caps_what_atomic_run_records() {
     on_codex_runtime(async {
@@ -2043,7 +2247,7 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
         assert!(!status.success(), "stopped short of its result");
         // Its call is settled as interrupted: the tokens stay at the bound,
         // the time is what it ran, not the 10 minutes it reserved.
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
         // The exec step before rank finished, and its command is settled.
         let (work, calls): (Vec<_>, Vec<_>) = attempts.iter().partition(|a| a.model == "(command)");
@@ -2193,7 +2397,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "gated-1").await;
         assert!(opened.deadline.is_some());
         first.kill().expect("SIGKILL the run");
@@ -2282,7 +2486,7 @@ fn decider_child() {
     let store = std::env::var(DECIDER_STORE).expect("store");
     let run = std::env::var(DECIDER_RUN).expect("run");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(Path::new(&store)).await.expect("store");
+        let rt = project_store_at(Path::new(&store)).await;
         let g = open_gate(&rt, &run).await;
         approve(&rt, &g).await;
     });
@@ -2305,7 +2509,7 @@ async fn decided_while_down(
         &with(env, &[]),
         &dir.join(format!("{id}.log")),
     );
-    let rt = Durare::sqlite(&database(state)).await.expect("store");
+    let rt = project_store(state).await;
     open_gate(&rt, id).await;
     run.kill().expect("SIGKILL the run");
     run.wait().expect("reap");
@@ -2315,7 +2519,7 @@ async fn decided_while_down(
 /// Approve run `id`'s gate from a decider that stops after recording its
 /// decision and before waking the run.
 async fn decide_without_waking(state: &Path, id: &str) {
-    let rt = Durare::sqlite(&database(state)).await.expect("store");
+    let rt = project_store(state).await;
     let decider = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "decider_child", "--ignored", "--nocapture"])
         .env(DECIDER_STORE, database(state))
@@ -2403,19 +2607,21 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &dir.join("decided-3.log"),
         );
         {
-            let rt = Durare::sqlite(&database(&state)).await.expect("store");
+            let rt = project_store(&state).await;
             open_gate(&rt, "decided-3").await;
         }
         third.kill().expect("SIGKILL the run");
         third.wait().expect("reap");
-        let mut serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        ));
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -2698,7 +2904,7 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "served-gate").await;
         assert!(opened.deadline.is_some(), "the gate has a deadline");
         first.kill().expect("SIGKILL the run");
@@ -2770,7 +2976,11 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             };
             // A run that has failed is finished, and not successfully: say
             // so now, with what it failed as, instead of waiting out the
-            // deadline below.
+            // deadline below. This is how the `gate-open-once` control
+            // (scripts/controls/gate-open-once.row) shows: it names the gate
+            // step's checkpoint after the process that wrote it, so a run
+            // recovered by another process re-opens its gate, and the gate
+            // store refuses a second row for the step's own id.
             if let Some(RunStatus::Failed(why)) = &status {
                 panic!(
                     "serve failed the approved run ({status:?}): {why}\nserve log: {}",
@@ -2804,6 +3014,116 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             .await
             .expect("child");
         assert!(status.success());
+    });
+}
+
+/// A manifest that is there but will not load names no project: every
+/// command that reads the project's runs and gates refuses, saying so,
+/// rather than read them under another key and find none. Mended, the
+/// manifest finds them all again, the gate still open: nothing was stranded.
+/// atomic refuses the manifest as it finds the project, before any command
+/// runs, and the store's key refuses it again (the engine's
+/// `the_store_key_falls_back_only_when_no_manifest_is_there`), so no one
+/// controls row switches this test's refusals off.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_broken_manifest_refuses_the_gate_and_run_commands_and_strands_nothing() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("broken-manifest");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut first = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "kept-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("first.log"),
+        );
+        let rt = project_store(&state).await;
+        let opened = open_gate(&rt, "kept-1").await;
+        first.kill().expect("SIGKILL the run");
+        first.wait().expect("reap");
+
+        let manifest = project.join("atomic.yaml");
+        let good = std::fs::read_to_string(&manifest).expect("manifest");
+        std::fs::write(&manifest, "atomic: 1\nname: [notes\n").expect("broken");
+        let commands: Vec<Vec<String>> = [
+            vec!["gates", "list"],
+            vec!["gates", "list", "--all", "--json"],
+            vec!["gates", "approve", opened.id.as_str()],
+            vec!["gates", "reject", opened.id.as_str()],
+            vec!["runs", "show", "kept-1"],
+            vec!["runs", "resume", "kept-1"],
+            vec!["run", "gated", "--run-id", "kept-2", "--data", NOTE],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(str::to_owned).collect())
+        .collect();
+        for args in &commands {
+            let (d, p, e, a) = (dir.clone(), project.clone(), env.clone(), args.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                atomic(
+                    &d,
+                    &p,
+                    &a,
+                    &with(&e, &[("ATOMIC_CREDENTIAL_STORE", "file")]),
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            let said = text(&out);
+            assert!(!out.status.success(), "{args:?} ran: {said}");
+            assert!(
+                (said.contains("manifest") || said.contains("atomic.yaml"))
+                    && !said.contains("no gate"),
+                "{args:?} did not name the manifest: {said}"
+            );
+        }
+        // Nothing was decided, run or recorded under another key.
+        assert_eq!(model.calls(), 1, "rank once, before the kill");
+        let still = gate::find(&rt, &opened.id)
+            .await
+            .expect("gate")
+            .expect("exists");
+        assert!(still.resolution.is_none(), "{:?}", still.resolution);
+        assert!(
+            rt.run_record("kept-2").await.expect("record").is_none(),
+            "a run started under the broken manifest"
+        );
+
+        std::fs::write(&manifest, good).expect("mended");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let listed = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["gates", "list", "--json"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(listed.status.success(), "{}", text(&listed));
+        let listed = stdout_json(&listed);
+        assert_eq!(listed[0]["id"], json!(opened.id), "{listed}");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let shown = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "runs", "show", "kept-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(shown.status.success(), "{}", text(&shown));
+        assert_eq!(stdout_json(&shown)["status"], json!("unfinished"));
     });
 }
 
@@ -2860,14 +3180,16 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
 
-        let serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        ));
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -2899,7 +3221,6 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(stdout_json(&out)["error"]["kind"], "runtime.busy");
 
         terminate(&serve);
-        let mut serve = serve;
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
             .expect("child");
@@ -3013,13 +3334,14 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         // Killed after its last step first, so built-2 still has its caches
         // and count's tally there: the other build's server ran nothing
         // the killed run had.
-        let mut killed = spawn_as(
+        let mut killed = spawn_streams(
             &other,
             &dir,
             &project,
             &["serve"],
             &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
             &dir.join("serve-killed.log"),
+            None,
         );
         let status = tokio::task::spawn_blocking(move || wait_child(&mut killed, "serve"))
             .await
@@ -3031,15 +3353,16 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         );
         assert_eq!(model.calls(), 4, "each run's rank and summarize once");
         ran_once_live(&dir, 1);
-        let mut serve = spawn_as(
+        let mut serve = spawn_streams(
             &other,
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
+            None,
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("built-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -3195,7 +3518,7 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         assert_eq!(
             rt.status("left-1").await.expect("status"),
             Some(RunStatus::Pending)
@@ -3415,9 +3738,26 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
 
 /// When Codex cannot make its links to atomic under its helpers' names, as
 /// when another atomic process sweeping the same Codex home takes their
-/// directory away, it runs atomic itself as its Linux sandbox helper: an
-/// exec atom's confined command still runs, rather than its run waiting for
-/// a sandbox that never starts.
+/// directory away, and atomic cannot make its own link either, Codex runs
+/// atomic itself as its Linux sandbox helper: an exec atom's confined
+/// command still runs, rather than its run waiting for a sandbox that never
+/// starts.
+/// Where Codex makes its links to atomic in `state`, and, with `own`, where
+/// atomic makes its own, made unusable: a file where each directory goes.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn unlink_helpers(state: &Path, own: bool) {
+    let mut places = vec!["codex/tmp/arg0-linux"];
+    if own {
+        places.push("codex/tmp/atomic-helper");
+    }
+    for place in places {
+        let at = state.join(place);
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(at.parent().expect("parent")).expect("dir");
+        std::fs::write(&at, "not a directory").expect("file");
+    }
+}
+
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
@@ -3427,12 +3767,7 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
     let dir = scratch("no-helper-links");
     let project = project(&dir);
     let state = state_dir(&dir, &project);
-    // Where Codex makes its links, made unusable: a file where their
-    // directory goes.
-    let links = state.join("codex/tmp/arg0-linux");
-    let _ = std::fs::remove_dir_all(&links);
-    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
-    std::fs::write(&links, "not a directory").expect("file");
+    unlink_helpers(&state, true);
     let out = atomic(
         &dir,
         &project,
@@ -3451,24 +3786,46 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
 }
 
 /// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
-/// the helper's inner stage by the name it was started under, a program a
-/// command put on `PATH` under the helper's name is never run in its place:
-/// the name is a path that cannot exist, so the run fails at once instead,
-/// saying the helper could not be set up.
+/// the helper's inner stage by the name it was started under, an exec atom's
+/// command still runs: Codex runs atomic's own link to itself as the
+/// helper, by its absolute path, and a program a command put on `PATH`
+/// under the helper's name is never run in the inner stage's place.
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
 #[test]
-fn a_helper_run_by_name_is_never_found_along_path() {
+fn an_exec_atom_runs_under_an_old_bubblewrap_through_atomics_own_link() {
+    old_bubblewrap_run(false);
+}
+
+/// With no link at all, Codex's or atomic's own, the same bubblewrap would
+/// run the inner stage by the helper's bare name, looking it up along
+/// `PATH`: atomic runs again under a name that is a path that cannot exist
+/// instead, so the run fails at once, saying the helper could not be set
+/// up, and a program a command put on `PATH` under that name never runs.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn with_no_helper_link_at_all_an_old_bubblewrap_fails_closed() {
+    old_bubblewrap_run(true);
+}
+
+/// `count-only` through `atomic run` with Codex's links unmade, and with
+/// `no_own_link` atomic's own too, under a bubblewrap without `--argv0`,
+/// with a program planted on `PATH` under the helper's name.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn old_bubblewrap_run(no_own_link: bool) {
     use std::os::unix::fs::PermissionsExt;
     support::require_sandbox();
-    let dir = scratch("helper-by-name");
+    let dir = scratch(if no_own_link {
+        "no-link-at-all"
+    } else {
+        "own-link"
+    });
     let project = project(&dir);
     let state = state_dir(&dir, &project);
-    let links = state.join("codex/tmp/arg0-linux");
-    let _ = std::fs::remove_dir_all(&links);
-    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
-    std::fs::write(&links, "not a directory").expect("file");
+    unlink_helpers(&state, no_own_link);
     let script = |path: &Path, text: &str| {
         std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
         std::fs::write(path, text).expect("script");
@@ -3476,15 +3833,20 @@ fn a_helper_run_by_name_is_never_found_along_path() {
     };
     // A bubblewrap from before `--argv0`: it runs what follows `--` as it
     // is named, looking a bare name up along PATH.
+    let bwrap_ran = dir.join("bwrap-ran");
     script(
         &dir.join("bwrap/bwrap"),
-        "#!/bin/sh\n\
-         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
-         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
-         shift\n\
-         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
-         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
-         exit 1\n",
+        &format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+             touch '{}'\n\
+             while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+             shift\n\
+             if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+             echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+             exit 1\n",
+            bwrap_ran.display()
+        ),
     );
     let ran = dir.join("planted-ran");
     script(
@@ -3505,6 +3867,16 @@ fn a_helper_run_by_name_is_never_found_along_path() {
         "",
     );
     assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(
+        bwrap_ran.exists(),
+        "the old bubblewrap never ran: {}",
+        text(&out)
+    );
+    if !no_own_link {
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(count_log(&dir), 1, "the command ran once");
+        return;
+    }
     assert!(!out.status.success(), "{}", text(&out));
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -4319,7 +4691,7 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
             &with_path,
             &dir.join("gated.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "gated-1").await;
         gated.kill().expect("SIGKILL the run");
         gated.wait().expect("reap");
@@ -5331,7 +5703,7 @@ fn serve_restarts_do_not_park_a_healthy_run() {
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "waiting-1").await;
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
@@ -5510,7 +5882,7 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
             &UNUSED_MODEL,
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         for id in &ids {
             while rt.status(id).await.expect("status") != Some(RunStatus::Succeeded) {
@@ -5686,48 +6058,12 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     }
 }
 
-/// git in `dir`, as a person runs it, with an identity of its own.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=dev",
-            "-c",
-            "user.email=dev@example.com",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .expect("git");
-    assert!(out.status.success(), "git {args:?}: {}", text(&out));
-    String::from_utf8_lossy(&out.stdout).trim().to_owned()
-}
-
 /// A commit of `file` with `text` in the repository at `dir`, returning it.
 fn commit_file(dir: &Path, file: &str, text: &str) -> String {
     std::fs::write(dir.join(file), text).expect("file");
     git_in(dir, &["add", file]);
     git_in(dir, &["commit", "-q", "-m", text]);
     git_in(dir, &["rev-parse", "HEAD"])
-}
-
-/// Everything git records about a repository's refs and worktrees.
-fn git_state(dir: &Path) -> String {
-    format!(
-        "{}\n{}",
-        git_in(dir, &["for-each-ref"]),
-        git_in(dir, &["worktree", "list", "--porcelain"])
-    )
-}
-
-/// What `git status` sees in the repository at `dir`: every change and every
-/// untracked file, which [`git_state`]'s refs and worktree list do not cover.
-fn git_status(dir: &Path) -> String {
-    git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
 }
 
 /// The coding example in the catalog, as written.
@@ -5761,18 +6097,38 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+/// A directory under the system's temporary directory, removed when this is
+/// dropped: a test that fails part-way leaves nothing behind there, which is
+/// where a directory the target directory cannot hold has to go.
+struct Scratch(PathBuf);
+
+impl std::ops::Deref for Scratch {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A directory of the test's own outside every git repository, under the
 /// system's temporary directory: the target directory sits inside the
 /// checkout atomic is built from. Checked, so the test fails rather than run
-/// inside a repository if that ever changes.
-fn outside_repository(tag: &str) -> PathBuf {
+/// inside a repository if that ever changes. What it returns is removed when
+/// the test ends, however it ends.
+fn outside_repository(tag: &str) -> Scratch {
     let dir = std::env::temp_dir().join(format!("atomic-run-cli-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("directory");
-    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    let outside = Scratch(std::fs::canonicalize(&dir).expect("canonical"));
     let inside = Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&dir)
+        .current_dir(&*outside)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
@@ -5780,27 +6136,10 @@ fn outside_repository(tag: &str) -> PathBuf {
     assert!(
         !inside.status.success(),
         "{} is inside a git work tree: {}",
-        dir.display(),
+        outside.display(),
         text(&inside)
     );
-    dir
-}
-
-/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
-fn spawn_logged(
-    dir: &Path,
-    cwd: &Path,
-    args: &[&str],
-    env: &[(&str, &str)],
-    log: &Path,
-    out: &Path,
-) -> Child {
-    command_as(Path::new(ATOMIC), dir, cwd, args, env)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(out).expect("stdout"))
-        .stderr(std::fs::File::create(log).expect("stderr"))
-        .spawn()
-        .expect("start atomic")
+    outside
 }
 
 /// A workflow whose second step changes code in a worktree, after a gate.
@@ -5968,19 +6307,27 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
                 ],
             ),
         ];
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         for (tag, cwd, args) in &runs {
             let id = args[args.iter().position(|a| *a == "--run-id").expect("id") + 1];
-            let mut child = spawn(
+            // The run in the background, held so that nothing in this round
+            // can leave it running: the guard kills and reaps it when the
+            // round ends, which is what an assertion that fails before any
+            // wait for the run does.
+            let mut child = Reaped(spawn(
                 &dir,
                 cwd,
                 args,
                 &UNUSED_MODEL,
                 &dir.join(format!("{tag}.log")),
-            );
+            ));
+            let pid = child.id();
+            // Admitted, and stopped at its first gate, still waiting there.
             open_gate(&rt, id).await;
-            child.kill().expect("stop the run at its gate");
-            child.wait().expect("reap");
+            assert!(
+                child.try_wait().expect("wait").is_none(),
+                "{tag}: the run waits at its gate"
+            );
             let record = rt.run_record(id).await.expect("record").expect("run");
             let bound = &record.input["pipeline"]["fixture"];
             assert_eq!(bound["commit"], second, "{tag}: {bound}");
@@ -5995,11 +6342,50 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
                 snapshot.starts_with(&state),
                 "{tag}: the snapshot is atomic's own"
             );
+            drop(child);
+            assert!(
+                !still_running(pid),
+                "{tag}: the run the round dropped is killed and reaped (pid {pid})"
+            );
         }
-        // Neither the developer's checkout nor the fixture gained a ref or a
-        // worktree.
+        // Neither the developer's checkout nor the fixture gained a ref, a
+        // worktree or a configuration entry, changed a file or wrote a loose
+        // object.
         assert_eq!(git_state(&project), checkout, "the checkout is as it was");
         assert_eq!(git_state(&fixture), source, "the fixture is as it was");
+        // And that comparison is not vacuous: one change of each kind git_state
+        // reads is planted here, in turn, and the comparison notices each — a
+        // ref, a working-tree file, an entry in the fixture's own configuration,
+        // a loose object and a worktree registered with the fixture. Each is one
+        // thing a run that may only read a fixture must never leave behind.
+        git_in(&fixture, &["tag", "decoy-ref"]);
+        let with_ref = git_state(&fixture);
+        assert_ne!(with_ref, source, "a ref the fixture did not have");
+        std::fs::write(fixture.join("decoy.txt"), "x").expect("file");
+        let with_file = git_state(&fixture);
+        assert_ne!(
+            with_file, with_ref,
+            "a working-tree file the fixture did not have"
+        );
+        git_in(&fixture, &["config", "--local", "atomic.decoy", "1"]);
+        let with_config = git_state(&fixture);
+        assert_ne!(
+            with_config, with_file,
+            "an entry in the fixture's own configuration"
+        );
+        git_in(&fixture, &["hash-object", "-w", "decoy.txt"]);
+        let with_object = git_state(&fixture);
+        assert_ne!(
+            with_object, with_config,
+            "an object added to the fixture's store"
+        );
+        let linked = dir.join("decoy-worktree").to_string_lossy().into_owned();
+        git_in(&fixture, &["worktree", "add", "--detach", &linked, "HEAD"]);
+        assert_ne!(
+            git_state(&fixture),
+            with_object,
+            "a worktree registered with the fixture"
+        );
     });
 }
 
@@ -6048,16 +6434,20 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
         );
         let candidate = git_in(&fixture, &["rev-parse", "HEAD"]);
         git_in(&fixture, &["tag", "candidate"]);
-        git_in(&fixture, &["checkout", "-q", "--detach", &base]);
         assert_ne!(candidate, base, "the fixture's tip is not its baseline");
-        let source = format!("{}\n{}", git_state(&fixture), git_status(&fixture));
+        // The repository is left checked out on its tip, which is not the
+        // revision every run below is given: a run that resolved the
+        // repository's HEAD instead of the revision it was named would be
+        // refused or bind the candidate, and each of its assertions would say
+        // so.
+        let source = git_state(&fixture);
         // The example checks as written, from a directory outside it, which
         // is also where atomic writes the declarations its atoms import.
         let project_arg = project.to_string_lossy().into_owned();
         let checked = atomic(&dir, &outside, &["check", &project_arg], &[], "");
         assert!(checked.status.success(), "{}", text(&checked));
         let state = state_dir(&dir, &project);
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = named_project_store(&state, "reviewed-change").await;
         // The example's own input, with the fixture's real baseline for the
         // placeholder, and the answers each step is scripted to give.
         let mut task =
@@ -6104,7 +6494,10 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
                 dir.join(format!("{tag}.log")),
                 dir.join(format!("{tag}.out")),
             );
-            let mut child = spawn_logged(
+            // The run in the background, held so that an assertion that
+            // fails before it is waited for still leaves nothing running.
+            let mut child = Reaped(spawn_streams(
+                Path::new(ATOMIC),
                 &dir,
                 &cwd,
                 &[
@@ -6124,8 +6517,8 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
                 ],
                 &with(&env, &[]),
                 &log,
-                &out,
-            );
+                Some(&out),
+            ));
             // Admitted from a directory that is neither the project nor the
             // fixture: the fixture found from there by a relative path, at
             // the revision it was given, pinned to its commit — which the
@@ -6144,19 +6537,19 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             // baseline into a snapshot of atomic's own leave the repository
             // as they found it.
             assert_eq!(
-                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                git_state(&fixture),
                 source,
                 "{tag}: binding the fixture leaves it as it was found"
             );
             // Planned, then stopped at the first gate, which shows the plan.
-            let g = await_gate(&rt, &id).await;
+            let g = open_gate(&rt, &id).await;
             assert_eq!(g.step, "approve-plan", "{tag}");
             assert_eq!(g.title, "Approve bounded plan", "{tag}");
             assert_eq!(g.show, plan, "{tag}");
             approve(&rt, &g).await;
             // Implemented in a worktree of the fixture's snapshot and
             // reviewed, then stopped at the second gate.
-            let g = await_gate(&rt, &id).await;
+            let g = open_gate(&rt, &id).await;
             assert_eq!(g.step, "accept-change", "{tag}");
             assert_eq!(
                 model.calls(),
@@ -6215,9 +6608,10 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             );
             pinned.push(bound["commit"].as_str().expect("commit").to_owned());
             // The fixture repository is exactly as it was: its refs, its
-            // worktrees and its working tree, every untracked file included.
+            // worktrees, its working tree with every untracked file, its own
+            // configuration and its objects.
             assert_eq!(
-                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                git_state(&fixture),
                 source,
                 "{tag}: the fixture repository is as it was"
             );
@@ -6231,11 +6625,12 @@ fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_
             "{pinned:?}: the same base commit every time"
         );
         assert_eq!(pinned[0], base, "{pinned:?}");
-        assert!(
-            pinned.iter().all(|c| c != &candidate),
-            "{pinned:?}: the pin is the named revision, not the tip"
+        let head = git_in(&fixture, &["rev-parse", "HEAD"]);
+        assert_eq!(head, candidate, "the fixture is still on its tip");
+        assert_ne!(
+            pinned[0], head,
+            "{pinned:?}: the pin is the revision the runs were given, not the fixture's HEAD"
         );
-        let _ = std::fs::remove_dir_all(&outside);
     });
 }
 
@@ -6308,6 +6703,61 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             "fixture.path",
             "inside the git repository",
         );
+        // A repository atomic cannot read at all. git is never run on it, so
+        // nothing was learned about it, and the refusal says what stopped git
+        // from being asked instead of saying the repository is not there —
+        // news atomic does not have, and the opposite of what the person can
+        // act on. The mode goes back before anything is asserted, so a
+        // failing assert leaves nothing unreadable behind.
+        let blind = dir.join("blind");
+        std::fs::create_dir_all(&blind).expect("blind");
+        git_in(&blind, &["init", "-q"]);
+        let blind_base = commit_file(&blind, "price.txt", "125");
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("unreadable");
+        let data = json!({"base": blind_base, "task": "multiply"}).to_string();
+        let blind_arg = blind.to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "coding",
+                "--data",
+                &data,
+                "--fixture",
+                &blind_arg,
+                "--fixture-rev",
+                "HEAD",
+            ],
+            &UNUSED_MODEL,
+            "",
+        );
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("readable again");
+        assert!(!out.status.success(), "{blind_arg}: {}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.unreadable", "{blind_arg}: {error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("atomic cannot tell whether it is a git repository"),
+            "{description}"
+        );
+        assert!(
+            description.contains("Permission denied"),
+            "what stopped git is kept: {description}"
+        );
+        assert!(
+            !description.contains("not a git repository"),
+            "atomic never reports what it did not learn: {description}"
+        );
+        assert!(
+            error["action"]
+                .as_str()
+                .is_some_and(|a| a.contains("readable")),
+            "the action names what to change: {error}"
+        );
         // What atomic does not copy whole.
         let (submodule, _) = repo("submodule", &[]);
         git_in(
@@ -6369,7 +6819,7 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
         let linked = dir.join("linked");
         let own = commit_file(&linked, "price.txt", "500");
         let state = state_dir(&dir, &project);
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let data = json!({"base": own, "task": "multiply"}).to_string();
         let linked_arg = linked.to_string_lossy().into_owned();
         let mut child = spawn(
@@ -6399,6 +6849,126 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             .expect("record")
             .expect("run");
         assert_eq!(record.input["pipeline"]["fixture"]["commit"], own);
+    });
+}
+
+/// What was found about a project's repository is said where a worktree is
+/// asked for and nowhere else. A run that changes code and names no fixture
+/// is refused, and the refusal carries what git said about the project, since
+/// its worktree step is asking why there is none; a run that asks nothing of
+/// git about the project is not refused for what git said, so a project
+/// outside every repository runs its other steps.
+#[test]
+fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() {
+    on_codex_runtime(async {
+        // Where atomic keeps its own state is its usual place, since it
+        // refuses a scratch directory under the temporary directory; where
+        // the project is is outside every repository.
+        let dir = scratch("no-repository");
+        let outside = outside_repository("no-repository");
+        let project = project(&outside);
+        write_coding(&project);
+        // The same project's work, with nothing asked of a worktree: one
+        // durable step, a gate a person decides, and the run's input back.
+        std::fs::write(
+            project.join("workflows/ask.workflow.yaml"),
+            "atomic: 1\nname: ask\n\
+             input: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             output: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             steps:\n  check:\n    gate:\n      title: \"'Check the note ' + input.title\"\n\
+             \x20     show: input\n      timeout: 24h\n\
+             returns: input\n",
+        )
+        .expect("workflow");
+        let checked = atomic(&dir, &project, &["--json", "check"], &[], "");
+        assert!(checked.status.success(), "{}", text(&checked));
+        let base = "1111111111111111111111111111111111111111";
+        let data = json!({"base": base, "task": "multiply"}).to_string();
+
+        // Refused, with what was found about the project in the refusal: that
+        // git was asked about its directory and said no, in git's own words,
+        // which the person can act on — and not that git could not be asked,
+        // which would be the other news, and false here.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "coding", "--data", &data],
+            &UNUSED_MODEL,
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.required", "{error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("git refused the project's directory"),
+            "{description}"
+        );
+        assert!(
+            description.contains("not a git repository"),
+            "git's own words are kept: {description}"
+        );
+        assert!(
+            !description.contains("cannot tell"),
+            "nothing about this project was unreadable: {description}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("run run-"),
+            "no run started: {}",
+            text(&out)
+        );
+
+        // The workflow that needs no worktree runs on the same project: the
+        // gate's own mapping ran, the decision came from a human credential,
+        // and the run carried itself to its end and printed its result.
+        // Nothing was asked of git about the project, which is in no
+        // repository.
+        let state = state_dir(&dir, &project);
+        let rt = project_store(&state).await;
+        let log = dir.join("ask.log");
+        let out_file = dir.join("ask.json");
+        let said = |what: &str| {
+            format!(
+                "{what}\nstderr: {}\nstdout: {}",
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(&out_file).unwrap_or_default()
+            )
+        };
+        let mut child = spawn_logged(
+            &dir,
+            &project,
+            &[
+                "--json", "run", "ask", "--run-id", "ask-1", "--data", RANK_INPUT,
+            ],
+            &UNUSED_MODEL,
+            &log,
+            &out_file,
+        );
+        let g = match tokio::time::timeout(Duration::from_secs(60), open_gate(&rt, "ask-1")).await {
+            Ok(g) => g,
+            Err(_) => panic!("{}", said("ask-1 never opened its gate")),
+        };
+        assert_eq!(
+            g.title, "Check the note Export crashes on accents",
+            "the gate step ran, and mapped its title from the input: {g:?}"
+        );
+        // A person decides, from another terminal than the run's, and the
+        // run's own command carries it the rest of the way and prints its
+        // result: the gate is all the waiting this workflow does.
+        approve(&rt, &g).await;
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut child, "the run"))
+            .await
+            .expect("child");
+        let shown = std::fs::read_to_string(&log).unwrap_or_default();
+        let printed = std::fs::read_to_string(&out_file).unwrap_or_default();
+        assert!(status.success(), "{shown}\n{printed}");
+        let given: Value = serde_json::from_str(RANK_INPUT).expect("input");
+        let doc: Value =
+            serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {shown}\n{printed}"));
+        assert_eq!(doc["run"], "ask-1", "{doc}");
+        assert_eq!(doc["status"], "succeeded", "{shown}\n{doc}");
+        assert_eq!(doc["output"], given, "{doc}: the run returned its input");
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
@@ -6836,7 +7406,7 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
             &with(&model_env, &env_a),
             &dir.join("a.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let gate_a = open_gate(&rt, "run-a").await;
         let mut b = Reaped(spawn(
             &dir,
@@ -6891,32 +7461,6 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     });
 }
 
-/// A spawned child process — `atomic` itself, or the shell that execs it —
-/// that is killed and reaped when this is dropped, if it has not ended by
-/// then: a test that fails part-way leaves nothing running behind it, and
-/// nothing holding its schema once the schema's guard drops it.
-struct Reaped(Child);
-
-impl std::ops::Deref for Reaped {
-    type Target = Child;
-    fn deref(&self) -> &Child {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for Reaped {
-    fn deref_mut(&mut self) -> &mut Child {
-        &mut self.0
-    }
-}
-
-impl Drop for Reaped {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 /// The environment of executor `name` on schema `schema`, with a state
 /// directory of its own, as on a host of its own.
 #[cfg(feature = "postgres-tests")]
@@ -6965,7 +7509,7 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
             &with(&a_env, &[]),
             &dir.join("a.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let opened = open_gate(&rt, "owned-1").await;
 
         // worker-a is alive and owns the run: worker-b may not take it.
@@ -7081,7 +7625,7 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             .await
             .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let record = rt
             .run_record("queued-1")
             .await
@@ -7145,7 +7689,7 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
             &with(&env, &[]),
             &dir.join("run.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let g = open_gate(&rt, "pg-gate-1").await;
         let gates = |args: &'static [&'static str]| {
             let (d, p, e) = (dir.clone(), project.clone(), env.clone());
@@ -7173,6 +7717,61 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
         assert!(listed.status.success(), "{}", text(&listed));
         let listed = stdout_json(&listed);
         assert_eq!(listed[0]["id"], json!(g.id), "{listed}");
+
+        // Another project on the same store neither lists nor decides the
+        // gate, nor shows the run: to it, they are not there.
+        let other_dir = dir.join("other");
+        std::fs::create_dir_all(&other_dir).expect("other");
+        let other = crate::project(&other_dir);
+        let in_other = |args: Vec<String>| {
+            let (d, p, e) = (dir.clone(), other.clone(), env.clone());
+            tokio::task::spawn_blocking(move || {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                atomic(&d, &p, &args, &with(&e, &[]), "")
+            })
+        };
+        let listed = in_other(vec!["gates".into(), "list".into(), "--json".into()])
+            .await
+            .expect("child");
+        assert!(listed.status.success(), "{}", text(&listed));
+        assert_eq!(
+            stdout_json(&listed),
+            json!([]),
+            "another project's gate is listed"
+        );
+        let approved = in_other(vec!["gates".into(), "approve".into(), g.id.clone()])
+            .await
+            .expect("child");
+        assert!(!approved.status.success(), "{}", text(&approved));
+        assert!(
+            text(&approved).contains(&format!("no gate {}", g.id)),
+            "{}",
+            text(&approved)
+        );
+        let shown = in_other(vec![
+            "--json".into(),
+            "runs".into(),
+            "show".into(),
+            "pg-gate-1".into(),
+        ])
+        .await
+        .expect("child");
+        assert!(!shown.status.success(), "{}", text(&shown));
+        assert_eq!(
+            stdout_json(&shown)["error"]["kind"],
+            "run.not_found",
+            "{}",
+            text(&shown)
+        );
+        assert!(
+            gate::find(&rt, &g.id)
+                .await
+                .expect("find")
+                .expect("still there")
+                .resolution
+                .is_none(),
+            "another project decided the gate"
+        );
 
         let id = g.id.clone();
         let (d, p, e) = (dir.clone(), project.clone(), env.clone());
@@ -7230,6 +7829,125 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
 
+/// A run named for a secret's word, such as `rotate-secret:2026-11`, is a
+/// name, not a secret: the lines `atomic runs resume` and `atomic serve`
+/// write about it name it as it is, resume hints included, while what the
+/// panic said is still redacted on its own. Redacted whole, as they were,
+/// such a line read `run rotate-secret:[REDACTED] …`, the hint with it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("named-secret");
+    let project = project(&dir);
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    // atomic run's own error report names it too, hint and all.
+    let reported = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        reported.contains("error: run rotate-secret:2026-11 stopped: atomic's own workflow code"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("failpoint pipeline:after:count"),
+        "{reported}"
+    );
+    assert!(!reported.contains("[REDACTED]"), "{reported}");
+    // And in JSON, for a second run under the same id.
+    let again = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!again.status.success(), "{}", text(&again));
+    let error = &stdout_json(&again)["error"];
+    assert_eq!(error["kind"], "run.exists", "{error}");
+    assert_eq!(
+        error["description"].as_str(),
+        Some(
+            "there is already a run rotate-secret:2026-11 in this project's store, and it is \
+             max_recovery_attempts_exceeded"
+        ),
+        "{error}"
+    );
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.ends_with("use `atomic runs resume rotate-secret:2026-11`")),
+        "{error}"
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "rotate-secret:2026-11"],
+        &panic,
+        "",
+    );
+    let resumed = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        resumed.contains(
+            "run rotate-secret:2026-11: it was parked because atomic's own workflow code"
+        ),
+        "{resumed}"
+    );
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    let line = served
+        .lines()
+        .find(|l| l.contains("workflow code panicked"))
+        .unwrap_or_else(|| panic!("serve named no panicked run: {served}"));
+    assert!(
+        line.starts_with("atomic serve: run rotate-secret:2026-11 stopped: "),
+        "{line}"
+    );
+    assert!(
+        line.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{line}"
+    );
+    assert!(line.contains("failpoint pipeline:after:count"), "{line}");
+    assert!(!served.contains("[REDACTED]"), "{served}");
+}
+
 /// A panic in atomic's own workflow code (made at a step's failpoint, for
 /// the test) is named as the cause, with its message, by `atomic run`,
 /// `atomic runs resume` and `atomic serve`, and kept in the project's
@@ -7278,7 +7996,7 @@ async fn a_run_whose_workflow_code_panics() {
     // a server to run again.
     let state = state_dir(&dir, &project);
     {
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         assert_eq!(
             rt.status("panicky").await.expect("status"),
             Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))
@@ -7852,5 +8570,154 @@ fn the_debug_prompt_escapes_its_answer() {
             );
         }
         assert!(said.contains("Second line."), "{said}");
+    });
+}
+
+/// What the commands of the turn that answered `model`'s first call printed.
+fn first_command_output(model: &FakeModel) -> String {
+    let requests = model.requests();
+    let follow_up = requests.get(1).expect("Codex answered the tool call");
+    follow_up["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A turn of `atomic run` cannot read what an attempt of `atomic debug
+/// codex-prompt` keeps in its scratch directory, nor the other way round,
+/// nor what another project's attempts keep in theirs: as atomic wires each
+/// command's backend, each denies its turns the home's whole `scratch/`,
+/// where every project's scratch roots are. What each looks for is there all
+/// along.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("scratch-roots");
+        let project = project(&dir);
+        let state = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || state_dir(&d, &p))
+                .await
+                .expect("state")
+        };
+        // Every project's scratch roots are in the home's `scratch/`, by
+        // project id.
+        let id = state
+            .file_name()
+            .expect("a project id")
+            .to_string_lossy()
+            .into_owned();
+        let home = state
+            .parent()
+            .and_then(Path::parent)
+            .expect("the atomic home")
+            .to_owned();
+        let plant = |project: &str, root: &str| {
+            let secret = home
+                .join("scratch")
+                .join(project)
+                .join(root)
+                .join("planted/secret");
+            std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
+            std::fs::write(&secret, format!("secret-in-{project}-{root}")).expect("secret");
+            secret
+        };
+        let (in_run, in_debug) = (plant(&id, "run"), plant(&id, "debug"));
+        let in_other = plant("another-project-0123456789ab", "run");
+        let look = |secrets: &[&PathBuf]| Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({
+                "cmd": secrets
+                    .iter()
+                    .map(|s| format!("cat '{}' 2>&1; echo cat-exit=$?", s.display()))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+                "yield_time_ms": 10000,
+            }),
+        };
+
+        // A run's turn looks in the debug prompt's scratch root.
+        write_atom(
+            &project,
+            "look",
+            "description: 'Look.', kind: 'codex'",
+            "Look around.",
+            object(json!({})),
+            object(json!({"done": {"type": "boolean"}})),
+        );
+        let model = FakeModel::start(vec![
+            look(&[&in_debug, &in_other]),
+            Reply::Text(r#"{"done": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let env = model_env(&model.base_url());
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &["run", "look", "--data", "{}"],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a run's turn read the debug prompt's or another project's scratch: {said}"
+        );
+
+        // A debug prompt's turn looks in the runs' scratch root.
+        let model = FakeModel::start(vec![
+            look(&[&in_run, &in_other]),
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &[
+                        "debug",
+                        "codex-prompt",
+                        "--base-url",
+                        &url,
+                        "--model",
+                        "synthetic",
+                        "Look.",
+                    ],
+                    &[],
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a debug prompt's turn read the runs' or another project's scratch: {said}"
+        );
+        // The denial kept them out, not the secrets' absence.
+        assert!(in_run.exists() && in_debug.exists() && in_other.exists());
     });
 }

@@ -1,0 +1,1 @@
+redact-os-error-bare|crates/atomic-core/src/redact.rs|        let error_len = if value_from == start {|        let error_len = if true /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole

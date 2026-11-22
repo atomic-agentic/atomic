@@ -425,8 +425,29 @@ fn a_reused_isolate_leaks_module_state() {
     );
 }
 
+/// A fresh isolate per call costs little. In what it holds, a measure no
+/// load on the machine changes: the heap an isolate has used once it has
+/// served a call, which grows with whatever each call sets up. In time, only
+/// a loose bound, since a loaded machine stretches the time of each call's
+/// child process: the start-up allowance a child is given before its call's
+/// deadline begins, a hundred times what a call takes on an idle machine.
 #[test]
 fn fresh_isolates_cost_little_per_call() {
+    let mut isolate =
+        Isolate::new(&graph(), Limits::default(), CLOCK, Controls::default()).expect("isolate");
+    isolate
+        .call("prepare", &input())
+        .expect("the call succeeds");
+    let used = isolate
+        .runtime
+        .v8_isolate()
+        .get_heap_statistics()
+        .used_heap_size();
+    eprintln!("a fresh isolate's heap after one call: {used} bytes");
+    assert!(
+        used < FRESH_HEAP_MAX,
+        "a fresh isolate used {used} bytes of heap for one call"
+    );
     let rounds = 20u32;
     let started = Instant::now();
     for _ in 0..rounds {
@@ -435,10 +456,14 @@ fn fresh_isolates_cost_little_per_call() {
     let fresh = started.elapsed() / rounds;
     eprintln!("per call: fresh isolate {fresh:?}");
     assert!(
-        fresh < Duration::from_millis(250),
+        fresh < Duration::from_secs(2),
         "a fresh isolate per call took {fresh:?}"
     );
 }
+
+/// The most heap a fresh isolate holds after one call: about three times the
+/// 1.4 MB it holds (see `fresh_isolates_cost_little_per_call`).
+const FRESH_HEAP_MAX: usize = 4 << 20;
 
 // The controls whose absence takes the whole process down run in a child
 // process: this test binary, filtered to `child_process`, with the control

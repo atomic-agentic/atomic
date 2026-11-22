@@ -1464,8 +1464,11 @@ fn probe_within(addr: SocketAddr, within: Duration) -> Option<Vec<String>> {
     let mut stream = TcpStream::connect_timeout(&addr, left()?).ok()?;
     stream.set_write_timeout(left()).ok()?;
     // HTTP/1.0, so the answer comes whole and the connection closes after
-    // it; a chunked answer is decoded all the same.
-    write!(stream, "GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n").ok()?;
+    // it; a chunked answer is decoded all the same. Sent in one write, so a
+    // server that answers what its first read gets, and then closes with the
+    // rest unread, which resets the connection, has the whole request.
+    let request = format!("GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
     let body = loop {
@@ -1597,6 +1600,16 @@ impl Resolved {
     /// and no endpoint is set.
     pub fn on_sign_in(&self) -> bool {
         self.sign_in.is_some() && self.settings.model.base_url.is_none()
+    }
+
+    /// Whether someone chose the model endpoint: a flag, a variable or a
+    /// configuration file set `model.base_url`. Such an endpoint comes before
+    /// the sign-in, which is then not looked for. One detection found, from
+    /// `OPENAI_API_KEY` or a local Ollama, comes only after it.
+    pub fn endpoint_chosen(&self) -> bool {
+        let source = self.sources.get("model.base_url");
+        let detected = matches!(source, Some(Source::Detected(_)));
+        self.settings.model.base_url.is_some() && !detected
     }
 
     /// Every setting for `atomic config --explain`: its path, its value as
@@ -1785,8 +1798,7 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
             };
             // With an endpoint configured, the sign-in is not looked for and
             // a run uses the endpoint.
-            let configured =
-                resolved.sign_in_unreadable.is_none() && resolved.settings.model.base_url.is_some();
+            let configured = resolved.sign_in_unreadable.is_none() && resolved.endpoint_chosen();
             let note = if configured {
                 format!(
                     "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \

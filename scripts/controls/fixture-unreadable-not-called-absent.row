@@ -1,0 +1,1 @@
+fixture-unreadable-not-called-absent|crates/atomic-core/src/fixture.rs|        if e.refused() {|        if std::hint::black_box(true) {|-p atomic-agentic --test run_cli -- a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refused

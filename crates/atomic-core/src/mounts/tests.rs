@@ -92,12 +92,7 @@ fn a_real_table_parses_and_finds_what_it_should() {
     assert_eq!(mounts.len(), 19);
     assert!(mounts.iter().any(|m| m.kind == "nsfs" && m.root.is_none()));
     // A FUSE mount under the user's runtime directory is found where it is.
-    let gvfs = mount_of(
-        &mounts,
-        &ids(&mounts),
-        Path::new("/run/user/1000/gvfs/share"),
-    )
-    .expect("a mount");
+    let gvfs = mount_of(&mounts, Path::new("/run/user/1000/gvfs/share")).expect("a mount");
     assert_eq!(
         (gvfs.kind.as_str(), gvfs.at.as_path()),
         ("fuse.gvfsd-fuse", Path::new("/run/user/1000/gvfs"))
@@ -180,7 +175,7 @@ fn the_mount_at_a_path_is_the_top_of_its_stack() {
 6 1 8:2 / /mnt/b rw - ext4 /dev/sdb1 rw
 ";
     let mounts = parse(stacked).expect("parses");
-    let home = mount_of(&mounts, &ids(&mounts), Path::new("/home/u")).expect("a mount");
+    let home = mount_of(&mounts, Path::new("/home/u")).expect("a mount");
     assert_eq!(home.id, 5);
     // Through the mount on top, sdb1, not the one it covers.
     assert_eq!(found(&mounts, "/home/u"), [PathBuf::from("/mnt/b/u")]);
@@ -229,6 +224,21 @@ fn a_root_that_is_its_own_parent_is_the_root() {
     assert_eq!(
         found(&mounts, "/home/u"),
         [PathBuf::from("/mnt/again/home/u")]
+    );
+}
+
+/// A mount on a root that is its own parent, at `/`, is above it: the root
+/// a process sees, as the kernel shows it.
+#[test]
+fn a_mount_at_the_root_over_one_that_is_its_own_parent_is_on_top() {
+    let stacked = b"\
+1 1 0:2 / / rw - rootfs rootfs rw
+2 1 8:1 / / rw - ext4 /dev/sda1 rw
+";
+    let mounts = parse(stacked).expect("parses");
+    assert_eq!(
+        mount_of(&mounts, Path::new("/home/u")).expect("a mount").id,
+        2
     );
 }
 
@@ -461,10 +471,35 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
     assert!(
         std::fs::symlink_metadata(&place).is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
     );
-    let mounts = ninep(&host, &dir.0.join("also"), "/");
+    // On a local filesystem, where only the walk of the place's directories
+    // looks at it.
+    let table = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+         2 1 8:3 / {} rw - ext4 /dev/sdc1 rw\n\
+         3 1 8:3 / {} rw - ext4 /dev/sdc1 rw\n",
+        host.display(),
+        dir.0.join("also").display()
+    );
+    let mounts = parse(table.as_bytes()).expect("parses");
     assert!(
-        aliases(&mounts, std::slice::from_ref(&place))
-            .is_err_and(|e| e.to_string().contains("cannot be looked at"))
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e
+            .to_string()
+            .contains("so atomic cannot check which other mounts show"))
+    );
+    // The place there, but the part of it a second mount shows looked at
+    // through a link to itself: what that mount shows cannot be checked.
+    let host = dir.0.join("host2");
+    let place = host.join("home/u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::fs::create_dir_all(dir.0.join("also2")).expect("dir");
+    std::os::unix::fs::symlink("loop", place.join("loop")).expect("link");
+    let mounts = ninep(&host, &dir.0.join("also2"), "/home/u/.ssh/loop/keys");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e.to_string().contains(
+            &format!("{} cannot be looked at", place.join("loop/keys").display())
+        ) && e
+            .to_string()
+            .contains("so atomic cannot check that its second mount"))
     );
 }
 

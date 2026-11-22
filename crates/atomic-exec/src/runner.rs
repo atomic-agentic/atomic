@@ -224,6 +224,7 @@ impl Request {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
             secret_env: crate::SecretEnv::default(),
         })
     }
@@ -333,8 +334,13 @@ pub fn serve_with_secret(
 /// on their way to stderr), running commands as child processes in the
 /// runner's own process group, so that the control plane stops a command,
 /// with everything it started, by stopping its runner's group. A command's
-/// secret variables come on the socket [`crate::SECRET_ENV_FD`] names; call
-/// this once the process is hardened, as `atomic runner` does.
+/// secret variables come on the socket [`crate::SECRET_ENV_FD`] names.
+///
+/// Call it as `atomic runner` does: once the process is hardened, before it
+/// starts any thread, and with [`crate::SECRET_ENV_FD`], if it is set,
+/// naming only the socket the control plane handed this process. The
+/// socket's reader takes that descriptor as its own and closes it, so
+/// nothing else in the process may hold it or be handed it.
 pub fn serve_stdio(errors: &mut dyn Write) -> i32 {
     process::ignore_stop_signals();
     // The command's secret variables come on a socket of their own, never

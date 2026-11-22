@@ -1,0 +1,1 @@
+scratch-deny-helper|crates/atomic-core/src/codex.rs|    if !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {|    if /*CONTROL_OFF*/ false && !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {|-p atomic-agentic-core --lib --features fake-model a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_except_on_macos

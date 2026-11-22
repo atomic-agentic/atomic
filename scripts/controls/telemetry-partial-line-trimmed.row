@@ -1,0 +1,1 @@
+telemetry-partial-line-trimmed|crates/atomic/tests/telemetry_common/mod.rs|                    let _ = sent.send(String::from_utf8_lossy(&partial).trim_end().to_owned());|                    let _ = sent.send(String::from_utf8_lossy(&partial).into_owned()); /*CONTROL_OFF*/|-p atomic-agentic --test telemetry a_last_line_with_no_end_of_line_is_read_like_the_others

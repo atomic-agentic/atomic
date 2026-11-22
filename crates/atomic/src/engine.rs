@@ -14,14 +14,13 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::state::ProjectState;
-use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
 use atomic_exec::runner::ProcessRunner;
@@ -145,31 +144,34 @@ pub fn store_project(state: &ProjectState) -> anyhow::Result<String> {
 }
 
 /// The backend on this machine that `atomic run`, `atomic serve` and the
-/// evals run turns and exec atoms' commands on, unconfined and unconnected:
-/// scratch in the project's state, outside every directory a sandboxed
-/// turn may write.
+/// evals run turns and exec atoms' commands on, unconfined and unconnected
+/// (see [`ProjectState::run_backend`]): scratch outside every directory a
+/// sandboxed turn may write, and every other scratch directory in the
+/// atomic home's `scratch/` denied to its commands.
 pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
-    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"))
+    state.run_backend()
 }
 
 /// The backend `atomic debug codex-prompt` and `atomic debug probe` run
-/// their turn on: one of its own beside [`local_backend`], since these
-/// commands take no execution lock, and connecting empties a backend's
-/// shared temporary directory, which a run's turns may be using.
+/// their turn on (see [`ProjectState::debug_backend`]): one of its own
+/// beside [`local_backend`], since these commands take no execution lock,
+/// and connecting empties a backend's shared temporary directory, which a
+/// run's turns may be using.
 pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
-    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch-debug"))
+    state.debug_backend()
 }
 
 /// The backend exec atoms' commands run on with `runner`: scratch in the
-/// project's state, confined like turns' commands where that is verified,
-/// connected once.
+/// atomic home's `scratch/`, confined like turns' commands where that is
+/// verified, connected once.
 pub fn exec_backend(
     state: &ProjectState,
     paths: &CodexPaths,
     runner: RunnerKind,
 ) -> anyhow::Result<atomic_exec::Backend> {
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
+    // Scratch directories live in the atomic home's `scratch/`, beside
+    // every other project's, outside every directory a sandboxed turn may
+    // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = local_backend(state);
@@ -527,9 +529,15 @@ pub async fn open(
         exec_meter: Default::default(),
         clock: None,
     });
-    // Never the developer's checkout: a run's worktree steps use the
-    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
-    let worktrees: Option<Arc<Worktrees>> = None;
+    // Never the developer's checkout: a run's worktree steps work in a
+    // worktree of the snapshot of the fixture the run is bound to (see
+    // `atomic_core::fixture`), and `atomic run` binds every run that changes
+    // code to one before it starts. So no repository of the project is offered
+    // here whatever git would say about it, and what git does say about it is
+    // asked where a run that names no fixture is refused, so that refusal can
+    // tell a project in no repository from one git could not read (see
+    // `runs::bind_fixture`).
+    let worktrees = ProjectWorktrees::FixtureOnly;
     let mut rt = Durare::open(
         &database,
         executor.as_deref(),

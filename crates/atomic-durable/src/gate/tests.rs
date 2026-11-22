@@ -845,6 +845,394 @@ async fn redelivery_wakes_a_run_whose_decider_stopped_early<R: DurableRuntime>(m
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+/// Two projects sharing one store, each on a runtime of its own: the
+/// second neither lists, finds nor decides the first one's gate, nor sees
+/// its run, nor wakes it, and the first does all of these for its own.
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs(database: crate::Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, None, crate::DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    let theirs = open("project-b").await;
+    register(&mut mine);
+    mine.launch().await.expect("launch");
+    let (run, gate) = start_gated(&mine, input(None)).await;
+    // Project B: no such gate, and no such run.
+    assert!(
+        gates(&theirs, GateFilter::default())
+            .await
+            .expect("gates")
+            .iter()
+            .all(|g| g.id != gate.id),
+        "project B lists project A's gate"
+    );
+    assert!(find(&theirs, &gate.id).await.expect("find").is_none());
+    assert_eq!(
+        decide(
+            &theirs,
+            &me(&theirs).await,
+            command(&gate, "b1", Verdict::Approve)
+        )
+        .await,
+        Err(DecideError::NoSuchGate(gate.id.clone()))
+    );
+    assert!(theirs.own_run_record(&run).await.expect("record").is_none());
+    assert!(mine.own_run_record(&run).await.expect("record").is_some());
+    let listed = gates(&mine, GateFilter::default()).await.expect("gates");
+    assert!(listed.iter().any(|g| g.id == gate.id), "{listed:?}");
+    // Retention keeps every project's evidence, whoever asks.
+    assert!(
+        pinned_evidence(&theirs)
+            .await
+            .expect("pinned")
+            .contains(&EVIDENCE.to_owned()),
+        "another project's evidence is not kept"
+    );
+    // Decided by its project, the decision is not B's to read back: the
+    // same command, sent by B, finds no gate.
+    let (decided_run, decided) = start_gated(&mine, input(None)).await;
+    decide(
+        &mine,
+        &me(&mine).await,
+        command(&decided, "a1", Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert_eq!(
+        decide(
+            &theirs,
+            &me(&theirs).await,
+            command(&decided, "a1", Verdict::Approve)
+        )
+        .await,
+        Err(DecideError::NoSuchGate(decided.id.clone()))
+    );
+    assert!(
+        outcome(&mine, &decided_run)
+            .await
+            .expect("finishes")
+            .approved()
+    );
+    // A run id another project recorded first, with no run behind it, as
+    // one that stopped before its run began leaves it, stays theirs.
+    let taken = unique("taken");
+    let id = taken.clone();
+    theirs
+        .control_transaction(move |mut tx| {
+            let id = id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, 'project-b')",
+                    &[Param::Text(id)],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .expect("a row of B's");
+    assert!(mine.run_id_taken_elsewhere(&taken).await.expect("taken"));
+    let refused = mine
+        .start("gated", &taken, input(None))
+        .await
+        .expect_err("refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("taken in this store by another project"),
+        "{refused}"
+    );
+    assert!(
+        mine.run_record(&taken).await.expect("record").is_none(),
+        "it ran"
+    );
+    // A decision recorded with no wake-up: only its own project's runtime
+    // wakes the run.
+    let id = gate.id.clone();
+    mine.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE atomic_gates SET state = 'approved', decided_by = 'local:dev', \
+                 decided_at = 1, command_id = 'c1' WHERE gate_id = ?",
+                &[Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("decide without waking");
+    assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
+    assert!(redeliver(&mine).await.expect("redeliver") >= 1);
+    assert!(outcome(&mine, &run).await.expect("finishes").approved());
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_projects")));
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_postgres() {
+    let schema = crate::testing::schema("gate_projects").await;
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// Two projects on one store whose processes share an executor identity,
+/// as one set in user configuration makes them: project B neither lists
+/// nor recovers project A's unfinished run, and A recovers its own run as
+/// before.
+async fn a_project_neither_lists_nor_recovers_anothers_runs(database: crate::Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(
+                &database,
+                Some("shared-executor"),
+                crate::DEFAULT_VERSION,
+                project,
+            )
+            .await
+            .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    register(&mut mine);
+    // A run left unfinished, as a crash leaves one, for recovery.
+    let tries = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    mine.register(
+        "counted",
+        move |_ctx: <Durare as DurableRuntime>::Context, (): ()| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    );
+    mine.launch().await.expect("launch");
+    let run = unique("counted");
+    mine.start("counted", &run, ()).await.expect("start");
+    mine.result::<()>(&run).await.expect("finished");
+    let id = run.clone();
+    mine.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?",
+                &[Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("unfinished");
+    let theirs = open("project-b").await;
+    assert!(
+        theirs
+            .unfinished()
+            .await
+            .expect("unfinished")
+            .iter()
+            .any(|r| r.id == run),
+        "the run is in the store"
+    );
+    assert!(
+        theirs
+            .own_unfinished()
+            .await
+            .expect("own unfinished")
+            .iter()
+            .all(|r| r.id != run),
+        "project B lists project A's run"
+    );
+    let refused = theirs.recover().await.expect_err("project B recovers");
+    assert!(
+        refused.to_string().contains("of another project"),
+        "{refused}"
+    );
+    assert!(!refused.to_string().contains(&run), "it names A's run");
+    assert_eq!(tries.load(Ordering::SeqCst), 1, "project B ran A's run");
+    assert!(
+        mine.own_unfinished()
+            .await
+            .expect("own unfinished")
+            .iter()
+            .any(|r| r.id == run)
+    );
+    assert_eq!(mine.recover().await.expect("recover"), 1);
+    mine.result::<()>(&run).await.expect("recovered");
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_neither_lists_nor_recovers_anothers_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_shared_executor")));
+    a_project_neither_lists_nor_recovers_anothers_runs(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_neither_lists_nor_recovers_anothers_runs_on_postgres() {
+    let schema = crate::testing::schema("shared_executor").await;
+    a_project_neither_lists_nor_recovers_anothers_runs(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// A run already in the store with no project's row, as one recorded
+/// before runs had projects is on a shared store, keeps its id: a project
+/// that starts a run with it is refused, and the run does not become its.
+async fn a_run_of_no_project_keeps_its_id(database: crate::Database) {
+    // The project's runtime first: on SQLite, opening one adopts every run
+    // of no project already there.
+    let mut mine = Durare::open(&database, None, crate::DEFAULT_VERSION, "project-a")
+        .await
+        .expect("engine");
+    let mut none = match &database {
+        crate::Database::Sqlite(path) => Durare::sqlite(path).await,
+        crate::Database::Postgres { url, schema } => Durare::postgres(url, schema).await,
+    }
+    .expect("engine for no project");
+    register(&mut mine);
+    register(&mut none);
+    mine.launch().await.expect("launch");
+    none.launch().await.expect("launch");
+    let (run, _) = start_gated(&none, input(None)).await;
+    let refused = mine
+        .start("gated", &run, input(None))
+        .await
+        .expect_err("a run of no project's id");
+    assert!(
+        refused.to_string().contains("a run of no project"),
+        "{refused}"
+    );
+    assert!(
+        mine.own_run_record(&run).await.expect("record").is_none(),
+        "the run became the project's"
+    );
+    assert!(none.own_run_record(&run).await.expect("record").is_some());
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    none.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_of_no_project_keeps_its_id_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_unowned_id")));
+    a_run_of_no_project_keeps_its_id(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_of_no_project_keeps_its_id_on_postgres() {
+    let schema = crate::testing::schema("unowned_id").await;
+    a_run_of_no_project_keeps_its_id(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// A local SQLite store's runs recorded for no project, as before runs had
+/// one, or under an older name of the project's (`<old name>/<state id>`, as
+/// before its manifest was renamed), become the project's when atomic opens
+/// the store for it: their gates are listed and the runs shown. Another
+/// project's run is left as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_stores_old_runs_become_the_projects() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_adopt")));
+    let database = crate::Database::Sqlite(path.clone());
+    // A run started for `key`, and its gate.
+    let started = |key: Option<&'static str>| {
+        let database = database.clone();
+        let path = path.clone();
+        async move {
+            let mut rt = match key {
+                Some(key) => Durare::open(&database, None, crate::DEFAULT_VERSION, key)
+                    .await
+                    .expect("engine"),
+                None => Durare::sqlite(&path).await.expect("engine"),
+            };
+            register(&mut rt);
+            rt.launch().await.expect("launch");
+            let started = start_gated(&rt, input(None)).await;
+            rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            started
+        }
+    };
+    // Under an older name of the project, as before its manifest was
+    // renamed; another project's; and, last, one from before runs had a
+    // project.
+    let renamed = started(Some("old-name/the-project-0123")).await;
+    let foreign = started(Some("notes/another-project-4567")).await;
+    let unowned = started(None).await;
+    let opened = Durare::open(
+        &database,
+        None,
+        crate::DEFAULT_VERSION,
+        "notes/the-project-0123",
+    )
+    .await
+    .expect("engine");
+    for (run, gate) in [&unowned, &renamed] {
+        assert!(
+            opened.own_run_record(run).await.expect("record").is_some(),
+            "{run}"
+        );
+        assert!(
+            find(&opened, &gate.id).await.expect("find").is_some(),
+            "{run}"
+        );
+    }
+    let (run, gate) = &foreign;
+    assert!(
+        opened.own_run_record(run).await.expect("record").is_none(),
+        "{run}"
+    );
+    assert!(
+        find(&opened, &gate.id).await.expect("find").is_none(),
+        "{run}"
+    );
+    opened
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
 #[test]
 fn the_proposal_digest_ignores_key_order_and_sees_every_change() {
     let a = json!({"b": 1, "a": {"y": [1, 2], "x": null}});

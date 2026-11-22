@@ -277,6 +277,24 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
+                if name == crate::codex::PLACES {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: it carries the places its sandbox denies \
+                             to Codex's sandbox helper; an atom cannot declare it"
+                        ),
+                    );
+                }
+                if name == crate::codex::RELISTED {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: it marks Codex's sandbox helper started \
+                             again with more denied; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if name == atomic_exec::SECRET_ENV_FD {
                     return refuse(
                         &format!("/env/{name}"),

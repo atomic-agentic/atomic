@@ -1062,22 +1062,76 @@ fn assigned(input: &str) -> Option<String> {
         let Some((value_from, mut value_to)) = value_after(input, start) else {
             continue;
         };
-        // `authorization=Bearer abc`: the scheme and its credential.
-        let value = &input[value_from..value_to];
-        if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
-            && input[value_to..].starts_with(' ')
-            && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
-            && !is_not_a_secret(&input[credential_from..credential_to])
-        {
-            value_to = credential_to;
-            strength = Strength::Strong;
+        // What the operating system said of the path before it, as Rust
+        // writes it, `Permission denied (os error 13)`: no secret, whatever
+        // the path's last name is. Only a bare value set off by a blank, as
+        // `path: Permission denied` is: a quoted one runs to its closing
+        // quote, and whatever follows the error in it is the value's; and
+        // one written hard against its name, `passwd:Permission denied …`,
+        // or inside `Some(`, is no error message's shape. The byte after the
+        // separator is tested itself, since `value_start` skips `Some(` too.
+        // Never under a name a header's name ends, as the header rule finds
+        // one, such as `proxy-authorization` or `X-Authorization`: what a
+        // header holds is a credential, however it reads, and a later pass
+        // over the same text, such as a JSON string's own, takes what this
+        // one hid as the header's credential and hides the rest with it.
+        let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
+        let header = ends_in_header(&input[name_start..name_end]);
+        let bare = set_off && !header;
+        let error_len = if value_from == start {
+            os_error_len(&input[value_from..])
+        } else {
+            None
+        };
+        if !(bare && error_len.is_some()) {
+            // `authorization=Bearer abc`: the scheme and its credential.
+            let value = &input[value_from..value_to];
+            if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
+                && input[value_to..].starts_with(' ')
+                && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
+                && !is_not_a_secret(&input[credential_from..credential_to])
+            {
+                value_to = credential_to;
+                strength = Strength::Strong;
+            }
+            let value = &input[value_from..value_to];
+            let quoted = value_from > start;
+            if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
+                out.push_str(&input[copied..value_from]);
+                out.push_str(REDACTED);
+                copied = value_to;
+            }
         }
-        let value = &input[value_from..value_to];
-        let quoted = value_from > start;
-        if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
-            out.push_str(&input[copied..value_from]);
-            out.push_str(REDACTED);
-            copied = value_to;
+        // What follows an operating system's error under a secret's name,
+        // `password: Permission denied (os error 13) <secret>`, is no part of
+        // the error, and the error took the place where the name's value is
+        // looked for: each word after it that looks like a credential is
+        // hidden, to the end of the line or the quote around it. Words such
+        // as `; try again`, paths, times, URLs, addresses and upper-case
+        // identifiers are kept. The words stop at the first one that starts
+        // an assignment, `DB_PASSWORD= …`, `api_key => …`, `secret: …`: that
+        // is read from there by its own name, as without an error before it.
+        if let Some(len) = error_len {
+            let after = value_from + len;
+            let end = input[after..]
+                .find(['\n', '"', '\'', '\\'])
+                .map_or(input.len(), |i| after + i);
+            for (from, to) in words(input, after, end) {
+                if word_starts_assignment(input, from, to) {
+                    break;
+                }
+                let word = &input[from..to];
+                if !is_not_a_secret(word)
+                    && !reads_as_no_credential(word)
+                    && looks_like_credential(word)
+                {
+                    out.push_str(&input[copied..from]);
+                    out.push_str(REDACTED);
+                    copied = to;
+                }
+            }
+            // Read on from past the error and what was hidden.
+            value_to = value_to.max(after).max(copied);
         }
         at = at.max(value_to);
     }
@@ -1086,6 +1140,129 @@ fn assigned(input: &str) -> Option<String> {
     }
     out.push_str(&input[copied..]);
     Some(out)
+}
+
+/// What the operating system says of a failed file or socket operation, as
+/// Rust's `io::Error` writes it: one of these words, then ` (os error N)`.
+/// Only these exact words, so nothing else that ends in such a suffix is
+/// taken for one.
+const OS_ERRORS: &[&str] = &[
+    "Permission denied",
+    "Operation not permitted",
+    "No such file or directory",
+    "Not a directory",
+    "Is a directory",
+    "File exists",
+    "Directory not empty",
+    "Read-only file system",
+    "Too many levels of symbolic links",
+    "No space left on device",
+    "Device or resource busy",
+    "Resource busy",
+    "Text file busy",
+    "Input/output error",
+    "Bad file descriptor",
+    "Invalid argument",
+    "No such device or address",
+    "File name too long",
+    "Resource temporarily unavailable",
+    "Connection refused",
+];
+
+/// Whether `byte` is a space or a tab.
+fn is_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
+
+/// How long the one of [`OS_ERRORS`] and its ` (os error N)` that `text`
+/// starts with is, if it starts with one.
+fn os_error_len(text: &str) -> Option<usize> {
+    OS_ERRORS.iter().find_map(|words| {
+        let rest = text.strip_prefix(words)?.strip_prefix(" (os error ")?;
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        (digits > 0 && rest.as_bytes().get(digits) == Some(&b')'))
+            .then(|| text.len() - rest.len() + digits + 1)
+    })
+}
+
+/// The words of `input` between `from` and `to`, as byte ranges: what lies
+/// between blanks and the punctuation that sets a word off, `;,()[]{}<>`,
+/// without a `:` at either end. A credential's own `.`, `/`, `+`, `=`, `-`
+/// and `_` stay in its word, and so do a time's `:`.
+fn words(input: &str, from: usize, to: usize) -> Vec<(usize, usize)> {
+    let apart = |c: char| c.is_whitespace() || ";,()[]{}<>".contains(c);
+    let mut found = Vec::new();
+    let mut push = |s: usize, e: usize| {
+        let word = &input[s..e];
+        let trimmed = word.trim_start_matches(':');
+        let s = s + (word.len() - trimmed.len());
+        let e = s + trimmed.trim_end_matches(':').len();
+        if s < e {
+            found.push((s, e));
+        }
+    };
+    let mut start = None;
+    for (i, c) in input[from..to].char_indices() {
+        match (apart(c), start) {
+            (true, Some(s)) => {
+                push(from + s, from + i);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        push(from + s, to);
+    }
+    found
+}
+
+/// Whether the word of `input` from `from` to `to` starts an assignment: a
+/// name, letters, digits, `_`, `-` and `.`, then `=` or `:`, in the word or
+/// after blanks past it, as in `DB_PASSWORD=`, `api_key => x`,
+/// `client_secret := x`, `token: x`, even with nothing after it.
+fn word_starts_assignment(input: &str, from: usize, to: usize) -> bool {
+    let name = input[from..to]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        .count();
+    let next = if from + name < to {
+        input[from + name..].bytes().next()
+    } else {
+        input[to..].bytes().find(|b| !is_blank(b))
+    };
+    name > 0 && matches!(next, Some(b'=' | b':'))
+}
+
+/// Whether `word`, after an operating system's error, is plainly something
+/// else than a credential: an absolute or relative path, `/var/lib/x`,
+/// `./x`, `~/x`; a time, digits and `-:.+TZ` with eight digits or more; a
+/// URL, `https://…`; an address, `ops@example.com`; or an upper-case
+/// identifier, `ERR_CONN_RESET`.
+fn reads_as_no_credential(word: &str) -> bool {
+    let path = ["/", "./", "../", "~/"].iter().any(|p| word.starts_with(p));
+    let time = word.bytes().filter(u8::is_ascii_digit).count() >= 8
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
+    let url = word.contains("://");
+    let address = word.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty()
+            && local
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
+            && domain.contains('.')
+            && domain
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+    });
+    let identifier = word.contains('_')
+        && word.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && word.split('_').all(|part| {
+            part.bytes().all(|b| b.is_ascii_uppercase()) || part.bytes().all(|b| b.is_ascii_digit())
+        });
+    path || time || url || address || identifier
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
@@ -1126,9 +1303,78 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// Replaces secrets in text. Linear in the length of `input`; callers
-/// with text of unknown length bound it first (see [`excerpt`]).
+/// How many readings [`text`] takes at most: a reading can leave what
+/// another rule reads as a secret only once a first rule has redacted
+/// around it, as a header after an assignment's marker. Most text settles
+/// in one or two; text still changing at the last, such as a header before
+/// a long run of backslashed chunks that a reading takes one at a time, is
+/// hidden whole.
+const TEXT_PASSES: usize = 4;
+
+/// Replaces secrets in text, read again until a reading changes nothing,
+/// so redacting the result again changes nothing; text still changing
+/// after [`TEXT_PASSES`] readings is hidden whole, since what a further
+/// reading would hide cannot be told. Linear in the length of `input`;
+/// callers with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
+    let mut output = match text_once(input) {
+        Cow::Owned(once) if once != input => once,
+        _ => return Cow::Borrowed(input),
+    };
+    for _ in 1..text_passes() {
+        let again = text_once(&output).into_owned();
+        if again == output {
+            return Cow::Owned(output);
+        }
+        output = again;
+    }
+    if text_once(&output) == output.as_str() {
+        Cow::Owned(output)
+    } else {
+        Cow::Owned(REDACTED.to_owned())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many readings [`text`] takes at most on this thread, for tests
+    /// that try a lower bound.
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(TEXT_PASSES) };
+}
+
+#[cfg(test)]
+fn text_passes() -> usize {
+    PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn text_passes() -> usize {
+    TEXT_PASSES
+}
+
+/// How surely `name` names a secret in every reading [`text`] makes of it,
+/// and as written too when `written`, the surest taken: a later reading
+/// can hide what made an earlier one name a secret.
+fn read_strength(name: &str, written: bool) -> Strength {
+    let mut surest = if written {
+        name_strength(name)
+    } else {
+        Strength::None
+    };
+    let mut reading = name.to_owned();
+    for _ in 0..=text_passes() {
+        let next = text_once(&reading).into_owned();
+        if next == reading {
+            break;
+        }
+        surest = surer(surest, name_strength(&next));
+        reading = next;
+    }
+    surest
+}
+
+/// One reading of `input` by every text rule (see [`text`]).
+fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
@@ -1352,10 +1598,19 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    // Whether the string read as JSON before text redaction touched it.
+    let was_json = |s: &str| {
+        nested < MAX_NESTED_JSON
+            && s.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+    };
+    let mut opened = false;
+    let mut written = String::new();
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
-        *string = redacted;
+        opened = redacted != *string && was_json(string);
+        written = std::mem::replace(string, redacted);
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
     // can hide where a secret starts, and a secret-named field is only clear
@@ -1364,12 +1619,86 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // JSON that text redaction broke deeper in, in a string it holds:
+        // hidden whole for the same reason.
+        if opened && broke_json_within(&written, &inner, nested) {
+            *string = REDACTED.to_owned();
+            return;
+        }
         let before = inner.clone();
         redact_nested(&mut inner, nested + 1);
         if inner != before {
             *string = inner.to_string();
         }
+    } else if opened {
+        // JSON that text redaction broke: the rules that read its names
+        // and pairs cannot read it, and text redaction alone may leave
+        // their secrets, so it is hidden whole.
+        *string = REDACTED.to_owned();
     }
+}
+
+/// Whether text redaction, which made `texted` of the JSON `written`, broke
+/// JSON held in a string inside it, so the rules that read names and pairs
+/// there no longer can: some string that reads as JSON as written, at a
+/// depth [`redact_string`] opens, is not one at the same place after (see
+/// [`kept_json`]). `nested` is the depth `written` is read at.
+fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
+    serde_json::from_str::<Value>(written)
+        .is_ok_and(|written| !kept_json(&written, texted, nested + 1))
+}
+
+/// Whether every string in `written`, read at depth `nested`, that reads as
+/// JSON is still a string that reads as JSON at the same place in `texted`,
+/// the same keys and indices, and so in turn for what it holds. Where it
+/// cannot be told, a key gone, a list grown or shrunk, or a value of
+/// another type, a place holding JSON counts as broken; one hidden whole
+/// counts as kept, as it shows nothing. JSON that reads as
+/// JSON only after text redaction counts for nothing, so it cannot make up
+/// for JSON broken beside it.
+fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
+    match (written, texted) {
+        (Value::String(string), _) => match opened_json(string, nested) {
+            None => true,
+            Some(written) => texted.as_str().is_some_and(|texted| {
+                texted == REDACTED
+                    || opened_json(texted, nested)
+                        .is_some_and(|texted| kept_json(&written, &texted, nested + 1))
+            }),
+        },
+        // Hidden whole, it shows nothing to read.
+        (_, Value::String(texted)) if texted == REDACTED => true,
+        (Value::Array(written), Value::Array(texted)) if written.len() == texted.len() => written
+            .iter()
+            .zip(texted)
+            .all(|(written, texted)| kept_json(written, texted, nested)),
+        (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
+            texted.get(key).map_or_else(
+                || !holds_json(field, nested),
+                |texted| kept_json(field, texted, nested),
+            )
+        }),
+        (written, _) => !holds_json(written, nested),
+    }
+}
+
+/// Whether `value`, read at depth `nested`, holds a string that reads as
+/// JSON that [`redact_string`] opens.
+fn holds_json(value: &Value, nested: usize) -> bool {
+    match value {
+        Value::String(string) => opened_json(string, nested).is_some(),
+        Value::Array(items) => items.iter().any(|item| holds_json(item, nested)),
+        Value::Object(fields) => fields.values().any(|field| holds_json(field, nested)),
+        _ => false,
+    }
+}
+
+/// `string` parsed, when it reads as JSON that [`redact_string`] opens at
+/// depth `nested`.
+fn opened_json(string: &str, nested: usize) -> Option<Value> {
+    (nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']))
+        .then(|| serde_json::from_str(string).ok())
+        .flatten()
 }
 
 /// Redact what a value held under a name of this strength holds, keeping
@@ -1476,11 +1805,18 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     // Redacted as text first, as it is unopened: what that finds in the
     // string as written, an escaped `\/` before a token say, stays hidden
     // once the JSON is written back without the escape. Text that no
-    // longer reads as JSON is left to be redacted as any string is.
+    // longer reads as JSON is left to [`redact_string`], which hides JSON
+    // that text redaction broke whole.
     let texted = text(string);
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return false;
     };
+    // JSON in a string it holds that text redaction broke: hidden whole,
+    // as [`redact_string`] hides it.
+    if texted != *string && broke_json_within(string, &inner, nested) {
+        *string = REDACTED.to_owned();
+        return true;
+    }
     // Grown past the bound, a second pass would cut it: hidden whole now.
     if texted.len() > MAX_TEXT {
         *string = REDACTED.to_owned();
@@ -1533,9 +1869,7 @@ fn header_named(name: &str) -> Option<&str> {
     } else {
         name.rsplit('.').next().unwrap_or(name)
     };
-    [name, last]
-        .into_iter()
-        .find(|n| HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)))
+    [name, last].into_iter().find(|n| is_header_name(n))
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1598,18 +1932,19 @@ fn base_name(key: &str) -> &str {
 
 /// How surely the field at `key` holds a secret: what its name says (see
 /// [`name_strength`]), number and all, so a second pass reads it as this
-/// one does; for a key renamed, the surer of that and what its new name
-/// said before it was numbered, and, under a secret's name (`held`), what
-/// its original key said and what it said redacted as text too, so a
-/// secret's name redacted, or hidden whole, is still one there.
+/// one does; for a key renamed, the surest of that, of what its new name
+/// said before it was numbered, and of every reading text redaction makes
+/// of its original key (see [`read_strength`]), so a later reading cannot
+/// weaken what an earlier one said; and, under a secret's name (`held`),
+/// of the original key as written too, so a secret's name redacted, or
+/// hidden whole, is still one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     let whole = name_strength(key);
     match renamed.get(key) {
-        Some(r) if held => surer(
-            surer(whole, name_strength(&text(&r.original))),
-            surer(name_strength(&r.original), name_strength(&r.name)),
+        Some(r) => surer(
+            surer(whole, read_strength(&r.original, held)),
+            name_strength(&r.name),
         ),
-        Some(r) => surer(whole, name_strength(&r.name)),
         None => whole,
     }
 }
@@ -1722,6 +2057,26 @@ fn key_looks_like_credential(key: &str) -> bool {
         .is_some_and(|(user, host)| !user.is_empty() && host.contains('.'));
     !(is_not_a_secret(key) || email || key.split(['-', '_', '.', '/', ':']).all(word))
         && looks_like_credential(key)
+}
+
+/// Whether `name` is one of [`HEADERS`], in any case.
+fn is_header_name(name: &str) -> bool {
+    HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether `name` ends, in any case, with one of [`HEADERS`] that starts at
+/// a word boundary, as the header rule finds a header's name inside a longer
+/// one: `X-Authorization`, `http.proxy-authorization`, not `Xauthorization`.
+fn ends_in_header(name: &str) -> bool {
+    HEADERS.iter().any(|h| {
+        let Some(at) = name.len().checked_sub(h.len()) else {
+            return false;
+        };
+        let word_before = name.as_bytes()[..at]
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(h) && !word_before
+    })
 }
 
 /// Header names whose values are credentials.
@@ -1912,10 +2267,19 @@ impl Line {
     }
 
     /// Text that is safe to show as it is: a name a person or a workflow
-    /// chose (a run's id, a gate's), escaped for the terminal, or a value
-    /// redacted already, such as by [`value`] or [`bounded`].
+    /// chose, such as a run's id, or a value redacted already, such as by
+    /// [`value`] or [`bounded`]. It needs no escaping first: the whole line
+    /// is made safe for a terminal when it is written.
     pub fn shown(mut self, text: &str) -> Self {
         self.text.push_str(text);
+        self
+    }
+
+    /// Text that may hold a secret, such as an error or what a model or a
+    /// command said: redacted on its own, so nothing in it changes how the
+    /// names beside it are shown.
+    pub fn redacted(mut self, value: &str) -> Self {
+        self.text.push_str(&text(value));
         self
     }
 

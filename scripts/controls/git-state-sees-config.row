@@ -1,0 +1,1 @@
+git-state-sees-config|crates/atomic/tests/git_repo/mod.rs|        git_in(dir, &["config", "--list", "--local"]),|        String::new(), // CONTROL_OFF|-p atomic-agentic --test run_cli -- a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
