@@ -587,7 +587,11 @@ fn aws_profile_token_files(
         // `scripts/controls/aws-profile-comment.row` switches this off.
         let comment = comment_start(value);
         let mut values = vec![value];
-        values.extend(comment.map(|at| value[..at].trim_end()).filter(|v| !v.is_empty()));
+        values.extend(
+            comment
+                .map(|at| value[..at].trim_end())
+                .filter(|v| !v.is_empty()),
+        );
         for value in values {
             let mut files = vec![named_path(value, here).map_err(refused)?];
             if let Some(rest) = value.strip_prefix("~/") {
@@ -4986,7 +4990,7 @@ mod tests {
         std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
         std::fs::set_permissions(
             dir.join("theirs"),
-            std::os::unix::fs::PermissionsExt::from_mode(0),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
         )
         .expect("mode");
         assert!(
