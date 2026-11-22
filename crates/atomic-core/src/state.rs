@@ -3249,6 +3249,57 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn database_probe_known_holders_keep_codex_records() {
+        for kind in [
+            libc::F_RDLCK as libc::c_short,
+            libc::F_WRLCK as libc::c_short,
+        ] {
+            let home = TestScratch::new("codex-probe-held");
+            let root = home.join("project");
+            std::fs::create_dir(&root).expect("project");
+            let state = ProjectState::under(&home, &root);
+            let codex = state.codex_home();
+            std::fs::create_dir_all(&codex).expect("Codex home");
+            let database = codex.join("state_5.sqlite");
+            std::fs::write(&database, "old Codex record").expect("old database");
+            std::fs::write(codex.join("state_5.sqlite-shm"), "shared memory")
+                .expect("shared-memory file");
+            assert_eq!(
+                DATABASE_PROBE_FAILURE.replace(Some(DatabaseProbeFailure::LockType(kind))),
+                None
+            );
+            let restore = RestoreDatabaseProbe;
+            state
+                .create()
+                .expect("held records stay for the old writer");
+            assert_eq!(
+                std::fs::read_to_string(&database).expect("held record remains"),
+                "old Codex record"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(state.codex_records().join("state_5.sqlite"))
+                    .expect_err("no held record moved")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            drop(restore);
+            state.create().expect("unlocked records can move");
+            assert_eq!(
+                std::fs::symlink_metadata(&database)
+                    .expect_err("old record moved")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(
+                std::fs::read_to_string(state.codex_records().join("state_5.sqlite"))
+                    .expect("record moved"),
+                "old Codex record"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn database_probe_unlocked_shared_memory_allows_migration() {
         let (_home, state, old) = database_probe_fixture("database-probe-unlocked");
         std::fs::write(old.join("atomic.db-shm"), "shared memory").expect("shared-memory file");
