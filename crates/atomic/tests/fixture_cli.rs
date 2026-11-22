@@ -19,9 +19,9 @@
 //! marked `needs_sandbox` and asks for the sandbox, so with the feature on a
 //! sandbox that cannot start fails it. What asks for the sandbox and what does
 //! not is what scripts/backends-check.sh counts on: the tests it names are
-//! exactly the tests the sandbox is for, and each must fail naming it. Four
+//! exactly the tests the sandbox is for, and each must fail naming it. Six
 //! tests ask for no sandbox, because nothing they run reaches a turn: the two
-//! `target.unsafe` refusals, which are made while a run is loaded, and the two
+//! `target.unsafe` refusals, which are made while a run is loaded, and the four
 //! checks of that comparison itself. They run wherever atomic builds.
 
 // Wherever the tests that need the sandbox are not built — Linux without the
@@ -154,6 +154,17 @@ fn shout(line: &str) {
     }
 }
 
+/// The euid of this run when it is root. Root is told past a directory's mode:
+/// it lists a directory whose mode is 000 and reads what an ordinary person is
+/// refused there, so a row that rests on a mode cannot bite for it. Each such
+/// row says so with [`shout`] and every other row still runs.
+fn root_euid() -> Option<u32> {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    #[allow(unsafe_code)]
+    let euid = unsafe { libc::geteuid() };
+    (euid == 0).then_some(euid)
+}
+
 /// A path the comparison of a checkout holds as its own. What it is decides how
 /// it is compared, and that is settled once, by the walk that found it, rather
 /// than asked of the file system again later (see [`working_files`]).
@@ -177,11 +188,12 @@ impl Working {
     /// How `path` stands right now, for a caller that has one and did not walk
     /// to it: a link by what it points at, anything else by its bytes.
     /// `symlink_metadata` answers about the path itself and never follows a
-    /// link, so a repository whose `.git/config` is one is compared as the link
-    /// it is. A path that is not there is kept as the file it would be, whose
-    /// reading says so. [`git_metadata_files`] asks the same question of
-    /// `.git/hooks`, and what the answer is decides whether there is anything
-    /// to walk.
+    /// link *at the end of it*, so a repository whose `.git/config` is one is
+    /// compared as the link it is. It does follow every part before the end: a
+    /// caller asking about a path under a directory a turn could have replaced
+    /// is answered through that link, which is why [`classify_root`] asks about
+    /// such a directory first. A path that is not there is kept as the file it
+    /// would be, whose reading says so.
     fn at(path: &Path) -> Self {
         let kind = match std::fs::symlink_metadata(path) {
             Ok(kind) => kind,
@@ -215,6 +227,63 @@ impl Working {
             },
             Working::Link { target, .. } => format!("{name} link -> {}", target.display()),
         }
+    }
+}
+
+/// How one of the roots under `.git` stands, which is what decides how much of
+/// it is compared — see [`classify_root`].
+enum Root {
+    /// A directory, so what is under it is compared, by the walk it starts.
+    Directory,
+    /// A link, already recorded in `found` by what it points at. Whatever
+    /// stands under that name lives wherever the turn that made the link
+    /// chose, so nothing under it is compared: a walk that begins by listing a
+    /// link lists whatever the link points at, which is how a copy holding the
+    /// same names and the same bytes comes to read as no change at all.
+    Link,
+    /// There, and no directory: the ordinary file a turn put where the
+    /// directory was, already recorded in `found` and compared by its bytes
+    /// like any other path.
+    File,
+    /// Not there at all, which leaves nothing to compare.
+    Absent,
+}
+
+/// Ask `path` what it is before anything under it is read or listed, and record
+/// in `found` the two answers that are a line of their own. It is asked of the
+/// roots a turn with write access can replace wholesale — `.git` itself, and
+/// under it `.git/info` and `.git/hooks` — because each is one path that no
+/// walk of the checkout can see: asking about a path *under* one is answered
+/// through a link standing in its place (see [`Working::at`]), and listing one
+/// lists whatever a link points at. What the answer is decides what is read:
+/// under a link and under a path that is no directory, nothing at all.
+///
+/// Fails closed. Only NotFound is an absence. Anything else — a component along
+/// the way that cannot be searched, a directory whose mode refuses the search,
+/// a link earlier in the path that loops back on itself — is not "nothing is
+/// here", and refuses rather than reads the root as an empty one. A root that is
+/// itself a link that loops back on itself is no such error: the answer is about
+/// the link, which is recorded by where it points.
+fn classify_root(path: &Path, found: &mut Vec<Working>) -> Root {
+    match std::fs::symlink_metadata(path) {
+        Ok(kind) if kind.is_symlink() => {
+            let target = match std::fs::read_link(path) {
+                Ok(target) => target,
+                Err(e) => panic!("cannot read where {} points: {e}", path.display()),
+            };
+            found.push(Working::Link {
+                path: path.to_owned(),
+                target,
+            });
+            Root::Link
+        }
+        Ok(kind) if kind.is_dir() => Root::Directory,
+        Ok(_) => {
+            found.push(Working::File(path.to_owned()));
+            Root::File
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Root::Absent,
+        Err(e) => panic!("cannot ask what {} is to compare it: {e}", path.display()),
     }
 }
 
@@ -252,6 +321,12 @@ enum Walk {
 /// file planted at `sub/.git/x` is compared with every other file — and one at
 /// the top of a walk that is not of the checkout, `.git/hooks/.git` say, is
 /// covered by nothing else and is compared just the same.
+///
+/// The name is asked before the entry's type, so a `.git` that is a link is left
+/// out with the same answer as a directory, whatever the link points at. That is
+/// sound only because [`classify_root`] asks what that one path is before
+/// anything under it is read: a link there is recorded as the link it is, so a
+/// path is never left out of the comparison by both.
 fn skips_the_git_at_the_top(walk: Walk, at_the_top: bool, path: &Path) -> bool {
     at_the_top && walk == Walk::TheCheckout && path.file_name() == Some(OsStr::new(".git"))
 }
@@ -311,51 +386,42 @@ fn working_files(dir: &Path, walk: Walk) -> Vec<Working> {
 /// refreshes it as it runs, and a change *to* the index is what `git status`'s
 /// own lines report.
 ///
-/// The hooks directory is asked what it is before anything is listed, and
-/// compared as the answer: a turn that replaces it with a link takes every
-/// hook out of a walk that starts by listing it, because listing a link lists
-/// whatever it points at, so hooks moved elsewhere read as these very names and
-/// bytes.
+/// The three roots here — `.git` itself, and under it `.git/info` and
+/// `.git/hooks` — are each asked what they are before anything under them is
+/// read or listed, and compared as the answer (see [`classify_root`]). A turn
+/// with write access can move any of those directories elsewhere and leave a
+/// link in its place, and a copy at the other end of the link can hold these
+/// very names and these very bytes: reading through the link, whether by asking
+/// about a path under the root or by listing it, answers with the copy and
+/// reads the swap as no change at all. So nothing under a root is read unless
+/// that root is a directory.
 fn git_metadata_files(dir: &Path) -> Vec<Working> {
     let git = dir.join(".git");
-    let mut found = vec![
-        Working::at(&git.join("config")),
-        Working::at(&git.join("info/exclude")),
-    ];
-    let hooks = git.join("hooks");
-    // `symlink_metadata` answers about the path itself and never follows a
-    // link, so what `is_symlink` answers here is what the path is and not what
-    // it leads to — the one question that decides whether there is anything
-    // here to walk.
-    match std::fs::symlink_metadata(&hooks) {
-        // The directory is a link, so what it holds stands wherever the turn
-        // that made it chose: recorded by what it points at, read from the link
-        // and never followed, and nothing under it is compared.
-        Ok(kind) if kind.is_symlink() => {
-            let target = match std::fs::read_link(&hooks) {
-                Ok(target) => target,
-                Err(e) => panic!("cannot read where {} points: {e}", hooks.display()),
-            };
-            found.push(Working::Link {
-                path: hooks,
-                target,
-            });
+    let mut found = Vec::new();
+    // The checkout's own `.git`, which the checkout walk leaves out by name
+    // before it asks what the entry is (see [`skips_the_git_at_the_top`]), so
+    // this is where that one path is compared — and once it is a link,
+    // everything below here would be read from whatever the link points at.
+    if let Root::Directory = classify_root(&git, &mut found) {
+        // The configuration, the ignore file, and the directory that holds it
+        // asked for before anything under it: `info/exclude` is read by a path,
+        // and a path is followed through a link standing where a directory was.
+        //
+        // What is asked first matters where `.git` itself cannot be searched:
+        // `symlink_metadata` succeeds on a directory whose mode refuses the
+        // search, so it is the asking of a path *under* the unsearchable one
+        // that fails, and the path asked first is the one the refusal names.
+        if let Root::Directory = classify_root(&git.join("info"), &mut found) {
+            found.push(Working::at(&git.join("info/exclude")));
         }
-        // No directory to walk: the ordinary file a turn put there in its place
-        // is compared by its bytes, as any other path is.
-        Ok(kind) if !kind.is_dir() => found.push(Working::File(hooks)),
-        // A directory after all, so its contents are compared — and only its
-        // contents. This walk is not of the checkout, so a directory inside it
-        // spelled `.git` is walked and compared like any other: nothing else
-        // here covers what sits under it.
-        Ok(_) => found.extend(working_files(&hooks, Walk::SomewhereElse)),
-        // Not there at all, which is a repository with no `.git/hooks`, has
-        // nothing to compare. Anything else — a component along the way that
-        // cannot be searched, a link that loops back on itself, a directory
-        // that cannot be read — is not an absence, and the comparison refuses
-        // rather than reads it as an empty one.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => panic!("cannot read what {} is to compare it: {e}", hooks.display()),
+        found.push(Working::at(&git.join("config")));
+        // The hooks, which are a walk and not one path. This walk is not of the
+        // checkout, so a directory inside it spelled `.git` is walked and
+        // compared like any other: nothing else here covers what sits under it.
+        let hooks = git.join("hooks");
+        if let Root::Directory = classify_root(&hooks, &mut found) {
+            found.extend(working_files(&hooks, Walk::SomewhereElse));
+        }
     }
     found
 }
@@ -1107,10 +1173,7 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
         let _ = repository_state(&checkout);
     }));
     std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
-    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
-    #[allow(unsafe_code)]
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
+    if let Some(euid) = root_euid() {
         // Root is told past a directory's mode: it lists `hidden` and every
         // file in it, so nothing is refused here and this row cannot be made to
         // bite. Say so where it will be seen rather than fail; every other row
@@ -1164,17 +1227,21 @@ fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
     );
 }
 
-/// The one path inside `.git` that a turn with write access can replace
-/// wholesale: the hooks directory. Listing a directory that is a link lists
-/// whatever the link points at, so hooks moved elsewhere and linked back in
-/// leave every line of [`repository_state`] exactly as they were — and a
+/// The hooks directory: one of the roots under `.git` that a turn with write
+/// access can replace wholesale, the others being `.git` itself and `.git/info`
+/// (see [`the_git_directory_at_the_top_is_compared_by_what_it_is_and_not_through_a_link`]
+/// and [`the_info_directory_is_compared_by_what_it_is_and_not_through_a_link`],
+/// and [`classify_root`] for the asking). Listing a directory that is a link
+/// lists whatever the link points at, so hooks moved elsewhere and linked back
+/// in leave every line of [`repository_state`] exactly as they were — and a
 /// comparison that never fires reads exactly like one that passed. So the
 /// comparison asks what `.git/hooks` is before it lists it, and never through a
 /// link: a link is recorded by what it points at and nothing under it is
 /// compared; a directory is compared by its contents, and the walk it starts
 /// leaves nothing out by name, which is what keeps a `.git` planted under the
 /// hooks directory in the answer too. And a hooks directory that cannot be
-/// listed fails the comparison rather than reads as an empty one.
+/// asked what it is, or cannot be listed once it is one, fails the comparison
+/// rather than reads as an empty one.
 ///
 /// Like the check above, nothing here runs a turn or reaches a model, so this
 /// test needs no sandbox. The one state it cannot show is a directory whose mode
@@ -1206,19 +1273,32 @@ fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
         std::fs::remove_file(&sample)
             .unwrap_or_else(|e| panic!("cannot remove the sample hook: {e}"));
     }
+    // One hook of this checkout's own left in the emptied directory, so that the
+    // first swap moves a directory that holds something: what the swap is
+    // claimed to leave untouched — every hook's name and every byte under the
+    // link — is then shown by a hook, and not by an empty directory.
+    let hook = hooks.join("post-checkout");
+    write(&hook, "#!/bin/sh\nexit 0\n");
     let (git, whole) = (git_state(&checkout), repository_state(&checkout));
-    assert!(
-        !file_lines(&whole).any(|l| l.starts_with(".git/hooks")),
-        "the hooks directory is compared by a line of its own before anything \
-         is swapped: {}",
+    assert_eq!(
+        file_lines(&whole)
+            .filter(|l| l.starts_with(".git/hooks"))
+            .collect::<Vec<_>>(),
+        [format!(
+            ".git/hooks/post-checkout {}",
+            digest(&std::fs::read(&hook).unwrap())
+        )
+        .as_str()],
+        "the checkout's own hook is not compared, by a line of its own and with \
+         the directory for once having contents, before anything is swapped: {}",
         file_lines(&whole).collect::<Vec<_>>().join(", ")
     );
 
-    // The swap this is about, made with a link to a directory of the person's
-    // own holding nothing else: every hook keeps its name and every byte under
-    // the link, so `git status` says nothing — it names nothing inside `.git` —
-    // and neither does a walk that begins by listing the link, which lists
-    // those same hooks. What changed is the path itself, and it is a link.
+    // The swap this is about, made with a link to the directory its hooks were
+    // moved out to: every hook keeps its name and every byte under the link, so
+    // `git status` says nothing — it names nothing inside `.git` — and neither
+    // does a walk that begins by listing the link, which lists those same hooks.
+    // What changed is the path itself, and it is a link.
     let moved = dir.join("hooks-elsewhere");
     std::fs::create_dir(&moved).unwrap();
     std::fs::rename(&hooks, &moved).unwrap();
@@ -1231,7 +1311,7 @@ fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
     let replaced = repository_state(&checkout);
     assert_eq!(
         left_behind(&whole, &replaced),
-        [".git/hooks"],
+        [".git/hooks", ".git/hooks/post-checkout"],
         "a hooks directory replaced by a link is not reported as a change"
     );
     assert_eq!(
@@ -1262,7 +1342,7 @@ fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
     let linked = repository_state(&checkout);
     assert_eq!(
         left_behind(&whole, &linked),
-        [".git/hooks"],
+        [".git/hooks", ".git/hooks/post-checkout"],
         "hooks read through a link are reported as the checkout's own: {}",
         file_lines(&linked).collect::<Vec<_>>().join(", ")
     );
@@ -1312,10 +1392,7 @@ fn the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link() {
     // one goes.
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&hooks, std::fs::Permissions::from_mode(0o000)).unwrap();
-    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
-    #[allow(unsafe_code)]
-    let euid = unsafe { libc::geteuid() };
-    if euid == 0 {
+    if let Some(euid) = root_euid() {
         shout(&format!(
             "SKIP the mode-000 hooks directory: this runs as root (euid {euid}), which is \
                  told past a directory's mode and lists one whose mode is 000, so the walk's \
@@ -1362,6 +1439,309 @@ fn refusal_of<T>(what: impl FnOnce() -> T) -> String {
             .or_else(|| why.downcast_ref::<&str>().map(|s| (*s).to_owned()))
             .unwrap_or_else(|| "a panic with no message".to_owned()),
     }
+}
+
+/// The lines of a comparison answer whose path is `named`, or sit under it:
+/// what one path of the answer says, which is where the roots under `.git` are
+/// seen — as the link they are, as their bytes, or as the paths under them.
+/// `lines` is [`file_lines`] of a [`repository_state`] answer, or
+/// [`file_state`] read straight for an answer about files alone, which is all a
+/// checkout whose `.git` is no repository can give.
+fn summarize<'a>(lines: impl Iterator<Item = &'a str>, named: &str) -> Vec<&'a str> {
+    let mut prefix = named.to_owned();
+    prefix.push(' ');
+    let under = format!("{named}/");
+    lines
+        .filter(|l| l.starts_with(&prefix) || l.starts_with(&under))
+        .collect()
+}
+
+/// Every path under `from`, with its bytes, at the same path under `to`: what a
+/// turn with write access makes when it moves a directory out and leaves
+/// something else in its place — a copy that keeps the names and the bytes, and
+/// reads as nothing to a comparison that asks through what it left behind.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let at = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &at);
+        } else {
+            std::fs::copy(entry.path(), at).unwrap();
+        }
+    }
+}
+
+/// The second of the roots a turn with write access can replace wholesale:
+/// `.git/info` (see [`classify_root`]). It is never walked, so it looks safe to
+/// leave out of the asking — the comparison reads the one path it holds,
+/// `info/exclude`, by its name. But `symlink_metadata` follows every part of a
+/// path before the last, so asking about `info/exclude` while `info` is a link
+/// answers from whatever that link points at: a directory moved elsewhere and
+/// linked back, with a copy holding this checkout's very `exclude` at the other
+/// end, leaves the ignore file's line exactly as it was. So the comparison asks
+/// what `.git/info` is before it reads anything under it, and reads nothing
+/// under a link.
+///
+/// Nothing here runs a turn or reaches a model, so this test needs no sandbox.
+/// The one row that cannot bite for a run as root — a directory whose mode is
+/// 000, which root is told past — says so with [`shout`] and the rest still
+/// run.
+#[test]
+fn the_info_directory_is_compared_by_what_it_is_and_not_through_a_link() {
+    let dir = scratch("info-state");
+    let checkout = dir.join("dev");
+    write(&checkout.join("price.txt"), "125\n");
+    git_in(&checkout, &["init", "-q"]);
+    git_in(&checkout, &["add", "price.txt"]);
+    git_in(&checkout, &["commit", "-q", "-m", "seed"]);
+    let info = checkout.join(".git/info");
+    let exclude = info.join("exclude");
+    let exclude_bytes = std::fs::read(&exclude).unwrap();
+    let (git, whole) = (git_state(&checkout), repository_state(&checkout));
+    assert_eq!(
+        summarize(file_lines(&whole), ".git/info"),
+        [format!(".git/info/exclude {}", digest(&exclude_bytes)).as_str()],
+        "the repository's own ignore file is not compared before anything is \
+         swapped: {}",
+        summarize(file_lines(&whole), ".git").join(", ")
+    );
+
+    // An ignore directory whose mode refuses the search is not a directory with
+    // nothing in it. The comparison is asked about the directory first, and that
+    // asking succeeds — a directory can be seen even where it cannot be searched
+    // — so the refusal comes one path nearer, from the ignore file it cannot
+    // read, and it names that file. Either way the comparison refuses rather than
+    // answer that there is no ignore file to compare. Root is told past a mode,
+    // so that row says what it cannot show; the swap below runs however this goes.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&info, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if let Some(euid) = root_euid() {
+        shout(&format!(
+            "SKIP the mode-000 info directory: this runs as root (euid {euid}), which is \
+             told past a directory's mode and reads what an ordinary person is refused, so \
+             this refusal cannot be shown here. Run this test as an unprivileged person to \
+             see it."
+        ));
+        // The mode goes back before anything is compared again, so that every
+        // answer below is read from the state the first one was.
+        std::fs::set_permissions(&info, std::fs::Permissions::from_mode(0o755)).unwrap();
+    } else {
+        let why = refusal_of(|| file_state(&checkout));
+        std::fs::set_permissions(&info, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            why.contains(&format!(
+                "cannot read what {} is to compare it",
+                exclude.display()
+            )) && why.contains("Permission denied"),
+            "the ignore file under a directory that cannot be searched was not \
+             refused for its own reason: {why}"
+        );
+    }
+
+    // The swap: the directory moved out, a link left where it was, and the copy
+    // at the other end holding this checkout's own `exclude`. `git status` says
+    // nothing of it — it names nothing inside `.git`, and least of all the
+    // ignore file the repository keeps for itself — and neither does a
+    // comparison that asks `info/exclude` by name, which is answered the
+    // copy's bytes. What changed is the directory itself, and it is a link.
+    let copy = dir.join("info-elsewhere");
+    write(
+        &copy.join("exclude"),
+        &String::from_utf8_lossy(&exclude_bytes),
+    );
+    std::fs::remove_dir_all(&info).unwrap();
+    std::os::unix::fs::symlink(&copy, &info).unwrap();
+    assert_eq!(
+        git_state(&checkout),
+        git,
+        "git reports the ignore directory replaced by a link"
+    );
+    let swapped = repository_state(&checkout);
+    assert_eq!(
+        left_behind(&whole, &swapped),
+        [".git/info", ".git/info/exclude"],
+        "an ignore directory replaced by a link to a copy of itself is not \
+         reported as a change: {}",
+        summarize(file_lines(&swapped), ".git").join(", ")
+    );
+    assert_eq!(
+        summarize(file_lines(&swapped), ".git/info"),
+        [format!(".git/info link -> {}", copy.display()).as_str()],
+        "the ignore directory is not recorded as the link it is, with nothing \
+         under the link read as this checkout's own: {}",
+        summarize(file_lines(&swapped), ".git").join(", ")
+    );
+
+    // The directory and its file put back, byte for byte: every answer above is
+    // the swap's and nothing else's.
+    std::fs::remove_file(&info).unwrap();
+    std::fs::create_dir(&info).unwrap();
+    std::fs::write(&exclude, &exclude_bytes).unwrap();
+    let again = repository_state(&checkout);
+    assert_eq!(
+        again,
+        whole,
+        "the ignore directory put back is not read as it was: {}",
+        left_behind(&whole, &again).join(", ")
+    );
+    std::fs::remove_dir_all(&copy).unwrap();
+}
+
+/// The first of the roots a turn with write access can replace wholesale: the
+/// checkout's `.git` itself (see [`classify_root`]). Nothing else in the
+/// comparison ever sees that path — the checkout walk leaves the name out at the
+/// top before it asks what the entry is (see [`skips_the_git_at_the_top`]), and
+/// everything read under it is read by a path, which a link standing in the way
+/// answers. So a `.git` moved out and linked back to a copy is doubly invisible:
+/// skipped as a name by one half of the comparison and read through by the
+/// other. The asking is what closes both: the path is compared as the link it
+/// is, and nothing under it is read.
+///
+/// The root is swapped twice and put back byte for byte both times, because a
+/// `.git` left pointing at a copy would have git itself read that copy for every
+/// test after this one.
+///
+/// Nothing here runs a turn or reaches a model, so this test needs no sandbox.
+/// The one row that cannot bite for a run as root — a directory whose mode is
+/// 000, which root is told past — says so with [`shout`] and the rest still
+/// run.
+#[test]
+fn the_git_directory_at_the_top_is_compared_by_what_it_is_and_not_through_a_link() {
+    let dir = scratch("dot-git-state");
+    let checkout = dir.join("dev");
+    write(&checkout.join("price.txt"), "125\n");
+    git_in(&checkout, &["init", "-q"]);
+    git_in(&checkout, &["add", "price.txt"]);
+    git_in(&checkout, &["commit", "-q", "-m", "seed"]);
+    let git_dir = checkout.join(".git");
+    let whole = repository_state(&checkout);
+    let clean = git_in(
+        &checkout,
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    let metadata = summarize(file_lines(&whole), ".git");
+    assert!(
+        metadata.iter().any(|l| l.starts_with(".git/config "))
+            && metadata.iter().any(|l| l.starts_with(".git/info/exclude ")),
+        "the metadata under `.git` is not compared, so there is nothing here for \
+         a swap to hide: {}",
+        metadata.join(", ")
+    );
+
+    // A `.git` whose mode is 000 is how a turn with write access hides what it
+    // did inside the metadata. It is not an empty `.git`, and the comparison
+    // refuses rather than answers that there is nothing under it. The asking of
+    // the root itself succeeds — a directory can be seen where it cannot be
+    // searched — so the refusal names the first path asked *under* it, `info`,
+    // which [`git_metadata_files`] asks for before anything else there, and not
+    // `.git` itself: what the guard promises is that some path under the
+    // metadata is refused, not which one says it. Root is told past a mode, so
+    // that row says what it cannot show; every other row here runs however this
+    // one goes.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if let Some(euid) = root_euid() {
+        shout(&format!(
+            "SKIP the mode-000 `.git`: this runs as root (euid {euid}), which is told past \
+             a directory's mode and reads what an ordinary person is refused, so this \
+             refusal cannot be shown here. Run this test as an unprivileged person to see \
+             it."
+        ));
+        // The mode goes back before anything is compared again, so that every
+        // answer below is read from the state the first one was.
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    } else {
+        let why = refusal_of(|| file_state(&checkout));
+        std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            why.contains(&format!(
+                "cannot ask what {} is to compare it",
+                git_dir.join("info").display()
+            )) && why.contains("Permission denied"),
+            "the metadata that cannot be searched was not refused for its own \
+             reason: {why}"
+        );
+    }
+
+    // The swap, twice over. The first is the ordinary one: the metadata moved
+    // out and the very same directory linked back, so every path under it
+    // answers exactly as it did before the move. The second is what a turn
+    // makes: a copy of the metadata planted where the original was, its
+    // configuration, hooks and ignore file holding this checkout's own names and
+    // bytes, so that a comparison reading through the link reports them as this
+    // checkout's own. Each swap is put back before the next row.
+    for copy in [dir.join("git-elsewhere"), dir.join("planted-git")] {
+        copy_tree(&git_dir, &copy);
+        std::fs::remove_dir_all(&git_dir).unwrap();
+        std::os::unix::fs::symlink(&copy, &git_dir).unwrap();
+        assert_eq!(
+            git_in(
+                &checkout,
+                &["status", "--porcelain", "--untracked-files=all"]
+            ),
+            clean,
+            "git reports the metadata replaced by a link to {}",
+            copy.display()
+        );
+        let swapped = repository_state(&checkout);
+        let mut hidden: Vec<&str> = metadata
+            .iter()
+            .map(|line| line.split_once(' ').map_or(*line, |(path, _)| path))
+            .chain(std::iter::once(".git"))
+            .collect();
+        hidden.sort();
+        assert_eq!(
+            left_behind(&whole, &swapped),
+            hidden,
+            "a `.git` replaced by a link to a copy of it is not reported as a \
+             change: {}",
+            summarize(file_lines(&swapped), ".git").join(", ")
+        );
+        assert_eq!(
+            summarize(file_lines(&swapped), ".git"),
+            [format!(".git link -> {}", copy.display()).as_str()],
+            "the checkout's `.git` is not recorded as the link it is, with \
+             nothing under the link read as this checkout's own: {}",
+            summarize(file_lines(&swapped), ".git").join(", ")
+        );
+        // Put back for the next swap, byte for byte, from the copy itself.
+        std::fs::remove_file(&git_dir).unwrap();
+        copy_tree(&copy, &git_dir);
+    }
+    let back = repository_state(&checkout);
+    assert_eq!(
+        summarize(file_lines(&back), ".git"),
+        metadata,
+        "the metadata copied back is not read as it was: {}",
+        left_behind(&whole, &back).join(", ")
+    );
+    // `.git` as an ordinary file where the directory was: no directory to read
+    // under, so its own bytes are the whole of what the comparison may say about
+    // it, and nothing under it is claimed. `git` cannot work at all here, so
+    // this row asks the files and not the repository.
+    std::fs::remove_dir_all(&git_dir).unwrap();
+    std::fs::write(&git_dir, "not a repository\n").unwrap();
+    assert_eq!(
+        summarize(file_state(&checkout).lines(), ".git"),
+        [format!(".git {}", digest(b"not a repository\n")).as_str()],
+        "a `.git` that is no directory is not compared by its bytes alone"
+    );
+
+    // Every one of these undone, from the first copy: what the checkout holds
+    // is what it held before, swap, file and mode included.
+    std::fs::remove_file(&git_dir).unwrap();
+    copy_tree(&dir.join("git-elsewhere"), &git_dir);
+    let again = repository_state(&checkout);
+    assert_eq!(
+        again,
+        whole,
+        "the checkout is as it was again: {}",
+        left_behind(&whole, &again).join(", ")
+    );
+    std::fs::remove_dir_all(dir.join("git-elsewhere")).unwrap();
+    std::fs::remove_dir_all(dir.join("planted-git")).unwrap();
 }
 
 /// The typed text of the `target.unsafe` refusal, and its advice, as
