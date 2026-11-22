@@ -2594,7 +2594,8 @@ fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
 /// Text still changing when the readings run out is hidden whole.
 #[test]
 fn text_still_changing_at_the_bound_is_hidden_whole() {
-    let input = "api_key=Authorization: Cookie: =12";
+    // Still changing after one reading, and settled within the bound.
+    let input = "password=12'Proxy-Authorization: Authorization: '";
     PASSES.with(|p| p.set(1));
     let capped = text(input).into_owned();
     PASSES.with(|p| p.set(TEXT_PASSES));
@@ -2673,4 +2674,43 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
         shown, 0,
         "a value one reading hides shows when the readings repeat"
     );
+}
+
+/// A value left as written is read on: an assignment inside a weak name's
+/// value, and a header inside a header's value that holds no credential,
+/// are found and hidden, however the text is read, and a second pass
+/// changes nothing.
+#[test]
+fn what_a_value_left_as_written_holds_is_read_too() {
+    for (input, secret) in [
+        ("token: password: hunter2", "hunter2"),
+        ("auth: \"password=hunter2 foo\"", "hunter2"),
+        ("Cookie: x-api-key: hunter2abc", "hunter2abc"),
+        ("auth=note api_key=hunter2", "hunter2"),
+        ("token: Cookie: sid=hunter2", "hunter2"),
+        ("Cookie: authorization: Bearer abcdef hunter2", "hunter2"),
+        (
+            "set-cookie: note; authorization: Bearer abcdef hunter2",
+            "hunter2",
+        ),
+    ] {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        for reading in [
+            text(input).into_owned(),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+        ] {
+            assert!(!reading.contains(secret), "{input:?}: {reading}");
+        }
+        let once = text(input).into_owned();
+        assert_eq!(text(&once), once, "{input:?}: a second pass changed it");
+    }
+    assert_kept(&[
+        "token: none",
+        "auth: basic",
+        "Cookie: none",
+        "cookie: theme: dark",
+    ]);
 }

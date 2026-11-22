@@ -1098,8 +1098,11 @@ fn assigned(input: &str) -> Option<String> {
             out.push_str(&input[copied..value_from]);
             out.push_str(REDACTED);
             copied = value_to;
+            at = at.max(value_to);
         }
-        at = at.max(value_to);
+        // A value left as written is read on, from just past its name's
+        // separator: what it holds may be an assignment of its own, as in
+        // `token: password: hunter2` or `auth: "password=hunter2 foo"`.
     }
     if copied == 0 {
         return None;
@@ -1260,6 +1263,28 @@ fn read_strength(name: &str, written: bool) -> Strength {
     surest
 }
 
+/// How many headers inside one another's values [`headers`] reads.
+const HEADERS_WITHIN: usize = 8;
+
+/// `text` with each credential header's value hidden. A header whose value
+/// holds no credential is read on inside its value, `levels` deep, so a
+/// header written there, as in `Cookie: x-api-key: hunter2abc`, is found
+/// too.
+fn headers(text: &str, levels: usize) -> Cow<'_, str> {
+    HEADER.replace_all(text, |c: &Captures<'_>| header_read(c, levels))
+}
+
+/// What [`headers`] makes of one header and its value.
+fn header_read(c: &Captures<'_>, levels: usize) -> String {
+    if is_header_secret(&c[1], &c[3]) {
+        format!("{}{}{REDACTED}", &c[1], &c[2])
+    } else if levels > 0 {
+        format!("{}{}{}", &c[1], &c[2], headers(&c[3], levels - 1))
+    } else {
+        c[0].to_string()
+    }
+}
+
 /// One reading of `input` by every text rule (see [`text`]).
 fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
@@ -1288,13 +1313,7 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
-    apply(&HEADER, &|c| {
-        if is_header_secret(&c[1], &c[3]) {
-            format!("{}{}{REDACTED}", &c[1], &c[2])
-        } else {
-            c[0].to_string()
-        }
-    });
+    apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
     if let Some(replaced) = assigned(&output) {
