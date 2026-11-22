@@ -3193,21 +3193,28 @@ fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
     assert_eq!(twice, once, "a second pass changed it");
 }
 
-/// Held JSON whose value is a chain of assignments, each read only once
-/// text around it is redacted, `password=pass =secret: pass =…`, is still
-/// changing when text redaction's readings run out, so the string is
-/// hidden whole, under a hint and under a secret's name, and a second pass
-/// changes nothing.
+/// Assignment scanning settles a chain in one reading. A recognized secret
+/// at its tail is hidden in held JSON, under a hint, a secret's name and an
+/// ordinary name, and a second pass changes nothing.
 #[test]
-fn a_chain_of_assignments_that_never_settles_is_hidden_whole() {
-    let chain = format!("password=pass{} hunter2", " =secret: pass".repeat(5));
-    for parent in ["key", "token"] {
-        let mut once = json!({ parent: json!({"a": chain}).to_string() });
-        value(&mut once);
-        assert_eq!(once[parent], REDACTED, "under {parent}: not hidden whole");
-        let mut twice = once.clone();
-        value(&mut twice);
-        assert_eq!(twice, once, "under {parent}: a second pass changed it");
+fn a_held_assignment_chain_hides_its_secret_and_settles_in_one_pass() {
+    let secret = format!("ghp_{}", "Aa0".repeat(12));
+    for count in 1..=12 {
+        let chain = format!("password=pass{} {secret}", " =secret: pass".repeat(count));
+        for parent in ["key", "token", "note"] {
+            let mut once = json!({ parent: json!({"a": chain}).to_string() });
+            value(&mut once);
+            assert!(
+                !once.to_string().contains(&secret),
+                "under {parent}, chain {count}: the recognized secret showed"
+            );
+            let mut twice = once.clone();
+            value(&mut twice);
+            assert_eq!(
+                twice, once,
+                "under {parent}, chain {count}: a second pass changed it"
+            );
+        }
     }
 }
 
