@@ -176,6 +176,7 @@ resolve:
 | `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
 | `backend_wait` | `ATOMIC_BACKEND_WAIT` | `--backend-wait` |
 | `budget.*` | `ATOMIC_BUDGET_*`, such as `ATOMIC_BUDGET_ATOM_TOKENS` | |
+| `exec.connections_per_command` | `ATOMIC_EXEC_CONNECTIONS_PER_COMMAND` | |
 
 `ATOMIC_MODEL` also names the model, over a file that set one; a flag and
 `ATOMIC_MODEL_NAME` come after it. An empty `model.base_url` is no endpoint.
@@ -185,6 +186,14 @@ least 1. An empty `ATOMIC_BACKEND_WAIT` sets nothing, but a null, `~` or blank
 value, in a file or a variable, is refused, so a higher layer cannot remove a
 limit a lower one set: to override it, set a larger number. Without it, a step
 waits for as long as it takes.
+
+`exec.connections_per_command` is how many connections an exec atom's command
+that declares hosts may hold through its proxy at once: 64 unless set, and a
+whole number from 1 to 128 when it is. One more is closed at once. A
+connection the proxy has not answered within 10 seconds of its first request
+is closed too, and atomic reserves open files for each command by this number;
+[network access](atom-files.md#network-access) says how connections are
+counted.
 
 The budget settings are the `budget` section: `budget.atom.*`,
 `budget.workflow.*`, `budget.call.*` and the `budget.pricing` table.

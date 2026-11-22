@@ -55,20 +55,39 @@
 //! to. A command's token admits no new connection once the command ends,
 //! and the proxy stops once no command needs it.
 //!
+//! The command's bridge reaches the proxy only through a relay of atomic's
+//! own ([`relay`]), which holds each command to its own number of live
+//! connections: [`DEFAULT_CONNECTIONS_PER_COMMAND`], 64, unless
+//! `exec.connections_per_command` says otherwise. The token the bridge sends
+//! is the relay's; the relay opens each connection it lets through with
+//! another, the proxy's, which never leaves atomic's process, so the proxy
+//! accepts no connection that has not passed the relay. A connection the
+//! relay cannot attribute to a running command, one over its command's
+//! limit, and one the relay cannot pass on (out of descriptors, or a proxy
+//! that does not accept within [`CONNECT_TIMEOUT`]) is closed, never passed
+//! through uncounted. A connection whose first request the proxy has not
+//! answered within that timeout is closed too.
+//!
 //! Each command that declares hosts is admitted against a budget of file
-//! descriptors ([`Budget`]): it reserves [`DESCRIPTORS_PER_COMMAND`], two for
-//! each of the 128 connections its sandbox's bridge keeps open to the proxy
-//! at once, and together the commands may reserve no more than half of
-//! atomic's limit on open files, which atomic first raises toward its hard
-//! limit. A command that would pass it does not start. The budget holds
-//! while upstreams answer and close as they should; it is not a limit the
-//! proxy enforces. Codex's proxy answers `CONNECT` before it dials, with no
-//! dial timeout of its own (the kernel's connect timeout still applies), may
-//! dial more than once for one connection, keeps a
-//! connection's descriptors for a while after the bridge has dropped it, and
-//! keeps a tunnel open until the upstream closes it, so a command that keeps
-//! opening and abandoning connections to a host that never answers can hold
-//! more than its share.
+//! descriptors ([`Budget`]): it reserves [`descriptors_per_command`] for its
+//! limit, [`DESCRIPTORS_PER_COMMAND`] for the default one, and together the
+//! commands may reserve no more than half of atomic's limit on open files,
+//! which atomic first raises toward its hard limit. A command that would
+//! pass it does not start. The relay counts a connection until the proxy
+//! has let go of it, since Codex's proxy answers `CONNECT` before it dials,
+//! with no dial timeout of its own, and keeps the connection until that dial
+//! ends; and until the kernel's connect timeout has passed for a request
+//! the proxy never answered, since a dial it started may outlive the
+//! connection, and since the client last sent anything on any connection
+//! the relay closed itself, at its timeout or at the command's end, while
+//! the proxy held it. A command that keeps opening and abandoning connections to a
+//! host that never answers holds its limit and is refused more until those
+//! dials end. Two things stay outside the count: a name that resolves to
+//! several addresses may leave the proxy's dials to the others running
+//! after one connected and the connection was answered, until the kernel
+//! gives them up; and a tunnel is kept open until its upstream closes it,
+//! though the relay closes its own side when the command ends. A command's
+//! room is given back once its last connection has let go.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
@@ -80,6 +99,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+
+mod relay;
+
+pub use relay::{CONNECT_TIMEOUT, DEFAULT_CONNECTIONS_PER_COMMAND, MAX_CONNECTIONS_PER_COMMAND};
 
 /// The most hosts one atom may declare.
 pub const MAX_HOSTS: usize = 32;
@@ -292,8 +315,10 @@ impl NetworkPolicyDecider for DeclaredHosts {
     }
 }
 
-/// A running proxy for one list of hosts.
+/// A running proxy for one list of hosts, and the relay in front of it.
 struct Running {
+    /// Dropped first, so no connection is relayed to a proxy that stopped.
+    relay: relay::Relay,
     proxy: NetworkProxy,
     _handle: NetworkProxyHandle,
     /// This machine's addresses when it started, which it never reaches.
@@ -362,13 +387,21 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
 
 /// The most connections the sandbox helper's bridge opens to a command's
 /// proxy at once (Codex's Linux sandbox caps each route at this).
-const BRIDGE_CONNECTIONS: u64 = 128;
+const BRIDGE_CONNECTIONS: u64 = MAX_CONNECTIONS_PER_COMMAND as u64;
 
-/// The file descriptors atomic reserves for a command's proxy connections:
-/// two for each connection its bridge may have open, the command's and one
-/// upstream, and some to spare. A reservation, not a bound the proxy holds
-/// connections to; see the module documentation.
-pub const DESCRIPTORS_PER_COMMAND: u64 = 2 * BRIDGE_CONNECTIONS + 16;
+/// The file descriptors atomic reserves for a command allowed `limit`
+/// connections at once: one in the relay for each connection its bridge
+/// may have open, which the relay closes at once past the limit; and for
+/// each connection the relay lets through, its own to the proxy, the
+/// proxy's end of that, and up to three dials the proxy makes at once for
+/// it; and some to spare. See the module documentation for what the count
+/// leaves out.
+pub const fn descriptors_per_command(limit: u32) -> u64 {
+    BRIDGE_CONNECTIONS + 5 * limit as u64 + 16
+}
+
+/// [`descriptors_per_command`] for [`DEFAULT_CONNECTIONS_PER_COMMAND`].
+pub const DESCRIPTORS_PER_COMMAND: u64 = descriptors_per_command(DEFAULT_CONNECTIONS_PER_COMMAND);
 
 /// Room in this process's file descriptors for commands' proxy
 /// connections: half of its limit on open files, the rest left to atomic's
@@ -380,8 +413,9 @@ struct Budget(Mutex<u64>);
 #[cfg(not(test))]
 static BUDGET: Budget = Budget(Mutex::new(0));
 
-/// One command's room in a [`Budget`], given back when it ends.
-struct Reservation(&'static Budget);
+/// One command's room in a [`Budget`], so many descriptors, given back
+/// when its last connection has let go.
+struct Reservation(&'static Budget, u64);
 
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -390,32 +424,32 @@ impl Drop for Reservation {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *reserved = reserved.saturating_sub(DESCRIPTORS_PER_COMMAND);
+        *reserved = reserved.saturating_sub(self.1);
     }
 }
 
 impl Budget {
-    /// Room for one more command's connections within half of `limit`, or
-    /// why there is none.
-    fn reserve(&'static self, limit: u64) -> anyhow::Result<Reservation> {
+    /// Room for one more command's connections, `each` descriptors, within
+    /// half of `limit`, or why there is none.
+    fn reserve(&'static self, limit: u64, each: u64) -> anyhow::Result<Reservation> {
         let share = limit / 2;
         let mut reserved = self
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *reserved + DESCRIPTORS_PER_COMMAND > share {
+        if *reserved + each > share {
             anyhow::bail!(
                 "{} commands that declare hosts are running, and atomic's limit of {limit} open \
                  files leaves room for {} at once: their proxy connections may take half of it, \
-                 {DESCRIPTORS_PER_COMMAND} for each. atomic raises its own limit only as far as \
-                 its hard limit and at most to {RAISED_LIMIT}; to run more at once, raise its \
-                 hard limit or start it with a higher soft limit",
-                *reserved / DESCRIPTORS_PER_COMMAND,
-                share / DESCRIPTORS_PER_COMMAND,
+                 {each} for each. atomic raises its own limit only as far as its hard limit and \
+                 at most to {RAISED_LIMIT}; to run more at once, raise its hard limit, start it \
+                 with a higher soft limit, or lower exec.connections_per_command",
+                *reserved / each,
+                share / each,
             );
         }
-        *reserved += DESCRIPTORS_PER_COMMAND;
-        Ok(Reservation(self))
+        *reserved += each;
+        Ok(Reservation(self, each))
     }
 }
 
@@ -443,9 +477,9 @@ fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
 /// raised as far as the hard one allows, up to [`RAISED_LIMIT`]; the
 /// commands atomic starts afterwards inherit it.
 #[allow(unsafe_code, clippy::unnecessary_cast)]
-fn reserve_room(budget: &'static Budget) -> anyhow::Result<Reservation> {
+fn reserve_room(budget: &'static Budget, each: u64) -> anyhow::Result<Reservation> {
     let mut limit = descriptor_limits()?;
-    let refused = match budget.reserve(limit.rlim_cur as u64) {
+    let refused = match budget.reserve(limit.rlim_cur as u64, each) {
         Ok(room) => return Ok(room),
         Err(why) => why,
     };
@@ -459,21 +493,24 @@ fn reserve_room(budget: &'static Budget) -> anyhow::Result<Reservation> {
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
         return Err(refused);
     }
-    budget.reserve(raised)
+    budget.reserve(raised, each)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
 /// holds it, and its token works until it lets go.
 pub(crate) type Lease = Arc<dyn std::any::Any + Send + Sync>;
 
-/// One command's hold on a proxy.
+/// One command's hold on a proxy. Its room among the process's file
+/// descriptors is the relay's to keep, until the command's last connection
+/// has let go.
 struct Leased {
-    /// The proxy scoped to this command, which keeps its token registered;
-    /// dropped first, so the token stops working before the proxy might.
+    /// The command's admission to the relay, dropped first, so its token
+    /// admits no connection once the command has ended.
+    _admission: relay::Admission,
+    /// The proxy scoped to this command, which keeps the proxy's token for
+    /// it registered; dropped before the proxy might stop.
     _scope: NetworkProxy,
     _running: Arc<Running>,
-    /// Its room among the process's file descriptors.
-    _room: Reservation,
 }
 
 /// A token for one command's bridge to open its connections with: 32 random
@@ -489,6 +526,8 @@ fn token() -> anyhow::Result<String> {
 #[derive(Clone)]
 pub(crate) struct Proxies {
     running: Arc<Mutex<HashMap<Vec<String>, Weak<Running>>>>,
+    /// How many connections each command may hold at once.
+    per_command: u32,
     /// The descriptor budget its commands reserve room in: the process's,
     /// or, in a unit test, one of the test's own.
     budget: &'static Budget,
@@ -508,6 +547,7 @@ impl Default for Proxies {
         let budget = &BUDGET;
         Self {
             running: Arc::default(),
+            per_command: DEFAULT_CONNECTIONS_PER_COMMAND,
             budget,
             #[cfg(test)]
             own_for_tests: Arc::default(),
@@ -535,22 +575,90 @@ fn runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
     }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
-        .thread_name("atomic-network-proxy")
+        .thread_name(relay::RUNTIME_THREAD)
         .enable_all()
         .build()?;
     Ok(RUNTIME.get_or_init(|| rt))
 }
 
-/// Whether `running` still accepts connections.
+/// Whether `running`, its proxy and its relay, still accepts connections.
 fn alive(running: &Running) -> bool {
-    std::net::TcpStream::connect_timeout(
-        &running.proxy.http_addr(),
-        std::time::Duration::from_secs(1),
-    )
-    .is_ok()
+    [running.proxy.http_addr(), running.relay.addr()]
+        .iter()
+        .all(|addr| {
+            std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(1)).is_ok()
+        })
+}
+
+/// `prepared`, as the proxy prepared it for a command, sending the command
+/// to the relay at `relay` instead of the proxy at `codex`, with `token`,
+/// the relay's, for its bridge: every variable naming the proxy names the
+/// relay, and the relay's port is the only one the sandbox routes. Refused
+/// when the proxy routed another port, or named itself in a form this does
+/// not rewrite, since the bridge would then reach it past the relay.
+fn through_relay(
+    mut prepared: PreparedManagedNetwork,
+    codex: std::net::SocketAddr,
+    relay: std::net::SocketAddr,
+    token: &str,
+) -> anyhow::Result<PreparedManagedNetwork> {
+    anyhow::ensure!(
+        prepared.sandbox_context.loopback_ports == [codex.port()],
+        "the proxy routes the command to the ports {:?}, not only its own, {}",
+        prepared.sandbox_context.loopback_ports,
+        codex.port()
+    );
+    let (from, to) = (format!("http://{codex}"), format!("http://{relay}"));
+    let mut rewritten = 0;
+    for value in prepared.env.values_mut() {
+        if *value == from {
+            value.clone_from(&to);
+            rewritten += 1;
+        }
+    }
+    anyhow::ensure!(
+        rewritten > 0,
+        "the proxy named itself in none of the command's variables"
+    );
+    if let Some(key) = prepared
+        .env
+        .iter()
+        .find(|(_, value)| names(value, &codex.to_string()))
+        .map(|(key, _)| key)
+    {
+        anyhow::bail!(
+            "the proxy named itself in {key} in a form atomic does not send to its relay"
+        );
+    }
+    prepared.env.insert(
+        codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY.to_owned(),
+        token.to_owned(),
+    );
+    prepared.sandbox_context.loopback_ports = vec![relay.port()];
+    Ok(prepared)
+}
+
+/// Whether `value` names `addr`, a `host:port`: holds it with no digit
+/// after, so `127.0.0.1:4312` is not read in `127.0.0.1:43120`.
+fn names(value: &str, addr: &str) -> bool {
+    value
+        .match_indices(addr)
+        .any(|(at, _)| !value[at + addr.len()..].starts_with(|c: char| c.is_ascii_digit()))
 }
 
 impl Proxies {
+    /// The same proxies, letting each command hold `per_command`
+    /// connections at once, from 1 to [`MAX_CONNECTIONS_PER_COMMAND`].
+    pub(crate) fn limiting(mut self, per_command: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            (1..=MAX_CONNECTIONS_PER_COMMAND).contains(&per_command),
+            "exec.connections_per_command is {per_command}; a command may hold from 1 to \
+             {MAX_CONNECTIONS_PER_COMMAND} connections at once"
+        );
+        self.per_command = per_command;
+        Ok(self)
+    }
+
     /// `env` with the variables that send a command's traffic through the
     /// proxy for `hosts`, started now if none runs for them, and what the
     /// sandbox needs to route it there; with the lease that keeps the proxy
@@ -571,7 +679,7 @@ impl Proxies {
         // A proxy started before this machine's addresses changed would
         // reach a new one: start another.
         let own = self.own()?;
-        let room = reserve_room(self.budget)?;
+        let room = reserve_room(self.budget, descriptors_per_command(self.per_command))?;
         let running = {
             let mut proxies = self
                 .running
@@ -591,14 +699,16 @@ impl Proxies {
                 }
             }
         };
-        // Each command gets a token of its own, which its helper's bridge
-        // sends first on every connection; the command never sees it.
+        // Each command gets two tokens of its own: the relay's, which its
+        // helper's bridge sends first on every connection and the command
+        // never sees, and the proxy's, which the relay sends in its place
+        // and which never leaves this process.
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let token = token()?;
+        let codex_token = token()?;
         let scope = running.proxy.for_execution(
             "atomic",
             &format!("command-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
-            token.clone(),
+            codex_token.clone(),
             None,
             None,
         )?;
@@ -607,13 +717,24 @@ impl Proxies {
             prepared
                 .env
                 .get(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY)
-                .is_some_and(|t| *t == token),
+                .is_some_and(|t| *t == codex_token),
             "the proxy did not hand the command's bridge its token"
         );
+        let relay_token = token()?;
+        let prepared = through_relay(
+            prepared,
+            running.proxy.http_addr(),
+            running.relay.addr(),
+            &relay_token,
+        )?;
+        let admission =
+            running
+                .relay
+                .admit(relay_token, codex_token, self.per_command, Box::new(room))?;
         let lease: Lease = Arc::new(Leased {
+            _admission: admission,
             _scope: scope,
             _running: running,
-            _room: room,
         });
         Ok((prepared, lease))
     }
@@ -692,7 +813,9 @@ async fn start(
         .build()
         .await?;
     let handle = proxy.run().await?;
+    let relay = relay::Relay::start(proxy.http_addr(), relay::Timeouts::production()).await?;
     Ok(Running {
+        relay,
         proxy,
         _handle: handle,
         own,
@@ -968,12 +1091,26 @@ mod tests {
         attempt().unwrap_or_else(|e| format!("{:?}", e.kind()))
     }
 
+    /// The proxy's own address, past the relay, for a command's `lease`.
+    fn proxy_addr(lease: &Lease) -> String {
+        lease
+            .downcast_ref::<Leased>()
+            .expect("a running proxy")
+            ._running
+            .proxy
+            .http_addr()
+            .to_string()
+    }
+
     /// Only a confined command's bridge can use its proxy. A client on this
     /// machine's loopback interface without the command's token is refused
-    /// before its host is looked at, as is one with a token the proxy never
-    /// issued, or a token whose command has ended. With the command's token
-    /// the same request passes, to be refused only by the address check,
-    /// since the host never resolves.
+    /// by the relay before anything reaches the proxy, as is one with a
+    /// token the relay never issued, or a token whose command has ended.
+    /// With the command's token the same request passes, to be refused only
+    /// by the address check, since the host never resolves. Past the relay,
+    /// the proxy itself refuses a request without a token before its host
+    /// is looked at, and drops one with the token the bridge holds, which
+    /// is the relay's, not the proxy's.
     #[test]
     fn only_a_commands_bridge_can_use_its_proxy() {
         let proxies = Proxies::default();
@@ -995,11 +1132,27 @@ mod tests {
             .trim_end_matches('/')
             .to_owned();
         let token = prepared.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone();
+        let proxy = proxy_addr(&lease);
+        assert_ne!(addr, proxy, "the command is sent to the relay");
+        assert_eq!(
+            prepared.sandbox_context.loopback_ports,
+            [addr
+                .rsplit_once(':')
+                .expect("port")
+                .1
+                .parse::<u16>()
+                .expect("port")],
+            "the sandbox routes only the relay's port"
+        );
 
-        assert_eq!(fetch(&addr, None), format!("403 {UNATTRIBUTED_REFUSED}"));
+        let unframed = fetch(&addr, None);
+        assert!(dropped(&unframed), "{unframed}");
         let forged = fetch(&addr, Some(&"0".repeat(64)));
         assert!(dropped(&forged), "{forged}");
         assert_eq!(fetch(&addr, Some(&token)), "403 not_allowed_local");
+        assert_eq!(fetch(&proxy, None), format!("403 {UNATTRIBUTED_REFUSED}"));
+        let past_relay = fetch(&proxy, Some(&token));
+        assert!(dropped(&past_relay), "{past_relay}");
 
         drop(lease);
         assert_eq!(proxies.running(), 1, "the other command holds it");
@@ -1086,7 +1239,8 @@ mod tests {
             .trim_start_matches("http://")
             .trim_end_matches('/')
             .to_owned();
-        assert_eq!(fetch_from(&addr, None, "127.0.0.1"), "403 denied");
+        let token = &prepared.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY];
+        assert_eq!(fetch_from(&addr, Some(token), "127.0.0.1"), "403 denied");
     }
 
     /// A proxy is used again only while this machine has the addresses it
@@ -1125,12 +1279,15 @@ mod tests {
             proxy_of(&moved),
             "new addresses: a new proxy"
         );
+        let token = |p: &PreparedManagedNetwork| {
+            p.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone()
+        };
         assert_eq!(
-            fetch_from(&proxy_of(&moved), None, "[2001:db8::6]"),
+            fetch_from(&proxy_of(&moved), Some(&token(&moved)), "[2001:db8::6]"),
             "403 denied"
         );
         assert_eq!(
-            fetch_from(&proxy_of(&first), None, "[2001:db8::5]"),
+            fetch_from(&proxy_of(&first), Some(&token(&first)), "[2001:db8::5]"),
             "403 denied"
         );
     }
@@ -1182,10 +1339,11 @@ mod tests {
     #[test]
     fn commands_share_half_the_descriptor_limit() {
         static OURS: Budget = Budget(Mutex::new(0));
-        let limit = 4 * DESCRIPTORS_PER_COMMAND + 1;
-        let first = OURS.reserve(limit).expect("room for one");
-        let second = OURS.reserve(limit).expect("room for two");
-        let Err(why) = OURS.reserve(limit) else {
+        let each = DESCRIPTORS_PER_COMMAND;
+        let limit = 4 * each + 1;
+        let first = OURS.reserve(limit, each).expect("room for one");
+        let second = OURS.reserve(limit, each).expect("room for two");
+        let Err(why) = OURS.reserve(limit, each) else {
             panic!("room for a third");
         };
         assert!(
@@ -1194,12 +1352,78 @@ mod tests {
             "{why}"
         );
         drop(first);
-        let third = OURS.reserve(limit).expect("room again");
+        let third = OURS.reserve(limit, each).expect("room again");
         drop((second, third));
         assert_eq!(*OURS.0.lock().expect("budget"), 0);
-        assert!(
-            OURS.reserve(2 * DESCRIPTORS_PER_COMMAND - 1).is_err(),
-            "half, not all"
+        assert!(OURS.reserve(2 * each - 1, each).is_err(), "half, not all");
+        // A smaller limit reserves less, and fits where the default would
+        // not.
+        let small = descriptors_per_command(1);
+        assert!(small < each);
+        let room = OURS
+            .reserve(2 * small, small)
+            .expect("room for the small one");
+        drop(room);
+    }
+
+    /// The variables that name the proxy name the relay instead, the
+    /// relay's token replaces the proxy's, and the relay's port is the only
+    /// one routed. A proxy that names itself any other way, or routes
+    /// another port, is refused, since the bridge would reach it past the
+    /// relay.
+    #[test]
+    fn a_command_is_sent_to_the_relay_not_the_proxy() {
+        let codex: std::net::SocketAddr = "127.0.0.1:4312".parse().expect("address");
+        let relay: std::net::SocketAddr = "127.0.0.1:43120".parse().expect("address");
+        let key = codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
+        let prepared = |env: &[(&str, &str)], ports: Vec<u16>| PreparedManagedNetwork {
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            sandbox_context: codex_network_proxy::ManagedNetworkSandboxContext {
+                loopback_ports: ports,
+                ..Default::default()
+            },
+        };
+        let ok = through_relay(
+            prepared(
+                &[
+                    ("HTTP_PROXY", "http://127.0.0.1:4312"),
+                    ("ALL_PROXY", "http://127.0.0.1:4312"),
+                    ("NO_PROXY", ""),
+                    (key, "the-proxys-token"),
+                ],
+                vec![4312],
+            ),
+            codex,
+            relay,
+            "the-relays-token",
+        )
+        .expect("rewritten");
+        assert_eq!(ok.env["HTTP_PROXY"], "http://127.0.0.1:43120");
+        assert_eq!(ok.env["ALL_PROXY"], "http://127.0.0.1:43120");
+        assert_eq!(ok.env[key], "the-relays-token");
+        assert_eq!(ok.sandbox_context.loopback_ports, [43120]);
+
+        let refused = |env: &[(&str, &str)], ports: Vec<u16>| {
+            through_relay(prepared(env, ports), codex, relay, "t")
+                .expect_err("refused")
+                .to_string()
+        };
+        let other_port = refused(&[("HTTP_PROXY", "http://127.0.0.1:4312")], vec![4312, 1080]);
+        assert!(other_port.contains("not only its own"), "{other_port}");
+        let none = refused(&[("HTTP_PROXY", "http://127.0.0.1:9")], vec![4312]);
+        assert!(none.contains("in none of"), "{none}");
+        let other_form = refused(
+            &[
+                ("HTTP_PROXY", "http://127.0.0.1:4312"),
+                ("WS_PROXY", "127.0.0.1:4312"),
+            ],
+            vec![4312],
         );
+        assert!(other_form.contains("WS_PROXY"), "{other_form}");
+        assert!(names("x 127.0.0.1:4312/", "127.0.0.1:4312"));
+        assert!(!names("127.0.0.1:43120", "127.0.0.1:4312"));
     }
 }

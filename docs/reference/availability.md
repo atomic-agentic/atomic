@@ -225,7 +225,9 @@ directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);
 the kernel keyrings; the network, unless an exec atom declares the hosts it
-reaches, and then all but those, which it reaches through atomic's proxy; and
+reaches, and then all but those, which it reaches through atomic's proxy, at
+most 64 connections at once unless `exec.connections_per_command` says
+otherwise (see [network access](atom-files.md#network-access)); and
 sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A command does not start when a denial
