@@ -680,10 +680,10 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
         ));
         let reader = tokio::spawn(turn(
             vec![format!(
-                "{}; {}; \
-                 if ls -A \"$HOME\" >/dev/null 2>&1; then echo reader-home=listed; \
-                 else echo reader-home=unreachable; fi; \
-                 echo reader-home-says=$(ls -A \"$HOME\" 2>&1 | head -1)",
+                "{}; {}; echo reader-home=$HOME; own=$(dirname \"$CARGO_HOME\"); \
+                 if ls -A \"$own\" >/dev/null 2>&1; then echo reader-own=listed; \
+                 else echo reader-own=unreachable; fi; \
+                 echo reader-own-says=$(ls -A \"$own\" 2>&1 | head -1)",
                 wait(&first_wrote, "first"),
                 look("reader-found", &root, "secret-of-the-first"),
             )],
@@ -734,11 +734,14 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                 && writer.contains("writer-home-own=2\\n"),
             "the writing turn read another's scratch, or lost its own: {writer}"
         );
-        // Not an empty directory: one it may not open at all.
+        // Its own scratch directory, where its CARGO_HOME is, is not an
+        // empty directory but one it may not open at all; so its HOME is a
+        // path that does not exist instead.
         assert!(
             reader.contains("saw-first")
                 && reader.contains("reader-found=0\\n")
-                && reader.contains("reader-home=unreachable")
+                && reader.contains("reader-home=/nonexistent\\n")
+                && reader.contains("reader-own=unreachable")
                 && reader.contains("Permission denied"),
             "the read-only turn read the first's scratch, or reached its own: {reader}"
         );
