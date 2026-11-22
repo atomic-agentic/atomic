@@ -992,11 +992,24 @@ fn program(path: &Path) -> bool {
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
+#[cfg(test)]
 fn denied_paths(
     private: &PrivateState,
     codex_home: &Path,
     cwd: Option<&Path>,
     writable: &[PathBuf],
+) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    denied_paths_with(private, codex_home, cwd, writable, &[])
+}
+
+/// [`denied_paths`], with `also` denied besides by [`deny_also`]: not in the
+/// list, but counted in its cap as each command counts them.
+fn denied_paths_with(
+    private: &PrivateState,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let given = writable;
@@ -1315,13 +1328,16 @@ fn denied_paths(
     }
     // The cap again, counted as each command's sandbox helper counts it
     // (see `late_targets`): the second mounts of all the list denies, its
-    // second mounts among them, and of each directory whose databases it
-    // denies; so a list a thread starts with does not refuse its commands.
+    // second mounts among them and what `deny_also` will deny besides (the
+    // backend's scratch directories), and of each directory whose databases
+    // it denies; so a list a thread starts with does not refuse its commands.
     let homes: Vec<PathBuf> = std::iter::once(home_spelled)
         .chain(home_aliases.iter().cloned())
         .collect();
-    let counted =
-        crate::mounts::second_mounts(&[&all, &homes]).map_err(|e| refuse(format!("{e:#}")))?;
+    let mut as_commands_see = all.clone();
+    as_commands_see.extend(also.iter().cloned());
+    let counted = crate::mounts::second_mounts(&[&as_commands_see, &homes])
+        .map_err(|e| refuse(format!("{e:#}")))?;
     let (mounted, home_mounts) = (counted[0].len(), counted[1].len());
     let as_commands_count = link_count + mounted + home_mounts;
     if as_commands_count > MAX_LINK_TARGETS {
@@ -1631,6 +1647,20 @@ fn real_spelling(path: &Path) -> PathBuf {
     }
 }
 
+/// The directory of `writable` that a denied place which is itself a link,
+/// at `link`, sits inside, at any depth. The sandbox mounts its denial on
+/// what the link points at, not on the link, so a command that may write
+/// there could remove the link, and once the list no longer finds it, read
+/// what it pointed at by its own path.
+#[cfg(any(target_os = "linux", test))]
+fn writable_holding_link<'a>(writable: &'a [PathBuf], link: &Path) -> Option<&'a PathBuf> {
+    let at = match (link.parent(), link.file_name()) {
+        (Some(parent), Some(name)) => real_spelling(parent).join(name),
+        _ => link.to_owned(),
+    };
+    writable.iter().find(|w| at.starts_with(w))
+}
+
 /// The first of the directories above `path` that is a link inside one of
 /// `writable`, which a command could point elsewhere.
 fn rewritable_link(path: &Path, writable: &[PathBuf]) -> Option<PathBuf> {
@@ -1678,6 +1708,20 @@ pub(crate) fn permission_profile(
     cwd: Option<&Path>,
     writable: &[PathBuf],
 ) -> anyhow::Result<PermissionProfile> {
+    permission_profile_with(sandbox, guard, codex_home, cwd, writable, &[])
+}
+
+/// [`permission_profile`], for a profile that [`deny_also`] will deny
+/// `also` in as well: counted toward the cap as each command's sandbox
+/// helper will count them, though denied by `deny_also`.
+pub(crate) fn permission_profile_with(
+    sandbox: crate::typed::Sandbox,
+    guard: &StateGuard,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
+) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
     };
@@ -1719,7 +1763,7 @@ pub(crate) fn permission_profile(
             FileSystemAccessMode::Read,
         ));
     }
-    let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
+    let (paths, globs) = denied_paths_with(private, codex_home, cwd, writable, also)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
             .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
@@ -2809,6 +2853,19 @@ fn late_targets(
         }
         Ok(())
     };
+    // A denied place that is a link inside a directory the command may write,
+    // as when the list is built.
+    let refuse_link_in_writable = |link: &Path| -> anyhow::Result<()> {
+        if let Some(root) = writable_holding_link(&writable, link) {
+            bail!(DenyRefused(format!(
+                "{} is now a link inside {}, which this command may write, so it could remove \
+                 it and then read what it points at by its own path",
+                link.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
     let mut late = Late::default();
     // A denied entry that is now a link, however it is spelled: the list
     // never holds one, and the sandbox cannot mount on one. Its denial is
@@ -2818,6 +2875,7 @@ fn late_targets(
             continue;
         }
         late.replaced.push(entry.clone());
+        refuse_link_in_writable(entry)?;
         let Some(target) = resolved(entry)? else {
             continue;
         };
@@ -2840,6 +2898,7 @@ fn late_targets(
             // A place that is a link: refused when it leads to what the
             // command needs, whatever that is, or deep inside a directory it
             // may write, as when the list is built.
+            refuse_link_in_writable(place)?;
             let Some(target) = resolved(place)? else {
                 continue;
             };
@@ -4130,7 +4189,7 @@ where
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
         Constrained::allow_any(deny_also(
-            permission_profile(
+            permission_profile_with(
                 spec.sandbox,
                 guard,
                 codex_home,
@@ -4143,6 +4202,7 @@ where
                         roots
                     }
                 },
+                &spec.denied,
             )?,
             &spec.denied,
         )?),
@@ -5971,6 +6031,44 @@ mod tests {
         );
     }
 
+    /// A place that has become a link inside a directory the command may
+    /// write is refused when the helper walks again, whether the list denies
+    /// the place itself or carries it as a place.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_became_a_link_inside_a_writable_root_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("late-link-in-writable");
+        std::fs::create_dir_all(dir.join("work")).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        let kept = dir.join("elsewhere/kube");
+        std::fs::write(&kept, "token").expect("kept");
+        let place = dir.join("work/kubeconfig");
+        let _ = std::fs::remove_file(&place);
+        link(&kept, &place);
+        let work = [dir.join("work")];
+        let only = std::slice::from_ref(&place);
+        // Denied as an entry of the list, carried as no place.
+        let refused = late_link_targets(only, Some(&[]), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Carried as a place, the list denying what it pointed at.
+        let built = [std::fs::canonicalize(&kept).expect("real")];
+        let refused = late_link_targets(&built, Some(only), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Outside every directory it may write, the target replaces it.
+        assert!(late_link_targets(only, Some(only), &[], &[dir.join("elsewhere-not")]).is_ok());
+    }
+
     /// What the late walk finds is denied once, the outer of nested ones
     /// only, as the sandbox cannot mount a denial inside another.
     #[cfg(unix)]
@@ -6603,6 +6701,34 @@ mod tests {
                 "{} is a second mount of what this command is denied, two or more levels inside",
                 work.join("a/b/.aws").display()
             )),
+            "{refused}"
+        );
+    }
+
+    /// What the profile will deny besides the list, the backend's scratch
+    /// directories, counts toward the cap as each command counts it.
+    #[cfg(unix)]
+    #[test]
+    fn the_builder_counts_the_scratch_it_will_deny_as_each_command_does() {
+        let dir = Scratch::new("builder-cap-scratch");
+        let codex = dir.0.join("codex");
+        let scratch = dir.0.join("scratch");
+        for d in [&codex, &scratch] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: Vec::new(),
+        };
+        let _table = crate::mounts::with_table(&binds_of(&scratch, MAX_LINK_TARGETS + 1));
+        assert!(denied_paths(&private, &codex, None, &[]).is_ok());
+        let refused =
+            denied_paths_with(&private, &codex, None, &[], std::slice::from_ref(&scratch))
+                .expect_err("refused")
+                .to_string();
+        assert!(
+            refused.contains("with 513 second mounts of what they deny, counted from each side"),
             "{refused}"
         );
     }
