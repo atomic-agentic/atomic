@@ -107,3 +107,4 @@ pub fn tree_paths(project: &Path, sha: &str) -> Vec<String> {
 pub fn show(project: &Path, sha: &str, path: &str) -> String {
     git(project, &["show", &format!("{sha}:{path}")])
 }
+// Probe: a trivial change to shared test code.
