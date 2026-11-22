@@ -1,1 +1,1 @@
-stranded-sign-in-site|crates/atomic-core/src/signin.rs|let dir = crate::state::credentials_dir_in_use()|let dir = crate::state::credentials_dir().map_err(ToString::to_string)|-p atomic-agentic-core --lib -- the_sign_in_is_refused_while_an_older_atomics_credentials_are_stranded
+stranded-sign-in-site|crates/atomic-core/src/signin.rs|let dir = crate::state::credentials_dir_in_use()|let dir = crate::state::credentials_dir().as_ref().cloned().map_err(ToString::to_string)|-p atomic-agentic-core --lib -- the_sign_in_is_refused_while_an_older_atomics_credentials_are_stranded

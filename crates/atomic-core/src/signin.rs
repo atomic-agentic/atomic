@@ -167,10 +167,21 @@ fn dangling_link(dir: &Path) -> Option<&Path> {
 /// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses keeps its
 /// directory, as written, whether or not [`SignIn::located`] accepts it
 /// there: a refused location that holds one may still hold a sign-in.
+/// While an older atomic's credentials are stranded at its old place (see
+/// [`crate::state::credentials_dir_in_use`]), that is where a sign-in may
+/// still be kept, so the directory there is the one named: one found there
+/// is said to be unusable rather than taken for no sign-in at all.
 pub fn location() -> Option<PathBuf> {
-    crate::state::credentials_dir()
-        .ok()
-        .map(|dir| dir.join("codex-auth"))
+    let current = crate::state::credentials_dir().ok()?;
+    let dir = match crate::state::credentials_dir_in_use() {
+        Ok(_) => current,
+        // With the place itself known, the one refusal left is the
+        // stranded one.
+        Err(_) => crate::state::legacy_config_dir()
+            .map(|old| old.join("credentials"))
+            .unwrap_or(current),
+    };
+    Some(dir.join("codex-auth"))
 }
 
 /// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
@@ -1532,6 +1543,11 @@ mod tests {
             Some(0),
             "the guard did not make the new credential directory, empty"
         );
+        assert_eq!(
+            location(),
+            Some(legacy.join("codex-auth")),
+            "the sign-in's directory at the older atomic's place is not the one named"
+        );
         let refused = SignIn::located(None).map(|_| ());
         let Err(SignInError::Store(CredentialError::File(why))) = refused else {
             panic!("the sign-in was looked for beside stranded credentials: {refused:?}");
@@ -1548,5 +1564,6 @@ mod tests {
         std::fs::rename(legacy.join("codex-auth"), new.join("codex-auth")).expect("moved");
         let located = SignIn::located(None).expect("the moved sign-in store");
         assert_eq!(located.reached, new.join("codex-auth"));
+        assert_eq!(location(), Some(new.join("codex-auth")));
     }
 }

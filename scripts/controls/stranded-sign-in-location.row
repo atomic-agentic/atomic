@@ -1,0 +1,1 @@
+stranded-sign-in-location|crates/atomic-core/src/signin.rs|Err(_) => crate::state::legacy_config_dir()|Err(_) => None::<PathBuf>|-p atomic-agentic-core --lib -- the_sign_in_is_refused_while_an_older_atomics_credentials_are_stranded

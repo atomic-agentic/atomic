@@ -1199,22 +1199,32 @@ pub(crate) fn refuse_stranded(
         Ok(true) => "which still holds them".to_owned(),
         Err(e) => format!("which cannot be read ({e}), so it may still hold them"),
     };
-    let new = match holds(current, file) {
+    let (new, readable) = match holds(current, file) {
         Ok(true) => return Ok(()),
-        Ok(false) => "which holds none of them".to_owned(),
-        Err(e) => format!("which cannot be read ({e})"),
+        Ok(false) => ("which holds none of them".to_owned(), true),
+        Err(e) => (format!("which cannot be read ({e})"), false),
+    };
+    let current_text = current.display();
+    let legacy_text = legacy.display();
+    let fix = if readable {
+        format!(
+            "move everything in {legacy_text} into {current_text}, making {current_text} first \
+             if it does not exist"
+        )
+    } else {
+        format!(
+            "change the permissions of {current_text} so that atomic can read it, then move \
+             everything in {legacy_text} into it"
+        )
     };
     let leaf = current
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     Err(format!(
-        "{what} are kept in {current} now, {new}, and an older atomic kept them in {legacy}, \
-         {old}: move everything in {legacy} into {current}, making {current} first if it does \
-         not exist, to keep using them, or set ATOMIC_HOME to a directory that holds them in \
-         its `{leaf}` directory",
-        current = current.display(),
-        legacy = legacy.display(),
+        "{what} are kept in {current_text} now, {new}, and an older atomic kept them in \
+         {legacy_text}, {old}: {fix} to keep using them, or set ATOMIC_HOME to a directory \
+         that holds them in its `{leaf}` directory"
     ))
 }
 
@@ -3318,14 +3328,17 @@ mod tests {
         );
         assert_eq!(
             refuse_stranded("credentials", &sealed, Some(&legacy), None),
-            Err(refusal(
-                &sealed,
-                &legacy,
-                "which cannot be read (Permission denied (os error 13))",
-                "which still holds them",
-                "sealed",
+            Err(format!(
+                "credentials are kept in {sealed} now, which cannot be read (Permission denied \
+                 (os error 13)), and an older atomic kept them in {legacy}, which still holds \
+                 them: change the permissions of {sealed} so that atomic can read it, then move \
+                 everything in {legacy} into it to keep using them, or set ATOMIC_HOME to a \
+                 directory that holds them in its `sealed` directory",
+                sealed = sealed.display(),
+                legacy = legacy.display(),
             )),
-            "a new place that cannot be listed was taken to hold them"
+            "a new place that cannot be listed was taken to hold them, or the remedy does not \
+             say to make it readable"
         );
 
         // Once the new place holds something, it is used.
