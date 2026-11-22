@@ -1243,9 +1243,78 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// Replaces secrets in text. Linear in the length of `input`; callers
-/// with text of unknown length bound it first (see [`excerpt`]).
+/// How many readings [`text`] takes at most: a reading can leave what
+/// another rule reads as a secret only once a first rule has redacted
+/// around it, as a header after an assignment's marker. Most text settles
+/// in one or two; text still changing at the last, such as a header before
+/// a long run of backslashed chunks that a reading takes one at a time, is
+/// hidden whole.
+const TEXT_PASSES: usize = 4;
+
+/// Replaces secrets in text, read again until a reading changes nothing,
+/// so redacting the result again changes nothing; text still changing
+/// after [`TEXT_PASSES`] readings is hidden whole, since what a further
+/// reading would hide cannot be told. Linear in the length of `input`;
+/// callers with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
+    let mut output = match text_once(input) {
+        Cow::Owned(once) if once != input => once,
+        _ => return Cow::Borrowed(input),
+    };
+    for _ in 1..text_passes() {
+        let again = text_once(&output).into_owned();
+        if again == output {
+            return Cow::Owned(output);
+        }
+        output = again;
+    }
+    if text_once(&output) == output.as_str() {
+        Cow::Owned(output)
+    } else {
+        Cow::Owned(REDACTED.to_owned())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many readings [`text`] takes at most on this thread, for tests
+    /// that try a lower bound.
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(TEXT_PASSES) };
+}
+
+#[cfg(test)]
+fn text_passes() -> usize {
+    PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn text_passes() -> usize {
+    TEXT_PASSES
+}
+
+/// How surely `name` names a secret in every reading [`text`] makes of it,
+/// and as written too when `written`, the surest taken: a later reading
+/// can hide what made an earlier one name a secret.
+fn read_strength(name: &str, written: bool) -> Strength {
+    let mut surest = if written {
+        name_strength(name)
+    } else {
+        Strength::None
+    };
+    let mut reading = name.to_owned();
+    for _ in 0..=text_passes() {
+        let next = text_once(&reading).into_owned();
+        if next == reading {
+            break;
+        }
+        surest = surer(surest, name_strength(&next));
+        reading = next;
+    }
+    surest
+}
+
+/// One reading of `input` by every text rule (see [`text`]).
+fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
@@ -1470,10 +1539,19 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    // Whether the string read as JSON before text redaction touched it.
+    let was_json = |s: &str| {
+        nested < MAX_NESTED_JSON
+            && s.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+    };
+    let mut opened = false;
+    let mut written = String::new();
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
-        *string = redacted;
+        opened = redacted != *string && was_json(string);
+        written = std::mem::replace(string, redacted);
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
     // can hide where a secret starts, and a secret-named field is only clear
@@ -1482,12 +1560,86 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // JSON that text redaction broke deeper in, in a string it holds:
+        // hidden whole for the same reason.
+        if opened && broke_json_within(&written, &inner, nested) {
+            *string = REDACTED.to_owned();
+            return;
+        }
         let before = inner.clone();
         redact_nested(&mut inner, nested + 1);
         if inner != before {
             *string = inner.to_string();
         }
+    } else if opened {
+        // JSON that text redaction broke: the rules that read its names
+        // and pairs cannot read it, and text redaction alone may leave
+        // their secrets, so it is hidden whole.
+        *string = REDACTED.to_owned();
     }
+}
+
+/// Whether text redaction, which made `texted` of the JSON `written`, broke
+/// JSON held in a string inside it, so the rules that read names and pairs
+/// there no longer can: some string that reads as JSON as written, at a
+/// depth [`redact_string`] opens, is not one at the same place after (see
+/// [`kept_json`]). `nested` is the depth `written` is read at.
+fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
+    serde_json::from_str::<Value>(written)
+        .is_ok_and(|written| !kept_json(&written, texted, nested + 1))
+}
+
+/// Whether every string in `written`, read at depth `nested`, that reads as
+/// JSON is still a string that reads as JSON at the same place in `texted`,
+/// the same keys and indices, and so in turn for what it holds. Where it
+/// cannot be told, a key gone, a list grown or shrunk, or a value of
+/// another type, a place holding JSON counts as broken; one hidden whole
+/// counts as kept, as it shows nothing. JSON that reads as
+/// JSON only after text redaction counts for nothing, so it cannot make up
+/// for JSON broken beside it.
+fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
+    match (written, texted) {
+        (Value::String(string), _) => match opened_json(string, nested) {
+            None => true,
+            Some(written) => texted.as_str().is_some_and(|texted| {
+                texted == REDACTED
+                    || opened_json(texted, nested)
+                        .is_some_and(|texted| kept_json(&written, &texted, nested + 1))
+            }),
+        },
+        // Hidden whole, it shows nothing to read.
+        (_, Value::String(texted)) if texted == REDACTED => true,
+        (Value::Array(written), Value::Array(texted)) if written.len() == texted.len() => written
+            .iter()
+            .zip(texted)
+            .all(|(written, texted)| kept_json(written, texted, nested)),
+        (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
+            texted.get(key).map_or_else(
+                || !holds_json(field, nested),
+                |texted| kept_json(field, texted, nested),
+            )
+        }),
+        (written, _) => !holds_json(written, nested),
+    }
+}
+
+/// Whether `value`, read at depth `nested`, holds a string that reads as
+/// JSON that [`redact_string`] opens.
+fn holds_json(value: &Value, nested: usize) -> bool {
+    match value {
+        Value::String(string) => opened_json(string, nested).is_some(),
+        Value::Array(items) => items.iter().any(|item| holds_json(item, nested)),
+        Value::Object(fields) => fields.values().any(|field| holds_json(field, nested)),
+        _ => false,
+    }
+}
+
+/// `string` parsed, when it reads as JSON that [`redact_string`] opens at
+/// depth `nested`.
+fn opened_json(string: &str, nested: usize) -> Option<Value> {
+    (nested < MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']))
+        .then(|| serde_json::from_str(string).ok())
+        .flatten()
 }
 
 /// Redact what a value held under a name of this strength holds, keeping
@@ -1594,11 +1746,18 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     // Redacted as text first, as it is unopened: what that finds in the
     // string as written, an escaped `\/` before a token say, stays hidden
     // once the JSON is written back without the escape. Text that no
-    // longer reads as JSON is left to be redacted as any string is.
+    // longer reads as JSON is left to [`redact_string`], which hides JSON
+    // that text redaction broke whole.
     let texted = text(string);
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return false;
     };
+    // JSON in a string it holds that text redaction broke: hidden whole,
+    // as [`redact_string`] hides it.
+    if texted != *string && broke_json_within(string, &inner, nested) {
+        *string = REDACTED.to_owned();
+        return true;
+    }
     // Grown past the bound, a second pass would cut it: hidden whole now.
     if texted.len() > MAX_TEXT {
         *string = REDACTED.to_owned();
@@ -1716,18 +1875,19 @@ fn base_name(key: &str) -> &str {
 
 /// How surely the field at `key` holds a secret: what its name says (see
 /// [`name_strength`]), number and all, so a second pass reads it as this
-/// one does; for a key renamed, the surer of that and what its new name
-/// said before it was numbered, and, under a secret's name (`held`), what
-/// its original key said and what it said redacted as text too, so a
-/// secret's name redacted, or hidden whole, is still one there.
+/// one does; for a key renamed, the surest of that, of what its new name
+/// said before it was numbered, and of every reading text redaction makes
+/// of its original key (see [`read_strength`]), so a later reading cannot
+/// weaken what an earlier one said; and, under a secret's name (`held`),
+/// of the original key as written too, so a secret's name redacted, or
+/// hidden whole, is still one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     let whole = name_strength(key);
     match renamed.get(key) {
-        Some(r) if held => surer(
-            surer(whole, name_strength(&text(&r.original))),
-            surer(name_strength(&r.original), name_strength(&r.name)),
+        Some(r) => surer(
+            surer(whole, read_strength(&r.original, held)),
+            name_strength(&r.name),
         ),
-        Some(r) => surer(whole, name_strength(&r.name)),
         None => whole,
     }
 }

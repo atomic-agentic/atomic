@@ -818,7 +818,12 @@ fn denied_paths(
     let mut own = Vec::new();
     for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
-            own.extend(children(&entry, &arg0));
+            // Codex's links, and atomic's own link to itself under the
+            // helper's name, which every sandbox runs; they stay readable.
+            let helpers = children(&entry, &arg0)
+                .into_iter()
+                .filter(|p| not_the_helpers_link(p));
+            own.extend(helpers);
         } else {
             own.push(entry);
         }
@@ -947,16 +952,21 @@ fn denied_paths(
     // The sandbox finds the denials inside a writable directory by the
     // spelling it is given that directory under: one given through a link
     // would not keep a denial inside it, under its real spelling, in force.
+    let codex = real_spelling(codex_home);
     for (named, root) in given.iter().zip(&roots) {
         if named.as_path() == root.as_path() {
             continue;
         }
-        let codex = real_spelling(codex_home);
-        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
+        // Codex's home, whose databases a pattern denies, is weighed with the
+        // places listed. The files planted in it at start are listed as well,
+        // so this is defence in depth for a home that holds them.
+        // `scripts/controls/deny-linked-codex-home.row` switches this off.
+        let mut weighed = all.iter().chain([&codex]);
+        if let Some(place) = weighed.find(|p| p.starts_with(root)) {
             return Err(refuse(format!(
                 "{} is inside {}, which atoms' commands may write, named {} through a link, so \
-                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
-                 their real paths, with no link above them",
+                 its denial would not hold; point ATOMIC_HOME (or XDG_DATA_HOME, or HOME) and \
+                 the project at their real paths, with no link above them",
                 place.display(),
                 root.display(),
                 named.display()
@@ -1372,10 +1382,227 @@ where
     }
     scrub_overrides();
     let links = hold_helper_links(codex_home);
+    #[cfg(target_os = "linux")]
+    let helper = own_helper_link(codex_home);
     arg0_dispatch_or_else(move |paths| {
         drop(links);
+        // Codex's sandbox runs atomic's own link to itself as its helper,
+        // which every bubblewrap can run by its path; without one, Codex's.
+        #[cfg(target_os = "linux")]
+        let paths = match helper {
+            Some(helper) => Arg0DispatchPaths {
+                codex_linux_sandbox_exe: Some(helper),
+                ..paths
+            },
+            None => paths,
+        };
         main_fn(CodexPaths(paths))
     })
+}
+
+/// Whether `path`, in a Codex home's `tmp/`, is anything but the real directory
+/// of atomic's own link to itself, which every sandbox must run.
+/// `scripts/controls/sandbox-helper-link-readable.row` switches this off.
+fn not_the_helpers_link(path: &Path) -> bool {
+    let named = path.file_name() == Some(HELPER_DIR.as_ref());
+    // Only a real directory by that name: a link planted under it is denied
+    // as what it points at, as every other entry is.
+    // `scripts/controls/sandbox-helper-link-real-dir.row` switches this off.
+    let real_dir = std::fs::symlink_metadata(path)
+        .ok()
+        .as_ref()
+        .map(std::fs::Metadata::is_dir)
+        == Some(true);
+    !(named && real_dir)
+}
+
+/// The directory below a Codex home's `tmp/` where atomic keeps its own
+/// link to itself under the Linux sandbox helper's name.
+const HELPER_DIR: &str = "atomic-helper";
+
+/// atomic's own link to this executable under the Linux sandbox helper's
+/// name, `<codex_home>/tmp/atomic-helper/<key>/codex-linux-sandbox`, made
+/// or mended now, while this process has one thread: `None` when it cannot
+/// be, and when what stands on the way is not what atomic made.
+///
+/// Codex runs it as the helper, by that absolute path, for every turn's and
+/// exec atom's command. A bubblewrap without `--argv0` runs the helper's
+/// inner stage by the name its outer stage was started under, and this one
+/// is a path it can run inside the sandbox, never a name it looks for along
+/// PATH. The directory is readable by every sandbox and writable by none:
+/// atoms' commands never write the Codex home, and this directory, like
+/// Codex's own links, is left out of what is denied them (see
+/// [`denied_paths`]). `<key>` names this executable's path, so processes run
+/// from two paths sharing a Codex home never run each other's.
+///
+/// `tmp`, `atomic-helper` and `<key>` are opened one at a time, never
+/// through a link, each made only when it is not there, and each, like the
+/// Codex home, must be a directory of this user's that no one else may
+/// write: one of this user's that others may write, as a umask such as 002
+/// leaves one, is narrowed first, and anything else falls back to Codex's
+/// own helper. The link is made in the `<key>` directory held open, beside
+/// its place, and renamed into it.
+#[cfg(target_os = "linux")]
+fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
+    use sha2::Digest as _;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let exe = std::env::current_exe().ok()?;
+    let key = sha2::Sha256::digest(exe.as_os_str().as_bytes());
+    let key: String = key[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let home = std::ffi::CString::new(codex_home.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `home` is valid for the call; the result is owned below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::open(
+            home.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just returned open, and nothing else owns it.
+    #[allow(unsafe_code)]
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    if !tightened(&dir) || !private_dir(&dir) {
+        return None;
+    }
+    for part in ["tmp", HELPER_DIR, key.as_str()] {
+        let name = std::ffi::CString::new(part).ok()?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: `name` is valid for the calls, and `dir` is open.
+        #[allow(unsafe_code)]
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        let mut made = false;
+        if fd < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            let r = unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700) };
+            made = r == 0;
+            // SAFETY: as above.
+            #[allow(unsafe_code)]
+            {
+                fd = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+            }
+        }
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `fd` was just returned open, and nothing else owns it.
+        #[allow(unsafe_code)]
+        let next = unsafe { OwnedFd::from_raw_fd(fd) };
+        if made {
+            // SAFETY: fchmod takes an open descriptor and a mode.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::fchmod(next.as_raw_fd(), 0o700);
+            }
+        }
+        if !tightened(&next) || !private_dir(&next) {
+            return None;
+        }
+        dir = next;
+    }
+    let link = codex_home
+        .join("tmp")
+        .join(HELPER_DIR)
+        .join(&key)
+        .join("codex-linux-sandbox");
+    let name = std::ffi::CString::new("codex-linux-sandbox").ok()?;
+    let mut leads = vec![0u8; 4096];
+    // SAFETY: `leads` is valid for its length, and `dir` is open.
+    #[allow(unsafe_code)]
+    let n = unsafe {
+        libc::readlinkat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            leads.as_mut_ptr().cast(),
+            leads.len(),
+        )
+    };
+    if n >= 0 && &leads[..n as usize] == exe.as_os_str().as_bytes() {
+        return Some(link);
+    }
+    // Made beside it and renamed over it, so another process never finds
+    // it half made, and one leading elsewhere is replaced.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp = std::ffi::CString::new(format!(
+        ".codex-linux-sandbox.{}.{nanos}",
+        std::process::id()
+    ))
+    .ok()?;
+    let target = std::ffi::CString::new(exe.as_os_str().as_bytes()).ok()?;
+    // SAFETY: both strings are valid for the calls, and `dir` is open.
+    #[allow(unsafe_code)]
+    unsafe {
+        if libc::symlinkat(target.as_ptr(), dir.as_raw_fd(), temp.as_ptr()) != 0 {
+            return None;
+        }
+        if libc::renameat(
+            dir.as_raw_fd(),
+            temp.as_ptr(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+        ) != 0
+        {
+            libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+            return None;
+        }
+    }
+    Some(link)
+}
+
+/// Take group and other write off the directory held open as `dir` when it
+/// is this user's own, as a umask such as 002 leaves one another program
+/// made: `false` only when that fails. One that is not this user's is left
+/// as it is, for [`private_dir`] to refuse.
+/// `scripts/controls/sandbox-helper-link-tighten.row` switches this off.
+#[cfg(target_os = "linux")]
+fn tightened(dir: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed stat is a valid value of a plain C struct.
+    #[allow(unsafe_code)]
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is valid for the call, and `dir` is open.
+    #[allow(unsafe_code)]
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // SAFETY: geteuid takes nothing and cannot fail.
+    #[allow(unsafe_code)]
+    let ours = st.st_uid == unsafe { libc::geteuid() };
+    let narrow = ours && st.st_mode & 0o022 != 0;
+    if !narrow {
+        return true;
+    }
+    // SAFETY: fchmod takes an open descriptor and a mode.
+    #[allow(unsafe_code)]
+    let r = unsafe { libc::fchmod(dir.as_raw_fd(), st.st_mode & 0o7777 & !0o022) };
+    r == 0
+}
+
+/// Whether the directory held open as `dir` is this user's own, which no
+/// one else may write. `scripts/controls/sandbox-helper-link-private.row`
+/// switches this off.
+#[cfg(target_os = "linux")]
+fn private_dir(dir: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed stat is a valid value of a plain C struct.
+    #[allow(unsafe_code)]
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is valid for the call, and `dir` is open.
+    #[allow(unsafe_code)]
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // SAFETY: geteuid takes nothing and cannot fail.
+    #[allow(unsafe_code)]
+    let me = unsafe { libc::geteuid() };
+    st.st_mode & libc::S_IFMT == libc::S_IFDIR && st.st_uid == me && st.st_mode & 0o022 == 0
 }
 
 /// How long one atomic process waits for another to finish making Codex's
@@ -1400,6 +1627,13 @@ const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// is full.
 fn hold_helper_links(codex_home: &Path) -> Option<std::fs::File> {
     let dir = codex_home.join("tmp");
+    // Private, as atomic's own link to itself requires of it, whatever the
+    // umask (see `own_helper_link`).
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(&dir)
+        .ok()?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).ok()?;
     let lock = std::fs::OpenOptions::new()
         .write(true)
@@ -1550,6 +1784,20 @@ fn deny_links_made_since_the_list() {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         // Started again once already: what it adds is its last chance.
         let again_already = take_env(RELISTED).is_some();
+        // Started again, it must not have been handed the proxy token in its
+        // environment: the token goes to the helper only on a socket, read
+        // after this walk, so a token here means it was read before a start
+        // again put it in the environment of a process that was dumpable
+        // until its first step. The command does not run.
+        if again_already
+            && std::env::var_os(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY).is_some()
+        {
+            crate::log_line!(
+                "atomic: the sandbox helper was started again with the proxy token in its \
+                 environment, where another process could have read it; the command does not run"
+            );
+            std::process::exit(1);
+        }
         let carried = take_env(PLACES);
         let places = match carried.as_ref().map(|v| {
             v.to_str()
@@ -2060,6 +2308,10 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// command its own `TMPDIR`.
 fn as_any_helper() {
     helper_not_dumpable();
+    // The walk may start the helper again, so it comes before the token is
+    // read: read first, the token would pass through `exec` in the
+    // environment of a process that is dumpable until its first step, which
+    // the walk then refuses.
     deny_links_made_since_the_list();
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
@@ -6308,6 +6560,102 @@ mod tests {
             "the profile grew with the projects"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// atomic's own link to itself is made in directories of this user's
+    /// that no one else may write, reached never through a link: a link
+    /// planted where one of them goes, or one someone else may write, leaves
+    /// none, and Codex's own helper is used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helpers_link_is_made_only_in_this_users_own_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = scratch("own-helper");
+        let link = own_helper_link(&home).expect("made");
+        assert_eq!(
+            std::fs::read_link(&link).expect("a link"),
+            std::env::current_exe().expect("this test")
+        );
+        assert_eq!(
+            own_helper_link(&home),
+            Some(link.clone()),
+            "mended, not made twice"
+        );
+        // Directories of this user's that others may write, as a umask of
+        // 002 leaves them, are narrowed and used.
+        let tmp = home.join("tmp");
+        let helpers = tmp.join(HELPER_DIR);
+        for dir in [&home, &tmp, &helpers] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        }
+        assert_eq!(own_helper_link(&home), Some(link.clone()), "a umask of 002");
+        for dir in [&home, &tmp, &helpers] {
+            let mode = std::fs::metadata(dir).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o022, 0, "{} is writable by others", dir.display());
+        }
+        std::fs::remove_dir_all(&helpers).expect("removed");
+        let elsewhere = scratch("own-helper-elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &helpers).expect("link");
+        assert_eq!(
+            own_helper_link(&home),
+            None,
+            "a link where a directory goes"
+        );
+        assert!(
+            std::fs::read_dir(&elsewhere)
+                .expect("elsewhere")
+                .next()
+                .is_none(),
+            "something was made where the link leads"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A directory others may write is not private, whoever owns it, so one
+    /// atomic cannot narrow is never used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_others_may_write_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("not-private");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        let held: std::os::fd::OwnedFd = std::fs::File::open(&dir).expect("open").into();
+        assert!(!private_dir(&held), "group write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o757)).expect("mode");
+        assert!(!private_dir(&held), "other write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(private_dir(&held));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The helper's directory is left readable only when it is a real
+    /// directory: a link planted under its name is denied as what it points
+    /// at, as every other entry of the Codex home's `tmp/` is.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_as_the_helpers_directory_is_denied() {
+        let dir = std::fs::canonicalize(scratch("helper-dir-link")).expect("real");
+        let codex = dir.join("codex");
+        std::fs::create_dir_all(codex.join("tmp")).expect("codex home");
+        let theirs = dir.join("theirs");
+        std::fs::create_dir_all(&theirs).expect("theirs");
+        std::os::unix::fs::symlink(&theirs, codex.join("tmp").join(HELPER_DIR)).expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: Vec::new(),
+        };
+        let (denied, _) = denied_paths(&private, &codex, None, &[]).expect("denied");
+        assert!(denied.contains(&theirs), "{denied:?}");
+        std::fs::remove_file(codex.join("tmp").join(HELPER_DIR)).expect("unlinked");
+        std::fs::create_dir_all(codex.join("tmp").join(HELPER_DIR)).expect("real");
+        let (denied, _) = denied_paths(&private, &codex, None, &[]).expect("denied");
+        assert!(
+            !denied.iter().any(|d| d.ends_with(HELPER_DIR)),
+            "the real directory was denied: {denied:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

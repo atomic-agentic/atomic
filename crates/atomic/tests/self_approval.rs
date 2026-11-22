@@ -389,7 +389,7 @@ fn a_turn_that_could_move_the_private_state_away_never_starts() {
         .await;
         match answer {
             Err(atomic_core::AtomError::Runtime(why)) => {
-                assert!(why.contains("may write"), "{why}")
+                assert!(why.contains("move it out from under its denial"), "{why}")
             }
             other => panic!("the turn was not refused as the machine's: {other:?}"),
         }

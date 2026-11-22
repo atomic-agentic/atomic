@@ -207,6 +207,18 @@ const MIGRATIONS: &[Migration] = &[
                 project TEXT NOT NULL
             )"],
     },
+    Migration {
+        version: 10,
+        // The project each run is for, on a store several projects share,
+        // recorded as the run starts: a project shows and resumes only its
+        // own runs, and lists and decides only its own runs' gates. A run
+        // started before has none, and only a runtime for no project sees
+        // it.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_run_projects (
+                run_id TEXT PRIMARY KEY,
+                project TEXT NOT NULL
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands: its last
