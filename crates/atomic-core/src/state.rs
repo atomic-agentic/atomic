@@ -810,7 +810,10 @@ const NOT_THROUGH_A_LINK: i32 = libc::O_NOFOLLOW;
 
 /// The main checkout of the linked worktree whose `.git` is `git`; `None`
 /// for a `.git` directory, a submodule's file (no `commondir`), or a bare
-/// repository.
+/// repository, and for a `commondir` whose target is not there. A target
+/// that is there and cannot be looked at, or whose path loops or walks
+/// through a file, is refused: what cannot be seen is never taken for
+/// absent.
 fn main_checkout(git: &Path, through_links: bool) -> Result<Option<PathBuf>, String> {
     if std::fs::metadata(git).is_ok_and(|m| m.is_dir()) {
         return Ok(None);
@@ -818,18 +821,24 @@ fn main_checkout(git: &Path, through_links: bool) -> Result<Option<PathBuf>, Str
     let Some(text) = link_file(git, through_links)? else {
         return Ok(None);
     };
-    let Some(gitdir) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+    let Some(gitdir) = text
+        .split(|b| *b == b'\n')
+        .find_map(|line| line.strip_prefix(b"gitdir:".as_slice()))
+    else {
         return Ok(None);
     };
     let Some(parent) = git.parent() else {
         return Ok(None);
     };
-    let gitdir = parent.join(gitdir.trim());
+    let gitdir = parent.join(link_path(gitdir));
     let Some(common) = link_file(&gitdir.join("commondir"), through_links)? else {
         return Ok(None);
     };
-    let Ok(common) = std::fs::canonicalize(gitdir.join(common.trim())) else {
-        return Ok(None);
+    let commondir = gitdir.join(link_path(&common));
+    let common = match std::fs::canonicalize(&commondir) {
+        Ok(common) => common,
+        Err(e) if not_there(&e) => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", commondir.display())),
     };
     if common.file_name().is_none_or(|n| n != ".git") {
         return Ok(None);
@@ -837,11 +846,46 @@ fn main_checkout(git: &Path, through_links: bool) -> Result<Option<PathBuf>, Str
     Ok(common.parent().map(Path::to_owned))
 }
 
-/// The text of `path`, a small regular file, or `None` when there is none:
+/// Whether a failed lookup found nothing there, which is all that counts as
+/// absent: what a user cannot look at, a path that loops, one that walks
+/// through a file and every other error say nothing about what is there, so
+/// they refuse rather than let a checkout go uncounted.
+fn not_there(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
+/// The path a link file names, as its bytes and not as text: a Unix file
+/// name is any bytes but a separator and a NUL, so a checkout under a name
+/// that is not text is still found. Text trims as text does; bytes that are
+/// not text lose only ASCII whitespace, which is all git writes around one.
+fn link_path(bytes: &[u8]) -> PathBuf {
+    fn not_space(b: &u8) -> bool {
+        !b.is_ascii_whitespace()
+    }
+    /// The bytes with ASCII whitespace removed from both ends.
+    fn ascii_trim(bytes: &[u8]) -> &[u8] {
+        let start = bytes.iter().position(not_space).unwrap_or(bytes.len());
+        let end = bytes.iter().rposition(not_space).map_or(start, |i| i + 1);
+        &bytes[start..end]
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => PathBuf::from(text.trim()),
+        #[cfg(unix)]
+        Err(_) => {
+            use std::os::unix::ffi::OsStrExt;
+            PathBuf::from(std::ffi::OsStr::from_bytes(ascii_trim(bytes)))
+        }
+        #[cfg(not(unix))]
+        Err(_) => PathBuf::from(String::from_utf8_lossy(ascii_trim(bytes)).as_ref()),
+    }
+}
+
+/// The bytes of `path`, a small regular file, or `None` when there is none:
 /// opened without blocking, so a pipe there cannot hang the read, and
 /// refused when it is anything but a regular file of at most
-/// [`LINK_FILE_MAX`] bytes.
-fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String> {
+/// [`LINK_FILE_MAX`] bytes. Bytes and not text, because what git writes
+/// there is a path and a path is any bytes.
+fn link_file(path: &Path, through_links: bool) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
     let refused = |why: &str| {
         Err(format!(
@@ -873,14 +917,14 @@ fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String>
         Ok(_) => {}
         Err(e) => return Err(format!("{}: {e}", path.display())),
     }
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     file.take(LINK_FILE_MAX + 1)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    if text.len() as u64 > LINK_FILE_MAX {
+    if bytes.len() as u64 > LINK_FILE_MAX {
         return refused("is larger than a link file");
     }
-    Ok(Some(text))
+    Ok(Some(bytes))
 }
 
 /// Where the opt-in file store keeps operator credentials (see
@@ -1628,6 +1672,169 @@ mod tests {
         std::fs::write(&commondir, "x".repeat(5000)).expect("commondir");
         let refused = checkouts_holding(&project).expect_err("too large");
         assert!(refused.contains("is larger than a link file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `commondir` whose target is there but cannot be looked in, whose
+    /// path walks through a file, or whose path loops refuses the project,
+    /// and says which error it met. Only a target that is not there at all
+    /// is taken for absent, and then no main checkout is counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_commondir_target_that_cannot_be_seen_refuses_the_project() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("atomic-commondir-seen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The `commondir` names `<main>/shared/.git`, whose parent is the
+        // main checkout. `shared` is on the way to what is looked for: it
+        // can be made unsearchable, be a file, or be a link that loops.
+        let gitdir = dir.join("main").join("wtgit");
+        let shared = dir.join("main").join("shared");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        std::fs::create_dir_all(shared.join(".git")).expect("common dir");
+        std::fs::write(gitdir.join("commondir"), "../shared/.git\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect(".git");
+        let project = dir.join("wt/project");
+        // Where the `commondir` says to look, with its `..` still in it as
+        // the refusal names it.
+        let target = gitdir.join("../shared/.git");
+        let held = checkouts_holding(&project).expect("read");
+        assert!(
+            held.contains(&std::fs::canonicalize(&shared).expect("shared")),
+            "the well-formed pair found no main checkout: {held:?}"
+        );
+
+        // A directory on the way this user may not look in. Its `.git` is
+        // there, so nothing is absent: the lookup is refused.
+        let mode = |m: u32| {
+            std::fs::set_permissions(&shared, PermissionsExt::from_mode(m)).expect("chmod")
+        };
+        // Opened again however the test ends, so that a failure here leaves
+        // no directory the next run cannot remove.
+        struct Reopened(PathBuf);
+        impl Drop for Reopened {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.0,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
+            }
+        }
+        mode(0o000);
+        let _reopened = Reopened(shared.clone());
+        assert!(
+            std::fs::read_dir(&shared).is_err(),
+            "mode 000 did not keep this user out (root?): run the test as a user"
+        );
+        let refused = checkouts_holding(&project).expect_err("a target out of reach");
+        assert!(
+            refused.contains(&target.display().to_string()),
+            "which target was refused: {refused}"
+        );
+        assert!(
+            refused.contains(&format!("os error {}", libc::EACCES)),
+            "not the permission denial: {refused}"
+        );
+        drop(_reopened);
+        mode(0o700);
+
+        // A file where the directory on the way should be.
+        std::fs::remove_dir_all(&shared).expect("remove");
+        std::fs::write(&shared, "not a directory").expect("file");
+        let refused = checkouts_holding(&project).expect_err("a path through a file");
+        assert!(
+            refused.contains(&format!("os error {}", libc::ENOTDIR)),
+            "not the walk through a file: {refused}"
+        );
+
+        // A link that loops back on itself.
+        std::fs::remove_file(&shared).expect("remove");
+        std::os::unix::fs::symlink(&shared, &shared).expect("a loop");
+        let refused = checkouts_holding(&project).expect_err("a link loop");
+        assert!(
+            refused.contains(&format!("os error {}", libc::ELOOP)),
+            "not the link loop: {refused}"
+        );
+
+        // Nothing there at all, which is absent: the project is read, and no
+        // main checkout is counted beside its own worktree.
+        std::fs::remove_file(&shared).expect("remove");
+        let held = checkouts_holding(&project)
+            .expect("a target that is not there is absent, not an error");
+        assert_eq!(held, vec![dir.join("wt")], "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A worktree's `.git` whose `gitdir:` names a path that is no text, and
+    /// a `commondir` that names one too, are read as the paths they name, so
+    /// the main checkout there is still counted.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_file_naming_a_path_that_is_no_text_is_still_read() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let dir = std::env::temp_dir().join(format!("atomic-link-bytes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A name of bytes that are no text, which any Unix name may be: a
+        // word and one byte no UTF-8 sequence starts with.
+        let odd = |name: &str| {
+            let mut name = name.as_bytes().to_vec();
+            name.push(0xff);
+            std::ffi::OsString::from_vec(name)
+        };
+        // What a link file holds, as the raw bytes git writes there. Going
+        // through `display()` would replace the byte that is no text with a
+        // marker, which names no directory.
+        let written = |head: &str, to: &Path, tail: &str| {
+            let mut body = head.as_bytes().to_vec();
+            body.extend_from_slice(to.as_os_str().as_bytes());
+            body.extend_from_slice(tail.as_bytes());
+            body
+        };
+        let main = dir.join(odd("repo"));
+        std::fs::create_dir_all(main.join(".git")).expect("main");
+        // One worktree whose `.git` names its git directory under the name
+        // that is no text.
+        let by_bytes = main.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&by_bytes).expect("gitdir");
+        std::fs::write(by_bytes.join("commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("by-bytes/project")).expect("worktree");
+        std::fs::write(
+            dir.join("by-bytes/.git"),
+            written("gitdir: ", &by_bytes, "\n"),
+        )
+        .expect(".git");
+        // Another whose git directory sits under names that are text, but
+        // whose `commondir` names the main checkout through one that is not:
+        // four levels up from `<dir>/plain/.git/worktrees/wt` is `<dir>`.
+        let by_name = dir.join("plain/.git/worktrees/wt");
+        std::fs::create_dir_all(&by_name).expect("gitdir");
+        let mut commondir = b"../../../../".to_vec();
+        commondir.extend_from_slice(odd("repo").as_bytes());
+        commondir.extend_from_slice(b"/.git\n");
+        std::fs::write(by_name.join("commondir"), &commondir).expect("commondir");
+        std::fs::create_dir_all(dir.join("by-name/project")).expect("worktree");
+        std::fs::write(
+            dir.join("by-name/.git"),
+            written("gitdir: ", &by_name, "\n"),
+        )
+        .expect(".git");
+        let main = std::fs::canonicalize(&main).expect("main");
+        let held = checkouts_holding(&dir.join("by-bytes/project")).expect("read");
+        assert!(
+            held.contains(&main),
+            "a `.git` naming a path that is no text lost the main checkout: {held:?}"
+        );
+        let held = checkouts_holding(&dir.join("by-name/project")).expect("read");
+        assert!(
+            held.contains(&main),
+            "a `commondir` naming a path that is no text lost the main checkout: {held:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
