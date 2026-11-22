@@ -2978,6 +2978,9 @@ mod tests {
         let old_lock = old.join("runtime.lock");
         let held = std::fs::File::create(&old_lock).expect("old lock");
         held.lock().expect("hold");
+        // Another test can fork while this descriptor is open. Keep a
+        // duplicate alive to model the inherited reference deterministically.
+        let inherited = held.try_clone().expect("duplicate the held descriptor");
         match state.create() {
             Err(StateError::InUse { path, to }) => {
                 assert_eq!(path, old_lock);
@@ -2986,8 +2989,12 @@ mod tests {
             other => panic!("moved under a held execution lock: {other:?}"),
         }
         assert!(old_db.exists(), "nothing moved");
+        // Closing one descriptor does not release a lock while an inherited
+        // reference remains open. Release this fixture's lock explicitly.
+        held.unlock().expect("release the old execution lock");
         drop(held);
         state.create().expect("moves once closed");
+        drop(inherited);
         assert!(state.database().is_file());
         assert!(state.context_dir().is_dir());
         assert!(!old.exists(), "the old private directory is gone");
