@@ -110,9 +110,15 @@ levels deep; deeper, a string that starts with `[` or `{`, after any
 blanks, is hidden whole, JSON or not (`[INFO] server started` too), and
 JSON that gives a key twice, in a string at any depth or a whole JSON
 body, is hidden whole. A name and value pair written as JSON,
-`{"name": "X-Api-Key", "value": "…"}`, is read, when its two fields sit
-side by side, even where its JSON does not parse, cut short or after other
-text.
+`{"name": "X-Api-Key", "value": "…"}`, is read with its fields in any case
+(`Name` and `Value`, as AWS writes them, or `key`, `header`, `headerName`
+and `headerValue`), and as an array, `["X-Api-Key", "…"]`; a value of more
+than a string, an object, an array or a number, is hidden whole under a
+header's name or a secret's. Where its JSON does not parse, cut short, after
+other text or written as Python writes a dict, in single quotes, it is read
+too, with up to four other fields between its name and value, either one
+first, and a name with `\u` escapes; not where a field's own name is
+written with `\u` escapes, as no JSON writer does for a plain letter.
 Redaction over-matches rather than under-matches, but it does let some
 things through: a short or word-like
 value after a name that only hints at a secret (`pass: 12`, `token: expired`),

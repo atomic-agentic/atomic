@@ -1,0 +1,1 @@
+redact-pair-text-name-cut|crates/atomic-core/src/redact.rs|.or(PAIR_NAME_CUT.captures(rest))|.or(None) /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- redact::tests::pair_shapes_beyond_side_by_side_fields_are_read_as_text

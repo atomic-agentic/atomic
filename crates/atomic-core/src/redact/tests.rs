@@ -3248,6 +3248,12 @@ fn reading_pairs_as_text_takes_linear_steps() {
         "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
         "\"value\": \\\\\\\"x \"",
         "{\"name\": \"a\", \"value\": \"b\"} ",
+        // Objects for values that open and never close, under a name they
+        // are not hidden for, so each is read on, and under one they are.
+        "{\"name\": \"a\", \"value\": {",
+        "{\"name\": \"X-Api-Key\", \"value\": {",
+        "[\"X-Api-Key\", \"x ",
+        "{'name': 'X-Api-Key', 'type': 'h', 'value': 'x'} ",
     ]
     .into_iter()
     .enumerate()
@@ -3258,4 +3264,94 @@ fn reading_pairs_as_text_takes_linear_steps() {
             "case {case}: {large} steps at sixteen times the size of {small}"
         );
     }
+}
+
+/// A pair in JSON that parses, its fields in any case as AWS writes them
+/// (`Name`, `Key`, `Value`), as `headerName` and `headerValue`, or with a
+/// value of more than a string under a header's or a secret's name, has its
+/// value hidden; one that holds no secret keeps it.
+#[test]
+fn a_parsed_pair_is_read_in_any_case_and_whatever_its_value() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, doc) in [
+        json!({"Name": "X-Api-Key", "Value": key}),
+        json!({"NAME": "X-Api-Key", "VALUE": key}),
+        json!({"Tags": [{"Key": "DB_PASSWORD", "Value": key}]}),
+        json!({"headerName": "X-Api-Key", "headerValue": key}),
+        json!({"name": "X-Api-Key", "value": {"v": key}}),
+        json!({"name": "password", "value": [key]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "case {case}: the pair's value showed"
+        );
+    }
+    for kept in [
+        json!({"Name": "Content-Type", "Value": "application/json"}),
+        json!({"name": "config", "value": {"retries": 3}}),
+    ] {
+        let mut out = kept.clone();
+        value(&mut out);
+        assert_eq!(out, kept, "a pair that holds no secret changed");
+    }
+}
+
+/// Pair shapes the text rule reads beside `{"name": …, "value": …}` side
+/// by side: fields in any case, `headerName` and `headerValue`, a field
+/// between name and value (either first), Python's quotes, an array pair,
+/// a `\u`-escaped name, an object for a value, and, value first, a name
+/// cut off where the text ends. Each is hidden as text and in JSON held in
+/// a string zero to two deep, cut so that it does not parse.
+#[test]
+fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, line) in [
+        format!("{{\"Name\": \"X-Api-Key\", \"Value\": \"{key}\""),
+        format!("{{\"headerName\": \"X-Api-Key\", \"headerValue\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"type\": \"h\", \"value\": \"{key}\""),
+        format!("{{\"value\": \"{key}\", \"type\": \"h\", \"name\": \"X-Api-Key\""),
+        format!("{{'name': 'X-Api-Key', 'value': '{key}'}}"),
+        format!("[[\"X-Api-Key\", \"{key}\"], [\"a\""),
+        format!("{{\"name\": \"\\u0041uthorization\", \"value\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"v\": \"{key}\"}}"),
+        format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&key[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = line.clone();
+        for depth in 0..=2 {
+            for parent in ["msg", "body"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "case {case}, depth {depth}, under {parent}: shown"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+    }
+    // A pair inside another's object for a value is still read, and pairs
+    // that hold no secret, and lists of more than two, are kept.
+    let inner = format!(
+        "{{\"name\": \"config\", \"value\": {{\"name\": \"X-Api-Key\", \"value\": \"{key}\""
+    );
+    assert!(!text(&inner).contains(&key[4..]), "an inner pair showed");
+    assert_kept(&[
+        "{\"Name\": \"Content-Type\", \"Value\": \"application/json\"",
+        "[\"password\", \"email\"]",
+        "for name in [\"ATOMIC_EFFECT_KEY\", \"ATOMIC_OUTPUTS\", \"ATOMIC_INPUTS\"] {",
+        "{'name': 'region', 'value': 'us-east-1'}",
+        "{\"name\": \"config\", \"value\": {\"retries\": 3}",
+    ]);
 }

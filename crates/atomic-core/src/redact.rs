@@ -313,22 +313,47 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
-/// A name and value pair written as JSON text, its quotes escaped to any
-/// depth, name first: `"name": "X-Api-Key", "value": "`, or with `key` or
-/// `header` for `name`, up to the value's opening quote, whose backslashes
-/// are the second group.
+/// A name and value pair written as JSON text, or as Python writes a
+/// dict, its quotes escaped to any depth, name first: `"name": "X-Api-Key",
+/// "value": "`, with `key`, `header` or `headerName` for `name` and
+/// `headerValue` for `value`, in any case (`Name`, `Value`), and up to
+/// four other fields between, up to the value's opening quote, whose
+/// backslashes are the second group and which the third is, or the bracket
+/// that opens a value of more than a string, the fourth.
 static PAIR_NAME_FIRST: LazyLock<Regex> = LazyLock::new(|| {
-    regex(
-        r#"\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*"\s*,\s*\\*"value\\*"\s*:\s*(\\*)""#,
-    )
+    regex(&format!(
+        r#"{PAIR_KEY}\s*:\s*\\*["']{PAIR_NAME_TEXT}\\*["'](?:\s*,\s*{PAIR_FIELD}){{0,4}}?\s*,\s*{PAIR_VALUE_KEY}\s*:\s*(?:(\\*)(["'])|([{{\[]))"#
+    ))
 });
 /// The same pair, value first: `"value": "`, up to its opening quote.
-static PAIR_VALUE_OPEN: LazyLock<Regex> = LazyLock::new(|| regex(r#"\\*"value\\*"\s*:\s*(\\*)""#));
+static PAIR_VALUE_OPEN: LazyLock<Regex> =
+    LazyLock::new(|| regex(&format!(r#"{PAIR_VALUE_KEY}\s*:\s*(\\*)(["'])"#)));
 /// What follows a value given first, from its closing quote: `", "name":
-/// "X-Api-Key"`.
-static PAIR_NAME_AFTER: LazyLock<Regex> = LazyLock::new(|| {
-    regex(r#"^\\*"\s*,\s*\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*""#)
+/// "X-Api-Key"`, with up to four other fields between.
+static PAIR_NAME_AFTER: LazyLock<Regex> = LazyLock::new(|| regex(&pair_name_after(r#"\\*["']"#)));
+/// The same, with the name's closing quote cut off where the text ends.
+static PAIR_NAME_CUT: LazyLock<Regex> = LazyLock::new(|| regex(&pair_name_after(r"\z")));
+/// [`PAIR_NAME_AFTER`]'s pattern, with what ends the name.
+fn pair_name_after(end: &str) -> String {
+    format!(
+        r#"^\\*["']\s*,\s*(?:{PAIR_FIELD}\s*,\s*){{0,4}}?{PAIR_KEY}\s*:\s*\\*["']{PAIR_NAME_TEXT}{end}"#
+    )
+}
+/// A pair as an array, `["X-Api-Key", "`, up to its value's opening quote.
+static PAIR_LISTED: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"\[\s*\\*["']{PAIR_NAME_TEXT}\\*["']\s*,\s*(\\*)(["'])"#
+    ))
 });
+/// A field that names a pair, `"name"`, in any case.
+const PAIR_KEY: &str = r#"\\*["'](?i:name|key|header|headername)\\*["']"#;
+/// A pair's name, which may hold `\u` escapes, as the first group.
+const PAIR_NAME_TEXT: &str = r#"((?:[^"'\\\n]|\\+u[0-9a-fA-F]{4}){1,128})"#;
+/// The field that holds a pair's value, `"value"`, in any case.
+const PAIR_VALUE_KEY: &str = r#"\\*["'](?i:value|headervalue)\\*["']"#;
+/// Another field of a pair's object, between its name and value: a word,
+/// then a short string, number or word.
+const PAIR_FIELD: &str = r#"\\*["'][A-Za-z_][A-Za-z0-9_.-]{0,63}\\*["']\s*:\s*(?:\\*["'][^"'\\\n]{0,128}\\*["']|[A-Za-z0-9.+-]{1,32})"#;
 /// A URL's password, to the last `@` before its host.
 static URL_PASSWORD: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/'"]+)(@)"#));
@@ -1403,12 +1428,12 @@ fn escaped_as_json(backslashes: usize) -> bool {
     (backslashes + 1).is_power_of_two() && backslashes < (1 << PAIR_LEVELS)
 }
 
-/// The length of a JSON string's value whose opening quote follows `level`
-/// backslashes, up to its closing quote: the first quote after `level` and
-/// then any number of escaped backslashes, `2 × (level + 1)` each, so a
-/// value that ends in a backslash, `C:\\`, closes where it does; or `None`
-/// if the line ends first.
-fn pair_value_len(rest: &str, level: usize) -> Option<usize> {
+/// The length of a JSON string's value whose opening `quote` follows
+/// `level` backslashes, up to its closing quote: the first such quote after
+/// `level` and then any number of escaped backslashes, `2 × (level + 1)`
+/// each, so a value that ends in a backslash, `C:\\`, closes where it does;
+/// or `None` if the line ends first.
+fn pair_value_len(rest: &str, level: usize, quote: u8) -> Option<usize> {
     let escaped = 2 * (level + 1);
     let mut backslashes = 0;
     for (i, b) in rest.bytes().enumerate() {
@@ -1416,7 +1441,10 @@ fn pair_value_len(rest: &str, level: usize) -> Option<usize> {
         match b {
             b'\n' => return None,
             b'\\' => backslashes += 1,
-            b'"' if backslashes >= level && (backslashes - level).is_multiple_of(escaped) => {
+            b if b == quote
+                && backslashes >= level
+                && (backslashes - level).is_multiple_of(escaped) =>
+            {
                 return Some(i - level);
             }
             _ => backslashes = 0,
@@ -1425,54 +1453,141 @@ fn pair_value_len(rest: &str, level: usize) -> Option<usize> {
     None
 }
 
+/// The length of a pair's value of more than a string, an object or an
+/// array, from its opening bracket: to the bracket that closes it, counted
+/// outside quoted strings, or to the end of the line if none does.
+fn pair_nested_len(rest: &str) -> usize {
+    let mut depth = 0usize;
+    let mut quoted: Option<u8> = None;
+    for (i, b) in rest.bytes().enumerate() {
+        step(1);
+        match (quoted, b) {
+            (_, b'\n') => return i,
+            (Some(q), b) if b == q => quoted = None,
+            (Some(_), _) => {}
+            (None, b'"' | b'\'') => quoted = Some(b),
+            (None, b'{' | b'[') => depth += 1,
+            (None, b'}' | b']') => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    rest.len()
+}
+
+/// A pair's name as text writes it, its `\u` escapes read, however
+/// deeply their backslash is escaped: `X\u002dApi-Key` is `X-Api-Key`.
+fn pair_name(written: &str) -> Cow<'_, str> {
+    if !written.contains('\\') {
+        return Cow::Borrowed(written);
+    }
+    let mut name = String::new();
+    let mut rest = written;
+    while let Some(at) = rest.find('\\') {
+        name.push_str(&rest[..at]);
+        let escape = rest[at..].trim_start_matches('\\');
+        let code = escape
+            .strip_prefix('u')
+            .and_then(|hex| hex.get(..4))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(char::from_u32);
+        match code {
+            Some(c) => {
+                name.push(c);
+                rest = &escape[5..];
+            }
+            None => {
+                name.push_str(&rest[at..at + 1]);
+                rest = &rest[at + 1..];
+            }
+        }
+    }
+    name.push_str(rest);
+    Cow::Owned(name)
+}
+
 /// Hide the secret of each name and value pair written as JSON text,
 /// `{"name": "X-Api-Key", "value": "…"}` with its quotes escaped as JSON
 /// held in strings escapes them (see [`escaped_as_json`]), name or value
 /// first, judged as the JSON rule judges such a pair (see
-/// [`header_pair`]). The JSON rule reads only JSON that parses; this reads
-/// one that is cut, follows other text or sits in a string literal. A value
-/// given after its name whose closing quote is not found before the line
-/// ends is cut, and judged and hidden to the end of the line. Linear: a
+/// [`hide_pair_secret`]); or written as Python writes a dict, in single quotes;
+/// or as an array, `["X-Api-Key", "…"]`. The JSON rule reads only JSON
+/// that parses; this reads one that is cut, follows other text or sits in
+/// a string literal. A value given after its name whose closing quote is
+/// not found before the line ends is cut, and judged and hidden to the end
+/// of the line; one that is an object or an array is hidden to the bracket
+/// that closes it, when its name is a header's or a secret's. Linear: a
 /// value is scanned once, and only a later value's opening quote at the
 /// same depth closes an earlier one, so a scan that finds no closing quote
 /// leaves none at its depth to scan on that line; each character is read
 /// at most once for each depth and once more.
 fn pairs(input: &str) -> Option<String> {
     let line_end = |from: usize| input[from..].find('\n').map_or(input.len(), |i| from + i);
-    let holds = |name: &str, value: &str| {
+    let holds = |name: &str, value: &str, explicit: bool| {
         let value = value.replace('\\', "");
-        pair_holds_secret(name, &Value::String(value), true)
+        pair_holds_secret(&pair_name(name), &Value::String(value), explicit)
     };
     let mut hidden: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    while let Some(c) = PAIR_NAME_FIRST.captures_at(input, at) {
-        let from = c.get(0).map_or(at, |m| m.end());
-        let level = c.get(2).map_or(0, |m| m.len());
-        at = from;
-        if !escaped_as_json(level) {
-            continue;
+    // Name first: as an object, then as an array.
+    for (rule, explicit) in [(&*PAIR_NAME_FIRST, true), (&*PAIR_LISTED, false)] {
+        let mut at = 0;
+        while let Some(c) = rule.captures_at(input, at) {
+            let from = c.get(0).map_or(at, |m| m.end());
+            at = from;
+            if c.get(4).is_some() {
+                // An object or an array for a value, from its bracket,
+                // scanned only under a name it is hidden for, and then
+                // passed over; under another, what it holds is read on.
+                if pair_holds_more(&pair_name(&c[1])) {
+                    let to = from - 1 + pair_nested_len(&input[from - 1..]);
+                    hidden.push((from - 1, to));
+                    at = to.max(from);
+                }
+                continue;
+            }
+            let level = c.get(2).map_or(0, |m| m.len());
+            let quote = c.get(3).map_or(b'"', |m| m.as_str().as_bytes()[0]);
+            if !escaped_as_json(level) {
+                continue;
+            }
+            let len = pair_value_len(&input[from..], level, quote);
+            let to = len.map_or_else(|| line_end(from), |len| from + len);
+            // An array is a pair only when its value ends it, or is cut:
+            // `["X-Api-Key", "…"]`, not a list of three.
+            let closed = input[to..]
+                .trim_start_matches(['\\', '"', '\''])
+                .trim_start()
+                .starts_with(']');
+            let pair = explicit || len.is_none() || closed;
+            let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
+            if pair && holds(&c[1], value, explicit) {
+                hidden.push((from, to));
+            }
+            at = to.max(from);
         }
-        let to =
-            pair_value_len(&input[from..], level).map_or_else(|| line_end(from), |len| from + len);
-        let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
-        if holds(&c[1], value) {
-            hidden.push((from, to));
-        }
-        at = to.max(from);
     }
-    at = 0;
+    let mut at = 0;
     while let Some(c) = PAIR_VALUE_OPEN.captures_at(input, at) {
         let from = c.get(0).map_or(at, |m| m.end());
         let level = c.get(1).map_or(0, |m| m.len());
+        let quote = c.get(2).map_or(b'"', |m| m.as_str().as_bytes()[0]);
         at = from;
         if !escaped_as_json(level) {
             continue;
         }
-        let Some(len) = pair_value_len(&input[from..], level) else {
+        let Some(len) = pair_value_len(&input[from..], level, quote) else {
             continue;
         };
-        if let Some(n) = PAIR_NAME_AFTER.captures(&input[from + len..])
-            && holds(&n[1], &input[from..from + len])
+        let rest = &input[from + len..];
+        let name = PAIR_NAME_AFTER
+            .captures(rest)
+            .or(PAIR_NAME_CUT.captures(rest));
+        if let Some(n) = name
+            && holds(&n[1], &input[from..from + len], true)
         {
             hidden.push((from, from + len));
         }
@@ -1918,9 +2033,7 @@ fn opened_json(string: &str, nested: usize) -> Option<Value> {
 /// strings that look like credentials.
 fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
     // The rules any value has: a name and value pair's secret.
-    if let Some(secret) = header_pair(value) {
-        *secret = Value::String(REDACTED.into());
-    }
+    hide_pair_secret(value);
     match value {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
@@ -2327,28 +2440,71 @@ fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
     }
 }
 
-/// A header as a pair, `["Authorization", "..."]`, or as an object,
-/// `{"name": "Authorization", "value": "..."}`: the value, when it is the
-/// pair's secret.
-fn header_pair(value: &mut Value) -> Option<&mut Value> {
+/// Whether a pair named `name` holds a secret in a value of more than a
+/// string, such as an object, an array or a number: when it is a header's
+/// name, or a secret's, as `password` is.
+fn pair_holds_more(name: &str) -> bool {
+    header_named(name).is_some() || strength(name) == Strength::Strong
+}
+
+/// The fields of a pair's object that name it, `name`, `key`, `header` or
+/// `headerName`, and that hold its value, `value` or `headerValue`, in any
+/// case, as AWS writes `Name` and `Value`.
+const PAIR_NAME_FIELDS: &[&str] = &["name", "key", "header", "headerName"];
+const PAIR_VALUE_FIELDS: &[&str] = &["value", "headerValue"];
+
+/// Whether `key` is one of `fields`, in any case.
+fn is_pair_field(key: &str, fields: &[&str]) -> bool {
+    for field in fields {
+        if key.eq_ignore_ascii_case(field) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a pair's value, `secret`, is hidden under its name: a string as
+/// [`pair_holds_secret`] judges it, or a value of more than a string as
+/// [`pair_holds_more`] does.
+fn pair_value_hidden(name: &str, secret: &Value) -> bool {
+    // A value of more than a string: an object, an array or a number.
+    let more = !secret.is_string() && !secret.is_null() && !secret.is_boolean();
+    if more {
+        return pair_holds_more(name);
+    }
+    pair_holds_secret(name, secret, true)
+}
+
+/// Hide a header's or a secret's value given as a pair: as an array,
+/// `["Authorization", "..."]`, or as an object, `{"name": "Authorization",
+/// "value": "..."}`, its fields in any case (see [`PAIR_NAME_FIELDS`]). An
+/// object's value of more than a string is hidden whole under a name
+/// [`pair_holds_more`] reads so.
+fn hide_pair_secret(value: &mut Value) {
     match value {
-        Value::Array(items) if items.len() == 2 => {
-            let named = items[0]
-                .as_str()
-                .is_some_and(|name| pair_holds_secret(name, &items[1], false));
-            named.then(|| &mut items[1])
+        Value::Array(items)
+            if items.len() == 2
+                && items[0]
+                    .as_str()
+                    .is_some_and(|name| pair_holds_secret(name, &items[1], false)) =>
+        {
+            items[1] = Value::String(REDACTED.into());
         }
         Value::Object(fields) => {
-            let secret = fields.get("value")?;
-            let named = ["name", "key", "header"].iter().any(|field| {
-                fields
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| pair_holds_secret(name, secret, true))
-            });
-            if named { fields.get_mut("value") } else { None }
+            let names: Vec<String> = fields
+                .iter()
+                .filter(|(key, _)| is_pair_field(key, PAIR_NAME_FIELDS))
+                .filter_map(|(_, name)| name.as_str().map(str::to_owned))
+                .collect();
+            for (key, secret) in fields.iter_mut() {
+                if is_pair_field(key, PAIR_VALUE_FIELDS)
+                    && names.iter().any(|name| pair_value_hidden(name, secret))
+                {
+                    *secret = Value::String(REDACTED.into());
+                }
+            }
         }
-        _ => None,
+        _ => {}
     }
 }
 
@@ -2368,9 +2524,7 @@ fn redact_flag_values(items: &mut [Value]) {
 }
 
 fn redact_nested(value: &mut Value, nested: usize) {
-    if let Some(secret) = header_pair(value) {
-        *secret = Value::String(REDACTED.into());
-    }
+    hide_pair_secret(value);
     match value {
         Value::String(string) => redact_string(string, nested),
         Value::Array(items) => {
