@@ -1,0 +1,1 @@
+database-probe-query-errors|crates/atomic-core/src/state.rs|return Err(fail(error));|let _ = error; // CONTROL_OFF: failed query output trusted|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_query_errors_refuse_migration
