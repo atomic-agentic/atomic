@@ -606,12 +606,22 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             // The executor checks each success against the schema of the
             // media type its reply names, so every schema a response declares
             // must compile, not only the first. The tool's `output` is
-            // compiled as the document it is — one schema where the successes
-            // agree, an `anyOf` whose members are each a schema resource of
-            // their own — so a union that does not compile is named here,
-            // where it can be said, and not on the first call that reads a
-            // reply. The components the response schemas reference travel in
-            // the input's `$defs`, which is listed too.
+            // compiled with them as the document it is: one schema where the
+            // successes agree, an `anyOf` whose members are each a schema
+            // resource of their own — the `$id` the spec gave each one, or a
+            // `urn:atomic:response:…` where the spec gave it none. No reply
+            // is ever held to that document and nothing else compiles it, so
+            // this is where a tool whose output does not compile is said. And
+            // because each member names itself there, the union asks one thing
+            // that no member's own compile asks: that a reference written
+            // inside a member resolves against that member. A root-relative
+            // `$ref: '/'`, with no scheme and no fragment, resolves against
+            // the base a member is compiled under, and a `urn:` base has no
+            // root for it to resolve against, so only this compile says it. A
+            // member reaching for a `$defs` entry nothing holds is refused
+            // here and by the member on its own. The components the response
+            // schemas reference travel in the input's `$defs`, which is listed
+            // too.
             let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
             if let Some(output) = &tool.output {
                 schemas.push(output);

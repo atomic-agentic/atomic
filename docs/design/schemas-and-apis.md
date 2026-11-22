@@ -90,23 +90,29 @@ Importing an OpenAPI document gives a project a toolset (M15).
   under, since a reply says which of them it is. One schema where they agree,
   `anyOf` of the distinct ones where they differ, and each member of that union
   is a schema document of its own, so a reference written inside a member means
-  that member and not the union. A `default` describes the output only while no
-  code from `200` to `299` and no `2XX` range is declared beside it; behind a
-  named success it is what the spec's failures fall back to. OpenAPI 3.1 already
-  uses JSON Schema 2020-12; documents in the 3.0 dialect, with keywords such as
-  `nullable`, are translated first.
+  that member and not the union: a member keeps the `$id` the spec gave it, and
+  one of atomic's is added only where the spec gave it none. A `default`
+  describes the output only while no code from `200` to `299` and no `2XX` range
+  is declared beside it; behind a named success it is what the spec's failures
+  fall back to. OpenAPI 3.1 already uses JSON Schema 2020-12; documents in the
+  3.0 dialect, with keywords such as `nullable`, are translated first.
 - **A reply is held to its own response.** The executor checks a success's body
   against the schema its response declares under the media type the reply names.
-  A response that declares a media type and keeps no schema for it — `text/plain`
-  however it is written, or a JSON type with no `schema` — declares that body and
-  describes no shape for it, so any body of it fits, as any body fits a reply of
-  a response declaring no schema at all; bodies are still read as JSON, and bytes
-  that are not stay the failure they have always been. A reply naming a media
-  type none of the response's schemas covers, when it declares several, is
+  A response that declares a media type and keeps no schema for it — a JSON type
+  with no `schema`, or a media type atomic reads no body from, `text/plain` among
+  them whether or not it names a schema of its own — declares that body and keeps
+  nothing to hold a reply of it to: a schema written under a media type atomic
+  reads no body from describes a body atomic never reads, so it is not one a JSON
+  reply can be held to, and any body fits such a reply, as any body fits a reply
+  of a response declaring no schema at all. Bodies are still read as JSON, and
+  bytes that are not stay the failure they have always been. A reply naming a
+  media type none of the response's schemas covers, when it declares several, is
   refused. `atomic check` compiles a tool's input, the schemas its successes are
-  checked against, and its `output` with them, so a schema of theirs that does
-  not compile is said before any call is made; a failure response's schema is
-  never read, so it is never compiled.
+  checked against, and its `output` with them — that union as the document it
+  is, each member a document of its own — so a schema of theirs that does not
+  compile is said before any call is made, and so is a member that reaches
+  outside itself, which no other compile of the tool sees; a failure response's
+  schema is never read, so it is never compiled.
 - **atomic sends the request.** A built-in HTTP executor performs every call. It
   takes credentials from secrets granted to that atom, only reaches base URLs the
   network policy allows, and applies rate limits and retries. Nothing the model

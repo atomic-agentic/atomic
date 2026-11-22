@@ -1,0 +1,1 @@
+output-union-keeps-a-members-own-id|crates/atomic-schema/src/openapi.rs|                        let unnamed = member.get("$id").is_none();|                        let unnamed = true; /*CONTROL_OFF*/|-p atomic-agentic-schema --lib -- openapi::tests::a_member_of_the_union_keeps_the_id_the_spec_gave_it

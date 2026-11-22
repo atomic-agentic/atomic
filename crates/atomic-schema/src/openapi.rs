@@ -53,10 +53,13 @@
 //! failures fall back to — still the response a success the spec gives no code
 //! for is checked against, but no longer one a spec describes — while a spec
 //! declaring no success at all means its `default` as the shape a success
-//! takes. Where the union holds more than one schema, each member carries an
-//! `$id` of its own, because the union is a document nothing compiles a reply
-//! against and a reference inside a member — `#`, or `#/$defs/…` into the
-//! `$defs` the member carries — must mean the member it is written in.
+//! takes. Where the union holds more than one schema, each member is a schema
+//! document of its own, because the union is a document nothing compiles a
+//! reply against and a reference inside a member — `#`, or `#/$defs/…` into the
+//! `$defs` the member carries — must mean the member it is written in. A member
+//! the spec gave an `$id` keeps it, and one the spec gave none is given a
+//! `urn:atomic:response:…` of its own; a reference naming a member's own `$id`
+//! is how such a member points at itself, so that name is kept too.
 //!
 //! A response declared for a
 //! status that is not a success is kept as a key with nothing beside it: what
@@ -79,11 +82,12 @@ pub enum ResponseBody {
     /// or a `200` written with only a description.
     NoBody,
     /// It declares a `content` map, but one that gives atomic no schema to
-    /// check against: it names only media types atomic does not read and
-    /// wildcards that name no schema (`text/plain`,
-    /// `application/octet-stream`, `*/*`, `application/*`), or only JSON
-    /// media types with no `schema`. A body is declared, of a shape nothing
-    /// in the spec describes.
+    /// check against: it names only media types atomic reads no body from —
+    /// `text/plain`, `application/octet-stream`, and the like, whether or not
+    /// one of them carries a `schema`, which is a shape written for a body
+    /// atomic never reads — wildcards that name no schema (`*/*`,
+    /// `application/*`), or only JSON media types with no `schema`. A body is
+    /// declared, and atomic holds no schema of its own to a reply of it.
     NoJsonSchema,
     /// It declares one or more schemas, each under a media type its body may
     /// arrive with: under one or more JSON media types, or, where no JSON
@@ -98,11 +102,14 @@ pub enum ResponseBody {
         schemas: std::collections::BTreeMap<String, Value>,
         /// The other media types the same `content` map declares, as it writes
         /// them, in sorted order: those that name no schema, and those atomic
-        /// reads no body from. They are declared, and they say nothing about a
-        /// shape atomic holds a reply to — a reply whose `Content-Type` names
-        /// one is not governed by another media type's schema, least of all a
-        /// wildcard written beside them, and the executor holds it to no schema
-        /// at all, as it holds a reply of a response naming no schema.
+        /// reads no body from. A media type of that last kind may name a schema
+        /// all the same — a `text/plain` of `type: string` does — and atomic
+        /// reads no schema from a media type it reads no body from, so none of
+        /// these says a shape atomic holds a reply to: a reply whose
+        /// `Content-Type` names one is not governed by another media type's
+        /// schema, least of all a wildcard written beside them, and the
+        /// executor holds it to no schema at all, as it holds a reply of a
+        /// response naming no schema.
         declared_media: Vec<String>,
     },
 }
@@ -136,7 +143,8 @@ impl ResponseBody {
     /// own, as it writes them. Empty for a response that declares no `content`
     /// map or no schema at all; otherwise the declared media types
     /// [`ResponseBody::schemas`] leaves out — the ones a reply may name while
-    /// nothing describes a shape atomic holds it to.
+    /// atomic holds it to no shape, a media type of its own that names a schema
+    /// for a body atomic never reads included.
     pub fn declared_media(&self) -> &[String] {
         match self {
             ResponseBody::Json { declared_media, .. } => declared_media,
@@ -181,10 +189,11 @@ pub struct Operation {
     /// in status order — that one schema where they agree, `anyOf` of them
     /// where they differ, `None` when none of them declares one. A `default`
     /// is asked only when no code from `200` to `299` and no `2XX` range is
-    /// declared beside it. Where it is an `anyOf`, each member carries an
-    /// `$id`, so a reference inside it means that member. A tool's output, for
-    /// what describes it; what a reply is checked against is
-    /// [`Operation::response`], and within it whichever schema the reply's
+    /// declared beside it. Where it is an `anyOf`, each member is a schema
+    /// document of its own — the `$id` the spec gave it, or one of atomic's
+    /// where the spec gave none — so a reference inside it means that member.
+    /// A tool's output, for what describes it; what a reply is checked against
+    /// is [`Operation::response`], and within it whichever schema the reply's
     /// `Content-Type` names. `declared_output` says which responses are asked
     /// and what each contributes.
     pub output: Option<Value>,
@@ -263,7 +272,10 @@ fn response_declared(
 /// schema is the output as it stands; where they differ, `anyOf` of them is, in
 /// status order and then in the order the response names its media types, so a
 /// reply is described whichever of them it answers with; and where none declares
-/// a shape, there is no output at all.
+/// a shape, there is no output at all. Each member of that `anyOf` is a schema
+/// resource of its own — the `$id` the spec gave it, or `urn:atomic:response:…`
+/// where the spec gave it none — so a reference written inside a member means
+/// that member, as it does when that member is compiled alone.
 fn declared_output(
     responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
 ) -> Option<Value> {
@@ -301,18 +313,27 @@ fn declared_output(
         1 => schemas.pop(),
         _ => {
             // The union is a document nothing else holds a reply to, so each
-            // member is given a base URI of its own: a reference inside a
+            // member has to be a document of its own: a reference inside a
             // member — `#`, or `#/$defs/…` into the `$defs` it carries beside
             // its own components — then means the member it is written in,
             // exactly as it does when the executor holds a reply to that member
-            // alone. A boolean schema holds no keyword and so no id, and
-            // declares nothing a reference could reach.
+            // alone. What names nothing is named here; what the spec already
+            // named keeps its name, because a reference written as that name is
+            // how such a member points at itself. A boolean schema holds no
+            // keyword and so no id, and declares nothing a reference could
+            // reach.
             let members: Vec<Value> = schemas
                 .into_iter()
                 .enumerate()
                 .map(|(index, schema)| match schema {
                     Value::Object(mut member) => {
-                        member.insert("$id".into(), json!(format!("urn:atomic:response:{index}")));
+                        let unnamed = member.get("$id").is_none();
+                        if unnamed {
+                            member.insert(
+                                "$id".into(),
+                                json!(format!("urn:atomic:response:{index}")),
+                            );
+                        }
                         Value::Object(member)
                     }
                     other => other,
@@ -467,12 +488,14 @@ fn response_content(content: &Value) -> Declared {
 
 /// The media types a `content` map declares that keep no schema for atomic:
 /// those whose entry names no schema, and those atomic reads no body from at
-/// all (`text/plain`, whatever it names). Wildcards are never among them — no
-/// reply names one, and a wildcard is the schema kept for exactly the media
-/// types the map does not name. A reply whose `Content-Type` names one of these
-/// is a reply the spec describes without describing a shape for it, which is
-/// not the same as a reply the spec never mentions: the executor decides what
-/// to hold each of them to.
+/// all (`text/plain`, whatever it names — a `text/plain` of `type: string`
+/// names a schema for a body atomic never reads, and is kept out all the
+/// same). Wildcards are never among them — no reply names one, and a wildcard
+/// is the schema kept for exactly the media types the map does not name. A
+/// reply whose `Content-Type` names one of these is a reply the spec declares
+/// without giving atomic a shape to hold it to, which is not the same as a
+/// reply the spec never mentions: the executor decides what to hold each of
+/// them to.
 fn media_with_no_kept_schema(content: &Value) -> Vec<String> {
     let Some(content) = content.as_object() else {
         return Vec::new();

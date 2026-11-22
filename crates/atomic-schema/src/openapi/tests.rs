@@ -463,9 +463,10 @@ paths:
 
 // What a response declares about its body comes in three kinds, and they
 // are not the same claim. Only a response with no `content` key says there
-// is no body to read; one whose content names no schema — a media type
-// atomic does not read, a wildcard with no `schema`, a JSON media type with
-// no `schema` — declares a body whose shape nothing describes. The two are
+// is no body to read; one whose content names no schema atomic reads a body
+// against — a media type atomic does not read, whether or not it names a
+// schema of its own, a wildcard with no `schema`, a JSON media type with
+// no `schema` — declares a body atomic has no schema to check. The two are
 // kept apart because only the first lets atomic refuse a body. A wildcard
 // that does name a schema is the response's own claim about its body, which
 // may be JSON, so it gives atomic one to check against.
@@ -700,7 +701,9 @@ paths:
 // no schema, and media types atomic reads no body from at all. They are declared
 // all the same, and the executor cannot tell a reply naming one of them from a
 // reply naming a media type the response never mentions without being told — the
-// first is a body the spec declares and describes no shape for, and another media
+// first is a body the spec declares and gives atomic no schema to check —
+// a `text/plain` of `type: string` is such a media type, its schema describing
+// a body atomic never reads — and another media
 // type's schema, a wildcard's above all, is not its contract.
 #[test]
 fn a_response_keeps_the_media_types_it_declares_that_keep_no_schema() {
@@ -1219,8 +1222,10 @@ paths:
 
 // The union is a schema like any other: it must compile, and what it accepts is
 // exactly one of the shapes the successes declare. Each member keeps the
-// components it references, and carries an `$id` of its own to stand as their
-// base: a reference written inside a member means that member, never the union
+// components it references, and an `$id` stands as their base — one of atomic's
+// here, because the spec named none; a member the spec did name keeps that
+// name, which the last test in this file shows. Either way a reference written
+// inside a member means that member, never the union
 // it sits in, so the union holds no `$defs` for a member to reach by accident.
 // What a reply is held to is one member alone, where it is the whole document
 // already.
@@ -1538,4 +1543,133 @@ components:
     };
     assert!(held(200).is_valid(&json!({ "thing": "x" })));
     assert!(!held(202).is_valid(&json!({ "thing": "x" })));
+}
+
+// A response schema that names itself is written that way so that it can point
+// at itself: a `$ref` of `https://example.com/node` inside the schema whose
+// `$id` is that is that member's own `#`. The union must not rename such a
+// member — its reference would then name a document nothing holds, and a
+// response schema that compiles every other way would stop compiling inside the
+// tool built from it — so a member keeps the name the spec gave it and takes a
+// `urn:atomic:response:…` only where it has none.
+#[test]
+fn a_member_of_the_union_keeps_the_id_the_spec_gave_it() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Node, version: "1" }
+paths:
+  /node:
+    get:
+      operationId: node
+      responses:
+        "200":
+          description: a node, which names itself and points at itself
+          content:
+            application/json:
+              schema:
+                $id: "https://example.com/node"
+                type: object
+                properties: { child: { $ref: "https://example.com/node" } }
+        "202":
+          description: a count, which names nothing
+          content:
+            application/json: { schema: { type: integer } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let member = op
+        .response(200)
+        .expect("a response")
+        .1
+        .schema()
+        .expect("a schema");
+    Registry::new()
+        .validator_for(member)
+        .expect("the member compiles alone, self-reference and all");
+    let union = op.output.as_ref().expect("a union of the two successes");
+    assert_eq!(
+        union["anyOf"],
+        json!([
+            {
+                "$id": "https://example.com/node",
+                "type": "object",
+                "properties": { "child": { "$ref": "https://example.com/node" } },
+            },
+            { "$id": "urn:atomic:response:1", "type": "integer" },
+        ]),
+        "the member the spec named keeps that name, and the one it named nothing \
+         takes an id of atomic's: {union}"
+    );
+    let validator = Registry::new()
+        .validator_for(union)
+        .expect("the union compiles, the self-reference naming the member it is in");
+    assert!(
+        validator.is_valid(&json!(7)),
+        "the shape a `202` answers with"
+    );
+    assert!(
+        validator.is_valid(&json!({ "child": { "child": {} } })),
+        "a node nested in a node nested in a node"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "child": 5 })),
+        "a `child` is the same node again, not anything at all: {union}"
+    );
+    // What a reply is held to is that member alone, which is the same document
+    // here and says the same thing about a nested node.
+    let held = Registry::new()
+        .validator_for(member)
+        .expect("the response's schema compiles alone");
+    assert!(held.is_valid(&json!({ "child": {} })));
+    assert!(!held.is_valid(&json!({ "child": 5 })));
+}
+
+// The union is compiled where no member is: a member that names its own
+// document resolves what it writes against that name, so a reference written
+// for whichever document it happens to be compiled into — a root-relative
+// `$ref: "/"`, with no scheme and no fragment — resolves when that member is
+// compiled on its own and does not resolve once it stands as a document of its
+// own. This is the one thing the union's own compile asks that no member's
+// does, and `atomic check` compiles the union, so it is said there.
+#[test]
+fn the_unions_own_compile_refuses_a_member_that_reaches_outside_itself() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Rooted, version: "1" }
+paths:
+  /thing:
+    get:
+      operationId: thing
+      responses:
+        "200":
+          description: a thing, reaching for a root nothing names
+          content:
+            application/json: { schema: { $ref: "/" } }
+        "202":
+          description: a count
+          content:
+            application/json: { schema: { type: string } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let member = op
+        .response(200)
+        .expect("a response")
+        .1
+        .schema()
+        .expect("a schema");
+    Registry::new()
+        .validator_for(member)
+        .expect("the member compiles alone, wherever it is asked to resolve `/`");
+    let union = op.output.as_ref().expect("a union of the two successes");
+    let error = Registry::new()
+        .validator_for(union)
+        .expect_err("the same reference does not resolve once the member names itself");
+    let said = error.to_string();
+    assert!(
+        said.contains("Failed to resolve '/'") && said.contains("urn:atomic:response:0"),
+        "the refusal should name the reference and the member's own base: {said}"
+    );
 }

@@ -744,11 +744,13 @@ async fn a_body_on_a_response_that_declares_no_content_is_refused() {
 
 // Three responses declare content atomic takes no schema from: a wildcard
 // that names none, a media type it does not read, and a JSON media type that
-// names no schema. Each declares a body whose shape nothing in the spec
-// describes, so what comes back is the caller's, unchecked. A refusal here
-// would be a claim that no body was declared, which is not what these say.
-// A wildcard that does name a schema is checked, which is the test after
-// this one.
+// names no schema. Each declares a body atomic has no schema to check, so
+// what comes back is the caller's, unchecked. The `/text` one spells its plain
+// text out as `type: string`, and that schema describes a body atomic never
+// reads: the reply it governs is a JSON body of any shape, and the object
+// below is accepted where a string was written. A refusal here would be a
+// claim that no body was declared, which is not what these say. A wildcard
+// that does name a schema is checked, which is the test after this one.
 #[tokio::test]
 async fn a_body_on_content_atomic_gives_no_schema_is_passed_through() {
     let (host, _) = server(vec![
@@ -1172,13 +1174,16 @@ async fn a_reply_is_checked_against_the_schema_its_content_type_names() {
 }
 
 // A response may declare two bodies and describe the shape of only one of
-// them: the thing it returns as JSON, and the plain text a server falls back
-// to. A reply that names the media type declared with nothing beside it is not
-// held to the other media type's schema — a wildcard's beside it most of all —
-// because the spec declared that body and described no shape for it. So it is
-// passed through with whatever body it carries, the same answer a reply of a
-// response declaring no schema at all gets. It is not treated as some other
-// media type either: a reply naming a media type the response never mentions is
+// them for atomic to check: the thing it returns as JSON, and the plain text a
+// server falls back to. A reply that names the media type declared with nothing
+// beside it is not held to the other media type's schema — a wildcard's beside
+// it most of all — because the spec declared that body and gave atomic no
+// schema to check it against. So it is passed through with whatever body it
+// carries, the same answer a reply of a response declaring no schema at all
+// gets. The same answer goes to a media type that does name a schema,
+// `text/plain` of `type: string`, which describes a body atomic never reads;
+// the test after this one is that reply. It is not treated as some other media
+// type either: a reply naming a media type the response never mentions is
 // a different reply, which keeps falling to the response's only schema, declared
 // under a wildcard or not, and a reply naming the media type that does have a
 // schema is held to it as it always was.
