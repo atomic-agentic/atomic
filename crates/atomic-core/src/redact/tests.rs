@@ -2373,7 +2373,9 @@ fn a_secret_after_an_os_error_under_a_secrets_name_is_hidden() {
 
     let secret = planted.secret();
     assert_eq!(
-        text(&format!("/srv/password: Permission denied (os error 13) {secret}")),
+        text(&format!(
+            "/srv/password: Permission denied (os error 13) {secret}"
+        )),
         "/srv/password: Permission denied (os error 13) [REDACTED]"
     );
     assert_kept(&[
@@ -2727,4 +2729,26 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
         shown, 0,
         "a value one reading hides shows when the readings repeat"
     );
+}
+
+/// A secret that reads as a word, after an operating system's error, is
+/// not caught by its shape: it stays hidden where the error is not taken
+/// whole, under a header's name or written hard against the name, as the
+/// header rule then reads what was hidden as the header's credential.
+#[test]
+fn a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole() {
+    let word = "hunter2";
+    let mut header =
+        json!({ "Authorization": format!("passwd:Permission denied (os error 13) {word}") });
+    value(&mut header);
+    assert!(!header.to_string().contains(word), "set off: {header}");
+    for name in [
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+    ] {
+        let line = json!({ "log": format!("{name}: Permission denied (os error 13) {word}") });
+        let read = excerpt(&line.to_string(), 4096);
+        assert!(!read.contains(word), "{name}: {read}");
+    }
 }

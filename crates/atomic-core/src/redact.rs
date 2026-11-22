@@ -1119,7 +1119,10 @@ fn assigned(input: &str) -> Option<String> {
                 .map_or(input.len(), |i| after + i);
             for (from, to) in words(input, after, end) {
                 let word = &input[from..to];
-                if !is_not_a_secret(word) && !reads_as_no_credential(word) && looks_like_credential(word) {
+                if !is_not_a_secret(word)
+                    && !reads_as_no_credential(word)
+                    && looks_like_credential(word)
+                {
                     out.push_str(&input[copied..from]);
                     out.push_str(REDACTED);
                     copied = to;
@@ -1226,7 +1229,9 @@ fn reads_as_no_credential(word: &str) -> bool {
             .all(|b| b.is_ascii_digit() || b"-:.+TZ".contains(&b));
     let assignment = word.split_once('=').is_some_and(|(name, value)| {
         !name.is_empty()
-            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
             && !value.is_empty()
             && !value.starts_with('=')
     });
