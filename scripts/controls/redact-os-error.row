@@ -1,0 +1,1 @@
+redact-os-error|crates/atomic-core/src/redact.rs|        if !(bare && error_len.is_some()) {|        if true /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::an_os_error_after_a_path_is_kept_whole

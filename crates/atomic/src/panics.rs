@@ -138,39 +138,50 @@ fn note_in(dir: Option<&Path>, run: &str, payload: &(dyn std::any::Any + Send)) 
         // The run is parked either way, and this process says why; a later
         // one cannot, so say that too.
         if let Err(e) = keep(dir, run, &kept) {
-            atomic_core::log_line!(
-                "atomic: run {run}'s panic is not kept for later processes: {e}"
-            );
+            atomic_core::redact::Line::new()
+                .plain("atomic: run ")
+                .shown(run)
+                .plain("'s panic is not kept for later processes: ")
+                .redacted(&e.to_string())
+                .log();
         }
     }
     message
 }
 
-/// What a person is told about run `run`, parked because its workflow code
-/// panicked with `message`.
-pub fn cause(run: &str, message: &str) -> String {
-    format!(
-        "run {run} stopped: atomic's own workflow code panicked ({message}), so the run is \
-         parked, not retried"
-    )
-}
+/// What a person is told about a run whose workflow code panicked, put
+/// together with the run's id and the panic's message apart: `run <id>`
+/// [`PANICKED`] `<message>` [`NOT_RETRIED`] when the run is parked, or
+/// [`NOT_PARKED`] when the command could not see the engine park it; then
+/// what to do, [`HINT`] `<id>` [`HINT_END`].
+pub const PANICKED: &str = " stopped: atomic's own workflow code panicked (";
+/// See [`PANICKED`].
+pub const NOT_RETRIED: &str = "), so the run is parked, not retried";
+/// See [`PANICKED`].
+pub const NOT_PARKED: &str = "), and the engine has not parked it yet, so a later `atomic serve` \
+                              may run it again";
+/// See [`PANICKED`].
+pub const HINT: &str = "this is a bug in atomic, and the panic will likely happen again if the \
+                        run is resumed as it is: report it with the message above, then continue \
+                        the run with `atomic runs resume ";
+/// See [`PANICKED`].
+pub const HINT_END: &str = "` once an atomic without it is installed";
 
-/// What a person is told about run `run`, whose workflow code panicked with
-/// `message` when this command could not see the engine park it.
-pub fn unparked(run: &str, message: &str) -> String {
-    format!(
-        "run {run} stopped: atomic's own workflow code panicked ({message}), and the engine has \
-         not parked it yet, so a later `atomic serve` may run it again"
-    )
-}
-
-/// What a person can do about it.
-pub fn hint(run: &str) -> String {
-    format!(
-        "this is a bug in atomic, and the panic will likely happen again if the run is resumed \
-         as it is: report it with the message above, then continue the run with `atomic runs \
-         resume {run}` once an atomic without it is installed"
-    )
+/// What `atomic serve` says of run `run`, whose workflow code panicked with
+/// `message`, in [`PANICKED`]'s words: the run's id as it is and the message
+/// redacted on its own, so a run named for a secret, such as
+/// `rotate-secret`, is still named.
+pub fn served(run: &str, message: &str) -> atomic_core::redact::Line {
+    atomic_core::redact::Line::new()
+        .plain("atomic serve: run ")
+        .shown(run)
+        .plain(PANICKED)
+        .redacted(message)
+        .plain(NOT_RETRIED)
+        .plain("; ")
+        .plain(HINT)
+        .shown(run)
+        .plain(HINT_END)
 }
 
 /// `workflow`, the workflow code of run `run`, with a panic in it noted
@@ -208,11 +219,7 @@ impl<F: Future> Future for Caught<F> {
             Err(payload) => {
                 let message = note(&this.run, payload.as_ref());
                 if crate::workflows::serving() {
-                    atomic_core::log_line!(
-                        "atomic serve: {}; {}",
-                        cause(&this.run, &message),
-                        hint(&this.run)
-                    );
+                    served(&this.run, &message).log();
                     // Said; a server keeps no note of every run it served.
                     NOTED
                         .lock()

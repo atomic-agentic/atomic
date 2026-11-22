@@ -1,0 +1,1 @@
+scratch-outermost-resolved|crates/atomic-exec/src/workspace.rs|.map(PathBuf::as_path).map(resolved).collect();|.map(PathBuf::as_path).map(Path::to_path_buf).collect();|-p atomic-agentic-exec --lib only_a_root_truly_inside_another_denied_one_is_left_to_it

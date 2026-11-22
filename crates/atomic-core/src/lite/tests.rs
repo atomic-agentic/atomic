@@ -937,6 +937,218 @@ fn a_chat_spans_error_is_the_status_and_type_not_the_body() {
     );
 }
 
+/// A key to an endpoint on this machine over plain http is refused while the
+/// client's own matcher says a proxy variable would carry it there, or while
+/// the system's settings may and NO_PROXY does not exempt the host; nothing
+/// else is refused.
+#[test]
+fn a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    };
+    let leak =
+        |pairs: Vec<(&'static str, &'static str)>| -> &'static [(&'static str, &'static str)] {
+            Box::leak(pairs.into_boxed_slice())
+        };
+    let local = "http://127.0.0.1:4000/v1";
+    let fix = "set NO_PROXY to include 127.0.0.1, or use an https endpoint";
+    for proxy in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        let pairs = leak(vec![(proxy, "http://proxy.example:3128")]);
+        let why = proxied_key(local, &env(pairs), ProxyRules::Variables).expect("refused");
+        assert!(why.contains(&format!("{proxy} names a proxy")), "{why}");
+        assert!(why.contains(fix), "{why}");
+    }
+    let proxied: &'static [(&str, &str)] = &[("HTTP_PROXY", "http://proxy.example:3128")];
+    // Not plain http on this machine: no proxy sees anything in cleartext
+    // that it would not see anyway.
+    for base in [
+        "https://127.0.0.1:4000/v1",
+        "http://example.com/v1",
+        "http://10.0.0.5:4000/v1",
+    ] {
+        assert_eq!(
+            proxied_key(base, &env(proxied), ProxyRules::VariablesOrPlatform),
+            None,
+            "{base}"
+        );
+    }
+    // Every local spelling is local.
+    for base in [
+        "http://localhost:4000/v1",
+        "http://api.localhost:4000/v1",
+        "http://[::1]:4000/v1",
+        "http://127.0.0.2:4000/v1",
+        "http://localhost.:4000/v1",
+        "http://0.0.0.0:4000/v1",
+        "http://[::ffff:127.0.0.1]:4000/v1",
+        "http://127.1:4000/v1",
+    ] {
+        assert!(
+            proxied_key(base, &env(proxied), ProxyRules::Variables).is_some(),
+            "{base}"
+        );
+    }
+    // No proxy, or one the client cannot use: nothing to refuse.
+    assert_eq!(proxied_key(local, &env(&[]), ProxyRules::Variables), None);
+    assert_eq!(
+        proxied_key(local, &env(&[("HTTP_PROXY", " ")]), ProxyRules::Variables),
+        None
+    );
+    // As in the client, the first of a pair that is set is the one read:
+    // an empty HTTP_PROXY hides http_proxy, but ALL_PROXY still applies.
+    let hidden = leak(vec![
+        ("HTTP_PROXY", ""),
+        ("http_proxy", "http://proxy.example:3128"),
+    ]);
+    assert_eq!(
+        proxied_key(local, &env(hidden), ProxyRules::Variables),
+        None
+    );
+    let all = leak(vec![
+        ("HTTP_PROXY", ""),
+        ("ALL_PROXY", "http://proxy.example:3128"),
+    ]);
+    let why = proxied_key(local, &env(all), ProxyRules::Variables).expect("refused");
+    assert!(why.contains("ALL_PROXY names a proxy"), "{why}");
+    // NO_PROXY entries that exempt the host, and ones that do not, as the
+    // client's matcher reads them: what it would still proxy is refused.
+    for (base, no_proxy, covered) in [
+        (local, "127.0.0.1", true),
+        (local, "example.com, 127.0.0.1", true),
+        (local, "127.0.0.0/8", true),
+        (local, "127.0.0.0/+8", false),
+        (local, "127.0.0.0/008", false),
+        (local, "*", false),
+        (local, "localhost", false),
+        (local, "10.0.0.0/8", false),
+        (local, "127.0.0.2", false),
+        ("http://localhost:4000/v1", "localhost", true),
+        ("http://localhost:4000/v1", "*", true),
+        ("http://localhost.:4000/v1", "localhost", false),
+        ("http://api.localhost:4000/v1", ".localhost", true),
+        ("http://api.localhost:4000/v1", "..localhost", false),
+        ("http://api.localhost:4000/v1", "other.localhost", false),
+        ("http://[::1]:4000/v1", "::1", true),
+        ("http://[::1]:4000/v1", "::1/128", true),
+        ("http://[::1]:4000/v1", "::1/0128", false),
+        ("http://[::1]:4000/v1", "[::1]", false),
+    ] {
+        for name in ["NO_PROXY", "no_proxy"] {
+            let named = leak(vec![
+                ("HTTP_PROXY", "http://proxy.example:3128"),
+                (name, no_proxy),
+            ]);
+            assert_eq!(
+                proxied_key(base, &env(named), ProxyRules::Variables).is_none(),
+                covered,
+                "{base} with {name}={no_proxy}"
+            );
+            // Where the system's settings may carry it, NO_PROXY alone
+            // decides, the same way.
+            let unnamed = leak(vec![(name, no_proxy)]);
+            assert_eq!(
+                proxied_key(base, &env(unnamed), ProxyRules::VariablesOrPlatform).is_none(),
+                covered,
+                "{base} with {name}={no_proxy} and the system's settings"
+            );
+        }
+    }
+    // A NO_PROXY that is set, even empty, hides no_proxy, as in the client.
+    let hidden = leak(vec![
+        ("HTTP_PROXY", "http://proxy.example:3128"),
+        ("NO_PROXY", ""),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    assert!(proxied_key(local, &env(hidden), ProxyRules::Variables).is_some());
+    // With no variable naming a proxy, the system's settings are what may:
+    // refused unless NO_PROXY exempts the host, and said as such.
+    let why = proxied_key(local, &env(&[]), ProxyRules::VariablesOrPlatform).expect("refused");
+    assert!(why.contains("the system's proxy settings"), "{why}");
+    assert!(why.contains(fix), "{why}");
+    assert_eq!(proxied_key(local, &env(&[]), ProxyRules::Variables), None);
+    // With respect_system_proxy on Linux, Codex's own resolver reads the
+    // variables: the first of a pair that is set, even empty, with an empty
+    // value meaning none; HTTP_PROXY's pair, else ALL_PROXY's, as the one
+    // proxy; and it parses that value leniently, so any value it takes counts.
+    let codex = ProxyRules::CodexVariables;
+    let hidden = leak(vec![
+        ("HTTP_PROXY", ""),
+        ("http_proxy", "http://proxy.example:3128"),
+    ]);
+    assert_eq!(proxied_key(local, &env(hidden), codex), None);
+    let not_exempted = leak(vec![
+        ("HTTP_PROXY", "http://proxy.example:3128"),
+        ("NO_PROXY", ""),
+        ("no_proxy", "127.0.0.1"),
+    ]);
+    let why = proxied_key(local, &env(not_exempted), codex).expect("refused");
+    assert!(why.contains("HTTP_PROXY names a proxy"), "{why}");
+    let falls_to_all = leak(vec![
+        ("HTTP_PROXY", ""),
+        ("ALL_PROXY", "http://proxy.example:3128"),
+    ]);
+    let why = proxied_key(local, &env(falls_to_all), codex).expect("refused");
+    assert!(why.contains("ALL_PROXY names a proxy"), "{why}");
+    for (name, spelling) in [
+        ("HTTP_PROXY", " http://proxy.example:3128"),
+        ("HTTP_PROXY", "http://proxy.example:3128 "),
+        ("HTTP_PROXY", "http://proxy.example:3128\n"),
+        ("http_proxy", "\thttp://proxy.example:3128"),
+        ("ALL_PROXY", " http://proxy.example:3128"),
+        ("HTTP_PROXY", "proxy.example:3128"),
+    ] {
+        let pairs = leak(vec![(name, spelling)]);
+        let why = proxied_key(local, &env(pairs), codex)
+            .unwrap_or_else(|| panic!("{name}={spelling:?} was let through"));
+        assert!(why.contains(&format!("{name} names a proxy")), "{why}");
+        assert!(why.contains(fix), "{why}");
+        let exempt = leak(vec![(name, spelling), ("NO_PROXY", "127.0.0.1")]);
+        assert_eq!(
+            proxied_key(local, &env(exempt), codex),
+            None,
+            "{name}={spelling:?} with NO_PROXY=127.0.0.1"
+        );
+    }
+    assert_eq!(proxied_key(local, &env(&[]), codex), None);
+    // Elsewhere, with respect_system_proxy on, the platform's settings and
+    // their own bypass list decide, and NO_PROXY changes nothing: always
+    // refused, naming the feature.
+    let platform = ProxyRules::Platform;
+    for pairs in [leak(vec![]), leak(vec![("NO_PROXY", "127.0.0.1")])] {
+        let why = proxied_key(local, &env(pairs), platform).expect("refused");
+        assert!(
+            why.contains("turn respect_system_proxy off, or use an https endpoint"),
+            "{why}"
+        );
+        assert!(!why.contains("set NO_PROXY"), "{why}");
+    }
+    assert_eq!(
+        proxied_key("https://127.0.0.1:4000/v1", &env(&[]), platform),
+        None
+    );
+}
+
+/// The rules a Codex atom's client finds its proxy by, for each platform
+/// and setting of Codex's respect_system_proxy feature.
+#[test]
+fn a_codex_atoms_proxy_rules_follow_the_platform_and_the_feature() {
+    assert_eq!(ProxyRules::for_codex(true, false), ProxyRules::Variables);
+    assert_eq!(
+        ProxyRules::for_codex(true, true),
+        ProxyRules::CodexVariables
+    );
+    assert_eq!(
+        ProxyRules::for_codex(false, false),
+        ProxyRules::VariablesOrPlatform
+    );
+    assert_eq!(ProxyRules::for_codex(false, true), ProxyRules::Platform);
+}
+
 #[test]
 fn an_endpoint_here_over_plain_http_is_told_from_one_elsewhere() {
     for (base, here) in [

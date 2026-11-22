@@ -3,7 +3,7 @@
 """Run the v0.1 gate scenario end to end, and print a transcript of it.
 
     scripts/v01-gate.py --atomic target/release/atomic
-    scripts/v01-gate.py --atomic target/debug/atomic --keep /tmp/v01-gate
+    scripts/v01-gate.py --atomic target/debug/atomic --keep target/v01-gate
 
 One developer runs the order-report example (examples/03-order-report): an exec
 atom totals the order, a lite atom writes a note about the total, a gate waits
@@ -33,11 +33,22 @@ scenario needs no provider and no network, and it counts every call. The
 binary under test is an ordinary build of atomic, with no test features. On
 Linux, exec atoms run in atomic's sandbox, so the sandbox must work where this
 runs (inside scripts/dev.sh, with ATOMIC_DEV_SANDBOX=on). Everything the run
-writes goes under a throwaway directory, removed at the end unless `--keep`
-names one.
+writes goes under a throwaway directory in the checkout's target/, removed at
+the end unless `--keep` names one. It is never under the system's temporary
+directory, where atomic refuses to put an atom's scratch: a work directory
+there is refused, whether `--keep` names it or it is the checkout's own
+`target/`, which is under it when the checkout is.
 
-Exits 0 when every check holds, 1 when any fails, and 2 when the scenario could
-not be set up.
+However the scenario ends, every atomic it started is killed and waited for
+before its directory is removed: on success, on a failed check, on an error,
+on Ctrl-C, and on SIGTERM or SIGHUP, which end it as SystemExit. A SIGHUP the
+caller already had ignored, as `nohup` leaves it, stays ignored and does not
+stop the scenario.
+
+Exits 0 when every check holds; 1 when any fails; 2 when the scenario could not
+be set up or run, or what atomic recorded is not in the shape this script
+reads; and 128 plus the signal's number when SIGTERM, or a SIGHUP that was not
+already ignored, stops it.
 """
 
 import argparse
@@ -68,10 +79,15 @@ WAIT = 180  # seconds any one wait may take before the scenario fails
 # The ledger's model name for an exec command's metered time.
 WORK_MODEL = "(command)"
 
-# What in the caller's environment could change what atomic does: every
-# variable with one of these prefixes, and these by name.
-CLEARED_PREFIXES = ("ATOMIC_", "CODEX_", "OPENAI_", "DBOS__", "XDG_")
+# What in the caller's environment would change what atomic does, or where
+# it sends what it records: every variable with one of these prefixes, and
+# these by name. OTEL_ goes too, so a developer's collector, whose headers can
+# carry a key, never hears of the scenario. Others still pass through, such as
+# PATH, RUST_LOG, KUBECONFIG, TMPDIR and the proxy variables.
+CLEARED_PREFIXES = ("ATOMIC_", "CODEX_", "OPENAI_", "DBOS__", "XDG_", "OTEL_")
 CLEARED = ("DATABASE_URL",)
+# The checkout's own scratch, where the scenario works by default.
+TARGET = os.path.join(ROOT, "target")
 
 
 def fixture(atom, which):
@@ -222,6 +238,8 @@ class Scenario:
             # The operator's credential is kept in a directory only they can
             # read: a container has no OS keyring.
             "ATOMIC_CREDENTIAL_STORE": "file",
+            # And no telemetry is sent, whatever else is set.
+            "OTEL_SDK_DISABLED": "true",
         })
         self.passed = []
         self.failed = []
@@ -372,11 +390,17 @@ def prepare(s, fake):
 
 
 def when(ms):
-    """A time the store recorded, milliseconds since the Unix epoch, as UTC.
-    The gate store keeps times as such integers, not as text."""
+    """A time the store recorded, milliseconds since the Unix epoch, as UTC,
+    or "none" for none. The gate store keeps times as such integers, not as
+    text."""
+    if ms is None:
+        return "none"
     if not isinstance(ms, int) or isinstance(ms, bool):
         raise Unexpected(f"a recorded time is {ms!r}, not milliseconds since the epoch")
-    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat()
+    try:
+        return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat()
+    except (OverflowError, ValueError, OSError) as e:
+        raise Unexpected(f"a recorded time, {ms}, is out of range: {e}") from e
 
 
 def of(name):
@@ -519,16 +543,36 @@ def scenario(s, fake):
     final = decided[0]
     decision = (final.get("resolution") or {}).get("decided") or {}
     s.check("within the original gate deadline",
-            (final["id"], final["opened_at"], final["deadline"])
+            # A gate recorded without its deadline or its opening time fails
+            # this check rather than reaching the time comparisons after it,
+            # which need both.
+            final["deadline"] is not None
+            and final["opened_at"] is not None
+            and (final["id"], final["opened_at"], final["deadline"])
             == (gate["id"], gate["opened_at"], gate["deadline"])
             and decision.get("verdict") == "approve"
-            and decision.get("at", final["deadline"]) < final["deadline"],
+            and isinstance(decision.get("at"), int)
+            and final["opened_at"] <= decision["at"] < final["deadline"],
             f"gate {final['id']} kept its opening, {when(final['opened_at'])}, and its deadline, "
             f"{when(final['deadline'])}; {decision.get('verdict')} by {decision.get('by')} "
             f"at {when(decision['at']) if 'at' in decision else None}")
     s.check("evals green", live[0] - before_eval[0] == 1 and after_eval == live,
             f"atomic eval --live and atomic eval exited 0; the live eval made "
             f"{live[0] - before_eval[0]} model call(s), the replay {after_eval[0] - live[0]}")
+
+
+def stopped(signum, _frame):
+    """End the scenario on `signum` as an exception would, so `finally` runs."""
+    raise SystemExit(128 + signum)
+
+
+def under_system_temp(path):
+    """Whether `path` is inside /tmp or $TMPDIR, as each really is."""
+    real = os.path.realpath(path)
+    temps = {os.path.realpath("/tmp"), os.path.realpath(tempfile.gettempdir())}
+    if os.environ.get("TMPDIR"):
+        temps.add(os.path.realpath(os.environ["TMPDIR"]))
+    return any(os.path.commonpath([real, t]) == t for t in temps)
 
 
 def main():
@@ -538,6 +582,13 @@ def main():
     parser.add_argument("--keep", metavar="DIR",
                         help="work in DIR, which must not exist yet, and keep it")
     args = parser.parse_args()
+    # SIGTERM and SIGHUP end the scenario as an exception does, so what it
+    # started is reaped and its directory removed: set before anything starts.
+    # A caller who started this with nohup has SIGHUP ignored on purpose, to
+    # keep a detached run going when its terminal closes, so leave that alone.
+    signal.signal(signal.SIGTERM, stopped)
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, stopped)
     atomic = os.path.abspath(args.atomic)
     if not os.access(atomic, os.X_OK):
         say(f"v01-gate: no atomic binary at {atomic}; build one, or name it with --atomic")
@@ -545,12 +596,32 @@ def main():
     try:
         if args.keep:
             work = os.path.abspath(args.keep)
-            os.makedirs(work)
         else:
-            work = tempfile.mkdtemp(prefix="atomic-v01-gate-")
+            os.makedirs(TARGET, exist_ok=True)
+            work = tempfile.mkdtemp(prefix="v01-gate-", dir=TARGET)
     except OSError as e:
         say(f"v01-gate: no directory to work in: {e}")
         return 2
+    # Either branch's directory, not just a --keep: atomic refuses an atom's
+    # scratch under the system's temporary directory, so a checkout that lives
+    # there would fail the run mid-step rather than here.
+    if under_system_temp(work):
+        if not args.keep:
+            shutil.rmtree(work, ignore_errors=True)  # empty; the one just made
+        say(f"v01-gate: the directory to work in, {work}, is under the system's temporary "
+            "directory, where atomic refuses an atom's scratch; work in a directory "
+            "elsewhere, named with --keep or in a checkout that is not under it")
+        return 2
+    # A --keep directory is made here and nowhere else, so it must not exist
+    # yet: the scenario would write its project/, home/, logs/ and atomic-home/
+    # among what is already there, and a store already under atomic-home/ would
+    # be read as the run's own.
+    if args.keep:
+        try:
+            os.makedirs(work)
+        except OSError as e:
+            say(f"v01-gate: no directory to work in: {e}")
+            return 2
     fake = Fake()
     s = Scenario(atomic, work)
     try:
@@ -566,6 +637,11 @@ def main():
         say(f"v01-gate: what atomic recorded is not in the shape this script reads: {e!r}")
         return 2
     finally:
+        # First: a second SIGTERM or SIGHUP must not cut the cleanup short.
+        # Its default action would end the process mid-reap or mid-removal,
+        # leaving an atomic running and its directory behind.
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
         s.reap()
         fake.stop()
         if not args.keep:
