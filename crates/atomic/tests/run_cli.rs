@@ -1103,6 +1103,54 @@ fn address_of(model: &FakeModel) -> String {
 /// run made with `atomic run`: the project's larger cap, and its `null` for
 /// their dollar cap, leave their caps the ones the run's plan records, with
 /// their ceilings beside them.
+/// `--run-id` outside its characters or its length is refused before
+/// anything is read or recorded, with the rule and without the id: what was
+/// pasted by mistake, such as a token, is not repeated.
+#[test]
+fn a_run_id_outside_its_characters_or_length_is_refused() {
+    let dir = scratch("run-id-refused");
+    let project = project(&dir);
+    let pasted = concat!("Bearer ghp_", "SAMPLE0123456789abcdefghijklmnopqrstuv");
+    let long = "a".repeat(129);
+    for id in [pasted, long.as_str(), "-x", "a\u{1b}[2Jb", "caf\u{e9}"] {
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "count-note", "--run-id", id, "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(!out.status.success(), "{id:?}: {}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.id_invalid", "{id:?}: {error}");
+        assert_eq!(
+            error["description"].as_str(),
+            Some(
+                "the run id given with --run-id is refused: a run id is 1 to 128 characters, \
+                 each an ASCII letter, a digit, `.`, `_`, `:` or `-`, and starts with a letter \
+                 or a digit"
+            ),
+            "{id:?}: {error}"
+        );
+    }
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--run-id", pasted, "--data", NOTE],
+        &[],
+        "",
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("error: the run id given with --run-id is refused"),
+        "{}",
+        text(&out)
+    );
+    assert!(!said.contains("SAMPLE0123456789"), "{said}");
+    assert!(stores(&dir).is_empty(), "a store was made");
+    assert_eq!(count_log(&dir), 0, "nothing ran");
+}
+
 #[test]
 fn your_own_configuration_caps_what_atomic_run_records() {
     on_codex_runtime(async {
