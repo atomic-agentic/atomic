@@ -2163,6 +2163,175 @@ fn rewritten_held_json_settles_in_one_pass() {
     }
 }
 
+/// What `io::Error` writes for an operating system's error, alone and after
+/// the path it is about, is kept whole, whatever the path's last name: a
+/// sign-in's directory, `credentials`, `secrets`, `token`.
+#[test]
+fn an_os_error_after_a_path_is_kept_whole() {
+    let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+    let missing = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    let looped = std::io::Error::from_raw_os_error(libc::ELOOP).to_string();
+    let mut kept = vec![denied.clone(), missing.clone(), looped.clone()];
+    for name in [
+        "codex-auth",
+        "credentials",
+        "secrets",
+        "token",
+        "auth.json",
+        "api_key",
+        "DB_PASSWORD",
+    ] {
+        for error in [&denied, &missing, &looped] {
+            kept.push(format!(
+                "/home/dev/.config/atomic/credentials/{name}: {error}"
+            ));
+            kept.push(format!("open {name}: {error}"));
+            kept.push(format!("error: {name}: {error}; try again"));
+        }
+    }
+    let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
+    assert_kept(&kept);
+}
+
+/// A deterministic stream of numbers, so the planted secrets below are the
+/// same on every run, and on main, where the same cases are hidden.
+struct Planted(u64);
+
+impl Planted {
+    fn next(&mut self) -> u64 {
+        // xorshift64*
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A secret no rule could take for a word: letters and digits, with at
+    /// least one of each, 16 to 40 long.
+    fn secret(&mut self) -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let len = 16 + (self.next() % 25) as usize;
+        let mut s: String = (0..len)
+            .map(|_| CHARS[(self.next() % CHARS.len() as u64) as usize] as char)
+            .collect();
+        s.replace_range(0..1, "q");
+        s.push('7');
+        s
+    }
+}
+
+/// Secrets planted after a secret's name, however the text around them
+/// looks like an operating system's error, stay hidden: the oracle is the
+/// planted value itself, not what redaction makes of it. The same cases
+/// pass on main, so keeping an operating system's error whole shows no
+/// secret main hides.
+#[test]
+fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
+    let mut planted = Planted(0x5eed_a70c_0000_0013);
+    let names = [
+        "password",
+        "DB_PASSWORD",
+        "client_secret",
+        "secrets",
+        "api_key",
+        "apikey",
+        "access_token",
+        "AUTH_TOKEN",
+        "github_token",
+    ];
+    let seps = [": ", "=", " = ", ": \"", "='"];
+    let mut shown = Vec::new();
+    let mut n = 0;
+    for name in names {
+        for sep in seps {
+            for _ in 0..8 {
+                let secret = planted.secret();
+                let close = match sep {
+                    ": \"" => "\"",
+                    "='" => "'",
+                    _ => "",
+                };
+                let mut inputs = vec![
+                    format!("{name}{sep}{secret}{close}"),
+                    format!("/srv/app/{name}{sep}{secret}{close} (os error 13)"),
+                    format!("{name}{sep}{secret}{close} denied (os error 13)"),
+                    format!("{name}{sep}{secret}{close}: Permission denied (os error 13)"),
+                    format!("open /srv/{name}{sep}{secret}{close}"),
+                ];
+                // A quoted value that leads with an operating system's
+                // error and goes on: the whole quoted value is the secret's,
+                // and it stays hidden. Only quoted: after a bare value main
+                // hides nothing past its first word either.
+                if !close.is_empty() {
+                    inputs.push(format!(
+                        "{name}{sep}Permission denied (os error 13) {secret}{close}"
+                    ));
+                    inputs.push(format!(
+                        "{name}{sep}No such file or directory (os error 2){secret}{close}"
+                    ));
+                }
+                for input in inputs {
+                    if text(&input).contains(&secret) {
+                        shown.push(n);
+                    }
+                    n += 1;
+                }
+            }
+        }
+        // A header's value that leads with a secret's name and an operating
+        // system's error, hard against the name: a credential, not an error.
+        for _ in 0..8 {
+            let secret = planted.secret();
+            let mut header = serde_json::json!({
+                "Authorization": format!("{name}:Permission denied (os error 13) {secret}")
+            });
+            value(&mut header);
+            if header.to_string().contains(&secret) {
+                shown.push(n);
+            }
+            n += 1;
+        }
+    }
+    // An operating system's error under a header's name, read twice: once
+    // as text and again as the JSON around it, by excerpt(), or inside a
+    // JSON string that value() reads twice. The header's value is a
+    // credential, so the second reading must not find the secret. (A log
+    // line holding it, read once by value(), shows the secret after the
+    // error on main too: only its first word is taken for the value.)
+    // Under a header's own name and under longer names that end in one, as
+    // the header rule finds it there.
+    for header in [
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+    ] {
+        for _ in 0..8 {
+            let secret = planted.secret();
+            let log = format!("{header}: Permission denied (os error 13) {secret}");
+            let nested = format!("open {header} : Permission denied (os error 13) :{secret}");
+            let line = serde_json::json!({"log": log});
+            let args = serde_json::json!({"args": serde_json::json!({"log": nested}).to_string()});
+            let mut read = args.clone();
+            value(&mut read);
+            let readings = [
+                excerpt(&line.to_string(), 4096),
+                excerpt(&args.to_string(), 4096),
+                read.to_string(),
+            ];
+            for reading in readings {
+                if reading.contains(&secret) {
+                    shown.push(n);
+                }
+                n += 1;
+            }
+        }
+    }
+    assert!(
+        shown.is_empty(),
+        "planted secrets shown in cases {shown:?} of {n}"
+    );
+}
+
 /// Redacting text twice changes nothing: a rule that a first rule's marker
 /// leaves something for, a header after an assignment's marker or a value
 /// after an open assignment, has already read it.
