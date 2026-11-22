@@ -1404,10 +1404,9 @@ lockfile, prepared once by a setup step whose result is cached; a DuckDB tool
 over files; handling for untrusted files; a heartbeat that keeps a long exec
 step's lease alive (exec atoms as such arrive earlier, in M11a); and the
 managed Deno that code atoms and scripts run on, which arrives in v0.7. Today,
-separately, the Astro compiler already needs a Deno 2.9.8 the user provides for
-every declarative atom, and `deno_core` with V8 is already linked into the
-binary for helper isolates; the managed Deno is a different runtime for atom
-code.
+separately, `deno_core` with V8 is already linked into the binary, for helper
+isolates and for the Astro compiler every declarative atom passes through; the
+managed Deno is a different runtime, for atom code.
 
 **Acceptance, files and data:**
 

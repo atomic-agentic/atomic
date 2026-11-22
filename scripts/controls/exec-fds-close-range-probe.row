@@ -1,0 +1,1 @@
+exec-fds-close-range-probe|crates/atomic-exec/src/inherited.rs|    let inheritable = flags & libc::FD_CLOEXEC == 0;|    let inheritable = false; /* CONTROL_OFF */|-p atomic-agentic-exec --lib -- inherited::tests::a_close_range_that_marks_nothing_is_an_error

@@ -1,0 +1,1 @@
+manifest-unreadable-refuses|crates/atomic-core/src/project.rs|        Err(e) => Err(refuse(e)),|        Err(_) => Ok(false), // CONTROL_OFF|-p atomic-agentic --bin atomic the_store_key_falls_back_only_when_no_manifest_is_there

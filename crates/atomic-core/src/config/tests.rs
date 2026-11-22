@@ -17,6 +17,15 @@ struct Model {
     timeout_secs: Option<u32>,
 }
 
+/// One model's price, as `budget.pricing` holds one: keyed by model name, in a
+/// section whose default is empty.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Price {
+    input_usd_per_mtok: f64,
+    output_usd_per_mtok: f64,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TestConfig {
@@ -24,6 +33,7 @@ struct TestConfig {
     retries: u32,
     verbose: bool,
     labels: BTreeMap<String, String>,
+    pricing: BTreeMap<String, Price>,
 }
 
 impl Default for TestConfig {
@@ -36,6 +46,7 @@ impl Default for TestConfig {
             retries: 3,
             verbose: false,
             labels: BTreeMap::new(),
+            pricing: BTreeMap::new(),
         }
     }
 }
@@ -209,6 +220,55 @@ fn a_bad_environment_value_is_refused() {
     ));
 }
 
+/// A value of the kind the setting takes but of a type it will not hold is
+/// refused by the variable's own name: `resolve` reads the value alone,
+/// against a copy of the defaults, so the refusal names the variable. The
+/// same value reaching the merged whole is refused too, but as one about the
+/// configuration, which says nothing about where to look.
+#[test]
+fn a_value_the_setting_s_own_type_refuses_names_the_variable() {
+    // `soon` is what an optional number's variable gives once it is parsed --
+    // a file would read it as the string "soon" -- so only the setting's own
+    // type can refuse it, and only the per-variable read sees it by name.
+    let shown = match load(
+        &dir(&[]),
+        None,
+        &[("ATOMIC_MODEL_TIMEOUT_SECS", "soon")],
+        vec![],
+    ) {
+        Err(ConfigError::Value { name, message }) => {
+            assert_eq!(name, "ATOMIC_MODEL_TIMEOUT_SECS");
+            message
+        }
+        other => panic!(
+            "ATOMIC_MODEL_TIMEOUT_SECS=soon: expected a refusal naming the variable, got {other:?}"
+        ),
+    };
+    // The type's own reason, with the word it could not read hidden.
+    assert_eq!(shown, "invalid type: string \"…\", expected u32");
+
+    // The same word in a file is the same type refusing it, and there is no
+    // variable to name: it comes out as a refusal of the merged whole.
+    let d = dir(&[("atomic.yaml", "model:\n  timeout_secs: soon\n")]);
+    match load(&d, None, &[], vec![]) {
+        Err(ConfigError::Invalid(message)) => {
+            assert_eq!(message, "invalid type: string \"…\", expected u32");
+        }
+        other => panic!(
+            "a file's model.timeout_secs: expected a refusal of the merged whole, got {other:?}"
+        ),
+    }
+    // What the type does hold is still taken from the variable.
+    let r = load(
+        &dir(&[]),
+        None,
+        &[("ATOMIC_MODEL_TIMEOUT_SECS", "30")],
+        vec![],
+    )
+    .expect("load");
+    assert_eq!(r.config.model.timeout_secs, Some(30));
+}
+
 /// A value for an optional setting is read as a YAML scalar, and the string it
 /// falls back to is faithful only where every YAML version reads that text as a
 /// string. `0200` is not such a spelling: this branch read it as the number 200
@@ -256,6 +316,71 @@ fn an_open_section_takes_any_keys_and_a_section_is_not_a_value() {
         load(&d, None, &[], vec![]),
         Err(ConfigError::Setting { line: 1, .. })
     ));
+}
+
+/// A section whose default is empty is open, so it is one value and not a
+/// mapping of settings: the layer that writes it replaces the whole table
+/// rather than merging per key. `budget.pricing` is such a section, so a layer
+/// that writes it leaves every model it does not name unpriced, whatever a
+/// layer below said about them.
+#[test]
+fn a_layer_writing_an_open_section_replaces_the_whole_table() {
+    let priced = "pricing:\n  gpt-test:\n    input_usd_per_mtok: 2.5\n    \
+                  output_usd_per_mtok: 10\n";
+    let other = "pricing:\n  other:\n    input_usd_per_mtok: 0\n    output_usd_per_mtok: 0\n";
+    // A file over a file.
+    let d = dir(&[("atomic.yaml", priced), ("atomic.local.yaml", other)]);
+    let r = load(&d, None, &[], vec![]).expect("load");
+    assert_eq!(
+        r.config
+            .pricing
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["other"],
+        "the table below is gone whole, not merged in per model"
+    );
+    assert_eq!(r.config.pricing["other"].input_usd_per_mtok, 0.0);
+    // The section is one setting, so it is cited as one: the layer that wrote
+    // it, at the line its entries start on.
+    assert!(
+        matches!(
+            &r.sources["pricing"],
+            Source::File { path, line } if path == &d.join("atomic.local.yaml") && *line == 2
+        ),
+        "the source names the layer that wrote the table, not the one below: {:?}",
+        r.sources.get("pricing")
+    );
+
+    // A variable over a file, which is how `ATOMIC_BUDGET_PRICING` writes it.
+    let d = dir(&[("atomic.yaml", priced)]);
+    let r = load(
+        &d,
+        None,
+        &[(
+            "ATOMIC_PRICING",
+            r#"{"other":{"input_usd_per_mtok":0,"output_usd_per_mtok":0}}"#,
+        )],
+        vec![],
+    )
+    .expect("load");
+    assert_eq!(
+        r.config
+            .pricing
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["other"],
+        "the variable's table replaces the file's whole"
+    );
+    assert!(
+        matches!(
+            r.sources.get("pricing"),
+            Some(Source::Env(name)) if name == "ATOMIC_PRICING"
+        ),
+        "{:?}",
+        r.sources.get("pricing")
+    );
 }
 
 #[test]

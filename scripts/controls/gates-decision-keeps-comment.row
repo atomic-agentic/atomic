@@ -1,0 +1,1 @@
+gates-decision-keeps-comment|crates/atomic/src/gates.rs|        comment.as_deref(),|        None,|-p atomic-agentic --bin atomic gates::tests::an_answer_the_deciding_commands_record_is_kept_from_a_sweep_already_reading

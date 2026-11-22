@@ -1,0 +1,1 @@
+skill-dir-check-at|crates/atomic/src/setup.rs|    const SUBDIR_NOT_THROUGH_A_LINK: libc::c_int = libc::O_NOFOLLOW;|    const SUBDIR_NOT_THROUGH_A_LINK: libc::c_int = 0;|-p atomic-agentic --bin atomic -- the_check_walks_through_held_directories_and_never_a_link

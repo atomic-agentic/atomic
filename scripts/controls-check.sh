@@ -30,8 +30,11 @@
 # code. Each control costs a rebuild of the crates it is in.
 #
 # The source is edited in place, so the script guards it. It refuses to start
-# when a file a control names differs from HEAD, because it would restore that
-# dirty state and read as clean. Before any edit it copies every file it will
+# when another run holds the tree's lock in target/controls-check.lock, because
+# two runs switch the same files under each other; it releases that lock when it
+# exits, however it exits. It refuses to start when a file a control names
+# differs from HEAD, because it would restore that dirty state and read as
+# clean. Before any edit it copies every file it will
 # touch to target/controls-check/ and checks each copy against the file's git
 # hash-object; if that fails, nothing is edited. On exit, however it ends, it
 # copies the originals back, checks each file's hash again and asks git that the
@@ -62,10 +65,47 @@ die() {
     exit 1
 }
 
-# Fail before any edit, leaving nothing behind.
+# Fail before any edit, leaving nothing behind. Only a run that holds the lock
+# may call this: it removes the state directory, which is what a running peer
+# is keeping its originals in.
 die_unedited() {
     rm -rf "${STATE}" 2>/dev/null
     die "$*; nothing was edited"
+}
+
+# One run at a time in a tree. Two runs switch the same files, each saving its
+# own originals: the one that finishes last puts back what it found, which is
+# the other's switched-off source, and each reads a failing test as its own
+# control caught. So the first to start holds a lock for the whole run and the
+# rest refuse. The lock is the kernel's, on a descriptor this process owns, so
+# a run that is killed outright releases it; it lives beside
+# ${STATE} rather than inside it, because ${STATE} is deleted on the way out
+# and deleting a lock's file lets a second holder in beside the first.
+LOCK="${ROOT}/target/controls-check.lock"
+command -v flock >/dev/null 2>&1 ||
+    die "flock is not available, so this run cannot be kept apart from another; nothing was edited"
+mkdir -p "${ROOT}/target" || die "cannot create ${ROOT}/target for the run's lock; nothing was edited"
+if ! exec 9>>"${LOCK}"; then
+    die "cannot open ${LOCK} for the run's lock; nothing was edited"
+fi
+# The refusal must not remove anything: a run that holds the lock is keeping
+# what it has saved in ${STATE}, which die_unedited would delete. And there is
+# nothing here for anyone to clean up: the kernel frees the lock when the run
+# that took it ends, however it ends, and removing the file would free nothing
+# while letting a third run lock a fresh file beside the run still holding the
+# old one.
+flock -n 9 ||
+    die "${LOCK} is held by another scripts/controls-check.sh run in this tree; it frees itself when that run ends, so wait for it and do not remove ${LOCK}; nothing was edited"
+
+# No git is handed the lock's descriptor, as no cargo is. A git whose worktree
+# has core.fsmonitor set starts a fsmonitor daemon out of `git diff` or
+# `git ls-files`, which outlives the command that started it; given the
+# descriptor it would keep the tree locked after this run had exited, which the
+# next run reads as one still going. Nothing else the run starts can do that:
+# cp, touch, tr, find, sort, grep, sed, awk, rm, mkdir, python3 and flock all
+# answer and go, and none of them leaves a process behind the run.
+git() {
+    command git "$@" 9>&-
 }
 
 # Where a file's original is kept.
@@ -262,8 +302,12 @@ run_cargo() {
     # shellcheck disable=SC2086
     # Every test binary runs, however an earlier one ends: a row may name
     # tests in several, and each must be seen to fail.
-    # Plain text, whatever CARGO_TERM_COLOR says, so the log reads as grepped.
-    cargo test --locked --no-fail-fast --color never ${1} >"${LOG}" 2>&1 &
+    #
+    # The lock's descriptor is closed for cargo and everything it starts: a
+    # test that leaves a process behind would otherwise keep holding the tree
+    # after this run has exited. Plain text, whatever CARGO_TERM_COLOR says,
+    # so the log reads as grepped.
+    cargo test --locked --no-fail-fast --color never ${1} 9>&- >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?

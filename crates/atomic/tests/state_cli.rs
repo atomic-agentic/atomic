@@ -27,6 +27,11 @@
 //!   creates anything, because all of them come through one function;
 //! - a home beside it, `~/.config/atomic-state`, is accepted: the comparison
 //!   is by path components, not by string;
+//! - a *relative* `HOME` is no configuration directory for the credential
+//!   store either: like settings and the denial, it gives way to the home the
+//!   password database gives (or is refused when there is none), so
+//!   `atomic model status` never reads the store at a spelling a working
+//!   directory would complete, and creates nothing under one;
 //! - a `HOME` that is not absolute gives a state home that is not absolute
 //!   either — the platform's data directory under it — and such a home is
 //!   placed from the directory the command was run in before it is compared
@@ -731,6 +736,88 @@ fn a_home_beside_the_configuration_directory_is_accepted() {
     assert!(
         private.join("atomic.db").is_file(),
         "the store was not made in the private directory: {t}"
+    );
+}
+
+#[test]
+fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
+    let dir = scratch("relative-home");
+    let project = dir.join("project");
+    // The person's `HOME` is a relative spelling. Settings, the denial, the
+    // credential store and the key directory are all made of the same
+    // configuration directory, and a relative `HOME` is no configuration
+    // directory: it gives way to the home the password database gives.
+    // `atomic model status` looks for the sign-in in the credential store,
+    // creating nothing, so a command run this way says which of the two it
+    // ends up with: signed out, where the password database names an
+    // absolute home, and that home being unknown where it does not. What
+    // it must never do is place the store at the relative spelling and
+    // read it from the working directory — which it used to, and the file
+    // store then refused a place that was not an absolute path; that
+    // sentence is named here as the one that must not come back. Nothing
+    // may be created under the relative spelling either: the store is
+    // found, not made, by a command that signs no one in.
+    let refusal = "the credential file store: the home directory is unknown (HOME is unset \
+                   or not an absolute path, and the user has no home in the password \
+                   database), so there is no configuration directory for credentials; set \
+                   HOME, or set ATOMIC_HOME to keep them under it";
+    let signed_out = "no one is signed in with ChatGPT";
+    let env = [("HOME", "home".to_string())];
+
+    let out = atomic(&dir, &project, &["model", "status"], &env);
+    let t = text(&out);
+    assert!(
+        !out.status.success(),
+        "`atomic model status` claimed a sign-in it was never given: {t}"
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !said.contains("is not an absolute path"),
+        "the credential store was placed at the relative spelling of `HOME`, and the file \
+         store refused itself there: {t}"
+    );
+    if said.contains("the home directory is unknown") {
+        // Neither the environment nor the password database names an
+        // absolute home: refused, saying which home is missing and what
+        // to set.
+        assert!(said.contains(refusal), "not the whole refusal: {t}");
+    } else {
+        // The password database names an absolute home: the sign-in is
+        // looked for in its `credentials` — the same directory settings
+        // and the denial are made of — and there is none.
+        assert!(
+            said.contains(signed_out),
+            "not the signed-out answer of the one configuration directory: {t}"
+        );
+    }
+    assert!(
+        !dir.join("home/.config").exists() && !dir.join("project/home").exists(),
+        "the relative spelling of `HOME` was made into a configuration directory: {t}"
+    );
+
+    // The same answer for a script, in its own form.
+    let out = atomic(&dir, &project, &["--json", "model", "status"], &env);
+    let t = text(&out);
+    assert!(
+        !out.status.success(),
+        "`atomic model status` claimed a sign-in it was never given: {t}"
+    );
+    let error = stdout_json(&out)["error"].clone();
+    let kind = error["kind"].as_str().unwrap_or("");
+    let description = error["description"].as_str().unwrap_or("");
+    // Which home the password database gives is this machine's; the unit
+    // tests of the credential and key places pin that choice with a home
+    // they make up.
+    if description.contains("the home directory is unknown") {
+        assert_eq!(kind, "error", "{t}");
+        assert_eq!(description, refusal, "the refusal of the unknown home: {t}");
+    } else {
+        assert_eq!(kind, "model.signed_out", "{t}");
+        assert_eq!(description, signed_out, "{t}");
+    }
+    assert!(
+        !dir.join("home/.config").exists() && !dir.join("project/home").exists(),
+        "the relative spelling of `HOME` was made into a configuration directory: {t}"
     );
 }
 

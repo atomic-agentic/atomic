@@ -25,13 +25,11 @@ See [availability](../reference/availability.md) before trying a feature.
   API key, or a supported local provider. Subscription sign-in exists upstream;
   Atomic still needs to expose it. The API-key path detects `OPENAI_API_KEY`.
 - Git and your usual build tools for repository work.
-- Deno 2.9.8, for now. Atomic's Astro compiler runs on it, and `atomic check`
-  and `atomic render` refuse any other version. Put it on your `PATH`, or set
-  `ATOMIC_DENO` to its executable; in a checkout of this repository,
-  `python3 scripts/setup-deno.py <dir>` downloads it and verifies its checksum.
-  From v0.7, Atomic downloads and verifies its own pinned
-  [Deno](../guides/atom-code-runtime.md) the first time a project needs it,
-  and this step goes away.
+
+Atomic's Astro compiler is built into the binary and runs on the V8 engine it
+embeds, so `atomic check` and `atomic render` need no Deno, Node or npm. From
+v0.7, atom code and scripts run on a [Deno](../guides/atom-code-runtime.md)
+that Atomic downloads and verifies itself the first time a project needs it.
 
 Read [subscriptions and authentication](authentication.md) for model access:
 `atomic model login` signs Codex atoms in with ChatGPT, and an endpoint with an API key

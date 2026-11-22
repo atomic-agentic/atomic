@@ -1,0 +1,1 @@
+skill-dir-read-in-one-name|crates/atomic/src/setup.rs|        let one_name = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;|        let one_name = true;|-p atomic-agentic --bin atomic -- a_file_in_a_held_directory_with_other_names_is_refused
