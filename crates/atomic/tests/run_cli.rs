@@ -2459,13 +2459,15 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
         }
         third.kill().expect("SIGKILL the run");
         third.wait().expect("reap");
-        let mut serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -2821,7 +2823,11 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             };
             // A run that has failed is finished, and not successfully: say
             // so now, with what it failed as, instead of waiting out the
-            // deadline below.
+            // deadline below. This is how the `gate-open-once` control
+            // (scripts/controls/gate-open-once.row) shows: it names the gate
+            // step's checkpoint after the process that wrote it, so a run
+            // recovered by another process re-opens its gate, and the gate
+            // store refuses a second row for the step's own id.
             if let Some(RunStatus::Failed(why)) = &status {
                 panic!(
                     "serve failed the approved run ({status:?}): {why}\nserve log: {}",
@@ -3021,13 +3027,15 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
 
-        let serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -3060,7 +3068,6 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(stdout_json(&out)["error"]["kind"], "runtime.busy");
 
         terminate(&serve);
-        let mut serve = serve;
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
             .expect("child");
