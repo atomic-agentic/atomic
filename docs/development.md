@@ -288,12 +288,30 @@ request touches, which `scripts/controls-touched.py <base> <head>` lists: each
 row whose row file it adds or changes; each row whose `file` it changes, since
 a code change can move a switch's text or stop it biting; each row naming a
 test whose name is in a file it changes, before or after the change, since a
-change to the guarding test can stop it failing; and each row whose
-`--test <t>` target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it
-changes. The script fails on a row file it cannot read, and on a row file
-deleted while its switch's text is still in some file, rows aside, that no
-other row switches it in: a control whose code remains, renamed or moved
-included, keeps its row.
+change to the guarding test can stop it failing; each row whose `--test <t>`
+target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it changes; and,
+when it changes test code a crate's targets share (`tests/support/`,
+`tests/fixtures/` or any other directory under `crates/<c>/tests/` that is
+no one target's, or a file there that is not Rust), every row whose
+`--test` target is in that crate; and, when it changes a test helper outside
+`tests/` that `scripts/controls-shared.txt` lists (the fake model in
+`crates/atomic-core/src/testing.rs`, the Postgres test schema in
+`crates/atomic-durable/src/testing.rs`), every row the list says it serves:
+each with a `--test` target, each whose features turn on the one named, or
+each that builds a package named, since a crate's own unit tests and those of
+the crates that turn its test features on compile the helper too. The script fails on a row file it cannot
+read, and on a row file deleted while its switch's text is still in some
+file, rows aside, that no other row switches it in: a control whose code
+remains, renamed or moved included, keeps its row.
+
+A few rows switch text that also appears in another file, such as
+`held: true,` or a `NotFound` arm, so deleting one of them can be refused for
+a copy that has nothing to do with it; the refusal names the files. Then take
+it in two pull requests: first change the row's switch to a longer stretch of
+its line that only its own file holds (`git grep -F` shows where text
+appears), and let that pull request's Controls run show the row still bites;
+then delete the row. Where no line of the control is unique, the owner
+decides whether to merge past the check.
 
 The "Touched controls" job cuts the rows into shards, one for every six rows
 and at most twelve; each shard, "Controls (i/n)", is set up as the test jobs
@@ -325,7 +343,8 @@ A row CI does not run, one a GitHub runner cannot run or one known to fail
 until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
 A pull request touching it, and every sweep, reports it as "not run in CI",
 with a warning, and leaves it to a local run; a pull request that changes the
-list gets a warning too, and should say why.
+list gets a warning too, and should say why, and a row it takes off the list
+is run.
 
 ## Milestone acceptance
 
