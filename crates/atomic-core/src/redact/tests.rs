@@ -675,6 +675,12 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
         ("names with open quotes", repeated("password=\"")),
         ("escaped open quotes", repeated("password=\\\"")),
         ("flags with no values", repeated(" --password")),
+        ("unclean flag values", repeated("--token [ \"")),
+        ("unclean flag values on lines", repeated("--token [ \"\n")),
+        (
+            "open escaped quotes after flags",
+            repeated("--note \\\\\\\"a \\\" "),
+        ),
         (
             "block starts with no end",
             repeated(concat!("-----BEGIN RSA PRIVATE", " KEY-----\n")),
@@ -2815,7 +2821,7 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
         for _ in 0..depth {
             let text = held.as_str().expect("a string").to_owned();
             let parsed: Value = serde_json::from_str(&text)
-                .unwrap_or_else(|_| panic!("DBGJSON depth {depth}: {text}"));
+                .unwrap_or_else(|_| panic!("depth {depth}: no longer JSON"));
             held = parsed.get("body").cloned().unwrap_or(parsed);
         }
     }
@@ -2877,4 +2883,57 @@ fn quotes_nested_at_one_depth_hide_their_text_whole() {
     // text.
     let paired = "sh -c \"login --password hunter2\" now";
     assert_ne!(text(paired), REDACTED);
+}
+
+/// A secret-named flag that takes no value, `psql --password`, followed by
+/// a flag assigned its value, hides that value and keeps its name, as text
+/// and in JSON held in a string.
+#[test]
+fn a_secret_flag_with_no_value_leaves_the_next_flag_readable() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("sh -c \"psql --password --token='{credential}'\""),
+        format!("echo \"run --password --api-key='{credential}' now\""),
+        format!("bash -c \"mysql -u root --password --api_key='{credential}' db\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the value showed"
+        );
+        assert!(out.contains("--password"), "case {case}: the flag went");
+        let mut held = json!({"key": json!({"cmd": line}).to_string()});
+        value(&mut held);
+        assert!(
+            !held.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in held JSON"
+        );
+    }
+}
+
+/// Quotes that nest ambiguously on one line hide that line, not the text
+/// around it.
+#[test]
+fn quotes_nested_ambiguously_hide_only_their_line() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let log = format!(
+        "first line stays\nrun \\\"sh --auth-token \"login [\"--pw\",\"{credential}\"]\", now\nlast line stays\n"
+    );
+    let out = text(&log);
+    assert_eq!(
+        out,
+        format!("first line stays\n{REDACTED}\nlast line stays\n")
+    );
+}
+
+/// An unclean value hidden on from its flag is not cut just past a `=`,
+/// which would hide the name it assigns and leave its value bare.
+#[test]
+fn an_unclean_value_is_not_cut_after_an_assignment() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let line = format!("sh -c \"x --token [a,api_key='{credential}'\"");
+    assert!(!text(&line).contains(&credential[4..]), "the value showed");
 }

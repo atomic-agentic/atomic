@@ -1321,6 +1321,28 @@ fn secret_flag_at(text: &str) -> bool {
         && strength(&name[..end]) != Strength::None
 }
 
+/// `input` with each line whose quotes nest ambiguously (see
+/// [`quotes_nest_ambiguously`]) hidden whole, its line end kept; `None` if
+/// there is none.
+fn hide_ambiguous_lines(input: &str) -> Option<String> {
+    if !quotes_nest_ambiguously(input) {
+        return None;
+    }
+    Some(
+        input
+            .split_inclusive('\n')
+            .map(|line| {
+                let body = line.trim_end_matches(['\n', '\r']);
+                if quotes_nest_ambiguously(body) {
+                    format!("{REDACTED}{}", &line[body.len()..])
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect(),
+    )
+}
+
 /// The quoted value `rest` starts with, plain or escaped, closed by the
 /// first quote of the same kind escaped alike on its line: what it holds,
 /// and all of it.
@@ -1355,13 +1377,21 @@ fn quoted_prefix(rest: &str) -> Option<(&str, &str)> {
 fn unclean_flag_values(input: &str) -> Option<String> {
     let mut out = String::new();
     let mut last = 0;
+    // How the last quote read so far is escaped, read on as the flags are.
+    let mut quotes = LastQuote::default();
     for head in FLAG_HEAD.captures_iter(input) {
         let Some(whole) = head.get(0) else { continue };
+        quotes.read_to(input, whole.start());
         if whole.start() < last || strength(&head[1]) == Strength::None {
             continue;
         }
         let at = whole.end();
         let rest = &input[at..];
+        // A secret-named flag that takes no value here, `psql --password
+        // --token=x`: the next flag is left to the readings of its own.
+        if starts_flag(rest.as_bytes()) {
+            continue;
+        }
         if clean_value(rest) {
             // One the readings before may not have reached, inside a value
             // they read whole: read it here.
@@ -1378,7 +1408,7 @@ fn unclean_flag_values(input: &str) -> Option<String> {
             }
             continue;
         }
-        let end = at + unclean_len(&input[..whole.start()], rest);
+        let end = at + unclean_len(quotes.escapes, rest);
         if end == at {
             continue;
         }
@@ -1449,15 +1479,39 @@ fn starts_flag(bytes: &[u8]) -> bool {
     }
 }
 
+/// The last quote read in a text, by how many backslashes escape it.
+#[derive(Default)]
+struct LastQuote {
+    escapes: Option<usize>,
+    read: usize,
+    run: usize,
+}
+
+impl LastQuote {
+    /// Read `text` on up to `to`, once over.
+    fn read_to(&mut self, text: &str, to: usize) {
+        for &b in &text.as_bytes()[self.read.min(to)..to] {
+            match b {
+                b'\\' => {
+                    self.run += 1;
+                    continue;
+                }
+                b'"' | b'\'' => self.escapes = Some(self.run),
+                _ => {}
+            }
+            self.run = 0;
+        }
+        self.read = self.read.max(to);
+    }
+}
+
 /// How much of `rest` an unclean flag value takes: up to the next flag
 /// after a space, the end of the line, or the quote that ends the string
-/// the flag is in, escaped as the nearest quote before the flag (`before`)
-/// is or less, and not its backslashes; to the end if there is none.
-fn unclean_len(before: &str, rest: &str) -> usize {
-    let enclosing = before.rfind(['"', '\'']).map(|at| {
-        let run = &before[..at];
-        run.len() - run.trim_end_matches('\\').len()
-    });
+/// the flag is in, escaped as the nearest quote before the flag
+/// (`enclosing`) is or less, and not its backslashes; to the end if there
+/// is none. Never just past a `=` or `:`, which would leave the name it
+/// assigns hidden and its value bare.
+fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
     let bytes = rest.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1466,8 +1520,11 @@ fn unclean_len(before: &str, rest: &str) -> usize {
             b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return i,
             b'"' | b'\'' => {
                 let run = rest[..i].len() - rest[..i].trim_end_matches('\\').len();
-                if enclosing.is_some_and(|level| run <= level) {
-                    return i - run;
+                let at = i - run;
+                let closes = enclosing.is_some_and(|level| run <= level);
+                let assigns = rest[..at].ends_with(['=', ':']);
+                if closes && !assigns {
+                    return at;
                 }
             }
             _ => {}
@@ -1603,13 +1660,13 @@ fn read_strength(name: &str, written: bool) -> Strength {
 
 /// One reading of `input` by every text rule (see [`text`]).
 fn text_once(input: &str) -> Cow<'_, str> {
-    if quotes_nest_ambiguously(input) {
-        return Cow::Owned(REDACTED.to_owned());
-    }
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
     };
+    if let Some(hidden) = hide_ambiguous_lines(&output) {
+        output = Cow::Owned(hidden);
+    }
     let mut apply = |rule: &Regex, replace: &dyn Fn(&Captures<'_>) -> String| {
         // Most text has nothing, so this avoids building a new string for
         // each rule.
