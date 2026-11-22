@@ -49,8 +49,9 @@
 //! all say the same thing and `anyOf` of them where they differ. A response
 //! declaring no schema contributes nothing to it. A `default` describes the
 //! output only when the spec declares no code from `200` to `299` and no `2XX`
-//! range beside it: behind a named success a `default` is what its failures
-//! fall back to and no success is ever checked against it, while a spec
+//! range beside it: behind a named success a `default` is what that operation's
+//! failures fall back to — still the response a success the spec gives no code
+//! for is checked against, but no longer one a spec describes — while a spec
 //! declaring no success at all means its `default` as the shape a success
 //! takes. Where the union holds more than one schema, each member carries an
 //! `$id` of its own, because the union is a document nothing compiles a reply
@@ -252,9 +253,10 @@ fn response_declared(
 /// [`Operation::response`] does, and each response is asked once however many
 /// statuses select it. A `default` is asked only when no code from `200` to
 /// `299` and no `2XX` range is declared beside it: behind a named success a
-/// `default` describes what the spec's failures carry, and a success is never
-/// checked against it, while a spec declaring nothing but a `default` means it
-/// as the shape every success takes. A response that declares no schema — no
+/// `default` describes what that operation's failures carry, which is not a
+/// reply the tool describes, even though a success the spec gives no code for
+/// is still checked against it; while a spec declaring nothing but a `default`
+/// means it as the shape every success takes. A response that declares no schema — no
 /// `content` map, or a map that names none — contributes nothing, so it neither
 /// describes the output nor widens it. The same schema written under two media
 /// types or two statuses is one schema. Where the successes agree, that one

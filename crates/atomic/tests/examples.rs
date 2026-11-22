@@ -481,11 +481,12 @@ fn atomic_check_reads_openapi_toolsets() {
         "a union whose members are each their own document failed the check: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    // The union is what gets compiled, and a member of it that reaches for a
-    // `$defs` name nothing holds is refused with its file and its operation.
+    // What gets compiled is a schema like any other, so a member of the union
+    // that reaches for a `$defs` name nothing holds is refused, with its file
+    // and its operation named and none of the spec's other tools blamed.
     std::fs::write(
         dir.join("toolsets/union.openapi.yaml"),
-        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing\n          content:\n            application/json:\n              schema: { $ref: '#/$defs/Nowhere' }\n",
+        "openapi: 3.1.0\ninfo: { title: Union, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: a thing\n          content:\n            application/json:\n              schema: { $ref: '#/$defs/Nowhere' }\n        '202':\n          description: a ticket\n          content:\n            application/json:\n              schema: { type: object }\n",
     )
     .expect("spec");
     let output = check();

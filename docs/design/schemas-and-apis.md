@@ -104,8 +104,9 @@ Importing an OpenAPI document gives a project a toolset (M15).
   that are not stay the failure they have always been. A reply naming a media
   type none of the response's schemas covers, when it declares several, is
   refused. `atomic check` compiles a tool's input, the schemas its successes are
-  checked against, and its `output` with them, so a schema that does not compile
-  is said before any call is made.
+  checked against, and its `output` with them, so a schema of theirs that does
+  not compile is said before any call is made; a failure response's schema is
+  never read, so it is never compiled.
 - **atomic sends the request.** A built-in HTTP executor performs every call. It
   takes credentials from secrets granted to that atom, only reaches base URLs the
   network policy allows, and applies rate limits and retries. Nothing the model
