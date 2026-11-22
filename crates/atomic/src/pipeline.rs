@@ -2766,8 +2766,11 @@ mod tests {
     /// is reported as the other.
     #[test]
     fn a_project_with_no_worktrees_says_whether_git_refused_it_or_never_answered() {
-        // Outside every repository, as the suites that need one check: the
-        // temporary directory is not inside the checkout atomic is built from.
+        // The temporary directory is outside every repository, which is what
+        // makes git refuse it below. Should it ever be inside one, git would
+        // find that repository, `at` would return `Found`, and the `Refused`
+        // match would panic: the test fails rather than passing on a
+        // repository it did not expect.
         let root = std::env::temp_dir().join(format!("atomic-worktrees-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("root");

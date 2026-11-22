@@ -320,14 +320,16 @@ impl SecretStore for MemorySecrets {
 
 /// The store `ATOMIC_CREDENTIAL_STORE` chooses for the project rooted at
 /// `project`: the OS keyring by default; with `file`, [`FileSecrets`] in
-/// [`crate::state::credentials_dir`].
+/// [`crate::state::credentials_dir`], refused while an older atomic's
+/// credentials are stranded at its old place (see
+/// [`crate::state::credentials_dir_in_use`]).
 pub fn configured_store(project: &Path) -> Result<Box<dyn SecretStore>, CredentialError> {
-    match std::env::var(STORE_VAR).ok().filter(|v| !v.is_empty()) {
+    let chosen = crate::state::process_env(STORE_VAR).and_then(|v| v.into_string().ok());
+    match chosen.filter(|v| !v.is_empty()) {
         None => Ok(Box::new(OsKeyring)),
         Some(v) if v == "keyring" => Ok(Box::new(OsKeyring)),
         Some(v) if v == "file" => {
-            let dir = crate::state::credentials_dir()
-                .map_err(|e| CredentialError::File(e.to_string()))?;
+            let dir = crate::state::credentials_dir_in_use().map_err(CredentialError::File)?;
             Ok(Box::new(FileSecrets::open(&dir, project)?))
         }
         Some(other) => Err(CredentialError::UnknownStore(other)),
@@ -517,5 +519,61 @@ mod tests {
             std::env::remove_var(STORE_VAR)
         };
         assert!(matches!(refused, Err(CredentialError::UnknownStore(_))));
+    }
+
+    /// The file store a gate opens for the operator credential is refused,
+    /// naming both places, while an older atomic's credentials are still at
+    /// their old place and the new one holds none — also after the denial
+    /// has made the new directory, empty, as every run with a Codex or exec
+    /// atom does before a gate reads the credential — rather than opened
+    /// empty, where the credential would read as missing.
+    #[test]
+    fn the_file_store_is_refused_while_an_older_atomics_credentials_are_stranded() {
+        let scratch = crate::state::TestScratch::new("stranded-store");
+        for dir in [
+            "home",
+            "legacy-config/atomic/credentials",
+            "project",
+            "state",
+        ] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let legacy = scratch.join("legacy-config/atomic/credentials");
+        std::fs::write(legacy.join("6f70"), "secret").expect("an older atomic's credential");
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home"), (STORE_VAR, "file")],
+            None,
+            Some("legacy-config"),
+            Some("data"),
+        );
+        let _guard =
+            crate::codex::StateGuard::deny_state_dir(scratch.join("state")).expect("the guard");
+        let new = scratch.join("home/.config/atomic/credentials");
+        assert_eq!(
+            std::fs::read_dir(&new).map(|entries| entries.count()).ok(),
+            Some(0),
+            "the guard did not make the new credential directory, empty"
+        );
+        let refused = configured_store(&scratch.join("project")).map(|_| ());
+        let Err(CredentialError::File(why)) = refused else {
+            panic!("the file store was opened beside stranded credentials: {refused:?}");
+        };
+        assert!(
+            why.starts_with(&format!(
+                "credentials are kept in {} now, which holds none of them, and an older atomic \
+                 kept them in {}, which still holds them: move everything in",
+                new.display(),
+                legacy.display()
+            )),
+            "{why}"
+        );
+        std::fs::rename(legacy.join("6f70"), new.join("6f70")).expect("moved");
+        let store = configured_store(&scratch.join("project")).expect("the moved store");
+        assert_eq!(
+            store.load("op").ok().flatten().as_deref(),
+            Some("secret"),
+            "the moved credential is not the one read"
+        );
     }
 }

@@ -1,0 +1,1 @@
+exec-fds-helper|crates/atomic-core/src/codex.rs|    keep_inherited_descriptors_from_the_command();|    let _ = keep_inherited_descriptors_from_the_command; // CONTROL_OFF|-p atomic-agentic --features atomic-agentic/sandbox-tests --test inherited_fds -- a_confined_command_holds_none_of_the_descriptors_left_open_in_its_parent

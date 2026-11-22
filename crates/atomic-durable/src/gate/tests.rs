@@ -997,6 +997,176 @@ async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_postgres() {
     .await
 }
 
+/// Two projects on one store whose processes share an executor identity,
+/// as one set in user configuration makes them: project B neither lists
+/// nor recovers project A's unfinished run, and A recovers its own run as
+/// before.
+async fn a_project_neither_lists_nor_recovers_anothers_runs(database: crate::Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(
+                &database,
+                Some("shared-executor"),
+                crate::DEFAULT_VERSION,
+                project,
+            )
+            .await
+            .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    register(&mut mine);
+    // A run left unfinished, as a crash leaves one, for recovery.
+    let tries = std::sync::Arc::new(AtomicUsize::new(0));
+    let counted = tries.clone();
+    mine.register(
+        "counted",
+        move |_ctx: <Durare as DurableRuntime>::Context, (): ()| {
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    );
+    mine.launch().await.expect("launch");
+    let run = unique("counted");
+    mine.start("counted", &run, ()).await.expect("start");
+    mine.result::<()>(&run).await.expect("finished");
+    let id = run.clone();
+    mine.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE workflow_status SET status = 'PENDING' WHERE workflow_uuid = ?",
+                &[Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("unfinished");
+    let theirs = open("project-b").await;
+    assert!(
+        theirs
+            .unfinished()
+            .await
+            .expect("unfinished")
+            .iter()
+            .any(|r| r.id == run),
+        "the run is in the store"
+    );
+    assert!(
+        theirs
+            .own_unfinished()
+            .await
+            .expect("own unfinished")
+            .iter()
+            .all(|r| r.id != run),
+        "project B lists project A's run"
+    );
+    let refused = theirs.recover().await.expect_err("project B recovers");
+    assert!(
+        refused.to_string().contains("of another project"),
+        "{refused}"
+    );
+    assert!(!refused.to_string().contains(&run), "it names A's run");
+    assert_eq!(tries.load(Ordering::SeqCst), 1, "project B ran A's run");
+    assert!(
+        mine.own_unfinished()
+            .await
+            .expect("own unfinished")
+            .iter()
+            .any(|r| r.id == run)
+    );
+    assert_eq!(mine.recover().await.expect("recover"), 1);
+    mine.result::<()>(&run).await.expect("recovered");
+    assert_eq!(tries.load(Ordering::SeqCst), 2);
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    theirs
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_neither_lists_nor_recovers_anothers_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_shared_executor")));
+    a_project_neither_lists_nor_recovers_anothers_runs(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_neither_lists_nor_recovers_anothers_runs_on_postgres() {
+    let schema = crate::testing::schema("shared_executor").await;
+    a_project_neither_lists_nor_recovers_anothers_runs(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
+/// A run already in the store with no project's row, as one recorded
+/// before runs had projects is on a shared store, keeps its id: a project
+/// that starts a run with it is refused, and the run does not become its.
+async fn a_run_of_no_project_keeps_its_id(database: crate::Database) {
+    // The project's runtime first: on SQLite, opening one adopts every run
+    // of no project already there.
+    let mut mine = Durare::open(&database, None, crate::DEFAULT_VERSION, "project-a")
+        .await
+        .expect("engine");
+    let mut none = match &database {
+        crate::Database::Sqlite(path) => Durare::sqlite(path).await,
+        crate::Database::Postgres { url, schema } => Durare::postgres(url, schema).await,
+    }
+    .expect("engine for no project");
+    register(&mut mine);
+    register(&mut none);
+    mine.launch().await.expect("launch");
+    none.launch().await.expect("launch");
+    let (run, _) = start_gated(&none, input(None)).await;
+    let refused = mine
+        .start("gated", &run, input(None))
+        .await
+        .expect_err("a run of no project's id");
+    assert!(
+        refused.to_string().contains("a run of no project"),
+        "{refused}"
+    );
+    assert!(
+        mine.own_run_record(&run).await.expect("record").is_none(),
+        "the run became the project's"
+    );
+    assert!(none.own_run_record(&run).await.expect("record").is_some());
+    mine.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    none.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_of_no_project_keeps_its_id_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_unowned_id")));
+    a_run_of_no_project_keeps_its_id(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_of_no_project_keeps_its_id_on_postgres() {
+    let schema = crate::testing::schema("unowned_id").await;
+    a_run_of_no_project_keeps_its_id(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
 /// A local SQLite store's runs recorded for no project, as before runs had
 /// one, or under an older name of the project's (`<old name>/<state id>`, as
 /// before its manifest was renamed), become the project's when atomic opens
@@ -1057,6 +1227,41 @@ async fn a_private_stores_old_runs_become_the_projects() {
         find(&opened, &gate.id).await.expect("find").is_none(),
         "{run}"
     );
+    opened
+        .shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+}
+
+/// A renamed project's runs are matched by its id's characters, not its
+/// bytes: those of a project whose directory name is not ASCII are adopted
+/// too, with no run of no project in the store to adopt beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_stores_renamed_runs_are_matched_by_characters() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_adopt_utf8")));
+    let database = crate::Database::Sqlite(path);
+    let mut old = Durare::open(&database, None, crate::DEFAULT_VERSION, "old/projét-ü-0123")
+        .await
+        .expect("engine");
+    register(&mut old);
+    old.launch().await.expect("launch");
+    let (run, gate) = start_gated(&old, input(None)).await;
+    old.shutdown(Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    let opened = Durare::open(
+        &database,
+        None,
+        crate::DEFAULT_VERSION,
+        "notes/projét-ü-0123",
+    )
+    .await
+    .expect("engine");
+    assert!(
+        opened.own_run_record(&run).await.expect("record").is_some(),
+        "the renamed project's run"
+    );
+    assert!(find(&opened, &gate.id).await.expect("find").is_some());
     opened
         .shutdown(Duration::from_secs(5))
         .await
