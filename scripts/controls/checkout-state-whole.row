@@ -1,0 +1,1 @@
+checkout-state-whole|crates/atomic/tests/fixture_cli.rs|file_state(dir)|String::new() // CONTROL_OFF: the checkout's own files are never compared|-p atomic-agentic --features atomic-agentic/sandbox-tests --test fixture_cli -- the_state_a_checkout_is_compared_by_sees_what_git_does_not
