@@ -1,0 +1,1 @@
+string-json-broken-hidden|crates/atomic-core/src/redact.rs|    } else if opened {|    } else if false /*CONTROL_OFF*/ && opened {|-p atomic-agentic-core --lib redact::tests::json_that_text_redaction_breaks_is_hidden_whole

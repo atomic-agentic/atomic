@@ -83,7 +83,10 @@ longer find through `HOME`; it cannot set `HOME`, `ZDOTDIR`, `TMPDIR` or
 `ATOMIC_TURN_TMPDIR`, nor a variable the dynamic loader reads (`LD_*`,
 `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code into the
 sandbox helper, nor one that makes a shell run a file or command as it starts
-(`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
+(`BASH_ENV`, `ENV`, `PROMPT_COMMAND`). Neither kind can set
+`ATOMIC_SANDBOX_PLACES` or `ATOMIC_SANDBOX_RELISTED`, which atomic uses to
+hand the sandbox helper the places a command's deny list was made with, and
+to mark a helper started again with more denied.
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
 bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
@@ -502,10 +505,10 @@ mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
-mount made after the list, or a root that goes stale after it, such as a
-mount an automount makes when a path is
-first used, even from inside the sandbox, which sees the host's new mounts
-until the next turn. A turn does
+mount made while a command runs, or a root that goes stale after the
+list, such as a mount an automount makes when a path is first used, even
+from inside the sandbox, which sees the host's new mounts: it is not
+denied to the command that runs then. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
@@ -519,9 +522,30 @@ its real path, which denies it under every spelling. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
-denied only to later commands, and a link made after the list is not
-followed until the next turn. Credentials kept anywhere else are not
-covered.
+denied only to later commands, and so is what a link made later inside a
+denied place points at, which each command looks for again as it starts,
+in the places the list was made with, and denies at its second mounts too,
+and so is a second mount of what the list denies made since it was built,
+or of Codex's home, whose databases are denied there too, as each command
+reads the mount table again; a command whose new link or
+new second mount leads somewhere atomic would refuse to deny does not
+start. As each command starts, the links up to four levels inside the
+places that lead outside them to something atomic would deny, old and new,
+each target counted once, together with the second mounts of what the new
+ones point at, of everything the list denies (its own second mounts among
+them, so each pair is counted from both sides) and of Codex's home, come to
+at most 512; past that, the command does not start, and the list is
+counted the same way when the turn starts.
+A link or a mount made in the moment between that look and the sandbox's
+start, or while a long-lived command, such as a turn's unified-exec
+session, keeps running, is followed only from the next command. The file operations Codex
+makes for a turn itself, such as applying a patch, go through a helper that
+is not handed the places: it walks the list's own entries instead, so for
+them a place that was already a link when the list was made is not
+followed again: not when it has been pointed elsewhere since, not when it
+led nowhere then and leads somewhere now, and not for new links inside it
+when it leads to a directory atomic never denies. Credentials kept
+anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,

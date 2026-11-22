@@ -1,0 +1,1 @@
+sandbox-home-glob-special|crates/atomic-core/src/codex.rs|    if let Some(c) = special {|    if let Some(c) = None::<&str> { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_home_whose_path_a_pattern_would_misread_refuses

@@ -80,7 +80,7 @@ pub fn model_client(
 /// Whether `base_url` is plain `http` to this machine: a loopback address,
 /// an unspecified one (`0.0.0.0` or `[::]`, which connect here), either as
 /// an IPv4-mapped IPv6 address, or `localhost`.
-fn http_loopback(base_url: &str) -> bool {
+pub(crate) fn http_loopback(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
     };
