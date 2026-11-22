@@ -70,7 +70,9 @@ pub fn serve() -> i32 {
 }
 
 fn serve_module(source: &str, heap_limit: usize) -> i32 {
-    let status = match limits::limit_self(limits::memory_limit(heap_limit))
+    // The memory limit follows the production heap limit whatever this
+    // child's heap, so that a test's smaller heap is what stops it.
+    let status = match limits::limit_self(limits::memory_limit(HEAP_LIMIT))
         .and_then(|()| run(source, heap_limit))
     {
         Ok(()) => 0,

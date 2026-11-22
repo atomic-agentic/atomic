@@ -276,6 +276,15 @@ fn no_other_module_can_be_imported() {
 #[test]
 fn a_heap_blow_up_is_refused_at_the_limit() {
     let heap = 64 * 1024 * 1024;
+    // Within the limit, a compile allocates as it needs.
+    assert_eq!(
+        probe_with(
+            "const kept = []; for (let i = 0; i < 32; i++) kept.push(new Array(1 << 16).fill(i)); return kept.length;",
+            &[(HEAP_ENV, heap.to_string())],
+            TIME_LIMIT,
+        ),
+        Ok(json!(32))
+    );
     let started = Instant::now();
     // Three times the limit, past what the limit grows to while a compile
     // unwinds; a host without the limit would answer.
@@ -396,10 +405,9 @@ fn console_output_stays_off_the_protocol() {
 // without that limit would grant both without using the memory.
 #[test]
 fn memory_outside_the_heap_is_refused_past_the_limit() {
-    let heap = 64 * 1024 * 1024;
-    let limit = limits::memory_limit(heap);
-    assert_eq!(limit, limits::OUTSIDE_HEAP + 2 * heap as u64);
-    let env = [(HEAP_ENV, heap.to_string())];
+    let limit = limits::memory_limit(HEAP_LIMIT);
+    assert_eq!(limit, limits::OUTSIDE_HEAP + 2 * HEAP_LIMIT as u64);
+    let env = [];
     let grow = |pages: u64| {
         probe_with(
             &format!(
