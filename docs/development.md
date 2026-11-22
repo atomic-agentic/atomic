@@ -598,7 +598,10 @@ python3 scripts/setup-deno.py /tmp/atomic-deno
 export ATOMIC_DENO=/tmp/atomic-deno/deno
 ```
 
-The setup script verifies the platform archive against `deps/deno.json`. The worker
+The setup script verifies the platform archive against `deps/deno.json`, and
+tries a download that fails transiently (HTTP 403, 429 or 5xx, or a dropped
+connection) up to five times, waiting 2, 4, 8 and 16 seconds between tries; an
+archive that does not match is refused at once, never tried again. The worker
 checks its runtime version, clears inherited environment, and has no network, npm,
 write, FFI or subprocess grant, and reads only the compiler assets: atomic reads
 atom sources itself and sends them in the request, for loading as for rendering.
