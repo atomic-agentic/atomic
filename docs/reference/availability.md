@@ -101,6 +101,11 @@ contract does not allow there refuses it too (`input.invalid`); the first
 such field is the one named. A reference in free text is held if stored and
 otherwise left alone. Either way nothing is recorded.
 
+A sweep also keeps the content a question gate's answer names from the moment
+the answer is decided, before the run that asked wakes and records it, and the
+content its default or an answer the feedback log keeps names. A gate store
+the sweep cannot read fails the sweep, and nothing is removed.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an

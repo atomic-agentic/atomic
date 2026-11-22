@@ -15,7 +15,11 @@
 //!   finished or not: a run's pinned definitions (its snapshot) and the
 //!   results its steps hand on by reference among them;
 //! - every gate's pinned evidence, open or resolved, read from the gate
-//!   store itself.
+//!   store itself;
+//! - every question gate's answer, its default, and every answer the
+//!   feedback log keeps, also read from the gate store: an answer is there
+//!   from its decision, before the run that asked wakes and records it, and
+//!   a default before its deadline makes it the answer.
 //!
 //! It also keeps anything written within the grace period before it began
 //! reading these, however long the reading and the wait for the store's
@@ -158,25 +162,70 @@ fn references(value: &Value, present: &HashSet<String>, into: &mut BTreeSet<Arti
     }
 }
 
-/// What the store's runs and gates refer to: [`recorded`] and [`pinned`].
+/// What the store's runs and gates refer to: [`recorded`], [`pinned`] and
+/// [`answered`].
 pub async fn referenced(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let mut found = recorded(store, rt).await?;
     found.extend(pinned(rt).await?);
+    found.extend(answered(store, rt).await?);
     Ok(found)
+}
+
+/// The digests of everything in `store`, read off the async workers.
+async fn present(store: &LocalStore) -> anyhow::Result<HashSet<String>> {
+    let store = store.clone();
+    Ok(tokio::task::spawn_blocking(move || store.stored())
+        .await??
+        .into_iter()
+        .map(|a| a.digest().to_owned())
+        .collect())
+}
+
+/// Every blob in `store` that a question gate's answer or default names, or
+/// an answer the feedback log keeps, read from the gate store, open gates
+/// and resolved ones alike.
+pub async fn answered(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let present = present(store).await?;
+    let gates =
+        atomic_durable::gate::gates(rt, atomic_durable::gate::GateFilter::default()).await?;
+    let feedback = atomic_durable::gate::feedback(rt).await?;
+    let mut found = BTreeSet::new();
+    for answer in answers(&gates, &feedback) {
+        references(answer, &present, &mut found);
+    }
+    Ok(found)
+}
+
+/// The answers the gate store holds: each question gate's default, the
+/// answer it was decided or defaulted with, and each answer in the feedback
+/// log.
+fn answers<'a>(
+    gates: &'a [atomic_durable::gate::Gate],
+    feedback: &'a [atomic_durable::gate::Feedback],
+) -> Vec<&'a Value> {
+    use atomic_durable::gate::Resolution;
+    let mut all = Vec::new();
+    for gate in gates {
+        if let Some(default) = gate.question.as_ref().and_then(|q| q.default.as_ref()) {
+            all.push(default);
+        }
+        match &gate.resolution {
+            Some(Resolution::Decided(decision)) => all.extend(decision.answer.as_ref()),
+            Some(Resolution::Defaulted { answer, .. }) => all.push(answer),
+            Some(Resolution::Expired { .. }) | None => {}
+        }
+    }
+    for entry in feedback {
+        all.push(&entry.answer);
+    }
+    all
 }
 
 /// Every blob in `store` any run in the store names, finished or not: in its
 /// input, its result or error, and every step's recorded output or error.
 /// Runs are read a page at a time, in order of creation and id.
 pub async fn recorded(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
-    let present: HashSet<String> = {
-        let store = store.clone();
-        tokio::task::spawn_blocking(move || store.stored())
-            .await??
-            .into_iter()
-            .map(|a| a.digest().to_owned())
-            .collect()
-    };
+    let present = present(store).await?;
     let mut found = BTreeSet::new();
     let mut after = None;
     loop {
@@ -478,6 +527,84 @@ fn mark_named(store: &LocalStore, artifacts: &[ArtifactRef], wait: &Wait) -> any
 mod tests {
     use super::*;
     use atomic_core::artifact::{ArtifactStore, Provenance};
+
+    /// Every answer the gate store keeps is read: a question's default, the
+    /// answer a gate was decided or defaulted with, and each answer the
+    /// feedback log keeps; an expired gate and an approval gate add none.
+    #[test]
+    fn every_answer_the_gate_store_keeps_is_read() {
+        use atomic_durable::gate::{
+            Decision, Feedback, Gate, OnTimeout, Principal, Question, Resolution, Tier, Verdict,
+        };
+        let gate = |question: Option<Question>, resolution: Option<Resolution>| Gate {
+            id: "run:ask".into(),
+            run: "run".into(),
+            workflow: "w".into(),
+            step: "ask".into(),
+            title: "Which file?".into(),
+            show: serde_json::json!({}),
+            evidence: Vec::new(),
+            proposal: "p".into(),
+            approvers: Vec::new(),
+            tier: Tier::High,
+            opened_at: 0,
+            deadline: None,
+            on_timeout: OnTimeout::Default,
+            question,
+            resolution,
+        };
+        let question = |default: Option<Value>| Question {
+            answer: serde_json::json!({}),
+            remember: true,
+            default,
+        };
+        let decided = Resolution::Decided(Decision {
+            verdict: Verdict::Approve,
+            by: Principal::local("dev"),
+            comment: None,
+            answer: Some(serde_json::json!("decided")),
+            command: "c".into(),
+            at: 1,
+        });
+        let gates = [
+            gate(Some(question(Some(serde_json::json!("default")))), None),
+            gate(Some(question(None)), Some(decided)),
+            gate(
+                Some(question(None)),
+                Some(Resolution::Defaulted {
+                    at: 1,
+                    answer: serde_json::json!("defaulted"),
+                }),
+            ),
+            gate(
+                Some(question(None)),
+                Some(Resolution::Expired {
+                    at: 1,
+                    on_timeout: OnTimeout::Reject,
+                }),
+            ),
+            gate(None, None),
+        ];
+        let feedback = [Feedback {
+            gate: "run:ask".into(),
+            workflow: "w".into(),
+            step: "ask".into(),
+            ask: "Which file?".into(),
+            answer: serde_json::json!("remembered"),
+            by: None,
+            at: 1,
+        }];
+        let read: Vec<&Value> = answers(&gates, &feedback);
+        assert_eq!(
+            read,
+            [
+                &serde_json::json!("default"),
+                &serde_json::json!("decided"),
+                &serde_json::json!("defaulted"),
+                &serde_json::json!("remembered"),
+            ]
+        );
+    }
 
     /// A store with one artifact in it written an hour ago, and a durable
     /// runtime with a workflow that does nothing, launched.
