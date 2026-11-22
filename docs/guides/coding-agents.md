@@ -72,9 +72,13 @@ action items, with their owners, out of meeting notes".
 
 The skill teaches; the CLI checks. The agent writes the schemas first, then the
 `.atom.astro` file with a typed example, then eval cases, and runs
-`atomic check` until it passes. It previews the prompt with `atomic render` and
-reports what it wrote. The eval runner is not available yet, so the agent
-writes eval cases but cannot run them.
+`atomic check --json` until it passes, using the diagnostics' `error.action`
+field to guide fixes. It previews the prompt with `atomic render`, runs
+`atomic eval <name>` and reports the result. Replay uses recorded answers
+without calling the model. Before making a live call, the agent asks you to
+choose the endpoint and model and authorize the call. For supported atom kinds
+and when to use `--live` or `--no-cassettes`, see the
+[eval reference](../reference/eval-cases.md#cases-golden-fixtures-and-recordings).
 
 The skill's `references/` folder is generated from the definitions the binary
 checks atoms with: the configuration fields the loader accepts and refuses, the
