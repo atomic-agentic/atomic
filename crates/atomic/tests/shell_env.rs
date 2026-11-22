@@ -1201,11 +1201,17 @@ async fn patch_keeps_its_registry(tag: &str, relative: bool) {
         .map(|r| r.parent().unwrap().to_owned())
         .collect();
     // In the shared directory of the backend runs use: the project's `run`
-    // root in the home's `scratch/`.
+    // root in the home's `scratch/`. The home is the state given as
+    // `ATOMIC_HOME`, or else `atomic` in the `XDG_DATA_HOME` it was given.
+    let atomic = if relative {
+        state.clone()
+    } else {
+        state.join("atomic")
+    };
     assert!(
         shared.len() == 1
             && shared[0].ends_with("run/.tmp")
-            && shared[0].starts_with(state.join("scratch")),
+            && shared[0].starts_with(atomic.join("scratch")),
         "registries: {shared:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
