@@ -302,12 +302,36 @@ fn regex(pattern: &str) -> Regex {
 static FLAG: LazyLock<Regex> = LazyLock::new(|| {
     regex(&format!(
         r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["']))({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
-        escaped = ESCAPED_QUOTED,
+        escaped = escaped_quoted(),
     ))
 });
-/// A value in escaped quotes, `\"x\"` or `\\\"x\\\"`, as alternatives of
-/// [`FLAG`]'s value, tried before a bare value would take the backslash.
-const ESCAPED_QUOTED: &str = r#"\\+"[^"\n]*?\\+"|\\+'[^'\n]*?\\+'|"#;
+/// The alternatives of [`FLAG`]'s value for one in escaped quotes, `\"x\"`
+/// or `\\\"x\\\"`, tried before a bare value would take the backslash:
+/// closed by the first quote after it, which must be escaped as the opening
+/// one is. A quote escaped otherwise is another value's, and the value is
+/// then read as a bare one, by its backslashes alone.
+fn escaped_quoted() -> String {
+    let mut alternatives = String::new();
+    for escapes in 1..=MAX_QUOTE_ESCAPES {
+        for quote in ['"', '\''] {
+            alternatives.push_str(&format!(
+                r"\\{{{escapes}}}{quote}(?:[^{quote}\n]*[^\\{quote}\n])?\\{{{escapes}}}{quote}|"
+            ));
+        }
+    }
+    alternatives
+}
+/// The most backslashes before a quote [`FLAG`] reads as escaping it.
+const MAX_QUOTE_ESCAPES: usize = 8;
+/// [`FLAG`] without reading escaped quotes, read after it: where escaped
+/// quotes pair otherwise than a command meant, around another quoted
+/// value or up to a flag with no space before it, what this reading finds
+/// is still found.
+static FLAG_UNESCAPED: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+    )
+});
 /// An authorization, cookie or API key header and its value, to the end of
 /// the line or the quote around it.
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
@@ -1095,14 +1119,100 @@ fn assigned(input: &str) -> Option<String> {
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
-    // Quoted, or quoted with escaped quotes, as in JSON held in a string.
-    let value = captures[3].trim_matches(['"', '\'', '\\']);
-    if !is_secret_value(strength(&captures[2]), value) {
-        return captures[0].to_string();
-    }
+    redact_flag_within(captures, 0)
+}
+
+/// How many quotes deep [`redact_flag`] reads the flags of a quoted value
+/// that is not a secret itself, `sh -c "login --password x"`.
+const FLAG_DEPTH: usize = 4;
+
+/// [`redact_flag`] for a flag `depth` quoted values deep.
+fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
     let whole = captures.get(0).map_or(0, |m| m.start());
     let value_at = captures.get(3).map_or(0, |m| m.start());
-    format!("{}{REDACTED}", &captures[0][..value_at - whole])
+    let prefix = &captures[0][..value_at - whole];
+    let raw = &captures[3];
+    let strength = strength(&captures[2]);
+    // A value in quotes, plain or escaped alike at both ends, is judged by
+    // what it holds.
+    if let Some((open, inner, close)) = quoted(raw) {
+        // Escaped quotes around what reads as more than a value, a name
+        // assigned, a flag or a quote, can close on the opening of a value
+        // inside it,
+        // which hiding them whole would leave bare: read as a bare value
+        // instead, by its backslashes, and the rest read on.
+        if open.len() > 1 && is_secret_value(strength, inner) && holds_more(inner) {
+            let (escapes, rest) = raw.split_at(open.len() - 1);
+            let escapes = if is_secret_value(strength, escapes) {
+                REDACTED
+            } else {
+                escapes
+            };
+            let inside = if depth < FLAG_DEPTH {
+                FLAG.replace_all(rest, |c: &Captures<'_>| redact_flag_within(c, depth + 1))
+            } else {
+                Cow::Borrowed(rest)
+            };
+            return format!("{prefix}{escapes}{inside}");
+        }
+        // Inside another flag's quoted value, which a reading without it
+        // takes whole, a value that reads as more than one is left to the
+        // readings of what it holds.
+        if depth > 0 && is_secret_value(strength, inner) && holds_more(inner) {
+            return captures[0].to_string();
+        }
+        if is_secret_value(strength, inner) {
+            // Escaped quotes are kept, so they still pair, and a flag right
+            // after the closing one is still read as one.
+            return if open.len() > 1 {
+                format!("{prefix}{open}{REDACTED}{close}")
+            } else {
+                format!("{prefix}{REDACTED}")
+            };
+        }
+        // Not a secret itself, it can hold a command whose flags are, and
+        // they were read as part of it: read them again inside the quotes.
+        if depth < FLAG_DEPTH && FLAG.is_match(inner) {
+            let inside =
+                FLAG.replace_all(inner, |c: &Captures<'_>| redact_flag_within(c, depth + 1));
+            return format!("{prefix}{open}{inside}{close}");
+        }
+        return captures[0].to_string();
+    }
+    if !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
+        return captures[0].to_string();
+    }
+    // A run of backslashes a bare value ends in escapes the quote after it,
+    // as in an escaped argument list, `[\"--password\", \"x\"]`: kept, so
+    // the quotes still pair.
+    let escape = &raw[raw.trim_end_matches('\\').len()..];
+    format!("{prefix}{REDACTED}{escape}")
+}
+
+/// Whether a quoted value reads as more than one: it assigns a name,
+/// holds a flag or a quote, so the quote closing it may open a value
+/// inside it.
+fn holds_more(inner: &str) -> bool {
+    inner.contains(['=', ':', '"', '\'']) || FLAG_START.is_match(inner)
+}
+
+/// Where a flag starts, as [`FLAG`] reads one.
+static FLAG_START: LazyLock<Regex> = LazyLock::new(|| regex(r#"(?:^|[\s"'\[,])--?[A-Za-z0-9]"#));
+
+/// `raw` as a quoted value, plain or escaped alike at both ends (`"x"`,
+/// `\"x\"`, `'x'`): its opening quote, what it holds, and its closing quote.
+fn quoted(raw: &str) -> Option<(&str, &str, &str)> {
+    let escapes = raw.len() - raw.trim_start_matches('\\').len();
+    let quote = raw[escapes..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))?;
+    let open = escapes + 1;
+    // Closed as it opened: as many backslashes, then the same quote.
+    let ends = raw.len().checked_sub(open).filter(|&at| at >= open)?;
+    let closing = &raw[ends..];
+    (closing.ends_with(quote) && closing.trim_start_matches('\\').len() == 1)
+        .then(|| (&raw[..open], &raw[open..ends], closing))
 }
 
 /// "bearer authentication" is prose: a bearer token has a digit or is long,
@@ -1171,6 +1281,7 @@ pub fn text(input: &str) -> Cow<'_, str> {
     });
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
+    apply(&FLAG_UNESCAPED, &redact_flag);
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }

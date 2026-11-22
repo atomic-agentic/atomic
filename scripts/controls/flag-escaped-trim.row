@@ -1,1 +1,0 @@
-flag-escaped-trim|crates/atomic-core/src/redact.rs|    let value = captures[3].trim_matches(['"', '\'', '\\']);|    let value = captures[3].trim_matches(['"', '\'']); /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_flag_value_in_escaped_quotes_is_hidden

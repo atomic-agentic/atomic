@@ -1,1 +1,1 @@
-flag-escaped-quotes|crates/atomic-core/src/redact.rs|        escaped = ESCAPED_QUOTED,|        escaped = "", /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_flag_value_in_escaped_quotes_is_hidden
+flag-escaped-quotes|crates/atomic-core/src/redact.rs|        escaped = escaped_quoted(),|        escaped = String::new(), /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_flag_value_in_escaped_quotes_is_hidden

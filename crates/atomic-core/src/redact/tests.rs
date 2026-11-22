@@ -2160,15 +2160,57 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
             "case {case}: the value showed"
         );
     }
+    // A flag inside the quoted value of a flag that is not a secret, as
+    // `sh -c` takes a command, in plain quotes and escaped ones.
+    for (case, line) in [
+        format!("sh -c \\\"login --password {credential}\\\" now"),
+        format!("sh -c \"login --password {credential}\" now"),
+        format!("sh -c 'login --token {credential}' now"),
+        // Quotes escaped otherwise, or around a value that opens another.
+        format!("--api-key \\'sh --api-key \"login [\\'--auth-token\\',\\'{credential}\\']\"\\'"),
+        format!("sh --name \"login sh --secret 'login --token='{credential}''\""),
+        format!("--pw \\\\\\\"\\\\\\\"--token \"{credential}\"\\\\\\\"\\\\\\\""),
+        format!("run sh --note \\\"login sh --auth-token 'login [\\\"--name\\\", \\\"{credential}\\\"]'\\\" now"),
+        format!("sh --password \\\\\\\"login --token=\\\\\\\"{credential}\\\\\\\"\\\\\\\""),
+        format!("sh --api-key \\\\\\\"login sh --note login --secret=\\\"{credential}\\\"\\\\\\\", --auth-token"),
+        format!("--pw sh --password \\\\\\\"login sh --secret 'login [\\\"--api-key\\\", \\\"{credential}\\\"]'\\\\\\\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the inner value showed"
+        );
+    }
+    // A bare value is judged as written, backslashes and all.
+    for line in [
+        "run --token abcdefg\\ now",
+        "run --password \\none now",
+        "run --password \\\\ now",
+    ] {
+        assert_ne!(text(line), line, "a value after a flag stayed");
+    }
     // A word in escaped quotes after a hint is read without them, as one
     // in plain quotes is, and stays.
     let kept = "run --token \\\"readOnlyScope\\\" now";
     assert_eq!(text(kept), kept, "a word after a hint was hidden");
     // In JSON held in a string, one level deep and two.
     let inner = json!({"cmd": "deploy --password \"hunter2\""}).to_string();
+    let wrapped = json!({"cmd": "sh -c \"login --password hunter2\""}).to_string();
+    // An argument list beside a key only parsing finds, `pass\u0077ord`.
+    let listed = r#"{"args":["--password","a"],"pass\u0077ord":"hunter2"}"#;
     for (depth, doc) in [
         (1, json!({"arguments": inner.clone()})),
         (2, json!({"arguments": json!({"body": inner}).to_string()})),
+        (1, json!({"arguments": wrapped.clone()})),
+        (
+            2,
+            json!({"arguments": json!({"body": wrapped}).to_string()}),
+        ),
+        (1, json!({"arguments": listed})),
+        (2, json!({"arguments": json!({"body": listed}).to_string()})),
     ] {
         let mut out = doc;
         value(&mut out);
