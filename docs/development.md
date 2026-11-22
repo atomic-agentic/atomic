@@ -182,12 +182,13 @@ With the feature on, a sandbox that cannot start fails the tests, each with a
 message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
-commands, and stops before such a step without it, so the tests in
-`crates/atomic/tests/run_cli.rs` and `crates/atomic/tests/telemetry.rs` that
-run commands are behind the same feature there, each marked
-`// needs_sandbox`; the rest of those files runs in a plain `cargo test`. The
-sandbox check runs each marked test, as it runs every test of a file that is
-behind the feature as a whole.
+commands, and stops before such a step without it, so in the four files under
+`crates/atomic/tests/` that hold both kinds of test — `run_cli.rs`,
+`telemetry.rs`, `fixture_cli.rs` and `command_environment.rs` — every test
+that runs a command is behind the same feature, marked `// needs_sandbox`
+above its attributes; the rest of those files runs in a plain `cargo test`.
+The sandbox check runs each marked test, as it runs every test of a file that
+is behind the feature as a whole.
 
 ## Controls are tested by removing them
 
