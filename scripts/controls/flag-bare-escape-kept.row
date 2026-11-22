@@ -1,0 +1,1 @@
+flag-bare-escape-kept|crates/atomic-core/src/redact.rs|    format!("{prefix}{REDACTED}{escape}")|    format!("{prefix}{REDACTED}{}", &escape[..0]) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_flag_value_in_escaped_quotes_is_hidden

@@ -1,0 +1,1 @@
+assigned-unclosed-quote|crates/atomic-core/src/redact.rs|                && let Some((value_from, value_to)) = unclosed_value(scope, start)|                && false /*CONTROL_OFF*/ && let Some((value_from, value_to)) = unclosed_value(scope, start)|-p atomic-agentic-core --lib redact::tests::separators_and_open_quotes_keep_the_next_value_hidden

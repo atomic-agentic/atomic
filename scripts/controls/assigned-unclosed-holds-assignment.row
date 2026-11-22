@@ -1,0 +1,1 @@
+assigned-unclosed-holds-assignment|crates/atomic-core/src/redact.rs|                && !scope[value_from..value_to].contains(['=', ':'])|                && true /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::separators_and_open_quotes_keep_the_next_value_hidden

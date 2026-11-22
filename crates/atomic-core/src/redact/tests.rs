@@ -675,6 +675,20 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
         ("names with open quotes", repeated("password=\"")),
         ("escaped open quotes", repeated("password=\\\"")),
         ("flags with no values", repeated(" --password")),
+        ("unclean flag values", repeated("--token [ \"")),
+        ("unclean flag values on lines", repeated("--token [ \"\n")),
+        (
+            "commas in an unclean flag value",
+            format!("--token [{}", repeated("a,")),
+        ),
+        (
+            "commas in an unclean flag value in quotes",
+            format!("echo \"--token [{}\"", repeated("a,")),
+        ),
+        (
+            "open escaped quotes after flags",
+            repeated("--note \\\\\\\"a \\\" "),
+        ),
         (
             "block starts with no end",
             repeated(concat!("-----BEGIN RSA PRIVATE", " KEY-----\n")),
@@ -1034,6 +1048,26 @@ fn escaped_quotes_and_open_key_blocks_grow_linearly() {
     for (name, small, large) in [
         ("escaped quotes", quotes(350), quotes(1400)),
         ("open key blocks", blocks(64 * 1024), blocks(1024 * 1024)),
+    ] {
+        let (small, large) = (steps_of(&small), steps_of(&large));
+        assert!(
+            large < 32 * small,
+            "{name}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+}
+
+/// An unclean flag value of many commas and no white space, as text and in
+/// quotes: each word after a comma is read for a name it assigns, and only
+/// that name is read, not the rest of the value up to the next white
+/// space, so the steps grow as the input does.
+#[test]
+fn commas_in_an_unclean_flag_value_grow_linearly() {
+    let bare = |size: usize| format!("--token [{}", "a,".repeat(size / 2));
+    let quoted = |size: usize| format!("echo \"--token [{}\"", "a,".repeat(size / 2));
+    for (name, small, large) in [
+        ("bare", bare(4 * 1024), bare(64 * 1024)),
+        ("quoted", quoted(4 * 1024), quoted(64 * 1024)),
     ] {
         let (small, large) = (steps_of(&small), steps_of(&large));
         assert!(
@@ -2632,11 +2666,16 @@ fn json_that_text_redaction_breaks_is_hidden_whole() {
 /// changed holds, is hidden whole too: by the time redaction reaches that
 /// string it no longer reads as JSON, and what the rules that read names
 /// and pairs would hide there must not show.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let inner = format!(
-        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+        "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
          \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
     );
     let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
@@ -2666,11 +2705,16 @@ fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
 /// for it: a string that does not read as JSON as written, a bad escape
 /// in a URL's password say, can read as JSON once text redaction hides the
 /// password, and the JSON broken beside it is still hidden whole.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let inner = format!(
-        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+        "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
          \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
     );
     let mended = r#"{"u":"https://user:pa\qss@host/"}"#;
@@ -2780,8 +2824,9 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
 
 /// JSON held in strings deeper than [`MAX_NESTED_JSON`] cannot be opened,
 /// so the rules that read its names and pairs never see it: a header's
-/// name and value, `{"name": "X-Api-Key", "value": "<key>"}`, which no text
-/// rule reads, is hidden with the string that holds it, under an ordinary
+/// name and value whose field's name is written with an escape,
+/// `{"\u006eame": "X-Api-Key", "value": "<key>"}`, which no text rule reads
+/// (the text rule for pairs reads field names only as written), is hidden with the string that holds it, under an ordinary
 /// name and under hints, beside a plain sibling or one text redaction
 /// renames, at depths 3 and 4, where its string is past the bound, and
 /// deeper, and a second pass changes nothing.
@@ -2792,7 +2837,7 @@ fn json_held_past_the_nesting_bound_is_hidden_whole() {
     for note in ["x\\\\q", "hi"] {
         for sibling in ["b", "https://u:pw@h"] {
             let inner = format!(
-                "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+                "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
                  \"note\": \"{note}\"}}"
             );
             let first = Value::String(
@@ -2836,7 +2881,9 @@ fn json_held_past_the_nesting_bound_is_hidden_whole() {
 /// Past [`MAX_NESTED_JSON`], a string that starts as JSON does but does
 /// not parse, cut say, is hidden whole too, and so is one that text
 /// redaction makes start so, so a second pass changes nothing; a string
-/// that does not start so is redacted as text, as at any depth.
+/// that does not start so is redacted as text, as at any depth. The cut
+/// pair writes its field's name with an escape, `"\u006eame"`, which the
+/// text rule for pairs does not read, so only the bound hides it.
 #[test]
 fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
     let token = concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz0123");
@@ -2848,7 +2895,10 @@ fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
         }
         held
     };
-    let cut = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{}\"", &token[7..]);
+    let cut = format!(
+        "{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{}\"",
+        &token[7..]
+    );
     let led = format!("{token} then more");
     for (case, (deep, expected)) in [
         (cut.as_str(), REDACTED),
@@ -2877,10 +2927,15 @@ fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
 /// is hidden whole, whichever key comes first and whether the value is an
 /// object or JSON in a string, under an ordinary name and under hints, at
 /// depths 1 to 4, and a second pass changes nothing.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn a_key_text_redaction_renames_into_a_siblings_name_hides_the_string_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
-    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let pair = format!("{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}");
     let in_string = |s: &str| Value::String(s.to_owned()).to_string();
     let held_pair = in_string(&format!("{{\"headers\": [{pair}]}}"));
     let twin = in_string("{\"headers\": [{\"name\": \"x\", \"value\": \"y\"}]}");
@@ -3166,10 +3221,15 @@ fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
 /// a key text redaction renames too, and two levels down, under an
 /// ordinary name and under hints, held one to four strings deep, and a
 /// second pass changes nothing.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
-    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let pair = format!("{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}");
     let (r, p, q) = (
         "\"https://u:[REDACTED]@h\"",
         "\"https://u:pw@h\"",
@@ -3223,13 +3283,12 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
         value(&mut out);
         assert_eq!(out, json!({ parent: REDACTED }), "under {parent}");
     }
-    // An object that gives each key once is opened as before.
+    // An object that gives each key once is opened as before, and written
+    // back from its parse.
     let mut once = json!({ "body": format!("{{\"h\": {pair}, \"i\": 1}}") });
     value(&mut once);
-    assert_eq!(
-        once,
-        json!({ "body": format!("{{\"h\":{{\"name\":\"X-Api-Key\",\"value\":\"{REDACTED}\"}},\"i\":1}}") })
-    );
+    let opened = json!({"h": {"name": "X-Api-Key", "value": REDACTED}, "i": 1});
+    assert_eq!(once, json!({ "body": opened.to_string() }));
 }
 
 /// A held document is checked before a changed header causes its parsed
@@ -3238,7 +3297,8 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
 fn held_json_duplicates_are_refused_before_normalization() {
     let header = concat!("Qk9L", "x3sR2tY7uV8w");
     let hidden = "sample-private-value";
-    let pair = format!(r#"{{"name":"X-Api-Key","value":"{header}"}}"#);
+    // The intervening object leaves the header for parsed redaction to hide.
+    let pair = format!(r#"{{"name":"X-Api-Key","note":{{}},"value":"{header}"}}"#);
     for (case, document) in [
         format!(
             "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"key\": \"note\"\n}}"
@@ -3279,31 +3339,35 @@ fn held_json_duplicates_are_refused_before_normalization() {
         let parsed: Value = serde_json::from_str(held).expect("unique JSON remains JSON");
         assert_eq!(parsed["value"], "ordinary");
         assert_eq!(parsed["h"]["value"], REDACTED);
+        assert_eq!(parsed["h"]["note"], json!({}));
     }
 }
 
-/// An excerpt of a JSON document that gives a key twice is written from
-/// the parse, which kept the last value, so the earlier one is left out
-/// rather than shown as written; a second excerpt changes nothing.
+/// An excerpt of a JSON document that gives a key twice is hidden whole:
+/// the parse kept only the last value, so what the rest says of it cannot
+/// be told, as a pair whose `key` or `name` was given twice, the secret's
+/// name first and a harmless one after, at the top or in a list; a second
+/// excerpt changes nothing.
 #[test]
-fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
+fn an_excerpt_of_json_that_gives_a_key_twice_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
-    for (case, (doc, expected)) in [
-        (
-            format!("{{\"h\": {pair}, \"h\": 1}}"),
-            "{\"h\":1}".to_owned(),
+    for (case, doc) in [
+        format!("{{\"h\": {pair}, \"h\": 1}}"),
+        "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
+        format!("{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\", \"key\": \"note\"}}"),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\", \"name\": \"x\"}}"),
+        format!(
+            "{{\"header\": \"Authorization\", \"value\": \"Bearer {key}\", \"header\": \"x\"}}"
         ),
-        (
-            "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
-            "{\"h\":\"ok\",\"i\":[2]}".to_owned(),
-        ),
+        format!("{{\"h\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\", \"name\": \"x\"}}]}}"),
+        format!("[{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\", \"key\": \"note\"}}]"),
     ]
     .into_iter()
     .enumerate()
     {
         let shown = excerpt(&doc, 4096);
-        assert!(shown == expected, "case {case}: not written from the parse");
+        assert!(shown == REDACTED, "case {case}: not hidden whole");
         assert_eq!(
             excerpt(&shown, 4096),
             shown,
@@ -3321,6 +3385,345 @@ fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
         !excerpt(&renamed, 4096).contains(&key[4..]),
         "the renamed key's value showed"
     );
+}
+
+/// A name and value pair in JSON that does not parse as it stands is read
+/// as text: cut short, after a byte-order mark, a zero-width space, an XSSI
+/// guard, `data: ` or a word, or in a JSON string literal, a header's value
+/// or a secret's is hidden, name or value first, held zero to six strings
+/// deep under an ordinary name and under hints, and a second pass changes
+/// nothing; a pair that holds no secret is kept.
+#[test]
+fn a_name_and_value_pair_that_does_not_parse_is_read_as_text() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let first = format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key\"}}");
+    let secret = format!("{{\"key\": \"DB_PASSWORD\", \"value\": \"{key}\"}}");
+    let mut shapes = Vec::new();
+    for doc in [&pair, &first, &secret] {
+        // Cut after the closing quote, and, name first, inside the value.
+        if doc != &first {
+            shapes.push(doc[..doc.len() - 2].to_owned());
+        }
+        shapes.extend([
+            doc[..doc.len() - 1].to_owned(),
+            format!("\u{feff}{doc}"),
+            format!("\u{200b}{doc}"),
+            format!(")]}}'\n{doc}"),
+            format!("data: {doc}"),
+            format!("body {doc}"),
+            Value::String(doc.clone()).to_string(),
+        ]);
+    }
+    for (shape, deep) in shapes.iter().enumerate() {
+        let mut held = deep.clone();
+        for depth in 0..=6 {
+            for parent in ["body", "msg", "note", "key", "token"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "shape {shape}, depth {depth}, under {parent}: the pair's value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert!(
+                    again == out,
+                    "shape {shape}, depth {depth}, under {parent}: a second pass changed it"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+        assert!(
+            !text(deep).contains(&key[4..]),
+            "shape {shape}: text showed it"
+        );
+    }
+    // Cut by the bound on what is redacted in one piece.
+    let long = format!("{pair}{}", " ".repeat(MAX_TEXT));
+    let mut out = json!({ "note": long[..pair.len() - 1].to_owned() + &" x".repeat(MAX_TEXT / 2) });
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&key[4..]),
+        "the cut long string showed it"
+    );
+    // Pairs that hold no secret, and the text around a hidden one, are kept.
+    assert_kept(&[
+        "{\"name\": \"Content-Type\", \"value\": \"application/json\"",
+        "data: {\"name\": \"x\", \"value\": \"y\"}",
+        "{\"key\": \"cache\", \"value\": \"v1-deps\"",
+    ]);
+    assert_eq!(
+        text(&format!("data: {pair} tail")),
+        format!("data: {{\"name\": \"X-Api-Key\", \"value\": \"{REDACTED}\"}} tail")
+    );
+    assert_eq!(
+        text(&format!("x {first}")),
+        format!("x {{\"value\": \"{REDACTED}\", \"name\": \"X-Api-Key\"}}")
+    );
+}
+
+/// A pair's value that ends in a backslash closes where it does, at every
+/// depth of escaping, so what follows it is kept: the closing quote comes
+/// after the depth's own backslashes and the escaped backslash before them.
+#[test]
+fn a_pair_value_that_ends_in_a_backslash_closes_where_it_does() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, (input, kept)) in [
+        (
+            format!(r#"{{"name": "X-Api-Key", "value": "{key}\\"}} next=1 status=ok"#),
+            r#""} next=1 status=ok"#,
+        ),
+        (
+            format!(
+                r#"{{"msg": "{{\"name\": \"X-Api-Key\", \"value\": \"{key}\\\\\"}}", "level": "info", "ts": 1}}"#
+            ),
+            r#"\"}", "level": "info", "ts": 1}"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shown = text(&input);
+        assert!(!shown.contains(&key[4..]), "case {case}: the value showed");
+        assert!(shown.ends_with(kept), "case {case}: what follows the value was not kept");
+    }
+}
+
+/// Reading pairs as text takes linear steps, however many values open and
+/// never close at their depth, at one depth or a ladder of them: at
+/// sixteen times the size, under 32 times the steps.
+#[test]
+fn reading_pairs_as_text_takes_linear_steps() {
+    // Values opening at each depth of escaping in turn, or at one
+    // backslash fewer each time, which no later one closes, since a value
+    // closes only after at least as many backslashes as it opened with.
+    let ladder = |bytes: usize, name_first: bool, real: bool| {
+        let mut line = String::new();
+        let top = (2.0 * bytes as f64).sqrt() as usize;
+        let mut i = 0usize;
+        while line.len() < bytes {
+            if name_first {
+                line.push_str("\"name\": \"X-Api-Key\", ");
+            }
+            let level = if real {
+                (1usize << (1 + i % 7)) - 1
+            } else {
+                top.saturating_sub(i).max(1)
+            };
+            line.push_str("\"value\": ");
+            line.push_str(&"\\".repeat(level));
+            line.push_str("\"x ");
+            i += 1;
+        }
+        line
+    };
+    for (case, (small, large)) in [
+        (
+            ladder(16 * 1024, false, true),
+            ladder(256 * 1024, false, true),
+        ),
+        (
+            ladder(16 * 1024, true, true),
+            ladder(256 * 1024, true, true),
+        ),
+        (
+            ladder(16 * 1024, false, false),
+            ladder(256 * 1024, false, false),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (small, large) = (steps_of(&small), steps_of(&large));
+        assert!(
+            large < 32 * small,
+            "ladder {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+    // A name holding a long run of backslashes before an escape that does
+    // not read, an unpaired surrogate, name first, as an array and value
+    // first: the run is read past once.
+    for (case, shape) in [
+        "\"name\": \"{run}ud800\", \"value\": \"x\"",
+        "[\"{run}ud800\", \"x\"]",
+        "\"value\": \"x\", \"name\": \"{run}ud800\"",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = |run: usize| shape.replace("{run}", &"\\".repeat(run));
+        let (small, large) = (steps_of(&line(1024)), steps_of(&line(16 * 1024)));
+        assert!(
+            large < 32 * small,
+            "surrogate {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+    for (case, unit) in [
+        "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
+        "\"value\": \\\\\\\"x \"",
+        "{\"name\": \"a\", \"value\": \"b\"} ",
+        // Objects for values that open and never close, under a name they
+        // are not hidden for, so each is read on, and under one they are.
+        "{\"name\": \"a\", \"value\": {",
+        "{\"name\": \"X-Api-Key\", \"value\": {",
+        "[\"X-Api-Key\", \"x ",
+        "{'name': 'X-Api-Key', 'type': 'h', 'value': 'x'} ",
+        // Lists of three on one line: where the line ends is read from the
+        // character after each list's second item, not by reading the rest
+        // of the line for each, which would take some 256 times the steps.
+        "[\"X-Api-Key\", \"a\", \"b\"] ",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (small, large) = (steps_of(&unit.repeat(500)), steps_of(&unit.repeat(8_000)));
+        assert!(
+            large < 32 * small,
+            "case {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+}
+
+/// A pair in JSON that parses, its fields in any case as AWS writes them
+/// (`Name`, `Key`, `Value`), as `headerName` and `headerValue`, or with a
+/// value of more than a string under a header's or a secret's name, has its
+/// value hidden; one that holds no secret keeps it.
+#[test]
+fn a_parsed_pair_is_read_in_any_case_and_whatever_its_value() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, doc) in [
+        json!({"Name": "X-Api-Key", "Value": key}),
+        json!({"NAME": "X-Api-Key", "VALUE": key}),
+        json!({"Tags": [{"Key": "DB_PASSWORD", "Value": key}]}),
+        json!({"headerName": "X-Api-Key", "headerValue": key}),
+        json!({"name": "X-Api-Key", "value": {"v": key}}),
+        json!({"name": "password", "value": [key]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "case {case}: the pair's value showed"
+        );
+    }
+    for kept in [
+        json!({"Name": "Content-Type", "Value": "application/json"}),
+        json!({"name": "config", "value": {"retries": 3}}),
+    ] {
+        let mut out = kept.clone();
+        value(&mut out);
+        assert_eq!(out, kept, "a pair that holds no secret changed");
+    }
+}
+
+/// Pair shapes the text rule reads beside `{"name": …, "value": …}` side
+/// by side: fields in any case, `headerName` and `headerValue`, a field
+/// between name and value (either first), Python's quotes, an array pair,
+/// a `\u`-escaped name, an object for a value, and, value first, a name
+/// cut off where the text ends. Each is hidden as text and in JSON held in
+/// a string zero to two deep, cut so that it does not parse.
+#[test]
+fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, line) in [
+        format!("{{\"Name\": \"X-Api-Key\", \"Value\": \"{key}\""),
+        format!("{{\"headerName\": \"X-Api-Key\", \"headerValue\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"type\": \"h\", \"value\": \"{key}\""),
+        format!("{{\"value\": \"{key}\", \"type\": \"h\", \"name\": \"X-Api-Key\""),
+        format!("{{'name': 'X-Api-Key', 'value': '{key}'}}"),
+        format!("[[\"X-Api-Key\", \"{key}\"], [\"a\""),
+        format!("{{\"name\": \"\\u0041uthorization\", \"value\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"v\": \"{key}\"}}"),
+        format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key"),
+        // An array pair cut just after its value, and an object for a value
+        // whose string holds an escaped quote and a bracket.
+        format!("[\"X-Api-Key\", \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"p\": \"x\\\"}}\", \"q\": \"{key}\"}}}}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&key[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = line.clone();
+        for depth in 0..=2 {
+            for parent in ["msg", "body"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "case {case}, depth {depth}, under {parent}: shown"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+    }
+    // A pair inside another's object for a value is still read, and pairs
+    // that hold no secret, lists of more than two, and a list of names cut
+    // after two, are kept.
+    let inner = format!(
+        "{{\"name\": \"config\", \"value\": {{\"name\": \"X-Api-Key\", \"value\": \"{key}\""
+    );
+    assert!(!text(&inner).contains(&key[4..]), "an inner pair showed");
+    assert_kept(&[
+        "{\"Name\": \"Content-Type\", \"Value\": \"application/json\"",
+        "[\"password\", \"email\"]",
+        "for name in [\"ATOMIC_EFFECT_KEY\", \"ATOMIC_OUTPUTS\", \"ATOMIC_INPUTS\"] {",
+        "{'name': 'region', 'value': 'us-east-1'}",
+        "{\"name\": \"config\", \"value\": {\"retries\": 3}",
+        "headers = [\"X-Api-Key\", \"X-Request-Id\"",
+        "allowed = [\"X-Auth-Token\", \"Content_Type\"\nmore",
+    ]);
+}
+
+/// An array pair cut where its line or the text ends, just after its
+/// value, is a list of names cut short only when the value reads as a
+/// header's name, each word a capital and then lower-case letters
+/// (`X-Request-Id`, `Content_Type`) or one of the credential headers.
+/// Words in lower case, or groups of letters and digits, joined by `-` or
+/// `_` are a value, and hidden under a credential header's name, as text and in a
+/// string; a header's name after it is kept.
+#[test]
+fn a_listed_pair_cut_after_its_value_is_read_unless_the_value_is_a_header_name() {
+    let mut shown = Vec::new();
+    for name in ["X-Api-Key", "X-Auth-Token"] {
+        for secret in [
+            "correct-horse-battery-staple",
+            "Zq9-xK2-pL7-mN4-bV6",
+            "a1b_c2d_e3f_g4h",
+            "blue_whale_river",
+            "Zq9-Xk2-Pl7-Mn4-Bv6",
+        ] {
+            for line in [
+                format!("[\"{name}\", \"{secret}\""),
+                format!("[\"{name}\", \"{secret}\"\nmore"),
+            ] {
+                let mut held = json!({ "msg": line });
+                value(&mut held);
+                for (how, read) in [
+                    ("text", text(&line).into_owned()),
+                    ("held", held.to_string()),
+                ] {
+                    if read.contains(secret) {
+                        shown.push(format!("{how}: {read}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "shown: {shown:#?}");
+    assert_kept(&[
+        "[\"X-Auth-Token\", \"X-Request-Id\"",
+        "[\"X-Api-Key\", \"Content_Type\"\nmore",
+        "[\"X-Api-Key\", \"X-Auth-Token\"",
+        "[\"X-Api-Key\", \"authorization\"\nmore",
+    ]);
 }
 
 #[test]
@@ -3374,6 +3777,488 @@ fn original_duplicate_spellings(parent: &str) {
     );
 }
 
+/// A flag's value quoted with escaped quotes, as a command held in JSON in
+/// a string writes it, is hidden as one in plain quotes is, at any depth,
+/// and the JSON around it still reads as JSON.
+#[test]
+fn a_flag_value_in_escaped_quotes_is_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        "run --password \\\"hunter2\\\" now".to_owned(),
+        "run --password \\\\\\\"hunter2\\\\\\\" now".to_owned(),
+        format!("run --token \\\"{credential}\\\" now"),
+        "[\\\"--password\\\", \\\"hunter2\\\"]".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(!out.contains("hunter2"), "case {case}: the value showed");
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the value showed"
+        );
+    }
+    // A flag inside the quoted value of a flag that is not a secret, as
+    // `sh -c` takes a command, in plain quotes and escaped ones.
+    for (case, line) in [
+        format!("sh -c \\\"login --password {credential}\\\" now"),
+        format!("sh -c \"login --password {credential}\" now"),
+        format!("sh -c 'login --token {credential}' now"),
+        // Quotes escaped otherwise, or around a value that opens another.
+        format!("run \\\"sh --api-key \\\"login --password=\\\"{credential}\\\"\\\"\\\" now"),
+        format!("--api-key \\'login \\'--auth-token {credential}\\\\'\\'"),
+        format!("run sh --auth-token \\\"login \\\"--token {credential}\\\" now"),
+        format!("--api-key \\'sh --api-key \"login [\\'--auth-token\\',\\'{credential}\\']\"\\'"),
+        format!("sh --name \"login sh --secret 'login --token='{credential}''\""),
+        format!("--pw \\\\\\\"\\\\\\\"--token \"{credential}\"\\\\\\\"\\\\\\\""),
+        format!("run sh --note \\\"login sh --auth-token 'login [\\\"--name\\\", \\\"{credential}\\\"]'\\\" now"),
+        format!("sh --password \\\\\\\"login --token=\\\\\\\"{credential}\\\\\\\"\\\\\\\""),
+        format!("sh --api-key \\\\\\\"login sh --note login --secret=\\\"{credential}\\\"\\\\\\\", --auth-token"),
+        format!("--pw sh --password \\\\\\\"login sh --secret 'login [\\\"--api-key\\\", \\\"{credential}\\\"]'\\\\\\\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the inner value showed"
+        );
+    }
+    // A bare value is judged as written, backslashes and all.
+    for line in [
+        "run --token abcdefg\\ now",
+        "run --password \\none now",
+        "run --password \\\\ now",
+    ] {
+        assert_ne!(text(line), line, "a value after a flag stayed");
+    }
+    // A word in escaped quotes after a hint is read without them, as one
+    // in plain quotes is, and stays.
+    let kept = "run --token \\\"readOnlyScope\\\" now";
+    assert_eq!(text(kept), kept, "a word after a hint was hidden");
+    // In JSON held in a string, one level deep and two.
+    let inner = json!({"cmd": "deploy --password \"hunter2\""}).to_string();
+    let wrapped = json!({"cmd": "sh -c \"login --password hunter2\""}).to_string();
+    // A weak flag's quoted list, whose escaped quotes read as more than a
+    // value: its backslashes alone are no secret, and stay.
+    let weak = json!({"cmd": "--token \"[\\'--pw\\',\\'hunter2\\']\""}).to_string();
+    // An argument list beside a key only parsing finds, `pass\u0077ord`.
+    let listed = r#"{"args":["--password","a"],"pass\u0077ord":"hunter2"}"#;
+    // Quoted values whose quotes pair only one way, read as JSON in a
+    // string one and two deep, or two deep only: the credential stays
+    // hidden.
+    for (case, (line, shallowest)) in [
+        (
+            format!("sh --cmd \"login --auth-token \\\\\\\"{credential}\\\\\\\"\""),
+            1,
+        ),
+        (
+            format!("run sh --note \"login sh --auth-token 'login --cmd {credential}'\", now"),
+            1,
+        ),
+        (format!("run x -c=\\\"{credential}\\\" --password now"), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let one = json!({"cmd": line}).to_string();
+        let two = json!({"body": one.clone()}).to_string();
+        for (depth, held) in [(1, one), (2, two)] {
+            if depth < shallowest {
+                continue;
+            }
+            let mut out = json!({ "arguments": held });
+            value(&mut out);
+            assert!(
+                !out.to_string().contains(&credential[4..]),
+                "case {case}, depth {depth}: the value showed in JSON"
+            );
+        }
+    }
+    // A hidden value keeps its escaped quotes, so the word after them stays.
+    let kept = format!("run sh -p \\\"login --password \\'{credential}\\'now");
+    let out = text(&kept);
+    assert!(
+        !out.contains(&credential[4..]) && out.contains("now"),
+        "{out}"
+    );
+    // Backslashes after a value that close no quote escaped alike before
+    // it are hidden with it: JSON that this breaks is hidden whole, and the
+    // credential with it.
+    let unpaired = json!({"cmd": format!("--api-key [\\\"-p, \\\"{credential}]")}).to_string();
+    let mut out = json!({"arguments": unpaired});
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&credential[4..]),
+        "a value past unpaired backslashes showed"
+    );
+    for (depth, doc) in [
+        (1, json!({"arguments": inner.clone()})),
+        (2, json!({"arguments": json!({"body": inner}).to_string()})),
+        (1, json!({"arguments": wrapped.clone()})),
+        (
+            2,
+            json!({"arguments": json!({"body": wrapped}).to_string()}),
+        ),
+        (1, json!({"arguments": weak.clone()})),
+        (2, json!({"arguments": json!({"body": weak}).to_string()})),
+        (1, json!({"arguments": listed})),
+        (2, json!({"arguments": json!({"body": listed}).to_string()})),
+    ] {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2"),
+            "depth {depth}: the value showed"
+        );
+        let mut held = out["arguments"].clone();
+        for _ in 0..depth {
+            let text = held.as_str().expect("a string").to_owned();
+            let parsed: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|_| panic!("depth {depth}: no longer JSON"));
+            held = parsed.get("body").cloned().unwrap_or(parsed);
+        }
+    }
+}
+
+/// A secret-named flag whose value no reading takes as one clean value,
+/// one starting with a bracket, or a quote no quote escaped alike closes,
+/// is hidden from the flag on, as text and in JSON held in a string.
+#[test]
+fn a_flag_value_no_reading_takes_whole_is_hidden_on() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("--api-key [\\\"-p, \\\"{credential}]"),
+        format!("sh --api-key \\\"login \\\"[--secret,{credential}]\\\" --cmd"),
+        format!("--password [\\\"--api-key, \\\"{credential}]"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: the value showed as text"
+        );
+        let mut out = json!({"arguments": json!({"cmd": line}).to_string()});
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in JSON"
+        );
+    }
+}
+
+/// Quotes nested at one escaping depth that no reading can pair, around a
+/// secret-named flag's value, hide the text they are in whole: a flag's
+/// quoted value that cuts off the value of a secret-named flag inside it,
+/// or one that runs straight on into a flag.
+#[test]
+fn quotes_nested_at_one_depth_hide_their_text_whole() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("sh --name \"login sh --cmd \\\"login --auth-token \\\"{credential}\"\\\" --name"),
+        format!("run x sh -p \\\"login --password \\\"{credential} --secret now"),
+        format!("--cmd \\\"sh --secret \\\"login [\"-c\", \"{credential}\"]"),
+        format!("run \\\"sh --auth-token \"login [\"--pw\",\"{credential}\"]\", now"),
+        format!("run \\\"sh --token \\\"login --auth-token \\\"{credential}\\\"\\\"now"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(text(&line), REDACTED, "case {case}: not hidden whole");
+        let mut out = json!({"arguments": json!({"cmd": line}).to_string()});
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in JSON"
+        );
+    }
+    // Quotes that pair, around a secret flag inside a command, keep the
+    // text.
+    let paired = "sh -c \"login --password hunter2\" now";
+    assert_ne!(text(paired), REDACTED);
+}
+
+/// A secret-named flag that takes no value, `psql --password`, followed by
+/// a flag assigned its value, hides that value and keeps its name, as text
+/// and in JSON held in a string.
+#[test]
+fn a_secret_flag_with_no_value_leaves_the_next_flag_readable() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("sh -c \"psql --password --token='{credential}'\""),
+        format!("echo \"run --password --api-key='{credential}' now\""),
+        format!("bash -c \"mysql -u root --password --api_key='{credential}' db\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the value showed"
+        );
+        assert!(out.contains("--password"), "case {case}: the flag went");
+        assert!(
+            out.contains(["--token=", "--api-key=", "--api_key="][case]),
+            "case {case}: the next flag's name went"
+        );
+        let mut held = json!({"key": json!({"cmd": line}).to_string()});
+        value(&mut held);
+        assert!(
+            !held.to_string().contains(&credential[4..]),
+            "case {case}: the value showed in held JSON"
+        );
+    }
+}
+
+/// Quotes that nest ambiguously on one line hide that line, not the text
+/// around it.
+#[test]
+fn quotes_nested_ambiguously_hide_only_their_line() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let log = format!(
+        "first line stays\nrun \\\"sh --auth-token \"login [\"--pw\",\"{credential}\"]\", now\nlast line stays\n"
+    );
+    let out = text(&log);
+    assert_eq!(
+        out,
+        format!("first line stays\n{REDACTED}\nlast line stays\n")
+    );
+}
+
+/// When only the full text makes the quotes ambiguous, preserving each
+/// line separately would not enforce the whole-text refusal.
+#[test]
+fn quotes_ambiguous_only_across_lines_hide_the_text_whole() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let line = format!("--name\n\"login --auth-token \"{credential}\"");
+    assert_eq!(
+        text(&line),
+        REDACTED,
+        "cross-line ambiguity was not hidden whole"
+    );
+}
+
+/// One production reading stops an unclean flag value before the next
+/// assignment's name, so the following assignment rule still sees it.
+/// Later settlement readings may hide that name, but must keep its value
+/// hidden too.
+#[test]
+fn an_unclean_flag_read_keeps_the_assignment_name_for_the_next_rule() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let line = format!("echo \"--token [a, b] api_key= '{credential}'\"");
+    let once = text_once(&line);
+    assert!(
+        !once.contains(&credential[4..]),
+        "the assigned value showed in one reading"
+    );
+    assert!(
+        once.contains("api_key="),
+        "the assignment's name was hidden before its rule"
+    );
+    assert!(
+        !text(&line).contains(&credential[4..]),
+        "the assigned value showed after settlement"
+    );
+}
+
+/// An unclean value hidden on from its flag is not cut just past a `=`,
+/// which would hide the name it assigns and leave its value bare.
+#[test]
+fn an_unclean_value_is_not_cut_after_an_assignment() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("sh -c \"x --token [a,api_key='{credential}'\""),
+        // A name no word start sets off, past `]`, at a quote that would
+        // end the string the flag is in: after `=`, and after `=>` and a
+        // blank.
+        format!("echo \"--token [a]api_key='{credential}'\""),
+        format!("echo \"--token [a]token => '{credential}'\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: the value showed"
+        );
+    }
+}
+
+/// An unclean flag value stops before an assignment after it, a separator
+/// alone is no flag's value, and quotes ambiguous only across lines hide
+/// the text: in each, the assignment's value or the flag's stays hidden,
+/// as text and in held JSON.
+#[test]
+fn assignments_after_flags_keep_their_values_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("echo \"--token [a, b] api_key= '{credential}'\""),
+        format!("echo \"--token [a, b] token: '{credential}'\""),
+        format!("echo \"--password , token: '{credential}'\""),
+        format!("echo \"--token [a, b] token => '{credential}'\""),
+        format!("--auth , API_KEY= -p{credential}"),
+        format!("echo \"--auth , API_KEY= -p{credential}\""),
+        format!("sh -c 'login --password : {credential}'"),
+        format!("sh -c 'login --password = {credential}'"),
+        format!("--name\n\"login --auth-token \"{credential}\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = json!({"key": json!({"cmd": line}).to_string()});
+        value(&mut held);
+        assert!(
+            !held.to_string().contains(&credential[4..]),
+            "case {case}: shown in held JSON"
+        );
+    }
+}
+
+/// A separator alone after a secret-named flag, before an assignment to a
+/// secret's name, is the flag's value, so the assignment is read by its own
+/// name; an unclean value cut just past a separator, `'x'token:=`, ends
+/// before the name it assigns instead; and a quote opened after a secret's
+/// name that nothing closes hides what follows it. In each, the credential
+/// stays hidden, as text and in held JSON.
+#[test]
+fn separators_and_open_quotes_keep_the_next_value_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        format!("--password :  --password=\"{credential}\""),
+        format!("--password = api_key=\"{credential}\""),
+        format!(" --password 'x'token:= --auth{credential} \n -t \""),
+        format!(
+            "run--token= \", \\\\\\\"{credential} --password \\\\\\\\\\\\\\\"hunter2hunter2\\\\\\\\\\\\\\\"\\\\\\'"
+        ),
+        format!("password: \"note {credential}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&credential[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = json!({"key": json!({"cmd": line}).to_string()});
+        value(&mut held);
+        assert!(
+            !held.to_string().contains(&credential[4..]),
+            "case {case}: shown in held JSON"
+        );
+    }
+    // A separator before a name no secret's is still no value, and the
+    // pair after the flag is read whole.
+    let line = format!("--password : user={credential}");
+    assert_eq!(text(&line), "--password : [REDACTED]");
+    // An open quote cut by the quote that ends the string it is in, just
+    // past an assignment's separator, hides nothing, so that assignment is
+    // read by its own name.
+    let line = format!("note=\\\"Some(pwd=Some(\\\", password=\"{credential}\"");
+    assert!(
+        !text(&line).contains(&credential[4..]),
+        "an assignment after an open quote showed"
+    );
+    // An open quote whose value is no secret's hides nothing, and an
+    // assignment inside it is still read by its own name.
+    let line = format!("token: \"see docs, password={credential}");
+    assert_eq!(text(&line), "token: \"see docs, password=[REDACTED]");
+}
+
+/// Adjacent ordinary quoted values must not each search the remaining line.
+#[test]
+fn repeated_quoted_flags_take_linear_steps() {
+    quoted_flag_steps(
+        "adjacent",
+        "--x \"a\" ".repeat(128),
+        "--x \"a\" ".repeat(2048),
+    );
+}
+
+/// Distinct escaping depths have no matching closer: even failed lookups
+/// must not repeatedly scan the remaining quotes.
+#[test]
+fn mismatched_quoted_flags_take_linear_steps() {
+    let input = |count: usize| {
+        (1..=count)
+            .map(|n| format!("--x {}\"a ", "\\".repeat(n)))
+            .collect()
+    };
+    quoted_flag_steps("mismatched", input(32), input(128));
+}
+
+fn quoted_flag_steps(name: &str, small: String, large: String) {
+    // Ordinary names carry no secrets; retain the public output semantics.
+    assert_eq!(text(&small), small);
+    assert_eq!(text(&large), large);
+    let (small, large) = (steps_of(&small), steps_of(&large));
+    eprintln!("quoted flags {name}: small={small}, large={large}");
+    assert!(large < 32 * small, "{name}: {large} steps versus {small}");
+}
+
+/// An outer quote cannot borrow its closer from another line. Exercise
+/// the actual ambiguity reading and the public redactor's retained context.
+#[test]
+fn a_flag_quote_does_not_close_on_another_line() {
+    let input = "--x \"--password '\n\" tail";
+    assert!(!quotes_nest_ambiguously(input));
+    assert!(text(input).contains("tail"));
+}
+
+/// Matched pairs at distinct escape depths all cover the common ordinary
+/// flags. Their nested classifications must not revisit that interior once
+/// for each enclosing pair. Exercise the public production reading.
+#[test]
+fn overlapping_quoted_flag_bodies_take_bounded_steps() {
+    let input = |depths: usize| {
+        let mut text = String::new();
+        for depth in 1..=depths {
+            text.push_str(&format!("--x {}\" ", "\\".repeat(depth)));
+        }
+        text.push_str(&"--x a ".repeat(depths * depths));
+        for depth in (1..=depths).rev() {
+            text.push_str(&format!(" {}\" end ", "\\".repeat(depth)));
+        }
+        text
+    };
+    let small = input(16);
+    let large = input(64);
+    assert_eq!(text(&small), small);
+    assert_eq!(text(&large), large);
+    let (small, large) = (steps_of(&small), steps_of(&large));
+    eprintln!("overlapping quoted flags: small={small}, large={large}");
+    assert!(
+        large < 32 * small,
+        "overlapping: {large} steps versus {small}"
+    );
+}
+
+/// A nested reading begins just after the outer opening quote, so its ^
+/// anchor recognizes the first head even though its global delimiter lies
+/// outside the nested body.
+#[test]
+fn a_nested_flag_at_the_body_start_keeps_its_anchor() {
+    assert_eq!(text("before --x \"--password '\" after"), REDACTED);
+}
+
+/// A secret flag outside this quoted body cannot make the body's
+/// ordinary words ambiguous. The public redactor still hides the credential.
+#[test]
+fn nested_flag_readings_end_with_their_body() {
+    let input = "--x \"ordinary\" --password 'secret-suffix'";
+    assert!(!quotes_nest_ambiguously(input));
+    let hidden = text(input);
+    assert!(hidden.contains("ordinary"));
+    assert!(!hidden.contains("secret-suffix"));
+}
+
 /// A secret's name and value pair in JSON held in a string is read as
 /// written, before text redaction hides the name: its value is hidden as
 /// it is in a real object, pretty or compact, under a hint or not.
@@ -3381,9 +4266,9 @@ fn original_duplicate_spellings(parent: &str) {
 fn a_pair_in_json_in_a_string_is_read_by_the_name_written() {
     let secret = "correct horse";
     let shapes = [
-        json!([{"key": "DB_PASSWORD", "value": secret}]),
-        json!({"items": [{"value": secret, "key": "GITHUB_TOKEN"}]}),
-        json!({"env": [{"header": "DB_PASSWORD", "value": secret}]}),
+        json!([{"key": "DB_PASSWORD", "note": {}, "value": secret}]),
+        json!({"items": [{"value": secret, "note": {}, "key": "GITHUB_TOKEN"}]}),
+        json!({"env": [{"header": "DB_PASSWORD", "note": {}, "value": secret}]}),
     ];
     for (case, shape) in shapes.iter().enumerate() {
         // As a real object, for the record.
@@ -3443,7 +4328,7 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
     ];
     const PARENTS: &[&str] = &["key", "note", "token", "data", "args"];
     let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
-    for _ in 0..3000 {
+    for case in 0..3000 {
         let mut planted = Vec::new();
         let mut secret = |next: &mut dyn FnMut(u64) -> u64| {
             let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -3458,6 +4343,10 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
         for _ in 0..=next(3) {
             let name = NAMES[next(NAMES.len() as u64) as usize];
             items.push(match next(4) {
+                // Exercise pairs that require the parsed reading as well as
+                // adjacent fields the text rule can read.
+                0 if case % 2 == 0 => json!({"name": name, "note": {}, "value": secret(&mut next)}),
+                1 if case % 2 == 0 => json!({"key": name, "note": {}, "value": secret(&mut next)}),
                 0 => json!({"name": name, "value": secret(&mut next)}),
                 1 => json!({"key": name, "value": secret(&mut next)}),
                 2 => json!([name, secret(&mut next)]),
@@ -3507,7 +4396,8 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
 /// as written too, two and three levels deep.
 #[test]
 fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
-    let pair = json!({"env": [{"key": "DB_PASSWORD", "value": "hunter2 x"}]}).to_string();
+    let pair =
+        json!({"env": [{"key": "DB_PASSWORD", "note": {}, "value": "hunter2 x"}]}).to_string();
     let two = json!({"body": pair}).to_string();
     let three = json!({"body": two.clone()}).to_string();
     for (depth, doc) in [
@@ -3531,7 +4421,7 @@ fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
 #[test]
 fn held_json_is_read_by_the_names_written() {
     let doc = json!({"key": json!([
-        {"key": "DB_PASSWORD", "value": "correct horse"},
+        {"key": "DB_PASSWORD", "note": {}, "value": "correct horse"},
         {"note": concat!("Zx81", "kQ0pL2mN4bV6")},
     ]).to_string()});
     let mut out = doc;
@@ -3622,6 +4512,10 @@ fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
     for parent in ["args", "key"] {
         let mut out = json!({ parent: held.clone() });
         value(&mut out);
+        assert_eq!(
+            out[parent], REDACTED,
+            "under {parent}: the string stayed open"
+        );
         assert!(
             !out.to_string().contains("hunter2hunter2"),
             "under {parent}: the pair's value showed"
@@ -3642,6 +4536,10 @@ fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
     for parent in ["body", "key"] {
         let mut out = json!({ parent: doc.clone() });
         value(&mut out);
+        assert_eq!(
+            out[parent], REDACTED,
+            "under {parent}: the string stayed open"
+        );
         assert!(
             !out.to_string().contains(&key[4..]),
             "under {parent}: the header's value showed"
