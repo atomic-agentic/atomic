@@ -317,8 +317,16 @@ fn check_by_reference(dir: &Path, out: &Output, size: u64, stored: usize) {
         durable > 0 && durable < 8 * 1024 * 1024,
         "the durable store holds {durable} bytes"
     );
-    // Nothing is left in the commands' scratch space.
-    let left = size_of(&state.join("scratch"));
+    // Nothing is left in the commands' scratch space, the project's in the
+    // home's `scratch/`.
+    let id = state.file_name().expect("a project id");
+    let home = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home");
+    let scratch = home.join("scratch").join(id);
+    assert!(scratch.is_dir(), "no scratch at {}", scratch.display());
+    let left = size_of(&scratch);
     assert!(left < 64 * 1024, "{left} bytes left in scratch");
 }
 

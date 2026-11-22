@@ -1,0 +1,1 @@
+text-bound-hides|crates/atomic-core/src/redact.rs|        Cow::Owned(REDACTED.to_owned())|        Cow::Owned(output) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::text_still_changing_at_the_bound_is_hidden_whole

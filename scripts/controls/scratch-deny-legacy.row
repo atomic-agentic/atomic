@@ -1,0 +1,1 @@
+scratch-deny-legacy|crates/atomic-core/src/state.rs|        denied.extend(self.legacy_scratch_roots());|        let _ = Self::legacy_scratch_roots; // CONTROL_OFF|-p atomic-agentic-core --lib old_scratch_roots_are_denied_until_they_are_retired
