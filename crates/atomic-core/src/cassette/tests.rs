@@ -224,6 +224,19 @@ fn the_identity_ignores_what_varies_between_runs_and_nothing_else() {
     );
     let other = json!({"model": "m2", "input": [{"role": "user", "content": "hi"}]});
     assert_ne!(one, identity("http://h/v1", "/v1/responses", &other).0);
+    // Every other field counts, a model setting sent with the request too.
+    for (setting, value) in [
+        ("max_output_tokens", json!(64)),
+        ("temperature", json!(0.2)),
+    ] {
+        let mut set = body.clone();
+        set[setting] = value;
+        assert_ne!(
+            one,
+            identity("http://h/v1", "/v1/responses", &set).0,
+            "{setting} counts"
+        );
+    }
     assert_ne!(
         one,
         identity("http://other/v1", "/v1/responses", &body).0,
