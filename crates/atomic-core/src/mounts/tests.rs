@@ -471,10 +471,20 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
     assert!(
         std::fs::symlink_metadata(&place).is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
     );
-    let mounts = ninep(&host, &dir.0.join("also"), "/");
+    // On a local filesystem, where only the walk of the place's directories
+    // looks at it.
+    let table = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+         2 1 8:3 / {} rw - ext4 /dev/sdc1 rw\n\
+         3 1 8:3 / {} rw - ext4 /dev/sdc1 rw\n",
+        host.display(),
+        dir.0.join("also").display()
+    );
+    let mounts = parse(table.as_bytes()).expect("parses");
     assert!(
-        aliases(&mounts, std::slice::from_ref(&place))
-            .is_err_and(|e| e.to_string().contains("cannot be looked at"))
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e
+            .to_string()
+            .contains("so atomic cannot check which other mounts show"))
     );
     // The place there, but the part of it a second mount shows looked at
     // through a link to itself: what that mount shows cannot be checked.
