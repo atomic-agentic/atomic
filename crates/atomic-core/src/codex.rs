@@ -1050,16 +1050,6 @@ fn denied_paths(
                 ))
             })
     };
-    let link_in_writable = |path: &Path, target: &Path, root: &Path| {
-        refuse(format!(
-            "{} is a link to {}, inside {}, which atoms' commands may write, so a command could \
-             remove it and then read what it points at by its own path; keep the file it points \
-             at in its place, or run with a working directory that does not hold the link",
-            path.display(),
-            target.display(),
-            root.display()
-        ))
-    };
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
@@ -1205,9 +1195,6 @@ fn denied_paths(
                     target.display(),
                     needed.display()
                 )));
-            }
-            if let Some(root) = writable_holding_link(&roots, &path) {
-                return Err(link_in_writable(&path, &target, root));
             }
             if let Some(refused) = movable(&path, &target, &writable) {
                 return Err(refused);
@@ -1649,6 +1636,7 @@ fn real_spelling(path: &Path) -> PathBuf {
 /// what the link points at, not on the link, so a command that may write
 /// there could remove the link, and once the list no longer finds it, read
 /// what it pointed at by its own path.
+#[cfg(any(target_os = "linux", test))]
 fn writable_holding_link<'a>(writable: &'a [PathBuf], link: &Path) -> Option<&'a PathBuf> {
     let at = match (link.parent(), link.file_name()) {
         (Some(parent), Some(name)) => real_spelling(parent).join(name),
@@ -5168,47 +5156,6 @@ async fn turn(
 mod tests {
     use super::*;
     use crate::testing::{FakeModel, Reply};
-
-    #[cfg(unix)]
-    #[test]
-    fn a_credential_place_that_is_a_link_inside_a_writable_root_is_refused() {
-        let dir = scratch("link-in-writable");
-        for sub in ["work", "elsewhere", "codex"] {
-            std::fs::create_dir_all(dir.join(sub)).expect("dir");
-        }
-        let dir = std::fs::canonicalize(&dir).expect("real");
-        std::fs::write(dir.join("elsewhere/kube"), "token").expect("kept");
-        let place = dir.join("work/kubeconfig");
-        let _ = std::fs::remove_file(&place);
-        std::os::unix::fs::symlink(dir.join("elsewhere/kube"), &place).expect("link");
-        let private = PrivateState {
-            state_dir: dir.join("state"),
-            private: dir.join("private"),
-            also: vec![place.clone()],
-        };
-        let refused = denied_paths(&private, &dir.join("codex"), None, &[dir.join("work")])
-            .expect_err("refused")
-            .to_string();
-        assert!(
-            refused.contains(&format!(
-                "{} is a link to {}, inside {}",
-                place.display(),
-                dir.join("elsewhere/kube").display(),
-                dir.join("work").display()
-            )),
-            "{refused}"
-        );
-        // Outside every writable root, the link is denied as what it points
-        // at, as before.
-        let (denied, _) = denied_paths(
-            &private,
-            &dir.join("codex"),
-            None,
-            &[dir.join("elsewhere-not")],
-        )
-        .expect("denied");
-        assert!(denied.contains(&dir.join("elsewhere/kube")), "{denied:?}");
-    }
 
     #[cfg(unix)]
     #[test]
