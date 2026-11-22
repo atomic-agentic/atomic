@@ -26,7 +26,7 @@
 //! A recording holds redacted copies of the request and response bodies.
 //! The request identity still comes from the unredacted request. Replay
 //! serves the stored response, so redaction can change an eval's result.
-//! A repeated object key in a JSON request or recorded response is refused.
+//! The cassette refuses repeated JSON object keys and JSON it cannot inspect.
 //! Headers are excluded, and endpoint URLs with credentials or queries are
 //! refused. Review cassettes before committing them as fixtures.
 //!
@@ -598,11 +598,9 @@ async fn answer(
             if (200..300).contains(&status) {
                 let mut stored_request = normalized.clone();
                 crate::redact::value(&mut stored_request);
-                let Some(stored_body) = redact_response(&text) else {
-                    return failed(
-                        "502 Bad Gateway",
-                        "the model response JSON contains a repeated object key; no cassette was written".into(),
-                    );
+                let stored_body = match redact_response(&text) {
+                    Ok(body) => body,
+                    Err(why) => return failed("502 Bad Gateway", why.into()),
                 };
                 let recording = Recording {
                     endpoint: endpoint.clone(),
@@ -630,17 +628,22 @@ async fn answer(
     }
 }
 
-fn redact_response(response: &str) -> Option<Cow<'_, str>> {
+fn redact_response(response: &str) -> Result<Cow<'_, str>, &'static str> {
     let Ok(mut json) = serde_json::from_str::<Value>(response) else {
-        return Some(crate::redact::text(response));
+        if crate::redact::reads_as_json(response) {
+            return Err("the model response JSON cannot be inspected; no cassette was written");
+        }
+        return Ok(crate::redact::text(response));
     };
     // Redaction needs the original classification as well as the value.
     // Parsing an object with repeated keys may separate the two.
     if crate::redact::gives_a_key_twice(response) {
-        return None;
+        return Err(
+            "the model response JSON contains a repeated object key; no cassette was written",
+        );
     }
     crate::redact::value(&mut json);
-    Some(Cow::Owned(json.to_string()))
+    Ok(Cow::Owned(json.to_string()))
 }
 
 #[cfg(test)]

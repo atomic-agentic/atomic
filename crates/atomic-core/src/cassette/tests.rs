@@ -447,6 +447,37 @@ async fn a_non_json_body_uses_text_redaction() {
 }
 
 #[tokio::test]
+async fn valid_json_that_cannot_be_inspected_is_not_recorded_as_text() {
+    let root = root("uninspectable-json");
+    let tapes = root.join("tapes");
+    let body = format!(
+        "{}{}{}",
+        "[".repeat(140),
+        r#"{"note":"synthetic fixture"}"#,
+        "]".repeat(140)
+    );
+    let model = FakeModel::start(vec![Reply::Http { status: 200, body }])
+        .await
+        .expect("fake model");
+    let upstream = model.base_url();
+    let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
+        .await
+        .expect("recorder");
+    let (status, reply) = post(&recorder, "/v1/chat/completions", ASK, None).await;
+    assert_eq!(
+        std::fs::read_dir(&tapes).expect("tapes").count(),
+        0,
+        "uninspectable response was written as text"
+    );
+    assert_eq!(status, 502);
+    assert!(reply.contains("response JSON cannot be inspected"));
+    assert!(!reply.contains("synthetic fixture"));
+    assert_eq!(recorder.tally().recorded, 0);
+    assert_eq!(model.calls(), 1);
+    std::fs::remove_dir_all(root).expect("remove test directory");
+}
+
+#[tokio::test]
 async fn a_repeated_classifier_cannot_leave_a_sensitive_response_value_in_a_cassette() {
     let root = root("repeat-classifier-response");
     let tapes = root.join("tapes");

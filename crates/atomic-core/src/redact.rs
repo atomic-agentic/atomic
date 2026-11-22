@@ -1899,7 +1899,7 @@ const fn reads_pairs_as_written() -> bool {
 
 /// Whether `text` reads as JSON, built into no value (`IgnoredAny`): a
 /// lone surrogate escape or nesting past serde_json's depth limit read too.
-fn reads_as_json(text: &str) -> bool {
+pub(crate) fn reads_as_json(text: &str) -> bool {
     serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok()
 }
 
