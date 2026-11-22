@@ -553,7 +553,7 @@ fn google_certificate_files(
     };
     let value = match serde_json::from_slice::<Value>(&bytes) {
         Ok(value) => value,
-        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
+        Err(error) => return Err(refused(format!("it is not JSON: {error}"))),
     };
     let Some(object) = value.as_object() else {
         return Err(refused("it is not a JSON object".into()));
