@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for `tools/yaml_scalar.py`, the loader's scalar classifier ported to Python.
 
-`tools/check_examples.py` reads every schema sidecar through this port, so the port
-is what decides whether an example is one atomic's loader would take. Two ways it
-can be wrong matter most, and both are tested here rather than left to whatever a
-YAML library constructs:
+`tools/check_examples.py` reads every YAML schema sidecar's plain values and keys
+through this port, so the port is what decides whether an example is one atomic's
+loader would take. Two ways it can be wrong matter most, and both are tested here
+rather than left to whatever a YAML library constructs:
 
   * it reads a spelling as the loader does not -- `0o17` as the string PyYAML
     resolves instead of the 15 the core schema reads, `1e3` as a string instead of
