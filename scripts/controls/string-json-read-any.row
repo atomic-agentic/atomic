@@ -1,0 +1,1 @@
+string-json-read-any|crates/atomic-core/src/redact.rs|            let read_any = serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok();|            let read_any = parsed.is_ok(); /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::json_that_text_redaction_breaks_is_hidden_whole
