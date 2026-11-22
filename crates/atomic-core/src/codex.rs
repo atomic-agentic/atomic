@@ -2616,7 +2616,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -2697,12 +2698,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -2730,6 +2734,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -2789,7 +2803,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -2891,6 +2910,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 secret_env: secret,
                 ..command.clone()
             },

@@ -150,8 +150,9 @@ attempts by their path. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
-command, which has a scratch directory of its own too, is not yet kept from
-the others' in the same way. (Codex's
+command, which has a scratch directory of its own too, is kept out of the
+project's other ones in the same way, its own apart, wherever its command is
+confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
