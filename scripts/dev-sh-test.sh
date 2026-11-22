@@ -178,7 +178,7 @@ PY
 start() {
     local how="$1" log="${WORK}/$1.log"
     local devsh=(env --default-signal=INT ATOMIC_DEV_DB=off ATOMIC_DEV_CPUS=1
-        ATOMIC_DEV_MEMORY=512m "${ROOT}/scripts/dev.sh" sleep 600)
+        ATOMIC_DEV_MEMORY=512m "${ROOT}/scripts/dev.sh" sleep 3600)
     case "${how}" in
     group)
         (
@@ -344,11 +344,11 @@ bystander_kept late
 sleep 300 </dev/null >/dev/null 2>&1 &
 other=$!
 other_start="$(started_at "${other}")"
-watch() { "${BASH}" "${ROOT}/scripts/dev.sh" --watch-run "${TAG}-none" "$@" </dev/null >/dev/null 2>&1 & }
+watch() { "${BASH}" "${ROOT}/scripts/dev.sh" --watch-run "$@" </dev/null >/dev/null 2>&1 & }
 
 # A process that took dev.sh's number, after dev.sh's parent went, is not
 # dev.sh: it is not signalled, and the watcher ends.
-watch "${other}" "Thu Jan  1 00:00:00 1970" "$$" "Thu Jan  1 00:00:00 1970"
+watch "${TAG}-none" "${other}" "Thu Jan  1 00:00:00 1970" "$$" "Thu Jan  1 00:00:00 1970"
 watcher=$!
 if within 15 eval '! running '"${watcher}" && same "${other}" "${other_start}"; then
     echo "ok reused: the watcher left alone a process that took dev.sh's number" >&2
@@ -358,24 +358,33 @@ else
 fi
 wait "${watcher}" 2>/dev/null
 
-# A ps that fails does not make dev.sh look gone: the watcher waits on until
-# dev.sh is.
+# A ps that fails does not make dev.sh look gone: the watcher keeps the
+# run's container, here one of this test's labelled with the run's token,
+# until dev.sh is gone.
 mkdir -p "${WORK}/no-ps"
 printf '#!/bin/sh\nexit 1\n' >"${WORK}/no-ps/ps"
 chmod +x "${WORK}/no-ps/ps"
-PATH="${WORK}/no-ps:${PATH}" watch "${other}" "${other_start}" 0 ""
+if command -v sha256sum >/dev/null 2>&1; then
+    image="atomic-dev:$(sha256sum "${ROOT}/dev/Dockerfile" | cut -c1-12)"
+else
+    image="atomic-dev:$(shasum -a 256 "${ROOT}/dev/Dockerfile" | cut -c1-12)"
+fi
+kept() { [ -n "$(ours_only --filter "label=${KEY}=${TAG}-ps")" ]; }
+"${REAL}" run -d --rm --network none --label "${KEY}=${TAG}-ps" --label "${TEST_KEY}=${TAG}" \
+    "${image}" sleep 300 >/dev/null 2>&1 || fail "no-ps: no container to keep"
+PATH="${WORK}/no-ps:${PATH}" watch "${TAG}-ps" "${other}" "${other_start}" 0 ""
 watcher=$!
-sleep 4
-if running "${watcher}" && same "${other}" "${other_start}"; then
+sleep 8
+if running "${watcher}" && kept && same "${other}" "${other_start}"; then
     kill -KILL "${other}"
     wait "${other}" 2>/dev/null
-    if within 15 eval '! running '"${watcher}"; then
+    if within 30 eval '! running '"${watcher}"' && ! kept'; then
         echo "ok no-ps: a failing ps did not make dev.sh look gone" >&2
     else
-        fail "no-ps: the watcher outlived dev.sh"
+        fail "no-ps: the watcher outlived dev.sh, or left its container"
     fi
 else
-    fail "no-ps: the watcher took a failing ps for dev.sh gone"
+    fail "no-ps: the watcher took a failing ps for dev.sh gone, and removed its container"
 fi
 kill -KILL "${watcher}" 2>/dev/null
 wait "${watcher}" 2>/dev/null
@@ -394,12 +403,13 @@ printf '#!/bin/sh\nexit 1\n' >"${WORK}/no-setsid/setsid"
 chmod +x "${WORK}/no-setsid/setsid" "${WORK}/ps-fails/ps"
 for case in no-setsid ps-self ps-parent; do
     case "${case}" in
-    no-setsid) run=(env PATH="${WORK}/no-setsid:${PATH}" "${ROOT}/scripts/dev.sh" sleep 600) ;;
-    # dev.sh takes the shell's process id, and then the shell is its parent.
+    no-setsid) run=(env PATH="${WORK}/no-setsid:${PATH}" "${ROOT}/scripts/dev.sh" true) ;;
+    # dev.sh takes the shell's process id, and then the shell is its parent:
+    # the shell goes on after it, so it is not replaced by it.
     ps-self) run=(env PATH="${WORK}/ps-fails:${PATH}" bash -c \
-        'export ATOMIC_DEV_TEST_PS_FAILS=$$; exec "$@"' _ "${ROOT}/scripts/dev.sh" sleep 600) ;;
+        'export ATOMIC_DEV_TEST_PS_FAILS=$$; exec "$@"' _ "${ROOT}/scripts/dev.sh" true) ;;
     ps-parent) run=(env PATH="${WORK}/ps-fails:${PATH}" bash -c \
-        'export ATOMIC_DEV_TEST_PS_FAILS=$$; "$@"' _ "${ROOT}/scripts/dev.sh" sleep 600) ;;
+        'export ATOMIC_DEV_TEST_PS_FAILS=$$; "$@"; exit $?' _ "${ROOT}/scripts/dev.sh" true) ;;
     esac
     out="$(ATOMIC_DEV_DB=off "${run[@]}" </dev/null 2>&1)"
     status=$?
