@@ -157,8 +157,8 @@ systemd's socket activation (`LISTEN_FDS`) or a `make` jobserver: none reaches
 a command, or another program atomic starts. On Linux, atomic uses
 `close_range`, or, on a kernel before 5.11, the list in `/proc/self/fd`; where
 it has neither, atomic does not start, and the helper does not start the
-command. Codex also starts a turn's commands on a pseudo-terminal of their own,
-closing, as far as it can, what they would inherit. On macOS atomic relies on
+command. Codex's process launcher also marks, as far as it can, what a turn's
+commands would inherit close-on-exec. On macOS atomic relies on
 the list in `/dev/fd`, which is not verified. Windows, where a process
 inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
