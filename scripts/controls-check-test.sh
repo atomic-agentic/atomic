@@ -1068,6 +1068,24 @@ run_on
     grep -q "scripts/controls/git-hardening.row names itself 'another-name', which is not its file name" <<<"${out}" ||
     fail "controls-on a row named otherwise: exit ${code}: ${out}"
 
+# A row that names the control another row file holds is refused for that name,
+# and the file holding it right is not reported along with it: a name is only
+# taken as claimed once it has been shown to be its file's own, which is the
+# order the shell's rules are in. Here a-first.row comes before git-hardening.row
+# in file-name order and names git-hardening, whose own file is in the tree and
+# correct.
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/a-first.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "^FAIL a-first.row: scripts/controls/a-first.row names itself 'git-hardening', which is not its file name" <<<"${out}" ||
+    fail "controls-on a row naming another file's control: exit ${code}: ${out}"
+grep -q "names the control 'git-hardening', which another row file already names" <<<"${out}" &&
+    fail "controls-on a row naming another file's control: it reports the file holding that control right as a second one naming it: ${out}"
+grep -q "1 row(s) name a control that is not on in this tree" <<<"${out}" ||
+    fail "controls-on a row naming another file's control: it does not count what it refused: ${out}"
+
 repo="$(fresh)"
 printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
     >"${repo}/scripts/controls/zsecond.row"
@@ -1179,7 +1197,12 @@ run_on
 #   if not entry.name.endswith(".row")              a row file named otherwise
 #   if name in by_name                              two rows naming one control
 #   if not name                                     a row naming no control
-#   name != entry.name[ :-len(".row")]              a row naming itself otherwise
+#   name != entry.name[ :-len(".row")]              a row naming itself otherwise,
+#                                                   which is all a row naming
+#                                                   another file's control is
+#   by_name[name] = row_file, after that rule       the file holding that control
+#                                                   right, which is not a second
+#                                                   one naming it
 #   text = text[:-1], then len(lines) != 1          two rows in one file, and an
 #                                                   empty row file, and a row file
 #                                                   with no trailing newline (one

@@ -173,12 +173,16 @@ def main():
                 "file already names"
             )
             continue
-        by_name[name] = row_file
         if name != entry.name[: -len(".row")]:
             problems.append(
                 f"{kind}: {row_file} names itself '{name}', which is not its file name"
             )
             continue
+        # Recorded only once the name is the file's own, as the shell records it
+        # after the same rule: a row that names another file's control is refused
+        # for that name, and does not go on to report the file holding it right
+        # as a second one naming it.
+        by_name[name] = row_file
         kind = name
 
         # Where the control lives. A file that is not there and a file that
