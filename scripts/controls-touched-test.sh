@@ -232,9 +232,7 @@ printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
 commit
 run
 expect "a change to a crate's shared test code" "$(printf 'c\nf')"
-off shared 'crates.add(parts[1])
-    return crates' 'pass
-    return crates'
+off shared 'return crates' 'return set()'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the shared test code rule off, a change to it still selected: ${OUT}"
 unset SCRIPT
@@ -247,9 +245,7 @@ printf '{"changed": true}\n' >crates/k/tests/data.json
 commit
 run
 expect "a change to a non-Rust file at the top of a crate's tests" "$(printf 'c\nf')"
-off shared-file 'if not parts[3].endswith(".rs"):
-                crates.add(parts[1])' 'if not parts[3].endswith(".rs"):
-                pass'
+off shared-file 'if len(parts) > 4 or not parts[3].endswith(".rs"):' 'if len(parts) > 4:'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the top-level shared file rule off, a change to it still selected: ${OUT}"
 unset SCRIPT
@@ -453,7 +449,7 @@ off data-readers 'if target and literal.startswith("tests/"):' 'if False:'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with named data readers off, shared fallback was not retained: ${OUT}"
 unset SCRIPT
-off data-ownership 'if any(references_to(path, refs) for refs in references):' 'if False:'
+off data-ownership 'if owners and owners <= changed:' 'if False:'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with data ownership off, shared fallback was not retained: ${OUT}"
 unset SCRIPT
@@ -465,6 +461,51 @@ printf 'new\n' >crates/k/tests/fixtures/project/input.txt
 commit
 run
 expect "a directory shared by two named targets selects both" "$(printf 'c\nf')"
+
+# A root-wide scan or one named runtime file is not proof that all of a
+# crate's shared data belongs exclusively to that reader.
+for path in 'tests/' 'tests/data.json'; do
+    shared_fixture
+    printf 'fn main() { std::path::Path::new("%s"); }\n' "${path}" >crates/k/tests/u/main.rs
+    printf '{}\n' >crates/k/tests/data.json
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf '{"changed": true}\n' >crates/k/tests/data.json
+    commit
+    run
+    expect "a broad root or runtime-file read keeps shared ownership" "$(printf 'c\nf')"
+done
+
+# Naming a compiled shared-module directory as data must not hide its
+# other users. A second include level likewise retains broad selection.
+shared_fixture
+printf 'fn main() { std::path::Path::new("tests/support"); }\n' >crates/k/tests/u/main.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
+commit
+run
+expect "a named data directory does not privatize shared Rust modules" "$(printf 'c\nf')"
+off compiled-shared 'if compiled:' 'if False:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = f ] || fail "with shared modules privatized, the missing target was not exposed: ${OUT}"
+unset SCRIPT
+
+shared_fixture
+mkdir -p crates/k/tests/shared
+printf 'include_str!("data.txt");\n' >crates/k/tests/shared/helper.rs
+printf '#[path = "../shared/helper.rs"]\nmod helper;\n' >crates/k/tests/u/main.rs
+printf 'before\n' >crates/k/tests/shared/data.txt
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/shared/data.txt
+commit
+run
+expect "a second include level retains shared fallback" "$(printf 'c\nf')"
+off dependency-depth 'if owners and owners <= changed:' 'if owners:'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with second-level readers ignored, missing selection was not exposed: ${OUT}"
+unset SCRIPT
 
 # A nested path attribute has a different Rust base. Never guess that it
 # owns an unrelated shared fixture with the same literal suffix.

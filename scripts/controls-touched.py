@@ -368,14 +368,19 @@ def source_references(commit):
     own directory, not a basename match elsewhere in the tree. A named tests/... data directory is owned
     by every integration target that names it; ambiguous owners are all kept.
     """
-    included, data = {}, []
+    included, data, sources = {}, [], set()
+    entries = []
+    for entry in filter(None, git("ls-tree", "-r", "-t", "-z", commit).split(b"\0")):
+        meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
+        entries.append((meta.split(" ")[0], name))
+    directories = {name for mode, name in entries if mode == "040000"}
     macro = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*$")
     attribute = re.compile(r"#\s*\[\s*path\s*=\s*$")
-    for entry in filter(None, git("ls-tree", "-r", "-z", commit).split(b"\0")):
-        meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
-        if not name.endswith(".rs"):
+    for mode, name in entries:
+        if mode == "040000" or not name.endswith(".rs"):
             continue
-        source = text_of(commit, regular(commit, name, meta.split(" ")[0]))
+        source = text_of(commit, regular(commit, name, mode))
+        sources.add(name)
         parts = name.split("/")
         target = (
             len(parts) == 4 and parts[0] == "crates" and parts[2] == "tests"
@@ -406,13 +411,17 @@ def source_references(commit):
                     included.setdefault(path, set()).add(name)
             if target and literal.startswith("tests/"):
                 path = posixpath.normpath(posixpath.join(*parts[:2], literal_path(name, literal, raw)))
-                if in_tree(path):
+                # Only a concrete directory below this crate's tests root
+                # can narrow the old shared-data rule. A root-wide read, a
+                # runtime filename or an unknown path keeps that fallback.
+                tests = "/".join(parts[:3]) + "/"
+                if path.startswith(tests) and path in directories:
                     data.append((path, name))
-    return included, data
+    return included, data, sources
 
 
 def references_to(path, references):
-    included, data = references
+    included, data, _ = references
     owners = set(included.get(path, ()))
     for directory, target in data:
         if path == directory or path.startswith(directory + "/"):
@@ -432,20 +441,28 @@ def shared_test_crates(base, head, changed, references):
         parts = path.split("/")
         if len(parts) < 4 or parts[0] != "crates" or parts[2] != "tests":
             continue
-        # Explicit includers/data readers own this path. With no known
-        # reader, retain the conservative crate-wide shared-data fallback.
-        if any(references_to(path, refs) for refs in references):
-            continue
         tests = "/".join(parts[:3])
-        if len(parts) == 4:
-            if not parts[3].endswith(".rs"):
+        if len(parts) > 4:
+            directory = f"{tests}/{parts[3]}"
+            owned = any(
+                f"{directory}.rs" in refs[2] or f"{directory}/main.rs" in refs[2]
+                for refs in references
+            )
+            if owned:
+                continue
+            # A shared Rust module may also be named as runtime data. That
+            # does not make its other compiled users disappear.
+            compiled = any(f"{directory}/mod.rs" in refs[2] for refs in references)
+            if compiled:
                 crates.add(parts[1])
+                continue
+        owners = set().union(*(references_to(path, refs) for refs in references))
+        # We expanded only one level. A reader added by that expansion can
+        # itself have readers not in this change: keep the broad fallback
+        # rather than pretend the second dependency level was followed.
+        if owners and owners <= changed:
             continue
-        d = parts[3]
-        owned = any(
-            exists(commit, f"{tests}/{d}.rs") or exists(commit, f"{tests}/{d}/main.rs") for commit in (base, head)
-        )
-        if not owned:
+        if len(parts) > 4 or not parts[3].endswith(".rs"):
             crates.add(parts[1])
     return crates
 
