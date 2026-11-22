@@ -1,1 +1,1 @@
-exec-fds-listing-keep|crates/atomic-exec/src/inherited.rs|        if fd <= 2 || keep.contains(&fd) {|        if fd <= 2 { // CONTROL_OFF|-p atomic-agentic-exec --lib -- inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose
+exec-fds-listing-keep|crates/atomic-exec/src/inherited.rs|keep.contains(&fd)|false /* CONTROL_OFF */|-p atomic-agentic-exec --lib -- inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose
