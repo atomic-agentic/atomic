@@ -40,8 +40,8 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 # is left as it was. The sixth runs the one Codex turn whose working directory
 # is the developer's checkout — a read-only Codex atom named directly, which
 # has no worktree to run in and may not write there — and shows it read a file
-# of the checkout, ran there, and left it as it was. The last is the control on
-# that comparison: it plants in the checkout, by hand and one at a time, each
+# of the checkout, ran there, and left it as it was. The seventh is the control
+# on that comparison: it plants in the checkout, by hand and one at a time, each
 # change to it that git's own answer misses — HEAD detached at its own commit,
 # a hook, the repository's own configuration, a file ignored by the
 # repository's own `info/exclude`, and a file under a `.git` below the top
