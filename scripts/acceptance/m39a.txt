@@ -27,20 +27,41 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 
 ## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
 # The turn works in a worktree of the fixture's snapshot, never in the
-# checkout: the first compares the checkout that holds the project (its refs,
-# its worktree list, its working tree with every untracked file, its own
-# configuration and its objects) before and after, and the second compares the
-# fixture repository the same way when the project sits outside any
-# repository. The third gives its turn a file to write and shows that file
-# committed in the snapshot's worktree, never in the checkout. The last two
-# run a `workspace-write` Codex atom directly and as a step with no
-# `worktree: true`: both are refused `target.unsafe` before the run starts,
-# and the checkout is left as it was.
+# checkout: the first compares the checkout that holds the project before and
+# after — its refs, where HEAD stands and what it is called, its worktree list,
+# the settings in its own configuration and the counts and sizes of its
+# objects, and the bytes of every file it holds, tracked, untracked or ignored,
+# with the repository's configuration file, its hooks and its ignore file — and
+# the second compares the fixture repository the same way when the project sits
+# outside any repository. The third gives its turn a file to write and shows
+# that file in the snapshot's own repository, at the commit atomic accepted for
+# its step, and never in the checkout. The next two run a `workspace-write`
+# Codex atom directly and as a step with no `worktree: true`: both are refused
+# `target.unsafe` before the run starts, neither records a run, and the checkout
+# is left as it was. The sixth runs the one Codex turn whose working directory
+# is the developer's checkout — a read-only Codex atom named directly, which
+# has no worktree to run in and may not write there — and shows it read a file
+# of the checkout, ran there, and left it as it was. The last is the control on
+# that comparison: it plants in the checkout, by hand and one at a time, each
+# change to it that git's own answer misses — HEAD detached at its own commit,
+# a hook, a file ignored by the repository's own `info/exclude`, and a file
+# under a `.git` below the top level, none of which `git status` names; the
+# repository's own configuration, which `git status` does not name either and
+# the reading of git the comparison is built on does name; a link to an
+# ancestor of the checkout, which status names but says nothing of where it
+# points, so the walk records the link by that target and never reads through
+# it; and a directory whose contents cannot be listed, which makes the
+# comparison name it and refuse rather than read an unseen file as no change.
+# That last cannot bite for root, which is told past a directory's mode, so a
+# run as root says in its output that it skipped that one plant and every other
+# row still runs.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
 fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
 fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
+fixture_cli a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_was
+fixture_cli the_state_a_checkout_is_compared_by_sees_what_git_does_not
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings

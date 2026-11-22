@@ -257,21 +257,42 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
+    ("CLOUDSDK_CONFIG", &[""]),
 ];
 
-/// Where AWS's workload identities put their token files on Kubernetes when
-/// no variable says otherwise (IAM roles for service accounts, and EKS Pod
-/// Identity): denied whether or not atomic's environment names them.
-const AWS_TOKEN_DIRS: &[&str] = &[
+/// Where workload identities put their token files on Kubernetes when no
+/// variable says otherwise: AWS's (IAM roles for service accounts, and EKS
+/// Pod Identity), the pod's own service account, and Azure workload
+/// identity's. Denied whether or not atomic's environment names them.
+const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     "/var/run/secrets/eks.amazonaws.com/serviceaccount",
     "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
+    // `scripts/controls/k8s-token-dir.row` switches this off.
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+    // `scripts/controls/azure-token-dir.row` switches this off.
+    "/var/run/secrets/azure/tokens",
 ];
 
-/// The variables that name a workload token file an AWS SDK reads.
-const AWS_TOKEN_FILES: &[&str] = &[
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+/// The variables that name a workload credential file an SDK reads, each
+/// with what the file is called in a refusal: AWS's token files, Azure
+/// workload identity's, and Google's application credentials, which may be
+/// a key or a configuration naming a token file of its own (see
+/// [`google_token_files`]).
+const WORKLOAD_TOKEN_FILES: &[(&str, &str)] = &[
+    ("AWS_WEB_IDENTITY_TOKEN_FILE", "token file"),
+    ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", "token file"),
+    // `scripts/controls/azure-token-file.row` switches this off.
+    ("AZURE_FEDERATED_TOKEN_FILE", "token file"),
+    // `scripts/controls/gcp-credentials-file.row` switches this off.
+    (GOOGLE_CREDENTIALS, "credentials file"),
 ];
+
+/// The variable that names Google's application credentials.
+const GOOGLE_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
+
+/// The most of a credential configuration atomic reads to find the token
+/// files it names: far more than any holds.
+const CONFIG_BYTES_MAX: u64 = 1 << 20;
 
 /// The projected volume `file` is in, if it is in one, as Kubernetes mounts
 /// a service account's token: the volume holds a `..data` link to its
@@ -327,17 +348,18 @@ fn projected_volume(file: PathBuf) -> Option<PathBuf> {
     None
 }
 
-/// AWS's workload token files the variables in `env` name, a relative one
-/// resolved against the working directory `here` gives, as an AWS SDK
+/// The workload credential files the variables in `env` name, a relative
+/// one resolved against the working directory `here` gives, as an SDK
 /// started there resolves it, and, for one in a projected volume, the
-/// volume itself. An error, so nothing runs, when a name is relative and
-/// the working directory is unknown.
+/// volume itself; with the token files Google's application credentials
+/// name. An error, so nothing runs, when a name is relative and the working
+/// directory is unknown, or when Google's credentials cannot be read whole.
 fn token_files(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
-    for name in AWS_TOKEN_FILES {
+    for (name, what) in WORKLOAD_TOKEN_FILES {
         let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
             continue;
         };
@@ -349,17 +371,248 @@ fn token_files(
         } else {
             let refused = |e: std::io::Error| {
                 format!(
-                    "{name} names the token file {} relative to the working directory, which \
-                     is unknown ({e}), so the token could not be denied to atoms' commands",
+                    "{name} names the {what} {} relative to the working directory, which \
+                     is unknown ({e}), so it could not be denied to atoms' commands",
                     file.display()
                 )
             };
             here().map_err(refused)?.join(&file)
         };
+        if *name == GOOGLE_CREDENTIALS {
+            // `scripts/controls/gcp-external-token.row` switches this off.
+            out.extend(google_token_files(&file, here)?);
+        }
         out.extend(projected_volume(file.clone()));
         out.push(file);
     }
     Ok(out)
+}
+
+/// `file` read as plainly as a name in a configuration reads, resolved
+/// against the working directory `here` gives when it is relative.
+fn named_path(file: &str, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let file: PathBuf = Path::new(file).components().collect();
+    if file.is_absolute() {
+        return Ok(file);
+    }
+    here().map(|here| here.join(&file)).map_err(|e| {
+        format!(
+            "it names {} relative to the working directory, which is unknown ({e})",
+            file.display()
+        )
+    })
+}
+
+/// The bytes of the credential configuration at `path`, followed through
+/// links as its SDK follows them, read without waiting, as opening a fifo
+/// would, and no further than [`CONFIG_BYTES_MAX`]: `None` when it is not
+/// there, or is a device, as `/dev/null` is when a variable names it to
+/// turn the configuration off, which is never opened; and an error for
+/// anything else that keeps it from being read whole.
+fn read_config(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read as _;
+    let unreadable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::PermissionDenied => format!("this user may not read it: {e}"),
+        _ => e.to_string(),
+    };
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        // Only a file that is not there names nothing: any other error
+        // refuses. `scripts/controls/workload-config-not-there.row` switches
+        // this off.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(unreadable(e)),
+    };
+    // `scripts/controls/workload-config-device.row` switches this off.
+    let device = is_device(&meta);
+    if device {
+        return Ok(None);
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = open.open(path).map_err(unreadable)?;
+    // What was opened, which may not be what was looked at.
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    // `scripts/controls/workload-config-plain.row` switches this off.
+    let plain = meta.is_file();
+    if !plain {
+        return Err("it is not a plain file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(CONFIG_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() as u64 > CONFIG_BYTES_MAX {
+        return Err(format!("it holds more than {CONFIG_BYTES_MAX} bytes"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Whether `meta` is a device's: a character or a block device.
+fn is_device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt as _;
+        meta.file_type().is_char_device() || meta.file_type().is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
+
+/// The token files the Google credentials file at `config` names, each
+/// with its projected volume where it is in one: an external account's
+/// `credential_source.file`, and the `output_file` its executable keeps a
+/// token in, as for the `source_credentials` an impersonated account is
+/// configured with. A key, or an account that names no file, names none,
+/// and so does a file that is not there. Anything that cannot be read whole
+/// and as JSON is refused, naming the file, so nothing runs rather than a
+/// token it may name being left readable.
+fn google_token_files(
+    config: &Path,
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as Google credentials ({why}), so a token file they name \
+             could not be denied to atoms' commands; fix it, or point {GOOGLE_CREDENTIALS} at \
+             a file that can be read",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    // `scripts/controls/gcp-config-refused.row` switches this off.
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),
+    };
+    let mut names = Vec::new();
+    google_named(&value, 0, &mut names).map_err(refused)?;
+    let mut out = Vec::new();
+    for name in names {
+        let file = named_path(&name, here).map_err(refused)?;
+        out.extend(projected_volume(file.clone()));
+        out.push(file);
+    }
+    Ok(out)
+}
+
+/// What Google credentials `value` name as files holding a token, into
+/// `out`, and those of the credentials they are configured with, no deeper
+/// than a few: an error when a field that names a file is not text, or one
+/// that holds others is not an object.
+fn google_named(
+    value: &serde_json::Value,
+    depth: usize,
+    out: &mut Vec<String>,
+) -> Result<(), String> {
+    use serde_json::Value;
+    let Some(object) = value.as_object() else {
+        return Err("they are not a JSON object".into());
+    };
+    if depth > 4 {
+        return Err("their source credentials nest too deeply".into());
+    }
+    let named = |value: Option<&Value>, field: &str| match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone()).filter(|n| !n.is_empty())),
+        Some(_) => Err(format!("{field} is not text")),
+    };
+    let fields = |value: &Value, field: &str| {
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| format!("{field} is not an object"))
+    };
+    if let Some(source) = object.get("credential_source") {
+        let source = fields(source, "credential_source")?;
+        out.extend(named(source.get("file"), "credential_source.file")?);
+        if let Some(executable) = source.get("executable") {
+            let executable = fields(executable, "credential_source.executable")?;
+            out.extend(named(
+                executable.get("output_file"),
+                "credential_source.executable.output_file",
+            )?);
+        }
+    }
+    if let Some(inner) = object.get("source_credentials") {
+        google_named(inner, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+/// The web identity token files the AWS configuration file at `config`
+/// names in any of its profiles, each with its projected volume where it is
+/// in one: one named relative to the working directory `here` gives, as an
+/// AWS SDK reads it, and one under `~/` in each of `homes` as well. A file
+/// that is not there names none; one that cannot be read whole as text is
+/// refused, naming it, so nothing runs.
+fn aws_profile_token_files(
+    config: &Path,
+    homes: &[PathBuf],
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let refused = |why: String| {
+        format!(
+            "{} could not be read as an AWS configuration file ({why}), so a web identity \
+             token file it names could not be denied to atoms' commands; make it a file this \
+             user can read, or move it",
+            config.display()
+        )
+    };
+    let Some(bytes) = read_config(config).map_err(refused)? else {
+        return Ok(Vec::new());
+    };
+    let text = String::from_utf8(bytes).map_err(|_| refused("it is not UTF-8 text".into()))?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // A key ends at `=` or, as Python's configuration parser reads it,
+        // at `:`, whichever comes first.
+        // `scripts/controls/aws-profile-colon.row` switches this off.
+        let Some(at) = line.find(['=', ':']) else {
+            continue;
+        };
+        let (key, value) = (&line[..at], line[at + 1..].trim());
+        if !key.trim().eq_ignore_ascii_case("web_identity_token_file") || value.is_empty() {
+            continue;
+        }
+        // Some SDKs end a value at a `#` or `;` after white space, as a
+        // comment, and others keep it: both readings are denied.
+        // `scripts/controls/aws-profile-comment.row` switches this off.
+        let comment = comment_start(value);
+        let mut values = vec![value];
+        values.extend(
+            comment
+                .map(|at| value[..at].trim_end())
+                .filter(|v| !v.is_empty()),
+        );
+        for value in values {
+            let mut files = vec![named_path(value, here).map_err(refused)?];
+            if let Some(rest) = value.strip_prefix("~/") {
+                files.extend(homes.iter().map(|home| home.join(rest)));
+            }
+            for file in files {
+                out.extend(projected_volume(file.clone()));
+                out.push(file);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Where a comment starts in a configuration value, as the SDKs that allow
+/// one read it: at the first `#` or `;` that follows white space.
+fn comment_start(value: &str) -> Option<usize> {
+    value
+        .char_indices()
+        .find(|&(at, c)| matches!(c, '#' | ';') && value[..at].ends_with(char::is_whitespace))
+        .map(|(at, _)| at)
 }
 
 /// The home directories whose credential places are denied, as `env` reads
@@ -401,7 +654,8 @@ pub fn home_secrets(
 ) -> Result<Vec<PathBuf>, String> {
     let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
     let mut out = Vec::new();
-    for home in real_homes(env, passwd)? {
+    let homes = real_homes(env, passwd)?;
+    for home in &homes {
         out.extend(HOME_SECRETS.iter().map(|p| home.join(p)));
     }
     for (prefix, variable) in [
@@ -433,12 +687,36 @@ pub fn home_secrets(
     if let Some(list) = env("KUBECONFIG") {
         out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
     }
-    // AWS's workload token files: where they usually are, those the
-    // variables name, a relative one resolved against atomic's working
-    // directory as an AWS SDK resolves it, and, for one in a projected
-    // volume, the volume itself.
-    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
+    // Workload token files: where they usually are, those the variables
+    // name, a relative one resolved against atomic's working directory as
+    // an SDK resolves it, and, for one in a projected volume, the volume
+    // itself.
+    out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
     out.extend(token_files(env, &std::env::current_dir)?);
+    // Those named inside a configuration rather than by a variable: an AWS
+    // profile's web identity token file, and what the application default
+    // credentials gcloud writes name.
+    let mut aws: Vec<PathBuf> = homes
+        .iter()
+        .flat_map(|home| [home.join(".aws/config"), home.join(".aws/credentials")])
+        .collect();
+    aws.extend(absolute("AWS_CONFIG_FILE"));
+    aws.extend(absolute("AWS_SHARED_CREDENTIALS_FILE"));
+    let here = &std::env::current_dir;
+    for config in &aws {
+        // `scripts/controls/aws-profile-token.row` switches this off.
+        out.extend(aws_profile_token_files(config, &homes, here)?);
+    }
+    let mut gcloud: Vec<PathBuf> = homes
+        .iter()
+        .map(|home| home.join(".config/gcloud"))
+        .collect();
+    gcloud.extend(absolute("CLOUDSDK_CONFIG"));
+    for dir in &gcloud {
+        let defaults = dir.join("application_default_credentials.json");
+        // `scripts/controls/gcp-default-credentials.row` switches this off.
+        out.extend(google_token_files(&defaults, &std::env::current_dir)?);
+    }
     out.sort();
     out.dedup();
     Ok(out)
@@ -846,7 +1124,14 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would refuse it.
+            if !found && let Err(e) = resolved(&path) {
+                return Err(refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                )));
+            }
             let Some(target) = std::fs::canonicalize(&path)
                 .ok()
                 .filter(|t| deniable(t, !found))
@@ -1182,6 +1467,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
 }
 
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
@@ -2091,7 +2396,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -2146,8 +2450,10 @@ fn late_link_targets(
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold and
-/// those second mounts come to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_targets(
     denied: &[PathBuf],
@@ -2616,7 +2922,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -2697,12 +3004,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -2730,6 +3040,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -2789,7 +3109,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -2891,6 +3216,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 secret_env: secret,
                 ..command.clone()
             },
@@ -3494,6 +3820,16 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
@@ -4605,10 +4941,21 @@ mod tests {
                 ),
                 ("NETRC", "/n/netrc"),
                 ("PASSWORD_STORE_DIR", "/pass"),
+                ("AZURE_FEDERATED_TOKEN_FILE", "/az/federated-token"),
+                ("GOOGLE_APPLICATION_CREDENTIALS", "/gcp/credentials.json"),
+                ("CLOUDSDK_CONFIG", "/gcloud"),
             ]),
             None,
         )
         .expect("homes");
+        // Where workload identities keep their tokens on Kubernetes.
+        let pod = "/var/run/secrets/kubernetes.io/serviceaccount";
+        let azure = "/var/run/secrets/azure/tokens";
+        assert!(has(&secrets, pod), "{pod} is not among the denied places");
+        assert!(
+            has(&secrets, azure),
+            "{azure} is not among the denied places"
+        );
         for path in [
             "/cfg/gh",
             "/cfg/git/credentials",
@@ -4632,6 +4979,9 @@ mod tests {
             "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
+            "/az/federated-token",
+            "/gcp/credentials.json",
+            "/gcloud",
         ] {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
@@ -4679,6 +5029,244 @@ mod tests {
         assert!(
             !places.contains(&dir),
             "an ordinary token's directory stays readable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A token file Google's application credentials name is denied with the
+    /// credentials: an external account's source file, with its projected
+    /// volume, the file its executable keeps a token in, and the source file
+    /// of the credentials an impersonated account is configured with.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_files_googles_credentials_name_are_denied() {
+        let dir = std::fs::canonicalize(scratch("gcp-external")).expect("real");
+        let volume = dir.join("gke");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let external = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {
+                "file": volume.join("token"),
+                "executable": {"command": "/bin/true", "output_file": dir.join("cached.json")},
+            },
+        });
+        std::fs::write(dir.join("external.json"), external.to_string()).expect("config");
+        let impersonated = serde_json::json!({
+            "type": "impersonated_service_account",
+            "source_credentials": {
+                "type": "external_account",
+                "credential_source": {"file": "relative/inner-token"},
+            },
+        });
+        std::fs::write(dir.join("impersonated.json"), impersonated.to_string()).expect("config");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        for (config, wanted) in [
+            (
+                "external.json",
+                vec![
+                    volume.clone(),
+                    volume.join("token"),
+                    dir.join("cached.json"),
+                ],
+            ),
+            (
+                "impersonated.json",
+                vec![PathBuf::from("/work/relative/inner-token")],
+            ),
+        ] {
+            let named = dir.join(config).display().to_string();
+            let env =
+                |name: &str| (name == GOOGLE_CREDENTIALS).then(|| std::ffi::OsString::from(&named));
+            let found = token_files(&env, &here).expect("found");
+            assert!(
+                found.contains(&dir.join(config)),
+                "the credentials: {found:?}"
+            );
+            for file in &wanted {
+                assert!(found.contains(file), "{}: {found:?}", file.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The web identity token file an AWS profile names, and not a variable,
+    /// is denied, with its projected volume: one under `~/` in each home as
+    /// well as from the working directory, in any profile.
+    #[cfg(unix)]
+    #[test]
+    fn the_web_identity_token_file_an_aws_profile_names_is_denied() {
+        let dir = std::fs::canonicalize(scratch("aws-profile")).expect("real");
+        let volume = dir.join("eks");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".aws")).expect("home");
+        std::fs::write(
+            home.join(".aws/config"),
+            format!(
+                "[default]\nregion = eu-west-1\n[profile pod]\nweb_identity_token_file = {}\n",
+                volume.join("token").display()
+            ),
+        )
+        .expect("config");
+        std::fs::write(
+            dir.join("moved-config"),
+            format!(
+                "[profile other]\n  Web_Identity_Token_File=~/tokens/web\n\
+                 [profile colon]\nweb_identity_token_file: {d}/colon-token\n\
+                 [profile commented]\nWEB_IDENTITY_TOKEN_FILE = {d}/commented-token  # eks\n\
+                 [profile both]\nweb_identity_token_file\t:\t{d}/both-token ;note\n",
+                d = dir.display()
+            ),
+        )
+        .expect("moved");
+        let (home_s, moved) = (home.display().to_string(), dir.join("moved-config"));
+        let moved_s = moved.display().to_string();
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some(home_s.clone()),
+                "AWS_CONFIG_FILE" => Some(moved_s.clone()),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let places = home_secrets(&env, None).expect("homes");
+        for file in [
+            volume.clone(),
+            volume.join("token"),
+            home.join("tokens/web"),
+            dir.join("colon-token"),
+            dir.join("commented-token"),
+            dir.join("commented-token  # eks"),
+            dir.join("both-token"),
+        ] {
+            assert!(
+                places.contains(&file),
+                "{} is not among the denied places",
+                file.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The application default credentials gcloud writes are read for the
+    /// token files they name, as Google's libraries read them with no
+    /// variable set.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_google_credentials_are_read_for_the_token_files_they_name() {
+        let dir = std::fs::canonicalize(scratch("gcp-default")).expect("real");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".config/gcloud")).expect("gcloud");
+        let config = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {"file": dir.join("adc-token")},
+        });
+        std::fs::write(
+            home.join(".config/gcloud/application_default_credentials.json"),
+            config.to_string(),
+        )
+        .expect("config");
+        let home_s = home.display().to_string();
+        let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(&home_s));
+        let places = home_secrets(&env, None).expect("homes");
+        assert!(
+            places.contains(&dir.join("adc-token")),
+            "adc-token is not among the denied places"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A credential configuration that cannot be read whole is refused,
+    /// naming it, so nothing runs: only one that is not there names nothing.
+    /// Google's credentials that are not JSON, or whose file field is not
+    /// text; a directory, a fifo (without waiting on it), a file past the
+    /// bound, a path through a file, and an AWS file that is not text.
+    #[cfg(unix)]
+    #[test]
+    fn a_credential_configuration_that_cannot_be_read_whole_is_refused() {
+        let dir = std::fs::canonicalize(scratch("config-refused")).expect("real");
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
+        let google = |name: &str| {
+            google_token_files(&dir.join(name), &here)
+                .err()
+                .unwrap_or_default()
+        };
+        let aws = |name: &str| {
+            aws_profile_token_files(&dir.join(name), &[], &here)
+                .err()
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            google_token_files(&dir.join("missing"), &here),
+            Ok(Vec::new())
+        );
+        // A device, as /dev/null is when a variable turns a configuration
+        // off, names nothing and is not opened.
+        let null = Path::new("/dev/null");
+        assert_eq!(aws_profile_token_files(null, &[], &here), Ok(Vec::new()));
+        assert_eq!(google_token_files(null, &here), Ok(Vec::new()));
+        // One this user may not read is refused, saying so.
+        std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
+        std::fs::set_permissions(
+            dir.join("theirs"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("mode");
+        assert!(
+            aws("theirs").contains("this user may not read it"),
+            "{}",
+            aws("theirs")
+        );
+        std::fs::write(dir.join("broken.json"), "{\"credential_source\": ").expect("broken");
+        assert!(
+            google("broken.json").contains("it is not JSON"),
+            "{}",
+            google("broken.json")
+        );
+        std::fs::write(
+            dir.join("number.json"),
+            r#"{"credential_source": {"file": 7}}"#,
+        )
+        .expect("number");
+        assert!(
+            google("number.json").contains("credential_source.file is not text"),
+            "{}",
+            google("number.json")
+        );
+        std::fs::create_dir_all(dir.join("a-directory")).expect("dir");
+        assert!(google("a-directory").contains("not a plain file"));
+        let fifo = std::ffi::CString::new(dir.join("fifo").into_os_string().into_encoded_bytes())
+            .expect("name");
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        assert!(aws("fifo").contains("not a plain file"), "{}", aws("fifo"));
+        let big = vec![b' '; CONFIG_BYTES_MAX as usize + 1];
+        std::fs::write(dir.join("big"), big).expect("big");
+        assert!(aws("big").contains("more than"), "{}", aws("big"));
+        // An error other than not being there: a path through a file.
+        std::fs::write(dir.join("plain"), "").expect("plain");
+        let through = google("plain/credentials.json");
+        assert!(through.contains("Not a directory"), "{through}");
+        std::fs::write(dir.join("latin1"), b"web_identity_token_file = /t\xff\n").expect("bytes");
+        assert!(
+            aws("latin1").contains("not UTF-8 text"),
+            "{}",
+            aws("latin1")
+        );
+        assert!(
+            aws("latin1").starts_with(&format!(
+                "{} could not be read",
+                dir.join("latin1").display()
+            )),
+            "the file is named"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -6257,6 +6845,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
         let dir = scratch("linked-secrets");
         let home = dir.join("home");
@@ -6431,11 +7050,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 

@@ -16,7 +16,9 @@
 
 #![recursion_limit = "512"]
 
-use atomic_app::pipeline::{PIPELINE, PipelineRun, Services, prepare, register_pipeline};
+use atomic_app::pipeline::{
+    PIPELINE, PipelineRun, ProjectWorktrees, Services, prepare, register_pipeline,
+};
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::compile;
@@ -254,7 +256,8 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 runtimes: runtimes(&dir, &model.base_url()),
                 store,
                 deployment,
-                worktrees: None,
+                // Nothing offered to a worktree step, as in `atomic`.
+                worktrees: ProjectWorktrees::FixtureOnly,
                 caches: None,
                 budgets: Arc::default(),
                 context: None,

@@ -2487,13 +2487,15 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
         }
         third.kill().expect("SIGKILL the run");
         third.wait().expect("reap");
-        let mut serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -2849,7 +2851,11 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             };
             // A run that has failed is finished, and not successfully: say
             // so now, with what it failed as, instead of waiting out the
-            // deadline below.
+            // deadline below. This is how the `gate-open-once` control
+            // (scripts/controls/gate-open-once.row) shows: it names the gate
+            // step's checkpoint after the process that wrote it, so a run
+            // recovered by another process re-opens its gate, and the gate
+            // store refuses a second row for the step's own id.
             if let Some(RunStatus::Failed(why)) = &status {
                 panic!(
                     "serve failed the approved run ({status:?}): {why}\nserve log: {}",
@@ -3049,13 +3055,15 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
 
-        let serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -3088,7 +3096,6 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(stdout_json(&out)["error"]["kind"], "runtime.busy");
 
         terminate(&serve);
-        let mut serve = serve;
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
             .expect("child");
@@ -6571,6 +6578,61 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             "fixture.path",
             "inside the git repository",
         );
+        // A repository atomic cannot read at all. git is never run on it, so
+        // nothing was learned about it, and the refusal says what stopped git
+        // from being asked instead of saying the repository is not there —
+        // news atomic does not have, and the opposite of what the person can
+        // act on. The mode goes back before anything is asserted, so a
+        // failing assert leaves nothing unreadable behind.
+        let blind = dir.join("blind");
+        std::fs::create_dir_all(&blind).expect("blind");
+        git_in(&blind, &["init", "-q"]);
+        let blind_base = commit_file(&blind, "price.txt", "125");
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("unreadable");
+        let data = json!({"base": blind_base, "task": "multiply"}).to_string();
+        let blind_arg = blind.to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "coding",
+                "--data",
+                &data,
+                "--fixture",
+                &blind_arg,
+                "--fixture-rev",
+                "HEAD",
+            ],
+            &UNUSED_MODEL,
+            "",
+        );
+        std::fs::set_permissions(&blind, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("readable again");
+        assert!(!out.status.success(), "{blind_arg}: {}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.unreadable", "{blind_arg}: {error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("atomic cannot tell whether it is a git repository"),
+            "{description}"
+        );
+        assert!(
+            description.contains("Permission denied"),
+            "what stopped git is kept: {description}"
+        );
+        assert!(
+            !description.contains("not a git repository"),
+            "atomic never reports what it did not learn: {description}"
+        );
+        assert!(
+            error["action"]
+                .as_str()
+                .is_some_and(|a| a.contains("readable")),
+            "the action names what to change: {error}"
+        );
         // What atomic does not copy whole.
         let (submodule, _) = repo("submodule", &[]);
         git_in(
@@ -6662,6 +6724,127 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
             .expect("record")
             .expect("run");
         assert_eq!(record.input["pipeline"]["fixture"]["commit"], own);
+    });
+}
+
+/// What was found about a project's repository is said where a worktree is
+/// asked for and nowhere else. A run that changes code and names no fixture
+/// is refused, and the refusal carries what git said about the project, since
+/// its worktree step is asking why there is none; a run that asks nothing of
+/// git about the project is not refused for what git said, so a project
+/// outside every repository runs its other steps.
+#[test]
+fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() {
+    on_codex_runtime(async {
+        // Where atomic keeps its own state is its usual place, since it
+        // refuses a scratch directory under the temporary directory; where
+        // the project is is outside every repository.
+        let dir = scratch("no-repository");
+        let outside = outside_repository("no-repository");
+        let project = project(&outside);
+        write_coding(&project);
+        // The same project's work, with nothing asked of a worktree: one
+        // durable step, a gate a person decides, and the run's input back.
+        std::fs::write(
+            project.join("workflows/ask.workflow.yaml"),
+            "atomic: 1\nname: ask\n\
+             input: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             output: { $ref: ../atoms/rank-note.input.schema.json }\n\
+             steps:\n  check:\n    gate:\n      title: \"'Check the note ' + input.title\"\n\
+             \x20     show: input\n      timeout: 24h\n\
+             returns: input\n",
+        )
+        .expect("workflow");
+        let checked = atomic(&dir, &project, &["--json", "check"], &[], "");
+        assert!(checked.status.success(), "{}", text(&checked));
+        let base = "1111111111111111111111111111111111111111";
+        let data = json!({"base": base, "task": "multiply"}).to_string();
+
+        // Refused, with what was found about the project in the refusal: that
+        // git was asked about its directory and said no, in git's own words,
+        // which the person can act on — and not that git could not be asked,
+        // which would be the other news, and false here.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "coding", "--data", &data],
+            &UNUSED_MODEL,
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = stdout_json(&out)["error"].clone();
+        assert_eq!(error["kind"], "fixture.required", "{error}");
+        let description = error["description"].as_str().expect("a description");
+        assert!(
+            description.contains("git refused the project's directory"),
+            "{description}"
+        );
+        assert!(
+            description.contains("not a git repository"),
+            "git's own words are kept: {description}"
+        );
+        assert!(
+            !description.contains("cannot tell"),
+            "nothing about this project was unreadable: {description}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("run run-"),
+            "no run started: {}",
+            text(&out)
+        );
+
+        // The workflow that needs no worktree runs on the same project: the
+        // gate's own mapping ran, the decision came from a human credential,
+        // and the run carried itself to its end and printed its result.
+        // Nothing was asked of git about the project, which is in no
+        // repository.
+        let state = state_dir(&dir, &project);
+        let rt = project_store(&state).await;
+        let log = dir.join("ask.log");
+        let out_file = dir.join("ask.json");
+        let said = |what: &str| {
+            format!(
+                "{what}\nstderr: {}\nstdout: {}",
+                std::fs::read_to_string(&log).unwrap_or_default(),
+                std::fs::read_to_string(&out_file).unwrap_or_default()
+            )
+        };
+        let mut child = spawn_logged(
+            &dir,
+            &project,
+            &[
+                "--json", "run", "ask", "--run-id", "ask-1", "--data", RANK_INPUT,
+            ],
+            &UNUSED_MODEL,
+            &log,
+            &out_file,
+        );
+        let g = match tokio::time::timeout(Duration::from_secs(60), await_gate(&rt, "ask-1")).await
+        {
+            Ok(g) => g,
+            Err(_) => panic!("{}", said("ask-1 never opened its gate")),
+        };
+        assert_eq!(
+            g.title, "Check the note Export crashes on accents",
+            "the gate step ran, and mapped its title from the input: {g:?}"
+        );
+        // A person decides, from another terminal than the run's, and the
+        // run's own command carries it the rest of the way and prints its
+        // result: the gate is all the waiting this workflow does.
+        approve(&rt, &g).await;
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut child, "the run"))
+            .await
+            .expect("child");
+        let shown = std::fs::read_to_string(&log).unwrap_or_default();
+        let printed = std::fs::read_to_string(&out_file).unwrap_or_default();
+        assert!(status.success(), "{shown}\n{printed}");
+        let given: Value = serde_json::from_str(RANK_INPUT).expect("input");
+        let doc: Value =
+            serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {shown}\n{printed}"));
+        assert_eq!(doc["run"], "ask-1", "{doc}");
+        assert_eq!(doc["status"], "succeeded", "{shown}\n{doc}");
+        assert_eq!(doc["output"], given, "{doc}: the run returned its input");
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
@@ -7522,6 +7705,77 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
 
+/// A run named for a secret's word, such as `rotate-secret:2026-11`, is a
+/// name, not a secret: the lines `atomic runs resume` and `atomic serve`
+/// write about it name it as it is, resume hints included, while what the
+/// panic said is still redacted on its own. Redacted whole, as they were,
+/// such a line read `run rotate-secret:[REDACTED] …`, the hint with it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("named-secret");
+    let project = project(&dir);
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "rotate-secret:2026-11"],
+        &panic,
+        "",
+    );
+    let resumed = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        resumed.contains(
+            "run rotate-secret:2026-11: it was parked because atomic's own workflow code"
+        ),
+        "{resumed}"
+    );
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    let line = served
+        .lines()
+        .find(|l| l.contains("workflow code panicked"))
+        .unwrap_or_else(|| panic!("serve named no panicked run: {served}"));
+    assert!(
+        line.starts_with("atomic serve: run rotate-secret:2026-11 stopped: "),
+        "{line}"
+    );
+    assert!(
+        line.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{line}"
+    );
+    assert!(line.contains("failpoint pipeline:after:count"), "{line}");
+    assert!(!served.contains("[REDACTED]"), "{served}");
+}
+
 /// A panic in atomic's own workflow code (made at a step's failpoint, for
 /// the test) is named as the cause, with its message, by `atomic run`,
 /// `atomic runs resume` and `atomic serve`, and kept in the project's
@@ -8162,9 +8416,11 @@ fn first_command_output(model: &FakeModel) -> String {
 }
 
 /// A turn of `atomic run` cannot read what an attempt of `atomic debug
-/// codex-prompt` keeps in its scratch directory, nor the other way round: as
-/// atomic wires each command's backend, each denies its turns both of the
-/// project's scratch roots. What each looks for is there all along.
+/// codex-prompt` keeps in its scratch directory, nor the other way round,
+/// nor what another project's attempts keep in theirs: as atomic wires each
+/// command's backend, each denies its turns the home's whole `scratch/`,
+/// where every project's scratch roots are. What each looks for is there all
+/// along.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[cfg(target_os = "linux")]
@@ -8180,17 +8436,38 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
                 .await
                 .expect("state")
         };
-        let plant = |root: &str| {
-            let secret = state.join(root).join("planted").join("secret");
+        // Every project's scratch roots are in the home's `scratch/`, by
+        // project id.
+        let id = state
+            .file_name()
+            .expect("a project id")
+            .to_string_lossy()
+            .into_owned();
+        let home = state
+            .parent()
+            .and_then(Path::parent)
+            .expect("the atomic home")
+            .to_owned();
+        let plant = |project: &str, root: &str| {
+            let secret = home
+                .join("scratch")
+                .join(project)
+                .join(root)
+                .join("planted/secret");
             std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
-            std::fs::write(&secret, format!("secret-in-{root}")).expect("secret");
+            std::fs::write(&secret, format!("secret-in-{project}-{root}")).expect("secret");
             secret
         };
-        let (in_run, in_debug) = (plant("scratch"), plant("scratch-debug"));
-        let look = |secret: &Path| Reply::Tool {
+        let (in_run, in_debug) = (plant(&id, "run"), plant(&id, "debug"));
+        let in_other = plant("another-project-0123456789ab", "run");
+        let look = |secrets: &[&PathBuf]| Reply::Tool {
             name: "exec_command".into(),
             arguments: json!({
-                "cmd": format!("cat '{}' 2>&1; echo cat-exit=$?", secret.display()),
+                "cmd": secrets
+                    .iter()
+                    .map(|s| format!("cat '{}' 2>&1; echo cat-exit=$?", s.display()))
+                    .collect::<Vec<_>>()
+                    .join("; "),
                 "yield_time_ms": 10000,
             }),
         };
@@ -8205,7 +8482,7 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
             object(json!({"done": {"type": "boolean"}})),
         );
         let model = FakeModel::start(vec![
-            look(&in_debug),
+            look(&[&in_debug, &in_other]),
             Reply::Text(r#"{"done": true}"#.into()),
         ])
         .await
@@ -8228,14 +8505,17 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         assert!(out.status.success(), "{}", text(&out));
         let said = first_command_output(&model);
         assert!(
-            !said.contains("secret-in-scratch-debug") && said.contains("cat-exit=1"),
-            "a run's turn read the debug prompt's scratch: {said}"
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a run's turn read the debug prompt's or another project's scratch: {said}"
         );
 
         // A debug prompt's turn looks in the runs' scratch root.
-        let model = FakeModel::start(vec![look(&in_run), Reply::Text("Done.".into())])
-            .await
-            .expect("fake model");
+        let model = FakeModel::start(vec![
+            look(&[&in_run, &in_other]),
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .expect("fake model");
         let url = model.base_url();
         let out = {
             let (d, p) = (dir.clone(), project.clone());
@@ -8262,10 +8542,10 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         assert!(out.status.success(), "{}", text(&out));
         let said = first_command_output(&model);
         assert!(
-            !said.contains("secret-in-scratch") && said.contains("cat-exit=1"),
-            "a debug prompt's turn read the runs' scratch: {said}"
+            !said.contains("secret-in-") && said.matches("cat-exit=1").count() == 2,
+            "a debug prompt's turn read the runs' or another project's scratch: {said}"
         );
         // The denial kept them out, not the secrets' absence.
-        assert!(in_run.exists() && in_debug.exists());
+        assert!(in_run.exists() && in_debug.exists() && in_other.exists());
     });
 }

@@ -43,7 +43,9 @@ pub fn git_in(dir: &Path, args: &[&str]) -> String {
 /// of these, before a run and after it, to say the repository was left alone.
 /// Leaving any one of the five readings out is a control of its own under
 /// `scripts/controls/`; each is shown to fail a test by a decoy planted in
-/// `run_cli`'s fixture test, which compares this same reading.
+/// `run_cli`'s fixture test, which compares this same reading. `fixture_cli`
+/// builds its file-by-file comparison of a checkout on this reading, and plants
+/// a setting in a repository's configuration there too.
 pub fn git_state(dir: &Path) -> String {
     format!(
         "{}\n{}\n{}\n{}\n{}",
