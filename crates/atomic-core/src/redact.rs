@@ -1506,11 +1506,19 @@ fn redact_flag_within(text: &str, captures: &Captures<'_>, depth: usize) -> Stri
 /// secret-named one after another's). Such text is hidden whole, as
 /// reading it as written would.
 fn quotes_nest_ambiguously(input: &str) -> bool {
+    let quotes = std::cell::OnceCell::new();
     FLAG_HEAD.captures_iter(input).any(|head| {
         let Some(whole) = head.get(0) else {
             return false;
         };
-        let Some((inner, all)) = quoted_prefix(&input[whole.end()..]) else {
+        if !input[whole.end()..]
+            .trim_start_matches('\\')
+            .starts_with(['"', '\''])
+        {
+            return false;
+        }
+        let quotes = quotes.get_or_init(|| QuotePrefixes::new(input));
+        let Some((inner, all, inner_at)) = quotes.prefix(whole.end(), input.len()) else {
             return false;
         };
         // A quoted value closed by a quote that runs straight on into a
@@ -1536,7 +1544,9 @@ fn quotes_nest_ambiguously(input: &str) -> bool {
             let value = &inner[at.end()..];
             value.is_empty()
                 || (value.trim_start_matches('\\').starts_with(['"', '\''])
-                    && quoted_prefix(value).is_none())
+                    && quotes
+                        .prefix(inner_at + at.end(), inner_at + inner.len())
+                        .is_none())
         })
     })
 }
@@ -1578,29 +1588,64 @@ fn hide_ambiguous_lines(input: &str) -> Option<String> {
     Some(if hidden { lines } else { REDACTED.to_owned() })
 }
 
-/// The quoted value `rest` starts with, plain or escaped, closed by the
-/// first quote of the same kind escaped alike on its line: what it holds,
-/// and all of it.
-fn quoted_prefix(rest: &str) -> Option<(&str, &str)> {
-    let escapes = rest.len() - rest.trim_start_matches('\\').len();
-    let quote = rest[escapes..]
-        .chars()
-        .next()
-        .filter(|c| matches!(c, '"' | '\''))?;
-    let body = &rest[escapes + 1..];
-    let line = body.find('\n').map_or(body, |end| &body[..end]);
-    let mut from = 0;
-    while let Some(at) = line[from..].find(quote) {
-        let close = from + at;
-        let run = line[..close].len() - line[..close].trim_end_matches('\\').len();
-        if run == escapes {
-            let inner = &line[..close - run];
-            let end = escapes + 1 + close + 1;
-            return Some((inner, &rest[..end]));
+/// The next equally escaped quote on the same line, indexed once for all
+/// flag readings. Reverse scanning also bounds absent/mismatched lookups:
+/// repeated openers never search overlapping suffixes of the input.
+struct QuotePrefixes<'a> {
+    input: &'a str,
+    next: std::collections::HashMap<usize, usize>,
+}
+
+impl<'a> QuotePrefixes<'a> {
+    fn new(input: &'a str) -> Self {
+        let bytes = input.as_bytes();
+        let mut latest = std::collections::HashMap::new();
+        let mut next = std::collections::HashMap::new();
+        let mut at = bytes.len();
+        while at > 0 {
+            at -= 1;
+            step(1);
+            match bytes[at] {
+                b'\n' => latest.clear(),
+                quote @ (b'"' | b'\'') => {
+                    let mut start = at;
+                    while start > 0 && bytes[start - 1] == b'\\' {
+                        start -= 1;
+                        step(1);
+                    }
+                    let level = at - start;
+                    if let Some(close) = latest.insert((quote, level), at) {
+                        next.insert(at, close);
+                    }
+                    at = start;
+                }
+                _ => {}
+            }
         }
-        from = close + 1;
+        Self { input, next }
     }
-    None
+
+    /// A prefix within `at..limit`, returning its body, whole spelling and
+    /// absolute body offset. A nested reading cannot use an outer closer.
+    fn prefix(&self, at: usize, limit: usize) -> Option<(&'a str, &'a str, usize)> {
+        let rest = &self.input[at..limit];
+        let escapes = rest.len() - rest.trim_start_matches('\\').len();
+        step(escapes + 1);
+        let open = at + escapes;
+        if !matches!(self.input.as_bytes().get(open), Some(b'"' | b'\'')) || open >= limit {
+            return None;
+        }
+        let close = *self.next.get(&open)?;
+        if close >= limit {
+            return None;
+        }
+        let inner_at = open + 1;
+        Some((
+            &self.input[inner_at..close - escapes],
+            &self.input[at..close + 1],
+            inner_at,
+        ))
+    }
 }
 
 /// Read once more each secret-named flag's value, and hide what follows

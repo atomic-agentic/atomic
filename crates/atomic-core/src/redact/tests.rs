@@ -3423,3 +3423,43 @@ fn separators_and_open_quotes_keep_the_next_value_hidden() {
     let line = format!("token: \"see docs, password={credential}");
     assert_eq!(text(&line), "token: \"see docs, password=[REDACTED]");
 }
+
+/// Adjacent ordinary quoted values must not each search the remaining line.
+#[test]
+fn repeated_quoted_flags_take_linear_steps() {
+    quoted_flag_steps(
+        "adjacent",
+        "--x \"a\" ".repeat(128),
+        "--x \"a\" ".repeat(2048),
+    );
+}
+
+/// Distinct escaping depths have no matching closer: even failed lookups
+/// must not repeatedly scan the remaining quotes.
+#[test]
+fn mismatched_quoted_flags_take_linear_steps() {
+    let input = |count: usize| {
+        (1..=count)
+            .map(|n| format!("--x {}\"a ", "\\".repeat(n)))
+            .collect()
+    };
+    quoted_flag_steps("mismatched", input(32), input(128));
+}
+
+fn quoted_flag_steps(name: &str, small: String, large: String) {
+    // Ordinary names carry no secrets; retain the public output semantics.
+    assert_eq!(text(&small), small);
+    assert_eq!(text(&large), large);
+    let (small, large) = (steps_of(&small), steps_of(&large));
+    eprintln!("quoted flags {name}: small={small}, large={large}");
+    assert!(large < 32 * small, "{name}: {large} steps versus {small}");
+}
+
+/// An outer quote cannot borrow its closer from another line. Exercise
+/// the actual ambiguity reading and the public redactor's retained context.
+#[test]
+fn a_flag_quote_does_not_close_on_another_line() {
+    let input = "--x \"--password '\n\" tail";
+    assert!(!quotes_nest_ambiguously(input));
+    assert!(text(input).contains("tail"));
+}
