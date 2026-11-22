@@ -432,23 +432,43 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them. AWS's workload token files
-are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
-`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name (one named relative to
-atomic's working directory, as AWS's SDKs read it), the whole projected
-volume when such a file is in one Kubernetes mounts, found through any
-links that lead to it (so the token it rotates in next is denied as well),
-and EKS's usual token directories,
-`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
-`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
-variable names them. An ordinary token file is denied by its path each
-time a command starts, so one replaced there is denied to the next command.
-A token given as a value rather than a file, such as
+variables, `KUBECONFIG`, `CLOUDSDK_CONFIG` and others) put them. Workload
+token files are denied too:
+
+- the files `AWS_WEB_IDENTITY_TOKEN_FILE`,
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, `AZURE_FEDERATED_TOKEN_FILE` and
+  `GOOGLE_APPLICATION_CREDENTIALS` name, one named relative to atomic's
+  working directory as the SDKs read it;
+- the token files Google's credentials name, there or in the application
+  default credentials gcloud writes: an external account's source file, the
+  file its executable keeps a token in, and those of the credentials an
+  impersonated account is configured with;
+- every `web_identity_token_file` setting in your AWS configuration and
+  credentials files, written with `=` or `:`, both with and without a `#` or
+  `;` comment after it;
+- the whole projected volume when such a file is in one Kubernetes mounts,
+  found through any links that lead to it, so the token it rotates in next
+  is denied as well;
+- the usual token directories, whether or not anything names them: EKS's
+  `/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+  `/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, the pod's own
+  `/var/run/secrets/kubernetes.io/serviceaccount`, and Azure workload
+  identity's `/var/run/secrets/azure/tokens`.
+
+A configuration atomic reads for the token files it names stops the run,
+with a message naming it, when it cannot be read whole, rather than leaving a
+token it may name readable: when it cannot be opened (this user may not read
+it, say), is not a plain file, is larger than any such file is, is not JSON
+or text, or gives a field that names a file a value that is not text. One
+that is not there, or is a device, as `/dev/null` is when a variable turns a
+configuration off, names nothing. An ordinary token file is denied by its
+path each time a command starts, so one replaced there is denied to the next
+command. A token given as a value rather than a file, such as
 `AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
 only a few core variables and those its atom declares, and the credential
 endpoints AWS serves on link-local and unique-local addresses are out of its
-reach, since a command reaches no private or local address. A link among them, up to four
-directory levels inside a denied directory, is denied as what it
+reach, since a command reaches no private or local address. A link among
+them, up to four directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,

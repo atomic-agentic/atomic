@@ -1,1 +1,1 @@
-aws-token-dirs|crates/atomic-core/src/codex.rs|    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));|    let _ = AWS_TOKEN_DIRS;|-p atomic-agentic-core --lib --features fake-model the_credential_places_are_found_wherever_the_environment_moves_them
+aws-token-dirs|crates/atomic-core/src/codex.rs|    out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));|    let _ = WORKLOAD_TOKEN_DIRS;|-p atomic-agentic-core --lib --features fake-model the_credential_places_are_found_wherever_the_environment_moves_them
