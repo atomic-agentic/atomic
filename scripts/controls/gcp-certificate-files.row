@@ -1,1 +1,1 @@
-gcp-certificate-files|crates/atomic-core/src/codex.rs|        out.extend(google_certificate_files(&config, here)?);|        let _ = google_certificate_files;|-p atomic-agentic-core --lib --features fake-model the_key_googles_certificate_configuration_names_is_denied
+gcp-certificate-files|crates/atomic-core/src/codex.rs|            out.extend(google_certificate_files(&at, &fix, here)?);|            let _ = (google_certificate_files, &fix);|-p atomic-agentic-core --lib --features fake-model the_key_googles_certificate_configuration_names_is_denied

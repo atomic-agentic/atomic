@@ -255,29 +255,37 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
-    // `scripts/controls/azure-config-dir.row` switches this off.
-    ("AZURE_CONFIG_DIR", &[""]),
+    // A systemd service's credentials, which systemd keeps under
+    // `/run/credentials` for a system service (see [`WORKLOAD_TOKEN_DIRS`]).
+    // `scripts/controls/systemd-credentials-var.row` switches this off.
+    ("CREDENTIALS_DIRECTORY", &[""]),
 ];
 
 /// Variables that move a credential file or directory elsewhere and are
-/// read as botocore and gcloud read them, `~/`, `$HOME/` and a relative name
-/// included (see [`expanded`]): denied whole, and read for the token files
-/// they name.
+/// read as their tools read them, `~` and, for botocore, `$VAR` expanded,
+/// and a relative name included (see [`expanded`]): denied whole, and the
+/// AWS and gcloud ones read for the token files they name.
 const AWS_CONFIG: &str = "AWS_CONFIG_FILE";
 const AWS_CREDENTIALS: &str = "AWS_SHARED_CREDENTIALS_FILE";
 const GCLOUD_CONFIG: &str = "CLOUDSDK_CONFIG";
+const AZURE_CONFIG: &str = "AZURE_CONFIG_DIR";
 
 /// Where Kubernetes and container engines mount secrets, denied whole
 /// whether or not atomic's environment names anything in them: the pod's
 /// own service account, AWS's (IAM roles for service accounts, and EKS Pod
 /// Identity), Azure workload identity's, projected tokens of any audience,
-/// and the secrets a container engine mounts by name. Nothing a command
-/// needs is kept there.
+/// and the secrets a container engine mounts by name; and where systemd
+/// keeps each system service's credentials. Nothing a command needs is kept
+/// there, though on RHEL a container's subscription entitlements are
+/// mounted under `/run/secrets` too, so a command cannot reach the entitled
+/// repositories with them.
 const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     // `scripts/controls/secrets-dir-var-run.row` switches this off.
     "/var/run/secrets",
     // `scripts/controls/secrets-dir-run.row` switches this off.
     "/run/secrets",
+    // `scripts/controls/systemd-credentials-dir.row` switches this off.
+    "/run/credentials",
 ];
 
 /// The variables that name a workload credential file an SDK reads, each
@@ -296,6 +304,8 @@ const WORKLOAD_TOKEN_FILES: &[(&str, &str)] = &[
     (GOOGLE_CREDENTIALS, "credentials file"),
     // `scripts/controls/gcp-certificate-config-var.row` switches this off.
     (GOOGLE_CERTIFICATES, "certificate configuration"),
+    // `scripts/controls/gcp-certificate-config-fallback.row` switches this off.
+    (GOOGLE_CERTIFICATES_FALLBACK, "certificate configuration"),
 ];
 
 /// The variable that names Google's application credentials.
@@ -304,6 +314,10 @@ const GOOGLE_CREDENTIALS: &str = "GOOGLE_APPLICATION_CREDENTIALS";
 /// The variable that names Google's certificate configuration, which names
 /// the certificate and private key of X.509 workload identity federation.
 const GOOGLE_CERTIFICATES: &str = "GOOGLE_API_CERTIFICATE_CONFIG";
+
+/// The variable google-auth reads for the certificate configuration when
+/// [`GOOGLE_CERTIFICATES`] is unset or empty.
+const GOOGLE_CERTIFICATES_FALLBACK: &str = "CLOUDSDK_CONTEXT_AWARE_CERTIFICATE_CONFIG_FILE_PATH";
 
 /// The most of a credential configuration atomic reads to find the token
 /// files it names: far more than any holds.
@@ -365,51 +379,78 @@ fn projected_volume(file: PathBuf) -> Option<PathBuf> {
 
 /// The workload credential files the variables in `env` name, a relative
 /// one resolved against the working directory `here` gives, as an SDK
-/// started there resolves it, and, for one in a projected volume, the
-/// volume itself; with the token files Google's application credentials
-/// name. An error, so nothing runs, when a name is relative and the working
-/// directory is unknown, or when Google's credentials cannot be read whole.
+/// started there resolves it, one naming a Google certificate configuration
+/// with `~` expanded under each of `homes`, as google-auth expands it (see
+/// [`read_as`]), and, for one in a projected volume, the volume itself;
+/// with the token files Google's application credentials name. An error,
+/// so nothing runs, when a name is relative and the working directory is
+/// unknown, when `~` cannot be expanded, or when Google's credentials
+/// cannot be read whole.
 fn token_files(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    homes: &[PathBuf],
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     for (name, what) in WORKLOAD_TOKEN_FILES {
-        let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
+        let Some(value) = env(name).filter(|v| !v.is_empty()) else {
             continue;
         };
-        // Named as plainly as it reads, so a trailing `/` is no directory it
-        // must be: only one above the file can fail as not a directory.
-        let file: PathBuf = file.components().collect();
-        let file = if file.is_absolute() {
-            file
+        let files = if names_certificates(name) {
+            // `scripts/controls/gcp-certificate-config-home.row` switches this off.
+            let reading = GOOGLE_AUTH;
+            read_as(&value, reading, env, homes).map_err(|why| format!("{name} {why}"))?
         } else {
-            let refused = |e: std::io::Error| {
-                format!(
-                    "{name} names the {what} {} relative to the working directory, which \
-                     is unknown ({e}), so it could not be denied to atoms' commands",
-                    file.display()
-                )
-            };
-            here().map_err(refused)?.join(&file)
+            vec![PathBuf::from(value)]
         };
-        if *name == GOOGLE_CREDENTIALS {
-            // `scripts/controls/gcp-external-token.row` switches this off.
-            out.extend(google_token_files(&file, here)?);
+        for file in files {
+            // Named as plainly as it reads, so a trailing `/` is no
+            // directory it must be: only one above the file can fail as not
+            // a directory.
+            let file: PathBuf = file.components().collect();
+            let file = if file.is_absolute() {
+                file
+            } else {
+                let refused = |e: std::io::Error| {
+                    format!(
+                        "{name} names the {what} {} relative to the working directory, which \
+                         is unknown ({e}), so it could not be denied to atoms' commands",
+                        file.display()
+                    )
+                };
+                here().map_err(refused)?.join(&file)
+            };
+            if *name == GOOGLE_CREDENTIALS {
+                // `scripts/controls/gcp-external-token.row` switches this off.
+                let fix = format!("point {GOOGLE_CREDENTIALS} at a file that can be read");
+                out.extend(google_token_files(&file, &fix, env, homes, here)?);
+            }
+            if names_certificates(name) {
+                let fix = format!("point {name} at a file that can be read");
+                out.extend(google_certificate_files(&file, &fix, here)?);
+            }
+            out.extend(projected_volume(file.clone()));
+            out.push(file);
         }
-        if *name == GOOGLE_CERTIFICATES {
-            out.extend(google_certificate_files(&file, here)?);
-        }
-        out.extend(projected_volume(file.clone()));
-        out.push(file);
     }
     Ok(out)
+}
+
+/// Whether the variable `name` of [`WORKLOAD_TOKEN_FILES`] names a Google
+/// certificate configuration.
+fn names_certificates(name: &str) -> bool {
+    name == GOOGLE_CERTIFICATES || name == GOOGLE_CERTIFICATES_FALLBACK
 }
 
 /// `file` read as plainly as a name in a configuration reads, resolved
 /// against the working directory `here` gives when it is relative.
 fn named_path(file: &str, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
-    let file: PathBuf = Path::new(file).components().collect();
+    plain_path(Path::new(file), here)
+}
+
+/// `file` read as plainly as [`named_path`] reads a name.
+fn plain_path(file: &Path, here: &dyn Fn() -> std::io::Result<PathBuf>) -> Result<PathBuf, String> {
+    let file: PathBuf = file.components().collect();
     if file.is_absolute() {
         return Ok(file);
     }
@@ -492,13 +533,15 @@ fn is_device(meta: &std::fs::Metadata) -> bool {
 /// token it may name being left readable.
 fn google_token_files(
     config: &Path,
+    fix: &str,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    homes: &[PathBuf],
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let refused = |why: String| {
         format!(
             "{} could not be read as Google credentials ({why}), so a token file they name \
-             could not be denied to atoms' commands; fix it, or point {GOOGLE_CREDENTIALS} at \
-             a file that can be read",
+             could not be denied to atoms' commands; fix it, or {fix}",
             config.display()
         )
     };
@@ -518,12 +561,23 @@ fn google_token_files(
         out.extend(projected_volume(file.clone()));
         out.push(file);
     }
+    // google-auth expands `~` in where the certificate configuration is.
     for name in certificates {
-        let config = named_path(&name, here).map_err(refused)?;
-        // `scripts/controls/gcp-certificate-files.row` switches this off.
-        out.extend(google_certificate_files(&config, here)?);
-        out.extend(projected_volume(config.clone()));
-        out.push(config);
+        // `scripts/controls/gcp-certificate-location-home.row` switches this off.
+        let location_reading = GOOGLE_AUTH;
+        let named = read_as(std::ffi::OsStr::new(&name), location_reading, env, homes)
+            .map_err(|why| refused(format!("its certificate_config_location {why}")))?;
+        let fix = format!(
+            "point the certificate_config_location in {} at a file that can be read",
+            config.display()
+        );
+        for at in named {
+            let at = plain_path(&at, here).map_err(refused)?;
+            // `scripts/controls/gcp-certificate-files.row` switches this off.
+            out.extend(google_certificate_files(&at, &fix, here)?);
+            out.extend(projected_volume(at.clone()));
+            out.push(at);
+        }
     }
     Ok(out)
 }
@@ -532,17 +586,19 @@ fn google_token_files(
 /// configuration at `config` names, each with its projected volume where it
 /// is in one: the `cert_path` and `key_path` of each of its `cert_configs`.
 /// A file that is not there names none; one that cannot be read whole and
-/// as JSON is refused, naming it, so nothing runs.
+/// as JSON is refused, naming it and with `fix`, what else may be done
+/// about it, so nothing runs. google-auth reads `cert_path` and `key_path`
+/// as they are written, `~` and all.
 fn google_certificate_files(
     config: &Path,
+    fix: &str,
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     use serde_json::Value;
     let refused = |why: String| {
         format!(
             "{} could not be read as a Google certificate configuration ({why}), so the \
-             private key it names could not be denied to atoms' commands; fix it, or point \
-             {GOOGLE_CERTIFICATES} at a file that can be read",
+             private key it names could not be denied to atoms' commands; fix it, or {fix}",
             config.display()
         )
     };
@@ -637,43 +693,269 @@ fn google_named(
     Ok(())
 }
 
-/// How a name under the home directory starts, as botocore and gcloud expand
-/// one.
+/// How a name under the home directory starts, as atomic reads one for
+/// botocore and gcloud under every home, whichever `HOME` they see.
 const HOME_PREFIXES: [&str; 3] = ["~/", "$HOME/", "${HOME}/"];
 
-/// The places the variable `name` in `env` names, as botocore and gcloud
-/// read it: as it is when absolute; under each of `homes` when it starts
-/// `~/`, `$HOME/` or `${HOME}/`; and otherwise relative to the working
-/// directory `here` gives. An error, so nothing runs, when it is relative
-/// and the working directory is unknown.
+/// How a tool reads a name that places a credential file or directory.
+#[derive(Clone, Copy, Debug)]
+struct Reading {
+    /// `$VAR` and `${VAR}` expanded first, from atomic's environment, one it
+    /// does not hold left as written, as Python's `os.path.expandvars`
+    /// expands them.
+    vars: bool,
+    /// A leading `~` then expanded, as Python's `os.path.expanduser` expands
+    /// it.
+    user: bool,
+    /// The name as it is written read too, as a tool that expands nothing
+    /// reads it.
+    as_written: bool,
+    /// One that starts with one of [`HOME_PREFIXES`] read under each home
+    /// too.
+    every_home: bool,
+}
+
+/// botocore, for `AWS_CONFIG_FILE` and `AWS_SHARED_CREDENTIALS_FILE`:
+/// `os.path.expandvars`, then `os.path.expanduser`.
+const BOTOCORE: Reading = Reading {
+    vars: true,
+    user: true,
+    as_written: false,
+    every_home: true,
+};
+
+/// gcloud and google-auth, for `CLOUDSDK_CONFIG`: as it is written; read
+/// under each home too where it starts `~/` or `$HOME/`, as a shell would
+/// have expanded it.
+const GCLOUD: Reading = Reading {
+    vars: false,
+    user: false,
+    as_written: true,
+    every_home: true,
+};
+
+/// The Azure CLI, for `AZURE_CONFIG_DIR`: as it is written, as current
+/// releases read it, and under `~` expanded, as `os.path.expanduser` would.
+const AZ: Reading = Reading {
+    vars: false,
+    user: true,
+    as_written: true,
+    every_home: false,
+};
+
+/// google-auth, for where a certificate configuration is:
+/// `os.path.expanduser`.
+const GOOGLE_AUTH: Reading = Reading {
+    vars: false,
+    user: true,
+    as_written: false,
+    every_home: false,
+};
+
+/// The places the variable `name` in `env` names, as `reading` says its
+/// tool reads it (see [`read_as`]), each relative one resolved against the
+/// working directory `here` gives. An error, so nothing runs, when one is
+/// relative and the working directory is unknown, or it cannot be read as
+/// its tool reads it.
 fn expanded(
     env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     name: &str,
+    reading: Reading,
     homes: &[PathBuf],
     here: &dyn Fn() -> std::io::Result<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
-    let Some(value) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
+    let Some(value) = env(name).filter(|v| !v.is_empty()) else {
         return Ok(Vec::new());
     };
-    if value.is_absolute() {
-        return Ok(vec![value]);
+    let mut out = Vec::new();
+    for place in read_as(&value, reading, env, homes).map_err(|why| format!("{name} {why}"))? {
+        if place.is_absolute() {
+            out.push(place);
+            continue;
+        }
+        let refused = |e: std::io::Error| {
+            format!(
+                "{name} names {} relative to the working directory, which is unknown ({e}), so \
+                 it could not be denied to atoms' commands",
+                place.display()
+            )
+        };
+        // `scripts/controls/expanded-relative.row` switches this off.
+        let relative = here().map_err(refused)?.join(&place);
+        out.push(relative);
     }
-    let text = value.to_string_lossy();
+    Ok(out)
+}
+
+/// The places `value` names as `reading` says its tool reads it, with
+/// `env` atomic's environment and `homes` the homes whose credentials are
+/// denied, before any relative one is resolved: `$VAR` and `${VAR}`
+/// expanded where it says ([`expand_vars`]), then a leading `~` ([`expand_user`]),
+/// with the name as it is written, and under each of `homes` where it
+/// starts with one of [`HOME_PREFIXES`], where it says. Worked on as bytes,
+/// so a name that is not UTF-8 is read as its tool reads it too. Each once,
+/// in the order found. The error says why it cannot be read so.
+fn read_as(
+    value: &std::ffi::OsStr,
+    reading: Reading,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    homes: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let written = value.as_encoded_bytes();
+    let mut text = written.to_vec();
+    if reading.vars {
+        text = expand_vars(&text, env)?;
+    }
+    let mut named = if reading.user {
+        expand_user(&text, env, homes)?
+    } else {
+        vec![text]
+    };
+    if reading.as_written {
+        named.push(written.to_vec());
+    }
     // `scripts/controls/expanded-home.row` switches this off.
     let under_home: &[&str] = &HOME_PREFIXES;
-    if let Some(rest) = under_home.iter().find_map(|p| text.strip_prefix(p)) {
-        return Ok(homes.iter().map(|home| home.join(rest)).collect());
+    if reading.every_home
+        && let Some(rest) = under_home
+            .iter()
+            .find_map(|p| written.strip_prefix(p.as_bytes()))
+    {
+        let rest = os_from_bytes(rest.to_vec());
+        named.extend(
+            homes
+                .iter()
+                .map(|home| home.join(&rest).into_os_string().into_encoded_bytes()),
+        );
     }
-    let refused = |e: std::io::Error| {
-        format!(
-            "{name} names {} relative to the working directory, which is unknown ({e}), so it \
-             could not be denied to atoms' commands",
-            value.display()
-        )
-    };
-    // `scripts/controls/expanded-relative.row` switches this off.
-    let relative = here().map_err(refused)?.join(&value);
-    Ok(vec![relative])
+    let mut out: Vec<PathBuf> = Vec::new();
+    for name in named {
+        let place = PathBuf::from(os_from_bytes(name));
+        if !out.contains(&place) {
+            out.push(place);
+        }
+    }
+    Ok(out)
+}
+
+/// `text` with `$NAME` and `${NAME}` replaced by what `env` holds for
+/// `NAME`, as Python's `os.path.expandvars` replaces them on POSIX: `NAME`
+/// is the longest run of ASCII letters, digits and `_` after a `$`, or
+/// whatever lies between `${` and the next `}`; one `env` does not hold, and
+/// a `$` that starts neither, is left as written; and what is put in is not
+/// read again. Refused when a name between braces is not UTF-8, as `env`
+/// cannot look it up.
+fn expand_vars(
+    text: &[u8],
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Vec<u8>, String> {
+    let word = |b: &u8| b.is_ascii_alphanumeric() || *b == b'_';
+    let mut out = Vec::with_capacity(text.len());
+    let mut at = 0;
+    while at < text.len() {
+        if text[at] != b'$' {
+            out.push(text[at]);
+            at += 1;
+            continue;
+        }
+        let after = &text[at + 1..];
+        let run = after.iter().take_while(|b| word(b)).count();
+        // The name, and how much of `text` after the `$` it takes.
+        let (name, len) = if run > 0 {
+            (&after[..run], run)
+        } else if after.first() == Some(&b'{')
+            && let Some(close) = after.iter().position(|b| *b == b'}')
+        {
+            (&after[1..close], close + 1)
+        } else {
+            out.push(b'$');
+            at += 1;
+            continue;
+        };
+        let Ok(name) = std::str::from_utf8(name) else {
+            return Err(format!(
+                "names a variable, in {}, that is not UTF-8, so atomic cannot tell what it \
+                 expands to",
+                String::from_utf8_lossy(text)
+            ));
+        };
+        match env(name) {
+            Some(value) => out.extend_from_slice(value.as_encoded_bytes()),
+            None => out.extend_from_slice(&text[at..at + 1 + len]),
+        }
+        at += 1 + len;
+    }
+    Ok(out)
+}
+
+/// `text` with a leading `~` expanded, as Python's `os.path.expanduser`
+/// expands it on POSIX: `~` alone, or before a `/`, is the home `env`'s
+/// `HOME` holds, as it is, or the password database's where it is unset;
+/// read under each of `homes` too, so overriding `HOME` hides nothing.
+/// Refused when it names another user's home, `~name`, which atomic does
+/// not look up, or when there is no home to expand it to.
+fn expand_user(
+    text: &[u8],
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    homes: &[PathBuf],
+) -> Result<Vec<Vec<u8>>, String> {
+    if text.first() != Some(&b'~') {
+        return Ok(vec![text.to_vec()]);
+    }
+    let end = text.iter().position(|b| *b == b'/').unwrap_or(text.len());
+    if end != 1 {
+        return Err(format!(
+            "names {} under the home of the user {}, which atomic does not look up, so it could \
+             not be denied to atoms' commands; name it in full",
+            String::from_utf8_lossy(text),
+            String::from_utf8_lossy(&text[1..end])
+        ));
+    }
+    let rest = &text[end..];
+    let mut users: Vec<Vec<u8>> = env("HOME")
+        .map(std::ffi::OsString::into_encoded_bytes)
+        .into_iter()
+        .collect();
+    users.extend(
+        homes
+            .iter()
+            .map(|h| h.as_os_str().as_encoded_bytes().to_vec()),
+    );
+    if users.is_empty() {
+        return Err(format!(
+            "names {} under the home directory, which is unknown, so it could not be denied to \
+             atoms' commands; set HOME",
+            String::from_utf8_lossy(text)
+        ));
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for mut home in users {
+        while home.last() == Some(&b'/') {
+            home.pop();
+        }
+        home.extend_from_slice(rest);
+        if home.is_empty() {
+            home.push(b'/');
+        }
+        if !out.contains(&home) {
+            out.push(home);
+        }
+    }
+    Ok(out)
+}
+
+/// The name whose bytes, as [`std::ffi::OsStr::as_encoded_bytes`] gives
+/// them, are `bytes`: pieces of names cut at ASCII bytes and joined.
+fn os_from_bytes(bytes: Vec<u8>) -> std::ffi::OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        std::ffi::OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8_lossy(&bytes).into_owned().into()
+    }
 }
 
 /// The web identity token files the AWS configuration file at `config`
@@ -821,18 +1103,22 @@ pub fn home_secrets(
     // an SDK resolves it, and, for one in a projected volume, the volume
     // itself.
     out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
-    out.extend(token_files(env, &std::env::current_dir)?);
+    out.extend(token_files(env, &homes, &std::env::current_dir)?);
     // Those named inside a configuration rather than by a variable: an AWS
     // profile's web identity token file, and what the application default
     // credentials gcloud writes name.
     let here = &std::env::current_dir;
+    // `scripts/controls/expanded-vars.row` switches botocore's reading off.
+    let aws_reading = BOTOCORE;
     let moved_aws = [
-        expanded(env, AWS_CONFIG, &homes, here)?,
-        expanded(env, AWS_CREDENTIALS, &homes, here)?,
+        expanded(env, AWS_CONFIG, aws_reading, &homes, here)?,
+        expanded(env, AWS_CREDENTIALS, aws_reading, &homes, here)?,
     ]
     .concat();
-    let moved_gcloud = expanded(env, GCLOUD_CONFIG, &homes, here)?;
+    let moved_gcloud = expanded(env, GCLOUD_CONFIG, GCLOUD, &homes, here)?;
     out.extend(moved_aws.iter().chain(&moved_gcloud).cloned());
+    // `scripts/controls/azure-config-dir.row` switches this off.
+    out.extend(expanded(env, AZURE_CONFIG, AZ, &homes, here)?);
     let mut aws: Vec<PathBuf> = homes
         .iter()
         .flat_map(|home| [home.join(".aws/config"), home.join(".aws/credentials")])
@@ -850,10 +1136,11 @@ pub fn home_secrets(
     for dir in &gcloud {
         let defaults = dir.join("application_default_credentials.json");
         // `scripts/controls/gcp-default-credentials.row` switches this off.
-        out.extend(google_token_files(&defaults, &std::env::current_dir)?);
+        let fix = "remove it";
+        out.extend(google_token_files(&defaults, fix, env, &homes, here)?);
         let certificates = dir.join("certificate_config.json");
         // `scripts/controls/gcp-default-certificates.row` switches this off.
-        out.extend(google_certificate_files(&certificates, here)?);
+        out.extend(google_certificate_files(&certificates, fix, here)?);
     }
     out.sort();
     out.dedup();
@@ -4986,13 +5273,13 @@ mod tests {
             "/home/dev/.ssh",
             "/home/dev/.cargo/credentials.toml",
         ] {
-            assert!(has(&secrets, path), "{path}: {secrets:?}");
+            assert!(has(&secrets, path), "{path} is not among the denied places");
         }
         // Cargo reads its config in every directory above a project, so it
         // stays readable; the tokens are in its credentials.
         assert!(
             !has(&secrets, "/home/dev/.cargo/config.toml"),
-            "{secrets:?}"
+            "cargo's config.toml is among the denied places"
         );
         // With no home at all, nothing runs.
         assert!(home_secrets(&env(&[]), None).is_err());
@@ -5066,10 +5353,13 @@ mod tests {
             "/azcfg",
             "/gcp/certificate_config.json",
         ] {
-            assert!(has(&secrets, path), "{path}: {secrets:?}");
+            assert!(has(&secrets, path), "{path} is not among the denied places");
         }
         assert!(!has(&secrets, "relative"));
-        assert!(!has(&secrets, "/opt/cargo/config.toml"), "{secrets:?}");
+        assert!(
+            !has(&secrets, "/opt/cargo/config.toml"),
+            "cargo's config.toml is among the denied places"
+        );
     }
 
     /// A workload token file a variable names in a projected volume, as
@@ -5163,7 +5453,7 @@ mod tests {
             let named = dir.join(config).display().to_string();
             let env =
                 |name: &str| (name == GOOGLE_CREDENTIALS).then(|| std::ffi::OsString::from(&named));
-            let found = token_files(&env, &here).expect("found");
+            let found = token_files(&env, &[], &here).expect("found");
             assert!(
                 found.contains(&dir.join(config)),
                 "the credentials are not among the denied places"
@@ -5227,7 +5517,7 @@ mod tests {
         ] {
             let named = dir.join(file).display().to_string();
             let env = |name: &str| (name == variable).then(|| std::ffi::OsString::from(&named));
-            let found = token_files(&env, &here).expect("found");
+            let found = token_files(&env, &[], &here).expect("found");
             for file in &wanted {
                 assert!(
                     found.contains(file),
@@ -5236,48 +5526,248 @@ mod tests {
                 );
             }
         }
+        // Named under `~`, as google-auth expands it: by either variable, and
+        // by the credentials' certificate_config_location.
+        let under_home = serde_json::json!({
+            "type": "external_account",
+            "credential_source": {"certificate": {
+                "certificate_config_location": "~/certificate_config.json",
+            }},
+        });
+        let home_credentials = dir.join("credentials-home.json");
+        std::fs::write(&home_credentials, under_home.to_string()).expect("config");
+        let homes = std::slice::from_ref(&dir);
+        let home_credentials_s = home_credentials.display().to_string();
+        for (variable, named) in [
+            (GOOGLE_CREDENTIALS, home_credentials_s.as_str()),
+            (GOOGLE_CERTIFICATES, "~/certificate_config.json"),
+            (GOOGLE_CERTIFICATES_FALLBACK, "~/certificate_config.json"),
+        ] {
+            let env = |name: &str| (name == variable).then(|| std::ffi::OsString::from(named));
+            let found = token_files(&env, homes, &here).expect("found");
+            for file in &wanted {
+                assert!(
+                    found.contains(file),
+                    "{variable} under ~: {} is not among the denied places",
+                    file.display()
+                );
+            }
+        }
+        // One that cannot be read for a reason other than not being there,
+        // under a directory this user may not search, refuses, naming what
+        // to point elsewhere.
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .expect("mode");
+        let in_locked = serde_json::json!({
+            "credential_source": {"certificate": {
+                "certificate_config_location": "~/locked/certificate_config.json",
+            }},
+        });
+        let locked_credentials = dir.join("credentials-locked.json");
+        std::fs::write(&locked_credentials, in_locked.to_string()).expect("config");
+        let locked_credentials_s = locked_credentials.display().to_string();
+        for (variable, named, fix) in [
+            (
+                GOOGLE_CERTIFICATES_FALLBACK,
+                "~/locked/certificate_config.json",
+                format!("point {GOOGLE_CERTIFICATES_FALLBACK} at a file that can be read"),
+            ),
+            (
+                GOOGLE_CREDENTIALS,
+                locked_credentials_s.as_str(),
+                format!(
+                    "point the certificate_config_location in {} at a file that can be read",
+                    locked_credentials.display()
+                ),
+            ),
+        ] {
+            let env = |name: &str| (name == variable).then(|| std::ffi::OsString::from(named));
+            let refused = token_files(&env, homes, &here).expect_err("refused");
+            assert!(
+                refused.starts_with(&format!(
+                    "{} could not be read as a Google certificate configuration (this user may \
+                     not read it",
+                    locked.join("certificate_config.json").display()
+                )) && refused.ends_with(&fix),
+                "{variable}: {refused}"
+            );
+        }
+        std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .expect("mode");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The variables that move AWS's and gcloud's configuration are read as
-    /// botocore and gcloud read them: under `~/` and `$HOME/` in each home,
-    /// and relative to the working directory, which, unknown, refuses.
+    /// The variables that move AWS's, gcloud's and Azure's configuration,
+    /// Google's certificate configuration and a systemd service's
+    /// credentials are found as their tools read them: botocore's with
+    /// `$VAR` and `${VAR}` expanded from atomic's environment, then `~`;
+    /// gcloud's and Azure's as written, relative to the working directory,
+    /// and under each home where they start `~/`; Google's certificate
+    /// configuration with `~` expanded under each home, the variable it
+    /// falls back to as well.
     #[test]
     fn moved_configurations_are_found_as_their_tools_read_them() {
+        let vars = [
+            ("HOME", "/nowhere/h"),
+            ("CFG", "/nowhere/cfg"),
+            (AWS_CONFIG, "$CFG/aws-config"),
+            (AWS_CREDENTIALS, "${HOME}/moved/creds"),
+            (GCLOUD_CONFIG, "~/gcloud-moved"),
+            (AZURE_CONFIG, "~/azure-moved"),
+            (GOOGLE_CERTIFICATES, "~/wif/cert_config.json"),
+            (
+                GOOGLE_CERTIFICATES_FALLBACK,
+                "/nowhere/ctx/cert_config.json",
+            ),
+            ("CREDENTIALS_DIRECTORY", "/nowhere/creds/atomic.service"),
+        ];
         let env = |name: &str| {
-            match name {
-                AWS_CONFIG => Some("~/moved/aws-config"),
-                AWS_CREDENTIALS => Some("${HOME}/moved/aws-credentials"),
-                GCLOUD_CONFIG => Some("relative/gcloud"),
-                _ => None,
-            }
-            .map(std::ffi::OsString::from)
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| std::ffi::OsString::from(v))
         };
-        let homes = [PathBuf::from("/nowhere/a"), PathBuf::from("/nowhere/b")];
+        let places = home_secrets(&env, Some("/nowhere/p".into())).expect("homes");
+        let cwd = std::env::current_dir().expect("cwd");
+        let wanted = [
+            // botocore: `$CFG` expanded.
+            PathBuf::from("/nowhere/cfg/aws-config"),
+            // `${HOME}` expanded, and under the password database's home.
+            PathBuf::from("/nowhere/h/moved/creds"),
+            PathBuf::from("/nowhere/p/moved/creds"),
+            // gcloud and az read the name as written, from where they run.
+            cwd.join("~/gcloud-moved"),
+            PathBuf::from("/nowhere/h/gcloud-moved"),
+            PathBuf::from("/nowhere/p/gcloud-moved"),
+            cwd.join("~/azure-moved"),
+            PathBuf::from("/nowhere/h/azure-moved"),
+            PathBuf::from("/nowhere/p/azure-moved"),
+            // google-auth expands `~`.
+            PathBuf::from("/nowhere/h/wif/cert_config.json"),
+            PathBuf::from("/nowhere/p/wif/cert_config.json"),
+            PathBuf::from("/nowhere/ctx/cert_config.json"),
+            // systemd's.
+            PathBuf::from("/nowhere/creds/atomic.service"),
+            PathBuf::from("/run/credentials"),
+        ];
+        for place in &wanted {
+            assert!(
+                places.contains(place),
+                "{} is not among the denied places",
+                place.display()
+            );
+        }
+        // google-auth reads no certificate configuration as written.
+        assert!(
+            !places.contains(&cwd.join("~/wif/cert_config.json")),
+            "the certificate configuration is read under ~ as written"
+        );
+        // A variable atomic's environment does not hold is left as written,
+        // as botocore leaves it; and a relative name refuses where the
+        // working directory is unknown.
+        let unknown =
+            |name: &str| (name == AWS_CONFIG).then(|| std::ffi::OsString::from("$NOPE/aws-config"));
         let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
         assert_eq!(
-            expanded(&env, AWS_CONFIG, &homes, &here),
-            Ok(vec![
-                PathBuf::from("/nowhere/a/moved/aws-config"),
-                PathBuf::from("/nowhere/b/moved/aws-config"),
-            ])
-        );
-        assert_eq!(
-            expanded(&env, AWS_CREDENTIALS, &homes, &here).map(|p| p.len()),
-            Ok(2)
-        );
-        assert_eq!(
-            expanded(&env, GCLOUD_CONFIG, &homes, &here),
-            Ok(vec![PathBuf::from("/work/relative/gcloud")])
+            expanded(&unknown, AWS_CONFIG, BOTOCORE, &[], &here),
+            Ok(vec![PathBuf::from("/work/$NOPE/aws-config")])
         );
         let gone = || -> std::io::Result<PathBuf> {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         };
-        let refused = expanded(&env, GCLOUD_CONFIG, &homes, &gone).expect_err("refused");
+        let refused = expanded(&unknown, AWS_CONFIG, BOTOCORE, &[], &gone).expect_err("refused");
         assert!(
-            refused.starts_with("CLOUDSDK_CONFIG names relative/gcloud"),
+            refused.starts_with("AWS_CONFIG_FILE names $NOPE/aws-config relative to"),
             "{refused}"
         );
+    }
+
+    /// `$VAR`, `${VAR}` and `~` are expanded as Python's `os.path` expands
+    /// them on POSIX, byte for byte.
+    #[test]
+    fn names_are_expanded_as_python_expands_them() {
+        let env = |name: &str| {
+            match name {
+                "A" => Some("/a"),
+                "EMPTY" => Some(""),
+                "DOLLAR" => Some("$A"),
+                "1" => Some("one"),
+                "HOME" => Some("/home/u/"),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let vars = |text: &str| {
+            String::from_utf8(expand_vars(text.as_bytes(), &env).expect("expanded")).expect("utf8")
+        };
+        for (text, wanted) in [
+            ("$A/x", "/a/x"),
+            ("${A}/x", "/a/x"),
+            ("$A$A", "/a/a"),
+            // The longest run of letters, digits and `_` is the name.
+            ("$Ab/x", "$Ab/x"),
+            ("$1", "one"),
+            ("${EMPTY}x", "x"),
+            // Unknown, unclosed, empty or alone: left as written.
+            ("$NOPE/x", "$NOPE/x"),
+            ("${NOPE}/x", "${NOPE}/x"),
+            ("${A", "${A"),
+            ("${}", "${}"),
+            ("x$", "x$"),
+            ("$-x", "$-x"),
+            // What is put in is not read again.
+            ("$DOLLAR", "$A"),
+            ("no variables", "no variables"),
+        ] {
+            assert_eq!(vars(text), wanted, "{text}");
+        }
+        let bad = [b'$', b'{', 0xff, b'}'];
+        let refused = expand_vars(&bad, &env).expect_err("refused");
+        assert!(refused.contains("that is not UTF-8"), "{refused}");
+        let user = |text: &str, homes: &[PathBuf]| {
+            expand_user(text.as_bytes(), &env, homes).map(|all| {
+                all.into_iter()
+                    .map(|b| String::from_utf8(b).expect("utf8"))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let homes = [PathBuf::from("/home/p")];
+        assert_eq!(
+            user("~/x", &homes),
+            Ok(vec!["/home/u/x".to_owned(), "/home/p/x".to_owned()])
+        );
+        assert_eq!(
+            user("~", &homes),
+            Ok(vec!["/home/u".to_owned(), "/home/p".to_owned()])
+        );
+        assert_eq!(user("x/~", &homes), Ok(vec!["x/~".to_owned()]));
+        let refused = user("~bob/x", &homes).expect_err("refused");
+        assert!(
+            refused.contains("under the home of the user bob, which atomic does not look up"),
+            "{refused}"
+        );
+        // `HOME` as Python takes it: `/` is stripped to nothing, a relative
+        // one stays relative, and with no home at all nothing is expanded.
+        for (home, wanted) in [("/", "/"), ("rel", "rel"), ("", "/")] {
+            let env = |name: &str| (name == "HOME").then(|| std::ffi::OsString::from(home));
+            let got = expand_user(b"~", &env, &[]).expect("expanded");
+            assert_eq!(got, vec![wanted.as_bytes().to_vec()], "HOME={home}");
+        }
+        let nothing = |_: &str| None;
+        let refused = expand_user(b"~/x", &nothing, &[]).expect_err("refused");
+        assert!(refused.contains("which is unknown"), "{refused}");
+        // Bytes that are not UTF-8 are kept as they are.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            let name = std::ffi::OsStr::from_bytes(b"$A/\xff");
+            let read = read_as(name, BOTOCORE, &env, &[]).expect("read");
+            assert_eq!(
+                read,
+                vec![PathBuf::from(std::ffi::OsStr::from_bytes(b"/a/\xff"))]
+            );
+        }
     }
 
     /// The web identity token file an AWS profile names, and not a variable,
@@ -5391,7 +5881,7 @@ mod tests {
         let dir = std::fs::canonicalize(scratch("config-refused")).expect("real");
         let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/work")) };
         let google = |name: &str| {
-            google_token_files(&dir.join(name), &here)
+            google_token_files(&dir.join(name), "fix", &|_: &str| None, &[], &here)
                 .err()
                 .unwrap_or_default()
         };
@@ -5401,14 +5891,17 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(
-            google_token_files(&dir.join("missing"), &here),
+            google_token_files(&dir.join("missing"), "fix", &|_: &str| None, &[], &here),
             Ok(Vec::new())
         );
         // A device, as /dev/null is when a variable turns a configuration
         // off, names nothing and is not opened.
         let null = Path::new("/dev/null");
         assert_eq!(aws_profile_token_files(null, &[], &here), Ok(Vec::new()));
-        assert_eq!(google_token_files(null, &here), Ok(Vec::new()));
+        assert_eq!(
+            google_token_files(null, "fix", &|_: &str| None, &[], &here),
+            Ok(Vec::new())
+        );
         // One this user may not read is refused, saying so.
         std::fs::write(dir.join("theirs"), "[default]\n").expect("theirs");
         std::fs::set_permissions(
@@ -5438,7 +5931,7 @@ mod tests {
             google("number.json")
         );
         let certificates = |name: &str| {
-            google_certificate_files(&dir.join(name), &here)
+            google_certificate_files(&dir.join(name), "fix", &here)
                 .err()
                 .unwrap_or_default()
         };
@@ -5566,7 +6059,7 @@ mod tests {
             (name == "AWS_WEB_IDENTITY_TOKEN_FILE").then(|| std::ffi::OsString::from(&named))
         };
         let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/")) };
-        let found = token_files(&env, &here).expect("found");
+        let found = token_files(&env, &[], &here).expect("found");
         assert!(found.contains(&volume), "the volume is denied");
         assert!(found.contains(&volume.join("token")), "the token is denied");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5583,7 +6076,7 @@ mod tests {
         let gone = || -> std::io::Result<PathBuf> {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         };
-        let refused = token_files(&env, &gone).expect_err("refused");
+        let refused = token_files(&env, &[], &gone).expect_err("refused");
         assert!(
             refused.starts_with(
                 "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE names the token file tokens/pod"
@@ -5800,7 +6293,15 @@ mod tests {
         let built = [place.clone(), real(&skills)];
         for places in [None, Some(std::slice::from_ref(&place))] {
             let late = late_link_targets(&built, places, &[], &[]).expect("walked");
-            assert_eq!(late, Late::default(), "{places:?}: {late:?}");
+            assert!(
+                late == Late::default(),
+                "something new is found, with the places {}",
+                if places.is_some() {
+                    "carried"
+                } else {
+                    "inferred"
+                }
+            );
         }
     }
 
