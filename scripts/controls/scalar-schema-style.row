@@ -1,0 +1,1 @@
+scalar-schema-style|tools/yaml_scalar.py|    if style is not None:|    if False and style is not None:|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does
