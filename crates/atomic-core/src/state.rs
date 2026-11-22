@@ -1223,7 +1223,7 @@ pub(crate) fn refuse_stranded(
         .unwrap_or_default();
     Err(format!(
         "{what} are kept in {current_text} now, {new}, and an older atomic kept them in \
-         {legacy_text}, {old}: {fix} to keep using them, or set ATOMIC_HOME to a directory \
+         {legacy_text}, {old}: {fix}, to keep using them, or set ATOMIC_HOME to a directory \
          that holds them in its `{leaf}` directory"
     ))
 }
@@ -3332,7 +3332,7 @@ mod tests {
                 "credentials are kept in {sealed} now, which cannot be read (Permission denied \
                  (os error 13)), and an older atomic kept them in {legacy}, which still holds \
                  them: change the permissions of {sealed} so that atomic can read it, then move \
-                 everything in {legacy} into it to keep using them, or set ATOMIC_HOME to a \
+                 everything in {legacy} into it, to keep using them, or set ATOMIC_HOME to a \
                  directory that holds them in its `sealed` directory",
                 sealed = sealed.display(),
                 legacy = legacy.display(),
