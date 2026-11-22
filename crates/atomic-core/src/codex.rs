@@ -1647,6 +1647,20 @@ fn real_spelling(path: &Path) -> PathBuf {
     }
 }
 
+/// The directory of `writable` that a denied place which is itself a link,
+/// at `link`, sits inside, at any depth. The sandbox mounts its denial on
+/// what the link points at, not on the link, so a command that may write
+/// there could remove the link, and once the list no longer finds it, read
+/// what it pointed at by its own path.
+#[cfg(any(target_os = "linux", test))]
+fn writable_holding_link<'a>(writable: &'a [PathBuf], link: &Path) -> Option<&'a PathBuf> {
+    let at = match (link.parent(), link.file_name()) {
+        (Some(parent), Some(name)) => real_spelling(parent).join(name),
+        _ => link.to_owned(),
+    };
+    writable.iter().find(|w| at.starts_with(w))
+}
+
 /// The first of the directories above `path` that is a link inside one of
 /// `writable`, which a command could point elsewhere.
 fn rewritable_link(path: &Path, writable: &[PathBuf]) -> Option<PathBuf> {
@@ -2839,6 +2853,19 @@ fn late_targets(
         }
         Ok(())
     };
+    // A denied place that is a link inside a directory the command may write,
+    // as when the list is built.
+    let refuse_link_in_writable = |link: &Path| -> anyhow::Result<()> {
+        if let Some(root) = writable_holding_link(&writable, link) {
+            bail!(DenyRefused(format!(
+                "{} is now a link inside {}, which this command may write, so it could remove \
+                 it and then read what it points at by its own path",
+                link.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
     let mut late = Late::default();
     // A denied entry that is now a link, however it is spelled: the list
     // never holds one, and the sandbox cannot mount on one. Its denial is
@@ -2848,6 +2875,7 @@ fn late_targets(
             continue;
         }
         late.replaced.push(entry.clone());
+        refuse_link_in_writable(entry)?;
         let Some(target) = resolved(entry)? else {
             continue;
         };
@@ -2870,6 +2898,7 @@ fn late_targets(
             // A place that is a link: refused when it leads to what the
             // command needs, whatever that is, or deep inside a directory it
             // may write, as when the list is built.
+            refuse_link_in_writable(place)?;
             let Some(target) = resolved(place)? else {
                 continue;
             };
@@ -6000,6 +6029,44 @@ mod tests {
                 && refused.contains("two or more levels"),
             "{refused}"
         );
+    }
+
+    /// A place that has become a link inside a directory the command may
+    /// write is refused when the helper walks again, whether the list denies
+    /// the place itself or carries it as a place.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_became_a_link_inside_a_writable_root_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("late-link-in-writable");
+        std::fs::create_dir_all(dir.join("work")).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        let kept = dir.join("elsewhere/kube");
+        std::fs::write(&kept, "token").expect("kept");
+        let place = dir.join("work/kubeconfig");
+        let _ = std::fs::remove_file(&place);
+        link(&kept, &place);
+        let work = [dir.join("work")];
+        let only = std::slice::from_ref(&place);
+        // Denied as an entry of the list, carried as no place.
+        let refused = late_link_targets(only, Some(&[]), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Carried as a place, the list denying what it pointed at.
+        let built = [std::fs::canonicalize(&kept).expect("real")];
+        let refused = late_link_targets(&built, Some(only), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Outside every directory it may write, the target replaces it.
+        assert!(late_link_targets(only, Some(only), &[], &[dir.join("elsewhere-not")]).is_ok());
     }
 
     /// What the late walk finds is denied once, the outer of nested ones

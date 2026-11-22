@@ -1,0 +1,1 @@
+redact-os-error-tail|crates/atomic-core/src/redact.rs|        if let Some(len) = error_len {|        if let Some(len) = error_len.and(None::<usize>) { // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::a_secret_after_an_os_error_under_a_secrets_name_is_hidden
