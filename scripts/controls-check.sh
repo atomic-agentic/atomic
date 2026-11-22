@@ -262,7 +262,8 @@ run_cargo() {
     # shellcheck disable=SC2086
     # Every test binary runs, however an earlier one ends: a row may name
     # tests in several, and each must be seen to fail.
-    cargo test --locked --no-fail-fast ${1} >"${LOG}" 2>&1 &
+    # Plain text, whatever CARGO_TERM_COLOR says, so the log reads as grepped.
+    cargo test --locked --no-fail-fast --color never ${1} >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?
