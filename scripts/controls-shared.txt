@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Test helpers outside crates/<c>/tests/ that the controls rows' tests share,
+# one per line, with the rows each serves:
+#
+#   <path>: --test             every row with a --test target
+#   <path>: feature=<name>     every row whose features turn <name> on
+#                              (--all-features turns every one on)
+#   <path>: package=<name>     every row that builds that package, with -p
+#                              or as part of --workspace
+#
+# A change to a helper listed here touches those rows, so CI's Controls
+# workflow runs them (scripts/controls-touched.py). A helper that is not
+# there, or a line that cannot be read, fails the workflow's plan.
+
+# The scripted fake model and its test seams: atomic-core's own unit tests
+# build it, and the packages whose dev-dependency on atomic-core turns
+# fake-model on build it into theirs.
+crates/atomic-core/src/testing.rs: --test feature=fake-model package=atomic-agentic-core package=atomic-agentic package=atomic-agentic-atoms
+# The Postgres test schema.
+crates/atomic-durable/src/testing.rs: feature=postgres-tests

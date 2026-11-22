@@ -745,6 +745,115 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
     );
 }
 
+/// The request head [`write_request`] is given, which is the one the probe
+/// builds for `addr`.
+fn request_head(addr: SocketAddr) -> Vec<u8> {
+    format!("GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n").into_bytes()
+}
+
+/// A writer that keeps every write call it is given, so how many writes there
+/// were and what each held are read back rather than guessed at from timing.
+#[derive(Default)]
+struct Writes(Vec<Vec<u8>>);
+
+impl Write for Writes {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.push(buf.to_vec());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A writer that refuses every write, so the error `write_request` hands back
+/// is the writer's own.
+struct Refuses;
+
+impl Write for Refuses {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("this writer refuses every write"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// That the probe's request goes out as one write: the writer is asked exactly
+/// once, and that one call holds every byte of the request head, ending with
+/// the blank line that ends it. So a server that answers what its first read
+/// gets, and closes with the rest unread, has the whole request. The counting
+/// writer sees each call as it happens, which is what makes this a fact about
+/// the code rather than about timing: a request written in pieces is asked for
+/// once per piece however fast the machine, on any number of CPUs and under
+/// any load. The last assertion shows that a writer which refuses hands back
+/// its own error, which is what `probe_within` turns into a `None`, meaning
+/// "not detected", for a request that never went out.
+#[test]
+fn probe_puts_the_request_head_on_one_write() {
+    let addr: SocketAddr = "127.0.0.1:11434".parse().expect("addr");
+    let head = request_head(addr);
+    let mut written = Writes::default();
+    write_request(&mut written, &head).expect("the one write");
+    let Writes(calls) = &written;
+    assert_eq!(
+        calls.len(),
+        1,
+        "the request went out in {} writes, not one: {calls:?}",
+        calls.len()
+    );
+    assert_eq!(calls[0], head, "the one write was not the request head");
+    assert!(
+        calls[0].ends_with(b"\r\n\r\n"),
+        "the one write did not end the request head: {:?}",
+        String::from_utf8_lossy(&calls[0])
+    );
+    let refused = write_request(&mut Refuses, &head).expect_err("a refused write stays refused");
+    assert_eq!(
+        refused.to_string(),
+        "this writer refuses every write",
+        "the writer's own error is what comes back"
+    );
+}
+
+/// The probe over loopback against the fake Ollama, which reads the request
+/// one byte at a time until its blank line: what the probe sends reaches a
+/// server as that request, and the answer comes back. The `Host` assertion is
+/// what ties it to the bytes [`probe_puts_the_request_head_on_one_write`]
+/// counts, since those are built from the address the probe was given.
+///
+/// This test says nothing about how many writes carried the request: a server
+/// that reads to the end of the head takes every write however many there
+/// were, so that is guarded by the counting test alone.
+#[test]
+fn the_probe_sends_a_request_a_server_can_end_reading() {
+    let (addr, told) = fake_ollama(|stream| {
+        let body = r#"{"models":[{"name":"one:latest"}]}"#;
+        let _ = stream.write_all(
+            format!(
+                "HTTP/1.0 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        );
+    });
+    assert_eq!(probe_ollama(addr), Some(vec!["one:latest".to_string()]));
+    let head = told
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the stand-in never read the request");
+    let addr_text = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Host: "))
+        .expect("the request names its Host");
+    assert!(
+        head.starts_with("GET /api/tags HTTP/1.0\r\n") && head.ends_with("\r\n\r\n"),
+        "not the request the probe sends: {head:?}"
+    );
+    // The Host is the address the probe was given, which is what the counting
+    // test's expected bytes are built from.
+    assert_eq!(addr_text, addr.to_string(), "the Host names another addr");
+}
+
 #[test]
 fn a_key_goes_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_too() {
     let d = dir(&[(

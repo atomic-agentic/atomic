@@ -10,5 +10,3 @@
 # rather than running it, so it stays a local duty: run it with
 # scripts/controls-check.sh as docs/development.md describes and quote its
 # result line. scripts/controls-touched.py refuses a line naming no row.
-
-sandbox-second-mounts: its switch no longer bites, on a runner or locally; pending its re-point to the site that now guards it
