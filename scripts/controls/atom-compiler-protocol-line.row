@@ -1,1 +1,1 @@
-atom-compiler-protocol-line|crates/atomic-core/assets/worker.mjs|console.log=|if(0)console.log=|-p atomic-agentic-core --lib -- atom::tests::a_source_the_compiler_faults_on_fails_the_load
+atom-compiler-protocol-line|crates/atomic-core/src/compiler_host/host.js|  const log = (...args) => print(`${args.map(show).join(' ')}\n`, true);|  const log = (...args) => print(`${args.map(show).join(' ')}\n`, false);|-p atomic-agentic-core --lib -- atom::tests::a_source_the_compiler_faults_on_fails_the_load
