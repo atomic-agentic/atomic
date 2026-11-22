@@ -542,6 +542,34 @@ fn gate_from_row(row: &Row) -> Result<Gate> {
     })
 }
 
+/// The gates with the project of each one's run, as `rp`, for
+/// [`FOR_PROJECT`].
+const SCOPED_GATES: &str = "atomic_gates g LEFT JOIN atomic_gate_questions q ON q.gate_id = g.gate_id \
+     LEFT JOIN atomic_run_projects rp ON rp.run_id = g.run";
+
+/// The condition on a [`SCOPED_GATES`] row that its run is of the project
+/// its one parameter, [`project_param`], names: on a store several projects
+/// share, no project lists, reads or decides another's gates.
+const FOR_PROJECT: &str = "COALESCE(rp.project, '') = ?";
+
+/// The parameter [`FOR_PROJECT`] takes for runtime `project`: a gate of a
+/// run for no project is seen only by a runtime for none.
+fn project_param(project: Option<&str>) -> Param {
+    Param::Text(project.unwrap_or_default().to_owned())
+}
+
+/// Gate `id`, if its run is of the project `project` names.
+async fn read_own_gate(tx: &mut Tx<'_, '_>, id: &str, project: &Param) -> Result<Option<Gate>> {
+    let sql = format!("SELECT {COLUMNS} FROM {SCOPED_GATES} WHERE g.gate_id = ? AND {FOR_PROJECT}");
+    match tx
+        .query_opt(&sql, &[Param::Text(id.to_owned()), project.clone()])
+        .await?
+    {
+        Some(row) => Ok(Some(gate_from_row(&row)?)),
+        None => Ok(None),
+    }
+}
+
 async fn read_gate(tx: &mut Tx<'_, '_>, id: &str) -> Result<Option<Gate>> {
     let sql = format!("SELECT {COLUMNS} FROM {GATES} WHERE g.gate_id = ?");
     match tx.query_opt(&sql, &[Param::Text(id.to_owned())]).await? {
@@ -886,10 +914,16 @@ pub async fn decide<R: DurableRuntime>(
     let request = request_digest(&by, &cmd);
     let gate_id = cmd.gate.clone();
     let credential = credential.clone();
+    let project = project_param(rt.project());
     let (recorded, run) = rt
         .control_transaction(move |mut tx| {
-            let (cmd, by, request, credential) =
-                (cmd.clone(), by.clone(), request.clone(), credential.clone());
+            let (cmd, by, request, credential, project) = (
+                cmd.clone(),
+                by.clone(),
+                request.clone(),
+                credential.clone(),
+                project.clone(),
+            );
             Box::pin(async move {
                 match credential::verify(&mut tx, &credential).await? {
                     credential::Verified::Yes => {}
@@ -900,15 +934,16 @@ pub async fn decide<R: DurableRuntime>(
                         return Ok((Err(DecideError::BadCredential(by)), None));
                     }
                 }
+                // Another project's gate is, to this one, no gate at all:
+                // checked before anything is read back of a decision on it.
+                let Some(gate) = read_own_gate(&mut tx, &cmd.gate, &project).await? else {
+                    return Ok((Err(DecideError::NoSuchGate(cmd.gate.clone())), None));
+                };
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
                     // A replay: wake the run again, in case the first time
                     // stopped before it did.
-                    let run = read_gate(&mut tx, &cmd.gate).await?.map(|g| g.run);
-                    return Ok((found, run));
+                    return Ok((found, Some(gate.run)));
                 }
-                let Some(gate) = read_gate(&mut tx, &cmd.gate).await? else {
-                    return Ok((Err(DecideError::NoSuchGate(cmd.gate.clone())), None));
-                };
                 if !gate.approvers.contains(&by) {
                     return Ok((
                         Err(DecideError::NotAnApprover {
@@ -1106,11 +1141,13 @@ async fn wake<R: DurableRuntime>(rt: &R, run: &str, gate: &str) -> Result<()> {
 
 /// Every gate the filter selects, oldest first.
 pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<Gate>> {
+    let project = project_param(rt.project());
     rt.read_transaction(move |mut tx| {
-        let filter = filter.clone();
+        let (filter, project) = (filter.clone(), project.clone());
         Box::pin(async move {
-            let mut sql = format!("SELECT {COLUMNS} FROM {GATES} WHERE 1 = 1");
-            let mut ps = Vec::new();
+            // Only the runtime's project's gates.
+            let mut sql = format!("SELECT {COLUMNS} FROM {SCOPED_GATES} WHERE {FOR_PROJECT}");
+            let mut ps = vec![project];
             if filter.open_only {
                 sql.push_str(" AND g.state = 'open'");
             }
@@ -1129,12 +1166,12 @@ pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<
     .await
 }
 
-/// One gate, if it exists.
+/// One gate, if it exists and its run is of the runtime's project.
 pub async fn find<R: DurableRuntime>(rt: &R, id: &str) -> Result<Option<Gate>> {
-    let id = id.to_owned();
+    let (id, project) = (id.to_owned(), project_param(rt.project()));
     rt.control_transaction(move |mut tx| {
-        let id = id.clone();
-        Box::pin(async move { read_gate(&mut tx, &id).await })
+        let (id, project) = (id.clone(), project.clone());
+        Box::pin(async move { read_own_gate(&mut tx, &id, &project).await })
     })
     .await
 }
@@ -1147,15 +1184,22 @@ pub async fn find<R: DurableRuntime>(rt: &R, id: &str) -> Result<Option<Gate>> {
 pub async fn redeliver<R: DurableRuntime>(rt: &R) -> Result<usize> {
     // Only resolved gates of unfinished runs, chosen in one query: a
     // server asks every few seconds, and finished runs' gates pile up.
+    // Only the runtime's project's runs.
+    let project = project_param(rt.project());
     let waiting: Vec<(String, String)> = rt
-        .control_transaction(|mut tx| {
+        .control_transaction(move |mut tx| {
+            let project = project.clone();
             Box::pin(async move {
                 let rows = tx
                     .query_all(
-                        "SELECT g.gate_id AS gate_id, g.run AS run FROM atomic_gates g \
-                         JOIN workflow_status w ON w.workflow_uuid = g.run \
-                         WHERE g.state <> 'open' AND w.status IN ('PENDING', 'ENQUEUED')",
-                        &[],
+                        &format!(
+                            "SELECT g.gate_id AS gate_id, g.run AS run FROM atomic_gates g \
+                             JOIN workflow_status w ON w.workflow_uuid = g.run \
+                             LEFT JOIN atomic_run_projects rp ON rp.run_id = g.run \
+                             WHERE g.state <> 'open' AND w.status IN ('PENDING', 'ENQUEUED') \
+                             AND {FOR_PROJECT}"
+                        ),
+                        &[project],
                     )
                     .await?;
                 rows.iter()
@@ -1174,7 +1218,18 @@ pub async fn redeliver<R: DurableRuntime>(rt: &R) -> Result<usize> {
 /// this content for as long as the gate's decision and its run's recovery
 /// may need it.
 pub async fn pinned_evidence<R: DurableRuntime>(rt: &R) -> Result<Vec<String>> {
-    let mut all: Vec<String> = gates(rt, GateFilter::default())
+    // Every project's gates: a store's content is kept for all of them.
+    let mut all: Vec<String> = rt
+        .read_transaction(|mut tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_all(&format!("SELECT {COLUMNS} FROM {GATES}"), &[])
+                    .await?;
+                rows.iter()
+                    .map(gate_from_row)
+                    .collect::<Result<Vec<Gate>>>()
+            })
+        })
         .await?
         .into_iter()
         .flat_map(|g| g.evidence)
