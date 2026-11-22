@@ -4893,15 +4893,10 @@ mod tests {
         // Where workload identities keep their tokens on Kubernetes.
         let pod = "/var/run/secrets/kubernetes.io/serviceaccount";
         let azure = "/var/run/secrets/azure/tokens";
-        assert!(
-            has(&secrets, pod),
-            "{pod} is not among the {} places",
-            secrets.len()
-        );
+        assert!(has(&secrets, pod), "{pod} is not among the denied places");
         assert!(
             has(&secrets, azure),
-            "{azure} is not among the {} places",
-            secrets.len()
+            "{azure} is not among the denied places"
         );
         for path in [
             "/cfg/gh",
@@ -5094,9 +5089,8 @@ mod tests {
         ] {
             assert!(
                 places.contains(&file),
-                "{} is not among the {} places",
-                file.display(),
-                places.len()
+                "{} is not among the denied places",
+                file.display()
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5125,8 +5119,7 @@ mod tests {
         let places = home_secrets(&env, None).expect("homes");
         assert!(
             places.contains(&dir.join("adc-token")),
-            "adc-token is not among the {} places",
-            places.len()
+            "adc-token is not among the denied places"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
