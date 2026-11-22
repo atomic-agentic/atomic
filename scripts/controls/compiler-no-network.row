@@ -1,0 +1,1 @@
+compiler-no-network|crates/atomic-core/src/compiler_host/host.js|value: (url) => Promise.reject(refused(|value: (url) => Promise.resolve(new globalThis.Response(new Uint8Array(0)), refused(|-p atomic-agentic-core --lib -- compiler_host::tests::fetch_reaches_no_network

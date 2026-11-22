@@ -35,16 +35,20 @@ Linux, exec atoms run in atomic's sandbox, so the sandbox must work where this
 runs (inside scripts/dev.sh, with ATOMIC_DEV_SANDBOX=on). Everything the run
 writes goes under a throwaway directory in the checkout's target/, removed at
 the end unless `--keep` names one. It is never under the system's temporary
-directory, where atomic refuses to put an atom's scratch: a `--keep` there is
-refused.
+directory, where atomic refuses to put an atom's scratch: a work directory
+there is refused, whether `--keep` names it or it is the checkout's own
+`target/`, which is under it when the checkout is.
 
 However the scenario ends, every atomic it started is killed and waited for
 before its directory is removed: on success, on a failed check, on an error,
-on Ctrl-C, and on SIGTERM or SIGHUP, which end it as SystemExit.
+on Ctrl-C, and on SIGTERM or SIGHUP, which end it as SystemExit. A SIGHUP the
+caller already had ignored, as `nohup` leaves it, stays ignored and does not
+stop the scenario.
 
 Exits 0 when every check holds; 1 when any fails; 2 when the scenario could not
 be set up or run, or what atomic recorded is not in the shape this script
-reads; and 128 plus the signal's number when SIGTERM or SIGHUP stops it.
+reads; and 128 plus the signal's number when SIGTERM, or a SIGHUP that was not
+already ignored, stops it.
 """
 
 import argparse
@@ -539,7 +543,12 @@ def scenario(s, fake):
     final = decided[0]
     decision = (final.get("resolution") or {}).get("decided") or {}
     s.check("within the original gate deadline",
-            (final["id"], final["opened_at"], final["deadline"])
+            # A gate recorded without its deadline or its opening time fails
+            # this check rather than reaching the time comparisons after it,
+            # which need both.
+            final["deadline"] is not None
+            and final["opened_at"] is not None
+            and (final["id"], final["opened_at"], final["deadline"])
             == (gate["id"], gate["opened_at"], gate["deadline"])
             and decision.get("verdict") == "approve"
             and isinstance(decision.get("at"), int)
@@ -575,8 +584,11 @@ def main():
     args = parser.parse_args()
     # SIGTERM and SIGHUP end the scenario as an exception does, so what it
     # started is reaped and its directory removed: set before anything starts.
-    for signum in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(signum, stopped)
+    # A caller who started this with nohup has SIGHUP ignored on purpose, to
+    # keep a detached run going when its terminal closes, so leave that alone.
+    signal.signal(signal.SIGTERM, stopped)
+    if signal.getsignal(signal.SIGHUP) is not signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, stopped)
     atomic = os.path.abspath(args.atomic)
     if not os.access(atomic, os.X_OK):
         say(f"v01-gate: no atomic binary at {atomic}; build one, or name it with --atomic")
@@ -584,18 +596,32 @@ def main():
     try:
         if args.keep:
             work = os.path.abspath(args.keep)
-            if under_system_temp(work):
-                say(f"v01-gate: --keep {work} is under the system's temporary directory, where "
-                    "atomic refuses an atom's scratch; name a directory elsewhere, such as "
-                    "target/v01-gate")
-                return 2
-            os.makedirs(work)
         else:
             os.makedirs(TARGET, exist_ok=True)
             work = tempfile.mkdtemp(prefix="v01-gate-", dir=TARGET)
     except OSError as e:
         say(f"v01-gate: no directory to work in: {e}")
         return 2
+    # Either branch's directory, not just a --keep: atomic refuses an atom's
+    # scratch under the system's temporary directory, so a checkout that lives
+    # there would fail the run mid-step rather than here.
+    if under_system_temp(work):
+        if not args.keep:
+            shutil.rmtree(work, ignore_errors=True)  # empty; the one just made
+        say(f"v01-gate: the directory to work in, {work}, is under the system's temporary "
+            "directory, where atomic refuses an atom's scratch; work in a directory "
+            "elsewhere, named with --keep or in a checkout that is not under it")
+        return 2
+    # A --keep directory is made here and nowhere else, so it must not exist
+    # yet: the scenario would write its project/, home/, logs/ and atomic-home/
+    # among what is already there, and a store already under atomic-home/ would
+    # be read as the run's own.
+    if args.keep:
+        try:
+            os.makedirs(work)
+        except OSError as e:
+            say(f"v01-gate: no directory to work in: {e}")
+            return 2
     fake = Fake()
     s = Scenario(atomic, work)
     try:
@@ -611,6 +637,11 @@ def main():
         say(f"v01-gate: what atomic recorded is not in the shape this script reads: {e!r}")
         return 2
     finally:
+        # First: a second SIGTERM or SIGHUP must not cut the cleanup short.
+        # Its default action would end the process mid-reap or mid-removal,
+        # leaving an atomic running and its directory behind.
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, signal.SIG_IGN)
         s.reap()
         fake.stop()
         if not args.keep:

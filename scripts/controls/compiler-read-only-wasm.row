@@ -1,0 +1,1 @@
+compiler-read-only-wasm|crates/atomic-core/src/compiler_host/host.js|if (String(file) === wasmUrl) return Promise.resolve(wasm());|if (String(file) !== '') return Promise.resolve(wasm());|-p atomic-agentic-core --lib -- compiler_host::tests::the_worker_reads_its_own_wasm_and_no_other_file

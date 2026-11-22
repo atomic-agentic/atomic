@@ -186,13 +186,16 @@ if yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG != yaml_scalar.STR_TAG:
     )
 for _tag in yaml_scalar.SCALAR_TAGS:
     SchemaLoader.add_constructor(_tag, strict_scalar)
-# SafeLoader's own constructors are shared by reference until a subclass adds one
-# of its own, and it has a constructor for the timestamp tag: it builds a
-# `datetime.date` for a plain `2026-11-21`, which atomic's loader has no type for
-# at all. Work on a copy, so that SafeLoader and the loader above -- which read the
-# manifests and the eval cases -- keep their dates, and drop that one constructor
-# here, so a plain date is refused by name instead of reaching `json_model` as an
-# object no JSON document can hold.
+# SafeLoader has a constructor for the timestamp tag: it builds a `datetime.date`
+# for a plain `2026-11-21`, which atomic's loader has no type for at all. Drop
+# that one constructor here, so a plain date is refused by name instead of
+# reaching `json_model` as an object no JSON document can hold. A subclass shares
+# its bases' constructors by reference only until it adds one of its own, and the
+# loop just above added five, so the dict popped below is already this loader's
+# own: SafeLoader and the loader above -- which read the manifests and the eval
+# cases -- have kept their dates since that loop, with or without the copy here,
+# which makes the `dict(...)` a harmless restatement of what the pop edits rather
+# than what keeps the dates.
 SchemaLoader.yaml_constructors = dict(SchemaLoader.yaml_constructors)
 SchemaLoader.yaml_constructors.pop(yaml_scalar.TIMESTAMP_TAG, None)
 

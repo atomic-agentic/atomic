@@ -29,8 +29,8 @@ independently validates complete schemas and the allowed expression AST; ordinar
 Astro tooling accepts syntax that Atomic deliberately rejects.
 
 Project-local `node_modules` are not required for running atoms. The shipped compiler
-contains its parser, TypeScript checker and WASM; its host uses pinned Deno 2.9.8.
-The authoring package's npm dependencies are contributor tooling for rebuilding and
+contains its parser, TypeScript checker and WASM; atomic runs it on its embedded V8,
+so no Deno is needed. The authoring package's npm dependencies are contributor tooling for rebuilding and
 testing those assets. The production loader checks fresh virtual declarations even
 when the on-disk editor files are stale.
 

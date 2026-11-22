@@ -12,6 +12,7 @@ pub mod cassette;
 pub mod codex;
 pub mod collections;
 pub mod compile;
+pub mod compiler_host;
 mod compiler_process;
 pub mod config;
 pub mod context;
