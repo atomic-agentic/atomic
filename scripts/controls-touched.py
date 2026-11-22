@@ -13,7 +13,9 @@ can move the switch's text or stop it biting; changes a file whose text, at
 BASE or at HEAD, holds the name of a test the row names (the last `::` part
 of each, read as scripts/controls-check.sh reads them), since a change to the
 guarding test can stop it failing; or changes anything under the row's
-`--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/. The rows
+`--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/, or any
+test code that crate's targets share (crates/<c>/tests/support/, fixtures/
+and the like: a directory there that is no one target's). The rows
 are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
@@ -37,6 +39,7 @@ build, then by name, and cut into N runs of nearly equal length.
 """
 
 import argparse
+import functools
 import os
 import posixpath
 import subprocess
@@ -57,6 +60,7 @@ def git(*args):
     return done.stdout
 
 
+@functools.lru_cache(maxsize=None)
 def exists(commit, path):
     done = subprocess.run(["git", "cat-file", "-e", f"{commit}:{path}"], capture_output=True)
     return done.returncode == 0
@@ -203,9 +207,35 @@ def test_targets(args):
     return [before[i + 1] for i, a in enumerate(before[:-1]) if a == "--test"]
 
 
-def selects(row, changed, contents):
+def shared_test_crates(base, head, changed):
+    """The crates whose shared test code the change touches: a file under
+    crates/<c>/tests/ that belongs to no one test target, such as one in
+    tests/support/ or tests/fixtures/, or a file there that is not Rust. A
+    directory tests/<d>/ belongs to the target <d> when tests/<d>.rs or
+    tests/<d>/main.rs is there, at the base or at the head."""
+    crates = set()
+    for path in changed:
+        parts = path.split("/")
+        if len(parts) < 4 or parts[0] != "crates" or parts[2] != "tests":
+            continue
+        tests = "/".join(parts[:3])
+        if len(parts) == 4:
+            if not parts[3].endswith(".rs"):
+                crates.add(parts[1])
+            continue
+        d = parts[3]
+        owned = any(
+            exists(commit, f"{tests}/{d}.rs") or exists(commit, f"{tests}/{d}/main.rs") for commit in (base, head)
+        )
+        if not owned:
+            crates.add(parts[1])
+    return crates
+
+
+def selects(row, changed, contents, shared, head):
     """Whether a change touches the row: its row file, its file, a file that
-    names one of its tests (at the base or the head), or its --test target."""
+    names one of its tests (at the base or the head), its --test target, or
+    the shared test code of a crate that holds that target."""
     if f"{ROWS}/{row['name']}.row" in changed or row["file"] in changed:
         return True
     tests = {name.rsplit("::", 1)[-1] for name in named_tests(row["args"])}
@@ -217,6 +247,9 @@ def selects(row, changed, contents):
             if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "tests":
                 if parts[3] == f"{target}.rs" or (parts[3] == target and len(parts) > 4):
                     return True
+        for crate in shared:
+            if exists(head, f"crates/{crate}/tests/{target}.rs") or exists(head, f"crates/{crate}/tests/{target}"):
+                return True
     return False
 
 
@@ -241,7 +274,8 @@ def touched(base, head, every=False):
             for commit in (base, head):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
-        names = sorted(name for name, row in rows.items() if selects(row, changed, contents))
+        shared = shared_test_crates(base, head, changed)
+        names = sorted(name for name, row in rows.items() if selects(row, changed, contents, shared, head))
     run = [rows[n] for n in names if n not in local]
     return run, [(n, local[n]) for n in names if n in local], gone
 

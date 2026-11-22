@@ -68,7 +68,7 @@ jobs:
           summary="${GITHUB_STEP_SUMMARY}"
           case "${EVENT}" in
           merge_group)
-            echo "A merge group runs no rows: they passed on its pull request before it joined the queue." | tee -a "${summary}"
+            echo "A merge group runs no rows. Its pull request's own Controls run checked them; once Controls is a required check, a pull request joins the queue only after that run passed." | tee -a "${summary}"
             echo "count=0" >>"${GITHUB_OUTPUT}"
             exit 0
             ;;

@@ -208,6 +208,52 @@ commit
 run
 expect "a change to another --test target" ""
 
+# A change to test code a crate's targets share selects each row whose
+# --test target is in that crate, and only those.
+shared_fixture() {
+    fresh
+    mkdir -p crates/k/tests/support crates/k/tests/t crates/k/tests/u crates/m/tests/fixtures
+    printf 'mod support;\n' >crates/k/tests/t.rs
+    printf 'pub fn help() {}\n' >crates/k/tests/support/mod.rs
+    printf 'pub fn own() {}\n' >crates/k/tests/t/own.rs
+    printf 'fn main() {}\n' >crates/k/tests/u/main.rs
+    printf 'fn m() {}\n' >crates/m/tests/v.rs
+    printf 'data\n' >crates/m/tests/fixtures/one.txt
+    echo 'f|src/one.rs|guard_a();|/*off*/|-p k --test u -- test_f' >scripts/controls/f.row
+    echo 'g|src/one.rs|guard_b();|/*off*/|-p m --test v -- test_g' >scripts/controls/g.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+shared_fixture
+printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
+commit
+run
+expect "a change to a crate's shared test code" "$(printf 'c\nf')"
+off shared 'crates.add(parts[1])
+    return crates' 'pass
+    return crates'
+run
+[ "${OUT}" = "" ] || fail "with the shared test code rule off, a change to it still selected: ${OUT}"
+unset SCRIPT
+
+shared_fixture
+printf 'data, changed\n' >crates/m/tests/fixtures/one.txt
+commit
+run
+expect "a change to a crate's fixtures" "g"
+
+shared_fixture
+printf 'pub fn own() { 1; }\n' >crates/k/tests/t/own.rs
+commit
+run
+expect "a change to one target's own module" "c"
+
+shared_fixture
+printf 'fn main() { 1; }\n' >crates/k/tests/u/main.rs
+commit
+run
+expect "a change to a target's own directory" "f"
+
 # Every row, for a full sweep.
 fresh
 code=0
