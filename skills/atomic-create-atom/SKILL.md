@@ -1,6 +1,6 @@
 ---
 name: atomic-create-atom
-description: Create, change or fix an atomic atom, a typed single-purpose agent written as an `.atom.astro` file with JSON Schema input and output, then check it with the atomic CLI until it is clean. Use when asked to write, add, scaffold or repair an atom or an `.atom.astro` file, or to turn a described task into an atomic agent.
+description: Create, change or fix an atomic atom, a typed single-purpose agent written as an `.atom.astro` file with JSON Schema input and output, then check it with the atomic CLI until it is clean and run its eval cases. Use when asked to write, add, scaffold or repair an atom or an `.atom.astro` file, or to turn a described task into an atomic agent.
 ---
 
 # Create an atom
@@ -41,17 +41,32 @@ Read these before writing, and again when a check fails:
 6. **Write eval cases**: at least two files in `evals/<name>/`, an ordinary
    case and an edge case such as a boundary or an instruction hidden in the
    data. Assert what the task requires, not exact wording.
-7. **Check.** Run `atomic check` from the project root. It stops at the first
-   problem and prints it as `file:line: path: message`. Fix the source and run
-   it again until it prints `checked … Astro atoms and … workflows`. Never edit
-   or suppress anything in `.atomic/types/`: every check regenerates it.
+7. **Check.** Run `atomic check --json` from the project root. It stops at the
+   first problem and prints one JSON object: `error.description` says what is
+   wrong, `error.action` says what to change, and `error.kind` names the kind.
+   Fix the source it names and run it again until it succeeds, printing
+   `checked` with how many atoms, workflows and toolset operations it read, and
+   any `warnings`. Never edit or suppress anything in `.atomic/types/`: every
+   check regenerates it.
 8. **Preview.** Save one case's input as `fixtures/<name>/<case>.input.json`
    and run `atomic render atoms/<name>.atom.astro --input fixtures/<name>/<case>.input.json`.
    No model is called. The `developer` part must hold your instructions and the
    `user` part the input values.
-9. **Report** the files you wrote, the last `atomic check` output and the eval
-   cases. This version of atomic has no eval runner yet: say that the cases
-   were written but not run against a model.
+9. **Eval.** Run `atomic eval <name>` from the project root. It answers each
+   case's model call from the recording beside the cases, in
+   `evals/<name>/cassettes/`, and says whether the atom's pass rate reaches
+   its threshold; a replayed run is a historical check of recorded answers, not
+   a live pass. A replay is keyed by the endpoint and model its recordings were
+   made for, so those are configured as a run would configure them, and it
+   reads no key and sends no call. A case with no
+   recording fails, saying to record it with `atomic eval <name> --live`, which
+   calls the model, so record only when the person has said which endpoint and
+   model to use and that a call is wanted. Read the failing cases it names,
+   then fix the atom, its prompt or the case and run it again.
+10. **Report** the files you wrote, what the last `atomic check --json` and the
+    last `atomic eval <name>` answered, and what each means for the atom. Say
+    plainly whether the eval replayed recordings, recorded new ones or ran no
+    case, and never call a case passing from your own reading of the prompt.
 
 ## Worked example
 
@@ -162,7 +177,12 @@ File `fixtures/extract-actions/two-actions.input.json`:
 {"notes": "Ana will send the budget by Friday. We agreed someone should book the room."}
 ```
 
-From the project root, `atomic check` prints `checked 1 Astro atoms and 0 workflows`.
+From the project root `atomic check --json` prints
+`{"checked":{"atoms":1,"workflows":0,"toolset_operations":0},"warnings":[]}`.
+Neither case has a recording yet: with the endpoint and model configured,
+`atomic eval extract-actions` fails both of them and says to record them with
+`atomic eval extract-actions --live`, which calls the model, and with no
+endpoint configured it says what it needs before it runs either.
 
 ## Rules that matter most
 
