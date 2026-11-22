@@ -209,7 +209,10 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. What Codex records of a project's threads, its state databases and
+may write, or when a denied place is itself a link inside a directory it may
+write, which a command could remove to read what it points at; a place that
+has become such a link since the list was built stops the next command too.
+What Codex records of a project's threads, its state databases and
 its logs, is kept with the project's private state, in the atomic home's
 `private/`, which every project's commands are denied; its Codex home keeps
 no thread records, and its helper links are the only part a turn's shell
