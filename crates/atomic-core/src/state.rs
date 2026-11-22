@@ -428,6 +428,30 @@ impl ProjectState {
         self.dir.join("codex")
     }
 
+    /// Every scratch root of the project's backends: `atomic run`, `atomic
+    /// serve` and `atomic eval`'s, and that of `atomic debug codex-prompt` and
+    /// `atomic debug probe`, which is apart because those commands take no
+    /// execution lock. Each backend denies its
+    /// workspaces' commands all of them, its own scratch directory excepted.
+    /// A backend with a scratch root of its own must be added here.
+    fn scratch_roots(&self) -> [PathBuf; 2] {
+        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+    }
+
+    /// The local backend `atomic run`, `atomic serve` and `atomic eval` run
+    /// atoms on, its scratch directories in the state directory.
+    pub fn run_backend(&self) -> atomic_exec::LocalBackend {
+        let [run, _] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())
+    }
+
+    /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
+    /// run their turn on, beside the one runs use.
+    pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
+        let [_, debug] = self.scratch_roots();
+        atomic_exec::LocalBackend::in_dir(debug).denying(self.scratch_roots())
+    }
+
     /// The file the execution lock is held on.
     pub fn lock_file(&self) -> PathBuf {
         self.private_dir().join("runtime.lock")
@@ -1278,6 +1302,23 @@ pub(crate) fn passwd_name(uid: u32) -> Option<String> {
 /// to: it is accepted only when its target is a directory the user owns and
 /// no one else can enter.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
+    if existing_private_dir(dir)? {
+        return Ok(());
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|source| StateError::Create {
+        path: dir.to_owned(),
+        source,
+    })
+}
+
+/// [`private_dir`]'s checks on `dir` where it is, made private as they
+/// make it, without making it: whether it is there. Not there, nothing is
+/// made.
+pub(crate) fn existing_private_dir(dir: &Path) -> Result<bool, StateError> {
     let fail = |source| StateError::Create {
         path: dir.to_owned(),
         source,
@@ -1287,13 +1328,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         why,
     };
     let meta = match std::fs::symlink_metadata(dir) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-            return builder.create(dir).map_err(fail);
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(fail(e)),
         Ok(meta) => meta,
     };
@@ -1303,7 +1338,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
         if meta.file_type().is_symlink() {
             let target = std::fs::metadata(dir).map_err(fail)?;
             if target.is_dir() && target.uid() == effective_uid() && target.mode() & 0o077 == 0 {
-                return Ok(());
+                return Ok(true);
             }
             return Err(refuse(
                 "is a symbolic link to a directory that is not yours alone: make the target \
@@ -1328,7 +1363,7 @@ pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     if !meta.is_dir() {
         return Err(refuse("is not a directory".into()));
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A readable, collision-resistant id: the root's last component, then the
@@ -1354,6 +1389,51 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Neither backend's commands may read the other's attempts: each
+    /// backend of the project denies its workspaces both scratch roots, which
+    /// it makes if they are missing, its own attempt's directory apart.
+    #[test]
+    fn the_run_and_debug_backends_deny_each_others_scratch() {
+        use atomic_exec::ExecutionBackend;
+        let home =
+            std::env::temp_dir().join(format!("atomic-scratch-roots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let roots = [
+            state.dir().join("scratch"),
+            state.dir().join("scratch-debug"),
+        ];
+        for (what, backend, own) in [
+            ("run", state.run_backend(), &roots[0]),
+            ("debug", state.debug_backend(), &roots[1]),
+        ] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: what.into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            let scratch = workspace.scratch.clone().expect("scratch");
+            assert!(scratch.starts_with(own), "{what}: {}", scratch.display());
+            let mut denied = workspace.denied.clone();
+            denied.sort();
+            assert_eq!(denied, roots.to_vec(), "{what}");
+            for dir in &roots {
+                assert!(dir.is_dir(), "{what}: {} was not made", dir.display());
+            }
+            backend.close(&workspace).expect("closes");
+            let _ = std::fs::remove_dir_all(&roots[0]);
+            let _ = std::fs::remove_dir_all(&roots[1]);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// A `.git` another user owns above a project, here a link to a device,
     /// counts its directory as a checkout and refuses nothing: it is not a
