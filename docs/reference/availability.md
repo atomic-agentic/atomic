@@ -139,19 +139,20 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn of the project can see, add, change or remove what
-a turn keeps in its `HOME` or temporary directory: every scratch directory of
-the project, those of `atomic run`, `atomic serve` and `atomic eval` and those
-of `atomic debug codex-prompt` and `atomic debug probe`, is denied to a turn's commands, apart from a
-`workspace-write` turn's own. A `read-only` turn, which may not write its own,
-cannot reach it at all, not even to list it. Other projects' scratch
-directories are not denied yet: a turn can read another project's live
-attempts by their path. Apart from macOS, whose own sandbox denies them, only
+file runs and no other turn, of the project or another project of the same
+atomic home, can see, add, change
+or remove what a turn keeps in its `HOME` or temporary directory: every
+project's scratch directories, those of `atomic run`, `atomic serve` and
+`atomic eval` and those of `atomic debug codex-prompt` and `atomic debug
+probe`, are kept in the atomic home's `scratch/`, which is denied to a turn's
+commands whole, apart from a `workspace-write` turn's own directory. A
+`read-only` turn, which may not write its own, cannot reach it at all, not
+even to list it. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
 command, which has a scratch directory of its own too, is kept out of the
-project's other ones in the same way, its own apart, wherever its command is
+others in the same way, its own apart, wherever its command is
 confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
@@ -165,9 +166,14 @@ toolchains, read-only, through `RUSTUP_HOME` (see
 outside a worktree or an exec atom in an eval, an atom names what it needs in
 its `env`, as in `env: { RUSTUP_HOME: '/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
-Scratch directories live in the project's state directory, where no sandboxed
-turn may write; atomic refuses to run when that would be under `/tmp`,
-`$TMPDIR` or the project. A turn's shell always runs on the machine its backend
+Scratch directories live in the atomic home's `scratch/`, one directory per
+project, where no sandboxed turn may write; atomic refuses to run when that
+would be under `/tmp`, `$TMPDIR` or the project. The scratch directories an
+older atomic kept in a project's state directory are denied to every turn too,
+until atomic next starts in the project and removes them: what attempts of
+processes that no longer run left there goes then, and a directory that still
+holds a live attempt, as of an older atomic still running, stays, and stays
+denied, until a later start. A turn's shell always runs on the machine its backend
 names; `CODEX_EXEC_SERVER_URL` and an `environments.toml` in Codex's home have
 no effect.
 
@@ -178,18 +184,19 @@ On Linux, atomic has verified that no atom's commands can reach the gate store
 or the credential: a Codex turn's commands and an exec atom's alike run under
 Codex's sandbox, which denies them the atomic home's `private/` directory, where
 every project keeps its database, its execution lock and its context
-checkpoints; the current project's
+checkpoints, and every project's
 Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; your own atomic
 configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them); AWS's workload token files (the files
-`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
-name, with the whole volume when such a file, or what a link to it leads
-to, is in a Kubernetes projected volume, so a rotated token stays denied,
-and EKS's usual token directories under `/var/run/secrets`); and what a link among them points at, up to four
+`KUBECONFIG`, put them); workload token files (the files AWS's, Azure
+workload identity's and Google's credential variables name, the token files
+Google's credentials and AWS's profiles name, with the whole volume when
+such a file, or what a link to it leads to, is in a Kubernetes projected
+volume, so a rotated token stays denied, and the usual token directories
+under `/var/run/secrets` for EKS, the pod's service account and Azure); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);
@@ -202,8 +209,13 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. Other projects'
-Codex records are not denied yet. atomic makes the list when a
+may write. What Codex records of a project's threads, its state databases and
+its logs, is kept with the project's private state, in the atomic home's
+`private/`, which every project's commands are denied; its Codex home keeps
+no thread records, and its helper links are the only part a turn's shell
+reads. Records an older atomic left in a
+project's Codex home move there when atomic next starts in that project, so
+until then another project's commands can still read them. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and so is what a link
 made after the list inside a denied place points at: each command looks for
@@ -362,6 +374,10 @@ Python transforms. One example's TypeScript also runs today under Deno, against
 a local stand-in for S3. None of this establishes live-model quality, command compatibility
 or crash recovery in an Atomic runtime. Those need the implementation and phase
 acceptance tests.
+
+The release workflow builds, packages and Sigstore-signs the Linux and macOS
+archives with their SBOMs ([verifying a download](../getting-started/installation.md#verifying-a-download)),
+but no release has been published yet.
 
 Installation packaging, standalone-session behavior and some control commands
 remain open decisions, tracked with the rest of the work in the project's issue

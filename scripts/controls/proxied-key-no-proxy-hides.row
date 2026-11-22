@@ -1,0 +1,1 @@
+proxied-key-no-proxy-hides|crates/atomic-core/src/lite.rs|    let no = first(["NO_PROXY", "no_proxy"])|    let no = first(["no_proxy", "NO_PROXY"])|-p atomic-agentic-core --lib --features fake-model a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused

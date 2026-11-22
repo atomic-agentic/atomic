@@ -16,7 +16,7 @@
 use crate::engine::{self, EngineArgs};
 use crate::failure::Failure;
 use crate::target;
-use atomic_app::pipeline::PIPELINE;
+use atomic_app::pipeline::{PIPELINE, ProjectWorktrees};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
 use atomic_durable::{DurableError, DurableRuntime, RunStatus};
@@ -77,11 +77,22 @@ fn bind_fixture(
     use atomic_core::fixture::{self, FixtureError};
     let (Some(repo), Some(rev)) = (&args.fixture, &args.fixture_rev) else {
         if run.pipeline.changes_code() {
+            // A run's worktrees are made from the repository it names, never
+            // from the project's checkout, so what was found about the project
+            // changes nothing about the refusal. It is still said, because a
+            // step that needs a worktree is asking why there is none — and
+            // "git refused the project's directory" is different news from
+            // "atomic cannot tell whether it is in a repository". A project
+            // with a repository gets the plain refusal.
+            let found = match ProjectWorktrees::find(state) {
+                ProjectWorktrees::Found(_) => String::new(),
+                found => format!(", and {}", found.describe()),
+            };
             return Err(Failure::new(
                 "fixture.required",
                 format!(
                     "workflow `{}` changes code in a worktree, and no fixture repository is \
-                     named; atomic never works in your own checkout",
+                     named{found}; atomic never works in your own checkout",
                     run.pipeline.name
                 ),
                 "name the repository and the revision to start from: --fixture <repo> \
@@ -101,6 +112,11 @@ fn bind_fixture(
             FixtureError::Path { .. } => (
                 "fixture.path",
                 "give --fixture the path of a git repository on this machine",
+            ),
+            FixtureError::Unreadable { .. } => (
+                "fixture.unreadable",
+                "make the repository readable by the account atomic runs as, or name one that \
+                 is; atomic refuses to guess what it could not read",
             ),
             FixtureError::Revision { .. } => (
                 "fixture.revision",
@@ -157,6 +173,36 @@ pub struct ResumeArgs {
 pub struct ServeArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+/// The most characters a run id given with `--run-id` may have.
+const RUN_ID_MAX: usize = 128;
+
+/// Refuse a run id given with `--run-id` that is not 1 to [`RUN_ID_MAX`]
+/// ASCII letters, digits, `.`, `_`, `:` and `-`, starting with a letter or
+/// a digit. atomic's own log lines and error reports show a run's id as it
+/// is, so an id is held to characters that carry no terminal control
+/// sequence, space, quote or line break, and to a bounded length; and
+/// `atomic runs resume <id>` must not read it as a flag. The refusal does
+/// not repeat the id, which may be something pasted by mistake, such as a
+/// token.
+pub fn check_run_id(id: &str) -> Result<(), Failure> {
+    let allowed = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-');
+    let fits = id.len() <= RUN_ID_MAX
+        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && id.bytes().all(allowed);
+    if fits {
+        return Ok(());
+    }
+    Err(Failure::new(
+        "run.id_invalid",
+        format!(
+            "the run id given with --run-id is refused: a run id is 1 to {RUN_ID_MAX} \
+             characters, each an ASCII letter, a digit, `.`, `_`, `:` or `-`, and starts with \
+             a letter or a digit"
+        ),
+        "give an id of that form, or leave out --run-id for a new one",
+    ))
 }
 
 /// A new run id: the time it started and some randomness.
@@ -899,4 +945,51 @@ pub async fn serve(
     };
     atomic_core::log_line!("atomic serve: {signal}");
     stop(&mut signals, "atomic serve", Exit::Served).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What every refusal says: the rule, and not the id.
+    const REFUSED: &str = "the run id given with --run-id is refused: a run id is 1 to 128 \
+                           characters, each an ASCII letter, a digit, `.`, `_`, `:` or `-`, \
+                           and starts with a letter or a digit";
+
+    /// A run id given with `--run-id` is held to its characters and its
+    /// length, and the ids atomic makes, and the ones its tests and
+    /// documents use, fit.
+    #[test]
+    fn a_run_id_is_held_to_its_characters_and_length() {
+        let longest = "a".repeat(RUN_ID_MAX);
+        for id in [
+            new_run_id().expect("a new id"),
+            "rotate-secret:2026-11".to_owned(),
+            "v0.1_gate".to_owned(),
+            "7".to_owned(),
+            longest,
+        ] {
+            assert_eq!(check_run_id(&id), Ok(()), "{id}");
+        }
+        let too_long = "a".repeat(RUN_ID_MAX + 1);
+        for id in [
+            "",
+            too_long.as_str(),
+            "-x",
+            ".hidden",
+            ":a",
+            "has space",
+            "tab\tid",
+            "line\nbreak",
+            "\u{1b}[2Jcleared",
+            "quote\"d",
+            "a/b",
+            "a=b",
+            "caf\u{e9}",
+        ] {
+            let refused = check_run_id(id).expect_err(id);
+            assert_eq!(refused.kind, "run.id_invalid", "{id:?}");
+            assert_eq!(refused.description, REFUSED, "{id:?}");
+        }
+    }
 }

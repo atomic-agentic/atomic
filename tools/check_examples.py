@@ -20,6 +20,7 @@ import astro_atoms
 import decisions
 import deno_exec
 import workflow_diagram
+import yaml_scalar
 from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
@@ -32,67 +33,20 @@ class UniqueKeysLoader(yaml.SafeLoader):
     pass
 
 
-# Plain scalars atomic's loader reads as a number, or refuses for it. Each is a
-# port of a rule in crates/atomic-schema/src/yaml.rs, which classifies a plain
-# scalar by its own text. PyYAML, which reads the catalog here, resolves
-# scalars the way YAML 1.1 does, so nothing here can depend on what PyYAML
-# constructs: `0o17:` is the string "0o17" to PyYAML and the number 15 to the
-# loader, and `12:30:` is the integer 750 to PyYAML and a string to the loader.
-# Both are refused as keys, as the loader refuses them.
-CORE_INT = re.compile(r"^[-+]?(?:0|[1-9][0-9]*|0o[0-7]+|0x[0-9a-fA-F]+)$")
-CORE_FLOAT = re.compile(r"^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$")
-CANONICAL_INT = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
-LEADING_ZERO_INT = re.compile(r"^[-+]?0[0-9]+$")
-# A sign on the wrong side of the base marker: `-0x1F`, which YAML 1.1 reads as
-# a number where 1.2 reads a string, and `0x-1F`, which no version reads as a
-# number at all. Both are refused, and quoting is the fix either way.
-SIGN_ON_A_BASE_MARKER = re.compile(r"^(?:[-+]0[ox][0-9a-fA-F]+|0[ox][-+][0-9a-fA-F]+)$")
-INF_OR_NAN = re.compile(r"^(?:[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$")
-YAML_11_BOOLS = {"yes", "no", "on", "off"}
-# YAML 1.1's integer rules exactly as PyYAML resolves them, in the order its
-# resolver tries them. An underscore counts anywhere after the first digit, so
-# `1000_` and `0x_1F` are integers to it, and a sexagesimal starts at 1 and
-# counts its groups in base 60. `0o` is absent because YAML 1.1 writes an octal
-# `0777` or `o777`, never `0o777`: PyYAML reads `0o7_7` as a string, and the
-# loader refuses that spelling only because 1.1's own type definition has an
-# `o` marker an underscore may sit in.
-YAML_11_BINARY = re.compile(r"0b[01_]+$")
-YAML_11_SEXAGESIMAL = re.compile(r"[1-9][0-9_]*(?::[0-5]?[0-9])+$")
-YAML_11_OTHER = re.compile(r"(?:0x[0-9a-fA-F_]+|0[0-7_]+|0|[1-9][0-9_]*)$")
-
-
-def one_version_integer(spelling):
-    """Whether YAML 1.1 alone reads this plain scalar as an integer.
-
-    Binary (`0b11`), a whole number with an underscore in it (`1_000`,
-    `0x_1F`, `07_7`) and the sexagesimal (`12:30`) are integers to YAML 1.1 and
-    strings to the core schema and JSON. A spelling both read as an integer is
-    left out: the loader has already read it as one or refused it for its own
-    reason. `yaml_11_int` in the loader is the same rule.
-    """
-    if CORE_INT.match(spelling) or LEADING_ZERO_INT.match(spelling) or SIGN_ON_A_BASE_MARKER.match(spelling):
-        return False
-    digits = re.sub(r"^[-+]", "", spelling)
-    if YAML_11_BINARY.match(digits):
-        return True
-    if ":" in digits:
-        return YAML_11_SEXAGESIMAL.match(digits) is not None
-    return "_" in digits and YAML_11_OTHER.match(digits) is not None
-
-
-def canonical_integer_key(spelling):
-    """Whether the loader reads this plain scalar as a key that is its own text.
-
-    That is `0` or `-?[1-9][0-9]*`, and only while a 64-bit integer can hold it:
-    the loader reads any decimal as a number, however many digits, and keeps a
-    key only while the number is one whose digits are the key, so a decimal past
-    `18446744073709551615` is refused there. `CORE_INT` below reports that
-    refusal; PyYAML, with Python's unbounded integers, reads either as the
-    integer and would let the key through.
-    """
-    if not CANONICAL_INT.match(spelling):
-        return False
-    return -(2**63) <= int(spelling) < 2**64
+# The shapes a plain scalar can be, and the two rules the key path below asks by
+# name, all of them a port of a rule in crates/atomic-schema/src/yaml.rs. That
+# loader classifies a plain scalar by its own text, and `yaml_scalar` is the same
+# classifier: `core_scalar` answers what it reads a text as or why it refuses it,
+# `schema_scalar` puts the tag the library resolved beside that answer for a value,
+# and the key path below asks the same rules for a key's text. The module needs no
+# third-party library, so `yaml_scalar_test.py` can check it where the library that
+# reads the catalog is not installed.
+#
+# PyYAML, which reads the catalog here, resolves scalars the way YAML 1.1 does, so
+# nothing here can depend on what PyYAML constructs: `0o17` is the string "0o17" to
+# PyYAML and the number 15 to the loader, and `12:30` is the integer 750 to PyYAML
+# and a string to the loader. Both are refused as keys, as the loader refuses them,
+# and read or refused as values the way the loader reads or refuses them.
 
 
 def mapping_key(loader, key_node, deep):
@@ -107,29 +61,32 @@ def mapping_key(loader, key_node, deep):
     it reads `200:` as the integer 200, `0200:` as an octal, 128, `08:` as a
     string, `0o17:` as a string and `12:30:` as the integer 750.
 
-    A key the loader reads as neither a string nor a number -- `true:`, `null:`
-    -- is left as PyYAML constructs it, because `json_model` is what reports
-    those here. A float, like `1.5:` or `1e3:`, is refused with the integers: the
-    loader reads a number and refuses the key, and PyYAML reads `1e3` as the
-    string "1e3" and would let it through.
+    A key the loader reads as neither a string nor a number -- `true:`, `null:` --
+    is constructed as written and comes back a bool or a null: `strict_scalar`
+    makes it so in a schema file, where it answers every plain scalar, and PyYAML's
+    own constructor elsewhere. It is `json_model` that reports it here, as no key a
+    JSON document can hold; atomic's loader refuses such a key itself. A float,
+    like `1.5:` or `1e3:`, is refused with the integers: the loader reads a number
+    and refuses the key, and PyYAML reads `1e3` as the string "1e3" and would let
+    it through.
     """
     spelling = key_node.value
     if key_node.style is None:
         line = key_node.start_mark.line + 1
         reason = None
-        if spelling.lower() in YAML_11_BOOLS:
+        if spelling.lower() in yaml_scalar.YAML_11_BOOLS:
             reason = "is a boolean in YAML 1.1 and a string in YAML 1.2"
-        elif INF_OR_NAN.match(spelling):
+        elif yaml_scalar.INF_OR_NAN.match(spelling):
             reason = "cannot be written in JSON"
-        elif canonical_integer_key(spelling):
+        elif yaml_scalar.canonical_integer_key(spelling):
             reason = None
-        elif SIGN_ON_A_BASE_MARKER.match(spelling):
+        elif yaml_scalar.SIGN_ON_A_BASE_MARKER.match(spelling):
             reason = "puts a sign on the wrong side of its base marker"
-        elif LEADING_ZERO_INT.match(spelling):
+        elif yaml_scalar.LEADING_ZERO_INT.match(spelling):
             reason = "has a leading zero, which YAML 1.1 reads as an octal"
-        elif CORE_INT.match(spelling) or CORE_FLOAT.match(spelling):
+        elif yaml_scalar.CORE_INT.match(spelling) or yaml_scalar.CORE_FLOAT.match(spelling):
             reason = "is a number, so the key would be renamed to it"
-        elif one_version_integer(spelling):
+        elif yaml_scalar.one_version_integer(spelling):
             reason = "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"
         require(
             reason is None,
@@ -171,17 +128,73 @@ class SchemaLoader(UniqueKeysLoader):
     """YAML restricted to what JSON can express, for schema files."""
 
 
-def strict_bool(loader, node):
-    # PyYAML follows YAML 1.1, where yes/no/on/off are booleans. The proposed
-    # loader uses the YAML 1.2 core schema, so only true/false are accepted here.
-    require(
-        node.value in {"true", "false"},
-        f"ambiguous YAML boolean {node.value!r} at line {node.start_mark.line + 1}; quote it or write true/false",
+def strict_scalar(loader, node):
+    """One plain value, read the way atomic's loader reads it.
+
+    PyYAML resolves a plain scalar the way YAML 1.1 does and then constructs from
+    what it resolved, so left alone it reads `0200` as the integer 128 that YAML
+    1.1 reads where the loader refuses the spelling, `-0x1F`, `1_000` and `12:30`
+    as the integers YAML 1.1 reads where the loader reads strings, `.inf` as an
+    infinity JSON has no form for, and `0o17` and `1e3` as strings where the
+    loader reads 15 and 1000.0. So how the scalar was written, the tag PyYAML
+    resolved and the text are asked together, of `yaml_scalar.schema_scalar` -- the
+    module that holds the loader's rules and that the key rule above reads from
+    too: a spelling the loader refuses is refused here with its reason and its fix,
+    and what the core schema reads is what comes back. Only `true` and `false` are
+    booleans, as the loader has it, because `yes`, `no`, `on` and `off` are among
+    what it refuses.
+
+    A quoted scalar is its own text to every version, so `schema_scalar` answers it
+    before it asks anything. A plain one PyYAML resolved to a tag whose value this
+    has no answer for -- a `2026-11-21`, which YAML 1.1 resolves as a timestamp and
+    the core schema reads as a string -- never reaches here: SafeLoader's
+    constructor for the timestamp tag is popped off this loader, so PyYAML raises
+    that it has no constructor for the tag rather than build a date no JSON
+    document can hold. A scalar that does reach this with a tag outside the five is
+    refused by `schema_scalar` the same way, named by the tag.
+    """
+    kind, answer = yaml_scalar.schema_scalar(node.style, node.tag, node.value)
+    if kind == yaml_scalar.REFUSED:
+        raise ValueError(
+            f"{node.value!r} value at line {node.start_mark.line + 1} is not one atomic's "
+            f"loader reads: {answer.as_value()}"
+        )
+    return answer
+
+
+# The tags PyYAML's resolver can give a plain scalar that the core schema reads a
+# null, a boolean, a number or a string by. A constructor on the default tag alone
+# would never see the ones PyYAML resolved on its own, which is exactly the set
+# this has to read: `0200`, `1_000` and `12:30` as integers, `.inf` as a float,
+# `yes` as a boolean and `~` as a null. The default scalar tag is
+# `tag:yaml.org,2002:str` itself, which is what a plain scalar nothing resolved
+# gets -- `0o17` and `1e3` -- and what every quoted scalar gets.
+#
+# Three more tags the resolver can give a plain scalar are left unregistered, and
+# what happens to each is a refusal: the timestamp, which is what a plain
+# `2026-11-21` gets, and which SafeLoader would otherwise construct a
+# `datetime.date` for; and the merge (`<<`) and value (`=`) keys, which PyYAML
+# resolves only where they are written plainly. All three are strings to the core
+# schema and to atomic's loader, so refusing them is stricter than the loader: the
+# catalog has no use for a plain date, and `a: =` and `a: <<` are refused here with
+# PyYAML's own "could not determine a constructor" error, which names the tag.
+if yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG != yaml_scalar.STR_TAG:
+    raise ValueError(
+        f"PyYAML's default scalar tag is "
+        f"{yaml.resolver.BaseResolver.DEFAULT_SCALAR_TAG!r}, which is not what yaml_scalar "
+        f"reads a plain string as; the constructor below would never see a plain scalar"
     )
-    return node.value == "true"
-
-
-SchemaLoader.add_constructor("tag:yaml.org,2002:bool", strict_bool)
+for _tag in yaml_scalar.SCALAR_TAGS:
+    SchemaLoader.add_constructor(_tag, strict_scalar)
+# SafeLoader's own constructors are shared by reference until a subclass adds one
+# of its own, and it has a constructor for the timestamp tag: it builds a
+# `datetime.date` for a plain `2026-11-21`, which atomic's loader has no type for
+# at all. Work on a copy, so that SafeLoader and the loader above -- which read the
+# manifests and the eval cases -- keep their dates, and drop that one constructor
+# here, so a plain date is refused by name instead of reaching `json_model` as an
+# object no JSON document can hold.
+SchemaLoader.yaml_constructors = dict(SchemaLoader.yaml_constructors)
+SchemaLoader.yaml_constructors.pop(yaml_scalar.TIMESTAMP_TAG, None)
 
 
 def json_model(value, path):
@@ -207,12 +220,22 @@ def json_model(value, path):
 SCHEMA_SUFFIXES = (".schema.yaml", ".schema.json")
 
 
+def read_schema_text(text, where):
+    """A schema as written, read the way atomic's loader would read it.
+
+    `where` is what a refusal names -- the file, or the stand-in name a mirror
+    case gives -- because a rule that refuses an example without saying which is
+    of no use to whoever has to fix it.
+    """
+    schema = yaml.load(text, Loader=SchemaLoader)
+    json_model(schema, where)
+    return schema
+
+
 def read_schema(path):
     if path.name.endswith(".schema.json"):
         return read_json(path)
-    schema = yaml.load(path.read_text(), Loader=SchemaLoader)
-    json_model(schema, path)
-    return schema
+    return read_schema_text(path.read_text(), path)
 
 
 def sidecar(atom_path, stem, role):
@@ -647,8 +670,10 @@ def check_yaml_loader_mirror():
         ("1.5: a\n", "is a number, so the key would be renamed to it"),
         # 1e3 is a float to JSON and to the core schema and a string to PyYAML.
         ("1e3: a\n", "is a number, so the key would be renamed to it"),
-        # Past what a 64-bit integer holds the loader reads a float, where
-        # PyYAML, with Python's integers, reads the digits as an integer.
+        # Past what a 64-bit integer holds the loader still reads the digits as a
+        # number, and refuses the key because a key must be a number whose digits
+        # are its own text; PyYAML reads the same digits as an integer, so the key
+        # would come through as one.
         (
             "99999999999999999999: a\n",
             "is a number, so the key would be renamed to it",
@@ -694,6 +719,222 @@ def check_yaml_loader_mirror():
         else:
             raise ValueError(f"{text!r} reached JSON as a key; it must be refused")
         checks += 1
+    return checks
+
+
+def check_yaml_value_mirror():
+    """The loader's plain-value rules, checked on text rather than on the catalog.
+
+    `strict_scalar` answers every plain value in a schema file, and PyYAML would
+    otherwise answer them the way YAML 1.1 reads them. Each case says what a value
+    must be read as -- the null, boolean or number the core schema reads -- or how
+    it must be refused, so a rule that stops refusing reads as a failure and not
+    as a smaller count. The type is part of every read case, because `0` and `0.0`
+    compare equal and are not the same answer for a schema's `maximum`. Quoting is
+    the other half: quoted, the same text is the string, and no rule here touches
+    a quoted scalar.
+
+    These are the spellings atomic's loader pins for values in
+    crates/atomic-schema/src/yaml/tests.rs, which is what keeps the two halves of
+    the mirror from drifting apart. No catalog file spells any shape the rule
+    refuses or re-reads, so nothing but this would ever run it.
+    """
+    checks = 0
+    where = "sidecar.input.schema.yaml"
+
+    def refused(text, *why):
+        """One value that must be refused, and each clause its refusal must say.
+
+        A value's refusal says what the versions read differently and both things
+        the author could write instead -- the number, and the quoted string --
+        because an author who wrote `0200` meant one of them.
+        """
+        try:
+            read_schema_text(f"a: {text}\n", where)
+        except ValueError as exc:
+            said = str(exc)
+            for clause in why:
+                require(
+                    clause in said,
+                    f"{text!r} value: refused for {said}, which does not say {clause!r}",
+                )
+            require(
+                "quote it" in said,
+                f"{text!r} value: refused for {said}, which does not say to quote it",
+            )
+            return 1
+        raise ValueError(f"a: {text} was read as a value; it must be refused")
+
+    def read_as(text, want):
+        """One value, and exactly what it must be read as."""
+        got = read_schema_text(f"a: {text}\n", where)["a"]
+        require(
+            type(got) is type(want) and got == want,
+            f"a: {text} was read as {got!r}, which must be {want!r}",
+        )
+        return 1
+
+    # What the core schema reads and PyYAML resolves differently. `0o17` and `1e3`
+    # are strings to PyYAML and numbers to the loader, so a checker that read what
+    # PyYAML built would let a schema say the text where atomic reads a number.
+    for text, want in (
+        ("200", 200),
+        ("-3", -3),
+        ("0", 0),
+        ("-0", 0),
+        ("18446744073709551615", 18446744073709551615),
+        ("true", True),
+        ("False", False),
+        ("null", None),
+        ("~", None),
+        ("", None),
+        ("0o17", 15),
+        ("0x1F", 31),
+        ("0o777", 511),
+        ("1e3", 1000.0),
+        ("1.5e3", 1500.0),
+        (".5", 0.5),
+        ("5.", 5.0),
+        # A float's leading zero is no integer's leading zero.
+        ("00.5", 0.5),
+        ("01.5", 1.5),
+        # Text no rule reads: the loader keeps it as the string it is.
+        ("1.2.3", "1.2.3"),
+        ("1_000.5", "1_000.5"),
+        ("0o7_7", "0o7_7"),
+        ("0b2", "0b2"),
+        ("1:70", "1:70"),
+    ):
+        checks += read_as(text, want)
+    for text, *why in [
+        # A leading zero is a decimal in 1.2 and an octal in 1.1, or a string
+        # there when a digit is no octal digit. PyYAML reads `0200` as the integer
+        # 128 and `08` as a string, so only the text says which it is.
+        ("0200", "has a leading zero", "YAML 1.1 reads as 128", "write 200, or 0o200 for octal"),
+        ("010", "has a leading zero", "YAML 1.1 reads as 8", "write 10"),
+        ("007", "has a leading zero", "YAML 1.1 reads as 7"),
+        ("-0200", "has a leading zero", "YAML 1.1 reads as -128", "write -200, or -0o200"),
+        ("08", "has a leading zero", "YAML 1.1 reads as a string", "write 8, or quote it"),
+        ("06008", "has a leading zero", "YAML 1.1 reads as a string"),
+        # A sign on either side of the base marker: `-0x1F` is -31 to YAML 1.1 and
+        # a string to 1.2, and `0x-1F` is no number to either.
+        (
+            "-0x1F",
+            "puts a sign before its hexadecimal prefix",
+            "YAML 1.1 reads as -31",
+            "write -31 for the number",
+        ),
+        ("-0o17", "puts a sign before its octal prefix", "YAML 1.1 reads as -15"),
+        (
+            "0x-1F",
+            "puts a sign after its 0x",
+            "no number in either YAML version",
+            "write -31 for the number",
+        ),
+        # A base integer past what a signed 64-bit number holds, which the loader
+        # has no number to read.
+        (
+            "0xFFFFFFFFFFFFFFFF",
+            "is a hexadecimal integer past signed 64 bits",
+            "write it in decimal",
+        ),
+        # Only YAML 1.1 reads these as numbers, and PyYAML constructs all three
+        # kinds as integers, so a checker reading what PyYAML built would see the
+        # number 750 where atomic reads the string "12:30".
+        (
+            "0b11",
+            "is a number in YAML 1.1 and a string in YAML 1.2 and JSON",
+            "write 3 for the number",
+        ),
+        (
+            "1_000",
+            "is a number in YAML 1.1 and a string in YAML 1.2 and JSON",
+            "write 1000 for the number",
+        ),
+        (
+            "12:30",
+            "is a number in YAML 1.1 and a string in YAML 1.2 and JSON",
+            "write 750 for the number",
+        ),
+        (
+            "0x_1F",
+            "is a number in YAML 1.1 and a string in YAML 1.2 and JSON",
+            "write 31 for the number",
+        ),
+        # The words YAML 1.1 resolves as booleans, in any letter case.
+        ("yes", "is a boolean in YAML 1.1 and a string in YAML 1.2", "write true or false"),
+        ("OFF", "is a boolean in YAML 1.1 and a string in YAML 1.2"),
+        # What JSON has no form for. PyYAML builds an infinity and a not-a-number
+        # for these, and both are Python floats, which is how they used to reach a
+        # schema unnoticed. `1e999` is the same infinity spelled as an exponent.
+        (".inf", "cannot be written in JSON"),
+        ("-.Inf", "cannot be written in JSON"),
+        (".nan", "cannot be written in JSON"),
+        ("1e999", "cannot be written in JSON"),
+    ]:
+        checks += refused(text, *why)
+    # A quoted value is its own text to every version, so none of this touches
+    # it: the same spellings that were refused above are the strings here.
+    for spelling in (
+        "0200", "08", "0x1F", "0o17", "1e3", "-0x1F", "0x-1F", "0b11", "1_000", "12:30",
+        "yes", "off", ".inf", ".nan", "2026-11-21", "0xFFFFFFFFFFFFFFFF", "1e999",
+    ):
+        read_as(f'"{spelling}"', spelling)
+        checks += 1
+    # A plain date -- what YAML 1.1 calls a timestamp and the core schema reads as
+    # a string -- is refused rather than read as a string here while the library
+    # makes a date of it. SafeLoader's constructor for that tag is popped off the
+    # schema loader, so nothing is left to construct it: PyYAML's own error names
+    # the tag it could not construct, and that is what the case asserts, not merely
+    # that some YAML error came out. That nothing is registered for any tag no rule
+    # here reads is asserted first, so a refusal that came from somewhere else reads
+    # as a failure.
+    for tag in yaml_scalar.UNREAD_TAGS:
+        require(
+            tag not in SchemaLoader.yaml_constructors,
+            f"a schema file has a constructor for {tag}, so a scalar the resolver gives that "
+            f"tag would be read as whatever the library makes of it",
+        )
+        checks += 1
+    # And popped from a copy: the loaders that read the manifests and the eval cases
+    # read a plain date as a date still, which is what `check_decision_dates` below
+    # compares.
+    for reads, where_read in ((yaml.safe_load, "SafeLoader"), (read_yaml, "the catalog loader")):
+        date = reads("a: 2026-11-21\n")["a"]
+        require(
+            isinstance(date, datetime.date),
+            f"a plain date read with {where_read} is {date!r}, which must still be a date",
+        )
+        checks += 1
+    no_constructor = f"could not determine a constructor for the tag '{yaml_scalar.TIMESTAMP_TAG}'"
+    try:
+        read_schema_text("a: 2026-11-21\n", where)
+    except yaml.YAMLError as exc:
+        said = str(exc)
+        require(
+            no_constructor in said,
+            f"a plain date was refused for {said!r}, which does not say {no_constructor!r}",
+        )
+        checks += 1
+    else:
+        raise ValueError(f"{where}: a: 2026-11-21 was read; a plain date must be refused")
+    # The two tags no rule here reads besides the timestamp -- the value (`=`) and
+    # the merge (`<<`) keys -- are refused the same way, on the text each is
+    # resolved from. atomic's loader reads both texts as strings, so this is
+    # stricter than the loader, and the catalog writes neither.
+    for spelling in ("=", "<<"):
+        try:
+            read_schema_text(f"a: {spelling}\n", where)
+        except yaml.YAMLError as exc:
+            said = str(exc)
+            require(
+                "could not determine a constructor for the tag" in said,
+                f"a plain {spelling} was refused for {said!r}, which does not say it could "
+                f"not construct the tag",
+            )
+            checks += 1
+        else:
+            raise ValueError(f"{where}: a: {spelling} was read; it must be refused")
     return checks
 
 
@@ -792,6 +1033,7 @@ def main():
     # Atom declarations come from this mirror, so it must agree with atomic's.
     print(f"PASS TypeScript projection mirror: {astro_atoms.check_projection()} cases match atomic's generator")
     print(f"PASS YAML mirror: {check_yaml_loader_mirror()} key rules match atomic's loader")
+    print(f"PASS YAML mirror: {check_yaml_value_mirror()} value rules match atomic's loader")
     total = [0, 0, 0, 0, 0]
     projects = sorted(path for path in EXAMPLES.iterdir() if path.is_dir())
     for project in projects:

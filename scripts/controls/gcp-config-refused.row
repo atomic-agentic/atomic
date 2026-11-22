@@ -1,0 +1,1 @@
+gcp-config-refused|crates/atomic-core/src/codex.rs|        Err(e) => return Err(refused(format!("it is not JSON: {e}"))),|        Err(_) => serde_json::json!({}),|-p atomic-agentic-core --lib --features fake-model a_credential_configuration_that_cannot_be_read_whole_is_refused
