@@ -1190,10 +1190,16 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
     // whole.
     let value = raw.trim_end_matches('\\');
     let run = &raw[value.len()..];
-    let opened = [format!("{run}\""), format!("{run}'")]
+    let closes_opening = [format!("{run}\""), format!("{run}'")]
         .iter()
         .any(|quote| prefix.ends_with(quote.as_str()));
-    let escape = if value.is_empty() || !opened { "" } else { run };
+    let escape = if value.is_empty() {
+        ""
+    } else if closes_opening {
+        run
+    } else {
+        ""
+    };
     format!("{prefix}{REDACTED}{escape}")
 }
 

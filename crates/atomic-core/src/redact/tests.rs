@@ -2549,6 +2549,16 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
     let weak = json!({"cmd": "--token \"[\\'--pw\\',\\'hunter2\\']\""}).to_string();
     // An argument list beside a key only parsing finds, `pass\u0077ord`.
     let listed = r#"{"args":["--password","a"],"pass\u0077ord":"hunter2"}"#;
+    // Backslashes after a value that close no quote escaped alike before
+    // it are hidden with it: JSON that this breaks is hidden whole, and the
+    // credential with it.
+    let unpaired = json!({"cmd": format!("--api-key [\\\"-p, \\\"{credential}]")}).to_string();
+    let mut out = json!({"arguments": unpaired});
+    value(&mut out);
+    assert!(
+        !out.to_string().contains(&credential[4..]),
+        "a value past unpaired backslashes showed"
+    );
     for (depth, doc) in [
         (1, json!({"arguments": inner.clone()})),
         (2, json!({"arguments": json!({"body": inner}).to_string()})),
