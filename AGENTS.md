@@ -224,8 +224,10 @@ first.
    link to itself, and assert the error took effect, so that under root the
    test fails rather than passing vacuously. Put the list in your report.
 10. **Prove every row bites, by running it.** CI's Controls workflow runs
-    every row your pull request adds or touches; quote each row's result
-    line from its shard's summary ("ok <row>: …"), and run a row listed in
+    each row whose row file, switched file or guarding test your pull
+    request changes; quote each row's result line from its shard's summary
+    ("ok <row>: …"). Check the "Touched controls" summary's "deleted" and
+    "not run in CI" lines too, and run a row listed in
     `scripts/controls-local.txt` yourself. Run a row locally only while you
     debug it:
     `ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>`

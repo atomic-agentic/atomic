@@ -1,26 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Controls are tested by removing them (docs/development.md). On every pull
-# request this runs the controls rows the pull request touches: each row file
-# it adds or changes, and each row whose file it changes
+# request this runs the controls rows the pull request touches: each row whose
+# row file, switched file or guarding test it changes
 # (scripts/controls-touched.py). The rows run in parallel shards, each a job
 # that builds once and runs its rows in turn with scripts/controls-check.sh,
 # which switches the control off, requires its tests to fail, puts it back and
 # requires them to pass. "Controls" passes only when every row passed.
 #
-# A merge group does not run the rows again: its pull request could only join
-# the queue once they had passed on it, and running them twice would double
-# the queue's wait. Actions are pinned by commit SHA.
+# A merge group runs no rows. Once "Controls" is a required check, a pull
+# request can join the queue only after its rows passed on it, and running
+# them again would double the queue's wait. A weekly run on main, and a run
+# started by hand, sweep every row instead, so that what changes no row
+# (combinations of changes, lockfile and pin bumps) is still checked.
+# Actions are pinned by commit SHA.
 
 name: Controls
 
 on:
   pull_request:
   merge_group:
+  schedule:
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
 
 concurrency:
-  group: controls-${{ github.ref }}
-  cancel-in-progress: true
+  group: controls-${{ github.event_name }}-${{ github.ref }}
+  # A newer run on a pull request or a merge group makes its older run moot;
+  # a sweep runs to the end.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
 
 permissions:
   contents: read
@@ -32,10 +40,12 @@ env:
   CARGO_INCREMENTAL: "1"
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
-  # How the touched rows are cut into shards: one shard for every ROWS_PER_SHARD
-  # rows, up to MAX_SHARDS.
+  # How the rows are cut into shards: one for every ROWS_PER_SHARD rows, up to
+  # MAX_SHARDS for a pull request (a change to codex.rs touches about a
+  # hundred rows) and SWEEP_SHARDS for a sweep of every row.
   ROWS_PER_SHARD: "6"
-  MAX_SHARDS: "8"
+  MAX_SHARDS: "12"
+  SWEEP_SHARDS: "16"
 
 jobs:
   plan:
@@ -50,36 +60,53 @@ jobs:
         with:
           fetch-depth: 0
       - id: plan
-        name: The rows this pull request touches
+        name: The rows to run
         env:
           EVENT: ${{ github.event_name }}
         run: |
           set -uo pipefail
           summary="${GITHUB_STEP_SUMMARY}"
-          if [ "${EVENT}" = merge_group ]; then
+          case "${EVENT}" in
+          merge_group)
             echo "A merge group runs no rows: they passed on its pull request before it joined the queue." | tee -a "${summary}"
             echo "count=0" >>"${GITHUB_OUTPUT}"
             exit 0
+            ;;
+          pull_request)
+            # A pull request's checkout is its merge onto the base branch, so
+            # the change is what that merge adds to its first parent.
+            git rev-parse --verify --quiet HEAD^2 >/dev/null ||
+              { echo "::error::HEAD is not the pull request's merge commit"; exit 1; }
+            base="$(git rev-parse HEAD^1)"
+            range=("${base}" HEAD)
+            most="${MAX_SHARDS}"
+            if ! git diff --quiet "${base}" HEAD -- scripts/controls-local.txt; then
+              echo "::warning::this pull request changes scripts/controls-local.txt, the rows CI does not run; say why in its description"
+            fi
+            ;;
+          *)
+            range=(--all HEAD)
+            most="${SWEEP_SHARDS}"
+            ;;
+          esac
+          rows="$(scripts/controls-touched.py "${range[@]}")" || exit 1
+          report=""
+          if [ "${EVENT}" = pull_request ]; then
+            report="$(scripts/controls-touched.py "${range[@]}" --report)" || exit 1
           fi
-          # A pull request's checkout is its merge onto the base branch, so the
-          # change is what that merge adds to its first parent.
-          git rev-parse --verify --quiet HEAD^2 >/dev/null ||
-            { echo "::error::HEAD is not the pull request's merge commit"; exit 1; }
-          base="$(git rev-parse HEAD^1)"
-          rows="$(scripts/controls-touched.py "${base}" HEAD)" || exit 1
-          report="$(scripts/controls-touched.py "${base}" HEAD --report)" || exit 1
           count="$(grep -c . <<<"${rows}" || true)"
           shards=$(( (count + ROWS_PER_SHARD - 1) / ROWS_PER_SHARD ))
-          [ "${shards}" -le "${MAX_SHARDS}" ] || shards="${MAX_SHARDS}"
+          [ "${shards}" -le "${most}" ] || shards="${most}"
           matrix="[]"
           for i in $(seq 1 "${shards}"); do
-            names="$(scripts/controls-touched.py "${base}" HEAD --shards "${shards}" --shard "${i}" | paste -sd' ')" || exit 1
+            names="$(scripts/controls-touched.py "${range[@]}" --shards "${shards}" --shard "${i}" | paste -sd' ')" || exit 1
+            [ -n "${names}" ] || { echo "::error::shard ${i} of ${shards} holds no row"; exit 1; }
             matrix="$(jq -c --argjson i "${i}" --argjson of "${shards}" --arg rows "${names}" '. + [{shard: $i, of: $of, rows: $rows}]' <<<"${matrix}")"
           done
           {
-            echo "### Touched controls"
+            echo "### Controls rows"
             echo
-            echo "${count} rows touched, in ${shards} shards."
+            echo "Rows to run: ${count}. Shards: ${shards}."
             if [ -n "${report}" ]; then
               echo
               echo '```'
@@ -87,7 +114,11 @@ jobs:
               echo '```'
             fi
           } >>"${summary}"
-          [ -z "${report}" ] || echo "${report}"
+          # Each row CI leaves to a local run, and each deleted row, is
+          # flagged on the pull request.
+          while IFS= read -r line; do
+            [ -z "${line}" ] || echo "::warning::${line}"
+          done <<<"${report}"
           echo "count=${count}" >>"${GITHUB_OUTPUT}"
           echo "matrix={\"include\":${matrix}}" >>"${GITHUB_OUTPUT}"
 
@@ -109,15 +140,18 @@ jobs:
           target-cache: test
           backends: "true"
       - name: Run the rows
+        # Under the job's limit, so the summary below still runs.
+        timeout-minutes: 290
         env:
           ROWS: ${{ matrix.rows }}
-          SHARD: ${{ matrix.shard }}/${{ matrix.of }}
           # The runner's /tmp belongs to this job alone, as in the test jobs.
           ATOMIC_TEST_PRIVATE_TMP: "1"
         run: |
           set -uo pipefail
+          set -f
           results="${RUNNER_TEMP}/results.txt"
           : >"${results}"
+          [ -n "${ROWS}" ] || { echo "::error::this shard was given no row"; exit 1; }
           status=0
           for row in ${ROWS}; do
             echo "::group::${row}"
@@ -140,20 +174,34 @@ jobs:
               *) line="FAIL ${row}: scripts/controls-check.sh exited 0 without its ok line" ;;
               esac
             fi
+            # Written as each row ends, so a shard stopped part way still
+            # shows the rows it finished.
             echo "${line}" >>"${results}"
             case "${line}" in
             "FAIL "*) echo "::error::${line}"; status=1 ;;
             *) echo "${line}" ;;
             esac
           done
+          exit "${status}"
+      - name: Summary
+        if: ${{ always() }}
+        env:
+          ROWS: ${{ matrix.rows }}
+          SHARD: ${{ matrix.shard }}/${{ matrix.of }}
+        run: |
+          set -uf
+          results="${RUNNER_TEMP}/results.txt"
           {
             echo "### Controls, shard ${SHARD}"
             echo
             echo '```'
-            cat "${results}"
+            [ ! -f "${results}" ] || cat "${results}"
+            finished=" $(cut -d' ' -f2 "${results}" 2>/dev/null | tr -d : | paste -sd' ') "
+            for row in ${ROWS}; do
+              case "${finished}" in *" ${row} "*) ;; *) echo "FAIL ${row}: not run, as the shard stopped first" ;; esac
+            done
             echo '```'
           } >>"${GITHUB_STEP_SUMMARY}"
-          exit "${status}"
       - name: Keep the failing rows' cargo output
         if: ${{ failure() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

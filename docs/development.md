@@ -258,16 +258,22 @@ fails until it is updated.
 ### The Controls workflow
 
 On every pull request, `.github/workflows/controls.yml` runs the rows the pull
-request touches: each row file it adds or changes, and each row whose `file`
-it changes, since a code change can move a switch's text or stop its test
-biting. `scripts/controls-touched.py <base> <head>` lists them. It fails on a
-row file it cannot read, and on a row file deleted while its switch still
-applies, its text still in its file and held by no other row: a control whose
-code remains keeps its row. The "Touched controls" job lists the rows and
-cuts them into shards, one for every six rows and at most eight; each shard,
-"Controls (i/n)", is set up as the test jobs are, sandbox and Postgres
-included, builds once and runs its rows in turn with `controls-check.sh`. A
-shard's summary holds one result line per row, the script's own:
+request touches, which `scripts/controls-touched.py <base> <head>` lists: each
+row whose row file it adds or changes; each row whose `file` it changes, since
+a code change can move a switch's text or stop it biting; each row naming a
+test whose name is in a file it changes, before or after the change, since a
+change to the guarding test can stop it failing; and each row whose
+`--test <t>` target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it
+changes. The script fails on a row file it cannot read, and on a row file
+deleted while its switch's text is still in some file, rows aside, that no
+other row switches it in: a control whose code remains, renamed or moved
+included, keeps its row.
+
+The "Touched controls" job cuts the rows into shards, one for every six rows
+and at most twelve; each shard, "Controls (i/n)", is set up as the test jobs
+are, sandbox and Postgres included, builds once and runs its rows in turn with
+`controls-check.sh`. A shard's summary holds one result line per row, the
+script's own:
 
 ```
 ok run-keeps-input: its test fails with the control off and passes with it on
@@ -275,14 +281,24 @@ FAIL serve-line-names: its test passed with the control off
 ```
 
 A row that ends any other way, or runs past 45 minutes, gets a `FAIL` line
-too, and a failing row's cargo output is kept as the shard's
-`controls-logs-<i>` artifact. "Controls" passes only when every touched row
-passed, and in seconds when none is touched. A merge group runs no rows: its
-pull request passed them before it joined the queue.
+too, as does each row a stopped shard did not reach, and a failing row's cargo
+output is kept as the shard's `controls-logs-<i>` artifact. "Controls" passes
+only when every touched row passed, and in seconds when none is touched. The
+"Touched controls" summary also lists each deleted row and why its deletion
+was allowed, and each touched row CI does not run, each with a warning on the
+pull request: check both.
+
+A merge group runs no rows: once "Controls" is a required check, a pull
+request joins the queue only after its rows passed. Every Sunday, and when
+started by hand (Actions > Controls > Run workflow), the workflow sweeps every
+row instead, in up to sixteen shards, so that what touches no row, such as
+changes that only break a row together or a lockfile or pin bump, is checked
+too.
 
 A row a GitHub runner cannot run is listed, with its reason, in
 `scripts/controls-local.txt`. CI reports it as "not run in CI" and leaves it
-to a local run.
+to a local run; a pull request that changes the list gets a warning, and
+should say why.
 
 ## Milestone acceptance
 

@@ -5,21 +5,27 @@
     scripts/controls-touched.py BASE HEAD                       # the rows to run, one per line
     scripts/controls-touched.py BASE HEAD --shards N --shard I  # those in shard I of N
     scripts/controls-touched.py BASE HEAD --report              # touched rows not run, and deleted rows
+    scripts/controls-touched.py --all HEAD [--shards N --shard I]  # every row, for a full sweep
 
 A change touches a row (scripts/controls/<name>.row) when it adds or changes
-the row's file, or changes the file the row switches off: a code change can
-move the switch's text or stop the guarding test from biting. The rows are
-read from HEAD's tree, not the working tree, and the changes are git's diff
-from BASE to HEAD.
+the row's file; changes the file the row switches off, since a code change
+can move the switch's text or stop it biting; changes a file whose text, at
+BASE or at HEAD, holds the name of a test the row names (the last `::` part
+of each, read as scripts/controls-check.sh reads them), since a change to the
+guarding test can stop it failing; or changes anything under the row's
+`--test <t>` target, crates/*/tests/<t>.rs or crates/*/tests/<t>/. The rows
+are read from HEAD's tree, not the working tree, and the changes are git's
+diff from BASE to HEAD.
 
 It fails, printing why, rather than leave out a row it cannot read: a row file
 that is not one row of five fields named after its file, or a file under
 scripts/controls/ that is not a regular `*.row` file. It also fails on a row
-file the change deletes while the row's switch still applies, its text still
-in a file that is still there, and no other row switches that text in that
-file: deleting the row would only stop its control being checked. A deleted
-row whose file is gone, or whose text is gone from it, or whose switch another
-row now holds (as a rename leaves it), is listed by --report.
+file the change deletes while its switch's text is still in a file at HEAD,
+any file, that no row switches it in: deleting the row would only stop its
+control being checked, and a file renamed with its rows deleted still holds
+the text. A deleted row whose text is nowhere at HEAD, or is switched by
+another row wherever it is (as renaming a row leaves it), is listed by
+--report.
 
 scripts/controls-local.txt lists the rows a CI runner cannot run, each with
 its reason. A touched row listed there is left out of the rows to run and
@@ -119,8 +125,31 @@ def local_rows(commit, rows):
     return local
 
 
+def holding(head, text):
+    """The files in the head's tree, rows aside, whose text holds `text`."""
+    done = subprocess.run(
+        ["git", "grep", "-z", "-l", "-F", "-I", "-e", text, head, "--", f":(exclude){ROWS}/"],
+        capture_output=True,
+    )
+    if done.returncode == 1:
+        return []
+    if done.returncode != 0:
+        raise Refused(f"git grep for a switch's text failed: {done.stderr.decode(errors='replace').strip()}")
+    prefix = f"{head}:"
+    files = []
+    for entry in filter(None, done.stdout.split(b"\0")):
+        path = entry.decode("utf-8", errors="surrogateescape")
+        files.append(posixpath.normpath(path[len(prefix) :] if path.startswith(prefix) else path))
+    return sorted(files)
+
+
 def deleted(base, head, changed, rows):
-    """Each row file the change deletes, with why that is allowed."""
+    """Each row file the change deletes, with why that is allowed.
+
+    A deleted row is allowed only when no file in the head's tree holds its
+    switch's text, or each one that does has a row switching that text there:
+    a file renamed with its rows deleted still holds the text, so it is
+    refused."""
     held = {(row["file"], row["switch"]): row["name"] for row in rows.values()}
     report = []
     for path in sorted(changed):
@@ -129,35 +158,90 @@ def deleted(base, head, changed, rows):
         if exists(head, path) or not exists(base, path):
             continue
         gone = parse(path, text_of(base, path))
-        key = (gone["file"], gone["switch"])
-        if not exists(head, gone["file"]):
-            why = f"{gone['file']} is gone"
-        elif key in held:
-            why = f"{held[key]} switches the same text in {gone['file']}"
-        elif gone["switch"] not in text_of(head, gone["file"]):
-            why = f"its text is gone from {gone['file']}"
-        else:
+        files = holding(head, gone["switch"])
+        holders = [(f, held[(f, gone["switch"])]) for f in files if (f, gone["switch"]) in held]
+        unheld = [f for f in files if (f, gone["switch"]) not in held]
+        if unheld:
             raise Refused(
-                f"{path} is deleted, but its switch still applies to {gone['file']} and no other row "
-                "holds it; a control whose code remains keeps its row"
+                f"{path} is deleted, but its switch's text is still in {', '.join(unheld)} and no row "
+                "switches it there; a control whose code remains keeps its row (update its file and switch)"
             )
+        if holders:
+            why = "; ".join(f"{name} switches the same text in {f}" for f, name in holders)
+        else:
+            why = "its text is in no file at the head"
         report.append((gone["name"], why))
     return report
 
 
-def touched(base, head):
+def named_tests(args):
+    """The tests a row's cargo arguments name, as scripts/controls-check.sh
+    reads them: every positional argument, and after `--` every argument but
+    a flag."""
+    names, after, skip = [], False, False
+    for a in args.split():
+        if skip:
+            skip = False
+            continue
+        if after:
+            if not a.startswith("-"):
+                names.append(a)
+            continue
+        if a == "--":
+            after = True
+        elif a in ("-p", "--package", "--features", "--test", "--bin", "--example"):
+            skip = True
+        elif not a.startswith("-"):
+            names.append(a)
+    return names
+
+
+def test_targets(args):
+    """The integration test targets a row's arguments name with --test."""
+    words = args.split()
+    before = words[: words.index("--")] if "--" in words else words
+    return [before[i + 1] for i, a in enumerate(before[:-1]) if a == "--test"]
+
+
+def selects(row, changed, contents):
+    """Whether a change touches the row: its row file, its file, a file that
+    names one of its tests (at the base or the head), or its --test target."""
+    if f"{ROWS}/{row['name']}.row" in changed or row["file"] in changed:
+        return True
+    tests = {name.rsplit("::", 1)[-1] for name in named_tests(row["args"])}
+    if any(test and test in text for test in tests for text in contents):
+        return True
+    for target in test_targets(row["args"]):
+        for path in changed:
+            parts = path.split("/")
+            if len(parts) >= 4 and parts[0] == "crates" and parts[2] == "tests":
+                if parts[3] == f"{target}.rs" or (parts[3] == target and len(parts) > 4):
+                    return True
+    return False
+
+
+def touched(base, head, every=False):
     """The rows to run, the touched rows CI does not run, and the deleted rows."""
-    changed = {
-        posixpath.normpath(path.decode("utf-8", errors="surrogateescape"))
-        for path in git("diff", "--no-renames", "--name-only", "-z", base, head).split(b"\0")
-        if path
-    }
     rows = rows_at(head)
-    gone = deleted(base, head, changed, rows)
     local = local_rows(head, rows)
-    names = sorted(
-        name for name, row in rows.items() if f"{ROWS}/{name}.row" in changed or row["file"] in changed
-    )
+    if every:
+        names = sorted(rows)
+        gone = []
+    else:
+        changed = {
+            posixpath.normpath(path.decode("utf-8", errors="surrogateescape"))
+            for path in git("diff", "--no-renames", "--name-only", "-z", base, head).split(b"\0")
+            if path
+        }
+        gone = deleted(base, head, changed, rows)
+        # Each changed file's text at the base and at the head, so a change to a
+        # guarding test, or its removal, selects the row that names it.
+        contents = []
+        for path in sorted(changed):
+            for commit in (base, head):
+                if exists(commit, path):
+                    contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
+        names = sorted(name for name, row in rows.items() if selects(row, changed, contents))
     run = [rows[n] for n in names if n not in local]
     return run, [(n, local[n]) for n in names if n in local], gone
 
@@ -175,12 +259,15 @@ def shard(rows, shards, index):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("base")
-    parser.add_argument("head")
+    parser.add_argument("revs", nargs="+", metavar="BASE HEAD", help="the change's base and head; with --all, only the head")
+    parser.add_argument("--all", action="store_true", help="every row, not only the touched ones")
     parser.add_argument("--shards", type=int, help="cut the rows to run into this many shards")
     parser.add_argument("--shard", type=int, help="print only this shard, from 1")
     parser.add_argument("--report", action="store_true", help="list touched rows not run, and deleted rows")
     args = parser.parse_args()
+    if len(args.revs) != (1 if args.all else 2):
+        parser.error("give BASE and HEAD, or --all and HEAD")
+    base, head = (None, args.revs[0]) if args.all else args.revs
     if (args.shards is None) != (args.shard is None):
         parser.error("--shards and --shard go together")
     if args.shards is not None and not (args.shards >= 1 and 1 <= args.shard <= args.shards):
@@ -188,7 +275,7 @@ def main():
     if args.report and args.shards is not None:
         parser.error("--report takes no shard")
     try:
-        run, not_run, gone = touched(args.base, args.head)
+        run, not_run, gone = touched(base, head, every=args.all)
     except Refused as refused:
         print(f"scripts/controls-touched.py: {refused}", file=sys.stderr)
         return 1

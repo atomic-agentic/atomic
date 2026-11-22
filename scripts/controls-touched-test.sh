@@ -64,6 +64,21 @@ refused() {
     fi
 }
 
+# Each rule is tested by removing it: with a rule taken out of a copy of the
+# script, its case above passes what it should not.
+mkdir -p "${WORK}/off"
+off() {
+    local name="$1" from="$2" to="$3"
+    SCRIPT="${WORK}/off/${name}.py"
+    python3 - "${TOUCHED}" "${SCRIPT}" "${from}" "${to}" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:]
+text = open(src).read()
+if old not in text:
+    sys.exit(f"the text to switch off is not in {src}: {old}")
+open(dst, "w").write(text.replace(old, new, 1))
+PY
+}
 fresh
 printf 'fn other() { 1; }\n' >src/other.rs
 commit
@@ -93,7 +108,7 @@ fresh
 git rm -q scripts/controls/b.row
 commit
 run
-refused "a row deleted while its switch still applies" "scripts/controls/b.row is deleted, but its switch still applies"
+refused "a row deleted while its switch still applies" "scripts/controls/b.row is deleted, but its switch's text is still in src/one.rs"
 
 fresh
 git rm -q scripts/controls/b.row
@@ -102,7 +117,7 @@ commit
 run
 expect "a row deleted with its guard" "a"
 run --report
-expect "a row deleted with its guard, reported" "deleted b: its text is gone from src/one.rs"
+expect "a row deleted with its guard, reported" "deleted b: its text is in no file at the head"
 
 fresh
 git rm -q scripts/controls/c.row src/two.rs
@@ -110,7 +125,7 @@ commit
 run
 expect "a row deleted with its file" ""
 run --report
-expect "a row deleted with its file, reported" "deleted c: src/two.rs is gone"
+expect "a row deleted with its file, reported" "deleted c: its text is in no file at the head"
 
 fresh
 git mv scripts/controls/c.row scripts/controls/c2.row
@@ -120,6 +135,86 @@ run
 expect "a renamed row" "c2"
 run --report
 expect "a renamed row, reported" "deleted c: c2 switches the same text in src/two.rs"
+
+fresh
+git mv src/one.rs src/renamed.rs
+git rm -q scripts/controls/a.row scripts/controls/b.row
+commit
+run
+refused "a file renamed with its rows deleted" "scripts/controls/a.row is deleted, but its switch's text is still in src/renamed.rs"
+
+fresh
+printf 'fn one() { guard_a(); }\n' >src/one.rs
+printf 'fn other() { guard_b(); }\n' >src/other.rs
+git rm -q scripts/controls/b.row
+commit
+run
+refused "a switch moved to another file with its row deleted" "scripts/controls/b.row is deleted, but its switch's text is still in src/other.rs"
+
+fresh
+git mv src/one.rs src/renamed.rs
+sed -i 's|src/one.rs|src/renamed.rs|' scripts/controls/a.row scripts/controls/b.row
+commit
+run
+expect "a file renamed with its rows" "$(printf 'a\nb')"
+
+# A change to a guarding test selects its row, wherever the test is.
+fresh
+echo 'e|src/two.rs|guard_c();|/*off*/|-p y --lib mod::tests::the_guard_holds -- --nocapture' >scripts/controls/e.row
+printf '#[test]\nfn the_guard_holds() {}\n' >src/tests.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf '#[test]\nfn the_guard_holds_renamed() {}\n' >src/tests.rs
+commit
+run
+expect "a changed test the row names" "e"
+
+fresh
+echo 'e|src/two.rs|guard_c();|/*off*/|-p y --lib -- a::the_guard_holds' >scripts/controls/e.row
+printf '#[test]\nfn the_guard_holds() {}\n' >src/tests.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf '#[test]\nfn renamed() {}\n' >src/tests.rs
+commit
+run
+expect "a test the row names, renamed away" "e"
+off test-names 'if any(test and test in text' 'if any(False and test in text'
+run
+[ "${OUT}" = "" ] || fail "with the test-name rule off, a renamed test still selected: ${OUT}"
+unset SCRIPT
+
+fresh
+mkdir -p crates/k/tests/t
+printf 'mod helper;\n' >crates/k/tests/t.rs
+printf 'pub fn help() {}\n' >crates/k/tests/t/helper.rs
+printf 'fn other() {}\n' >crates/k/tests/tt.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn help() { 1; }\n' >crates/k/tests/t/helper.rs
+commit
+run
+expect "a change under the row's --test target" "c"
+off test-target 'if parts[3] == f"{target}.rs" or (parts[3] == target and len(parts) > 4):' 'if False:'
+run
+[ "${OUT}" = "" ] || fail "with the --test target rule off, a change under it still selected: ${OUT}"
+unset SCRIPT
+fresh
+mkdir -p crates/k/tests
+printf 'fn other() {}\n' >crates/k/tests/tt.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'fn other() { 1; }\n' >crates/k/tests/tt.rs
+commit
+run
+expect "a change to another --test target" ""
+
+# Every row, for a full sweep.
+fresh
+code=0
+python3 "${TOUCHED}" --all HEAD >"${WORK}/out" 2>"${WORK}/err" || code=$?
+OUT="$(cat "${WORK}/out")"
+expect "every row" "$(printf 'a\nb\nc')"
+python3 "${TOUCHED}" --all "${BASE}" HEAD >/dev/null 2>&1 && fail "--all with two revisions was accepted"
 
 # Rows a CI runner cannot run.
 fresh
@@ -226,21 +321,6 @@ commit
 run --shards 2 --shard 2
 expect "rows built alike share a shard" "$(printf 'a\nc')"
 
-# Each rule is tested by removing it: with a rule taken out of a copy of the
-# script, its case above passes what it should not.
-mkdir -p "${WORK}/off"
-off() {
-    local name="$1" from="$2" to="$3"
-    SCRIPT="${WORK}/off/${name}.py"
-    python3 - "${TOUCHED}" "${SCRIPT}" "${from}" "${to}" <<'PY'
-import sys
-src, dst, old, new = sys.argv[1:]
-text = open(src).read()
-if old not in text:
-    sys.exit(f"the text to switch off is not in {src}: {old}")
-open(dst, "w").write(text.replace(old, new, 1))
-PY
-}
 fresh
 printf 'fn one() { guard_a(); guard_b(); } // moved\n' >src/one.rs
 commit
@@ -252,11 +332,18 @@ unset SCRIPT
 fresh
 git rm -q scripts/controls/b.row
 commit
-off deletion 'raise Refused(
-                f"{path} is deleted' 'why = "x"; (
-                f"{path} is deleted'
+off deletion 'if unheld:' 'if False:'
 run
 [ "${code}" -eq 0 ] || fail "with the deletion rule off, the deletion was still refused: ${ERR}"
+unset SCRIPT
+
+fresh
+git mv src/one.rs src/renamed.rs
+git rm -q scripts/controls/a.row scripts/controls/b.row
+commit
+off deletion-file 'unheld = [f for f in files if' 'unheld = [f for f in files if f == gone["file"] and'
+run
+[ "${code}" -eq 0 ] || fail "with the deletion rule held to the row's own file, a rename was still refused: ${ERR}"
 unset SCRIPT
 
 fresh
