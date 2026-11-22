@@ -1,1 +1,1 @@
-redact-renamed-whole|crates/atomic-core/src/redact.rs|        Some(r) => surer(whole, name_strength(&r.name)),|        Some(r) => name_strength(&r.name) /*CONTROL_OFF*/,|-p atomic-agentic-core --lib redact::tests::a_numbered_keys_value_is_judged_by_its_name
+redact-renamed-whole|crates/atomic-core/src/redact.rs|    let whole = name_strength(key);|    let whole = Strength::None; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_numbered_keys_value_is_judged_by_its_name

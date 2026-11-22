@@ -1,0 +1,1 @@
+key-every-reading|crates/atomic-core/src/redact.rs|            surer(whole, read_strength(&r.original, held)),|            whole, /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_key_is_judged_by_every_reading_of_its_name
