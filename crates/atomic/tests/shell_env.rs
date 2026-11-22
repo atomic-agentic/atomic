@@ -1355,8 +1355,16 @@ fn workload_credentials_beside_aws_stay_denied() {
         let certificates = serde_json::json!({
             "cert_configs": {"workload": {"key_path": dir.join("spiffe/token")}},
         });
-        std::fs::write(dir.join("gcp/certificate_config.json"), certificates.to_string()).unwrap();
-        std::fs::write(dir.join("gcp-cache/client.pem"), "canary-azure-certificate\n").unwrap();
+        std::fs::write(
+            dir.join("gcp/certificate_config.json"),
+            certificates.to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("gcp-cache/client.pem"),
+            "canary-azure-certificate\n",
+        )
+        .unwrap();
         reads.push(dir.join("gcp/credentials.json"));
         reads.push(dir.join("gcp-cache/token.json"));
         reads.push(dir.join("gcp-cache/client.pem"));
@@ -1369,7 +1377,10 @@ fn workload_credentials_beside_aws_stay_denied() {
         let azure = dir.join("azure/token").display().to_string();
         let google = dir.join("gcp/credentials.json").display().to_string();
         let aws = dir.join("aws/config").display().to_string();
-        let x509 = dir.join("gcp/certificate_config.json").display().to_string();
+        let x509 = dir
+            .join("gcp/certificate_config.json")
+            .display()
+            .to_string();
         let client = dir.join("gcp-cache/client.pem").display().to_string();
         let printed = look_once(
             &dir,

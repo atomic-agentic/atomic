@@ -5022,7 +5022,10 @@ mod tests {
                 ("CLOUDSDK_CONFIG", "/gcloud"),
                 ("AZURE_CLIENT_CERTIFICATE_PATH", "/az/client.pem"),
                 ("AZURE_CONFIG_DIR", "/azcfg"),
-                ("GOOGLE_API_CERTIFICATE_CONFIG", "/gcp/certificate_config.json"),
+                (
+                    "GOOGLE_API_CERTIFICATE_CONFIG",
+                    "/gcp/certificate_config.json",
+                ),
             ]),
             None,
         )
@@ -5180,7 +5183,10 @@ mod tests {
         std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
         std::fs::write(volume.join("..2026_01_01_00_00_00.1/private_key.pem"), "k").expect("key");
         link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
-        link(Path::new("..data/private_key.pem"), &volume.join("private_key.pem"));
+        link(
+            Path::new("..data/private_key.pem"),
+            &volume.join("private_key.pem"),
+        );
         let certificates = serde_json::json!({
             "version": 1,
             "cert_configs": {"workload": {
@@ -5188,8 +5194,11 @@ mod tests {
                 "key_path": volume.join("private_key.pem"),
             }},
         });
-        std::fs::write(dir.join("certificate_config.json"), certificates.to_string())
-            .expect("certificate configuration");
+        std::fs::write(
+            dir.join("certificate_config.json"),
+            certificates.to_string(),
+        )
+        .expect("certificate configuration");
         let credentials = serde_json::json!({
             "type": "external_account",
             "credential_source": {"certificate": {
@@ -5212,7 +5221,11 @@ mod tests {
             let env = |name: &str| (name == variable).then(|| std::ffi::OsString::from(&named));
             let found = token_files(&env, &here).expect("found");
             for file in &wanted {
-                assert!(found.contains(file), "{variable}: {}: {found:?}", file.display());
+                assert!(
+                    found.contains(file),
+                    "{variable}: {}: {found:?}",
+                    file.display()
+                );
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -5253,7 +5266,10 @@ mod tests {
             Err(std::io::Error::from(std::io::ErrorKind::NotFound))
         };
         let refused = expanded(&env, GCLOUD_CONFIG, &homes, &gone).expect_err("refused");
-        assert!(refused.starts_with("CLOUDSDK_CONFIG names relative/gcloud"), "{refused}");
+        assert!(
+            refused.starts_with("CLOUDSDK_CONFIG names relative/gcloud"),
+            "{refused}"
+        );
     }
 
     /// The web identity token file an AWS profile names, and not a variable,
