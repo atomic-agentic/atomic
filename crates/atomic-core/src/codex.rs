@@ -5701,8 +5701,8 @@ mod tests {
         link(&kept, &place);
         let work = [dir.join("work")];
         let only = std::slice::from_ref(&place);
-        // Denied as the place itself.
-        let refused = late_link_targets(only, Some(only), &[], &work)
+        // Denied as an entry of the list, carried as no place.
+        let refused = late_link_targets(only, Some(&[]), &[], &work)
             .expect_err("refused")
             .to_string();
         assert!(
