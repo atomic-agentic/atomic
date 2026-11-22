@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The compiler's host, tried from inside it: each probe is a module run in
 //! place of the worker, in the child atomic starts for a compile, with the
-//! same host, limits and protocol.
+//! same host, limit setup and protocol. Resource probes can use smaller
+//! budgets; the CPU probe verifies the production bounds before lowering them.
 use super::*;
 use crate::compiler_process::{TIME_LIMIT, run_interactive};
 use serde_json::{Value, json};
