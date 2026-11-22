@@ -397,10 +397,13 @@ pub async fn run(
     // their run, which this project can neither read nor resume.
     if engine.rt.run_id_taken_elsewhere(&run_id).await? {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
-        return Err(Failure::new(
+        return Err(Failure::named(
             "run.exists",
-            format!("the run id {run_id} is taken in this store by another project"),
-            "give a new id, or leave out --run-id for one",
+            Said::new()
+                .text("the run id ")
+                .name(&run_id)
+                .text(" is taken in this store by another project"),
+            Said::new().text("give a new id, or leave out --run-id for one"),
         )
         .into());
     }
