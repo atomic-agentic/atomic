@@ -212,6 +212,26 @@
   "Astro does not read that `</head>` as its end"
  ],
  [
+  "!text\n<template>x</template>\n",
+  "Astro does not read that `</template>` as its end"
+ ],
+ [
+  "!text\n<noscript>x</noscript>\n",
+  "Astro does not read that `</noscript>` as its end"
+ ],
+ [
+  "!text\n<frameset><frame></frameset>\n",
+  "Astro does not read that `</frameset>` as its end"
+ ],
+ [
+  "!text\n<slot />\n",
+  null
+ ],
+ [
+  "!text\n<template><div>x</div></template>\n",
+  null
+ ],
+ [
   "<p>x</p></b foo>",
   "`</b>` closes no open element"
  ],

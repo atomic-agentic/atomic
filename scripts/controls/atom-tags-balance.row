@@ -1,1 +1,1 @@
-atom-tags-balance|crates/atomic-core/assets/worker.mjs|let bo=X4e(en,Wt.ast);if(bo)|let bo=null;/*CONTROL_OFF*/if(bo)|-p atomic-agentic-core --lib atom::tests::an_unbalanced_section_tag_fails_the_load
+atom-tags-balance|crates/atomic-core/assets/worker.mjs|let bo=X4e(en,Wt.ast);if(bo)|let bo=null;/*CONTROL_OFF*/if(bo)|-p atomic-agentic-core --lib -- atom::tests::an_unbalanced_section_tag_fails_the_load atom::tests::an_element_astro_moves_after_leading_text_fails_the_load

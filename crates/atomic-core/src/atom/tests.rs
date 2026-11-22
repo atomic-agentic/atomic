@@ -710,6 +710,48 @@ fn a_source_the_compiler_faults_on_fails_the_load() {
     );
 }
 
+/// Astro moves an element written after leading text or a leading expression
+/// out of the top of the file, so it no longer ends where its own closing tag
+/// is. The load refuses the file, and the refusal says both that the closer is
+/// not read as the element's end and what to do about it; the element is not
+/// reported as never closed, because the source does hold a closer for it.
+#[test]
+fn an_element_astro_moves_after_leading_text_fails_the_load() {
+    for name in ["slot", "template", "noscript", "frameset"] {
+        let root = project(format!("text\n<{name}>x</{name}>").as_str(), "{}", None);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err("an element Astro moves");
+        assert_eq!(
+            (error.line, error.message.as_str(), error.path.as_str()),
+            (
+                9,
+                format!(
+                    "<{name}> is closed on line 9, but Astro does not read that `</{name}>` as its end; close it in the same expression it opens in, and put no text or expression before an element Astro moves, such as <slot>, <head> or <template>"
+                )
+                .as_str(),
+                "body",
+            ),
+            "{name}"
+        );
+        assert!(
+            error.file.ends_with("test.atom.astro"),
+            "{}",
+            error.file.display()
+        );
+    }
+    // What the parse leaves where it is written: a self-closing tag, which
+    // needs no closer, and an element holding another element rather than text.
+    for body in [
+        "text\n<slot />",
+        "<div>t<br><slot /></div>",
+        "<div><template>x</template></div>",
+        "text\n<template><div>x</div></template>",
+    ] {
+        let (atom, _) = checked(body);
+        assert_eq!(atom.name, "test", "{body}");
+    }
+}
+
 /// Tags balance inside an expression too.
 #[test]
 fn an_unbalanced_tag_inside_an_expression_fails_the_load() {
