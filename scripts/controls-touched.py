@@ -17,8 +17,11 @@ guarding test can stop it failing; or changes anything under the row's
 test code that crate's targets share (crates/<c>/tests/support/, fixtures/
 and the like: a directory there that is no one target's), or a shared test
 helper outside tests/ that scripts/controls-shared.txt lists for the row (by
-its --test target, a feature it turns on or a package it builds). The rows
-are read from HEAD's tree, not the working tree, and the changes are git's
+its --test target, a feature it turns on or a package it builds). Before
+these rules, the change is expanded by one level of literal Rust includers
+at the base and head. A literal tests/... path in an integration target owns
+that data directory; all named owners are kept, and unowned data retains
+the crate-wide shared-test fallback. The rows are read from HEAD's tree, not the working tree, and the changes are git's
 diff from BASE to HEAD.
 
 It fails, printing why, rather than leave out a row it cannot read: a row file
@@ -41,9 +44,11 @@ build, then by name, and cut into N runs of nearly equal length.
 """
 
 import argparse
+import collections
 import functools
 import os
 import posixpath
+import re
 import subprocess
 import sys
 
@@ -247,27 +252,300 @@ def test_targets(args):
     return [before[i + 1] for i, a in enumerate(before[:-1]) if a == "--test"]
 
 
-def shared_test_crates(base, head, changed):
+def rust_literals(path, text):
+    """Literal spans outside Rust comments and character literals.
+
+    This is a lexical scan, not a Rust parser: only literal include paths and
+    literal tests/... data paths are followed. Dynamic paths remain sweep-only.
+    Comments are blanked without changing offsets, so a comment cannot claim
+    ownership and comments between a macro and its argument are harmless.
+    """
+    code, literals, i = list(text), [], 0
+    character = re.compile(r"'(?:\\(?:u\{[0-9A-Fa-f_]+\}|x[0-9A-Fa-f]{2}|.)|[^'\\\n])'")
+    while i < len(text):
+        start = i
+        if text.startswith("//", i):
+            i = text.find("\n", i)
+            if i < 0:
+                i = len(text)
+            code[start:i] = " " * (i - start)
+            continue
+        if text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < len(text) and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+            if depth:
+                raise Refused(f"{path} has an unterminated Rust comment")
+            code[start:i] = " " * (i - start)
+            continue
+        if text[i] == "'":
+            matched = character.match(text, i)
+            if matched:
+                i = matched.end()
+                code[start:i] = " " * (i - start)
+                continue
+        if text[i] == "r":
+            quote = i + 1
+            while quote < len(text) and text[quote] == "#":
+                quote += 1
+            if quote < len(text) and text[quote] == '"':
+                hashes = text[i + 1 : quote]
+                end = text.find('"' + hashes, quote + 1)
+                if end < 0:
+                    raise Refused(f"{path} has an unterminated raw Rust string")
+                i = end + 1 + len(hashes)
+                literals.append((start, i, text[quote + 1 : end], True))
+                continue
+        if text[i] == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            if i >= len(text):
+                raise Refused(f"{path} has an unterminated Rust string")
+            literals.append((start, i + 1, text[start + 1 : i], False))
+            i += 1
+            continue
+        i += 1
+    return "".join(code), literals
+
+
+def literal_path(source, text, raw, classification=False):
+    """Decode a Rust literal; selected paths are never guessed.
+
+    Classification admits bytes and NUL so unrelated byte/data literals can
+    be ruled out. An actual path is decoded again under the strict rules.
+    """
+    if raw:
+        value = text
+    else:
+        chars, i = [], 0
+        escapes = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+        while i < len(text):
+            if text[i] != "\\":
+                chars.append(text[i])
+                i += 1
+                continue
+            i += 1
+            if i >= len(text):
+                raise Refused(f"{source} has an incomplete Rust path escape")
+            escape = text[i]
+            i += 1
+            if escape in escapes:
+                chars.append(escapes[escape])
+            elif escape == "x" and re.fullmatch(r"[0-9A-Fa-f]{2}" if classification else r"[0-7][0-9A-Fa-f]", text[i : i + 2]):
+                chars.append(chr(int(text[i : i + 2], 16)))
+                i += 2
+            elif escape == "u" and i < len(text) and text[i] == "{":
+                end = text.find("}", i + 1)
+                digits = text[i + 1 : end].replace("_", "") if end >= 0 else ""
+                if not re.fullmatch(r"[0-9A-Fa-f]{1,6}", digits):
+                    raise Refused(f"{source} has an invalid Unicode Rust path escape")
+                point = int(digits, 16)
+                if point > 0x10FFFF or 0xD800 <= point <= 0xDFFF:
+                    raise Refused(f"{source} has an invalid Unicode Rust path escape")
+                chars.append(chr(point))
+                i = end + 1
+            elif escape in "\r\n":
+                while i < len(text) and text[i] in " \t\r\n":
+                    i += 1
+            else:
+                raise Refused(f"{source} has an unsupported Rust path escape")
+        value = "".join(chars)
+    if "\0" in value and not classification:
+        raise Refused(f"{source} has a NUL in a Rust path")
+    return value
+
+
+def in_tree(path):
+    return not posixpath.isabs(path) and path != ".." and not path.startswith("../")
+
+
+def included_paths(commit, source, path, modes, allow_directory=False):
+    """Every tracked link and final input a literal include depends on.
+
+    Walk the committed tree, not the host filesystem. Resolve links before
+    parent components, retaining link names so retargeting a directory link
+    is a change to the includer too. A missing input name remains a dependency
+    (including when the change removes it); it never means no dependency.
+    Runtime readers may consume directories as well as regular files.
+    """
+    if posixpath.isabs(path):
+        raise Refused(f"{source} includes a path out of the repository")
+    pending = collections.deque(path.split("/"))
+    resolved, names, seen, hops = [], set(), set(), 0
+    while pending:
+        part = pending.popleft()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not resolved:
+                raise Refused(f"{source} includes a path out of the repository")
+            resolved.pop()
+            continue
+        resolved.append(part)
+        current = "/".join(resolved)
+        mode = modes.get(current)
+        if mode is None:
+            # There can be no tracked descendant below a missing component.
+            # Preserve its logical final name for additions/removals instead
+            # of treating a dangling include as an empty set of readers.
+            missing = posixpath.normpath("/".join([*resolved, *pending]))
+            if not in_tree(missing):
+                raise Refused(f"{source} includes a path out of the repository")
+            names.add(missing)
+            return names
+        if mode == "120000":
+            state = (current, tuple(pending))
+            if state in seen or hops >= 40:
+                raise Refused(f"{current} is an included link that does not end")
+            seen.add(state)
+            hops += 1
+            names.add(current)
+            target = git("cat-file", "blob", f"{commit}:{current}").decode("utf-8", errors="surrogateescape")
+            if not target or "\0" in target:
+                raise Refused(f"{current} is an included link with an unreadable target")
+            if posixpath.isabs(target):
+                raise Refused(f"{current} is an included link out of the repository")
+            resolved.pop()
+            pending.extendleft(reversed(target.split("/")))
+            continue
+        if pending and mode != "040000":
+            raise Refused(f"{current}, on an included path, is not a directory")
+        if not pending:
+            if mode not in ("100644", "100755") and not (allow_directory and mode == "040000"):
+                raise Refused(f"{current}, which {source} includes, is not a regular file")
+            names.add(current)
+    final = "/".join(resolved)
+    if modes.get(final) not in ("100644", "100755") and not (allow_directory and modes.get(final) == "040000"):
+        raise Refused(f"{final}, which {source} includes, is not a regular file")
+    names.add(final)
+    return names
+
+
+@functools.lru_cache(maxsize=None)
+def source_references(commit):
+    """One level of literal includers and integration targets naming data.
+
+    Resolve includes and top-level #[path] attributes from the source file's
+    own directory, not a basename match elsewhere in the tree. A named tests/... data directory is owned
+    by every integration target that names it; ambiguous owners are all kept.
+    """
+    included, data, sources, readers = {}, [], set(), []
+    entries = []
+    for entry in filter(None, git("ls-tree", "-r", "-t", "-z", commit).split(b"\0")):
+        meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
+        entries.append((meta.split(" ")[0], name))
+    modes = dict((name, mode) for mode, name in entries)
+    directories = {name for mode, name in entries if mode == "040000"}
+    macro = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*$")
+    attribute = re.compile(r"#\s*\[\s*path\s*=\s*$")
+    for mode, name in entries:
+        if mode == "040000" or not name.endswith(".rs"):
+            continue
+        source = text_of(commit, regular(commit, name, mode))
+        sources.add(name)
+        parts = name.split("/")
+        target = (
+            len(parts) == 4 and parts[0] == "crates" and parts[2] == "tests"
+        ) or (
+            len(parts) == 5 and parts[0] == "crates" and parts[2] == "tests" and parts[4] == "main.rs"
+        )
+        # Every target must be lexed: its test path can be a bare root or
+        # use Rust escapes. Other sources need literal include syntax.
+        candidate = "include" in source or ("#" in source and "path" in source)
+        if not candidate and not target:
+            continue
+        code, literals = rust_literals(name, source)
+        previous, depth = 0, 0
+        for start, end, literal, raw in literals:
+            # Disjoint prefixes keep this linear even in large generated
+            # source files with many literals. No include starts inside a
+            # preceding literal.
+            before, previous = code[previous:start], end
+            depth += before.count("{") - before.count("}")
+            # Inline-module #[path] bases differ from the source directory.
+            # Do not guess their owner and accidentally suppress the shared
+            # data fallback. Those paths remain covered by the sweep.
+            top_level_path = depth == 0 and attribute.search(before)
+            if macro.search(before) or top_level_path:
+                path = posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw))
+                for dependency in included_paths(commit, name, path, modes):
+                    included.setdefault(dependency, set()).add(name)
+            if target:
+                decoded = literal_path(name, literal, raw, classification=True)
+                if posixpath.isabs(decoded):
+                    continue
+                runtime = posixpath.normpath(decoded)
+                first = next((part for part in decoded.split("/") if part not in ("", ".")), "")
+                if runtime != "tests" and not runtime.startswith("tests/") and first != "tests":
+                    continue
+                # Preserve components until committed links are resolved:
+                # tests/alias/../word need not mean tests/word.
+                path = posixpath.join(*parts[:2], literal_path(name, literal, raw))
+                dependencies = included_paths(commit, name, path, modes, allow_directory=True)
+                for dependency in dependencies:
+                    readers.append((dependency, name))
+                # Only a concrete directory below this crate's tests root
+                # can narrow the old shared-data rule. A root-wide read, a
+                # runtime filename or an unknown path keeps that fallback.
+                tests = "/".join(parts[:3]) + "/"
+                for dependency in dependencies:
+                    if dependency.startswith(tests) and dependency in directories:
+                        data.append((dependency, name))
+    return included, data, sources, readers
+
+
+def references_to(path, references, owners_only=False):
+    included, data, _, readers = references
+    owners = set(included.get(path, ()))
+    # A broad directory owner cannot make exact-file or root-wide readers
+    # disappear. All readers select rows; only proven directory owners can
+    # narrow the old shared-data fallback.
+    for directory, target in data + ([] if owners_only else readers):
+        if path == directory or path.startswith(directory + "/"):
+            owners.add(target)
+    return owners
+
+
+def shared_test_crates(base, head, changed, references):
     """The crates whose shared test code the change touches: a file under
     crates/<c>/tests/ that belongs to no one test target, such as one in
     tests/support/ or tests/fixtures/, or a file there that is not Rust. A
     directory tests/<d>/ belongs to the target <d> when tests/<d>.rs or
-    tests/<d>/main.rs is there, at the base or at the head."""
+    tests/<d>/main.rs is there, at the base or at the head. Literal include
+    and data references give a path to its named readers first."""
     crates = set()
     for path in changed:
         parts = path.split("/")
         if len(parts) < 4 or parts[0] != "crates" or parts[2] != "tests":
             continue
         tests = "/".join(parts[:3])
-        if len(parts) == 4:
-            if not parts[3].endswith(".rs"):
+        if len(parts) > 4:
+            directory = f"{tests}/{parts[3]}"
+            owned = any(
+                f"{directory}.rs" in refs[2] or f"{directory}/main.rs" in refs[2]
+                for refs in references
+            )
+            if owned:
+                continue
+            # A shared Rust module may also be named as runtime data. That
+            # does not make its other compiled users disappear.
+            compiled = any(f"{directory}/mod.rs" in refs[2] for refs in references)
+            if compiled:
                 crates.add(parts[1])
+                continue
+        owners = set().union(*(references_to(path, refs, owners_only=True) for refs in references))
+        # We expanded only one level. A reader added by that expansion can
+        # itself have readers not in this change: keep the broad fallback
+        # rather than pretend the second dependency level was followed.
+        if owners and owners <= changed:
             continue
-        d = parts[3]
-        owned = any(
-            exists(commit, f"{tests}/{d}.rs") or exists(commit, f"{tests}/{d}/main.rs") for commit in (base, head)
-        )
-        if not owned:
+        if len(parts) > 4 or not parts[3].endswith(".rs"):
             crates.add(parts[1])
     return crates
 
@@ -390,6 +668,11 @@ def touched(base, head, every=False):
             if path
         }
         gone = deleted(base, head, changed, rows)
+        references = [source_references(commit) for commit in (base, head)] if changed else []
+        # Expand exactly one level from the original change, at both ends.
+        # A removed include still belongs to the source that formerly read it.
+        included = {owner for path in changed for refs in references for owner in references_to(path, refs)}
+        changed |= included
         # Each changed file's text at the base and at the head, so a change to a
         # guarding test, or its removal, selects the row that names it.
         contents = []
@@ -397,7 +680,7 @@ def touched(base, head, every=False):
             for commit in (base, head):
                 if exists(commit, path):
                     contents.append(git("cat-file", "blob", f"{commit}:{path}").decode("utf-8", errors="replace"))
-        shared = shared_test_crates(base, head, changed)
+        shared = shared_test_crates(base, head, changed, references)
         helpers = [words for path, words in shared_helpers(head).items() if path in changed]
         # A row taken off the list of rows CI does not run is run.
         released = listed(base) - set(local)
