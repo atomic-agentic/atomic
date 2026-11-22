@@ -2613,11 +2613,16 @@ fn json_that_text_redaction_breaks_is_hidden_whole() {
 /// changed holds, is hidden whole too: by the time redaction reaches that
 /// string it no longer reads as JSON, and what the rules that read names
 /// and pairs would hide there must not show.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let inner = format!(
-        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+        "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
          \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
     );
     let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
@@ -2647,11 +2652,16 @@ fn json_text_redaction_breaks_deeper_in_is_hidden_whole() {
 /// for it: a string that does not read as JSON as written, a bad escape
 /// in a URL's password say, can read as JSON once text redaction hides the
 /// password, and the JSON broken beside it is still hidden whole.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
     let inner = format!(
-        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+        "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
          \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
     );
     let mended = r#"{"u":"https://user:pa\qss@host/"}"#;
@@ -2760,8 +2770,9 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
 
 /// JSON held in strings deeper than [`MAX_NESTED_JSON`] cannot be opened,
 /// so the rules that read its names and pairs never see it: a header's
-/// name and value, `{"name": "X-Api-Key", "value": "<key>"}`, which no text
-/// rule reads, is hidden with the string that holds it, under an ordinary
+/// name and value whose field's name is written with an escape,
+/// `{"\u006eame": "X-Api-Key", "value": "<key>"}`, which no text rule reads
+/// (the text rule for pairs reads field names only as written), is hidden with the string that holds it, under an ordinary
 /// name and under hints, beside a plain sibling or one text redaction
 /// renames, at depths 3 and 4, where its string is past the bound, and
 /// deeper, and a second pass changes nothing.
@@ -2772,7 +2783,7 @@ fn json_held_past_the_nesting_bound_is_hidden_whole() {
     for note in ["x\\\\q", "hi"] {
         for sibling in ["b", "https://u:pw@h"] {
             let inner = format!(
-                "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+                "{{\"headers\": [{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
                  \"note\": \"{note}\"}}"
             );
             let first = Value::String(
@@ -2816,7 +2827,9 @@ fn json_held_past_the_nesting_bound_is_hidden_whole() {
 /// Past [`MAX_NESTED_JSON`], a string that starts as JSON does but does
 /// not parse, cut say, is hidden whole too, and so is one that text
 /// redaction makes start so, so a second pass changes nothing; a string
-/// that does not start so is redacted as text, as at any depth.
+/// that does not start so is redacted as text, as at any depth. The cut
+/// pair writes its field's name with an escape, `"\u006eame"`, which the
+/// text rule for pairs does not read, so only the bound hides it.
 #[test]
 fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
     let token = concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz0123");
@@ -2828,7 +2841,10 @@ fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
         }
         held
     };
-    let cut = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{}\"", &token[7..]);
+    let cut = format!(
+        "{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{}\"",
+        &token[7..]
+    );
     let led = format!("{token} then more");
     for (case, (deep, expected)) in [
         (cut.as_str(), REDACTED),
@@ -2857,10 +2873,15 @@ fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
 /// is hidden whole, whichever key comes first and whether the value is an
 /// object or JSON in a string, under an ordinary name and under hints, at
 /// depths 1 to 4, and a second pass changes nothing.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn a_key_text_redaction_renames_into_a_siblings_name_hides_the_string_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
-    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let pair = format!("{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}");
     let in_string = |s: &str| Value::String(s.to_owned()).to_string();
     let held_pair = in_string(&format!("{{\"headers\": [{pair}]}}"));
     let twin = in_string("{\"headers\": [{\"name\": \"x\", \"value\": \"y\"}]}");
@@ -2980,10 +3001,15 @@ fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
 /// a key text redaction renames too, and two levels down, under an
 /// ordinary name and under hints, held one to four strings deep, and a
 /// second pass changes nothing.
+///
+/// The header's name and value pair planted here writes its field's name
+/// with an escape, `"\u006eame"`: the parse reads it as `name`, and the
+/// text rule for pairs, which reads field names only as written, does
+/// not, so only the rule under test hides it.
 #[test]
 fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
     let key = concat!("Qk9L", "x3sR2tY7uV8w");
-    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let pair = format!("{{\"\\u006eame\": \"X-Api-Key\", \"value\": \"{key}\"}}");
     let (r, p, q) = (
         "\"https://u:[REDACTED]@h\"",
         "\"https://u:pw@h\"",
@@ -3037,13 +3063,12 @@ fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
         value(&mut out);
         assert_eq!(out, json!({ parent: REDACTED }), "under {parent}");
     }
-    // An object that gives each key once is opened as before.
+    // An object that gives each key once is opened as before, and written
+    // back from its parse.
     let mut once = json!({ "body": format!("{{\"h\": {pair}, \"i\": 1}}") });
     value(&mut once);
-    assert_eq!(
-        once,
-        json!({ "body": format!("{{\"h\": {{\"name\": \"X-Api-Key\", \"value\": \"{REDACTED}\"}}, \"i\": 1}}") })
-    );
+    let opened = json!({"h": {"name": "X-Api-Key", "value": REDACTED}, "i": 1});
+    assert_eq!(once, json!({ "body": opened.to_string() }));
 }
 
 /// An excerpt of a JSON document that gives a key twice is hidden whole:
