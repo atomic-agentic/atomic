@@ -668,7 +668,9 @@ forwards decisions with an actor token.
 other OIDC issuer. Users and groups are provisioned through the issuer's SCIM
 API, which atomic reads and never serves. Authorization is relationship-based,
 with project roles, approvers per gate, separation of duties, service accounts,
-and model allowlists through managed requirements.
+and model allowlists through managed requirements. Step-up for high-tier gates
+— a tier that makes a decision need a fresh step-up login, such as a passkey —
+is not part of M27: it arrives in M27a, which ships alongside M9.
 
 **Acceptance:**
 

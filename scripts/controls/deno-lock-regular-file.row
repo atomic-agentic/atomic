@@ -1,0 +1,1 @@
+deno-lock-regular-file|tools/deno_exec.py|    _require(stat.S_ISREG(mode), f"{where}: {what} {path.name} is not a regular file")|    return stat.S_ISREG(mode)|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read

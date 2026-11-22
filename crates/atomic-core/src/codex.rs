@@ -128,6 +128,14 @@ pub struct TurnSpec {
     /// Directories a `workspace-write` thread may write besides its working
     /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
+    /// Directories the thread's commands may neither read nor write, apart
+    /// from those inside them it may write: the scratch roots of the
+    /// project's backends, a `workspace-write` thread's own directory
+    /// excepted. Absolute paths. Codex's Linux sandbox reopens only writable
+    /// directories inside a denied one, so a `read-only` thread's own scratch
+    /// directory, which it may not write, is out of its reach too: it cannot
+    /// even list it.
+    pub denied: Vec<PathBuf>,
 }
 
 /// What a thread's commands are kept out of. It has no default: every
@@ -278,10 +286,16 @@ const AWS_TOKEN_FILES: &[&str] = &[
 /// which its `..data` resolves to, or which is hidden as a version is,
 /// beside a `..data` link. A file that does not resolve through such a
 /// version, even beside a `..data`, is in no volume. Where `..data`, or the
-/// file, cannot be read for any reason but that it is not there, the
+/// file, cannot be read for any reason but that it is not there (nor any
+/// directory it could be in), such as a link that leads back to itself, the
 /// directory holding it is denied whole.
 fn projected_volume(file: PathBuf) -> Option<PathBuf> {
-    let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let missing = |e: &std::io::Error| {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    };
     let target = match std::fs::canonicalize(&file) {
         Ok(target) => target,
         Err(e) if missing(&e) => return None,
@@ -304,11 +318,48 @@ fn projected_volume(file: PathBuf) -> Option<PathBuf> {
         match std::fs::canonicalize(&data) {
             Ok(current) if current == version || hidden => return Some(volume.to_owned()),
             Ok(_) => {}
-            Err(e) if missing(&e) && !hidden => {}
-            Err(_) => return Some(volume.to_owned()),
+            // One that leads nowhere beside a version, or cannot be resolved.
+            Err(_) if hidden => return Some(volume.to_owned()),
+            Err(e) if !missing(&e) => return Some(volume.to_owned()),
+            Err(_) => {}
         }
     }
     None
+}
+
+/// AWS's workload token files the variables in `env` name, a relative one
+/// resolved against the working directory `here` gives, as an AWS SDK
+/// started there resolves it, and, for one in a projected volume, the
+/// volume itself. An error, so nothing runs, when a name is relative and
+/// the working directory is unknown.
+fn token_files(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    here: &dyn Fn() -> std::io::Result<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut out = Vec::new();
+    for name in AWS_TOKEN_FILES {
+        let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
+            continue;
+        };
+        // Named as plainly as it reads, so a trailing `/` is no directory it
+        // must be: only one above the file can fail as not a directory.
+        let file: PathBuf = file.components().collect();
+        let file = if file.is_absolute() {
+            file
+        } else {
+            let refused = |e: std::io::Error| {
+                format!(
+                    "{name} names the token file {} relative to the working directory, which \
+                     is unknown ({e}), so the token could not be denied to atoms' commands",
+                    file.display()
+                )
+            };
+            here().map_err(refused)?.join(&file)
+        };
+        out.extend(projected_volume(file.clone()));
+        out.push(file);
+    }
+    Ok(out)
 }
 
 /// The home directories whose credential places are denied, as `env` reads
@@ -387,26 +438,7 @@ pub fn home_secrets(
     // directory as an AWS SDK resolves it, and, for one in a projected
     // volume, the volume itself.
     out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
-    let here = |name: &str| {
-        std::env::current_dir().map_err(|e| {
-            format!(
-                "{name} names a token file relative to the working directory, which is unknown \
-                 ({e}), so the token could not be denied to atoms' commands"
-            )
-        })
-    };
-    let mut tokens = Vec::new();
-    for name in AWS_TOKEN_FILES {
-        let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
-            continue;
-        };
-        tokens.push(match file.is_absolute() {
-            true => file,
-            false => here(name)?.join(file),
-        });
-    }
-    out.extend(tokens.iter().cloned());
-    out.extend(tokens.into_iter().filter_map(projected_volume));
+    out.extend(token_files(env, &std::env::current_dir)?);
     out.sort();
     out.dedup();
     Ok(out)
@@ -654,9 +686,10 @@ fn program(path: &Path) -> bool {
 /// links its shell needs. Each is denied whole, never re-opened below, so
 /// the sandbox needs no mount inside a denied directory. A path reached
 /// through a linked directory is denied under its real spelling, which
-/// denies it under every other; one that is itself a link, such as a `~/.bashrc` kept with a person's dotfiles, is
-/// denied as the file or directory it points at, since the sandbox cannot
-/// mount on a link, and a read through the link lands on the denied target.
+/// denies it under every other; one that is itself a link, such as a
+/// `~/.bashrc` kept with a person's dotfiles, is denied as the file or
+/// directory it points at, since the sandbox cannot mount on a link, and a
+/// read through the link lands on the denied target.
 /// The real file or directory behind each link up to [`LINK_DEPTH`] levels
 /// inside a denied directory is denied too, such as a `config.yaml` linked
 /// to one kept elsewhere.
@@ -664,9 +697,13 @@ fn program(path: &Path) -> bool {
 /// A resolved target is denied only if [`deniable`]. Nothing runs when a
 /// denied path would cover what the thread needs (its working directory
 /// `cwd`, the directories it may write, `writable`, the state directory,
-/// its Codex home or atomic's own program), or when a link's target lies in
+/// its Codex home or atomic's own program); when a link's target lies in
 /// a directory the thread may write, where a command could rename it out
-/// from under its denial.
+/// from under its denial; when a place is named through a link inside a
+/// directory the thread may write, which a command could point elsewhere;
+/// and when a place lies in a directory the thread may write that it is
+/// given through a link, where the sandbox, which knows that directory by
+/// the spelling it was given, would not keep the place denied.
 ///
 /// Each is denied too wherever else the mount table shows it, such as a
 /// home bound at a second path (see [`crate::mounts`]); nothing runs when
@@ -684,6 +721,7 @@ fn denied_paths(
     writable: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let given = writable;
     let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
@@ -699,7 +737,8 @@ fn denied_paths(
         refuse(format!(
             "{} holds {}, which atoms' commands need, so atomic cannot deny it; keep the \
              project and atomic's state outside the places that hold credentials, and point \
-             any variable that names such a place (HISTFILE, CODEX_HOME and the like) elsewhere",
+             any variable that names such a place (HISTFILE, CODEX_HOME, \
+             AWS_WEB_IDENTITY_TOKEN_FILE and the like) elsewhere",
             path.display(),
             needed.display()
         ))
@@ -888,7 +927,7 @@ fn denied_paths(
     // at a second path or the host's files under /run/host: denied there
     // too, or nothing runs (see `crate::mounts`).
     // And Codex's home, whose databases a pattern denies (see below).
-    let home = [codex_home.to_owned()];
+    let home = [real_spelling(codex_home)];
     let found =
         crate::mounts::second_mounts(&[&all, &home]).map_err(|e| refuse(format!("{e:#}")))?;
     let (aliases, home_aliases) = (&found[0], &found[1]);
@@ -927,11 +966,31 @@ fn denied_paths(
     all.dedup();
     let inside_another = |p: &PathBuf| all.iter().any(|q| q != p && p.starts_with(q));
     let all: Vec<PathBuf> = all.iter().filter(|p| !inside_another(p)).cloned().collect();
+    // The sandbox finds the denials inside a writable directory by the
+    // spelling it is given that directory under: one given through a link
+    // would not keep a denial inside it, under its real spelling, in force.
+    for (named, root) in given.iter().zip(&roots) {
+        if named.as_path() == root.as_path() {
+            continue;
+        }
+        let codex = real_spelling(codex_home);
+        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
+            return Err(refuse(format!(
+                "{} is inside {}, which atoms' commands may write, named {} through a link, so \
+                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
+                 their real paths, with no link above them",
+                place.display(),
+                root.display(),
+                named.display()
+            )));
+        }
+    }
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
-    // covers it.
-    // And so at each second mount of Codex's home.
-    let mut globs = vec![sqlite_glob(codex_home).map_err(|e| refuse(format!("{e:#}")))?];
+    // covers it, under the home's real spelling, as every place is, and so
+    // at each second mount of Codex's home.
+    let home_spelled = real_spelling(codex_home);
+    let mut globs = vec![sqlite_glob(&home_spelled).map_err(|e| refuse(format!("{e:#}")))?];
     for alias in home_aliases {
         globs.push(sqlite_glob(alias).map_err(|e| refuse(format!("{e:#}")))?);
     }
@@ -939,7 +998,7 @@ fn denied_paths(
     // (see `late_targets`): the second mounts of all the list denies, its
     // second mounts among them, and of each directory whose databases it
     // denies; so a list a thread starts with does not refuse its commands.
-    let homes: Vec<PathBuf> = std::iter::once(codex_home.to_owned())
+    let homes: Vec<PathBuf> = std::iter::once(home_spelled)
         .chain(home_aliases.iter().cloned())
         .collect();
     let counted =
@@ -1254,6 +1313,55 @@ pub(crate) fn permission_profile(
     ))
 }
 
+/// `profile` with `denied` denied as well: the backend's scratch
+/// directories. What the thread may write inside a denied directory, such as
+/// its own scratch directory, stays writable, as a writable root of its own.
+fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    };
+    if denied.is_empty() {
+        return Ok(profile);
+    }
+    let mut policy = profile.file_system_sandbox_policy();
+    for dir in denied {
+        let dir = AbsolutePathBuf::from_absolute_path(dir)
+            .with_context(|| format!("resolve the sandbox path {}", dir.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(dir),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        SANDBOX_NETWORK,
+    ))
+}
+
+/// Refuse a thread whose commands must be kept out of `denied` when `paths`
+/// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
+/// denies paths itself. On Linux, Codex's sandbox reads a profile that
+/// denies paths only through that helper, and nowhere else has atomic seen a
+/// denial hold, so without one the thread could not be kept out of other
+/// attempts' scratch directories; atomic refuses it before the thread starts
+/// rather than run it with less denied. On macOS the denial is not verified.
+fn refuse_denied_without_helper(
+    paths: &CodexPaths,
+    denied: &[PathBuf],
+    macos: bool,
+) -> anyhow::Result<()> {
+    if !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {
+        let denied: Vec<_> = denied.iter().map(|d| d.display().to_string()).collect();
+        bail!(
+            "this turn's commands must be kept out of {}, and apart from macOS only \
+             Codex's Linux sandbox helper can do that, which this process does not have; \
+             run atomic itself, which provides one",
+            denied.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a workspace-write thread under [`StateGuard::NoProjectState`]
 /// whose writable roots cover atomic's state or user-wide private
 /// directories, or lie inside them: nothing would deny them.
@@ -1413,8 +1521,9 @@ fn harden() {
 /// still dumpable. Until it has run, the request is exposed in the stdin
 /// pipe: another process of the same user can reopen that pipe through /proc
 /// and read the request, its program, arguments, directory and whole
-/// environment among it, or replace it; the socket's digest refuses a
-/// replaced request, but does not stop one being read.
+/// environment among it, or replace it. When a secret was handed, the
+/// socket's digest refuses a replaced request; it does not stop one being
+/// read, and with no secret handed there is no digest to refuse with.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
@@ -1461,7 +1570,7 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
-    // Before anything that could re-execute this process: see run_helper.
+    // Before anything that could re-execute this process: see [`as_any_helper`].
     as_any_helper();
     harden();
     // The person's own Codex home stays denied to atoms' commands.
@@ -1473,7 +1582,52 @@ where
         std::env::set_var("CODEX_HOME", codex_home);
     }
     scrub_overrides();
-    arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+    let links = hold_helper_links(codex_home);
+    arg0_dispatch_or_else(move |paths| {
+        drop(links);
+        main_fn(CodexPaths(paths))
+    })
+}
+
+/// How long one atomic process waits for another to finish making Codex's
+/// links in the same Codex home before it makes its own regardless.
+const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A lock on making Codex's links to atomic under its helpers' names, in a
+/// file of `codex_home` that atoms' commands are denied under
+/// [`StateGuard::Deny`], held from just
+/// before Codex's dispatch until the command itself starts: or none, when
+/// it cannot be taken within [`HELPER_LINKS_WAIT`] or made at all.
+///
+/// Codex makes those links in a new directory of its home, after sweeping
+/// away every such directory no running process holds, and a directory
+/// another process is still making is not yet held: two atomic processes
+/// starting at once in one Codex home can take each other's away, and the
+/// one that loses warns that it "could not create PATH aliases" and runs
+/// atomic itself as its helper (see [`run_as_linux_sandbox`]). One at a time
+/// they cannot. The same warning has other causes this does not touch: a
+/// Codex home under the system's temporary directory, which a release build
+/// of Codex refuses to make links in, and a home that cannot be written or
+/// is full.
+fn hold_helper_links(codex_home: &Path) -> Option<std::fs::File> {
+    let dir = codex_home.join("tmp");
+    std::fs::create_dir_all(&dir).ok()?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("atomic-helper-links.lock"))
+        .ok()?;
+    let deadline = std::time::Instant::now() + HELPER_LINKS_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Some(lock),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// The entry point for a command that starts no Codex thread, such as
@@ -1527,6 +1681,13 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
         return true;
     }
     let first = args.next().unwrap_or_default();
+    // Codex's Linux sandbox helper run as this executable under its own
+    // name, as Codex runs it when it could not make its link to atomic
+    // under the helper's name (see [`run_as_linux_sandbox`]).
+    #[cfg(target_os = "linux")]
+    if helper_arguments(&first, args.next().as_deref()) {
+        return true;
+    }
     // Exactly the first arguments Codex's dispatch at the pinned revision
     // answers to (arg0, apply-patch, the exec-server's helpers, the pty
     // setup, the Windows sandboxes).
@@ -1545,6 +1706,29 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
+    // The outer stage, started as atomic itself or by the helper's bare
+    // name, as Codex starts it when it could not link atomic under that
+    // name, runs again under one that is a path: a bubblewrap without
+    // `--argv0` runs the inner stage by the outer stage's own name, and a
+    // bare one it would look for along PATH. The inner stage is left as it
+    // is, already past bubblewrap.
+    #[cfg(target_os = "linux")]
+    if linux_sandbox_args(std::env::args_os())
+        && !is_inner_stage(std::env::args_os())
+        && (!invoked_as_linux_sandbox() || started_by_relative_name())
+    {
+        return Err(run_as_linux_sandbox());
+    }
+    // A helper of another system's, which Codex's dispatch here would not
+    // take, goes no further: nothing of a command's start is made for it.
+    if let Some(first) = std::env::args_os().nth(1)
+        && OTHER_SYSTEMS_HELPERS.iter().any(|h| first == *h)
+    {
+        bail!(
+            "{} names a Codex helper of another operating system",
+            first.to_string_lossy()
+        );
+    }
     as_any_helper();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
@@ -2147,6 +2331,20 @@ fn deep_inside<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
     })
 }
 
+/// The first arguments [`is_helper`] knows that name a helper Codex's dispatch
+/// runs only on another operating system than this one.
+const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
+    &["--codex-run-as-process-setup"]
+} else if cfg!(target_os = "linux") {
+    &["--__codex-windows-mxc", "--run-as-windows-sandbox"]
+} else {
+    &[
+        "--__codex-windows-mxc",
+        "--run-as-windows-sandbox",
+        "--codex-run-as-process-setup",
+    ]
+};
+
 /// What [`dispatch`] and [`run_helper`] both do first, whichever of Codex's
 /// helpers this process turns out to be. First, and before the walk, the
 /// sandbox helper's outer stage is made non-dumpable (which reads nothing),
@@ -2648,7 +2846,15 @@ impl atomic_exec::Confine for ExecSandbox {
                 // stops the run; anything else, such as a full disk under the
                 // helper's registry of mount points, may pass, and the run
                 // waits.
-                if sandbox_refused(&stderr) {
+                if not_the_helper(&stderr) {
+                    Err(atomic_exec::ExecError::Unconfinable {
+                        message: format!(
+                            "Codex's Linux sandbox helper could not be set up: what ran in \
+                             its place was not the helper ({why}); run atomic again, and if \
+                             this repeats, install a bubblewrap that supports --argv0"
+                        ),
+                    })
+                } else if sandbox_refused(&stderr) {
                     Err(refuse(why))
                 } else {
                     Err(atomic_exec::ExecError::Unavailable {
@@ -2665,6 +2871,36 @@ impl atomic_exec::Confine for ExecSandbox {
             }),
         }
     }
+}
+
+/// Whether a sandbox trial that failed with `stderr` failed because what
+/// ran in the helper's place was not the helper: atomic's own command line,
+/// refusing the helper's arguments, or bubblewrap, unable to run the helper
+/// by its name, as one without `--argv0` tries to. Waiting would not change
+/// either.
+pub(crate) fn not_the_helper(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| refused_helper_arguments(line) || ran_by_helper_name(line))
+}
+
+/// Whether `line` is atomic's own command line refusing the helper's first
+/// argument. `scripts/controls/sandbox-helper-not-atomic.row` switches this
+/// off.
+fn refused_helper_arguments(line: &str) -> bool {
+    line.contains("unexpected argument '--sandbox-policy-cwd'")
+}
+
+/// Whether `line` is bubblewrap failing to run the helper by its name, the
+/// bare one or a path that ends in it.
+/// `scripts/controls/sandbox-helper-not-by-name.row` switches this off.
+fn ran_by_helper_name(line: &str) -> bool {
+    let Some((said, rest)) = line.split_once("execvp ") else {
+        return false;
+    };
+    let run = rest.split(':').next().unwrap_or_default();
+    let named = run == "codex-linux-sandbox" || run.ends_with("/codex-linux-sandbox");
+    said.trim_start().starts_with("bwrap:") && named
 }
 
 /// Whether a sandbox trial that failed with `stderr` failed because this
@@ -2845,6 +3081,95 @@ fn scrub(mut remove: impl FnMut(&str)) {
     for name in OVERRIDES {
         remove(name);
     }
+}
+
+/// The first argument Codex passes its Linux sandbox helper at the pinned
+/// revision, to its outer stage and to its inner one alike, whenever it
+/// does not first pass `--inherit-pid-namespace`, as it does only for a
+/// command of its own. No command line of atomic's own starts with it.
+#[cfg(target_os = "linux")]
+const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
+
+/// Whether this process was started under a name that is not an absolute
+/// path: a bare one, which a program run by that name would be looked for
+/// along PATH, or a relative one, which would be resolved against whatever
+/// directory it is run from, the workspace a command writes among them.
+/// `scripts/controls/sandbox-helper-bare-name.row` switches this off.
+#[cfg(target_os = "linux")]
+fn started_by_relative_name() -> bool {
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    !Path::new(&argv0).is_absolute()
+}
+
+/// The option Codex may give its Linux sandbox helper ahead of
+/// [`LINUX_SANDBOX_ARG1`], for a command of its own at the pinned revision.
+#[cfg(target_os = "linux")]
+const INHERIT_PID_NAMESPACE: &str = "--inherit-pid-namespace";
+
+/// Whether `first` and `second`, the first two arguments after the
+/// program's name, are how Codex starts its Linux sandbox helper: with
+/// [`LINUX_SANDBOX_ARG1`], alone or after [`INHERIT_PID_NAMESPACE`].
+/// `scripts/controls/sandbox-helper-pid-namespace.row` switches the second
+/// form off.
+#[cfg(target_os = "linux")]
+fn helper_arguments(first: &std::ffi::OsStr, second: Option<&std::ffi::OsStr>) -> bool {
+    let after_inherit = first == INHERIT_PID_NAMESPACE;
+    first == LINUX_SANDBOX_ARG1 || (after_inherit && second == Some(LINUX_SANDBOX_ARG1.as_ref()))
+}
+
+/// Whether this process was given the Linux sandbox helper's arguments,
+/// under a name that is not one of Codex's other helpers'.
+#[cfg(target_os = "linux")]
+fn linux_sandbox_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
+    let patch = args
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "apply_patch" || name == "applypatch");
+    let first = args.next().unwrap_or_default();
+    !patch && helper_arguments(&first, args.next().as_deref())
+}
+
+/// The name this executable runs again under as Codex's Linux sandbox
+/// helper: its file name is the helper's, which Codex's dispatch and
+/// atomic's own know it by, but as a path it can never exist, since
+/// `/dev/null` is no directory. A bubblewrap without `--argv0` runs the
+/// inner stage by this name: an absolute one, which it cannot find, so it
+/// fails, rather than the bare name, which it would look for along `PATH`,
+/// where a command could have put a program by that name.
+/// `scripts/controls/sandbox-helper-unfindable.row` switches it off.
+#[cfg(target_os = "linux")]
+const HELPER_BY_NAME_ONLY: &str = "/dev/null/codex-linux-sandbox";
+
+/// Run this executable again, with the same arguments, under the Linux
+/// sandbox helper's name, which Codex's dispatch and atomic's own helper
+/// entry know it by. Codex runs atomic itself as its helper when it could
+/// not make its link to atomic under that name, such as when another
+/// atomic process sweeping the same Codex home took the directory away as
+/// it was being made; it warns that it "could not create PATH aliases".
+/// Returns only why the executable could not be run.
+#[cfg(target_os = "linux")]
+fn run_as_linux_sandbox() -> anyhow::Error {
+    use std::os::unix::process::CommandExt;
+    // Its environment may already hold a command's proxy token, before the
+    // helper this becomes makes itself non-dumpable.
+    if let Err(e) = not_dumpable() {
+        return anyhow::Error::new(e).context("make the sandbox helper non-dumpable");
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => return anyhow::Error::new(e).context("find atomic's own executable"),
+    };
+    let error = std::process::Command::new(&exe)
+        .arg0(HELPER_BY_NAME_ONLY)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    anyhow::Error::new(error).context(format!(
+        "run {} as Codex's Linux sandbox helper",
+        exe.display()
+    ))
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -3076,6 +3401,7 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -3084,19 +3410,22 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(
-            spec.sandbox,
-            guard,
-            codex_home,
-            Some(cwd),
-            &match spec.sandbox {
-                crate::typed::Sandbox::ReadOnly => Vec::new(),
-                crate::typed::Sandbox::WorkspaceWrite => {
-                    let mut roots = spec.writable_roots.clone();
-                    roots.push(cwd.to_owned());
-                    roots
-                }
-            },
+        Constrained::allow_any(deny_also(
+            permission_profile(
+                spec.sandbox,
+                guard,
+                codex_home,
+                Some(cwd),
+                &match spec.sandbox {
+                    crate::typed::Sandbox::ReadOnly => Vec::new(),
+                    crate::typed::Sandbox::WorkspaceWrite => {
+                        let mut roots = spec.writable_roots.clone();
+                        roots.push(cwd.to_owned());
+                        roots
+                    }
+                },
+            )?,
+            &spec.denied,
         )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();
@@ -3330,10 +3659,13 @@ where
             // A turn cut off at its reserved time used up the active time
             // its atom had left: the run parks, as at any other cap.
             Err(e) if e.downcast_ref::<CutOff>().is_some() => {
-                break Err(meter_error(MeterError::Exhausted(Exhausted(format!(
-                    "{e}: all the active time the allowance {} had left",
-                    bounded_by.as_deref().unwrap_or("of its atom")
-                )))));
+                break Err(meter_error(MeterError::Exhausted(Exhausted {
+                    reason: format!(
+                        "{e}: all the active time the allowance {} had left",
+                        bounded_by.as_deref().unwrap_or("of its atom")
+                    ),
+                    scope: bounded_by.clone(),
+                })));
             }
             Err(e) => break Err(e),
             Ok(answer) => match next(answer.clone()).await {
@@ -4306,6 +4638,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What cannot be read is denied whole: a token that is a link leading
+    /// back to itself denies its directory, and a `..data` that does denies
+    /// its volume. A token below a file, which can be in no directory, is in
+    /// no volume.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_token_or_data_link_denies_its_directory() {
+        let dir = scratch("projected-unreadable");
+        link(&dir.join("loop"), &dir.join("loop"));
+        assert_eq!(projected_volume(dir.join("loop")), Some(dir.clone()));
+        let volume = dir.join("volume");
+        std::fs::create_dir_all(volume.join("current")).expect("version");
+        std::fs::write(volume.join("current/token"), "t").expect("token");
+        link(&volume.join("..data"), &volume.join("..data"));
+        assert_eq!(projected_volume(volume.join("current/token")), Some(volume));
+        std::fs::write(dir.join("plain"), "p").expect("plain");
+        assert_eq!(projected_volume(dir.join("plain/token")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A token file named with a trailing `/` is found in its projected
+    /// volume all the same: the name is read plainly, so only a directory
+    /// above the file can fail as not a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_named_with_a_trailing_slash_is_still_found_in_its_volume() {
+        let dir = scratch("trailing-slash");
+        let volume = dir.join("volume");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let named = format!("{}/token/", volume.display());
+        let env = |name: &str| {
+            (name == "AWS_WEB_IDENTITY_TOKEN_FILE").then(|| std::ffi::OsString::from(&named))
+        };
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/")) };
+        let found = token_files(&env, &here).expect("found");
+        assert!(found.contains(&volume), "the volume is denied");
+        assert!(found.contains(&volume.join("token")), "the token is denied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relative token file with no working directory to resolve it
+    /// against is refused, naming the variable, so nothing runs.
+    #[test]
+    fn a_relative_token_file_with_no_working_directory_is_refused() {
+        let env = |name: &str| {
+            (name == "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE")
+                .then(|| std::ffi::OsString::from("tokens/pod"))
+        };
+        let gone = || -> std::io::Result<PathBuf> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let refused = token_files(&env, &gone).expect_err("refused");
+        assert!(
+            refused.starts_with(
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE names the token file tokens/pod"
+            ),
+            "{refused}"
+        );
+    }
+
     /// A token file named relative to atomic's working directory is denied
     /// where an AWS SDK started there would read it.
     #[test]
@@ -4328,8 +4723,9 @@ mod tests {
 
     /// A place named through a directory that is an absolute link goes to
     /// the sandbox under its real spelling alone, existing or not: an older
-    /// bubblewrap cannot mount on the other. One reached through a link a
-    /// command may write is refused.
+    /// bubblewrap cannot mount on the other, and so does Codex's database
+    /// pattern. One reached through a link a command may write is refused,
+    /// and so is one inside a writable directory given through a link.
     #[cfg(unix)]
     #[test]
     fn a_place_behind_a_linked_directory_is_denied_by_its_real_path() {
@@ -4351,6 +4747,14 @@ mod tests {
             !denied.iter().any(|d| d.starts_with(dir.join("linked"))),
             "a spelling through the link: {denied:?}"
         );
+        // Codex's database pattern, too, is under the home's real spelling.
+        link(&dir.join("codex"), &dir.join("linked-codex"));
+        let (_, globs) =
+            denied_paths(&named, &dir.join("linked-codex"), None, &[]).expect("denied");
+        assert_eq!(
+            globs,
+            vec![format!("{}/*.sqlite*", dir.join("codex").display())]
+        );
         let work = dir.join("work");
         link(&dir.join("real"), &work.join("link"));
         let through = private(vec![work.join("link/gnupg")]);
@@ -4359,6 +4763,35 @@ mod tests {
             .map(|e| e.to_string())
             .unwrap_or_default();
         assert!(refused.contains("may write"), "{refused}");
+        // A place inside a directory the thread may write, given through a
+        // link: the sandbox would not keep it denied.
+        std::fs::write(dir.join("real/.secret"), "s").expect("secret");
+        let inside = private(vec![dir.join("real/.secret")]);
+        let refused = denied_paths(&inside, &dir.join("codex"), None, &[dir.join("linked")])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            refused.contains("through a link, so its denial would not hold"),
+            "{refused}"
+        );
+        // And so is Codex's home there, whose databases a pattern denies.
+        std::fs::create_dir_all(dir.join("real/codex-home")).expect("codex home");
+        let refused = denied_paths(
+            &private(vec![]),
+            &dir.join("real/codex-home"),
+            None,
+            &[dir.join("linked")],
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(
+            refused.contains("through a link, so its denial would not hold"),
+            "{refused}"
+        );
+        let given_real = denied_paths(&inside, &dir.join("codex"), None, &[dir.join("real")]);
+        assert!(given_real.is_ok(), "{given_real:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6118,6 +6551,13 @@ mod tests {
         }
     }
 
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        // Under its real spelling, as the deny list spells what it finds.
+        std::fs::canonicalize(&d).expect("real")
+    }
+
     /// A scratch directory this call alone has: named by a counter and the
     /// clock as well as the pid, and made with `create_dir`, so a second run
     /// says so instead of planting its canaries where the first left them.
@@ -6414,6 +6854,129 @@ mod tests {
         });
     }
 
+    /// Only Codex's Linux sandbox helper keeps a thread's commands out of
+    /// the paths its profile denies, apart from macOS's own sandbox, so
+    /// anywhere but macOS a thread with something to deny and no helper is
+    /// refused before any model call, and is never run with less denied.
+    #[test]
+    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_except_on_macos() {
+        let denied = [PathBuf::from("/scratch/root")];
+        let helperless = CodexPaths::without_helpers();
+        let why = refuse_denied_without_helper(&helperless, &denied, false)
+            .expect_err("no helper to deny with")
+            .to_string();
+        assert!(
+            why.contains("/scratch/root") && why.contains("sandbox helper"),
+            "{why}"
+        );
+        refuse_denied_without_helper(&helperless, &[], false).expect("nothing to deny");
+        refuse_denied_without_helper(&helperless, &denied, true).expect("macOS denies itself");
+        let with =
+            CodexPaths::with_helpers("/bin/atomic".into(), "/bin/codex-linux-sandbox".into());
+        refuse_denied_without_helper(&with, &denied, false).expect("a helper denies");
+
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let (home, cwd) = (scratch("deny-home"), scratch("deny-cwd"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let spec = TurnSpec {
+                prompt: "ping".into(),
+                denied: denied.to_vec(),
+                ..TurnSpec::default()
+            };
+            let err = run(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &spec,
+            )
+            .await
+            .expect_err("refused without a helper");
+            assert!(err.to_string().contains("sandbox helper"), "{err:#}");
+            assert_eq!(model.calls(), 0, "refused before any model call");
+        });
+    }
+
+    /// A turn's profile, as atomic builds it, denies the scratch root and
+    /// so never reads the whole disk: what it reads are its readable roots,
+    /// the deepest entry for a path winning. Its own scratch directory, a
+    /// writable root inside the denied one, is one of them, and the scratch
+    /// root is unreadable. (Codex's macOS sandbox builds its reads from these
+    /// roots; that it then reads its own scratch is not verified on macOS.)
+    #[test]
+    fn a_turns_profile_reads_its_own_scratch_inside_a_denied_root() {
+        // Outside the system's temporary directory, as atomic keeps scratch
+        // roots.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("profile-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = {
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::canonicalize(&dir).expect("canonical")
+        };
+        let (home, cwd, root) = (dir.join("home"), dir.join("cwd"), dir.join("state/scratch"));
+        let own = root.join("step/attempt");
+        for d in [&home, &cwd, &own] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let profile = deny_also(
+            permission_profile(
+                crate::typed::Sandbox::WorkspaceWrite,
+                &StateGuard::NoProjectState,
+                &home,
+                Some(&cwd),
+                &[own.clone(), cwd.clone()],
+            )
+            .expect("profile"),
+            std::slice::from_ref(&root),
+        )
+        .expect("denied");
+        // With the turn's writable roots as its workspace roots, as
+        // `converse_async` sets them, and resolved as Codex's macOS sandbox
+        // resolves it.
+        let roots: Vec<AbsolutePathBuf> = [&cwd, &own]
+            .into_iter()
+            .map(|r| AbsolutePathBuf::from_absolute_path(r).expect("absolute"))
+            .collect();
+        let resolved = profile
+            .materialize_project_roots_with_workspace_roots(&roots)
+            .file_system_sandbox_policy()
+            .resolve_for_enforcement(
+                &cwd,
+                codex_protocol::permissions::FileSystemPolicyProjection::PreserveMutableRoots,
+            )
+            .expect("resolved");
+        assert!(!resolved.has_full_disk_read_access);
+        assert!(
+            resolved.readable_roots.iter().any(|r| r.as_path() == own),
+            "{:?}, writable {:?}",
+            resolved.readable_roots,
+            resolved.writable_roots
+        );
+        assert!(
+            resolved
+                .unreadable_roots
+                .iter()
+                .any(|r| r.as_path() == root),
+            "{:?}",
+            resolved.unreadable_roots
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Codex sends TurnComplete before it marks the thread idle; a follow-up
     /// submitted in that window must wait, not fail as NotIdle.
     #[test]
@@ -6692,6 +7255,30 @@ mod tests {
             &["atomic", "--codex-run-as-process-setup"][..],
         ] {
             assert!(is_helper(args(helper).into_iter()), "{helper:?}");
+        }
+        // The Linux sandbox helper by its arguments, as Codex runs atomic
+        // itself when it could not link to it under the helper's name.
+        #[cfg(target_os = "linux")]
+        for by_args in [
+            &["/opt/atomic", "--sandbox-policy-cwd", "/x", "--", "true"][..],
+            &[
+                "/opt/atomic",
+                "--inherit-pid-namespace",
+                "--sandbox-policy-cwd",
+                "/x",
+                "--",
+                "true",
+            ][..],
+        ] {
+            assert!(is_helper(args(by_args).into_iter()), "{by_args:?}");
+            assert!(linux_sandbox_args(args(by_args)), "{by_args:?}");
+        }
+        #[cfg(target_os = "linux")]
+        for not_by_args in [
+            &["/opt/atomic", "--inherit-pid-namespace", "run"][..],
+            &["/opt/apply_patch", "--sandbox-policy-cwd", "/x"][..],
+        ] {
+            assert!(!linux_sandbox_args(args(not_by_args)), "{not_by_args:?}");
         }
         for not in [
             &["atomic", "run", "x"][..],
@@ -7088,6 +7675,32 @@ mod tests {
             // The second call carries the failed tool call's result.
             assert!(model.requests()[1].to_string().contains("call_synthetic"));
         });
+    }
+
+    /// A trial whose helper turned out to be atomic's own command line, which
+    /// refuses the helper's arguments, is told apart from a sandbox that
+    /// failed.
+    #[test]
+    fn a_trial_run_by_atomics_command_line_is_not_the_helper() {
+        assert!(not_the_helper(
+            "error: unexpected argument '--sandbox-policy-cwd' found\n\n\
+             Usage: atomic-x86_64 [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+        ));
+        for by_name in [
+            "bwrap: execvp codex-linux-sandbox: No such file or directory",
+            "bwrap: execvp /dev/null/codex-linux-sandbox: Not a directory",
+        ] {
+            assert!(not_the_helper(by_name), "{by_name}");
+        }
+        for other in [
+            "",
+            "bwrap: Can't make directory /tmp/x: No space left on device",
+            "error: unexpected argument '--other' found",
+            "bwrap: execvp /usr/bin/true: No such file or directory",
+            "bwrap: execvp /opt/codex-linux-sandbox-x: No such file or directory",
+        ] {
+            assert!(!not_the_helper(other), "{other}");
+        }
     }
 
     /// A sandbox trial stops the run only for what the machine repeats until

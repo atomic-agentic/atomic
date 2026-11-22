@@ -757,7 +757,8 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
 
 /// The same title and the same shown content, with only an evidence digest
 /// changed: a new proposal, and the approval made on the old evidence does
-/// not carry over to it.
+/// not carry over to it, while a new approval carrying the new proposal is
+/// decided.
 async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) {
     register(&mut rt);
     rt.launch().await.expect("launch");
@@ -772,7 +773,7 @@ async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R)
         evidence: vec![other.into()],
         ..input(None)
     };
-    let (_, second) = start_gated(&rt, changed).await;
+    let (second_run, second) = start_gated(&rt, changed).await;
     assert_eq!((&second.title, &second.show), (&first.title, &first.show));
     assert_ne!(
         second.proposal, first.proposal,
@@ -795,6 +796,22 @@ async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R)
             .expect("stored")
             .resolution,
         None
+    );
+    // The refusal was the old approval, not the new evidence: a command that
+    // carries the second gate's own proposal decides it. And the run
+    // finishes, so the shutdown below has nothing left to wait for.
+    decide(
+        &rt,
+        &me(&rt).await,
+        command(&second, &unique("e"), Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert!(
+        outcome(&rt, &second_run)
+            .await
+            .expect("finishes")
+            .approved()
     );
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }

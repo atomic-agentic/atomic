@@ -1,0 +1,1 @@
+sandbox-mounts-stale-overlay|crates/atomic-core/src/mounts.rs|    shown_unlisted(home, &same, path, &out[start..], points)?;|    let _ = (start, points); // CONTROL_OFF|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test stale_roots a_second_mount_whose_root_went_stale_refuses_the_list

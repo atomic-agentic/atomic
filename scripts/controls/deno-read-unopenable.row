@@ -1,0 +1,1 @@
+deno-read-unopenable|tools/deno_exec.py|    except (OSError, UnicodeDecodeError) as error:|    except UnicodeDecodeError as error:|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read
