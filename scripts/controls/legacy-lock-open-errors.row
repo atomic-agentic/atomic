@@ -1,0 +1,1 @@
+legacy-lock-open-errors|crates/atomic-core/src/state.rs|Err(source) => return Err(std::fs::TryLockError::Error(source)),|Err(_source) => return Ok(None), // CONTROL_OFF: open errors look absent|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_open_errors_refuse_migration

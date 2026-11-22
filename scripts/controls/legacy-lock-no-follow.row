@@ -1,0 +1,1 @@
+legacy-lock-no-follow|crates/atomic-core/src/state.rs|&mut open, LEGACY_LOCK_OPEN_FLAGS|&mut open, LINK_OPEN_FLAGS|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_links_are_not_followed
