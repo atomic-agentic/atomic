@@ -8,16 +8,18 @@
 # and when the process that started it dies, when dev.sh exits 143, unless
 # ATOMIC_DEV_DETACHED=1 lets it outlive that process. A bystander run keeps
 # its container through all of them. The watcher knows dev.sh and its parent
-# by when they started, so a process that took one's number is never
-# signalled; a ps that fails does not make dev.sh look gone; a watcher that
-# cannot start is reported; and a signal after the client was waited for
-# signals no client.
+# by when they started, so a process that took one's number is not
+# signalled, nor one whose start cannot be read; a stepped clock does not
+# make dev.sh look gone, nor does a start that cannot be read; a watcher
+# that cannot start is reported; and a signal after the client was waited
+# for signals no client.
 #
 # Runs on the host, with the container engine dev.sh uses (docker or podman),
 # and starts dev.sh with a long sleep each time. Every run's engine is a shim
-# that labels the containers it makes with this test's own token, and lists
-# and removes only those, so nothing but the containers this test starts is
-# ever touched, even when dev.sh's own label match is wrong.
+# that labels the containers it makes with this test's own token, lists and
+# removes only those, and refuses any other engine command, so nothing but
+# the containers this test starts is ever touched, even when dev.sh's own
+# label match is wrong.
 #
 #   scripts/dev-sh-test.sh
 #
@@ -87,12 +89,23 @@ rm)
     [ "${#mine[@]}" -eq 0 ] || exec "${real}" rm ${flags[@]+"${flags[@]}"} "${mine[@]}"
     exit 0
     ;;
-*) exec "${real}" "$@" ;;
+build) exec "${real}" "$@" ;;
+image | inspect)
+    [ "${1}" = inspect ] || [ "${2:-}" = inspect ] || denied=1
+    [ -n "${denied:-}" ] || exec "${real}" "$@"
+    ;&
+*)
+    # Anything else could reach containers this test did not start.
+    echo "FAIL the engine shim refused: $*" >&2
+    echo "$*" >>"${ATOMIC_DEV_TEST_REFUSED}"
+    exit 97
+    ;;
 esac
 SHIM
 } >"${WORK}/engine/${ENGINE##*/}"
 chmod +x "${WORK}/engine/${ENGINE##*/}"
 export PATH="${WORK}/engine:${PATH}" ATOMIC_CONTAINER="${ENGINE##*/}"
+export ATOMIC_DEV_TEST_REFUSED="${WORK}/refused"
 
 fail() {
     echo "FAIL $*" >&2
@@ -122,8 +135,27 @@ within() {
 }
 
 # When process $1 started, or nothing when it is not there.
-started_at() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//'; }
-running() { kill -0 "$1" 2>/dev/null && ! ps -o stat= -p "$1" | grep -q '^Z'; }
+# As dev.sh reads them: on Linux the kernel's start ticks, elsewhere ps's
+# start time in UTC.
+probe() {
+    local stat
+    if [ -r /proc/self/stat ]; then
+        stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+        stat="${stat##*) }"
+        # shellcheck disable=SC2086
+        set -- ${stat}
+        [ -z "${20:-}" ] || echo "$1 ${20}"
+        return 0
+    fi
+    LC_ALL=C TZ=UTC0 ps -o stat= -o lstart= -p "$1" 2>/dev/null |
+        sed 's/^ *//; s/ *$//; s/  */ /g' || true
+}
+started_at() {
+    local seen
+    seen="$(probe "$1")"
+    [ -z "${seen}" ] || echo "${seen#* }"
+}
+running() { kill -0 "$1" 2>/dev/null && ! probe "$1" | grep -q '^Z'; }
 # Whether process $1 is still the one that started at $2: never one that
 # took its number after it was waited for.
 same() { [ -n "$2" ] && running "$1" && [ "$(started_at "$1")" = "$2" ]; }
@@ -201,6 +233,14 @@ start() {
             echo "$?" >"${WORK}/${how}.status"
         ) </dev/null >/dev/null 2>&1 &
         ;;
+    clock-step)
+        (
+            env PATH="${WORK}/stepped-ps:${PATH}" "${devsh[@]}" </dev/null >"${log}" 2>&1 &
+            echo "$!" >"${WORK}/${how}.pid"
+            wait "$!"
+            echo "$?" >"${WORK}/${how}.status"
+        ) </dev/null >/dev/null 2>&1 &
+        ;;
     parent | detached)
         [ "${how}" = parent ] || devsh=(env ATOMIC_DEV_DETACHED=1 "${devsh[@]}")
         python3 "${WORK}/reaper.py" "${WORK}" "${how}" "${devsh[@]}" </dev/null >/dev/null 2>&1 &
@@ -253,7 +293,19 @@ bystander_kept() {
     fi
 }
 
-for how in TERM INT HUP pty KILL group parent detached; do
+# A ps whose start times move, as they do when the wall clock is stepped,
+# once the test says the clock was stepped: dev.sh's watcher must not take
+# its run for gone.
+mkdir -p "${WORK}/stepped-ps"
+{
+    echo '#!/usr/bin/env bash'
+    printf 'real=%q stepped=%q\n' "$(command -v ps)" "${WORK}/stepped"
+    echo '[ -e "${stepped}" ] || exec "${real}" "$@"'
+    echo '"${real}" "$@" | sed -E "s/[0-9]{4}\$/1999/"'
+} >"${WORK}/stepped-ps/ps"
+chmod +x "${WORK}/stepped-ps/ps"
+
+for how in TERM INT HUP pty KILL group parent detached clock-step; do
     pids="$(start "${how}")" || {
         fail "${how}: did not start"
         continue
@@ -264,8 +316,21 @@ for how in TERM INT HUP pty KILL group parent detached; do
     pty) kill -TERM "${pid}" ;;
     parent | detached) kill -KILL "${parent}" ;;
     group) kill -KILL -- "-${pid}" ;;
+    clock-step) touch "${WORK}/stepped" ;;
     *) kill "-${how}" "${pid}" ;;
     esac
+    if [ "${how}" = clock-step ]; then
+        # The clock stepped, the run and its container go on; stopped, it
+        # goes as any run does.
+        sleep 5
+        if same "${pid}" "${pid_start}" && [ -n "$(containers_of "${pid}")" ]; then
+            echo "ok clock-step: a stepped clock left the run and its container alone" >&2
+        else
+            fail "clock-step: the watcher took a stepped clock for dev.sh gone"
+        fi
+        rm -f "${WORK}/stepped"
+        kill -TERM "${pid}"
+    fi
     if [ "${how}" = detached ]; then
         # Its parent gone, it runs on; stopped, it goes as any run does.
         sleep 5
@@ -277,7 +342,7 @@ for how in TERM INT HUP pty KILL group parent detached; do
         kill -TERM "${pid}"
     fi
     case "${how}" in
-    TERM | INT | HUP | pty | parent | detached)
+    TERM | INT | HUP | pty | parent | detached | clock-step)
         # The trap removes the container before dev.sh exits; when the
         # parent died, the watcher stops dev.sh first.
         within 20 test -s "${WORK}/${how}.status"
@@ -348,7 +413,7 @@ watch() { "${BASH}" "${ROOT}/scripts/dev.sh" --watch-run "$@" </dev/null >/dev/n
 
 # A process that took dev.sh's number, after dev.sh's parent went, is not
 # dev.sh: it is not signalled, and the watcher ends.
-watch "${TAG}-none" "${other}" "Thu Jan  1 00:00:00 1970" "$$" "Thu Jan  1 00:00:00 1970"
+watch "${TAG}-none" "${other}" "0" "$$" "0"
 watcher=$!
 if within 15 eval '! running '"${watcher}" && same "${other}" "${other_start}"; then
     echo "ok reused: the watcher left alone a process that took dev.sh's number" >&2
@@ -358,12 +423,13 @@ else
 fi
 wait "${watcher}" 2>/dev/null
 
-# A ps that fails does not make dev.sh look gone: the watcher keeps the
-# run's container, here one of this test's labelled with the run's token,
-# until dev.sh is gone.
+# When dev.sh's start cannot be read, as when ps or /proc fails, it
+# does not look gone: the watcher keeps the run's container, here one of
+# this test's labelled with the run's token, until dev.sh is gone.
 mkdir -p "${WORK}/no-ps"
 printf '#!/bin/sh\nexit 1\n' >"${WORK}/no-ps/ps"
-chmod +x "${WORK}/no-ps/ps"
+printf '#!/bin/sh\nexit 1\n' >"${WORK}/no-ps/cat"
+chmod +x "${WORK}/no-ps/ps" "${WORK}/no-ps/cat"
 if command -v sha256sum >/dev/null 2>&1; then
     image="atomic-dev:$(sha256sum "${ROOT}/dev/Dockerfile" | cut -c1-12)"
 else
@@ -390,17 +456,39 @@ kill -KILL "${watcher}" 2>/dev/null
 wait "${watcher}" 2>/dev/null
 kill_same "${other}" "${other_start}"
 
+# Nor is a process whose start cannot be read signalled: after dev.sh's
+# parent went, a stranger with dev.sh's number, unconfirmed, is left alone.
+sleep 300 </dev/null >/dev/null 2>&1 &
+stranger=$!
+stranger_start="$(started_at "${stranger}")"
+(:) &
+dead=$!
+wait "${dead}"
+PATH="${WORK}/no-ps:${PATH}" watch "${TAG}-none" "${stranger}" "0" "${dead}" "0"
+watcher=$!
+if within 20 eval '! running '"${watcher}" && same "${stranger}" "${stranger_start}"; then
+    echo "ok blind: the watcher signalled no process it could not confirm was dev.sh" >&2
+else
+    fail "blind: the watcher signalled a process it could not confirm was dev.sh"
+    kill -KILL "${watcher}" 2>/dev/null
+fi
+wait "${watcher}" 2>/dev/null
+kill_same "${stranger}" "${stranger_start}"
+
 # A watcher that cannot start is reported, and nothing starts: setsid fails,
-# or ps cannot say when dev.sh, or the process that started it, started.
+# or when dev.sh, or the process that started it, started cannot be read.
 mkdir -p "${WORK}/no-setsid" "${WORK}/ps-fails"
 printf '#!/bin/sh\nexit 1\n' >"${WORK}/no-setsid/setsid"
-{
-    echo '#!/usr/bin/env bash'
-    printf 'real=%q\n' "$(command -v ps)"
-    echo 'for arg; do [ "${arg}" != "${ATOMIC_DEV_TEST_PS_FAILS}" ] || exit 1; done'
-    echo 'exec "${real}" "$@"'
-} >"${WORK}/ps-fails/ps"
-chmod +x "${WORK}/no-setsid/setsid" "${WORK}/ps-fails/ps"
+for tool in ps cat; do
+    {
+        echo '#!/usr/bin/env bash'
+        printf 'real=%q\n' "$(command -v "${tool}")"
+        echo 'fails="${ATOMIC_DEV_TEST_PS_FAILS:-none}"'
+        echo 'for arg; do case "${arg}" in "${fails}" | "/proc/${fails}/stat") exit 1 ;; esac; done'
+        echo 'exec "${real}" "$@"'
+    } >"${WORK}/ps-fails/${tool}"
+done
+chmod +x "${WORK}/no-setsid/setsid" "${WORK}/ps-fails/ps" "${WORK}/ps-fails/cat"
 for case in no-setsid ps-self ps-parent; do
     case "${case}" in
     no-setsid) run=(env PATH="${WORK}/no-setsid:${PATH}" "${ROOT}/scripts/dev.sh" true) ;;
@@ -421,6 +509,9 @@ for case in no-setsid ps-self ps-parent; do
     fi
 done
 bystander_kept watcher
+if [ -s "${ATOMIC_DEV_TEST_REFUSED}" ]; then
+    fail "shim: dev.sh called engine commands the test does not allow: $(cat "${ATOMIC_DEV_TEST_REFUSED}")"
+fi
 
 # The bystander, stopped last, goes as any run does.
 kill -TERM "${by_pid}"

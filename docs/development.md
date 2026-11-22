@@ -89,14 +89,18 @@ test Postgres stays up, since every run shares it. A run started with
 `ATOMIC_DEV_DETACHED=1`, as for `nohup scripts/dev.sh … &`, outlives the
 process that started it, as does one the system's first process starts. The
 watcher knows dev.sh and its parent by when each started as well as by its
-process id, so it never signals a process that took one's number, and a
-watcher that cannot start stops the run (exit 1) with a message saying so.
+process id (on Linux the kernel's start time, which stepping the clock does
+not move), and checks dev.sh is still the process it started just before it
+signals it, so a process that took its number is not signalled, short of
+one ending and its number being taken in the moment between the check and
+the signal. A watcher that cannot start stops the run (exit 1) with a
+message saying so.
 `scripts/dev-sh-test.sh` runs on the host, with docker or podman, and checks
 each of these, with another run's container kept through every stop; it exits
 75 at once while `ATOMIC_DEV_WAIT_LOCK` exists. Its runs reach the engine
 through a shim that labels each container they make with the test's own
-token and lists and removes only those, so the test touches no container it
-did not start.
+token and lists and removes only those, and refuses every other engine
+command, so the test touches no container it did not start.
 
 ## The test database
 
