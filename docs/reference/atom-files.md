@@ -52,9 +52,11 @@ On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
 `private/`, the current project's Codex records, the credential and key
-directories) and the places in your home directory where credentials are
+directories), the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
-[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
+[configuration](#configuration)), and the scratch directories of the
+project's other attempts, live or not, whether a turn's, another exec
+step's or that of `atomic debug codex-prompt` or `atomic debug probe`. It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
@@ -503,10 +505,10 @@ mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
-mount made after the list, or a root that goes stale after it, such as a
-mount an automount makes when a path is
-first used, even from inside the sandbox, which sees the host's new mounts
-until the next turn. A turn does
+mount made while a command runs, or a root that goes stale after the
+list, such as a mount an automount makes when a path is first used, even
+from inside the sandbox, which sees the host's new mounts: it is not
+denied to the command that runs then. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
@@ -522,15 +524,21 @@ commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a
 denied place points at, which each command looks for again as it starts,
-in the places the list was made with, and denies at its second mounts too;
-a command whose new link leads somewhere atomic would refuse to deny does
-not start. As each command starts, the links up to four levels inside the
+in the places the list was made with, and denies at its second mounts too,
+and so is a second mount of what the list denies made since it was built,
+or of Codex's home, whose databases are denied there too, as each command
+reads the mount table again; a command whose new link or
+new second mount leads somewhere atomic would refuse to deny does not
+start. As each command starts, the links up to four levels inside the
 places that lead outside them to something atomic would deny, old and new,
 each target counted once, together with the second mounts of what the new
-ones point at, come to at most 512; past that, the command does not start.
-A link made in the moment between that look and the sandbox's start, or
-while a long-lived command, such as a turn's unified-exec session, keeps
-running, is followed only from the next command. The file operations Codex
+ones point at, of everything the list denies (its own second mounts among
+them, so each pair is counted from both sides) and of Codex's home, come to
+at most 512; past that, the command does not start, and the list is
+counted the same way when the turn starts.
+A link or a mount made in the moment between that look and the sandbox's
+start, or while a long-lived command, such as a turn's unified-exec
+session, keeps running, is followed only from the next command. The file operations Codex
 makes for a turn itself, such as applying a patch, go through a helper that
 is not handed the places: it walks the list's own entries instead, so for
 them a place that was already a link when the list was made is not

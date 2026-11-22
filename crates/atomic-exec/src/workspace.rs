@@ -115,9 +115,9 @@ pub struct Workspace {
     /// Directories of the backend's own that the workspace's commands may
     /// neither read nor write, `scratch` excepted: the scratch directories of
     /// every other attempt, live or not, its backend's and those of the
-    /// project's other backends it was told to deny, so no turn of the
-    /// project reads another's `HOME` or `TMPDIR`. Other projects' scratch
-    /// directories are not among them.
+    /// project's other backends it was told to deny, so no turn and no
+    /// confined command of the project reads another's `HOME` or `TMPDIR`.
+    /// Other projects' scratch directories are not among them.
     pub denied: Vec<PathBuf>,
 }
 

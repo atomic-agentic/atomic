@@ -1,0 +1,1 @@
+log-line-redacted-alone|crates/atomic-core/src/redact.rs|        self.text.push_str(&text(value));|        self.text.push_str(value); // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::a_lines_quoted_text_is_redacted_on_its_own
