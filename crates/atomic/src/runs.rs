@@ -14,7 +14,7 @@
 //! terminal let their runs go on, until it is stopped.
 
 use crate::engine::{self, EngineArgs};
-use crate::failure::Failure;
+use crate::failure::{Failure, Said};
 use crate::target;
 use atomic_app::pipeline::PIPELINE;
 use atomic_core::codex::CodexPaths;
@@ -268,28 +268,44 @@ async fn finish(
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
         Err(_) if panicked.is_some() => {
+            use atomic_app::panics::{HINT, HINT_END, NOT_PARKED, NOT_RETRIED, PANICKED};
             let message = panicked.unwrap_or_default();
-            let cause = if parked_seen.get() {
-                atomic_app::panics::cause(run_id, &message)
+            let end = if parked_seen.get() {
+                NOT_RETRIED
             } else {
-                atomic_app::panics::unparked(run_id, &message)
+                NOT_PARKED
             };
-            Err(Failure::new("run.panicked", cause, atomic_app::panics::hint(run_id)).into())
+            let cause = Said::new()
+                .text("run ")
+                .name(run_id)
+                .text(format!("{PANICKED}{message}{end}"));
+            let hint = Said::new().text(HINT).name(run_id).text(HINT_END);
+            Err(Failure::named("run.panicked", cause, hint).into())
         }
         Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
-            Err(Failure::new(
+            Err(Failure::named(
                 "run.dead_lettered",
-                format!("run {run_id} failed: {why}"),
-                "find why its step keeps stopping, such as a command whose runner dies under it, \
-                 fix that, and start a new run",
+                Said::new()
+                    .text("run ")
+                    .name(run_id)
+                    .text(format!(" failed: {why}")),
+                Said::new().text(
+                    "find why its step keeps stopping, such as a command whose runner dies under \
+                     it, fix that, and start a new run",
+                ),
             )
             .into())
         }
-        Err(DurableError::Failed(why)) => Err(Failure::new(
+        Err(DurableError::Failed(why)) => Err(Failure::named(
             "run.failed",
-            format!("run {run_id} failed: {why}"),
-            "fix what the description names and start a new run; this run's record stays in \
-             the store",
+            Said::new()
+                .text("run ")
+                .name(run_id)
+                .text(format!(" failed: {why}")),
+            Said::new().text(
+                "fix what the description names and start a new run; this run's record stays in \
+                 the store",
+            ),
         )
         .into()),
         Err(e)
@@ -298,23 +314,29 @@ async fn finish(
                 Ok(Some(RunStatus::Other(ref state))) if state == "MAX_RECOVERY_ATTEMPTS_EXCEEDED"
             ) =>
         {
-            Err(Failure::new(
+            Err(Failure::named(
                 "run.parked",
-                format!(
-                    "run {run_id} stopped without finishing more times than the engine allows, \
-                     so it is parked: {e}"
-                ),
-                format!(
-                    "find why it keeps stopping, then continue it with `atomic runs resume \
-                     {run_id}`"
-                ),
+                Said::new().text("run ").name(run_id).text(format!(
+                    " stopped without finishing more times than the engine allows, so it is \
+                     parked: {e}"
+                )),
+                Said::new()
+                    .text("find why it keeps stopping, then continue it with `atomic runs resume ")
+                    .name(run_id)
+                    .text("`"),
             )
             .into())
         }
-        Err(e) => Err(Failure::new(
+        Err(e) => Err(Failure::named(
             "run.interrupted",
-            format!("run {run_id} did not finish: {e}"),
-            format!("fix the cause, then continue the same run with `atomic runs resume {run_id}`"),
+            Said::new()
+                .text("run ")
+                .name(run_id)
+                .text(format!(" did not finish: {e}")),
+            Said::new()
+                .text("fix the cause, then continue the same run with `atomic runs resume ")
+                .name(run_id)
+                .text("`"),
         )
         .into()),
     }
@@ -379,13 +401,19 @@ pub async fn run(
             RunStatus::Failed(_) => "failed".to_owned(),
             RunStatus::Other(state) => state.to_lowercase(),
         };
-        return Err(Failure::new(
+        return Err(Failure::named(
             "run.exists",
-            format!("there is already a run {run_id} in this project's store, and it is {state}"),
-            format!(
-                "give a new id, or leave out --run-id for one; to continue or read that run, use \
-                 `atomic runs resume {run_id}`"
-            ),
+            Said::new()
+                .text("there is already a run ")
+                .name(&run_id)
+                .text(format!(" in this project's store, and it is {state}")),
+            Said::new()
+                .text(
+                    "give a new id, or leave out --run-id for one; to continue or read that run, \
+                     use `atomic runs resume ",
+                )
+                .name(&run_id)
+                .text("`"),
         )
         .into());
     }
@@ -504,23 +532,27 @@ pub async fn resume(
     match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
-            Err(Failure::new(
+            Err(Failure::named(
                 "run.not_found",
-                format!(
-                    "no run {id} in this project's store ({})",
+                Said::new().text("no run ").name(id).text(format!(
+                    " in this project's store ({})",
                     engine.store_description
+                )),
+                Said::new().text(
+                    "give the id `atomic run` printed, from the project that ran it (or pass \
+                     --project)",
                 ),
-                "give the id `atomic run` printed, from the project that ran it (or pass \
-                 --project)",
             )
             .into())
         }
         Some(RunStatus::Failed(why)) => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
-            Err(Failure::new(
+            Err(Failure::named(
                 "run.failed",
-                format!("run {id} already failed, so there is nothing to resume: {why}"),
-                "fix what the description names and start a new run",
+                Said::new().text("run ").name(id).text(format!(
+                    " already failed, so there is nothing to resume: {why}"
+                )),
+                Said::new().text("fix what the description names and start a new run"),
             )
             .into())
         }
@@ -538,10 +570,13 @@ pub async fn resume(
         }
         Some(RunStatus::Other(state)) if state != PARKED => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
-            Err(Failure::new(
+            Err(Failure::named(
                 "run.not_resumable",
-                format!("run {id} is {state}, so it cannot be resumed"),
-                "start a new run",
+                Said::new()
+                    .text("run ")
+                    .name(id)
+                    .text(format!(" is {state}, so it cannot be resumed")),
+                Said::new().text("start a new run"),
             )
             .into())
         }
@@ -552,15 +587,20 @@ pub async fn resume(
             // would wait for ever.
             if record.version != engine.rt.version() {
                 let _ = engine.rt.shutdown(SHUTDOWN).await;
-                return Err(Failure::new(
+                return Err(Failure::named(
                     "run.other_layout",
-                    format!(
-                        "run {id} was started by an atomic whose durable step layout is {}, and \
-                         this atomic's is {}, so it cannot continue the run",
-                        record.version,
-                        engine.rt.version()
+                    Said::new()
+                        .text("run ")
+                        .name(id)
+                        .text(" was started by an atomic whose durable step layout is ")
+                        .name(&record.version)
+                        .text(", and this atomic's is ")
+                        .name(engine.rt.version())
+                        .text(", so it cannot continue the run"),
+                    Said::new().text(
+                        "continue it with an atomic of the layout that started it, or start a \
+                         new run",
                     ),
-                    "continue it with an atomic of the layout that started it, or start a new run",
                 )
                 .into());
             }
@@ -584,20 +624,25 @@ pub async fn resume(
             let owner = record.owner().unwrap_or_default();
             if engine.shared && owner != engine.rt.executor_id() && !args.owner_stopped {
                 let _ = engine.rt.shutdown(SHUTDOWN).await;
-                return Err(Failure::new(
+                return Err(Failure::named(
                     "run.owned",
-                    format!(
-                        "run {id} is owned by executor {}, not this one ({}), and may still be \
-                         running there",
-                        owner,
-                        engine.rt.executor_id()
-                    ),
-                    format!(
-                        "let executor {} finish it, or restart its `atomic serve`; if that \
-                         executor has stopped for good, run `atomic runs resume {id} \
-                         --owner-stopped`",
-                        owner
-                    ),
+                    Said::new()
+                        .text("run ")
+                        .name(id)
+                        .text(" is owned by executor ")
+                        .name(&owner)
+                        .text(", not this one (")
+                        .name(engine.rt.executor_id())
+                        .text("), and may still be running there"),
+                    Said::new()
+                        .text("let executor ")
+                        .name(&owner)
+                        .text(
+                            " finish it, or restart its `atomic serve`; if that executor has \
+                             stopped for good, run `atomic runs resume ",
+                        )
+                        .name(id)
+                        .text(" --owner-stopped`"),
                 )
                 .into());
             }

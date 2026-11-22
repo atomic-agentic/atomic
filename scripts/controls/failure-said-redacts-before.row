@@ -1,0 +1,1 @@
+failure-said-redacts-before|crates/atomic/src/failure.rs|                    out.push_str(&atomic_core::redact::text(&text));|                    out.push_str(&text); // CONTROL_OFF|-p atomic-agentic --bin atomic failure::tests::a_named_failure_keeps_its_names_and_redacts_its_text
