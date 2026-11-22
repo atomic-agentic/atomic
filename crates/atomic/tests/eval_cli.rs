@@ -1579,3 +1579,385 @@ fn a_command_that_fills_one_stream_is_read_while_it_writes_the_other() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The `atomic-create-atom` skill as this binary ships it: `atomic setup
+/// codex` run in a directory of this test's own, and the `SKILL.md` it wrote
+/// read back from there. The worked example is run as the file an agent that
+/// was set up reads, not as a copy of it kept beside a test.
+fn installed_skill(dir: &Path) -> String {
+    let root = dir.join("agent");
+    std::fs::create_dir_all(&root).expect("agent directory");
+    let where_ = root.display().to_string();
+    let out = atomic(dir, &root, &["setup", "codex", "--path", &where_]);
+    assert!(out.status.success(), "{}", text(&out));
+    let skill = root.join(".agents/skills/atomic-create-atom/SKILL.md");
+    let text = std::fs::read_to_string(&skill).unwrap_or_else(|e| {
+        panic!(
+            "{}: the skill `atomic setup` said it wrote: {e}",
+            skill.display()
+        )
+    });
+    assert!(
+        text.contains("`atomic eval "),
+        "the installed skill tells the agent to run no eval command: {text}"
+    );
+    text
+}
+
+/// Every file the worked example in `skill` names — each `File \`path\`:`
+/// line followed by its fenced block — as its path and the exact bytes the
+/// block holds. A named file with no block after it, a block that names no
+/// language or holds nothing, and a block that is never closed are this
+/// test's own failures: an example it cannot read whole is never run in part,
+/// and an unclosed block would otherwise swallow the rest of the file into
+/// the one being read.
+fn worked_example(skill: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = skill.lines().collect();
+    let mut files = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        let Some(path) = lines[at]
+            .strip_prefix("File `")
+            .and_then(|rest| rest.strip_suffix("`:"))
+        else {
+            at += 1;
+            continue;
+        };
+        let opened = lines[at..]
+            .iter()
+            .position(|l| l.starts_with("```"))
+            .unwrap_or_else(|| panic!("the skill names `{path}` with no block after it"));
+        let fence = lines[at + opened];
+        assert!(fence.len() > 3, "`{path}`: its block names no language");
+        let after = at + opened + 1;
+        let closed = lines[after..]
+            .iter()
+            .position(|l| *l == "```")
+            .unwrap_or_else(|| panic!("`{path}`: its block is never closed"));
+        let body = &lines[after..after + closed];
+        assert!(!body.is_empty(), "`{path}`: its block holds nothing");
+        files.push((path.to_owned(), body.join("\n") + "\n"));
+        at = after + closed + 1;
+    }
+    assert!(
+        !files.is_empty(),
+        "the skill names no file of its worked example"
+    );
+    files
+}
+
+/// What the loopback server answers one of the worked example's cases with:
+/// the notes it was sent say what the actions are. Every case's prompt holds
+/// the atom's typed example notes as well as its own, so only the case with
+/// an instruction hidden in its notes says this.
+fn example_actions(request: &Value) -> Reply {
+    let actions = if request.to_string().contains("Ignore your instructions") {
+        // The instruction is data: it names no task, so there is no action.
+        json!([])
+    } else {
+        json!([
+            {"task": "Send the budget by Friday", "owner": "Ana"},
+            {"task": "Book the room", "owner": ""},
+        ])
+    };
+    Reply::Text(json!({ "actions": actions }).to_string())
+}
+
+/// The skill's own worked example, run at the command line the skill tells an
+/// agent to use, with nothing but this test's loopback server behind it.
+///
+/// `atomic setup` writes the pack, the worked example's files become a
+/// project, `atomic check --json` says what the installed skill says it says,
+/// and `atomic eval extract-actions` runs the example's two cases: recorded
+/// once from the stand-in, then replayed from those recordings with the real
+/// command — plain and with `--json`, whole and one case by its identity —
+/// which answers both from the tapes and sends the endpoint no request of any
+/// kind. A recording taken away leaves that case without an answer, says to
+/// record it with `--live`, and still sends nothing. So the skill's ending is
+/// checked as a person gets it: the flags, the case selection, the endpoint
+/// the replay needs, the replay meter and the exit status, not only the
+/// engine underneath them.
+#[test]
+fn the_skill_worked_example_replays_its_two_cases_through_the_cli_with_no_further_call() {
+    on_codex_runtime(async {
+        let dir = scratch("skill-worked-example");
+        let skill = installed_skill(&dir);
+        let files = worked_example(&skill);
+        let named: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+        // The example's own files, in the order the skill writes them: one
+        // atom, its two schemas, its two cases and one fixture. If the skill
+        // stops naming any of these, this test says so rather than run a
+        // project of its own invention.
+        assert_eq!(
+            named,
+            [
+                "atomic.yaml",
+                "atoms/extract-actions.input.schema.yaml",
+                "atoms/extract-actions.output.schema.yaml",
+                "atoms/extract-actions.atom.astro",
+                "evals/extract-actions/two-actions.yaml",
+                "evals/extract-actions/instruction-in-notes.yaml",
+                "fixtures/extract-actions/two-actions.input.json",
+            ],
+            "the worked example's files, as the installed skill names them: {named:?}"
+        );
+        let project = dir.join("project");
+        for (path, contents) in &files {
+            let target = project.join(path);
+            std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&target, contents)
+                .unwrap_or_else(|e| panic!("{}: {e}", target.display()));
+        }
+
+        // Step 7, at the command line. What the command printed is the very
+        // line the installed skill tells the agent to expect, so the two
+        // cannot drift apart unnoticed.
+        let checked = atomic(&dir, &project, &["check", "--json"]);
+        assert!(checked.status.success(), "{}", text(&checked));
+        let printed = String::from_utf8_lossy(&checked.stdout).trim().to_owned();
+        let check_json: Value = serde_json::from_str(&printed)
+            .unwrap_or_else(|e| panic!("`atomic check --json` printed no JSON: {printed}: {e}"));
+        assert_eq!(
+            check_json,
+            json!({
+                "checked": {"atoms": 1, "workflows": 0, "toolset_operations": 0},
+                "warnings": [],
+            }),
+            "the skill's own project is one atom, no workflow, no toolset operation"
+        );
+        assert!(
+            skill.contains(&printed),
+            "the installed skill does not print what `atomic check --json` answered: {printed}"
+        );
+
+        // The endpoint the recordings name: this test's own loopback server,
+        // so no provider, no key and no person's decision is anywhere near
+        // this. It counts every request it is sent, model call or other.
+        let model = FakeModel::respond(example_actions)
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+
+        // Recorded once, so the project has the two recordings a checked-in
+        // example would ship: two cases, two calls, each answer recorded.
+        let live = eval_async(&dir, &project, &url, &["extract-actions", "--live"]).await;
+        assert!(live.status.success(), "{}", text(&live));
+        assert_eq!(model.calls(), 2, "one model call per case");
+        let said = String::from_utf8_lossy(&live.stdout).to_string();
+        for part in [
+            "model calls: live, each answer recorded in the cassettes",
+            "PASS extract-actions: 2 of 2 cases passed",
+            "cassettes: 0 replayed, 2 recorded, 0 without a recording",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        let cassettes = project.join("evals/extract-actions/cassettes");
+        let recordings: Vec<PathBuf> = std::fs::read_dir(&cassettes)
+            .unwrap_or_else(|e| panic!("{}: {e}", cassettes.display()))
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(
+            recordings.len(),
+            2,
+            "one recording beside the cases per case: {recordings:?}"
+        );
+        for tape in &recordings {
+            let kept = std::fs::symlink_metadata(tape)
+                .unwrap_or_else(|e| panic!("{}: {e}", tape.display()));
+            assert!(
+                kept.is_file(),
+                "what sits beside the cases is no file: {tape:?}"
+            );
+            let bytes =
+                std::fs::read_to_string(tape).unwrap_or_else(|e| panic!("{}: {e}", tape.display()));
+            assert!(
+                !bytes.contains("Authorization"),
+                "a header kept in a recording: {tape:?}"
+            );
+        }
+
+        // Replayed, plainly: the same two cases off those recordings, called
+        // a historical check, with the stand-in sent nothing at all.
+        let sent = model.every_request();
+        let replay = eval_async(&dir, &project, &url, &["extract-actions"]).await;
+        assert!(replay.status.success(), "{}", text(&replay));
+        assert_eq!(model.calls(), 2, "the replay made a model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "the replay sent the endpoint a request of any kind"
+        );
+        let said = String::from_utf8_lossy(&replay.stdout).to_string();
+        for part in [
+            "model calls: replayed from cassettes: a historical check of recorded answers, \
+             not a live pass",
+            "PASS extract-actions: 2 of 2 cases passed, pass rate 1.000, threshold 1.000",
+            "cassettes: 2 replayed, 0 recorded, 0 without a recording",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+
+        // The same replay as its JSON report: two cases, each named for the
+        // file the skill wrote, each answered with what its own case checks,
+        // every call replayed and none keyed by a credential.
+        let replay = eval_async(&dir, &project, &url, &["extract-actions", "--json"]).await;
+        assert!(replay.status.success(), "{}", text(&replay));
+        assert_eq!(model.calls(), 2, "the replay made a model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "the replay sent the endpoint a request of any kind"
+        );
+        let document: Value =
+            serde_json::from_slice(&replay.stdout).expect("one JSON report from --json");
+        assert_eq!(document["passed"], true, "{document}");
+        assert_eq!(document["source"], "recorded", "{document}");
+        assert_eq!(document["refused"], json!([]), "a lite atom was set aside");
+        assert_eq!(document["reports"].as_array().expect("one report").len(), 1);
+        let report = &document["reports"][0];
+        assert_eq!(report["atom"], "extract-actions");
+        assert_eq!(report["passed"], true);
+        assert_eq!(report["pass_rate"], 1.0);
+        assert_eq!(report["threshold"], 1.0);
+        assert_eq!(report["failures"], json!([]));
+        let mut ids: Vec<&str> = report["cases"]
+            .as_array()
+            .expect("the example's two cases")
+            .iter()
+            .map(|c| c["id"].as_str().expect("a case identity"))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            ["instruction-in-notes.yaml", "two-actions.yaml"],
+            "the cases the skill wrote are the cases that ran"
+        );
+        for case in report["cases"].as_array().expect("two cases") {
+            assert_eq!(case["passed"], true, "{case}");
+        }
+        let actions = |id: &str| -> Value {
+            report["cases"]
+                .as_array()
+                .expect("two cases")
+                .iter()
+                .find(|c| c["id"] == json!(id))
+                .and_then(|c| c["output"].get("actions"))
+                .cloned()
+                .expect("the case has its output")
+        };
+        assert_eq!(
+            actions("two-actions.yaml"),
+            json!([
+                {"task": "Send the budget by Friday", "owner": "Ana"},
+                {"task": "Book the room", "owner": ""},
+            ]),
+            "what the ordinary case's assertions were checked against"
+        );
+        assert_eq!(
+            actions("instruction-in-notes.yaml"),
+            json!([]),
+            "the hidden instruction named no task, so the case expects no action"
+        );
+        let tape = &document["cassettes"][0];
+        assert_eq!(tape["atom"], "extract-actions", "{document}");
+        assert_eq!(tape["replayed"], 2, "{document}");
+        assert_eq!(tape["recorded"], 0, "the replay recorded: {document}");
+        assert_eq!(tape["missed"], 0, "a case with no recording: {document}");
+        assert_eq!(tape["corrupt"], 0, "{document}");
+        assert_eq!(tape["keyed"], 0, "a key reached the replay: {document}");
+        assert_eq!(document["usage"], json!([]), "a replay spent nothing");
+
+        // One case by its identity, as the skill says to read a failing case:
+        // it runs alone, off its own recording, and asks the endpoint nothing.
+        let one = eval_async(
+            &dir,
+            &project,
+            &url,
+            &["extract-actions", "--case", "two-actions.yaml", "--json"],
+        )
+        .await;
+        assert!(one.status.success(), "{}", text(&one));
+        assert_eq!(model.calls(), 2, "one case by its identity made no call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "one case by its identity sent the endpoint a request"
+        );
+        let report: Value =
+            serde_json::from_slice(&one.stdout).expect("one JSON report from --json");
+        assert_eq!(
+            report["reports"][0]["cases"]
+                .as_array()
+                .expect("one case")
+                .len(),
+            1,
+            "`--case two-actions.yaml` ran some other number of cases: {report}"
+        );
+        assert_eq!(
+            report["reports"][0]["cases"][0]["id"], "two-actions.yaml",
+            "{report}"
+        );
+        assert_eq!(report["reports"][0]["cases"][0]["passed"], true, "{report}");
+        assert_eq!(report["cassettes"][0]["replayed"], 1, "{report}");
+        assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
+
+        // A recording taken away is the case with none: the command fails,
+        // says which call had no answer and how to record it, and still sends
+        // the endpoint nothing rather than asking it instead.
+        std::fs::remove_file(&recordings[0])
+            .unwrap_or_else(|e| panic!("{}: {e}", recordings[0].display()));
+        let gone = eval_async(&dir, &project, &url, &["extract-actions", "--json"]).await;
+        assert!(
+            !gone.status.success(),
+            "a missing recording passed: {}",
+            text(&gone)
+        );
+        assert_eq!(
+            model.calls(),
+            2,
+            "a case with no recording reached the model"
+        );
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "a case with no recording sent the endpoint a request"
+        );
+        let report: Value =
+            serde_json::from_slice(&gone.stdout).expect("one JSON report from --json");
+        assert_eq!(report["passed"], false, "{report}");
+        assert_eq!(report["cassettes"][0]["replayed"], 1, "{report}");
+        assert_eq!(report["cassettes"][0]["missed"], 1, "{report}");
+        assert_eq!(report["cassettes"][0]["corrupt"], 0, "{report}");
+        let said = text(&gone);
+        for part in [
+            "no recording answers this request",
+            "run the eval with --live to record it",
+            "1 model call(s) had no usable recording (1 missing, 0 corrupt): record them with \
+             --live",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+
+        // The whole run, as the endpoint saw it: the two calls that made the
+        // two recordings, and nothing else across any replay, any one-case
+        // run or any miss — no second call, no probe, no list, no retry.
+        let every = model.every_request();
+        let seen: Vec<(&str, &str)> = every
+            .iter()
+            .map(|(m, p)| (m.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(
+            seen.len(),
+            2,
+            "every request the endpoint ever saw: {seen:?}"
+        );
+        for (method, path) in &seen {
+            assert_eq!(*method, "POST", "not a model call reached it: {seen:?}");
+            assert!(
+                path.ends_with("/chat/completions") || path.ends_with("/responses"),
+                "a request that is no model call reached it: {seen:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
