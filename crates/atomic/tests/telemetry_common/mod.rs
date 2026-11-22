@@ -594,7 +594,9 @@ impl Drop for Child {
 
 /// How long [`wait_for_gate`] waits for a run to reach its gate, and with
 /// it each `atomic gates list` it runs: far more than a run of one model
-/// call takes, however loaded the machine.
+/// call takes, however loaded the machine. No test sits through it: the ones
+/// that test the wait itself pass a limit of their own to
+/// [`wait_for_gate_by`].
 pub const GATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The lines a run has written to stderr, as its reader read them: each
@@ -765,46 +767,65 @@ impl Drained {
     }
 }
 
-/// How long one `atomic gates list` inside [`wait_for_gate`] is waited for
+/// How long one `atomic gates list` inside [`wait_for_gate_by`] is waited for
 /// before it is killed and tried again: far more than that command takes,
 /// however loaded the machine, and far less than [`GATE_LIMIT`], so a CLI
-/// stuck on a lock costs one poll rather than the whole wait.
+/// stuck on a lock costs one poll rather than the whole wait. A `limit`
+/// shorter than this bounds the poll instead, down to the wait's own
+/// deadline.
 const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
-/// `atomic gates list` shows, reading its output meanwhile. A run that ends
-/// first, or has not reached its gate within [`GATE_LIMIT`], fails the test
-/// with how it ended and what it printed; one still running then is killed
-/// first.
+/// `atomic gates list` shows, reading its output meanwhile, for no longer
+/// than [`GATE_LIMIT`]: [`wait_for_gate_by`] with that limit, which is what
+/// every test that only needs a run at its gate calls.
+pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
+    wait_for_gate_by(dir, model, child, GATE_LIMIT)
+}
+
+/// [`wait_for_gate`]'s wait with its bound given: a run that ends first, or
+/// that has not reached its gate within `limit`, fails the test with how it
+/// ended and what it printed; a run still running then is killed first. A
+/// test of the wait's own bounds passes a limit of seconds, so that it sits
+/// through seconds rather than through [`GATE_LIMIT`].
 ///
 /// Each poll is spawned and waited for with `try_wait`, under a
-/// [`POLL_LIMIT`] of its own that never runs past [`GATE_LIMIT`]: one that
-/// stops answering is killed, reaped and tried again, and none starts once
-/// the deadline has passed. The message that then fails the test counts how
-/// many polls ran and how many of them had to be killed, and quotes what the
-/// last poll that answered said with how long that one took, or, if none
+/// [`POLL_LIMIT`] of its own that never runs past `limit`: one that stops
+/// answering is killed, reaped and tried again, and none starts once the
+/// deadline has passed. The message that then fails the test counts how many
+/// polls ran and how many of them had to be killed, and quotes what the last
+/// poll that answered said with how long that one took, or, if none
 /// answered, that none did. None of it quotes a killed poll, whose output
 /// stops where the kill landed and would hide the last real answer.
 ///
-/// Neither bound has a row under `scripts/controls/`: a row needs a test that
-/// fails with the control off, and nothing in the repository makes
-/// `atomic gates list` stop answering on its own, while the deadline is
-/// [`GATE_LIMIT`], which no test outlasts on the thread that runs it. Both
-/// are measured by hand. With the poll replaced by a command that never ends,
-/// the wait kills it, counts it and tries again, and with the poll's bound
-/// removed the same wait does not come back at all. With the deadline
-/// shortened to seconds, the guard is what keeps the wait from starting a
-/// poll it has no time left to wait for: with the guard gone the message
-/// counts one more killed poll than the same wait with it. A poll that had to
-/// be killed is kept out of what the message quotes because such a poll holds
-/// only what it got out before the kill, which for a command that never
-/// answered is nothing.
-/// `a_wait_for_a_gate_gives_up_at_its_limit_and_quotes_the_last_answer` runs
-/// to the deadline for real and holds what the wait counts and what it quotes
-/// to what actually happened.
-pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
+/// `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll` runs
+/// this with a limit of 3 s, so that it reaches its deadline in seconds: it
+/// holds the count to what happened — more than one poll, none of them
+/// killed — and reads back as an answer what the message quotes. With the
+/// deadline guard there switched off, the wait starts one more poll, one it
+/// has no time left to wait for, and that poll is killed where it stands;
+/// the test fails on the count.
+/// `a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for` holds
+/// what the message quotes, and how long it says that took, to what a run
+/// that ends before its gate really did.
+///
+/// [`POLL_LIMIT`] and [`GATE_LIMIT`] have no row under `scripts/controls/`:
+/// a row needs a test that fails with the control off, and nothing in the
+/// repository makes `atomic gates list` stop answering on its own, while no
+/// test runs to [`GATE_LIMIT`]. Both are measured by hand. With the poll
+/// replaced by a command that never ends, the wait kills it, counts it and
+/// tries again, and with the poll's bound removed the same wait does not come
+/// back at all. A poll that had to be killed is kept out of what the message
+/// quotes because such a poll holds only what it got out before the kill,
+/// which for a command that never answered is nothing.
+pub(crate) fn wait_for_gate_by(
+    dir: &Path,
+    model: &str,
+    child: &mut Child,
+    limit: std::time::Duration,
+) -> Drained {
     let drained = Drained::of(child);
-    let deadline = std::time::Instant::now() + GATE_LIMIT;
+    let deadline = std::time::Instant::now() + limit;
     let mut polls = 0usize;
     let mut killed = 0usize;
     // What the last poll that answered said, and how long that one took. A
@@ -817,6 +838,10 @@ pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
         // where it stands, and what it had printed by then is not the last
         // thing the command said. The deadline is weighed again below, so
         // the wait ends there whether a poll ran or not.
+        // `scripts/controls/telemetry-poll-not-started-late` switches this
+        // off, and the wait then leaves one poll killed at birth, which
+        // `a_wait_for_a_gate_that_opens_by_its_limit_counts_no_killed_poll`
+        // fails on.
         if std::time::Instant::now() < deadline {
             let started = std::time::Instant::now();
             let mut poll = Child::new(
@@ -865,7 +890,7 @@ pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
                 Some(_) => "the run ended before its gate".to_owned(),
                 None => {
                     signal(child, "KILL");
-                    format!("no gate opened in {GATE_LIMIT:?}, so the run was killed")
+                    format!("no gate opened in {limit:?}, so the run was killed")
                 }
             };
             let out = drained.wait(child);
@@ -906,55 +931,13 @@ fn last_poll(
     }
 }
 
-/// How the tests that hand a run to [`wait_for_gate`] wait for it: the run
-/// ends however it is asked to, and this says when the wait gave up on it.
-#[derive(Debug)]
-pub struct Waited {
-    /// How long the wait took, measured from before it started and settled
-    /// once the thread that waited has joined.
-    pub when: std::time::Duration,
-    /// The message that failed the wait.
-    pub why: String,
-}
-
-/// Wait for a gate in `dir`'s project that never opens, for the run `run`,
-/// on a thread of its own: [`wait_for_gate`] runs to the end of its own
-/// [`GATE_LIMIT`] if `run` outlives it, which is too long for a test to sit
-/// through on the thread that runs it. This joins that thread and says how
-/// long the wait took and what it said, with the run ended either way before
-/// this returns.
-pub fn waited(dir: &Path, run: std::process::Child) -> Waited {
-    let dir = dir.to_path_buf();
-    let started = std::time::Instant::now();
-    let waited = std::thread::spawn(move || {
-        let mut child = Child::new(run);
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            wait_for_gate(&dir, "http://127.0.0.1:9/v1", &mut child)
-        }))
-        .err()
-        .and_then(|payload| payload.downcast_ref::<String>().cloned())
-        .expect("waiting for a gate that never opens fails the wait")
-    });
-    // Join it here rather than leave it: the thread holds the run, and the
-    // run a test hands over is to be gone by the time the test is.
-    let why = match waited.join() {
-        Ok(why) => why,
-        // The test that started this is itself failing, so its own reason is
-        // the one to report; the wait's panic is what a thread whose test is
-        // unwinding ends with, not a finding.
-        Err(_) if std::thread::panicking() => {
-            return Waited {
-                when: started.elapsed(),
-                why: String::new(),
-            };
-        }
-        Err(payload) => match payload.downcast_ref::<String>() {
-            Some(why) => panic!("the wait gave no failure of its own, and failed: {why}"),
-            None => panic!("the wait gave no failure of its own, and failed outright"),
-        },
-    };
-    Waited {
-        when: started.elapsed(),
-        why,
-    }
+/// The message `call` failed with; when it did not fail, or failed with
+/// something that is no message, this test fails rather than comparing
+/// nothing: what a test that bounds a wait has to check.
+pub(crate) fn failed_wait(call: impl FnOnce()) -> String {
+    let why = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+        .expect_err("the wait did not fail, so it gave no message to compare");
+    why.downcast_ref::<String>()
+        .cloned()
+        .expect("the wait failed with no message of its own")
 }
