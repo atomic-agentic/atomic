@@ -286,6 +286,7 @@ def rust_literals(path, text):
             matched = character.match(text, i)
             if matched:
                 i = matched.end()
+                code[start:i] = " " * (i - start)
                 continue
         if text[i] == "r":
             quote = i + 1
@@ -363,31 +364,43 @@ def in_tree(path):
 def source_references(commit):
     """One level of literal includers and integration targets naming data.
 
-    Resolve includes from the source file's own directory, not a basename
-    match elsewhere in the tree. A named tests/... data directory is owned
+    Resolve includes and top-level #[path] attributes from the source file's
+    own directory, not a basename match elsewhere in the tree. A named tests/... data directory is owned
     by every integration target that names it; ambiguous owners are all kept.
     """
     included, data = {}, []
-    prefix = re.compile(r"(?:\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*|#\s*\[\s*path\s*=\s*)$")
+    macro = re.compile(r"\binclude(?:_str|_bytes)?\s*!\s*[({\[]\s*$")
+    attribute = re.compile(r"#\s*\[\s*path\s*=\s*$")
     for entry in filter(None, git("ls-tree", "-r", "-z", commit).split(b"\0")):
         meta, _, name = entry.decode("utf-8", errors="surrogateescape").partition("\t")
         if not name.endswith(".rs"):
             continue
         source = text_of(commit, regular(commit, name, meta.split(" ")[0]))
-        code, literals = rust_literals(name, source)
         parts = name.split("/")
         target = (
             len(parts) == 4 and parts[0] == "crates" and parts[2] == "tests"
         ) or (
             len(parts) == 5 and parts[0] == "crates" and parts[2] == "tests" and parts[4] == "main.rs"
         )
-        previous = 0
+        # Sources with neither include syntax nor a target's data path
+        # cannot contribute a reference. Avoid lexing unrelated fixtures.
+        if not re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source) and not (
+            target and "tests/" in source
+        ):
+            continue
+        code, literals = rust_literals(name, source)
+        previous, depth = 0, 0
         for start, end, literal, raw in literals:
             # Disjoint prefixes keep this linear even in large generated
             # source files with many literals. No include starts inside a
             # preceding literal.
             before, previous = code[previous:start], end
-            if prefix.search(before):
+            depth += before.count("{") - before.count("}")
+            # Inline-module #[path] bases differ from the source directory.
+            # Do not guess their owner and accidentally suppress the shared
+            # data fallback. Those paths remain covered by the sweep.
+            top_level_path = depth == 0 and attribute.search(before)
+            if macro.search(before) or top_level_path:
                 path = posixpath.normpath(posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw)))
                 if in_tree(path):
                     included.setdefault(path, set()).add(name)

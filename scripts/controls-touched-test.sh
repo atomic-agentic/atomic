@@ -374,7 +374,7 @@ expect "raw Rust path and binary included bytes" "e"
 fresh
 mkdir -p crates/k/tests/model_auth
 printf 'fn model_auth_test() {}\n' >crates/k/tests/model_auth.rs
-printf '#[path = "model_auth/fixture.rs"]\nmod fixture;\n' >crates/k/tests/model_auth_sandbox.rs
+printf 'fn helper() { let close = '\''}'\''; }\n#[path = "model_auth/fixture.rs"]\nmod fixture;\n' >crates/k/tests/model_auth_sandbox.rs
 printf 'pub fn fixture() {}\n' >crates/k/tests/model_auth/fixture.rs
 printf 'm|src/other.rs|fn other|fn a|-p k --test model_auth -- model_auth_test\n' >scripts/controls/m.row
 printf 'n|src/other.rs|fn other|fn b|-p k --test model_auth_sandbox -- sandbox_test\n' >scripts/controls/n.row
@@ -384,6 +384,10 @@ printf 'pub fn fixture() { 1; }\n' >crates/k/tests/model_auth/fixture.rs
 commit
 run
 expect "path-included helper selects both integration targets" "$(printf 'm\nn')"
+off path-attribute 'top_level_path = depth == 0 and attribute.search(before)' 'top_level_path = False'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = m ] || fail "with path attributes off, another target still selected: ${OUT}"
+unset SCRIPT
 
 # A library includes data under tests/: that is not shared integration data.
 fresh
@@ -461,6 +465,23 @@ printf 'new\n' >crates/k/tests/fixtures/project/input.txt
 commit
 run
 expect "a directory shared by two named targets selects both" "$(printf 'c\nf')"
+
+# A nested path attribute has a different Rust base. Never guess that it
+# owns an unrelated shared fixture with the same literal suffix.
+shared_fixture
+mkdir -p crates/k/tests/fixtures/project
+printf 'mod nested { #[path = "fixtures/project/data.rs"] mod data; }\n' >crates/k/tests/other.rs
+printf 'pub fn data() {}\n' >crates/k/tests/fixtures/project/data.rs
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'pub fn data() { 1; }\n' >crates/k/tests/fixtures/project/data.rs
+commit
+run
+expect "nested path attributes do not claim an unrelated shared fixture" "$(printf 'c\nf')"
+off nested-attribute 'top_level_path = depth == 0 and attribute.search(before)' 'top_level_path = attribute.search(before)'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the nested attribute restriction off, false ownership was not exposed: ${OUT}"
+unset SCRIPT
 
 # Comments cannot turn shared data into one target's private data.
 for comment in '// "tests/fixtures/project"' '/* outer /* "tests/fixtures/project" */ end */'; do
