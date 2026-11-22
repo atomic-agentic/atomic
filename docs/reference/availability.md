@@ -136,7 +136,14 @@ with a `worktree: true` step is refused on it before anything runs.
 
 A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
-atomic's own environment or its credentials. A turn's commands run with no
+atomic's own environment or its credentials. Nor does it get the descriptors
+whatever started atomic left open, such as a CI runner's pipes or a shell's,
+an editor's or an agent's files and sockets: on Unix, atomic marks every one
+past the standard three close-on-exec as it starts, and so does Codex's Linux
+sandbox helper before it starts a command, so a command holds only what atomic
+hands it. That includes descriptors handed to atomic on purpose, such as
+systemd's socket activation (`LISTEN_FDS`) or a `make` jobserver: none reaches
+a command, or another program atomic starts. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn, of the project or another project of the same
