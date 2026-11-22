@@ -1,1 +1,1 @@
-exec-fds-listing|crates/atomic-exec/src/inherited.rs|        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {|        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } == -1 { // CONTROL_OFF|-p atomic-agentic-exec --lib -- inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose
+exec-fds-listing|crates/atomic-exec/src/inherited.rs|libc::F_SETFD, cloexec)|libc::F_SETFD, flags) /* CONTROL_OFF */|-p atomic-agentic-exec --lib -- inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose

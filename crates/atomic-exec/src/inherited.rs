@@ -117,8 +117,9 @@ pub(crate) fn keep_listed_from_children(
             }
             return Err(e);
         }
+        let cloexec = flags | libc::FD_CLOEXEC;
         // SAFETY: as above.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, cloexec) } == -1 {
             return Err(std::io::Error::last_os_error());
         }
     }
