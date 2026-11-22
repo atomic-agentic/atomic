@@ -2599,6 +2599,32 @@ fn helper_not_dumpable() {
     }
 }
 
+/// When this process is the outer stage of Codex's Linux sandbox helper,
+/// keep every descriptor it was started with from the programs it starts,
+/// bubblewrap and through it the command, but the socket its proxy token
+/// comes on; or exit. Whatever started the process that started this one
+/// may have left descriptors open, a CI runner's pipes or a person's shell's
+/// files and sockets, and Codex's helper and bubblewrap pass on every one
+/// without close-on-exec. Done first, before the walk that may start the
+/// helper again, which keeps the token's socket, and before Codex's helper
+/// opens what it hands bubblewrap on purpose. The inner stage is left as
+/// it is: what reaches it was handed on purpose.
+fn keep_inherited_descriptors_from_the_command() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
+        let handed: Vec<_> = atomic_exec::inherited::handed_secret_fd()
+            .into_iter()
+            .collect();
+        if let Err(e) = atomic_exec::inherited::keep_from_children(&handed) {
+            crate::log_line!(
+                "atomic: the sandbox helper cannot keep the descriptors it was started with from \
+                 the command; the command does not run: {e}"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Take `name` out of this process's environment, and what it held.
 #[cfg(target_os = "linux")]
 fn take_env(name: &str) -> Option<std::ffi::OsString> {
@@ -3104,6 +3130,7 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// never left in a process that is dumpable again; and give a sandboxed
 /// command its own `TMPDIR`.
 fn as_any_helper() {
+    keep_inherited_descriptors_from_the_command();
     helper_not_dumpable();
     // The walk may start the helper again, so it comes before the token is
     // read: read first, the token would pass through `exec` in the

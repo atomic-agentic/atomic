@@ -225,6 +225,13 @@ fn real_main() -> anyhow::Result<()> {
     if codex::is_helper(std::env::args_os()) {
         return codex::run_helper();
     }
+    // Whatever started atomic may have left descriptors open: they pass to
+    // none of the programs it starts, the socket a runner's secret variables
+    // come on included, which the runner reads itself and hands on afresh.
+    // A process that cannot make sure of that starts nothing.
+    #[cfg(unix)]
+    atomic_exec::inherited::keep_from_children(&[])
+        .context("keep the descriptors atomic was started with from the programs it starts")?;
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
