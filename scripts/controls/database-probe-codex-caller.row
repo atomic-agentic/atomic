@@ -1,0 +1,1 @@
+database-probe-codex-caller|crates/atomic-core/src/state.rs|if database_in_use(&main)? {|if database_in_use(&main).unwrap_or(false) { // CONTROL_OFF: caller ignores unknown probe|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_errors_keep_codex_records

@@ -1,0 +1,1 @@
+database-probe-held|crates/atomic-core/src/state.rs|return Ok(true); // Another process holds the SQLite DMS byte.|return Ok(false); // CONTROL_OFF: a held database is admitted|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_known_holders_refuse_migration

@@ -1,0 +1,1 @@
+database-probe-regular|crates/atomic-core/src/state.rs|if !shared_memory_regular {|if false && !shared_memory_regular { // CONTROL_OFF: nonregular shared memory admitted|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::database_probe_nonregular_files_refuse_migration

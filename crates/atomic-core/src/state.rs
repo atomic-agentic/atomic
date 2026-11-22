@@ -331,10 +331,7 @@ impl ProjectState {
         private_dir(&self.private)?;
         self.move_codex_records()?;
         self.retire_legacy_scratch()?;
-        let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
-            .into_iter()
-            .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
-            .collect();
+        let legacy = legacy_layouts(&self.dir)?;
         if legacy.is_empty() {
             return Ok(());
         }
@@ -350,22 +347,30 @@ impl ProjectState {
             .truncate(false)
             .open(&lock_path)
             .map_err(fail(&lock_path))?;
+        #[cfg(test)]
+        legacy_inventory_ready();
         lock.lock().map_err(fail(&lock_path))?;
-        for dir in legacy {
+        let locked_legacy = legacy_layouts(&self.dir)?;
+        for dir in locked_legacy {
             // Both layouts at once: moving would lose one of them, and
             // ignoring the old one could hide the project's runs.
             for name in LEGACY {
                 let (old, current) = (dir.join(name), self.private.join(name));
-                if old.exists() && current.exists() {
+                if legacy_entry_present(&old)? && legacy_entry_present(&current)? {
                     return Err(StateError::Both { old, current });
                 }
             }
             let database = dir.join("atomic.db");
-            if database_in_use(&database) {
+            if database_in_use(&database)? {
                 return Err(StateError::InUse {
                     path: database,
                     to: self.database(),
                 });
+            }
+            // Validate all source entries before moving even the first member:
+            // relocating a relative link can change where private state lives.
+            for name in LEGACY {
+                legacy_source_safe(&dir.join(name))?;
             }
             // An older atomic kept its execution lock in `<state>/private`: a
             // process holding it may still run the project's work. It is
@@ -389,7 +394,7 @@ impl ProjectState {
             };
             for name in LEGACY {
                 let (old, new) = (dir.join(name), self.private.join(name));
-                if old.exists() {
+                if legacy_entry_present(&old)? {
                     std::fs::rename(&old, &new).map_err(fail(&new))?;
                 }
             }
@@ -494,6 +499,7 @@ impl ProjectState {
     /// removed whole. A database another process still has open is left,
     /// with a warning, to move once it is not. Under the migration lock; a
     /// file that is gone when its turn comes was moved by another process.
+    /// An unknown database-lock outcome refuses instead of moving its unit.
     fn move_codex_records(&self) -> Result<(), StateError> {
         let home = self.codex_home();
         let names: Vec<String> = match std::fs::read_dir(&home) {
@@ -524,7 +530,7 @@ impl ProjectState {
             private_dir(&records)?;
             for base in &bases {
                 let main = home.join(format!("{base}.sqlite"));
-                if database_in_use(&main) {
+                if database_in_use(&main)? {
                     crate::log_line!(
                         "atomic: {} is in use, so it stays in the Codex home until it is not",
                         main.display()
@@ -764,6 +770,72 @@ pub enum LockError {
 /// `private/`.
 const LEGACY: [&str; 4] = ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"];
 
+/// Only the filesystem saying an entry is absent counts as absent. A final
+/// link is an entry too: an old entry or destination must not be lost merely
+/// because the link's target is missing.
+fn legacy_entry_present(path: &Path) -> Result<bool, StateError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StateError::Create {
+            path: path.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn legacy_source_safe(path: &Path) -> Result<(), StateError> {
+    let fail = |source| StateError::Create {
+        path: path.to_owned(),
+        source,
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(fail(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "legacy state entry is a symbolic link",
+                )));
+            }
+            Ok(())
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(fail(source)),
+    }
+}
+
+fn legacy_layouts(state: &Path) -> Result<Vec<PathBuf>, StateError> {
+    let mut found = Vec::new();
+    for dir in [state.join("private"), state.to_owned()] {
+        let mut has_state = false;
+        for name in LEGACY {
+            has_state |= legacy_entry_present(&dir.join(name))?;
+        }
+        if has_state {
+            found.push(dir);
+        }
+    }
+    Ok(found)
+}
+
+#[cfg(test)]
+type InventoryReadyHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_INVENTORY_READY: std::cell::RefCell<Option<InventoryReadyHook>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn legacy_inventory_ready() {
+    let ready = LEGACY_INVENTORY_READY.with(|slot| slot.borrow_mut().take());
+    if let Some(ready) = ready {
+        ready();
+    }
+}
+
 /// Hold an existing, regular legacy execution lock until the returned file
 /// is dropped. Only a missing path is absent. Another holder, an unreadable
 /// file or an unknown lock outcome stops migration.
@@ -897,20 +969,33 @@ fn copy_record(old: &Path, new: &Path) -> std::io::Result<()> {
 
 /// Whether another process has the SQLite database at `path` open in WAL
 /// mode: each such connection holds a read lock on its shared-memory file's
-/// "DMS" byte (offset 128) for as long as it is open.
-fn database_in_use(path: &Path) -> bool {
+/// "DMS" byte (offset 128) for as long as it is open. Only a missing sidecar
+/// or a successful, unlocked probe permits movement; inspection errors do not.
+fn database_in_use(path: &Path) -> Result<bool, StateError> {
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    let shm = PathBuf::from(shm);
+    let fail = |source| StateError::Create {
+        path: shm.clone(),
+        source,
+    };
     #[cfg(unix)]
     {
-        use std::os::fd::AsRawFd;
-        let mut shm = path.as_os_str().to_owned();
-        shm.push("-shm");
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&shm)
-        else {
-            return false;
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true).write(true);
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, DATABASE_SHM_OPEN_FLAGS);
+        let file = match open.open(&shm) {
+            Ok(file) => file,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(fail(source)),
         };
+        let shared_memory_regular = database_probe_regular(&file).map_err(fail)?;
+        if !shared_memory_regular {
+            return Err(fail(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "SQLite shared-memory lock is not a regular file",
+            )));
+        }
         // SAFETY: a zeroed flock is a valid value of a plain C struct.
         #[allow(unsafe_code)]
         let mut probe: libc::flock = unsafe { std::mem::zeroed() };
@@ -918,16 +1003,91 @@ fn database_in_use(path: &Path) -> bool {
         probe.l_whence = libc::SEEK_SET as _;
         probe.l_start = 128;
         probe.l_len = 1;
-        // SAFETY: F_GETLK reads and writes only `probe`, a valid flock.
-        #[allow(unsafe_code)]
-        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
-        asked == 0 && probe.l_type != libc::F_UNLCK as libc::c_short
+        let (asked, error) = database_lock_query(&file, &mut probe);
+        if asked != 0 {
+            return Err(fail(error));
+        }
+        let sqlite_holder = [
+            libc::F_RDLCK as libc::c_short,
+            libc::F_WRLCK as libc::c_short,
+        ]
+        .contains(&probe.l_type);
+        if sqlite_holder {
+            return Ok(true); // Another process holds the SQLite DMS byte.
+        }
+        if probe.l_type == libc::F_UNLCK as libc::c_short {
+            return Ok(false);
+        }
+        let unknown = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "SQLite shared-memory lock probe returned an unknown lock type",
+        );
+        Err(fail(unknown))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        false
+        if legacy_entry_present(&shm)? || legacy_entry_present(path)? {
+            return Err(fail(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "SQLite database-in-use probing is unsupported on this platform",
+            )));
+        }
+        Ok(false)
     }
+}
+
+#[cfg(unix)]
+const DATABASE_SHM_OPEN_FLAGS: i32 = LINK_OPEN_FLAGS | NOT_THROUGH_A_LINK;
+
+#[cfg(unix)]
+fn database_probe_regular(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if let Some(DatabaseProbeFailure::Metadata(kind)) = DATABASE_PROBE_FAILURE.get() {
+        return Err(std::io::Error::new(kind, "injected SQLite metadata error"));
+    }
+    file.metadata().map(|metadata| metadata.is_file())
+}
+
+/// Keep the native answer and its errno together: the caller must never
+/// interpret the output flock after a failed query.
+#[cfg(unix)]
+fn database_lock_query(
+    file: &std::fs::File,
+    probe: &mut libc::flock,
+) -> (libc::c_int, std::io::Error) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: F_GETLK reads and writes only `probe`, a valid flock.
+    #[allow(unsafe_code)]
+    let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, probe as *mut libc::flock) };
+    let error = std::io::Error::last_os_error();
+    #[cfg(test)]
+    match DATABASE_PROBE_FAILURE.get() {
+        Some(DatabaseProbeFailure::Query(kind)) => {
+            probe.l_type = libc::F_UNLCK as libc::c_short;
+            return (
+                -1,
+                std::io::Error::new(kind, "injected SQLite lock query error"),
+            );
+        }
+        Some(DatabaseProbeFailure::LockType(kind)) => probe.l_type = kind,
+        _ => {}
+    }
+    (asked, error)
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DatabaseProbeFailure {
+    Metadata(std::io::ErrorKind),
+    Query(std::io::ErrorKind),
+    LockType(libc::c_short),
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static DATABASE_PROBE_FAILURE: std::cell::Cell<Option<DatabaseProbeFailure>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 /// Where atomic keeps every project's state: `$ATOMIC_HOME`, or `atomic` in
@@ -2726,6 +2886,521 @@ mod tests {
         std::fs::create_dir_all(old.join("context")).expect("old context");
         std::fs::write(old.join("context/kept"), "unmoved").expect("old state");
         (home, state, old)
+    }
+
+    #[test]
+    fn legacy_inventory_lookup_errors_refuse_creation() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-directory");
+        std::fs::remove_dir_all(&old).expect("remove old fixture");
+        std::fs::write(&old, "not a directory").expect("opaque old layout");
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("context"))
+                .expect_err("the lookup really fails")
+                .kind(),
+            std::io::ErrorKind::NotADirectory
+        );
+        match state.create().expect_err("an unknown layout must refuse") {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old.join("atomic.db"));
+                assert_eq!(source.kind(), std::io::ErrorKind::NotADirectory);
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&old).expect("unchanged"),
+            "not a directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_loop_errors_refuse_creation() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-loop");
+        std::fs::remove_dir_all(&old).expect("remove old fixture");
+        std::os::unix::fs::symlink("private", &old).expect("old layout loop");
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("atomic.db"))
+                .expect_err("the parent loop really fails")
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        match state.create().expect_err("an unknown layout must refuse") {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old.join("atomic.db"));
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_keeps_an_existing_dangling_destination() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-inventory-destination");
+        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+        std::fs::create_dir_all(state.private_dir()).expect("new private directory");
+        std::os::unix::fs::symlink("missing", state.database()).expect("existing destination");
+        match state
+            .create()
+            .expect_err("an existing destination is not absent")
+        {
+            StateError::Both { old: from, current } => {
+                assert_eq!(from, old.join("atomic.db"));
+                assert_eq!(current, state.database());
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_link(state.database()).expect("link remains"),
+            Path::new("missing")
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join("atomic.db")).expect("source remains"),
+            "old database"
+        );
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_refuses_source_links_before_moving_members() {
+        for target in ["missing", "../../outside", "live"] {
+            let (home, state, old) = legacy_lock_fixture("legacy-inventory-entry");
+            std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+            std::fs::write(old.join("atomic.db-wal"), "old WAL").expect("old WAL");
+            std::fs::remove_dir_all(old.join("context")).expect("replace old context");
+            std::os::unix::fs::symlink(target, old.join("context")).expect("old entry");
+            if target == "../../outside" {
+                std::fs::create_dir(home.join("home/outside"))
+                    .expect("destination-relative target");
+            }
+            if target == "live" {
+                std::fs::create_dir(old.join("live")).expect("existing link target");
+                assert!(
+                    std::fs::metadata(old.join("context"))
+                        .expect("live link")
+                        .is_dir()
+                );
+            } else {
+                assert_eq!(
+                    std::fs::metadata(old.join("context"))
+                        .expect_err("old link is dangling")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            match state
+                .create()
+                .expect_err("source links must refuse before any member moves")
+            {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, old.join("context"));
+                    assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                    assert_eq!(source.to_string(), "legacy state entry is a symbolic link");
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            assert_eq!(
+                std::fs::read_link(old.join("context")).expect("original link remains"),
+                Path::new(target)
+            );
+            for (name, bytes) in [("atomic.db", "old database"), ("atomic.db-wal", "old WAL")] {
+                assert_eq!(
+                    std::fs::read_to_string(old.join(name)).expect("source remains"),
+                    bytes
+                );
+                assert_eq!(
+                    std::fs::symlink_metadata(state.private_dir().join(name))
+                        .expect_err("destination untouched")
+                        .kind(),
+                    std::io::ErrorKind::NotFound
+                );
+            }
+            assert_eq!(
+                std::fs::symlink_metadata(state.context_dir())
+                    .expect_err("no context installed")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_inventory_keeps_links_inside_an_ordinary_context_directory() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-context-directory");
+        std::os::unix::fs::symlink("kept", old.join("context/nested-link")).expect("nested link");
+        state.create().expect("ordinary context directory migrates");
+        assert_eq!(
+            std::fs::read_to_string(state.context_dir().join("kept")).expect("context bytes"),
+            "unmoved"
+        );
+        assert_eq!(
+            std::fs::read_link(state.context_dir().join("nested-link"))
+                .expect("nested link retained"),
+            Path::new("kept")
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("context"))
+                .expect_err("old context moved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn legacy_inventory_is_rechecked_under_the_migration_lock() {
+        let (_home, state, _old) = legacy_lock_fixture("legacy-inventory-locked");
+        let held = std::fs::File::create(state.dir().join("migrate.lock")).expect("migration lock");
+        held.lock().expect("another migration holds the lock");
+        let (ready, before_lock) = std::sync::mpsc::sync_channel(0);
+        let work = state.clone();
+        let worker = std::thread::spawn(move || {
+            LEGACY_INVENTORY_READY.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    ready.send(()).expect("preflight observed");
+                }));
+            });
+            work.create()
+        });
+        let reached = before_lock.recv_timeout(std::time::Duration::from_secs(10));
+        let arrived = std::fs::write(
+            state.dir().join("atomic.db"),
+            "arrived during another migration",
+        );
+        let released = held.unlock();
+        let migrated = worker.join();
+        reached.expect("the first inventory completed before waiting on the lock");
+        arrived.expect("another process left a legacy database");
+        released.expect("migration lock released");
+        migrated
+            .expect("migration thread")
+            .expect("migration succeeded");
+        assert_eq!(
+            std::fs::read_to_string(state.database()).expect("newly discovered database moved"),
+            "arrived during another migration"
+        );
+    }
+
+    fn database_probe_fixture(tag: &str) -> (TestScratch, ProjectState, PathBuf) {
+        let (home, state, old) = legacy_lock_fixture(tag);
+        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+        (home, state, old)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_loop_errors_refuse_legacy_migration() {
+        let (_home, state, old) = database_probe_fixture("database-probe-loop");
+        let shm = old.join("atomic.db-shm");
+        std::os::unix::fs::symlink("atomic.db-shm", &shm).expect("shared-memory loop");
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&shm)
+                .expect_err("the open really fails")
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        match state
+            .create()
+            .expect_err("an unknown database lock refuses migration")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, shm);
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_open_errors_refuse_legacy_migration() {
+        let (_home, state, old) = database_probe_fixture("database-probe-directory");
+        let shm = old.join("atomic.db-shm");
+        std::fs::create_dir(&shm).expect("a directory instead of shared memory");
+        match state
+            .create()
+            .expect_err("an unknown database lock refuses migration")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, shm);
+                assert_eq!(source.raw_os_error(), Some(libc::EISDIR));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_errors_keep_codex_records() {
+        let home = TestScratch::new("codex-database-probe-loop");
+        let root = home.join("project");
+        std::fs::create_dir(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(&codex).expect("Codex home");
+        let database = codex.join("state_5.sqlite");
+        std::fs::write(&database, "old Codex record").expect("old database");
+        let shm = codex.join("state_5.sqlite-shm");
+        std::os::unix::fs::symlink("state_5.sqlite-shm", &shm).expect("shared-memory loop");
+        match state
+            .create()
+            .expect_err("unknown records must stay in place")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, shm);
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(database).expect("old record remains"),
+            "old Codex record"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(state.codex_records().join("state_5.sqlite"))
+                .expect_err("no record moved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_links_are_not_followed() {
+        for target in ["missing-shm", "other-shm"] {
+            let (_home, state, old) = database_probe_fixture("database-probe-link");
+            let shm = old.join("atomic.db-shm");
+            if target == "other-shm" {
+                std::fs::write(old.join(target), "unlocked shared memory").expect("target");
+            }
+            std::os::unix::fs::symlink(target, &shm).expect("shared-memory link");
+            match state
+                .create()
+                .expect_err("a linked shared-memory lock refuses migration")
+            {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, shm);
+                    assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            legacy_context_is_unmoved(&state, &old);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn database_probe_nonregular_files_refuse_migration() {
+        let (_home, state, old) = database_probe_fixture("database-probe-fifo");
+        let shm = old.join("atomic.db-shm");
+        let name = std::ffi::CString::new(shm.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives this call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        match state
+            .create()
+            .expect_err("a pipe is not SQLite shared memory")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, shm);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert_eq!(
+                    source.to_string(),
+                    "SQLite shared-memory lock is not a regular file"
+                );
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    struct RestoreDatabaseProbe;
+
+    #[cfg(unix)]
+    impl Drop for RestoreDatabaseProbe {
+        fn drop(&mut self) {
+            DATABASE_PROBE_FAILURE.set(None);
+        }
+    }
+
+    #[cfg(unix)]
+    fn database_probe_errors_refuse(failure: fn(std::io::ErrorKind) -> DatabaseProbeFailure) {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            let (_home, state, old) = database_probe_fixture("database-probe-error");
+            let shm = old.join("atomic.db-shm");
+            std::fs::write(&shm, "shared memory").expect("shared-memory file");
+            let injected = failure(kind);
+            assert_eq!(DATABASE_PROBE_FAILURE.replace(Some(injected)), None);
+            let restore = RestoreDatabaseProbe;
+            match state
+                .create()
+                .expect_err("an unknown probe outcome must refuse")
+            {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, shm);
+                    assert_eq!(source.kind(), kind);
+                    let message = match injected {
+                        DatabaseProbeFailure::Metadata(_) => "injected SQLite metadata error",
+                        DatabaseProbeFailure::Query(_) => "injected SQLite lock query error",
+                        other => panic!("unexpected fixture: {other:?}"),
+                    };
+                    assert_eq!(source.to_string(), message);
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            legacy_context_is_unmoved(&state, &old);
+            drop(restore);
+            state.create().expect("a known unlocked database can move");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_metadata_errors_refuse_migration() {
+        database_probe_errors_refuse(DatabaseProbeFailure::Metadata);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_query_errors_refuse_migration() {
+        database_probe_errors_refuse(DatabaseProbeFailure::Query);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_unknown_lock_types_refuse_migration() {
+        let (_home, state, old) = database_probe_fixture("database-probe-unknown");
+        let shm = old.join("atomic.db-shm");
+        std::fs::write(&shm, "shared memory").expect("shared-memory file");
+        assert_eq!(
+            DATABASE_PROBE_FAILURE
+                .replace(Some(DatabaseProbeFailure::LockType(libc::c_short::MAX))),
+            None
+        );
+        let _restore = RestoreDatabaseProbe;
+        match state
+            .create()
+            .expect_err("an unknown lock type must refuse")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, shm);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(
+                    source.to_string(),
+                    "SQLite shared-memory lock probe returned an unknown lock type"
+                );
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_known_holders_refuse_migration() {
+        for kind in [
+            libc::F_RDLCK as libc::c_short,
+            libc::F_WRLCK as libc::c_short,
+        ] {
+            let (_home, state, old) = database_probe_fixture("database-probe-held");
+            std::fs::write(old.join("atomic.db-shm"), "shared memory").expect("shared-memory file");
+            assert_eq!(
+                DATABASE_PROBE_FAILURE.replace(Some(DatabaseProbeFailure::LockType(kind))),
+                None
+            );
+            let restore = RestoreDatabaseProbe;
+            match state.create().expect_err("a held database must refuse") {
+                StateError::InUse { path, to } => {
+                    assert_eq!(path, old.join("atomic.db"));
+                    assert_eq!(to, state.database());
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            legacy_context_is_unmoved(&state, &old);
+            drop(restore);
+            state.create().expect("an unlocked database can move");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_known_holders_keep_codex_records() {
+        for kind in [
+            libc::F_RDLCK as libc::c_short,
+            libc::F_WRLCK as libc::c_short,
+        ] {
+            let home = TestScratch::new("codex-probe-held");
+            let root = home.join("project");
+            std::fs::create_dir(&root).expect("project");
+            let state = ProjectState::under(&home, &root);
+            let codex = state.codex_home();
+            std::fs::create_dir_all(&codex).expect("Codex home");
+            let database = codex.join("state_5.sqlite");
+            std::fs::write(&database, "old Codex record").expect("old database");
+            std::fs::write(codex.join("state_5.sqlite-shm"), "shared memory")
+                .expect("shared-memory file");
+            assert_eq!(
+                DATABASE_PROBE_FAILURE.replace(Some(DatabaseProbeFailure::LockType(kind))),
+                None
+            );
+            let restore = RestoreDatabaseProbe;
+            state
+                .create()
+                .expect("held records stay for the old writer");
+            assert_eq!(
+                std::fs::read_to_string(&database).expect("held record remains"),
+                "old Codex record"
+            );
+            assert_eq!(
+                std::fs::symlink_metadata(state.codex_records().join("state_5.sqlite"))
+                    .expect_err("no held record moved")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            drop(restore);
+            state.create().expect("unlocked records can move");
+            assert_eq!(
+                std::fs::symlink_metadata(&database)
+                    .expect_err("old record moved")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert_eq!(
+                std::fs::read_to_string(state.codex_records().join("state_5.sqlite"))
+                    .expect("record moved"),
+                "old Codex record"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_probe_unlocked_shared_memory_allows_migration() {
+        let (_home, state, old) = database_probe_fixture("database-probe-unlocked");
+        std::fs::write(old.join("atomic.db-shm"), "shared memory").expect("shared-memory file");
+        state.create().expect("unlocked state migrates");
+        assert_eq!(
+            std::fs::read_to_string(state.database()).expect("database moved"),
+            "old database"
+        );
+        state.create().expect("migration is idempotent");
     }
 
     fn legacy_context_is_unmoved(state: &ProjectState, old: &Path) {

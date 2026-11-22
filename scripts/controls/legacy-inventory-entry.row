@@ -1,0 +1,1 @@
+legacy-inventory-entry|crates/atomic-core/src/state.rs|if metadata.file_type().is_symlink() {|if false && metadata.file_type().is_symlink() { // CONTROL_OFF: unsafe source link admitted|-p atomic-agentic-core --lib --features fake-model -- legacy_inventory_refuses_source_links_before_moving_members migration_cannot_retarget_a_dangling_context_link_for_the_consumer

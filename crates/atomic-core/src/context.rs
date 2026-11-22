@@ -616,6 +616,73 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn migration_cannot_retarget_a_dangling_context_link_for_the_consumer() {
+        let (root, atom) = contextual_atom();
+        let home = crate::state::TestScratch::new("context-migration-link");
+        let state = crate::state::ProjectState::under(&home, &root);
+        let old = state.dir().join("private");
+        std::fs::create_dir_all(&old).expect("old layout");
+        std::fs::write(old.join("atomic.db"), "old database").expect("old database");
+        let outside = home.join("outside");
+        std::fs::create_dir(&outside).expect("outside private state");
+        std::os::unix::fs::symlink("../../outside", old.join("context")).expect("old link");
+        assert_eq!(
+            std::fs::canonicalize(old.join("context"))
+                .expect_err("dangling at source")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let migrated = state.create();
+        if migrated.is_ok() {
+            // Exercise the actual consumer before the refusal assertion: the old
+            // implementation admits the retargeted path and reaches resolution.
+            assert_eq!(
+                resolved(&state.context_dir()).expect("consumer resolves link"),
+                outside
+            );
+            let error = checkpoint_with_key(
+                &atom,
+                &state.context_dir(),
+                &home.join("keys"),
+                "run",
+                || Err("consumer reached outside private state".into()),
+            )
+            .expect_err("resolution sentinel");
+            assert_eq!(error, "consumer reached outside private state");
+        }
+        match migrated.expect_err("migration must refuse the retargetable source link") {
+            crate::state::StateError::Create { path, source } => {
+                assert_eq!(path, old.join("context"));
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert_eq!(source.to_string(), "legacy state entry is a symbolic link");
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(old.join("atomic.db")).expect("database remains"),
+            "old database"
+        );
+        assert_eq!(
+            std::fs::read_link(old.join("context")).expect("link remains"),
+            Path::new("../../outside")
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(state.context_dir())
+                .expect_err("no installed link")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside)
+                .expect("outside untouched")
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn the_key_is_kept_apart_from_the_checkpoints() {
         let (root, atom) = contextual_atom();
