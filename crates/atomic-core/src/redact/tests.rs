@@ -2641,6 +2641,25 @@ fn json_that_text_redaction_breaks_is_hidden_whole() {
             "under {parent}: neither hidden whole nor JSON"
         );
     }
+    // JSON that reads as JSON to any reader but not as a value to
+    // serde_json, a lone surrogate escape or nesting past its depth limit,
+    // that text redaction changes and leaves unreadable: hidden whole.
+    let pair = r#""key":"DB_PASSWORD","value":"hunter2hunter2""#;
+    let deep = format!("{}{}", "[".repeat(130), "]".repeat(130));
+    for (case, held) in [
+        format!(r#"{{"s":"\ud800","a":"{SAMPLE}",{pair}}}"#),
+        format!(r#"{{"d":{deep},"a":"{SAMPLE}",{pair}}}"#),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = json!({ "args": held });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2hunter2"),
+            "case {case}: the pair's value showed"
+        );
+    }
 }
 
 /// JSON that text redaction breaks deeper in, in a string the JSON it
@@ -3509,4 +3528,279 @@ fn nested_flag_readings_end_with_their_body() {
     let hidden = text(input);
     assert!(hidden.contains("ordinary"));
     assert!(!hidden.contains("secret-suffix"));
+}
+
+/// A secret's name and value pair in JSON held in a string is read as
+/// written, before text redaction hides the name: its value is hidden as
+/// it is in a real object, pretty or compact, under a hint or not.
+#[test]
+fn a_pair_in_json_in_a_string_is_read_by_the_name_written() {
+    let secret = "correct horse";
+    let shapes = [
+        json!([{"key": "DB_PASSWORD", "value": secret}]),
+        json!({"items": [{"value": secret, "key": "GITHUB_TOKEN"}]}),
+        json!({"env": [{"header": "DB_PASSWORD", "value": secret}]}),
+    ];
+    for (case, shape) in shapes.iter().enumerate() {
+        // As a real object, for the record.
+        let mut real = json!({ "key": shape.clone() });
+        value(&mut real);
+        for text in [
+            serde_json::to_string_pretty(shape).expect("JSON"),
+            shape.to_string(),
+        ] {
+            for parent in ["key", "note"] {
+                let mut out = json!({ parent: text.clone() });
+                value(&mut out);
+                let shown = out.to_string();
+                assert!(
+                    !shown.contains(secret),
+                    "case {case} under {parent}: the value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert_eq!(
+                    again, out,
+                    "case {case} under {parent}: a second pass changed it"
+                );
+            }
+        }
+        assert!(
+            !real.to_string().contains(secret),
+            "case {case}: a real object showed"
+        );
+    }
+}
+
+/// Reading JSON in a string as written as well never shows what redaction
+/// hid before, and never makes a stable result unstable: over generated
+/// strings of pairs, flags and named fields, every planted secret hidden
+/// before is hidden now.
+#[test]
+fn reading_pairs_as_written_never_shows_what_was_hidden() {
+    let mut seed: u64 = 0x9a17_5eed;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    const NAMES: &[&str] = &[
+        "DB_PASSWORD",
+        "GITHUB_TOKEN",
+        "password",
+        "token",
+        "note",
+        "Authorization",
+        "cookie",
+        "--password",
+        "api_key",
+        "user",
+    ];
+    const PARENTS: &[&str] = &["key", "note", "token", "data", "args"];
+    let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
+    for _ in 0..3000 {
+        let mut planted = Vec::new();
+        let mut secret = |next: &mut dyn FnMut(u64) -> u64| {
+            let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+            let mut s = String::from("P");
+            for _ in 0..13 {
+                s.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+            }
+            planted.push(s.clone());
+            if next(2) == 0 { format!("{s} x") } else { s }
+        };
+        let mut items = Vec::new();
+        for _ in 0..=next(3) {
+            let name = NAMES[next(NAMES.len() as u64) as usize];
+            items.push(match next(4) {
+                0 => json!({"name": name, "value": secret(&mut next)}),
+                1 => json!({"key": name, "value": secret(&mut next)}),
+                2 => json!([name, secret(&mut next)]),
+                _ => json!({ name: secret(&mut next) }),
+            });
+        }
+        let inner = Value::Array(items);
+        let text = if next(2) == 0 {
+            serde_json::to_string_pretty(&inner).expect("JSON")
+        } else {
+            inner.to_string()
+        };
+        let doc = json!({ PARENTS[next(PARENTS.len() as u64) as usize]: text });
+        let run = |as_written: bool| {
+            PAIRS_AS_WRITTEN.with(|p| p.set(as_written));
+            let mut once = doc.clone();
+            value(&mut once);
+            let mut twice = once.clone();
+            value(&mut twice);
+            PAIRS_AS_WRITTEN.with(|p| p.set(true));
+            (once, twice)
+        };
+        let (now, now_again) = run(true);
+        let (before, before_again) = run(false);
+        if before_again == before && now_again != now {
+            unstable += 1;
+        }
+        let (now, before) = (now.to_string(), before.to_string());
+        shown_more += planted
+            .iter()
+            .filter(|p| now.contains(p.as_str()) && !before.contains(p.as_str()))
+            .count();
+        hidden_more += planted
+            .iter()
+            .filter(|p| before.contains(p.as_str()) && !now.contains(p.as_str()))
+            .count();
+    }
+    assert_eq!(shown_more, 0, "a secret hidden before is shown now");
+    assert_eq!(
+        unstable, 0,
+        "a second pass changes what it did not change before"
+    );
+    assert!(hidden_more > 0, "nothing is hidden that was shown before");
+}
+
+/// JSON held in a string inside JSON held in a string is read by its names
+/// as written too, two and three levels deep.
+#[test]
+fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
+    let pair = json!({"env": [{"key": "DB_PASSWORD", "value": "hunter2 x"}]}).to_string();
+    let two = json!({"body": pair}).to_string();
+    let three = json!({"body": two.clone()}).to_string();
+    for (depth, doc) in [
+        (2, json!({"arguments": two})),
+        (3, json!({"arguments": three})),
+    ] {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2 x"),
+            "depth {depth}: the value showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "depth {depth}: a second pass changed it");
+    }
+}
+
+/// Under a hint, held JSON opened as held is read by its names as written
+/// too, not only after text redaction hid them.
+#[test]
+fn held_json_is_read_by_the_names_written() {
+    let doc = json!({"key": json!([
+        {"key": "DB_PASSWORD", "value": "correct horse"},
+        {"note": concat!("Zx81", "kQ0pL2mN4bV6")},
+    ]).to_string()});
+    let mut out = doc;
+    value(&mut out);
+    let shown = out.to_string();
+    assert!(!shown.contains("correct horse"), "the value showed");
+    assert!(!shown.contains("kQ0pL2mN4bV6"), "the credential showed");
+}
+
+/// A string held under a hint that text redaction leaves reading as a
+/// credential whole is hidden in the same pass, as a second pass would hide
+/// it.
+#[test]
+fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
+    let mut once = json!({"token": "pwd=\"a b\""});
+    value(&mut once);
+    let mut twice = once.clone();
+    value(&mut twice);
+    assert_eq!(twice, once, "a second pass changed it");
+}
+
+/// Assignment scanning settles a chain in one reading. A recognized secret
+/// at its tail is hidden in held JSON, under a hint, a secret's name and an
+/// ordinary name, and a second pass changes nothing.
+#[test]
+fn a_held_assignment_chain_hides_its_secret_and_settles_in_one_pass() {
+    let secret = format!("ghp_{}", "Aa0".repeat(12));
+    for count in 1..=12 {
+        let chain = format!("password=pass{} {secret}", " =secret: pass".repeat(count));
+        for parent in ["key", "token", "note"] {
+            let mut once = json!({ parent: json!({"a": chain}).to_string() });
+            value(&mut once);
+            assert!(
+                !once.to_string().contains(&secret),
+                "under {parent}, chain {count}: the recognized secret showed"
+            );
+            let mut twice = once.clone();
+            value(&mut twice);
+            assert_eq!(
+                twice, once,
+                "under {parent}, chain {count}: a second pass changed it"
+            );
+        }
+    }
+}
+
+/// A name and value pair whose value redaction rewrites into the pair's
+/// secret is read again once its value is redacted, so a second pass
+/// changes nothing: `pwd="a b"` redacted to `pwd="[REDACTED]"`, or a
+/// cookie's JSON written back with `\u003d` as the `=` that makes it one,
+/// as a value on its own and held under a hint.
+#[test]
+fn a_pair_whose_value_redacts_to_its_secret_settles_in_one_pass() {
+    let secret = "pwd=\"a b\"";
+    let token = concat!("Zx81", "kQ0pL2mN4bV6");
+    let cookie = format!("{{\"t\\u006fken\": \"{token}\", \"a\": \"a b\\u003dc\"}}");
+    for (case, doc) in [
+        json!(["token", secret]),
+        json!({"name": "--token", "value": secret}),
+        json!(["Cookie", cookie]),
+        json!({"key": ["Cookie", cookie]}),
+        json!({"key": {"name": "Cookie", "value": cookie}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut once = doc;
+        value(&mut once);
+        let shown = once.to_string();
+        assert!(
+            !shown.contains("a b") && !shown.contains(&token[4..]),
+            "case {case}: a secret showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(twice, once, "case {case}: a second pass changed it");
+    }
+}
+
+/// JSON that reads as JSON as written only without building a value, a
+/// lone surrogate escape inside text that redaction hides, where the
+/// redacted JSON builds one: it cannot be compared place by place, so it
+/// is hidden whole, under an ordinary name and under a hint.
+#[test]
+fn json_readable_only_without_a_value_as_written_is_hidden_whole() {
+    let pair = r#""key":"DB_PASSWORD","value":"hunter2hunter2""#;
+    let held = format!(r#"{{"p":"password=\ud800qq","a":"{SAMPLE}",{pair}}}"#);
+    for parent in ["args", "key"] {
+        let mut out = json!({ parent: held.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2hunter2"),
+            "under {parent}: the pair's value showed"
+        );
+    }
+    // The same lead before JSON whose header deeper in text redaction
+    // breaks.
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let inner = format!(
+        "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+         \"note\": \"Authorization: \\\\Bearer \\\\\"}}"
+    );
+    let wrapped = format!("{{\"body\": {}}}", Value::String(inner));
+    let doc = format!(
+        r#"{{"p":"password=\ud800qq", "body": {}}}"#,
+        Value::String(wrapped)
+    );
+    for parent in ["body", "key"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "under {parent}: the header's value showed"
+        );
+    }
 }
