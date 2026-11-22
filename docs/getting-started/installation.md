@@ -106,5 +106,25 @@ atomic config --explain
 and a top-level layout in an empty directory. Detected configuration is inspectable;
 explicit settings take precedence within your organization's policy.
 
+In a fresh project, `atomic init` creates the lite atom `summarize-note` and
+one sample eval case. Configure an [endpoint for lite atoms](authentication.md#lite-atoms),
+then record a model answer for the sample.
+
+```sh
+atomic eval --live
+```
+
+The command calls the configured model and writes its answer to the sample's
+cassettes. A passing result starts with `PASS summarize-note: 1 of 1 cases passed`.
+Keep the same endpoint URL and model name and replay the answer.
+
+```sh
+atomic eval
+```
+
+Replay checks the recorded answer without calling the model. See the
+[eval reference](../reference/eval-cases.md#cases-golden-fixtures-and-recordings)
+for cassette behavior.
+
 Continue with the [CLI quickstart](quickstart.md), or go straight to
 [your first atom](first-atom.md) for the planned v0.1 automation path.

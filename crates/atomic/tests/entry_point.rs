@@ -96,7 +96,7 @@ fn under_apply_patch_it_takes_the_apply_patch_path() {
     let t = text(&out);
     assert!(!out.status.success());
     assert!(
-        !t.contains("atomic 0.0.0"),
+        !t.contains(concat!("atomic ", env!("CARGO_PKG_VERSION"))),
         "ran atomic's own entry point: {t}"
     );
     assert!(
@@ -114,7 +114,7 @@ fn under_the_sandbox_helpers_name_it_takes_the_helper_path() {
     let t = text(&out);
     assert!(!out.status.success());
     assert!(
-        !t.contains("atomic 0.0.0"),
+        !t.contains(concat!("atomic ", env!("CARGO_PKG_VERSION"))),
         "ran atomic's own entry point: {t}"
     );
     assert!(

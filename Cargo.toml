@@ -15,7 +15,7 @@ members = [
 exclude = ["crates/atomic-durable/tests/dbos_schema/upstream"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 # The toolchain Codex pins at the revision in deps/codex.toml.
 rust-version = "1.95.0"
