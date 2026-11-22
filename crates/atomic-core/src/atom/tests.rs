@@ -599,6 +599,117 @@ fn an_unbalanced_section_tag_fails_the_load() {
     assert_eq!(atom.name, "test");
 }
 
+/// Where atomic's scan of a start tag and Astro's own reading of that tag's
+/// last attribute leave the tag in different places, the load refuses the file
+/// and names the attribute: neither reading points at the tag the other takes
+/// for it, so nothing after the start tag can be named with confidence.
+#[test]
+fn a_start_tag_the_two_readings_disagree_on_fails_the_load() {
+    for (body, name, attribute) in [
+        // A template literal whose escaped backtick ends the value for one
+        // reading and not the other.
+        (
+            "<Note title={`a \\`b`} />\n<section>x</section>",
+            "Note",
+            "title",
+        ),
+        // JSX whose apostrophe ends the expression here and not for Astro.
+        (
+            "<Note a={<b>it's</b>} />\n<section>y</section>",
+            "Note",
+            "a",
+        ),
+        // A character class holding both kinds of quote, a value the scan
+        // closes early.
+        ("<Note x={/[\"']/g} />\n<section>y</section>", "Note", "x"),
+        // Quotes inside a call's arguments, in a tag the scan closes at its
+        // own `>` rather than at the value.
+        ("<a x={input.text.replace(/'/g, \"'\")}>t</a></b>", "a", "x"),
+    ] {
+        let root = project(body, "{}", None);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err("a start tag the two readings disagree on");
+        assert_eq!(
+            (error.line, error.message.as_str(), error.path.as_str()),
+            (
+                8,
+                format!(
+                    "the start tag of <{name}> cannot be read: its attribute `{attribute}` ends where atomic and Astro disagree about the tag"
+                )
+                .as_str(),
+                "body",
+            ),
+            "{body}"
+        );
+    }
+    // Attributes a template literal and a braced number, which both readings
+    // end where they are written, load on a component.
+    let root = project(
+        "<Style title={`a`} level={1} />\n{input.text}",
+        "{}",
+        Some("---\n---\n<rules>\n<slot />\n</rules>\n"),
+    );
+    let atom = load(&root.join("test.atom.astro"), &mut Registry::new()).expect("loads Astro");
+    assert_eq!(atom.name, "test");
+}
+
+/// The parse leaves a fragment one byte after the `<` of its own `</>`, and
+/// three bytes after the `<` of a closing tag of another name it read as the
+/// fragment's end, where a `</>` of three bytes would have ended. The refusal
+/// names the closing tag the parse read.
+#[test]
+fn a_fragment_closer_of_another_name_is_named() {
+    let root = project("<>x</qq></>", "{}", None);
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("a stray closer");
+    assert_eq!(
+        (error.line, error.message.as_str()),
+        (
+            8,
+            "`</qq>` closes <>, opened on line 8; close it with `</>`"
+        )
+    );
+    let (atom, _) = checked("<>{input.text}</>");
+    assert_eq!(atom.name, "test");
+}
+
+/// The Astro parser is a Go program, and a few sources fault it inside
+/// itself: it prints its own runtime failure and rejects without a diagnostic.
+/// Such a file is refused for what the compiler did manage to say, and its
+/// trace stays off the one-line protocol the host reads, so the reply is
+/// still the compiler's own.
+#[test]
+fn a_source_the_compiler_faults_on_fails_the_load() {
+    // What the compiler says when it faults, with no file and no line to go
+    // with it: the fault is in the compiler, not on an authored line.
+    const FAULT: &str = "the Astro compiler could not read this file and gave no diagnostic; a closing tag or a comment inside a {…} expression is a known trigger";
+    for closer in ["b", "i", "a", "em", "strong", "code"] {
+        let body = format!("<Note level=1/>\n{{input.text}}</{closer}>");
+        let root = project(&body, "{}", None);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err("a compiler fault");
+        assert_eq!(
+            (error.path.as_str(), error.message.as_str()),
+            ("body", FAULT),
+            "{body}"
+        );
+        assert!(
+            error.file.ends_with("test.atom.astro"),
+            "{}",
+            error.file.display()
+        );
+    }
+    // The other fault: a comment inside an expression, whose `>` the parser
+    // reads as the end of a tag.
+    let root = project("<a x={/*>t</a>", "{}", None);
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("a compiler fault");
+    assert_eq!(
+        (error.path.as_str(), error.message.as_str()),
+        ("body", FAULT)
+    );
+}
+
 /// Tags balance inside an expression too.
 #[test]
 fn an_unbalanced_tag_inside_an_expression_fails_the_load() {

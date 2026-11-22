@@ -229,7 +229,15 @@
  ],
  [
   "<>x</a>",
-  "<> is never closed"
+  "`</a>` closes <>"
+ ],
+ [
+  "<>x</qq></>",
+  "`</qq>` closes <>, opened on line 5; close it with `</>`"
+ ],
+ [
+  "<>x</qq>",
+  "`</qq>` closes <>, opened on line 5; close it with `</>`"
  ],
  [
   "<p>x</p foo>",
@@ -294,5 +302,41 @@
  [
   "<Style/x=\"/>\">\n{input.text}",
   "<Style> is never closed; close it with `</Style>`"
+ ],
+ [
+  "<Note level=1/>\n<section>x</section>",
+  "<Note> is never closed; close it with `</Note>`"
+ ],
+ [
+  "<Note title={`a \\`b`} />\n<section>x</section>",
+  "the start tag of <Note> cannot be read: its attribute `title` ends where atomic and Astro disagree about the tag"
+ ],
+ [
+  "<Note a={<b>it's</b>} />\n<section>y</section>",
+  "the start tag of <Note> cannot be read: its attribute `a` ends where atomic and Astro disagree about the tag"
+ ],
+ [
+  "<a x={input.text.replace(/'/g, \"'\")}>t</a></b>",
+  "the start tag of <a> cannot be read: its attribute `x` ends where atomic and Astro disagree about the tag"
+ ],
+ [
+  "<Note x={/[\"']/g} />\n<section>y</section>",
+  "the start tag of <Note> cannot be read: its attribute `x` ends where atomic and Astro disagree about the tag"
+ ],
+ [
+  "<Note x={/}/.test(input.text)} />\n<section>y</section>",
+  null
+ ],
+ [
+  "<Note a={<a href=\"https://x.y/a?b=1&amp;c=2\">l</a>} />\n<section>y</section>",
+  null
+ ],
+ [
+  "<plaintext>x</plaintext>",
+  "<plaintext> is never closed"
+ ],
+ [
+  "text\n<plaintext>x</plaintext>\n",
+  "<plaintext> is never closed"
  ]
 ]
