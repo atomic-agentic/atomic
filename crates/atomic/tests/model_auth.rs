@@ -123,23 +123,69 @@ fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
 /// A stand-in for a local Ollama on loopback: it lists `synthetic` to every
 /// request, so a run that took it as its endpoint would reach no further
 /// than here, and it keeps the first line of each request it was sent.
+/// A stand-in Ollama on loopback, listing one model, and what it saw: each
+/// request's first line, with when it was accepted and answered, counted
+/// from the stand-in's start, so a failure says whether and when the probe
+/// arrived.
 fn ollama_on_loopback() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
+    let started = std::time::Instant::now();
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            let mut request = [0u8; 4096];
-            let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
-            let line = String::from_utf8_lossy(&request[..n])
+            let accepted = started.elapsed().as_millis();
+            // The whole request head, however many writes it came in: an
+            // answer sent while some of it is still unread, and the stream
+            // then dropped, resets the connection, which can lose the
+            // answer before the client reads it.
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let complete = loop {
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break true;
+                }
+                match std::io::Read::read(&mut stream, &mut chunk) {
+                    Ok(0) | Err(_) => break false,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+                if request.len() > 1 << 16 {
+                    break false;
+                }
+            };
+            // And its body, by its length, for the same reason.
+            let head_end = request
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(request.len(), |at| at + 4);
+            let length = String::from_utf8_lossy(&request[..head_end])
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while complete && request.len() < head_end + length {
+                match std::io::Read::read(&mut stream, &mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => request.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let line = String::from_utf8_lossy(&request)
                 .lines()
                 .next()
                 .unwrap_or_default()
                 .to_owned();
-            log.lock().unwrap().push(line);
+            let line = if complete {
+                line
+            } else {
+                format!("{line} (an incomplete request)")
+            };
             let body = r#"{"models":[{"name":"synthetic"}]}"#;
-            let _ = std::io::Write::write_all(
+            let answered = std::io::Write::write_all(
                 &mut stream,
                 format!(
                     "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
@@ -147,6 +193,13 @@ fn ollama_on_loopback() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>
                 )
                 .as_bytes(),
             );
+            let answered = match answered {
+                Ok(()) => format!("answered at {} ms", started.elapsed().as_millis()),
+                Err(e) => format!("not answered: {e}"),
+            };
+            log.lock()
+                .unwrap()
+                .push(format!("{line} (accepted at {accepted} ms, {answered})"));
         }
     });
     (addr, seen)
@@ -166,7 +219,7 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
         seen.lock()
             .unwrap()
             .iter()
-            .filter(|l| !l.starts_with("GET /api/tags"))
+            .filter(|l| !l.starts_with("GET /api/tags "))
             .count()
     };
     let run = ["run", "tidy-codex", "--data", r#"{"text": "a note"}"#];
@@ -213,7 +266,8 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     assert!(!t.contains("cannot be used"), "{t}");
     assert!(
         calls() > 0,
-        "the detected endpoint did not take the run: {t}"
+        "the detected endpoint did not take the run; the stand-in saw {:?}: {t}",
+        seen.lock().unwrap()
     );
     let before = calls();
     std::fs::create_dir_all(inside.join("credentials/codex-auth")).unwrap();

@@ -213,10 +213,13 @@ store does not hold, and waiting for the store's lock within one bounded wait
 that a stop signal ends; and
 that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
-puts the source back and requires the test to pass. Each control costs a rebuild, so it
-runs by hand rather than in CI:
+puts the source back and requires the test to pass. Each control costs a
+rebuild, so CI runs only the rows a pull request touches (see
+[The Controls workflow](#the-controls-workflow)). To run a row by hand, or all
+of them:
 
 ```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 ```
 
@@ -226,7 +229,15 @@ file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
 (in CI) tests that. It refuses to start while a file a selected control edits
 differs from HEAD, including a file git does not track or is told to assume
 unchanged, so commit or put back changes to those files first; changes to
-other files do not matter.
+other files do not matter. It also refuses to start while another run holds the
+tree's lock at `target/controls-check.lock`, taken with `flock`: two runs switch
+the same files and each saves its own originals, so the one that finishes last
+would put back the other's switched-off source. That lock is closed before the
+run's cargo and its git are started, so neither a test that leaves a process
+behind nor a git that starts a fsmonitor daemon holds a finished run's lock.
+The lock frees itself when the run that took it ends, however it ends, so its
+file is never something to remove: removing it frees nothing and would let a
+third run lock a fresh file beside the one still held.
 
 Each control is one file under `scripts/controls/`, named `<name>.row` and
 holding one line:
@@ -250,7 +261,70 @@ different control, a file holding anything but one row, a second file naming a
 control again, and anything there that is not a `*.row` regular file. That is
 why a control is a file rather than a line in the script: two branches adding a
 control add two files and never edit the same line. A row whose code has moved
-fails until it is updated.
+fails until it is updated. `scripts/controls-on.py` and
+`scripts/controls-touched.py` read row files by these same rules, and refuse a
+row that names no control; the second reads them from git's tree, so a row
+file that is a link must lead to a regular file inside the repository.
+
+`python3 scripts/controls-on.py` asks of every row whether its file holds the
+control rather than what switching the row off writes, and CI runs it on the
+commit it checks out, for every row at once: a rebuild per control is why
+`controls-check.sh` runs only the rows a pull request touches, and this needs
+no build. A row whose replacement does not hold its own switch text takes that
+text out of the file when it switches the control off — whatever the
+replacement is, even a value the file says elsewhere — so for those rows the check requires the switch text to be in the file exactly
+once. A row whose replacement does hold its own switch text leaves that text
+where the row points, so for those the check requires the replacement not to be
+in the file at all. A row that fails either is named. The script reads the row
+files by the same rules as `controls-check.sh`, so a row that cannot be read is
+refused there too rather than left unchecked, and
+`scripts/controls-check-test.sh` tests both with fixtures it commits.
+
+### The Controls workflow
+
+On every pull request, `.github/workflows/controls.yml` runs the rows the pull
+request touches, which `scripts/controls-touched.py <base> <head>` lists: each
+row whose row file it adds or changes; each row whose `file` it changes, since
+a code change can move a switch's text or stop it biting; each row naming a
+test whose name is in a file it changes, before or after the change, since a
+change to the guarding test can stop it failing; and each row whose
+`--test <t>` target, `crates/*/tests/<t>.rs` or `crates/*/tests/<t>/`, it
+changes. The script fails on a row file it cannot read, and on a row file
+deleted while its switch's text is still in some file, rows aside, that no
+other row switches it in: a control whose code remains, renamed or moved
+included, keeps its row.
+
+The "Touched controls" job cuts the rows into shards, one for every six rows
+and at most twelve; each shard, "Controls (i/n)", is set up as the test jobs
+are, sandbox and Postgres included, builds once and runs its rows in turn with
+`controls-check.sh`. A shard's summary holds one result line per row, the
+script's own:
+
+```
+ok run-keeps-input: its test fails with the control off and passes with it on
+FAIL serve-line-names: its test passed with the control off
+```
+
+A row that ends any other way, or runs past 45 minutes, gets a `FAIL` line
+too, as does each row a stopped shard did not reach, and a failing row's cargo
+output is kept as the shard's `controls-logs-<i>` artifact. "Controls" passes
+only when every touched row passed, and in seconds when none is touched. The
+"Touched controls" summary also lists each deleted row and why its deletion
+was allowed, and each touched row CI does not run, each with a warning on the
+pull request: check both.
+
+A merge group runs no rows: once "Controls" is a required check, a pull
+request joins the queue only after its rows passed. Every Sunday, and when
+started by hand (Actions > Controls > Run workflow), the workflow sweeps every
+row instead, in up to sixteen shards, so that what touches no row, such as
+changes that only break a row together or a lockfile or pin bump, is checked
+too.
+
+A row CI does not run, one a GitHub runner cannot run or one known to fail
+until a fix lands, is listed with its reason in `scripts/controls-local.txt`.
+A pull request touching it, and every sweep, reports it as "not run in CI",
+with a warning, and leaves it to a local run; a pull request that changes the
+list gets a warning too, and should say why.
 
 ## Milestone acceptance
 
@@ -392,7 +466,9 @@ in turn:
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it.
+requests too, and nothing in CI waits for it. The Controls workflow runs the
+controls rows a pull request touches
+([The Controls workflow](#the-controls-workflow)).
 
 Main is merged through a merge queue. Once a pull request's checks pass, it can
 be added to the queue, which runs CI again on the pull request merged onto main
