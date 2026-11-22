@@ -2510,6 +2510,7 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
         format!("sh -c \"login --password {credential}\" now"),
         format!("sh -c 'login --token {credential}' now"),
         // Quotes escaped otherwise, or around a value that opens another.
+        format!("run \\\"sh --api-key \\\"login --password=\\\"{credential}\\\"\\\"\\\" now"),
         format!("--api-key \\'login \\'--auth-token {credential}\\\\'\\'"),
         format!("run sh --auth-token \\\"login \\\"--token {credential}\\\" now"),
         format!("--api-key \\'sh --api-key \"login [\\'--auth-token\\',\\'{credential}\\']\"\\'"),
@@ -2549,6 +2550,44 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
     let weak = json!({"cmd": "--token \"[\\'--pw\\',\\'hunter2\\']\""}).to_string();
     // An argument list beside a key only parsing finds, `pass\u0077ord`.
     let listed = r#"{"args":["--password","a"],"pass\u0077ord":"hunter2"}"#;
+    // Quoted values whose quotes pair only one way, read as JSON in a
+    // string one and two deep, or two deep only: the credential stays
+    // hidden.
+    for (case, (line, shallowest)) in [
+        (
+            format!("sh --cmd \"login --auth-token \\\\\\\"{credential}\\\\\\\"\""),
+            1,
+        ),
+        (
+            format!("run sh --note \"login sh --auth-token 'login --cmd {credential}'\", now"),
+            1,
+        ),
+        (format!("run x -c=\\\"{credential}\\\" --password now"), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let one = json!({"cmd": line}).to_string();
+        let two = json!({"body": one.clone()}).to_string();
+        for (depth, held) in [(1, one), (2, two)] {
+            if depth < shallowest {
+                continue;
+            }
+            let mut out = json!({ "arguments": held });
+            value(&mut out);
+            assert!(
+                !out.to_string().contains(&credential[4..]),
+                "case {case}, depth {depth}: the value showed in JSON"
+            );
+        }
+    }
+    // A hidden value keeps its escaped quotes, so the word after them stays.
+    let kept = format!("run sh -p \\\"login --password \\'{credential}\\'now");
+    let out = text(&kept);
+    assert!(
+        !out.contains(&credential[4..]) && out.contains("now"),
+        "{out}"
+    );
     // Backslashes after a value that close no quote escaped alike before
     // it are hidden with it: JSON that this breaks is hidden whole, and the
     // credential with it.

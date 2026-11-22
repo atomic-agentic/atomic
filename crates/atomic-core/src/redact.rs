@@ -1169,12 +1169,6 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
             };
             return format!("{prefix}{escapes}{inside}");
         }
-        // Inside another flag's quoted value, which a reading without it
-        // takes whole, a value that reads as more than one is left to the
-        // readings of what it holds.
-        if depth > 0 && is_secret_value(strength, inner) && holds_more(inner) {
-            return captures[0].to_string();
-        }
         if is_secret_value(strength, inner) {
             // Escaped quotes are kept, so they still pair, and a flag right
             // after the closing one is still read as one.
