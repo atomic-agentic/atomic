@@ -37,13 +37,20 @@ alone says the switch is where it points. Where a row names a file that cannot b
 read, neither rule can be asked and the row is refused as what could not be read,
 never as a control that is simply absent.
 
-Every row file is read the way scripts/controls-check.sh reads it, and the same
-malformed files are refused: a row read wrongly is a control that goes unchecked
-while the tree is reported as holding all of them on. Anything that cannot be
-read, cannot be found, or cannot be decoded is a refusal, and only a file that
-is genuinely not there is reported as missing rather than unreadable. Every row
-is checked before the run ends, so a commit that switched two controls off names
-both.
+Every row file is read the way scripts/controls-check.sh reads it, since a row
+read wrongly is a control that goes unchecked while the tree is reported as
+holding all of them on. The two refuse the same rows: a file holding anything but
+its one row -- one trailing newline being how a file ends rather than a second
+row, so a file written without one is malformed to neither -- a row whose fields
+are not five, a row that names no control, a name another row file already names,
+and a name that is not the file's own. Past that python refuses three rows the
+shell goes on to run, because the shell has no way to ask them: a row file that is
+not text, a row whose switch text is empty, and a switch text its file holds more
+than once. Each is a row that switches nothing the row means, so refusing it fails
+closed where running it would say nothing. Anything that cannot be read, cannot be
+found, or cannot be decoded is a refusal, and only a file that is genuinely not
+there is reported as missing rather than unreadable. Every row is checked before
+the run ends, so a commit that switched two controls off names both.
 
 A row's fields are passed on with no interpretation at all, which is why this is
 python rather than a shell loop: a row's text holds both `"` and `'`, and a
@@ -129,13 +136,22 @@ def main():
             problems.append(f"{kind}: {row_file} is not text")
             continue
 
-        # One row per file: five fields, so four separators. A file that does
-        # not say which control it is names nothing to check, so it is refused
-        # by name before anything else is asked of it.
-        lines = text.split("\n")
-        if len(lines) != 2 or lines[1] != "":
-            seen = len(lines) - 1 if lines[-1] == "" else len(lines)
-            problems.append(f"{kind}: {row_file} holds {seen} rows, not the one it must")
+        # One row per file: five fields, so four separators. At most one
+        # trailing newline comes off first: that is how the file ends rather than
+        # a second row, which is what scripts/controls-check.sh's mapfile sees,
+        # so a row file written without the newline is refused by neither and one
+        # holding a blank line after its row is refused by both. A file holding
+        # nothing at all holds no row, which is why empty text counts as zero
+        # lines and not as one blank one. A file that does not say which control
+        # it is names nothing to check, so it is refused by name before anything
+        # else is asked of it.
+        if text.endswith("\n"):
+            text = text[:-1]
+        lines = text.split("\n") if text else []
+        if len(lines) != 1:
+            problems.append(
+                f"{kind}: {row_file} holds {len(lines)} rows, not the one it must"
+            )
             continue
         fields = lines[0].split("|")
         if len(fields) != 5:

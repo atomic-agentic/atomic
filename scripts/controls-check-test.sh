@@ -417,6 +417,22 @@ run honest git-hardening
     fail "an empty row file: exit ${code}: ${out}"
 [ ! -e "${repo}/cargo-args" ] || fail "an empty row file: cargo ran"
 
+# A row file with no trailing newline holds the one row it holds, which is what
+# mapfile sees: a reader that called that file's last line anything other than
+# the row itself would refuse a control that is there. The row is read here as
+# any other and reaches the rule about the code, which is where its switch text
+# is not in the file. scripts/controls-on.py reads the same file the same way,
+# which its own case asks below.
+repo="$(fresh)"
+printf '%s' \
+    'git-hardening|crates/atomic-core/src/git.rs|no switch this row could mean|b|guard' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "FAIL git-hardening: its switch no longer applies to crates/atomic-core/src/git.rs" <<<"${out}" ||
+    fail "a row file with no trailing newline: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row file with no trailing newline: cargo ran"
+
 repo="$(fresh)"
 printf '%s\n' '|crates/atomic-core/src/git.rs|a|b|args' \
     >"${repo}/scripts/controls/git-hardening.row"
@@ -716,7 +732,10 @@ done
 #   [ -f "${entry}" ] || die                        a directory in the rows
 #   *.row) ;;                                       a row file with another
 #                                                   extension
-#   [ "${#lines[@]}" -eq 1 ] || die                 two rows, and an empty file
+#   [ "${#lines[@]}" -eq 1 ] || die                 two rows, and an empty file;
+#                                                   and it runs a row file with no
+#                                                   trailing newline as the one row
+#                                                   it is
 #   [ -n "${name}" ] || die                         a row naming no control
 #   case " ${names[*]-} " in                        two rows naming one control
 #   [ "${name}" = "${base%.row}" ] || die           a row naming itself
@@ -955,6 +974,35 @@ run_on
     grep -q "scripts/controls/git-hardening.row has 3 '|' separators, not the 4 between its five fields" <<<"${out}" ||
     fail "controls-on a row missing a field: exit ${code}: ${out}"
 
+# A file holding nothing holds no row, which is what mapfile counts, and is not
+# one row with nothing in it.
+repo="$(fresh)"
+: >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row holds 0 rows, not the one it must" <<<"${out}" ||
+    fail "controls-on an empty row file: exit ${code}: ${out}"
+
+# A trailing newline is how the file ends and not a second row, so a row file
+# written without one is the one row it is and is read as that here exactly as
+# mapfile reads it: every control in the tree is still counted, this row's
+# switch and all.
+repo="$(fresh)"
+printf '%s' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 0 ] &&
+    grep -q "^ok: ${#CONTROL_ROWS[@]} controls are on in this tree$" <<<"${out}" ||
+    fail "controls-on a row file with no trailing newline: exit ${code}: ${out}"
+
+# A blank line after the row is a second line to mapfile and a second line here:
+# taking one trailing newline off is not taking a blank line off.
+repo="$(fresh)"
+printf '%s\n\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
+run_on
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row holds 2 rows, not the one it must" <<<"${out}" ||
+    fail "controls-on a blank line after the row: exit ${code}: ${out}"
+
 repo="$(fresh)"
 printf '%s\n' '|crates/atomic-core/src/git.rs|a|b|args' \
     >"${repo}/scripts/controls/git-hardening.row"
@@ -1082,7 +1130,11 @@ run_on
 #   if name in by_name                              two rows naming one control
 #   if not name                                     a row naming no control
 #   name != entry.name[ :-len(".row")]              a row naming itself otherwise
-#   len(lines) != 2 or lines[1] != ""               two rows in one file
+#   text = text[:-1], then len(lines) != 1          two rows in one file, and an
+#                                                   empty row file, and a row file
+#                                                   with no trailing newline (one
+#                                                   row) and one with a blank line
+#                                                   after its row (two)
 #   len(fields) != 5                                a field holding a '|', and a
 #                                                   row missing a field
 #   except UnicodeDecodeError, on the row           a row that is not text
