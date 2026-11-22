@@ -1112,11 +1112,13 @@ fn a_run_id_outside_its_characters_or_length_is_refused() {
     let project = project(&dir);
     let pasted = concat!("Bearer ghp_", "SAMPLE0123456789abcdefghijklmnopqrstuv");
     let long = "a".repeat(129);
+    // `--run-id=<id>`, so an id that starts with `-` reaches atomic.
     for id in [pasted, long.as_str(), "-x", "a\u{1b}[2Jb", "caf\u{e9}"] {
+        let given = format!("--run-id={id}");
         let out = atomic(
             &dir,
             &project,
-            &["--json", "run", "count-note", "--run-id", id, "--data", NOTE],
+            &["--json", "run", "count-note", &given, "--data", NOTE],
             &[],
             "",
         );
