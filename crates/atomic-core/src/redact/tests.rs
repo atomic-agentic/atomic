@@ -3284,6 +3284,40 @@ fn reading_pairs_as_text_takes_linear_steps() {
     }
 }
 
+/// Pairs on one long line read as fast as the same pairs a line each, name
+/// first, as plain pairs and as lists of three: where a line ends is read
+/// from the character after a value, not found by reading the rest of the
+/// line for each value on it. Reading the rest of the line takes over ten
+/// times as long at two megabytes in a debug build (4.4 s against 0.4 s),
+/// and more the longer the line; the bound is four times. Timed, as the
+/// best of two runs each, since that read counts no steps.
+#[test]
+fn one_long_line_of_pairs_reads_as_fast_as_many_short_ones() {
+    let best = |input: &str| {
+        (0..2)
+            .map(|_| {
+                let start = std::time::Instant::now();
+                let _ = text(input);
+                start.elapsed()
+            })
+            .min()
+            .expect("two runs")
+    };
+    let size = 2 * 1024 * 1024;
+    for unit in [
+        "{\"name\": \"X-Api-Key\", \"value\": \"abcdefghijklmnop\"} ",
+        "{\"name\": \"a\", \"value\": \"b\"} ",
+        "[\"X-Api-Key\", \"a\", \"b\"] ",
+    ] {
+        let line = best(&unit.repeat(size / unit.len() + 1));
+        let lines = best(&format!("{unit}\n").repeat(size / (unit.len() + 1) + 1));
+        assert!(
+            line < 4 * lines,
+            "{unit}: one line took {line:?}, a line each {lines:?}"
+        );
+    }
+}
+
 /// A pair in JSON that parses, its fields in any case as AWS writes them
 /// (`Name`, `Key`, `Value`), as `headerName` and `headerValue`, or with a
 /// value of more than a string under a header's or a secret's name, has its
@@ -3364,7 +3398,8 @@ fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
         }
     }
     // A pair inside another's object for a value is still read, and pairs
-    // that hold no secret, and lists of more than two, are kept.
+    // that hold no secret, lists of more than two, and a list of names cut
+    // after two, are kept.
     let inner = format!(
         "{{\"name\": \"config\", \"value\": {{\"name\": \"X-Api-Key\", \"value\": \"{key}\""
     );
@@ -3375,5 +3410,7 @@ fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
         "for name in [\"ATOMIC_EFFECT_KEY\", \"ATOMIC_OUTPUTS\", \"ATOMIC_INPUTS\"] {",
         "{'name': 'region', 'value': 'us-east-1'}",
         "{\"name\": \"config\", \"value\": {\"retries\": 3}",
+        "headers = [\"X-Api-Key\", \"X-Request-Id\"",
+        "allowed = [\"X-Auth-Token\", \"Content_Type\"\nmore",
     ]);
 }

@@ -1580,14 +1580,23 @@ fn pairs(input: &str) -> Option<String> {
             let to = len.map_or_else(|| line_end(from), |len| from + len);
             // An array is a pair only when its value ends it, or is cut,
             // within the value or after it, where the text or the line
-            // ends: `["X-Api-Key", "…"]`, not a list of three.
+            // ends: `["X-Api-Key", "…"]`, not a list of three. One that
+            // ends with the line just after its value is not a pair when
+            // the value reads as another name, words joined by `-` or `_`:
+            // `["X-Api-Key", "X-Request-Id"` is a list of names cut short.
             let after = input[to..]
                 .trim_start_matches(['\\', '"', '\''])
                 .trim_start_matches([' ', '\t', '\r']);
-            let closed = after.starts_with(']');
-            let ended = after.split('\n').next() == Some("");
-            let pair = explicit || len.is_none() || closed || ended;
             let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
+            let closed = after.starts_with(']');
+            let named = || {
+                let value = value.trim_matches('\\');
+                value.contains(['-', '_'])
+                    && value
+                        .split(['-', '_'])
+                        .all(|w| !w.is_empty() && is_wordlike(w))
+            };
+            let pair = explicit || len.is_none() || closed || (at_line_end(after) && !named());
             if pair && holds(&c[1], value, explicit) {
                 hidden.push((from, to));
             }
@@ -1635,6 +1644,13 @@ fn pairs(input: &str) -> Option<String> {
     }
     out.push_str(&input[copied..]);
     (out != input).then_some(out)
+}
+
+/// Whether `after`, what follows a pair's value and its spaces, starts
+/// where its line ends. Only its first character is read, so a long line
+/// is not read again for each value on it.
+fn at_line_end(after: &str) -> bool {
+    after.bytes().next().unwrap_or(b'\n') == b'\n'
 }
 
 /// One reading of `input` by every text rule (see [`text`]).
