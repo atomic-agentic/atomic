@@ -445,7 +445,7 @@ fn an_answered_tunnel_owes_nothing_more() {
     refused.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
     assert!(refused.owed.is_some(), "a request after a refusal owes");
 
-    // Bytes sent before the upstream's first answer still owe.
+    // Before the upstream's first answer, the `CONNECT` itself is owed.
     let mut early = Exchange::default();
     early.sent(b"CONNECT example.com:443 HTTP/1.1\r\n\r\n", now);
     early.received(b"HTTP/1.1 200 OK\r\n\r\n");

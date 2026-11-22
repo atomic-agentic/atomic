@@ -378,7 +378,10 @@ impl Exchange {
             }
             self.started = Some(now);
         }
-        let tunnelled = self.first == Some(true) && self.refused == Some(false) && self.answered;
+        // Until a tunnel's upstream has answered, the `CONNECT` sent first
+        // is still owed, since only an answer clears it; past that, its
+        // bytes start nothing.
+        let tunnelled = self.first == Some(true) && self.refused == Some(false);
         if !tunnelled {
             self.owed.get_or_insert(now);
         }
