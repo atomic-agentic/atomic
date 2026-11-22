@@ -147,8 +147,8 @@ pub fn store_project(state: &ProjectState) -> anyhow::Result<String> {
 /// The backend on this machine that `atomic run`, `atomic serve` and the
 /// evals run turns and exec atoms' commands on, unconfined and unconnected
 /// (see [`ProjectState::run_backend`]): scratch outside every directory a
-/// sandboxed turn may write, and the project's other backends' denied to
-/// its commands.
+/// sandboxed turn may write, and every other scratch directory in the
+/// atomic home's `scratch/` denied to its commands.
 pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
     state.run_backend()
 }

@@ -139,7 +139,8 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn, of the project or another, can see, add, change
+file runs and no other turn, of the project or another project of the same
+atomic home, can see, add, change
 or remove what a turn keeps in its `HOME` or temporary directory: every
 project's scratch directories, those of `atomic run`, `atomic serve` and
 `atomic eval` and those of `atomic debug codex-prompt` and `atomic debug
@@ -183,7 +184,7 @@ On Linux, atomic has verified that no atom's commands can reach the gate store
 or the credential: a Codex turn's commands and an exec atom's alike run under
 Codex's sandbox, which denies them the atomic home's `private/` directory, where
 every project keeps its database, its execution lock and its context
-checkpoints; the current project's
+checkpoints, and every project's
 Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; your own atomic
 configuration directory; the places in your home directory where credentials,
@@ -210,7 +211,8 @@ denied place or a linked secret lies two or more levels inside a directory it
 may write. What Codex records of a project's threads, its state databases and
 its logs, is kept with the project's private state, in the atomic home's
 `private/`, which every project's commands are denied; its Codex home keeps
-only the helper links a turn's shell runs. Records an older atomic left in a
+no thread records, and its helper links are the only part a turn's shell
+reads. Records an older atomic left in a
 project's Codex home move there when atomic next starts in that project, so
 until then another project's commands can still read them. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs

@@ -521,7 +521,7 @@ impl ExecutionBackend for Backend {
 /// Each attempt's scratch directory is a private one under
 /// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
 /// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
-/// as one in the project's state directory: [`LocalBackend::in_dir`].
+/// as one in the atomic home's `scratch/`: [`LocalBackend::in_dir`].
 #[derive(Clone)]
 pub struct LocalBackend {
     scratch_root: PathBuf,
@@ -639,7 +639,7 @@ impl Default for LocalBackend {
     /// directory every such backend of this user shares. Sandboxed turns may
     /// write there, so [`connect`](ExecutionBackend::connect) refuses it:
     /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
-    /// in the project's state directory, and this one is for tests that
+    /// in the atomic home's `scratch/`, and this one is for tests that
     /// open workspaces without connecting. Each has its own scratch root,
     /// since runs of different stores may share a run and step name.
     fn default() -> Self {

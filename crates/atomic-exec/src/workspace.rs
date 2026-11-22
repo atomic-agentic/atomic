@@ -176,8 +176,8 @@ pub(crate) fn check_outside(scratch_root: &Path, roots: &[PathBuf]) -> Result<()
         if root.starts_with(&other) {
             return Err(format!(
                 "scratch directories under {} would be inside {}, where a sandboxed turn may \
-                 write; keep them in the project's state directory, outside the project, /tmp \
-                 and $TMPDIR",
+                 write; keep them in the atomic home's scratch/, outside the project, /tmp and \
+                 $TMPDIR",
                 scratch_root.display(),
                 other.display()
             ));

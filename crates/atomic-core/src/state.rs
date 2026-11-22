@@ -26,8 +26,9 @@
 //!     debug/        the same for `atomic debug codex-prompt` and `atomic debug
 //!                   probe`
 //! <state>/ = <home>/projects/<project>/
-//!   codex/        Codex's home for atom threads: only the helper links
-//!                 Codex's shell needs, the rest denied to atoms
+//!   codex/        Codex's home for atom threads: it keeps no thread
+//!                 records; its helper links are the only part a turn's
+//!                 shell reads, the rest denied to atoms
 //!   worktrees/    one worktree per code-changing step
 //!   cache/        build caches shared by a project's steps
 //!   fixtures/     a bare snapshot of each commit a coding run is bound to
@@ -768,9 +769,6 @@ fn hold_lock(path: &Path) -> Option<Option<std::fs::File>> {
     }
 }
 
-/// Whether another process has the SQLite database at `path` open in WAL
-/// mode: each such connection holds a read lock on its shared-memory file's
-/// "DMS" byte (offset 128) for as long as it is open.
 /// Remove a record a Codex home kept, a file or the `log/` directory; one
 /// already gone is no error.
 fn remove_record(path: &Path) -> Result<(), StateError> {
@@ -821,6 +819,9 @@ fn copy_record(old: &Path, new: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether another process has the SQLite database at `path` open in WAL
+/// mode: each such connection holds a read lock on its shared-memory file's
+/// "DMS" byte (offset 128) for as long as it is open.
 fn database_in_use(path: &Path) -> bool {
     #[cfg(unix)]
     {
