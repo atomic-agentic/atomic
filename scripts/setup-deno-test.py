@@ -11,9 +11,11 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import threading
+import urllib.error
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +56,18 @@ class Server:
                 outer.requests += 1
                 if isinstance(answer, int):
                     self.send_error(answer)
+                    return
+                if isinstance(answer, tuple):
+                    # ('short', body): Content-Length for all of it, half the
+                    # body, then a clean close.
+                    body = answer[1]
+                    self.send_response(200)
+                    self.send_header('Content-Length', str(len(body)))
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+                    self.wfile.write(body[: len(body) // 2])
+                    self.wfile.flush()
+                    self.close_connection = True
                     return
                 self.send_response(200)
                 self.send_header('Content-Length', str(len(answer)))
@@ -111,6 +125,21 @@ def run(module):
     outcome, requests, slept = attempt(module, [403, OTHER, GOOD])
     check('a different archive after a retry', (outcome, requests), (('refused', 'Deno archive checksum mismatch'), 2))
 
+    outcome, requests, slept = attempt(module, [('short', GOOD), GOOD])
+    check('a body cut off part way, then the archive', (outcome[0], requests, slept), ('installed', 2, [2]))
+
+    limit = module.LIMIT
+    module.LIMIT = len(GOOD) - 1
+    try:
+        outcome, requests, slept = attempt(module, [GOOD])
+    finally:
+        module.LIMIT = limit
+    check('an archive over the limit', (outcome, requests, slept), (('refused', 'Deno archive checksum mismatch'), 1, []))
+
+    unverified = urllib.error.URLError(ssl.SSLCertVerificationError(1, 'certificate verify failed'))
+    check('a certificate that does not verify is not retried', module.transient(unverified), False)
+    check('a refused connection is retried', module.transient(urllib.error.URLError(ConnectionRefusedError())), True)
+
     outcome, requests, slept = attempt(module, [404, GOOD])
     check('404 is not retried', (outcome[0], requests, slept), ('refused', 1, []))
 
@@ -136,12 +165,15 @@ def main():
     run(load(script))
     found = list(failures)
     failures.clear()
-    # Each rule is tested by removing it: with the checksum check or the retry
-    # taken out of a copy of the script, a case above fails.
+    # Each rule is tested by removing it: with any one taken out of a copy of
+    # the script, a case above fails.
     text = script.read_text()
     for name, old, new in [
         ('checksum', "hashlib.sha256(archive).hexdigest() != sha256", 'False'),
         ('retry', 'if not transient(error):', 'if True:'),
+        ('size', 'if len(archive) > LIMIT or hashlib', 'if hashlib'),
+        ('short body', 'if len(archive) <= LIMIT and response.length:', 'if False:'),
+        ('certificate', 'isinstance(error.reason, ssl.SSLCertVerificationError):', 'False:'),
     ]:
         if old not in text:
             found.append(f'the {name} rule to remove is not in {script}')

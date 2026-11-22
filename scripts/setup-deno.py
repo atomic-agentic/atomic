@@ -7,10 +7,12 @@
 The archive deps/deno.json pins is downloaded from Deno's release and must
 match its SHA-256, or nothing is installed. A download that fails in a way a
 retry can fix (HTTP 403, 429 or 5xx, which GitHub's release storage answers
-now and then, a connection that fails or drops, a timeout) is tried again
-after 2, 4, 8 and 16 seconds, five tries in all; any other failure, and an
-archive that does not match its checksum, stops at once. A mismatch is never
-retried: a different archive is refused, however often it is offered.
+now and then, a connection that fails or drops, also part way through the
+archive, or a timeout) is tried again after 2, 4, 8 and 16 seconds, five tries
+in all. Any other failure (another HTTP status, a certificate that does not
+verify), an archive larger than 100 MB and one that does not match its
+checksum stop at once: a different archive is refused, however often it is
+offered.
 scripts/setup-deno-test.py tests this against a stand-in server.
 """
 import hashlib
@@ -20,6 +22,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import ssl
 import sys
 import time
 import urllib.error
@@ -36,6 +39,9 @@ def transient(error):
     """Whether a failed download may succeed if tried again."""
     if isinstance(error, urllib.error.HTTPError):
         return error.code in (403, 429) or 500 <= error.code <= 599
+    # A certificate that does not verify is no passing fault.
+    if isinstance(error, urllib.error.URLError) and isinstance(error.reason, ssl.SSLCertVerificationError):
+        return False
     return isinstance(error, (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError))
 
 
@@ -46,7 +52,13 @@ def download(url, sleep=time.sleep, delays=DELAYS):
     for attempt in range(1, tries + 1):
         try:
             with urllib.request.urlopen(url, timeout=60) as response:
-                return response.read(LIMIT + 1)
+                archive = response.read(LIMIT + 1)
+                # A connection closed cleanly part way through the body
+                # reads as a short body, with no error of its own: the bytes
+                # Content-Length promised and did not deliver are what say so.
+                if len(archive) <= LIMIT and response.length:
+                    raise http.client.IncompleteRead(archive, response.length)
+                return archive
         except Exception as error:  # noqa: BLE001 -- sorted by transient()
             if not transient(error):
                 raise SystemExit(f'Deno archive download failed: {error}')
