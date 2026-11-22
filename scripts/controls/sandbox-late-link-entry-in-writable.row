@@ -1,0 +1,1 @@
+sandbox-late-link-entry-in-writable|crates/atomic-core/src/codex.rs|        refuse_link_in_writable(entry)?;|        let _ = &entry;|-p atomic-agentic-core --lib --features fake-model -- a_place_that_became_a_link_inside_a_writable_root_refuses

@@ -2332,6 +2332,89 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
     );
 }
 
+/// A secret after an operating system's error under a secret's or a
+/// header's name is hidden, however the text is read: the error took the
+/// place where the name's value is looked for, so the value moved after it.
+/// Main showed every one of these. The error's words, and words after it
+/// that read as words, are kept.
+#[test]
+fn a_secret_after_an_os_error_under_a_secrets_name_is_hidden() {
+    let mut planted = Planted(0x5eed_0e44_0000_0081);
+    let names = [
+        "password",
+        "api_key",
+        "authorization",
+        "Authorization",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+        "x-api-key",
+        "x-auth-token",
+    ];
+    let forms = [
+        "{n}: Permission denied (os error 13) {s}",
+        "{n}: No such file or directory (os error 2) {s}",
+        "open {n} : Permission denied (os error 13) :{s}",
+        "{n}: Too many levels of symbolic links (os error 40) {s}",
+        "error: {n}: Permission denied (os error 13) {s}",
+        "/srv/{n}: Permission denied (os error 13) {s}",
+        "{n}: Permission denied (os error 13), retrying with {s}",
+        "{n}: Permission denied (os error 13) token={s}",
+    ];
+    let mut shown = Vec::new();
+    let mut n = 0;
+    for name in names {
+        for form in forms {
+            for _ in 0..4 {
+                let secret = planted.secret();
+                let input = form.replace("{n}", name).replace("{s}", &secret);
+                let line = json!({ "log": input });
+                let nested = json!({ "args": json!({ "log": input }).to_string() });
+                let mut line_read = line.clone();
+                value(&mut line_read);
+                let mut nested_read = nested.clone();
+                value(&mut nested_read);
+                let readings = [
+                    text(&input).into_owned(),
+                    text(&text(&input)).into_owned(),
+                    excerpt(&line.to_string(), 4096),
+                    excerpt(&nested.to_string(), 4096),
+                    line_read.to_string(),
+                    nested_read.to_string(),
+                ];
+                for reading in readings {
+                    if reading.contains(&secret) {
+                        shown.push(format!("{n}: {reading}"));
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "{} of {n} shown: {shown:#?}", shown.len());
+
+    let secret = planted.secret();
+    assert_eq!(
+        text(&format!(
+            "/srv/password: Permission denied (os error 13) {secret}"
+        )),
+        "/srv/password: Permission denied (os error 13) [REDACTED]"
+    );
+    assert_kept(&[
+        "password: Permission denied (os error 13), retrying in 5s",
+        "open /srv/token: No such file or directory (os error 2); try again",
+        "api_key: Permission denied (os error 13)",
+        "password: No such file or directory (os error 2), run 2026-11-21T10:00:00Z",
+        "token: Permission denied (os error 13) (path /var/lib/atomic/runs/run-1a2b3c4d)",
+        "auth: Permission denied (os error 13) request_id=abc-123",
+        "token: Permission denied (os error 13) at https://api.example.com/v1/x2Fq9z",
+        "token: Permission denied (os error 13), tell ops+atomic@example.com",
+        "token: Permission denied (os error 13) ERR_CONN_RESET_2",
+    ]);
+}
+
 /// Redacting text twice changes nothing: a rule that a first rule's marker
 /// leaves something for, a header after an assignment's marker or a value
 /// after an open assignment, has already read it.
@@ -2594,7 +2677,8 @@ fn json_text_redaction_mends_does_not_hide_json_it_breaks() {
 /// Text still changing when the readings run out is hidden whole.
 #[test]
 fn text_still_changing_at_the_bound_is_hidden_whole() {
-    let input = "api_key=Authorization: Cookie: =12";
+    // Still changing after one reading, and settled within the bound.
+    let input = "password=12'Proxy-Authorization: Authorization: '";
     PASSES.with(|p| p.set(1));
     let capped = text(input).into_owned();
     PASSES.with(|p| p.set(TEXT_PASSES));
@@ -2672,5 +2756,241 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
     assert_eq!(
         shown, 0,
         "a value one reading hides shows when the readings repeat"
+    );
+}
+
+/// A value left as written is read on: an assignment inside a weak name's
+/// value, and a header inside a header's value that holds no credential,
+/// are found and hidden, however the text is read, and a second pass
+/// changes nothing.
+#[test]
+fn what_a_value_left_as_written_holds_is_read_too() {
+    for (input, secret) in [
+        ("token: password: hunter2", "hunter2"),
+        ("auth: \"password=hunter2 foo\"", "hunter2"),
+        ("Cookie: x-api-key: hunter2abc", "hunter2abc"),
+        ("auth=note api_key=hunter2", "hunter2"),
+        ("token: Cookie: sid=hunter2", "hunter2"),
+        ("Cookie: authorization: Bearer abcdef hunter2", "hunter2"),
+        (
+            "set-cookie: note; authorization: Bearer abcdef hunter2",
+            "hunter2",
+        ),
+    ] {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        for reading in [
+            text(input).into_owned(),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+        ] {
+            assert!(!reading.contains(secret), "{input:?}: {reading}");
+        }
+        let once = text(input).into_owned();
+        assert_eq!(text(&once), once, "{input:?}: a second pass changed it");
+    }
+    assert_kept(&[
+        "token: none",
+        "auth: basic",
+        "Cookie: none",
+        "cookie: theme: dark",
+    ]);
+}
+
+/// A value read inside one left as written ends within it: a quoted value
+/// there that opens with the other quote never runs past the outer value's
+/// closing quote, so the next assignment's name stays a name and its value
+/// is hidden, in text, its start and end, an excerpt, value() and JSON in a
+/// string, and a second pass changes nothing; and where nothing is hidden,
+/// the text is kept as written.
+#[test]
+fn a_value_read_inside_one_left_as_written_ends_within_it() {
+    let key = concat!("Zx9abc", "defghij");
+    let pass = concat!("hunter2", "xyzQ");
+    for (case, (input, secret)) in [
+        (format!("auth: \"x password='abc\" api_key: '{key}'"), key),
+        (
+            format!("auth: \"x secret='abc\", \"api_key\": '{key}'"),
+            key,
+        ),
+        (
+            format!("token: \"note pwd='a\" password: '{pass}' tail"),
+            pass,
+        ),
+        (format!("auth: 'x password=\"abc' api_key: \"{key}\""), key),
+        (
+            format!("token: 'note pwd=\"a' password: \"{pass}\" tail"),
+            pass,
+        ),
+        (
+            format!("auth: \"x client_secret := 'abc\" api_key: '{key}'"),
+            key,
+        ),
+        (
+            format!("auth: \"x password='abc\" client_secret := '{key}'"),
+            key,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        let mut held = json!({ "args": line.to_string() });
+        value(&mut held);
+        for (reading, shown) in [
+            text(&input).into_owned(),
+            bounded(&input, 4096),
+            tail(&input, 4096),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+            held.to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !shown.contains(secret),
+                "case {case}, reading {reading}: shown"
+            );
+        }
+        let once = text(&input).into_owned();
+        assert!(
+            once == input.replace(secret, REDACTED),
+            "case {case}: not only the next value was hidden"
+        );
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+    assert_kept(&[
+        "auth: \"x password='abc\" more' tail",
+        "auth: 'x password=\"abc' more\" tail",
+    ]);
+}
+
+/// A value found inside one left as written can run on past it, as after
+/// `token: password:` or `token=pwd=`, whose value is the name and
+/// separator alone, and take a name a reading that passes the value over
+/// would see for part of its own: what that reading hides is hidden too, in
+/// text, an excerpt and value(), and a second pass changes nothing.
+#[test]
+fn a_value_found_inside_one_left_as_written_never_shows_what_passing_over_hides() {
+    let key = concat!("Zx9abc", "defghij");
+    for (case, input) in [
+        format!("token: password: 'abc api_key: '{key}'"),
+        format!("token=pwd='a api_key: '{key}'"),
+        format!("auth: secret: \"x api_key: \"{key}\" tail"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = json!({ "log": input });
+        let mut read = line.clone();
+        value(&mut read);
+        for (reading, shown) in [
+            text(&input).into_owned(),
+            excerpt(&line.to_string(), 4096),
+            read.to_string(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !shown.contains(key),
+                "case {case}, reading {reading}: shown"
+            );
+        }
+        let once = text(&input).into_owned();
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+}
+
+/// A value left as written is read on inside at most [`VALUES_WITHIN`]
+/// deep, so a long bare value that looks like code, read on at each of its
+/// own assignments, takes linear steps: at sixteen times the size, about
+/// sixteen times the steps, not the 256 times a rescan of the rest at each
+/// would take.
+#[test]
+fn values_read_on_inside_one_another_take_linear_steps() {
+    for (case, unit) in ["token=x->", "password=a::", "auth: x->"]
+        .into_iter()
+        .enumerate()
+    {
+        let (small, large) = (steps_of(&unit.repeat(500)), steps_of(&unit.repeat(8_000)));
+        assert!(
+            large < 32 * small,
+            "case {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+}
+
+/// A secret that reads as a word, after an operating system's error, is
+/// not caught by its shape: it stays hidden where the error is not taken
+/// whole, quoted, under a header's name or written hard against the name,
+/// as the header rule then reads what was hidden as the header's
+/// credential.
+#[test]
+fn a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole() {
+    let word = "hunter2";
+    for quoted in [
+        format!("password: \"Permission denied (os error 13) {word}\""),
+        format!("password='Permission denied (os error 13) {word}'"),
+    ] {
+        let read = text(&quoted);
+        assert!(!read.contains(word), "quoted: {read}");
+    }
+    let mut header =
+        json!({ "Authorization": format!("passwd:Permission denied (os error 13) {word}") });
+    value(&mut header);
+    assert!(!header.to_string().contains(word), "set off: {header}");
+    for name in [
+        "proxy-authorization",
+        "X-Authorization",
+        "http.proxy-authorization",
+    ] {
+        let line = json!({ "log": format!("{name}: Permission denied (os error 13) {word}") });
+        let read = excerpt(&line.to_string(), 4096);
+        assert!(!read.contains(word), "{name}: {read}");
+    }
+}
+
+/// An assignment after an operating system's error is read by its own name,
+/// as it is with no error before it: the words after the error stop at it.
+/// Its value is hidden however short it is, or however it starts.
+#[test]
+fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
+    let mut shown = Vec::new();
+    for name in ["DB_PASSWORD", "api_key", "client_secret", "passwd"] {
+        for sep in ["=", "= ", " = ", "=>", " => ", ":=", " := ", "=\t", ": "] {
+            for secret in ["hunter2", "/qS7mLx2pQ9vT4", "s3"] {
+                for lead in [
+                    "token: Permission denied (os error 13) ",
+                    "password: No such file or directory (os error 2), then ",
+                    "Authorization: Permission denied (os error 13) ",
+                ] {
+                    let input = format!("{lead}{name}{sep}{secret}");
+                    let line = json!({ "log": input });
+                    let mut read = line.clone();
+                    value(&mut read);
+                    for reading in [
+                        text(&input).into_owned(),
+                        excerpt(&line.to_string(), 4096),
+                        read.to_string(),
+                    ] {
+                        // What main hides: the same text with no error.
+                        let plain = text(&format!("{name}{sep}{secret}")).into_owned();
+                        if !plain.contains(secret) && reading.contains(secret) {
+                            shown.push(reading);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "{} shown: {shown:#?}", shown.len());
+    assert_eq!(
+        text("token: Permission denied (os error 13) DB_PASSWORD= hunter2"),
+        "token: Permission denied (os error 13) DB_PASSWORD= [REDACTED]"
     );
 }

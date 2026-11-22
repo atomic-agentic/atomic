@@ -1,0 +1,1 @@
+stranded-unreadable-remedy|crates/atomic-core/src/state.rs|    let fix = if readable {|    let fix = if true {|-p atomic-agentic-core --lib -- credentials_left_at_an_older_atomics_place_are_not_hidden

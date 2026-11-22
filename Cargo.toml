@@ -49,6 +49,10 @@ jsonschema = { version = "0.61", default-features = false }
 regex = "1"
 # Lite atoms' model client: the version and TLS stack Codex's own client uses.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
+# The proxy matcher reqwest's client uses, asked whether a call would go by a
+# proxy, and the URI type it takes: the versions Codex locks.
+hyper-util = { version = "0.1.20", default-features = false, features = ["client-proxy"] }
+http = "1"
 saphyr-parser = "0.3.4"
 thiserror = "2"
 # Telemetry: the versions Codex locks, with no features Codex does not

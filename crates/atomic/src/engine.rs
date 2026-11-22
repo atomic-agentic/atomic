@@ -14,14 +14,13 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::state::ProjectState;
-use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
 use atomic_exec::runner::ProcessRunner;
@@ -147,8 +146,8 @@ pub fn store_project(state: &ProjectState) -> anyhow::Result<String> {
 /// The backend on this machine that `atomic run`, `atomic serve` and the
 /// evals run turns and exec atoms' commands on, unconfined and unconnected
 /// (see [`ProjectState::run_backend`]): scratch outside every directory a
-/// sandboxed turn may write, and the project's other backends' denied to
-/// its commands.
+/// sandboxed turn may write, and every other scratch directory in the
+/// atomic home's `scratch/` denied to its commands.
 pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
     state.run_backend()
 }
@@ -163,15 +162,16 @@ pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
 }
 
 /// The backend exec atoms' commands run on with `runner`: scratch in the
-/// project's state, confined like turns' commands where that is verified,
-/// connected once.
+/// atomic home's `scratch/`, confined like turns' commands where that is
+/// verified, connected once.
 pub fn exec_backend(
     state: &ProjectState,
     paths: &CodexPaths,
     runner: RunnerKind,
 ) -> anyhow::Result<atomic_exec::Backend> {
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
+    // Scratch directories live in the atomic home's `scratch/`, beside
+    // every other project's, outside every directory a sandboxed turn may
+    // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = local_backend(state);
@@ -529,9 +529,15 @@ pub async fn open(
         exec_meter: Default::default(),
         clock: None,
     });
-    // Never the developer's checkout: a run's worktree steps use the
-    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
-    let worktrees: Option<Arc<Worktrees>> = None;
+    // Never the developer's checkout: a run's worktree steps work in a
+    // worktree of the snapshot of the fixture the run is bound to (see
+    // `atomic_core::fixture`), and `atomic run` binds every run that changes
+    // code to one before it starts. So no repository of the project is offered
+    // here whatever git would say about it, and what git does say about it is
+    // asked where a run that names no fixture is refused, so that refusal can
+    // tell a directory git refused from one git could not be asked about (see
+    // `runs::bind_fixture`).
+    let worktrees = ProjectWorktrees::FixtureOnly;
     let mut rt = Durare::open(
         &database,
         executor.as_deref(),
@@ -652,7 +658,57 @@ mod tests {
         let state = ProjectState::resolve(&both).expect("state");
         assert!(store_project(&state).is_err(), "both manifests");
 
-        for dir in [none, named, broken, both] {
+        // A `.atomic` that is a file holds no manifest: nothing is there.
+        let plain = project("plain-dot-atomic");
+        std::fs::write(plain.join(".atomic"), "not a directory").expect(".atomic");
+        let state = ProjectState::resolve(&plain).expect("state");
+        let dir = plain
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            store_project(&state).expect("no manifest under a plain .atomic"),
+            format!("{dir}/{}", state.id())
+        );
+
+        // A manifest that is there but cannot be looked at, or is not a file,
+        // is refused with its path: a link to itself, a link to nothing, a
+        // link through a file and a directory.
+        let mut odd = Vec::new();
+        #[cfg(unix)]
+        {
+            let looped = project("looped");
+            std::os::unix::fs::symlink("atomic.yaml", looped.join("atomic.yaml")).expect("link");
+            odd.push((looped.clone(), looped.join("atomic.yaml")));
+            let dangling = project("dangling");
+            std::os::unix::fs::symlink("gone.yaml", dangling.join("atomic.yaml")).expect("link");
+            odd.push((dangling.clone(), dangling.join("atomic.yaml")));
+            let through = project("through-a-file");
+            std::fs::write(through.join("README.md"), "a file").expect("file");
+            std::os::unix::fs::symlink("README.md/atomic.yaml", through.join("atomic.yaml"))
+                .expect("link");
+            odd.push((through.clone(), through.join("atomic.yaml")));
+        }
+        let directory = project("directory");
+        std::fs::create_dir_all(directory.join(".atomic/atomic.yaml")).expect("directory");
+        odd.push((directory.clone(), directory.join(".atomic/atomic.yaml")));
+        for (dir, manifest) in &odd {
+            let state = ProjectState::resolve(dir).expect("state");
+            let refused = store_project(&state).expect_err("a manifest that cannot be used");
+            assert!(
+                matches!(
+                    refused.downcast_ref::<atomic_core::project::ProjectError>(),
+                    Some(atomic_core::project::ProjectError::Read { path, .. }) if path == manifest
+                ),
+                "{refused:#}"
+            );
+        }
+
+        for dir in [none, named, broken, both, plain]
+            .into_iter()
+            .chain(odd.into_iter().map(|(dir, _)| dir))
+        {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

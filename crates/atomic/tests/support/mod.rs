@@ -37,3 +37,48 @@ pub fn require_sandbox() {
         Ok(_) => {}
     }
 }
+
+/// The descriptors [`plant`] leaves open in the process a command starts:
+/// a pipe's read and write ends, a file, a socket, and the pipe's read end
+/// again at a high number, none close-on-exec.
+#[allow(dead_code)]
+pub const PLANTED: [i32; 5] = [600, 601, 602, 603, 900];
+
+/// Leave [`PLANTED`] open in the process `command` starts, as whatever
+/// starts atomic may, a CI runner, a shell or an editor: a pipe, a file at
+/// `file`, a socket. Returns this process's own ends, to keep until the
+/// process has started.
+#[allow(dead_code, unsafe_code)]
+pub fn plant(command: &mut Command, file: &std::path::Path) -> Vec<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let (read, write) = std::io::pipe().expect("pipe");
+    let file = std::fs::File::create(file).expect("file");
+    let (socket, peer) = std::os::unix::net::UnixStream::pair().expect("socket");
+    let sources = [
+        read.as_raw_fd(),
+        write.as_raw_fd(),
+        file.as_raw_fd(),
+        socket.as_raw_fd(),
+        read.as_raw_fd(),
+    ];
+    // SAFETY: between fork and exec the closure makes only dup2 calls, which
+    // are async-signal-safe, and allocates nothing. A descriptor dup2 makes
+    // is not close-on-exec.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(command, move || {
+            for (source, target) in sources.into_iter().zip(PLANTED) {
+                if libc::dup2(source, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    vec![
+        OwnedFd::from(read),
+        OwnedFd::from(write),
+        OwnedFd::from(file),
+        OwnedFd::from(socket),
+        OwnedFd::from(peer),
+    ]
+}

@@ -24,8 +24,12 @@ interactive coding, the target entry experience also works in an ordinary
 directory without a project manifest.
 
 `atomic run` returns a typed result when successful and provides a run identity
-for inspection. `--run-id` names the new run; an id that is already in the store
-is refused, since that run continues only with `atomic runs resume`. Local workflow gates can wait for your decision in the terminal.
+for inspection. `--run-id` names the new run: 1 to 128 characters, each an
+ASCII letter, a digit, `.`, `_`, `:` or `-`, starting with a letter or a digit,
+since atomic's own lines show a run's id as it is. Any other id is refused
+before anything is recorded, and the refusal does not repeat it. An id that is
+already in the store is refused, since that run continues only with
+`atomic runs resume`. Local workflow gates can wait for your decision in the terminal.
 Use `atomic runs resume <run-id>` after an interruption, from the same project
 and state store. It uses saved inputs and definitions; there is no replacement
 `--input`. If another local runtime owns the project, it reports that owner
@@ -130,8 +134,9 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 
 | Kind | When |
 | --- | --- |
-| `fixture.required` | The workflow changes code and no fixture is named |
-| `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
+| `fixture.required` | The workflow changes code and no fixture is named. When the project's own directory offers no worktree, the refusal says what was found about it: that git refused it — which it says alike of a directory holding no repository and of a repository it cannot read — or that git never got to answer for it |
+| `fixture.path` | git finds no repository at `--fixture`, or it names a directory inside a repository rather than that repository's top |
+| `fixture.unreadable` | Nothing was learned about `--fixture`, because git never got to answer for it: it could not be run on that directory, was stopped, or printed what atomic cannot read. The description carries what stopped git, and atomic does not guess whether a repository is there |
 | `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
 | `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
 | `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
@@ -321,6 +326,13 @@ Each run is stamped with the layout of the durable steps atomic records, not
 with the build that started it, so a rebuilt or upgraded atomic with the same
 layout resumes and recovers it. A run of another layout is refused by
 `atomic runs resume` and listed by `atomic serve`, which leaves it as it is.
+
+On a PostgreSQL store several projects share, `atomic serve` lists, takes
+and recovers only its own project's runs. Give each project's processes an
+executor identity of their own: when an identity, set in user configuration
+for example, owns another project's unfinished run that recovery would
+take, `atomic serve` refuses to start rather than run that project's run in
+this one's code, and says how many such runs there are without naming them.
 Atomic refuses to start when the durable engine's own version variable
 (`DBOS__APPVERSION`) is set.
 

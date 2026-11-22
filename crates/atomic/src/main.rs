@@ -225,6 +225,13 @@ fn real_main() -> anyhow::Result<()> {
     if codex::is_helper(std::env::args_os()) {
         return codex::run_helper();
     }
+    // Whatever started atomic may have left descriptors open: they pass to
+    // none of the programs it starts, the socket a runner's secret variables
+    // come on included, which the runner reads itself and hands on afresh.
+    // A process that cannot make sure of that starts nothing.
+    #[cfg(unix)]
+    atomic_exec::inherited::keep_from_children(&[])
+        .context("keep the descriptors atomic was started with from the programs it starts")?;
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
@@ -288,6 +295,15 @@ fn real_main() -> anyhow::Result<()> {
             }
             Ok(())
         });
+    }
+    // A run id outside its rule is refused before anything is made: no state
+    // directory, no store, no Codex.
+    if let Some(Command::Run(args)) = &cli.command
+        && let Some(id) = &args.run_id
+        && let Err(refused) = runs::check_run_id(id)
+    {
+        failure::report(&refused, cli.json);
+        std::process::exit(1);
     }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. Without one, nothing starts: there is no Codex
@@ -782,9 +798,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         };
         Some(
             if args.run_id.is_some() {
-                context::default_key_dir().and_then(|keys| {
-                    context::checkpoint(&atom, &state.context_dir(), &keys, run_id, resolve)
-                })
+                context::checkpoint(&atom, &state.context_dir(), run_id, resolve)
             } else {
                 context::resolve_fresh(&atom, run_id, resolve)
             }

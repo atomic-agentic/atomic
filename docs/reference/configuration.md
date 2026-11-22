@@ -270,6 +270,43 @@ name that resolves to this machine, such as one that `/etc/hosts` maps to
 `127.0.1.1`, counts as elsewhere and uses the proxies the environment names, so
 put it in `NO_PROXY`.
 
+A Codex atom calls through Codex's own client, which atomic cannot tell to skip
+a proxy or to refuse a redirect. When a key would go to an endpoint on this
+machine over plain `http` and the client would send it through a proxy that
+`HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy` names, the atom's turn is
+refused before anything is sent, naming the variable. Whether `NO_PROXY` exempts
+the host is decided by the client's own rules, so the entry must name the host
+as the URL does: `localhost` does not exempt `127.0.0.1`, `*` exempts names but
+not addresses, and `NO_PROXY`, when it is set at all, hides `no_proxy`. Add the
+host to `NO_PROXY` (for example `NO_PROXY=127.0.0.1`) or use an `https`
+endpoint.
+
+On any platform but Linux, the system's proxy settings can carry the key too,
+and atomic cannot read them. With Codex's default, Codex's client may take a
+proxy from them where the variables name none, and `NO_PROXY` still applies:
+the turn is refused unless `NO_PROXY` exempts the host. With Codex's
+`respect_system_proxy` feature on, the platform's settings and their own bypass
+list decide and `NO_PROXY` changes nothing, so the turn is always refused: turn
+the feature off, or use an `https` endpoint. On Linux the feature finds no
+platform settings, and Codex reads the proxy variables itself: the upper-case
+name of each pair wins whenever it is set, an empty value means none, and any
+other value of `HTTP_PROXY` or else `ALL_PROXY` is taken as the proxy, even one
+with spaces or a line break around it, so atomic refuses the turn for it unless
+`NO_PROXY` exempts the host.
+
+This machine is recognised as for a lite atom: a host name that only resolves
+here is not refused and goes through the proxy, so put it in `NO_PROXY`
+yourself.
+
+Redirects stay open: Codex's client follows one, so an `https` endpoint that
+redirects to `http` on the same host and port receives the key again in
+cleartext. Point a Codex atom only at an endpoint you trust not to redirect.
+
+For a lite or a Codex atom alike, a key sent over plain `http` to an endpoint
+elsewhere than this machine is not refused: it travels in cleartext across the
+network, and through any proxy on the way. Use `https` for any endpoint that is
+not on this machine.
+
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
 as [models](../models.md) describes. The names are settled and appear in the
@@ -342,7 +379,7 @@ process environment does.
 | Variable | Sets |
 | --- | --- |
 | `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied. A home that leads there is refused at start, before anything is created in it — whether it leads there directly, by a link, by `..`, or from the directory the command was run in — and so is a home whose path atomic cannot resolve. So is a configuration directory atomic cannot resolve: if `HOME`, or `XDG_CONFIG_HOME`, names a directory that cannot be entered, that passes through something which is not a directory, that is a link leading nowhere, or that cannot otherwise be looked up, atomic cannot tell where its state would go relative to it and refuses to run, and only fixing `HOME` or `XDG_CONFIG_HOME` helps there, not `ATOMIC_HOME`. Every `atomic` command refuses it but `atomic model`, which keeps nothing in a project's state, the `runner` role, which runs one command for a control plane, and the help and version output, which run nothing |
-| `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
+| `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in `credentials` inside your own atomic configuration directory — the same directory layer 2 reads your own settings from and every atom's commands are denied — or, with `ATOMIC_HOME` set, in `$ATOMIC_HOME/credentials`; the OS keyring is the default, and `keyring` says so. The checkpoint key is kept beside them, in `keys` in the configuration directory, or `$ATOMIC_HOME/keys`. An older atomic kept both, without `ATOMIC_HOME`, in `atomic` in the platform's configuration directory (on macOS `~/Library/Application Support/atomic`, on Windows under `%APPDATA%`): those places are still denied to every atom's commands, whether they exist or not, and while the old place still holds them (anything in `credentials`; `context.key` in `keys`) and the new one holds none, even as an empty directory, atomic refuses to use the new place, naming both: move what the old directory holds into the new one. An old place atomic cannot read counts as holding them, and a new one it cannot read refuses too, until its permissions are fixed. With a relative `HOME`, the old places resolve under the directory the command was run in, and one that is missing there and would be made inside a directory an atom's commands may write refuses the turn. With neither `HOME` nor a home in the password database, as on Windows, there is no configuration directory: set `ATOMIC_HOME` |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |
 | `ATOMIC_DENO` | the Deno that runs the Astro compiler, instead of the `deno` found on `PATH` |
