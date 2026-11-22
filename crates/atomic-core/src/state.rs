@@ -360,17 +360,17 @@ impl ProjectState {
                     return Err(StateError::Both { old, current });
                 }
             }
-            // Validate all source entries before moving even the first member:
-            // relocating a relative link can change where private state lives.
-            for name in LEGACY {
-                legacy_source_safe(&dir.join(name))?;
-            }
             let database = dir.join("atomic.db");
             if database_in_use(&database)? {
                 return Err(StateError::InUse {
                     path: database,
                     to: self.database(),
                 });
+            }
+            // Validate all source entries before moving even the first member:
+            // relocating a relative link can change where private state lives.
+            for name in LEGACY {
+                legacy_source_safe(&dir.join(name))?;
             }
             // An older atomic kept its execution lock in `<state>/private`: a
             // process holding it may still run the project's work. It is
