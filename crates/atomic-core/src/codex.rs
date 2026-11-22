@@ -1550,6 +1550,20 @@ fn deny_links_made_since_the_list() {
         let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
         // Started again once already: what it adds is its last chance.
         let again_already = take_env(RELISTED).is_some();
+        // Started again, it must not have been handed the proxy token in its
+        // environment: the token goes to the helper only on a socket, read
+        // after this walk, so a token here means it was read before a start
+        // again put it in the environment of a process that was dumpable
+        // until its first step. The command does not run.
+        if again_already
+            && std::env::var_os(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY).is_some()
+        {
+            crate::log_line!(
+                "atomic: the sandbox helper was started again with the proxy token in its \
+                 environment, where another process could have read it; the command does not run"
+            );
+            std::process::exit(1);
+        }
         let carried = take_env(PLACES);
         let places = match carried.as_ref().map(|v| {
             v.to_str()
@@ -2060,6 +2074,10 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// command its own `TMPDIR`.
 fn as_any_helper() {
     helper_not_dumpable();
+    // The walk may start the helper again, so it comes before the token is
+    // read: read first, the token would pass through `exec` in the
+    // environment of a process that is dumpable until its first step, which
+    // the walk then refuses.
     deny_links_made_since_the_list();
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
