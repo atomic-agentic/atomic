@@ -1114,7 +1114,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             .plain("atomic: run ")
             .shown(ctx.workflow_id())
             .plain(": under your own dollar cap, the run calls ")
-            .shown(&unvouched.join(", "))
+            .redacted(&unvouched.join(", "))
             .plain(
                 " at prices only a layer above your own configuration sets; `atomic config \
                  --explain` says more",
