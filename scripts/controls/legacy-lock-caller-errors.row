@@ -1,0 +1,1 @@
+legacy-lock-caller-errors|crates/atomic-core/src/state.rs|return Err(fail(&old_lock)(source));|let _ = source; None // CONTROL_OFF: caller ignores lock errors|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_acquisition_errors_refuse_migration

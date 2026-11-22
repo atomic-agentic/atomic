@@ -1,0 +1,1 @@
+string-json-unreadable-as-written|crates/atomic-core/src/redact.rs|        let unreadable = opened && written.is_none();|        let unreadable = false; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::json_readable_only_without_a_value_as_written_is_hidden_whole

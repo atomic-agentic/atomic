@@ -1,0 +1,1 @@
+legacy-lock-held|crates/atomic-core/src/state.rs|Err(std::fs::TryLockError::WouldBlock) => return Err(in_use()),|Err(std::fs::TryLockError::WouldBlock) => { let _ = in_use; None }, // CONTROL_OFF: held lock ignored|-p atomic-agentic-core --lib --features fake-model -- --exact state::tests::legacy_execution_lock_holders_refuse_migration

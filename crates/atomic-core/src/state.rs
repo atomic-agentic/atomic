@@ -372,15 +372,18 @@ impl ProjectState {
             // held here until the state has moved, so no older atomic starts
             // on it meanwhile.
             let old_lock = dir.join("runtime.lock");
-            let old_layout_lock = dir != self.dir && old_lock.exists();
-            let held = if old_layout_lock {
-                let Some(held) = hold_lock(&old_lock) else {
-                    return Err(StateError::InUse {
-                        path: old_lock,
-                        to: self.lock_file(),
-                    });
+            let held = if dir != self.dir {
+                let in_use = || StateError::InUse {
+                    path: old_lock.clone(),
+                    to: self.lock_file(),
                 };
-                held
+                match hold_lock(&old_lock) {
+                    Ok(held) => held,
+                    Err(std::fs::TryLockError::WouldBlock) => return Err(in_use()),
+                    Err(std::fs::TryLockError::Error(source)) => {
+                        return Err(fail(&old_lock)(source));
+                    }
+                }
             } else {
                 None
             };
@@ -390,7 +393,7 @@ impl ProjectState {
                     std::fs::rename(&old, &new).map_err(fail(&new))?;
                 }
             }
-            if old_layout_lock {
+            if held.is_some() {
                 let _ = std::fs::remove_file(&old_lock);
             }
             drop(held);
@@ -761,22 +764,85 @@ pub enum LockError {
 /// `private/`.
 const LEGACY: [&str; 4] = ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"];
 
-/// The lock on the file at `path`, held until the file returned is dropped,
-/// or `None` when another process holds it. A file that cannot be opened or
-/// locked at all holds nothing back.
-fn hold_lock(path: &Path) -> Option<Option<std::fs::File>> {
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    else {
-        return Some(None);
-    };
-    match file.try_lock() {
-        Ok(()) => Some(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => None,
-        Err(std::fs::TryLockError::Error(_)) => Some(None),
+/// Hold an existing, regular legacy execution lock until the returned file
+/// is dropped. Only a missing path is absent. Another holder, an unreadable
+/// file or an unknown lock outcome stops migration.
+fn hold_lock(path: &Path) -> Result<Option<std::fs::File>, std::fs::TryLockError> {
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, LEGACY_LOCK_OPEN_FLAGS);
+    #[cfg(windows)]
+    {
+        // Open a final reparse point itself, so metadata rejects it instead
+        // of following a missing target and treating the lock as absent.
+        const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::os::windows::fs::OpenOptionsExt::custom_flags(&mut open, OPEN_REPARSE_POINT);
     }
+    let file = match open.open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(std::fs::TryLockError::Error(source)),
+    };
+    let regular = legacy_lock_regular(&file).map_err(std::fs::TryLockError::Error)?;
+    if !regular {
+        return Err(std::fs::TryLockError::Error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy execution lock is not a regular file",
+        )));
+    }
+    try_legacy_lock(&file)?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+const LEGACY_LOCK_OPEN_FLAGS: i32 = LINK_OPEN_FLAGS | NOT_THROUGH_A_LINK;
+
+fn legacy_lock_regular(file: &std::fs::File) -> std::io::Result<bool> {
+    #[cfg(test)]
+    if let Some(error) = legacy_lock_error_at(LegacyLockCheck::Metadata) {
+        return Err(error);
+    }
+    let metadata = file.metadata()?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & REPARSE_POINT != 0 {
+            return Ok(false);
+        }
+    }
+    Ok(metadata.is_file())
+}
+
+fn try_legacy_lock(file: &std::fs::File) -> Result<(), std::fs::TryLockError> {
+    #[cfg(test)]
+    if let Some(error) = legacy_lock_error_at(LegacyLockCheck::Acquisition) {
+        return Err(std::fs::TryLockError::Error(error));
+    }
+    file.try_lock()
+}
+
+#[cfg(test)]
+thread_local! {
+    static LEGACY_LOCK_ERROR: std::cell::Cell<Option<(LegacyLockCheck, std::io::ErrorKind)>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyLockCheck {
+    Metadata,
+    Acquisition,
+}
+
+#[cfg(test)]
+fn legacy_lock_error_at(check: LegacyLockCheck) -> Option<std::io::Error> {
+    LEGACY_LOCK_ERROR
+        .get()
+        .filter(|(stage, _)| *stage == check)
+        .map(|(_, kind)| std::io::Error::new(kind, "injected legacy execution lock error"))
 }
 
 /// Remove a record a Codex home kept, a file or the `log/` directory; one
@@ -2646,6 +2712,223 @@ mod tests {
         }
         state.create().expect("again");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn legacy_lock_fixture(tag: &str) -> (TestScratch, ProjectState, PathBuf) {
+        let home = TestScratch::new(tag);
+        let state = ProjectState {
+            root: home.join("project"),
+            dir: home.join("home/projects/p"),
+            private: home.join("home/private/p"),
+            scratch: home.join("home/scratch/p"),
+        };
+        let old = state.dir().join("private");
+        std::fs::create_dir_all(old.join("context")).expect("old context");
+        std::fs::write(old.join("context/kept"), "unmoved").expect("old state");
+        (home, state, old)
+    }
+
+    fn legacy_context_is_unmoved(state: &ProjectState, old: &Path) {
+        assert_eq!(
+            std::fs::read_to_string(old.join("context/kept")).expect("old state remains"),
+            "unmoved"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(state.context_dir())
+                .expect_err("no context moved")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    /// A link loop is not absence, even when the test runs as root.
+    #[cfg(unix)]
+    #[test]
+    fn legacy_execution_lock_link_errors_refuse_migration() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-lock-loop");
+        let old_lock = old.join("runtime.lock");
+        std::os::unix::fs::symlink("runtime.lock", &old_lock).expect("loop");
+        assert_eq!(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&old_lock)
+                .expect_err("the loop really refuses an open")
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        match state
+            .create()
+            .expect_err("an unseen lock refuses migration")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old_lock);
+                assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_execution_lock_links_are_not_followed() {
+        for target in ["missing-lock", "other-lock"] {
+            let (_home, state, old) = legacy_lock_fixture("legacy-lock-link");
+            let old_lock = old.join("runtime.lock");
+            if target == "other-lock" {
+                std::fs::write(old.join(target), "untouched").expect("target");
+            }
+            std::os::unix::fs::symlink(target, &old_lock).expect("lock link");
+            assert!(
+                std::fs::symlink_metadata(&old_lock)
+                    .expect("link exists even if its target does not")
+                    .file_type()
+                    .is_symlink()
+            );
+            match state.create().expect_err("a linked lock refuses migration") {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, old_lock);
+                    assert_eq!(source.raw_os_error(), Some(libc::ELOOP));
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            legacy_context_is_unmoved(&state, &old);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_execution_lock_open_errors_refuse_migration() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-lock-directory");
+        let old_lock = old.join("runtime.lock");
+        std::fs::create_dir(&old_lock).expect("a directory instead of a lock");
+        match state
+            .create()
+            .expect_err("an unopenable lock refuses migration")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old_lock);
+                assert_eq!(source.raw_os_error(), Some(libc::EISDIR));
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_execution_lock_nonregular_files_refuse_migration() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-lock-fifo");
+        let old_lock = old.join("runtime.lock");
+        let name = std::ffi::CString::new(old_lock.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives this call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        match state
+            .create()
+            .expect_err("a pipe cannot be an execution lock")
+        {
+            StateError::Create { path, source } => {
+                assert_eq!(path, old_lock);
+                assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+                assert_eq!(
+                    source.to_string(),
+                    "legacy execution lock is not a regular file"
+                );
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+    }
+
+    fn legacy_lock_errors_refuse_migration(check: LegacyLockCheck) {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LEGACY_LOCK_ERROR.set(None);
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::NotADirectory,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Unsupported,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            let (_home, state, old) = legacy_lock_fixture("legacy-lock-error");
+            let old_lock = old.join("runtime.lock");
+            std::fs::write(&old_lock, "legacy owner").expect("old lock");
+            assert_eq!(LEGACY_LOCK_ERROR.replace(Some((check, kind))), None);
+            let restore = Restore;
+            match state
+                .create()
+                .expect_err("an unknown lock outcome refuses migration")
+            {
+                StateError::Create { path, source } => {
+                    assert_eq!(path, old_lock);
+                    assert_eq!(source.kind(), kind);
+                    assert_eq!(source.to_string(), "injected legacy execution lock error");
+                }
+                other => panic!("wrong refusal: {other:?}"),
+            }
+            legacy_context_is_unmoved(&state, &old);
+            drop(restore);
+            state.create().expect("moves after a successful lock");
+            assert_eq!(
+                std::fs::read_to_string(state.context_dir().join("kept")).expect("moved"),
+                "unmoved"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_execution_lock_acquisition_errors_refuse_migration() {
+        legacy_lock_errors_refuse_migration(LegacyLockCheck::Acquisition);
+    }
+
+    #[test]
+    fn legacy_execution_lock_metadata_errors_refuse_migration() {
+        legacy_lock_errors_refuse_migration(LegacyLockCheck::Metadata);
+    }
+
+    #[test]
+    fn legacy_execution_lock_absence_allows_migration() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-lock-absent");
+        assert_eq!(
+            std::fs::symlink_metadata(old.join("runtime.lock"))
+                .expect_err("no old execution lock")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        state.create().expect("an absent lock holds nothing back");
+        assert_eq!(
+            std::fs::read_to_string(state.context_dir().join("kept")).expect("moved"),
+            "unmoved"
+        );
+        state.create().expect("already migrated");
+    }
+
+    #[test]
+    fn legacy_execution_lock_holders_refuse_migration() {
+        let (_home, state, old) = legacy_lock_fixture("legacy-lock-held");
+        let old_lock = old.join("runtime.lock");
+        let held = std::fs::File::create(&old_lock).expect("old lock");
+        held.lock().expect("another executor holds the old lock");
+        match state.create().expect_err("a held lock refuses migration") {
+            StateError::InUse { path, to } => {
+                assert_eq!(path, old_lock);
+                assert_eq!(to, state.lock_file());
+            }
+            other => panic!("wrong refusal: {other:?}"),
+        }
+        legacy_context_is_unmoved(&state, &old);
+        held.unlock().expect("executor releases its lock");
+        state.create().expect("moves after release");
     }
 
     /// The layout before every project's private state moved under the
