@@ -1044,6 +1044,37 @@ fn value_after(input: &str, at: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// The span of a value at `at` that opens a quote, escaped at most eight
+/// deep as [`value_after`] reads one, which nothing closes: up to the end
+/// of the line, or, for an escaped quote, the first quote escaped less,
+/// which ends the string the value is in; `None` if it is empty or `at`
+/// opens no quote.
+fn unclosed_value(input: &str, at: usize) -> Option<(usize, usize)> {
+    let rest = &input[at..];
+    let level = rest.bytes().take_while(|b| *b == b'\\').count();
+    if level > 8 || !matches!(rest.as_bytes().get(level), Some(b'"' | b'\'')) {
+        return None;
+    }
+    let start = at + level + 1;
+    let mut backslashes = 0;
+    let mut end = input.len();
+    for (i, b) in input[start..].bytes().enumerate() {
+        match b {
+            b'\n' => {
+                end = start + i;
+                break;
+            }
+            b'\\' => backslashes += 1,
+            b'"' | b'\'' if backslashes < level => {
+                end = start + i - backslashes;
+                break;
+            }
+            _ => backslashes = 0,
+        }
+    }
+    (start < end).then_some((start, end))
+}
+
 /// Redact the values assigned to secret names in `input`: `name=value`,
 /// `name: value`, `name := value`, `'name' => 'value'`. One pass: each
 /// separator is looked at once, a name at most 128 characters back, and a
@@ -1095,6 +1126,21 @@ fn assigned(input: &str) -> Option<String> {
         }
         let start = value_start(input, sep + sep_len);
         let Some((value_from, mut value_to)) = value_after(input, start) else {
+            // A quote opened after a secret's name that nothing on its line
+            // closes as it opened, `token= "x \"y`: what follows it to the
+            // end of the line, or of the string it is in, is the value,
+            // hidden if it is a secret's and holds no `=` or `:`. If it is
+            // not, or holds one, the search goes on from the separator, so
+            // an assignment inside is still read by its own name.
+            if let Some((value_from, value_to)) = unclosed_value(input, start)
+                && !input[value_from..value_to].contains(['=', ':'])
+                && is_secret_value(strength, &input[value_from..value_to])
+            {
+                out.push_str(&input[copied..value_from]);
+                out.push_str(REDACTED);
+                copied = value_to;
+                at = value_to;
+            }
             continue;
         };
         // What the operating system said of the path before it, as Rust
@@ -1300,8 +1346,9 @@ fn reads_as_no_credential(word: &str) -> bool {
     path || time || url || address || identifier
 }
 
-fn redact_flag(captures: &Captures<'_>) -> String {
-    redact_flag_within(captures, 0)
+/// [`FLAG`]'s replacement for a match in `text`.
+fn redact_flag(text: &str, captures: &Captures<'_>) -> String {
+    redact_flag_within(text, captures, 0)
 }
 
 /// How many quotes deep [`redact_flag`] reads the flags of a quoted value
@@ -1309,7 +1356,7 @@ fn redact_flag(captures: &Captures<'_>) -> String {
 const FLAG_DEPTH: usize = 4;
 
 /// [`redact_flag`] for a flag `depth` quoted values deep.
-fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
+fn redact_flag_within(text: &str, captures: &Captures<'_>, depth: usize) -> String {
     let whole = captures.get(0).map_or(0, |m| m.start());
     let value_at = captures.get(3).map_or(0, |m| m.start());
     let prefix = &captures[0][..value_at - whole];
@@ -1331,7 +1378,9 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
                 escapes
             };
             let inside = if depth < FLAG_DEPTH {
-                FLAG.replace_all(rest, |c: &Captures<'_>| redact_flag_within(c, depth + 1))
+                FLAG.replace_all(rest, |c: &Captures<'_>| {
+                    redact_flag_within(rest, c, depth + 1)
+                })
             } else {
                 Cow::Borrowed(rest)
             };
@@ -1349,16 +1398,23 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
         // Not a secret itself, it can hold a command whose flags are, and
         // they were read as part of it: read them again inside the quotes.
         if depth < FLAG_DEPTH && FLAG.is_match(inner) {
-            let inside =
-                FLAG.replace_all(inner, |c: &Captures<'_>| redact_flag_within(c, depth + 1));
+            let inside = FLAG.replace_all(inner, |c: &Captures<'_>| {
+                redact_flag_within(inner, c, depth + 1)
+            });
             return format!("{prefix}{open}{inside}{close}");
         }
         return captures[0].to_string();
     }
     // A separator of an assignment, `--password = x`, is no value: the
-    // pair is left to the reading of assignments.
+    // pair is left to the reading of assignments. Unless a secret's name is
+    // assigned right after it, `--password : api_key="x"`: that reading
+    // would take the name for the value and leave the name's own value
+    // bare, so the separator is judged as the value, and the name after it
+    // is read by its own.
     let separator = [":", "=", "=>", ":="].contains(&raw);
-    if separator || !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
+    let after = captures.get(0).map_or("", |m| &text[m.end()..]);
+    let assigns_next = separator && assigns_secret_next(after);
+    if (separator && !assigns_next) || !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
         return captures[0].to_string();
     }
     // A run of backslashes a bare value ends in escapes the quote after it.
@@ -1521,7 +1577,7 @@ fn unclean_flag_values(input: &str) -> Option<String> {
             if let Some(flag) = FLAG_AT_START.captures(from)
                 && let Some(read) = flag.get(0)
             {
-                let redacted = redact_flag(&flag);
+                let redacted = redact_flag(from, &flag);
                 if redacted != read.as_str() {
                     out.push_str(&input[last..whole.start()]);
                     out.push_str(&redacted);
@@ -1631,8 +1687,9 @@ impl LastQuote {
 /// after a space, the end of the line, or the quote that ends the string
 /// the flag is in, escaped as the nearest quote before the flag
 /// (`enclosing`) is or less, and not its backslashes; to the end if there
-/// is none. Never past the start of an assignment, or just past a `=` or
-/// `:`, which would leave the name it assigns hidden and its value bare.
+/// is none. Never past the start of an assignment, or just past a `=`,
+/// `:`, `:=` or `=>`, which would leave the name it assigns hidden and its
+/// value bare.
 fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
     let bytes = rest.as_bytes();
     let mut i = 0;
@@ -1644,13 +1701,16 @@ fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
             return i;
         }
         match bytes[i] {
-            b'\n' => return i,
-            b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return i,
+            // Stopped just past a separator, the span ends before the name
+            // it assigns instead, wherever that name starts: after a quote,
+            // `'x'token:= --x`, or what a reading hid, `[REDACTED]token:=`.
+            b'\n' => return before_assigned_name(rest, i),
+            b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return before_assigned_name(rest, i),
             b'"' | b'\'' => {
                 let run = rest[..i].len() - rest[..i].trim_end_matches('\\').len();
                 let at = i - run;
                 let closes = enclosing.is_some_and(|level| run <= level);
-                let assigns = rest[..at].ends_with(['=', ':']);
+                let assigns = separator_before(&rest[..at]).is_some();
                 if closes && !assigns {
                     return at;
                 }
@@ -1662,13 +1722,66 @@ fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
     bytes.len()
 }
 
-/// Whether the word of `text` at `at` starts an assignment (see
-/// [`word_starts_assignment`]).
+/// Whether the word of `text` at `at` starts an assignment, as
+/// [`word_starts_assignment`] reads one.
 fn assignment_at(text: &str, at: usize) -> bool {
-    let end = text[at..]
-        .find(|c: char| c.is_whitespace())
-        .map_or(text.len(), |n| at + n);
-    word_starts_assignment(text, at, end)
+    assigned_name_at(text, at).is_some()
+}
+
+/// The name assigned at `at` in `text`: letters, digits, `_`, `-` and
+/// `.`, then `=` or `:`, at once or after blanks. Only the name and the
+/// blanks after it are read, so reading from each word start of a text
+/// stays linear: no two names overlap.
+fn assigned_name_at(text: &str, at: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let name = name_len(&bytes[at..]);
+    if name == 0 {
+        return None;
+    }
+    let next = bytes[at + name..].iter().find(|b| {
+        step(1);
+        !is_blank(b)
+    });
+    matches!(next, Some(b'=' | b':')).then(|| &text[at..at + name])
+}
+
+/// How many bytes `bytes` starts with that a name holds: letters, digits,
+/// `_`, `-` and `.`.
+fn name_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|b| {
+            step(1);
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+        })
+        .count()
+}
+
+/// Whether the word `text` starts with, past blanks, assigns a secret's
+/// name, `api_key="x"`.
+fn assigns_secret_next(text: &str) -> bool {
+    let next = text.len() - text.trim_start_matches([' ', '\t']).len();
+    assigned_name_at(text, next).is_some_and(|name| strength(name) != Strength::None)
+}
+
+/// Where the separator of an assignment that `text` ends in starts, past
+/// blanks: `=`, `:`, `:=` or `=>`.
+fn separator_before(text: &str) -> Option<usize> {
+    let text = text.trim_end_matches([' ', '\t']);
+    let separator = [":=", "=>", "=", ":"]
+        .iter()
+        .find(|separator| text.ends_with(*separator))?;
+    Some(text.len() - separator.len())
+}
+
+/// `stop`, or, when `rest` ends there in an assignment's separator, where
+/// the name it assigns starts (as [`assigned`] finds the name).
+fn before_assigned_name(rest: &str, stop: usize) -> usize {
+    let name = separator_before(&rest[..stop]).and_then(|separator| name_before(rest, separator));
+    match name {
+        Some((name_start, _)) => name_start,
+        None => stop,
+    }
 }
 
 /// Whether a quoted value reads as more than one: it assigns a name,
@@ -1834,7 +1947,12 @@ fn text_once(input: &str) -> Cow<'_, str> {
         }
     });
     apply(&SCHEME, &redact_scheme);
-    apply(&FLAG, &redact_flag);
+    if FLAG.is_match(&output) {
+        let replaced = FLAG
+            .replace_all(&output, |c: &Captures<'_>| redact_flag(&output, c))
+            .into_owned();
+        output = Cow::Owned(replaced);
+    }
     if let Some(hidden) = unclean_flag_values(&output) {
         output = Cow::Owned(hidden);
     }

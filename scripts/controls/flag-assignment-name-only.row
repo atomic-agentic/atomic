@@ -1,0 +1,1 @@
+flag-assignment-name-only|crates/atomic-core/src/redact.rs|    let name = name_len(&bytes[at..]);|    let name = { let end = text[at..].find(char::is_whitespace).unwrap_or(text.len() - at); step(end); name_len(&bytes[at..at + end]) }; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::commas_in_an_unclean_flag_value_grow_linearly
