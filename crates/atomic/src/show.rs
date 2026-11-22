@@ -59,7 +59,7 @@ fn utc(ms: i64) -> String {
 
 /// Gather what the store has about `id` as one JSON document.
 async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
-    let Some(record) = rt.run_record(id).await? else {
+    let Some(record) = rt.own_run_record(id).await? else {
         return Ok(None);
     };
     let steps = rt.steps(id).await?;
@@ -264,9 +264,14 @@ pub async fn show(
 ) -> anyhow::Result<()> {
     let state = crate::runs::state(project)?;
     let database = engine::database(&state)?;
-    let rt = Durare::open(&database, None, LAYOUT_VERSION)
-        .await
-        .with_context(|| format!("open the store at {}", engine::describe(&database)))?;
+    let rt = Durare::open(
+        &database,
+        None,
+        LAYOUT_VERSION,
+        &crate::engine::store_project(&state)?,
+    )
+    .await
+    .with_context(|| format!("open the store at {}", engine::describe(&database)))?;
     let Some(doc) = gather(&rt, &args.run_id).await? else {
         return Err(Failure::new(
             "run.not_found",

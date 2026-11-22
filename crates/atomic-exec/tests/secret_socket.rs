@@ -25,7 +25,7 @@ fn a_secret_socket_is_read_only_once_hardened_and_only_from_a_socket() {
     // SAFETY: each descriptor here was made for this test alone, which runs
     // on one thread of its own binary.
     let read = |fd: &str| unsafe { read_secret_socket(std::ffi::OsStr::new(fd)) };
-    // Still dumpable: refused before the socket is touched, and the socket,
+    // Still dumpable: refused before the socket is read, and the socket,
     // handed inheritable, is kept from the programs this process starts.
     let fd = socket_holding(b"K=v\0");
     let raw: std::os::fd::RawFd = fd.parse().expect("a number");

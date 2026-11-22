@@ -539,6 +539,228 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
     });
 }
 
+/// A turn's commands cannot read another live attempt's scratch directory,
+/// its `HOME` or its `TMPDIR`, on its own backend or on another backend of
+/// the project, though a `workspace-write` turn reads and writes its own: a
+/// backend denies a turn every scratch root it names, a writing turn's own
+/// directory apart. A `read-only` turn, which may not write its own, cannot
+/// reach it at all. One turn leaves a secret in both and holds its attempt
+/// open, as does a neighbour on a backend with a scratch root of its own,
+/// while the others look for the secrets everywhere under both roots once
+/// the markers the two leave say they are there.
+#[test]
+fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        // Scratch roots of this test's own, not the shared one: connecting
+        // a backend empties its shared temporary directory, which other
+        // tests' turns use. The neighbour, on the other backend, works in a
+        // directory of its own: turns that share a writable directory must
+        // share their backend's temporary directory too.
+        let (dir, apart) = (scratch("scratch-deny"), scratch("scratch-deny-apart"));
+        let root = dir.join("state/scratch");
+        let sibling = dir.join("state/scratch-debug");
+        // Two backends of one project, as `atomic run` and `atomic debug
+        // codex-prompt` have, each told to deny the other's scratch root.
+        let backend =
+            Backend::connect(LocalBackend::in_dir(root.clone()).denying([sibling.clone()]))
+                .expect("connects");
+        let neighbours =
+            Backend::connect(LocalBackend::in_dir(sibling.clone()).denying([root.clone()]))
+                .expect("connects");
+        let turn = |commands: Vec<String>, sandbox: Sandbox, backend: &Backend, dir: &Path| {
+            let (dir, backend) = (dir.to_owned(), backend.clone());
+            async move {
+                let mut script: Vec<Reply> = commands.iter().map(|c| tool(c)).collect();
+                script.push(Reply::Text("Done.".into()));
+                let model = FakeModel::start(script).await.expect("fake model");
+                let rt = runtime(&dir, &model);
+                let answer = run_turn(
+                    &rt,
+                    &backend,
+                    &TurnSpec {
+                        prompt: "Do the work.".into(),
+                        sandbox,
+                        ..TurnSpec::default()
+                    },
+                )
+                .await
+                .expect("the turn runs");
+                assert_eq!(answer, "Done.");
+                model
+                    .requests()
+                    .last()
+                    .cloned()
+                    .expect("requests")
+                    .to_string()
+            }
+        };
+        // The markers are in the turns' working directories, outside every
+        // scratch root; a look starts once they are there, gives up after
+        // 30 s, and says whether it saw them.
+        let (first_wrote, neighbour_wrote) = (
+            dir.join("project/first-wrote"),
+            apart.join("project/neighbour-wrote"),
+        );
+        let (neighbour_looked, release) = (
+            apart.join("project/neighbour-looked"),
+            dir.join("project/release"),
+        );
+        let wait = |marker: &Path, saw: &str| {
+            let m = marker.display();
+            format!(
+                "for i in $(seq 300); do [ -e '{m}' ] && break; sleep 0.1; done; \
+                 [ -e '{m}' ] && echo saw-{saw}"
+            )
+        };
+        let look = |name: &str, under: &Path, secret: &str| {
+            format!(
+                "echo {name}=$(grep -rls {secret} {} 2>/dev/null | grep -c .)",
+                under.display()
+            )
+        };
+        // A holder holds its attempt open until this test, once every look
+        // has ended and it has seen the secrets still there, leaves
+        // `release`: in calls of up to 8 s, under the 10 s a command may run
+        // before its turn goes on, and up to 64 s in all.
+        let hold = |who: &str| {
+            let r = release.display();
+            let mut calls =
+                vec![format!("for i in $(seq 80); do [ -e '{r}' ] && break; sleep 0.1; done"); 7];
+            calls.push(format!(
+                "for i in $(seq 80); do [ -e '{r}' ] && break; sleep 0.1; done; \
+                 [ -e '{r}' ] && echo {who}-held"
+            ));
+            calls
+        };
+        let first = tokio::spawn(turn(
+            [
+                vec![
+                    "echo secret-of-the-first > \"$HOME/secret\" && \
+                     echo secret-of-the-first > \"$TMPDIR/secret\" && touch first-wrote && \
+                     echo first-wrote"
+                        .to_owned(),
+                ],
+                hold("first"),
+            ]
+            .concat(),
+            Sandbox::WorkspaceWrite,
+            &backend,
+            &dir,
+        ));
+        let neighbour = tokio::spawn(turn(
+            [
+                vec![format!(
+                    "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
+                     {}; {}; touch neighbour-looked",
+                    wait(&first_wrote, "first"),
+                    look("neighbour-found", &root, "secret-of-the-first"),
+                )],
+                hold("neighbour"),
+            ]
+            .concat(),
+            Sandbox::WorkspaceWrite,
+            &neighbours,
+            &apart,
+        ));
+        let writer = tokio::spawn(turn(
+            vec![format!(
+                "{}; {}; {}; {}; \
+                 echo mine > \"$HOME/m\" && cat \"$HOME/m\" && \
+                 echo also > \"$TMPDIR/m\" && cat \"$TMPDIR/m\" && echo writer-own-ok; \
+                 echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')",
+                wait(&first_wrote, "first"),
+                wait(&neighbour_wrote, "neighbour"),
+                look("writer-found", &root, "secret-of-the-first"),
+                look("writer-sibling-found", &sibling, "secret-of-the-neighbour"),
+            )],
+            Sandbox::WorkspaceWrite,
+            &backend,
+            &dir,
+        ));
+        let reader = tokio::spawn(turn(
+            vec![format!(
+                "{}; {}; \
+                 if ls -A \"$HOME\" >/dev/null 2>&1; then echo reader-home=listed; \
+                 else echo reader-home=unreachable; fi; \
+                 echo reader-home-says=$(ls -A \"$HOME\" 2>&1 | head -1)",
+                wait(&first_wrote, "first"),
+                look("reader-found", &root, "secret-of-the-first"),
+            )],
+            Sandbox::ReadOnly,
+            &backend,
+            &dir,
+        ));
+        let (writer, reader) = (writer.await.expect("writer"), reader.await.expect("reader"));
+        for _ in 0..300 {
+            if neighbour_looked.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Every look has ended, and what it looked for is still there: the
+        // holders still hold their attempts.
+        assert!(neighbour_looked.exists(), "the neighbour never looked");
+        assert!(
+            holds(&root, "secret-of-the-first"),
+            "the first's secret was gone"
+        );
+        assert!(
+            holds(&sibling, "secret-of-the-neighbour"),
+            "the neighbour's secret was gone"
+        );
+        std::fs::write(&release, "").expect("release");
+        let (first, neighbour) = (
+            first.await.expect("first"),
+            neighbour.await.expect("neighbour"),
+        );
+        assert!(
+            first.contains("first-wrote") && first.contains("first-held"),
+            "{first}"
+        );
+        assert!(
+            neighbour.contains("saw-first")
+                && neighbour.contains("neighbour-found=0\\n")
+                && neighbour.contains("neighbour-held"),
+            "the neighbour read the first's scratch: {neighbour}"
+        );
+        // Its own scratch directory holds its TMPDIR and what it wrote.
+        assert!(
+            writer.contains("saw-first")
+                && writer.contains("saw-neighbour")
+                && writer.contains("writer-found=0\\n")
+                && writer.contains("writer-sibling-found=0\\n")
+                && writer.contains("writer-own-ok")
+                && writer.contains("writer-home-own=2\\n"),
+            "the writing turn read another's scratch, or lost its own: {writer}"
+        );
+        // Not an empty directory: one it may not open at all.
+        assert!(
+            reader.contains("saw-first")
+                && reader.contains("reader-found=0\\n")
+                && reader.contains("reader-home=unreachable")
+                && reader.contains("Permission denied"),
+            "the read-only turn read the first's scratch, or reached its own: {reader}"
+        );
+    });
+}
+
+/// Whether a file under `dir` holds `needle`, as this test process, which no
+/// sandbox confines, finds it.
+fn holds(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            holds(&path, needle)
+        } else {
+            std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
+}
+
 /// The variable that says `/tmp` belongs to this test run alone, as in
 /// `scripts/dev.sh`'s container or a CI job's machine: only then does a test
 /// create and remove `/tmp/.codex`, which any Codex session sharing that
@@ -654,4 +876,123 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
         toggled > COMMANDS,
         "/tmp/.codex came and went during the turn"
     );
+}
+
+/// Set in the process [`a_turns_helper_started_by_its_bare_name_is_never_found_along_path`]
+/// starts again, to its directory: that process runs the turn.
+const BARE_HELPER_IN: &str = "ATOMIC_TEST_BARE_HELPER_IN";
+
+/// When Codex's links to atomic are missing, it starts its Linux sandbox
+/// helper for a turn's command as atomic itself under the helper's bare
+/// name, and a bubblewrap without `--argv0` runs the inner stage by that
+/// name: a program a command put on `PATH` under it is never run in the
+/// inner stage's place. The turn runs in a process of its own, whose `PATH`
+/// leads to such a bubblewrap and to the planted program.
+#[test]
+fn a_turns_helper_started_by_its_bare_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    // The turn's own process, whose PATH leads to the old bubblewrap.
+    if let Some(dir) = std::env::var_os(BARE_HELPER_IN) {
+        return turn_with_a_bare_helper(Path::new(&dir));
+    }
+    support::require_sandbox();
+    let dir = scratch("bare-helper");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it is
+    // named, looking a bare name up along PATH.
+    let bwrap_ran = dir.join("bwrap-ran");
+    script(
+        &dir.join("old-bwrap/bwrap"),
+        &format!(
+            "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         touch '{}'\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+            bwrap_ran.display()
+        ),
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("old-bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = std::process::Command::new(std::env::current_exe().expect("this test"))
+        .args([
+            "--exact",
+            "a_turns_helper_started_by_its_bare_name_is_never_found_along_path",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(BARE_HELPER_IN, &dir)
+        .env("PATH", path)
+        .output()
+        .expect("the turn's process");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ran.exists(),
+        "the planted program ran in the inner stage's place:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The old bubblewrap is what the turn's command went to, and it was
+    // asked to run the name that is a path, which it could not.
+    assert!(bwrap_ran.exists(), "the old bubblewrap never ran");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("execvp /dev/null/codex-linux-sandbox"),
+        "the command's output: {said}"
+    );
+}
+
+/// A `workspace-write` turn in `dir` running one command, with atomic itself
+/// as Codex's Linux sandbox helper, as when Codex could not link it under
+/// the helper's name: Codex then starts it by that bare name.
+fn turn_with_a_bare_helper(dir: &Path) {
+    let dir = dir.to_owned();
+    on_codex_runtime(async move {
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let model = FakeModel::start(vec![tool("echo looked"), Reply::Text("Done.".into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&dir, &model);
+        rt.paths = CodexPaths::with_helpers(
+            PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+            PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+        );
+        // The command fails where the helper cannot be found; the turn ends
+        // either way, and what the command printed is shown for the test that
+        // started this process to read.
+        let _ = run_turn(
+            &rt,
+            &backend,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await;
+        println!(
+            "{}",
+            serde_json::to_string(&model.requests()).expect("requests")
+        );
+    });
 }
