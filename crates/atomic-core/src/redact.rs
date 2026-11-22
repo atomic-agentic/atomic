@@ -331,15 +331,6 @@ fn escaped_quoted() -> String {
 }
 /// The most backslashes before a quote [`FLAG`] reads as escaping it.
 const MAX_QUOTE_ESCAPES: usize = 8;
-/// [`FLAG`] without reading escaped quotes, read after it: where escaped
-/// quotes pair otherwise than a command meant, around another quoted
-/// value or up to a flag with no space before it, what this reading finds
-/// is still found.
-static FLAG_UNESCAPED: LazyLock<Regex> = LazyLock::new(|| {
-    regex(
-        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
-    )
-});
 /// A flag and what separates it from its value, as [`FLAG`] reads them.
 static FLAG_HEAD: LazyLock<Regex> = LazyLock::new(|| {
     regex(&format!(
@@ -1211,15 +1202,6 @@ fn redact_flag_within(captures: &Captures<'_>, depth: usize) -> String {
     format!("{prefix}{REDACTED}{escape}")
 }
 
-/// [`redact_flag`] for [`FLAG_UNESCAPED`]: a value of backslashes alone
-/// there escapes a quote [`FLAG`] has read already, and is left.
-fn redact_unescaped_flag(captures: &Captures<'_>) -> String {
-    if captures[3].trim_start_matches('\\').is_empty() {
-        return captures[0].to_string();
-    }
-    redact_flag_within(captures, 0)
-}
-
 /// Whether `input` nests quotes at one escaping depth so that no reading
 /// can pair them: a flag's quoted value holds a secret-named flag whose own
 /// value the quote closing the outer one cuts off, or opens a quote
@@ -1595,7 +1577,6 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
-    apply(&FLAG_UNESCAPED, &redact_unescaped_flag);
     if let Some(hidden) = unclean_flag_values(&output) {
         output = Cow::Owned(hidden);
     }
