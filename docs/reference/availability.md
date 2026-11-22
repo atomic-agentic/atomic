@@ -217,7 +217,10 @@ any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
 draw on the terminal atomic runs in, whether through `/dev/tty`, the
 terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
-needs bubblewrap and unprivileged user namespaces there: where the sandbox
+needs bubblewrap and unprivileged user namespaces there; a bubblewrap older
+than 0.9, without `--argv0`, as Ubuntu 22.04 ships, works too, since Codex
+runs the sandbox helper through a link atomic keeps in its own state, by its
+path, which no command can write. Where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead sets that run
