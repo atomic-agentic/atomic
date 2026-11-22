@@ -1,0 +1,1 @@
+turn-home-absent|crates/atomic-core/src/codex.rs|    let home_held = spec.env.get("HOME").is_none_or(|home| home == SHELL_HOME);|    let home_held = false;|-p atomic-agentic-core --lib --features fake-model a_read_only_turn_does_not_start_while_its_home_is_there

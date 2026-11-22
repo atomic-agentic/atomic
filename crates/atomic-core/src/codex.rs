@@ -4143,6 +4143,14 @@ where
 {
     let spec = first;
     refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
+    // A command whose HOME is the one that must not exist, as a read-only
+    // turn's is, runs only while it does not: refused before anything
+    // reaches the model.
+    // `scripts/controls/turn-home-absent.row` switches this off.
+    let home_held = spec.env.get("HOME").is_none_or(|home| home == SHELL_HOME);
+    if home_held {
+        shell_home_absent().map_err(|why| anyhow::Error::new(HomeThere(why)))?;
+    }
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -4224,11 +4232,6 @@ where
         config.permissions.set_workspace_roots(roots.clone());
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
-    }
-    // A command whose HOME is the one that must not exist, as a read-only
-    // turn's is, runs only while it does not.
-    if env.get("HOME").is_none_or(|home| home == SHELL_HOME) {
-        shell_home_absent().map_err(anyhow::Error::msg)?;
     }
     config.permissions.shell_environment_policy = command_environment(&env);
     // No login shell, and no snapshot taken from one: a command never runs
@@ -4897,7 +4900,46 @@ pub const SHELL_HOME: &str = "/nonexistent";
 /// would read startup files from it, so one put there, by whoever may make
 /// it, would run in every such command, and git would read its settings.
 pub fn shell_home_absent() -> Result<(), String> {
+    #[cfg(test)]
+    if let Some(path) = SHELL_HOME_LOOKED_AT.with(|p| p.borrow().clone()) {
+        return absent_home(&path);
+    }
     absent_home(Path::new(SHELL_HOME))
+}
+
+/// Why a command whose home must not exist cannot start
+/// ([`shell_home_absent`]): a fault of the machine's, which nothing sent to
+/// the model caused.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct HomeThere(pub String);
+
+#[cfg(test)]
+thread_local! {
+    /// Where [`shell_home_absent`] looks on this thread instead of
+    /// [`SHELL_HOME`], for the tests of what calls it.
+    static SHELL_HOME_LOOKED_AT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While held, [`shell_home_absent`] looks at another path on this thread.
+#[cfg(test)]
+pub(crate) struct ShellHomeAt;
+
+#[cfg(test)]
+impl ShellHomeAt {
+    /// Look at `path` on this thread until the value is dropped.
+    pub(crate) fn new(path: &Path) -> Self {
+        SHELL_HOME_LOOKED_AT.with(|p| *p.borrow_mut() = Some(path.to_owned()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShellHomeAt {
+    fn drop(&mut self) {
+        SHELL_HOME_LOOKED_AT.with(|p| *p.borrow_mut() = None);
+    }
 }
 
 /// [`shell_home_absent`] for `path`: only a true "not there" passes; a file,

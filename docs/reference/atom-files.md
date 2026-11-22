@@ -421,7 +421,9 @@ A Codex atom's shell inherits only the platform's core variables, such as
 `HOME` and `ZDOTDIR` are its attempt's own scratch directory. In a
 `read-only` turn, whose scratch directory is out of its reach, and where no
 attempt gives it one, its `HOME` is `/nonexistent`, and the turn does not
-start if anything is there. It is not a login shell, so none of your shell
+start if anything is there. atomic's own git, whose `HOME` is
+`/nonexistent` too, refuses to run as well, so on a machine where
+something is there no run gets far. It is not a login shell, so none of your shell
 startup files run, and no functions or aliases from them are replayed into
 it.
 

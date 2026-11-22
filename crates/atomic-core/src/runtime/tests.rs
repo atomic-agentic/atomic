@@ -100,6 +100,48 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     }
 }
 
+// While something is at the home a read-only turn's commands are given,
+// which must not exist, the turn does not start: nothing reaches the
+// model, and the failure is the machine's, so a durable run stops without
+// recording one.
+#[test]
+fn a_read_only_turn_does_not_start_while_its_home_is_there() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text("{}".into())])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "home-there");
+        let there = std::env::temp_dir().join(format!("atomic-home-there-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&there);
+        std::fs::create_dir_all(&there).expect("home");
+        let failed = {
+            let _home = codex::ShellHomeAt::new(&there);
+            run_codex_atom(
+                &Classify,
+                &Note {
+                    text: "Export crashes.".into(),
+                },
+                &rt,
+                &helperless(),
+            )
+            .await
+        };
+        let _ = std::fs::remove_dir_all(&there);
+        match failed {
+            Err(AtomError::Unconfinable(why)) => assert!(
+                why.starts_with(&format!(
+                    "{} is the home atomic gives commands",
+                    there.display()
+                )),
+                "{why}"
+            ),
+            Err(e) => panic!("the turn was not refused as the machine's: {e:?}"),
+            Ok(_) => panic!("the turn ran"),
+        }
+        assert_eq!(model.calls(), 0, "the turn reached the model");
+    });
+}
+
 #[test]
 fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
     on_codex_runtime(async {

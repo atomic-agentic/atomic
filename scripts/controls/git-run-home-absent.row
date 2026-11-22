@@ -1,0 +1,1 @@
+git-run-home-absent|crates/atomic-core/src/git.rs|        crate::codex::shell_home_absent().map_err(GitError::Home)?;|        let _ = crate::codex::shell_home_absent;|-p atomic-agentic-core --lib --features fake-model no_git_runs_while_its_home_is_there

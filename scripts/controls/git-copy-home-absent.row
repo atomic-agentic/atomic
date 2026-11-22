@@ -1,0 +1,1 @@
+git-copy-home-absent|crates/atomic-core/src/git.rs|        let home = crate::codex::shell_home_absent();|        let home: Result<(), String> = Ok(());|-p atomic-agentic-core --lib --features fake-model no_git_runs_while_its_home_is_there

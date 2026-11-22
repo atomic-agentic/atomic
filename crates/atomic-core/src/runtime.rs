@@ -1024,8 +1024,18 @@ async fn run_contract(
 }
 
 /// What a turn that failed failed of: the model, or, when the sandbox's
-/// deny list could not be made, the machine it would have run on.
+/// deny list could not be made or the home its commands must not have is
+/// there ([`crate::codex::HomeThere`]), the machine it would have run on.
 fn turn_failure(e: &anyhow::Error) -> AtomError {
+    // A home that must not exist is there: the machine's to fix, and the
+    // step's to run again once it is.
+    // `scripts/controls/turn-home-unconfinable.row` switches this off.
+    let home = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::HomeThere>());
+    if let Some(there) = home {
+        return AtomError::Unconfinable(there.to_string());
+    }
     match e
         .chain()
         .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())

@@ -140,7 +140,8 @@ atomic's own environment or its credentials. A turn's commands run with no
 login shell; a `workspace-write` turn's `HOME` (and `ZDOTDIR`) is a private
 scratch directory of the attempt's own, a `read-only` turn's `HOME` is
 `/nonexistent`, where nothing may be (the turn does not start if anything is
-there), so its shell starts without a word about a home it cannot read, and
+there, and neither does any git atomic runs itself, so every run stops on
+such a machine), so its shell starts without a word about a home it cannot read, and
 their `TMPDIR` is a directory inside the scratch directory, so no shell
 startup file runs and no other turn, of the project or another project of the
 same atomic home, can see, add, change or remove what a turn keeps in its

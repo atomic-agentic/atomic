@@ -395,6 +395,7 @@ impl Git {
         input: Option<Vec<u8>>,
         cap: usize,
     ) -> Result<Vec<u8>, GitError> {
+        // `scripts/controls/git-run-home-absent.row` switches this off.
         crate::codex::shell_home_absent().map_err(GitError::Home)?;
         let started = Instant::now();
         command
@@ -741,7 +742,9 @@ impl Repo {
         check_sha(sha)?;
         // The two gits run here start outside `Git::run`, which holds
         // every other to this.
-        crate::codex::shell_home_absent().map_err(GitError::Home)?;
+        // `scripts/controls/git-copy-home-absent.row` switches this off.
+        let home = crate::codex::shell_home_absent();
+        home.map_err(GitError::Home)?;
         let deadline = Instant::now() + self.git.timeout;
         let mut pack = self.command();
         pack.args(["pack-objects", "--revs", "--stdout", "--quiet"])
