@@ -385,6 +385,10 @@ a local stand-in for S3. None of this establishes live-model quality, command co
 or crash recovery in an Atomic runtime. Those need the implementation and phase
 acceptance tests.
 
+The release workflow builds, packages and Sigstore-signs the Linux and macOS
+archives with their SBOMs ([verifying a download](../getting-started/installation.md#verifying-a-download)),
+but no release has been published yet.
+
 Installation packaging, standalone-session behavior and some control commands
 remain open decisions, tracked with the rest of the work in the project's issue
 tracker. No feature in this table should be read as already shipped.

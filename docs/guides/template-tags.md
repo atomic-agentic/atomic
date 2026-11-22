@@ -128,11 +128,17 @@ open nothing, so `<input>…</input>` is refused. Names match exactly, so the
 component `<Input>` is not the element `<input>`. Which tags there are, and
 where each closes, is read from Astro's own parse, so comments, a
 ```` ```mermaid ```` fence and the frontmatter hold none; where a start tag
-ends is read by atomic, its quoted values and braced expressions passed over.
-An element Astro reads as ending somewhere other than where it is written is
-refused too: `<slot>`, `<template>`, `<noscript>`, `<frameset>` and `<head>`
-after leading text or a leading expression, and a closing tag inside a `{…}`
-expression the element did not open in. A literal section takes no attributes.
+ends is read by atomic, its quoted values and braced expressions passed over,
+and checked against where Astro leaves that tag's last attribute — a start tag
+the two readings disagree about is refused, naming the attribute, because
+nothing after it can name the right tag. An element Astro reads as ending
+somewhere other than where it is written is refused too: `<slot>`,
+`<template>`, `<noscript>`, `<frameset>` and `<head>` after leading text or a
+leading expression, and a closing tag inside a `{…}` expression the element did
+not open in. `<plaintext>` takes the rest of the file as its content, so
+nothing ends it: a template holding one at the top level, after leading text or
+an expression or after another element, is refused. A literal section takes no
+attributes.
 `<Fragment>` groups content without adding a section, and takes only a `slot`
 attribute. The `<data-…>` prefix is reserved for atomic's own value wrappers,
 and `<data-…>`, `<script>` and `<style>` are rejected wherever you write them.

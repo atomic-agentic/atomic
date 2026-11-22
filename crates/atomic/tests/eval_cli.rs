@@ -15,6 +15,8 @@
 //! - a call with no recording fails the eval whatever its pass rate;
 //! - editing the atom's output schema makes every recording of it unusable,
 //!   in plain output and in `--json`, and says to record it again;
+//! - adding a `validate` rule reuses every recording, labelled historical, and
+//!   checks the rule against the recorded answers; another model reuses none;
 //! - a live eval is metered in the usage ledger, and a budget with no room
 //!   for a call stops it before any;
 //! - a replay reads no API key and sends none;
@@ -919,6 +921,108 @@ fn an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again()
             assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
             assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
         }
+        assert_eq!(model.calls(), recorded, "a miss reached the model");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// What `atomic eval` reuses and what it throws away: `note`'s recordings
+/// are recorded once; a `validate` rule added to the atom changes nothing that
+/// is sent, so each case's first turn is answered from them, the replay says
+/// it is a historical check, and the new rule is checked against the recorded
+/// answers; another model is a request never recorded, so every case is left
+/// without a recording and says to record it again. No model is called after
+/// the recording.
+#[test]
+fn a_validate_edit_reuses_the_recordings_and_another_model_throws_them_away() {
+    on_codex_runtime(async {
+        let dir = scratch("validate-model");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let recorded = model.calls();
+        assert_eq!(recorded, 2, "one call per case");
+
+        // A rule both recorded answers keep: replayed whole, and labelled.
+        let atom = project.join("atoms/note.atom.astro");
+        let original = std::fs::read_to_string(&atom).expect("the atom");
+        let with_rule = |rule: &str| {
+            let edited = original.replace(
+                "kind: 'lite'",
+                &format!("kind: 'lite', validate: [({{ output }}) => {rule}]"),
+            );
+            assert_ne!(edited, original, "the rule was not added");
+            std::fs::write(&atom, edited).expect("the edited atom");
+        };
+        with_rule("output.ticket.length > 0");
+        let out = eval_async(&dir, &project, &url, &["note"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        for part in [
+            "a historical check",
+            "PASS note: 2 of 2 cases passed",
+            "2 replayed, 0 recorded, 0 without a recording",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert_eq!(model.calls(), recorded, "a validate edit called the model");
+
+        // A rule the second recorded answer, FEAT-2, breaks: both first
+        // turns are still answered from the recordings, and the rule is
+        // checked against what they recorded. BUG-1 keeps it; FEAT-2 does
+        // not, so its repair turn asks again, a request never recorded, which
+        // misses and calls no model.
+        with_rule("output.ticket.length < 6");
+        let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(report["source"], "recorded", "{report}");
+        assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+        assert_eq!(
+            report["cassettes"][0]["missed"], 1,
+            "the repair turn: {report}"
+        );
+        let cases = report["reports"][0]["cases"].as_array().expect("two cases");
+        assert_eq!(cases.len(), 2, "{report}");
+        assert_eq!(cases[0]["passed"], true, "BUG-1 keeps the rule: {report}");
+        assert_eq!(cases[0]["output"], json!({"ticket": "BUG-1"}), "{report}");
+        assert_eq!(cases[1]["passed"], false, "FEAT-2 breaks it: {report}");
+        let failures = cases[1]["failures"].as_array().expect("FEAT-2's failures");
+        assert_eq!(failures.len(), 1, "{report}");
+        assert!(
+            failures[0]
+                .as_str()
+                .is_some_and(|f| f.contains("no recording answers this request")),
+            "the repair turn missed: {report}"
+        );
+        assert_eq!(model.calls(), recorded, "a validate edit called the model");
+        std::fs::write(&atom, &original).expect("the atom back");
+
+        // Another model: no recording answers, and each case says so.
+        let other = [("ATOMIC_MODEL", "another-model")];
+        let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+        let out = tokio::task::spawn_blocking(move || eval_with(&d, &p, &u, &["note"], &other))
+            .await
+            .expect("eval");
+        assert!(
+            !out.status.success(),
+            "another model was answered: {}",
+            text(&out)
+        );
+        let said = text(&out);
+        for part in [
+            "no recording answers this request",
+            "run the eval with --live to record it",
+            "2 model call(s) had no usable recording (2 missing, 0 corrupt): \
+             record them with --live",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        // The control: the recorded model is still answered.
+        let out = eval_async(&dir, &project, &url, &["note"]).await;
+        assert!(out.status.success(), "{}", text(&out));
         assert_eq!(model.calls(), recorded, "a miss reached the model");
         let _ = std::fs::remove_dir_all(&dir);
     });
