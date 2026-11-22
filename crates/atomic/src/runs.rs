@@ -16,7 +16,7 @@
 use crate::engine::{self, EngineArgs};
 use crate::failure::Failure;
 use crate::target;
-use atomic_app::pipeline::PIPELINE;
+use atomic_app::pipeline::{PIPELINE, ProjectWorktrees};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
 use atomic_durable::{DurableError, DurableRuntime, RunStatus};
@@ -77,11 +77,22 @@ fn bind_fixture(
     use atomic_core::fixture::{self, FixtureError};
     let (Some(repo), Some(rev)) = (&args.fixture, &args.fixture_rev) else {
         if run.pipeline.changes_code() {
+            // A run's worktrees are made from the repository it names, never
+            // from the project's checkout, so what was found about the project
+            // changes nothing about the refusal. It is still said, because a
+            // step that needs a worktree is asking why there is none — and
+            // "git refused the project's directory" is different news from
+            // "atomic cannot tell whether it is in a repository". A project
+            // with a repository gets the plain refusal.
+            let found = match ProjectWorktrees::find(state) {
+                ProjectWorktrees::Found(_) => String::new(),
+                found => format!(", and {}", found.describe()),
+            };
             return Err(Failure::new(
                 "fixture.required",
                 format!(
                     "workflow `{}` changes code in a worktree, and no fixture repository is \
-                     named; atomic never works in your own checkout",
+                     named{found}; atomic never works in your own checkout",
                     run.pipeline.name
                 ),
                 "name the repository and the revision to start from: --fixture <repo> \
@@ -101,6 +112,11 @@ fn bind_fixture(
             FixtureError::Path { .. } => (
                 "fixture.path",
                 "give --fixture the path of a git repository on this machine",
+            ),
+            FixtureError::Unreadable { .. } => (
+                "fixture.unreadable",
+                "make the repository readable by the account atomic runs as, or name one that \
+                 is; atomic refuses to guess what it could not read",
             ),
             FixtureError::Revision { .. } => (
                 "fixture.revision",

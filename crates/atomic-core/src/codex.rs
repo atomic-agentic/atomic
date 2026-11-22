@@ -1124,7 +1124,14 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would refuse it.
+            if !found && let Err(e) = resolved(&path) {
+                return Err(refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                )));
+            }
             let Some(target) = std::fs::canonicalize(&path)
                 .ok()
                 .filter(|t| deniable(t, !found))
@@ -1460,6 +1467,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
 }
 
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
@@ -2369,7 +2396,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -2424,8 +2450,10 @@ fn late_link_targets(
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold and
-/// those second mounts come to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_targets(
     denied: &[PathBuf],
@@ -3792,6 +3820,16 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
@@ -6807,6 +6845,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
         let dir = scratch("linked-secrets");
         let home = dir.join("home");
@@ -6981,11 +7050,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 
