@@ -1134,6 +1134,99 @@ fn aws_workload_token_files_stay_denied_whether_plain_or_mounted() {
     });
 }
 
+/// The workload credentials beside AWS's stay denied to a turn's commands,
+/// and every command still starts: the token Azure workload identity's
+/// variable names, Google's application credentials and the token files
+/// they name, and the web identity token file an AWS profile names rather
+/// than a variable. Each token is in a projected volume, as Kubernetes
+/// mounts one, so the version it rotates in next is denied too.
+#[test]
+fn workload_credentials_beside_aws_stay_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir =
+            std::env::temp_dir().join(format!("atomic-workload-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        let mut reads = Vec::new();
+        for volume in ["azure", "gke", "eks"] {
+            let at = dir.join(volume);
+            for version in [now, next] {
+                std::fs::create_dir_all(at.join(version)).unwrap();
+                std::fs::write(
+                    at.join(version).join("token"),
+                    format!("canary-{volume}{version}\n"),
+                )
+                .unwrap();
+                reads.push(at.join(version).join("token"));
+            }
+            std::os::unix::fs::symlink(now, at.join("..data")).unwrap();
+            std::os::unix::fs::symlink("..data/token", at.join("token")).unwrap();
+            reads.push(at.join("token"));
+        }
+        std::fs::create_dir_all(dir.join("gcp-cache")).unwrap();
+        std::fs::write(dir.join("gcp-cache/token.json"), "canary-gcp-cached\n").unwrap();
+        std::fs::write(dir.join("gcp-cache/readme"), "readable-beside\n").unwrap();
+        std::fs::create_dir_all(dir.join("gcp")).unwrap();
+        let google = serde_json::json!({
+            "type": "external_account",
+            "audience": "canary-gcp-config",
+            "credential_source": {
+                "file": dir.join("gke/token"),
+                "executable": {
+                    "command": "/bin/true",
+                    "output_file": dir.join("gcp-cache/token.json"),
+                },
+            },
+        });
+        std::fs::write(dir.join("gcp/credentials.json"), google.to_string()).unwrap();
+        std::fs::create_dir_all(dir.join("aws")).unwrap();
+        std::fs::write(
+            dir.join("aws/config"),
+            format!(
+                "[profile pod]\nweb_identity_token_file = {}\n",
+                dir.join("eks/token").display()
+            ),
+        )
+        .unwrap();
+        reads.push(dir.join("gcp/credentials.json"));
+        reads.push(dir.join("gcp-cache/token.json"));
+        let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
+        let command = format!(
+            "cat {} 2>/dev/null; cat {}/gcp-cache/readme; echo looked",
+            reads.join(" "),
+            dir.display()
+        );
+        let azure = dir.join("azure/token").display().to_string();
+        let google = dir.join("gcp/credentials.json").display().to_string();
+        let aws = dir.join("aws/config").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("AZURE_FEDERATED_TOKEN_FILE", azure.as_str()),
+                ("GOOGLE_APPLICATION_CREDENTIALS", google.as_str()),
+                ("AWS_CONFIG_FILE", aws.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            printed.contains("readable-beside"),
+            "a file beside a token stays readable: {printed}"
+        );
+        assert!(
+            !printed.contains("canary"),
+            "a credential was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// Codex's file helper, which applies a turn's patches under the turn's
 /// sandbox, keeps that sandbox's registry of mount points where the turn's
 /// commands keep theirs: in the backend's shared directory in atomic's
