@@ -149,24 +149,27 @@ fn note_in(dir: Option<&Path>, run: &str, payload: &(dyn std::any::Any + Send)) 
     message
 }
 
-/// What a person is told about run `run`, parked because its workflow code
-/// panicked with `message`.
-pub fn cause(run: &str, message: &str) -> String {
-    format!("run {run}{PANICKED}{message}{NOT_RETRIED}")
-}
-
-/// What [`cause`] and [`hint`] say around the run's id and the panic's
-/// message.
-const PANICKED: &str = " stopped: atomic's own workflow code panicked (";
-const NOT_RETRIED: &str = "), so the run is parked, not retried";
-const HINT: &str = "this is a bug in atomic, and the panic will likely happen again if the run \
-                    is resumed as it is: report it with the message above, then continue the \
-                    run with `atomic runs resume ";
-const HINT_END: &str = "` once an atomic without it is installed";
+/// What a person is told about a run whose workflow code panicked, put
+/// together with the run's id and the panic's message apart: `run <id>`
+/// [`PANICKED`] `<message>` [`NOT_RETRIED`] when the run is parked, or
+/// [`NOT_PARKED`] when the command could not see the engine park it; then
+/// what to do, [`HINT`] `<id>` [`HINT_END`].
+pub const PANICKED: &str = " stopped: atomic's own workflow code panicked (";
+/// See [`PANICKED`].
+pub const NOT_RETRIED: &str = "), so the run is parked, not retried";
+/// See [`PANICKED`].
+pub const NOT_PARKED: &str = "), and the engine has not parked it yet, so a later `atomic serve` \
+                              may run it again";
+/// See [`PANICKED`].
+pub const HINT: &str = "this is a bug in atomic, and the panic will likely happen again if the \
+                        run is resumed as it is: report it with the message above, then continue \
+                        the run with `atomic runs resume ";
+/// See [`PANICKED`].
+pub const HINT_END: &str = "` once an atomic without it is installed";
 
 /// What `atomic serve` says of run `run`, whose workflow code panicked with
-/// `message`: [`cause`] and [`hint`], with the run's id as it is and the
-/// message redacted on its own, so a run named for a secret, such as
+/// `message`, in [`PANICKED`]'s words: the run's id as it is and the message
+/// redacted on its own, so a run named for a secret, such as
 /// `rotate-secret`, is still named.
 pub fn served(run: &str, message: &str) -> atomic_core::redact::Line {
     atomic_core::redact::Line::new()
@@ -179,20 +182,6 @@ pub fn served(run: &str, message: &str) -> atomic_core::redact::Line {
         .plain(HINT)
         .shown(run)
         .plain(HINT_END)
-}
-
-/// What a person is told about run `run`, whose workflow code panicked with
-/// `message` when this command could not see the engine park it.
-pub fn unparked(run: &str, message: &str) -> String {
-    format!(
-        "run {run} stopped: atomic's own workflow code panicked ({message}), and the engine has \
-         not parked it yet, so a later `atomic serve` may run it again"
-    )
-}
-
-/// What a person can do about it.
-pub fn hint(run: &str) -> String {
-    format!("{HINT}{run}{HINT_END}")
 }
 
 /// `workflow`, the workflow code of run `run`, with a panic in it noted

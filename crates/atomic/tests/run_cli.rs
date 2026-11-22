@@ -7823,7 +7823,55 @@ fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
         &panic,
         "",
     );
+    // atomic run's own error report names it too, hint and all.
+    let reported = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        reported.contains("error: run rotate-secret:2026-11 stopped: atomic's own workflow code"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{reported}"
+    );
+    assert!(
+        reported.contains("failpoint pipeline:after:count"),
+        "{reported}"
+    );
+    assert!(!reported.contains("[REDACTED]"), "{reported}");
+    // And in JSON, for a second run under the same id.
+    let again = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!again.status.success(), "{}", text(&again));
+    let error = &stdout_json(&again)["error"];
+    assert_eq!(error["kind"], "run.exists", "{error}");
+    assert_eq!(
+        error["description"].as_str(),
+        Some(
+            "there is already a run rotate-secret:2026-11 in this project's store, and it is \
+             max_recovery_attempts_exceeded"
+        ),
+        "{error}"
+    );
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.ends_with("use `atomic runs resume rotate-secret:2026-11`")),
+        "{error}"
+    );
     let out = atomic(
         &dir,
         &project,
