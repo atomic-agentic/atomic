@@ -1,0 +1,1 @@
+failure-named-json|crates/atomic/src/failure.rs|    match &failure.said {|    match None::<&Box<[Said; 2]>> { // CONTROL_OFF|-p atomic-agentic --bin atomic failure::tests::a_named_failure_keeps_its_names_and_redacts_its_text

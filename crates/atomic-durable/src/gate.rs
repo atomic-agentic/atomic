@@ -1218,25 +1218,36 @@ pub async fn redeliver<R: DurableRuntime>(rt: &R) -> Result<usize> {
 /// this content for as long as the gate's decision and its run's recovery
 /// may need it.
 pub async fn pinned_evidence<R: DurableRuntime>(rt: &R) -> Result<Vec<String>> {
-    // Every project's gates: a store's content is kept for all of them.
-    let mut all: Vec<String> = rt
-        .read_transaction(|mut tx| {
-            Box::pin(async move {
-                let rows = tx
-                    .query_all(&format!("SELECT {COLUMNS} FROM {GATES}"), &[])
-                    .await?;
-                rows.iter()
-                    .map(gate_from_row)
-                    .collect::<Result<Vec<Gate>>>()
-            })
-        })
-        .await?
-        .into_iter()
-        .flat_map(|g| g.evidence)
-        .collect();
+    Ok(evidence_of(&every_gate(rt).await?))
+}
+
+/// Every digest `gates` pin as evidence, once each, in order.
+pub fn evidence_of(gates: &[Gate]) -> Vec<String> {
+    let mut all: Vec<String> = gates.iter().flat_map(|g| g.evidence.clone()).collect();
     all.sort();
     all.dedup();
-    Ok(all)
+    all
+}
+
+/// Every gate in the store, open or resolved, whichever project's run it
+/// is of, and one of no project's: what keeping a store's content reads,
+/// since a store's content is kept for all of them. Nothing else may use it
+/// to show or decide a gate; [`gates`] is the runtime's project's.
+pub async fn every_gate<R: DurableRuntime>(rt: &R) -> Result<Vec<Gate>> {
+    rt.read_transaction(|mut tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_all(
+                    &format!("SELECT {COLUMNS} FROM {GATES} ORDER BY g.opened_at, g.gate_id"),
+                    &[],
+                )
+                .await?;
+            rows.iter()
+                .map(gate_from_row)
+                .collect::<Result<Vec<Gate>>>()
+        })
+    })
+    .await
 }
 
 #[cfg(test)]

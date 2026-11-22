@@ -1,0 +1,1 @@
+exec-scratch-deny|crates/atomic-core/src/runtime.rs|        denied: workspace.denied.clone(),|        denied: Vec::new(), // CONTROL_OFF|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test exec_scratch an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own

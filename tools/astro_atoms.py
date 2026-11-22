@@ -4,21 +4,23 @@ from pathlib import Path
 import json
 import os
 import subprocess
-import shutil
-import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-ASSETS = ROOT / 'crates/atomic-core/assets'
 CACHE = {}
 
 
+def compiler():
+    """The atomic binary whose embedded compiler runs the checks: ATOMIC_BIN, else this checkout's debug build."""
+    binary = Path(os.environ.get('ATOMIC_BIN') or ROOT / 'target/debug/atomic')
+    if not binary.is_file():
+        raise ValueError(f'Astro checks run on the compiler embedded in atomic, and {binary} is not built; run cargo build or set ATOMIC_BIN')
+    return binary
+
+
 def invoke(request):
-    binary = os.environ.get('ATOMIC_DENO') or shutil.which('deno')
-    if not binary:
-        raise ValueError('Astro checks require pinned Deno 2.9.8; set ATOMIC_DENO to its executable')
-    # As in atomic itself, Deno may read only the compiler assets: atom sources
-    # travel in the request.
-    result = subprocess.run([binary, 'run', '--no-config', '--no-lock', '--no-remote', '--cached-only', '--no-npm', '--no-prompt', f'--allow-read={ASSETS}', str(ASSETS / 'worker.mjs')], input=json.dumps(request), text=True, capture_output=True, timeout=35, env={'DENO_NO_UPDATE_CHECK': '1', 'DENO_DIR': os.environ.get('DENO_DIR') or os.path.join(tempfile.gettempdir(), 'atomic-catalog-deno')})
+    # As in atomic itself: atomic runs its own embedded compiler as a child,
+    # with a cleared environment; atom sources travel in the request.
+    result = subprocess.run([str(compiler()), '__atomic-compiler'], input=json.dumps(request), text=True, capture_output=True, timeout=35, env={})
     if result.returncode:
         raise ValueError(f'the Astro compiler crashed: {result.stderr.strip()}')
     response = json.loads(result.stdout)

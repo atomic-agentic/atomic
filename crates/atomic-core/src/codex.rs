@@ -400,8 +400,10 @@ fn token_files(
         if *name == GOOGLE_CERTIFICATES {
             out.extend(google_certificate_files(&file, here)?);
         }
-        out.extend(projected_volume(file.clone()));
-        out.push(file);
+        // `scripts/controls/aws-projected-volume.row` and
+        // `scripts/controls/aws-web-identity-token.row` switch these off.
+        out.extend(projected_volume(file.clone())); // the variable's volume
+        out.push(file); // the variable's own file
     }
     Ok(out)
 }
@@ -888,13 +890,24 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist. The entry
-        // from `dirs` is where that other atomic would keep its credentials
-        // (see [`crate::state::credentials_dir`]), which is not always the
-        // directory denied above: that one comes from
-        // [`crate::state::user_config_dir`], the same function
-        // [`crate::state::outside_user_config`] reads, so the directory a
-        // state directory is refused for sitting inside is denied outright.
+        // keys are another atomic's: denied too, where they exist. That
+        // atomic's credentials and keys sit under
+        // [`crate::state::user_config_dir`], the directory denied above and
+        // the same function [`crate::state::outside_user_config`] reads, so
+        // the directory a state directory is refused for sitting inside is
+        // denied outright. The entries from `dirs` are denied beside it: the
+        // state directory `base_dir` falls back to, and the configuration
+        // directory `dirs` names. That is not always the same one: on macOS
+        // (`~/Library/Application Support`) and Windows (`%APPDATA%`) it
+        // never is, and on Linux it differs only for a relative `HOME`,
+        // which `user_config_dir` gives way from (`dirs` ignores a relative
+        // `XDG_CONFIG_HOME` itself).
+        // An older atomic's credentials and checkpoint key, `ATOMIC_HOME`
+        // set or not and whether they exist yet or not: on macOS and Windows
+        // that place was never the configuration directory above.
+        also.extend(crate::state::legacy_secret_dirs(
+            crate::state::legacy_config_dir().as_deref(),
+        ));
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1130,19 +1143,39 @@ fn program(path: &Path) -> bool {
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
+#[cfg(test)]
 fn denied_paths(
     private: &PrivateState,
     codex_home: &Path,
     cwd: Option<&Path>,
     writable: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    denied_paths_with(private, codex_home, cwd, writable, &[])
+}
+
+/// [`denied_paths`], with `also` denied besides by [`deny_also`]: not in the
+/// list, but counted in its cap as each command counts them.
+fn denied_paths_with(
+    private: &PrivateState,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
+) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     let given = writable;
-    let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let mut roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
+    let state = real(&private.state_dir);
+    // The same directories wherever else they are mounted, such as a bind of
+    // the working directory: a command may write them there too.
+    let seen_again = crate::mounts::second_mounts(&[&roots, std::slice::from_ref(&state)])
+        .map_err(|e| anyhow::Error::new(DenyRefused(format!("{e:#}"))))?;
+    roots.extend(seen_again[0].iter().cloned());
     let mut writable = roots.clone();
-    writable.push(real(&private.state_dir));
+    writable.push(state);
+    writable.extend(seen_again[1].iter().cloned());
     let mut needed = writable.clone();
     needed.extend(cwd.map(real));
     needed.push(real(codex_home));
@@ -1201,6 +1234,14 @@ fn denied_paths(
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
     }
+    // A link inside a place, walked as the kernel walks it: one whose chain
+    // runs through a link a command may point, or that leads nowhere yet into
+    // what the thread may write, refuses the thread.
+    for link in &links {
+        if let Some(refused) = link_planted(link, &writable, &places) {
+            return Err(refused);
+        }
+    }
     // Only the links that lead somewhere a denial is needed count against
     // the cap.
     links.retain(|link| {
@@ -1254,7 +1295,16 @@ fn denied_paths(
     for (i, path) in denied.into_iter().enumerate() {
         let found = i >= base;
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            // Nothing there yet: denied once it is.
+            // Nothing there yet: denied once it is. A place, but for
+            // atomic's own private state, that would be made in what the
+            // thread may write, or through a link there, refuses it: a
+            // command could make it for what reads it to find.
+            if !found
+                && i != 0
+                && let Some(refused) = missing_into(&path, &writable, &places)
+            {
+                return Err(refused);
+            }
             all.push(path);
             continue;
         };
@@ -1262,11 +1312,40 @@ fn denied_paths(
             // A link: the sandbox cannot mount on one, so what it resolves
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
-            // denied with it.
-            let Some(target) = std::fs::canonicalize(&path)
-                .ok()
-                .filter(|t| deniable(t, !found))
-            else {
+            // denied with it. A place that is a link atomic cannot resolve
+            // for a reason other than leading nowhere yet refuses the
+            // thread here, as each of its commands would where the sandbox
+            // helper walks the places again (Linux); one that leads nowhere
+            // yet refuses it when where it leads lies in what the thread may
+            // write, where a command could put a file for what reads the
+            // place to find.
+            let unresolved = |e: anyhow::Error| {
+                refuse(format!(
+                    "{e:#}; remove the link, or point it at something atomic can reach"
+                ))
+            };
+            let target = if found {
+                std::fs::canonicalize(&path).ok()
+            } else {
+                match resolved(&path) {
+                    Ok(Some(target)) => {
+                        // Its own chain, which a command may repoint where
+                        // it runs through what the thread may write.
+                        if let Some(refused) = rewritable_chain(&path, &writable, &places) {
+                            return Err(refused);
+                        }
+                        Some(target)
+                    }
+                    Ok(None) => {
+                        if let Some(refused) = dangling_into(&path, &writable, &places) {
+                            return Err(refused);
+                        }
+                        None
+                    }
+                    Err(e) => return Err(unresolved(e)),
+                }
+            };
+            let Some(target) = target.filter(|t| deniable(t, !found)) else {
                 continue;
             };
             if found && places.iter().any(|p| target.starts_with(p)) {
@@ -1400,13 +1479,16 @@ fn denied_paths(
     }
     // The cap again, counted as each command's sandbox helper counts it
     // (see `late_targets`): the second mounts of all the list denies, its
-    // second mounts among them, and of each directory whose databases it
-    // denies; so a list a thread starts with does not refuse its commands.
+    // second mounts among them and what `deny_also` will deny besides (the
+    // backend's scratch directories), and of each directory whose databases
+    // it denies; so a list a thread starts with does not refuse its commands.
     let homes: Vec<PathBuf> = std::iter::once(home_spelled)
         .chain(home_aliases.iter().cloned())
         .collect();
-    let counted =
-        crate::mounts::second_mounts(&[&all, &homes]).map_err(|e| refuse(format!("{e:#}")))?;
+    let mut as_commands_see = all.clone();
+    as_commands_see.extend(also.iter().cloned());
+    let counted = crate::mounts::second_mounts(&[&as_commands_see, &homes])
+        .map_err(|e| refuse(format!("{e:#}")))?;
     let (mounted, home_mounts) = (counted[0].len(), counted[1].len());
     let as_commands_count = link_count + mounted + home_mounts;
     if as_commands_count > MAX_LINK_TARGETS {
@@ -1447,6 +1529,256 @@ const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
 /// The databases Codex keeps in its home, as a pattern inside it.
 const SQLITE_FILES: &str = "*.sqlite*";
 
+/// Where [`walk_link`] found a link leads.
+enum Landing {
+    /// There now, as what it resolves to.
+    There(PathBuf),
+    /// Not there yet: where it would be once something is made there.
+    NotYet(PathBuf),
+}
+
+/// Walk `path`, a link, as the kernel walks it, a directory at a time, each
+/// link on the way followed where it is, and say where it leads. Refused
+/// when a link on the way lies in one of `writable`, where a command could
+/// point it elsewhere; when it climbs back out of one of them with `..`,
+/// where a command could make what it climbs out of a link; or when where
+/// it leads cannot be told. What lies inside a denied place of `masked` is
+/// hidden from every command, and no link or directory there can be changed.
+fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::Result<Landing> {
+    use std::path::Component;
+    let refuse = |why: String| Err(anyhow::Error::new(DenyRefused(why)));
+    // What is walked so far, every link in it followed, and what is left.
+    let mut done = PathBuf::from("/");
+    let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir))
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut hops = 0;
+    while let Some(part) = rest.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            // Up out of a directory a command may write: what it holds,
+            // that this climbs back out of, a command can make a link.
+            if let Some(root) = climbing_out(writable, masked, &done) {
+                return refuse(format!(
+                    "{} leads by way of {}, and climbs back out of it, in {}, which atoms' \
+                     commands may write, so a command could make it a link that leads \
+                     elsewhere; point {} without `..`",
+                    path.display(),
+                    done.display(),
+                    root.display(),
+                    path.display()
+                ));
+            }
+            done.pop();
+            continue;
+        }
+        let next = done.join(&part);
+        let link = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // Not there: where it would lead is this, and the rest.
+                if rest.iter().any(|p| p == ".." || p == ".") {
+                    return refuse(format!(
+                        "{} is a link that leads nowhere yet, by way of {}, and atomic cannot \
+                         tell where it would lead; point the link elsewhere",
+                        path.display(),
+                        next.display()
+                    ));
+                }
+                return Ok(Landing::NotYet(
+                    rest.iter().fold(next, |p, part| p.join(part)),
+                ));
+            }
+            Err(e) => {
+                return refuse(format!(
+                    "{} leads by way of {}, which cannot be looked at ({e}); point the link at \
+                     something atomic can reach",
+                    path.display(),
+                    next.display()
+                ));
+            }
+        };
+        if !link {
+            done = next;
+            continue;
+        }
+        // A link on the way: one a command may point elsewhere decides
+        // where the place leads, whatever it points at now.
+        if let Some(root) = changeable(writable, masked, &next) {
+            if next == path {
+                return refuse(format!(
+                    "{} is a link in {}, which atoms' commands may write, so a command could \
+                     point it elsewhere or put something in its place; keep it elsewhere, or \
+                     run the project from a directory that does not hold it",
+                    path.display(),
+                    root.display()
+                ));
+            }
+            return refuse(format!(
+                "{} leads by way of {}, a link in {}, which atoms' commands may write, so a \
+                 command could point it elsewhere; point {} past it",
+                path.display(),
+                next.display(),
+                root.display(),
+                path.display()
+            ));
+        }
+        hops += 1;
+        if hops > LINK_HOPS {
+            return refuse(format!(
+                "{} leads through more than {LINK_HOPS} links; atomic cannot tell where",
+                path.display()
+            ));
+        }
+        let to = match std::fs::read_link(&next) {
+            Ok(to) => to,
+            Err(e) => {
+                return refuse(format!(
+                    "{} leads by way of {}, a link atomic cannot read ({e}); point it at \
+                     something atomic can reach",
+                    path.display(),
+                    next.display()
+                ));
+            }
+        };
+        if to.is_absolute() {
+            done = PathBuf::from("/");
+        }
+        for part in to
+            .components()
+            .filter(|c| !matches!(c, Component::RootDir))
+            .rev()
+        {
+            rest.push_front(part.as_os_str().to_owned());
+        }
+    }
+    Ok(Landing::There(done))
+}
+
+/// Why a denied place that is a link leading nowhere yet cannot be left as
+/// it is ([`walk_link`]): a link on the way a command may point, or where it
+/// would lead lies in one of `writable`, where a command could put a file for
+/// what reads the place to find. `None` when it leads elsewhere.
+fn dangling_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        // There after all, as when it was made a moment ago.
+        Ok(Landing::There(lands)) => {
+            let root = inside_of(writable, &lands)?;
+            return Some(anyhow::Error::new(DenyRefused(format!(
+                "{} leads to {}, in {}, which atoms' commands may write; point the link \
+                 elsewhere",
+                path.display(),
+                lands.display(),
+                root.display()
+            ))));
+        }
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{} is a link to {}, which is not there yet and lies in {}, which atoms' commands may \
+         write, so a command could put a file there for what reads {} to find; point the link \
+         elsewhere, or make what it leads to first",
+        path.display(),
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
+/// Why a denied place that is not there cannot be left so: its path, walked
+/// as [`walk_link`] walks it, would be made in one of `writable`, or runs
+/// through a link a command may point elsewhere, so a command could make it
+/// for what reads it to find. `None` when it would be made elsewhere.
+fn missing_into(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(path, writable, masked) {
+        Ok(Landing::NotYet(lands) | Landing::There(lands)) => lands,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, which is not there yet, would be made at {}, in {}, which atoms' commands may \
+         write, so a command could make it for what reads {} to find; make it first, or run the \
+         project from a directory that does not hold it",
+        path.display(),
+        lands.display(),
+        root.display(),
+        path.display()
+    ))))
+}
+
+/// Why a link that leads somewhere now cannot be denied as what it points at
+/// ([`walk_link`]): a link on the way a command may point elsewhere, as for
+/// a place whose own chain runs through what the thread may write. `None`
+/// when its chain is the thread's to change nowhere.
+fn rewritable_chain(
+    path: &Path,
+    writable: &[PathBuf],
+    masked: &[PathBuf],
+) -> Option<anyhow::Error> {
+    walk_link(path, writable, masked).err()
+}
+
+/// Why a link found inside a denied place cannot be left as it is: its chain
+/// runs through a link a command may point elsewhere, or it leads nowhere
+/// yet into what the thread may write, where a command could put a file for
+/// what reads it to find ([`walk_link`]). `None` otherwise.
+fn link_planted(link: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> Option<anyhow::Error> {
+    let lands = match walk_link(link, writable, masked) {
+        Ok(Landing::NotYet(lands)) => lands,
+        Ok(Landing::There(_)) => return None,
+        Err(e) => return Some(e),
+    };
+    let root = inside_of(writable, &lands)?;
+    Some(anyhow::Error::new(DenyRefused(format!(
+        "{}, inside a place denied to atoms' commands, is a link to {}, which is not there yet \
+         and lies in {}, which they may write, so a command could put a file there for what \
+         reads {} to find; point the link elsewhere, or make what it leads to first",
+        link.display(),
+        lands.display(),
+        root.display(),
+        link.display()
+    ))))
+}
+
+/// The first of `writable` that holds `path`, where a command may change it,
+/// unless a denied place of `masked` holds it too: the sandbox hides what is
+/// inside one, so no command can change it there.
+fn changeable<'a>(writable: &'a [PathBuf], masked: &[PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    if inside_of(masked, path).is_some() {
+        return None;
+    }
+    inside_of(writable, path)
+}
+
+/// The first of `writable` that `dir` lies inside, not at, where a command
+/// may change what `..` from it climbs out of ([`changeable`]).
+fn climbing_out<'a>(
+    writable: &'a [PathBuf],
+    masked: &[PathBuf],
+    dir: &Path,
+) -> Option<&'a PathBuf> {
+    changeable(writable, masked, dir).filter(|root| dir != root.as_path())
+}
+
+/// The first of `dirs` that holds `path`, or is it.
+fn inside_of<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    dirs.iter().find(|d| path.starts_with(d))
+}
+
+/// The most links [`walk_link`] follows, as the kernel does.
+const LINK_HOPS: usize = 40;
+
 /// `path` with the links among the directories above it, and itself,
 /// resolved as far as it exists, and the rest as it is named.
 fn real_spelling(path: &Path) -> PathBuf {
@@ -1464,6 +1796,20 @@ fn real_spelling(path: &Path) -> PathBuf {
             _ => return path.to_owned(),
         }
     }
+}
+
+/// The directory of `writable` that a denied place which is itself a link,
+/// at `link`, sits inside, at any depth. The sandbox mounts its denial on
+/// what the link points at, not on the link, so a command that may write
+/// there could remove the link, and once the list no longer finds it, read
+/// what it pointed at by its own path.
+#[cfg(any(target_os = "linux", test))]
+fn writable_holding_link<'a>(writable: &'a [PathBuf], link: &Path) -> Option<&'a PathBuf> {
+    let at = match (link.parent(), link.file_name()) {
+        (Some(parent), Some(name)) => real_spelling(parent).join(name),
+        _ => link.to_owned(),
+    };
+    writable.iter().find(|w| at.starts_with(w))
 }
 
 /// The first of the directories above `path` that is a link inside one of
@@ -1513,6 +1859,20 @@ pub(crate) fn permission_profile(
     cwd: Option<&Path>,
     writable: &[PathBuf],
 ) -> anyhow::Result<PermissionProfile> {
+    permission_profile_with(sandbox, guard, codex_home, cwd, writable, &[])
+}
+
+/// [`permission_profile`], for a profile that [`deny_also`] will deny
+/// `also` in as well: counted toward the cap as each command's sandbox
+/// helper will count them, though denied by `deny_also`.
+pub(crate) fn permission_profile_with(
+    sandbox: crate::typed::Sandbox,
+    guard: &StateGuard,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+    also: &[PathBuf],
+) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
     };
@@ -1554,7 +1914,7 @@ pub(crate) fn permission_profile(
             FileSystemAccessMode::Read,
         ));
     }
-    let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
+    let (paths, globs) = denied_paths_with(private, codex_home, cwd, writable, also)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
             .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
@@ -1578,6 +1938,18 @@ pub(crate) fn permission_profile(
 /// `profile` with `denied` denied as well: the backend's scratch
 /// directories. What the thread may write inside a denied directory, such as
 /// its own scratch directory, stays writable, as a writable root of its own.
+///
+/// These go into the profile spelled as they were handed over: their cap is
+/// weighed with the list's (`denied_paths_with`), but no link in them is
+/// resolved here. So a scratch or state root that is itself a link reaches
+/// each command's sandbox helper as a denial that is a link, and that walk
+/// denies what it points at instead (see `late_targets`). It refuses the
+/// command, and the command does not run, when what it points at holds a
+/// place the command needs to run, such as the command's own working
+/// directory: a turn whose root lies inside such a linked root is refused
+/// every command of its turn. That fails closed, and is what supporting
+/// scratch or state directories moved elsewhere and linked back would have to
+/// settle -- by resolving them here, before they are denied.
 fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -1598,6 +1970,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
 }
 
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
@@ -1637,6 +2029,9 @@ fn refuse_uncovered_store(
     }
     let mut stores = vec![crate::state::base_dir()?, crate::state::credentials_dir()?];
     stores.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+    stores.extend(crate::state::legacy_secret_dirs(
+        crate::state::legacy_config_dir().as_deref(),
+    ));
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     for root in roots {
         let root = real(root);
@@ -2368,6 +2763,32 @@ fn helper_not_dumpable() {
     }
 }
 
+/// When this process is the outer stage of Codex's Linux sandbox helper,
+/// keep every descriptor it was started with from the programs it starts,
+/// bubblewrap and through it the command, but the socket its proxy token
+/// comes on; or exit. Whatever started the process that started this one
+/// may have left descriptors open, a CI runner's pipes or a person's shell's
+/// files and sockets, and Codex's helper and bubblewrap pass on every one
+/// without close-on-exec. Done first, before the walk that may start the
+/// helper again, which keeps the token's socket, and before Codex's helper
+/// opens what it hands bubblewrap on purpose. The inner stage is left as
+/// it is: what reaches it was handed on purpose.
+fn keep_inherited_descriptors_from_the_command() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
+        let handed: Vec<_> = atomic_exec::inherited::handed_secret_fd()
+            .into_iter()
+            .collect();
+        if let Err(e) = atomic_exec::inherited::keep_from_children(&handed) {
+            crate::log_line!(
+                "atomic: the sandbox helper cannot keep the descriptors it was started with from \
+                 the command; the command does not run: {e}"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Take `name` out of this process's environment, and what it held.
 #[cfg(target_os = "linux")]
 fn take_env(name: &str) -> Option<std::ffi::OsString> {
@@ -2507,7 +2928,6 @@ fn relisted(
 /// link made before what it points at, and refused when it cannot be
 /// resolved for any other reason, such as a loop or a filesystem that has
 /// gone away, since then what it leads to is unknown.
-#[cfg(any(target_os = "linux", test))]
 fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
     match std::fs::canonicalize(link) {
         Ok(target) => Ok(Some(target)),
@@ -2558,12 +2978,18 @@ fn late_link_targets(
 /// mount of `homes`, the directories whose databases the list denies by a
 /// pattern (Codex's home and its second mounts as the list was built)
 /// ([`Late::globs`]), from one read of the mount table
-/// (two where the places are inferred, which needs the table too). Nothing
+/// (two where the places are inferred, which needs the table too). What
+/// `denied` holds is counted from each side, as when the list is built: the
+/// second mounts of its second mounts among them, which is the count
+/// `denied_paths_with` weighs a list against the cap with, so that a list a
+/// thread starts with is not refused by its own commands. Nothing
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
-/// when a link inside a place does; or when the links the places hold and
-/// those second mounts come to more than [`MAX_LINK_TARGETS`].
+/// when a link inside a place does; when a denied entry or a place has
+/// become a link it cannot resolve for a reason other than leading nowhere
+/// ([`resolved`]); or when the links the places hold and those second
+/// mounts come to more than [`MAX_LINK_TARGETS`].
 #[cfg(any(target_os = "linux", test))]
 fn late_targets(
     denied: &[PathBuf],
@@ -2623,6 +3049,19 @@ fn late_targets(
         }
         Ok(())
     };
+    // A denied place that is a link inside a directory the command may write,
+    // as when the list is built.
+    let refuse_link_in_writable = |link: &Path| -> anyhow::Result<()> {
+        if let Some(root) = writable_holding_link(&writable, link) {
+            bail!(DenyRefused(format!(
+                "{} is now a link inside {}, which this command may write, so it could remove \
+                 it and then read what it points at by its own path",
+                link.display(),
+                root.display()
+            )));
+        }
+        Ok(())
+    };
     let mut late = Late::default();
     // A denied entry that is now a link, however it is spelled: the list
     // never holds one, and the sandbox cannot mount on one. Its denial is
@@ -2632,6 +3071,7 @@ fn late_targets(
             continue;
         }
         late.replaced.push(entry.clone());
+        refuse_link_in_writable(entry)?;
         let Some(target) = resolved(entry)? else {
             continue;
         };
@@ -2654,6 +3094,7 @@ fn late_targets(
             // A place that is a link: refused when it leads to what the
             // command needs, whatever that is, or deep inside a directory it
             // may write, as when the list is built.
+            refuse_link_in_writable(place)?;
             let Some(target) = resolved(place)? else {
                 continue;
             };
@@ -2857,6 +3298,7 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// never left in a process that is dumpable again; and give a sandboxed
 /// command its own `TMPDIR`.
 fn as_any_helper() {
+    keep_inherited_descriptors_from_the_command();
     helper_not_dumpable();
     // The walk may start the helper again, so it comes before the token is
     // read: read first, the token would pass through `exec` in the
@@ -3032,7 +3474,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -3113,12 +3556,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -3146,6 +3592,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -3205,7 +3661,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -3307,6 +3768,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 secret_env: secret,
                 ..command.clone()
             },
@@ -3910,11 +4372,21 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
         Constrained::allow_any(deny_also(
-            permission_profile(
+            permission_profile_with(
                 spec.sandbox,
                 guard,
                 codex_home,
@@ -3927,6 +4399,7 @@ where
                         roots
                     }
                 },
+                &spec.denied,
             )?,
             &spec.denied,
         )?),
@@ -4211,6 +4684,21 @@ async fn new_config(
     cwd: &Path,
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
+    new_config_reading(endpoint, codex_home, cwd, arg0_paths, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+}
+
+/// [`new_config`], with the proxy variables a key's refusal reads from
+/// `var` rather than this process's environment.
+async fn new_config_reading(
+    endpoint: &ModelEndpoint,
+    codex_home: &Path,
+    cwd: &Path,
+    arg0_paths: Arg0DispatchPaths,
+    var: fn(&str) -> Option<String>,
+) -> anyhow::Result<Config> {
     let codex_home =
         AbsolutePathBuf::from_absolute_path(codex_home).context("resolve the Codex home")?;
     let cwd = AbsolutePathBuf::from_absolute_path(cwd).context("resolve the working directory")?;
@@ -4278,6 +4766,18 @@ async fn new_config(
         // provider, pointed at another base URL, with no OpenAI sign-in and
         // no websockets.
         None => {
+            // A key to an endpoint on this machine over plain http would go
+            // to a proxy in cleartext, and Codex's client cannot be told to
+            // skip proxies: the turn is refused, saying how to fix it.
+            // Elsewhere than Linux, or told to respect the system's proxy
+            // settings, Codex's client finds its proxy by other rules.
+            let rules =
+                crate::lite::ProxyRules::for_codex(cfg!(target_os = "linux"), respect_system_proxy);
+            if endpoint.api_key_env.is_some()
+                && let Some(why) = crate::lite::proxied_key(&endpoint.base_url, &var, rules)
+            {
+                anyhow::bail!(why);
+            }
             model_provider.name = "atomic endpoint".to_string();
             model_provider.base_url = Some(endpoint.base_url.clone());
             model_provider.env_key = endpoint.api_key_env.clone();
@@ -4940,12 +5440,76 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older atomic's credentials and checkpoint key, kept in the
+    /// configuration directory `dirs` names (on macOS not the one atomic
+    /// uses now), are denied to atoms' commands, with `ATOMIC_HOME` set as
+    /// with it unset, both of them whether they exist yet or not: an older
+    /// atomic can still make one after the guard is built, and a place
+    /// missing when a command starts is denied once it exists. With no such
+    /// directory, nothing is added for them. Every place the guard makes or
+    /// reads is below the case's own throwaway directory.
+    #[test]
+    fn an_older_atomics_credentials_and_keys_are_denied_where_they_are() {
+        let scratch = crate::state::TestScratch::new("legacy-denied");
+        for dir in ["home", "legacy-config/atomic/credentials", "state"] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let also = || match StateGuard::deny_state_dir(scratch.join("state")).expect("a guard") {
+            StateGuard::Deny(private) => private.also,
+            StateGuard::NoProjectState => panic!("no denial"),
+        };
+        let old =
+            ["credentials", "keys"].map(|name| scratch.join("legacy-config/atomic").join(name));
+        assert!(
+            !old[1].exists(),
+            "the older atomic's key directory is here already"
+        );
+        for atomic_home in [Some("/atomic-home"), None] {
+            let mut vars = vec![("HOME", "/home")];
+            vars.extend(atomic_home.map(|home| ("ATOMIC_HOME", home)));
+            let _process = crate::state::as_process_with_dirs(
+                &scratch,
+                &vars,
+                None,
+                Some("legacy-config"),
+                Some("data"),
+            );
+            let denied = also();
+            for place in &old {
+                assert!(
+                    denied.contains(place),
+                    "{} is not denied with ATOMIC_HOME {atomic_home:?}: {denied:?}",
+                    place.display()
+                );
+            }
+        }
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/atomic-home")],
+            None,
+            None,
+            None,
+        );
+        let none = also();
+        assert!(
+            !none
+                .iter()
+                .any(|d| d.starts_with(scratch.join("legacy-config"))),
+            "{none:?}"
+        );
+        assert!(
+            scratch.join("data/atomic/private").is_dir(),
+            "without ATOMIC_HOME the guard did not make the state home the case named"
+        );
+    }
     use crate::testing::{FakeModel, Reply};
 
     #[cfg(unix)]
     #[test]
     fn the_file_behind_a_link_in_a_denied_directory_is_denied_too() {
-        let dir = scratch("linked-deny");
+        let dir_scratch = Scratch::new("linked-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         std::fs::create_dir_all(&config).expect("config dir");
         std::fs::create_dir_all(dir.join("kept")).expect("kept");
@@ -5079,7 +5643,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_token_volume_is_denied_whole() {
-        let dir = scratch("projected-token");
+        let dir_scratch = Scratch::new("projected-token");
+        let dir = dir_scratch.0.clone();
         let volume = dir.join("serviceaccount");
         std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
         std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
@@ -5495,7 +6060,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_volume_is_found_through_links_and_for_nested_items() {
-        let dir = std::fs::canonicalize(scratch("projected-links")).expect("real");
+        let dir_scratch = Scratch::new("projected-links");
+        let dir = dir_scratch.0.clone();
         let version = "..2026_01_01_00_00_00.1";
         let volume = |name: &str| {
             let volume = dir.join(name);
@@ -5618,7 +6184,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_place_behind_a_linked_directory_is_denied_by_its_real_path() {
-        let dir = std::fs::canonicalize(scratch("real-spelling")).expect("real");
+        let dir_scratch = Scratch::new("real-spelling");
+        let dir = dir_scratch.0.clone();
         std::fs::create_dir_all(dir.join("real/gnupg")).expect("gnupg");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         link(&dir.join("real"), &dir.join("linked"));
@@ -5694,7 +6261,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_the_persons_own_files_and_directories_are_denied_behind_links() {
-        let dir = scratch("deniable");
+        let dir_scratch = Scratch::new("deniable");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
@@ -5733,7 +6301,8 @@ mod tests {
     #[test]
     fn a_late_link_is_found_and_one_that_cannot_be_denied_refuses() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-links");
+        let dir_scratch = Scratch::new("late-links");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         for d in [&place, &work.join("deep"), &dir.join("elsewhere")] {
@@ -5781,7 +6350,8 @@ mod tests {
     #[test]
     fn a_static_chain_of_links_finds_nothing_new() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-static");
+        let dir_scratch = Scratch::new("late-static");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.codex");
         let skills = dir.join("dev/skills");
         let store = dir.join("dev/store");
@@ -5810,7 +6380,8 @@ mod tests {
     #[test]
     fn a_place_that_became_a_link_is_replaced_by_its_target() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-place");
+        let dir_scratch = Scratch::new("late-place");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
         std::fs::create_dir_all(dir.join("work/deep")).expect("dir");
@@ -5857,13 +6428,52 @@ mod tests {
         );
     }
 
+    /// A place that has become a link inside a directory the command may
+    /// write is refused when the helper walks again, whether the list denies
+    /// the place itself or carries it as a place.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_that_became_a_link_inside_a_writable_root_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = scratch("late-link-in-writable");
+        std::fs::create_dir_all(dir.join("work")).expect("dir");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
+        let kept = dir.join("elsewhere/kube");
+        std::fs::write(&kept, "token").expect("kept");
+        let place = dir.join("work/kubeconfig");
+        let _ = std::fs::remove_file(&place);
+        link(&kept, &place);
+        let work = [dir.join("work")];
+        let only = std::slice::from_ref(&place);
+        // Denied as an entry of the list, carried as no place.
+        let refused = late_link_targets(only, Some(&[]), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Carried as a place, the list denying what it pointed at.
+        let built = [std::fs::canonicalize(&kept).expect("real")];
+        let refused = late_link_targets(&built, Some(only), &[], &work)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!("{} is now a link inside", place.display())),
+            "{refused}"
+        );
+        // Outside every directory it may write, the target replaces it.
+        assert!(late_link_targets(only, Some(only), &[], &[dir.join("elsewhere-not")]).is_ok());
+    }
+
     /// What the late walk finds is denied once, the outer of nested ones
     /// only, as the sandbox cannot mount a denial inside another.
     #[cfg(unix)]
     #[test]
     fn nested_late_targets_collapse_to_the_outer() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-nested");
+        let dir_scratch = Scratch::new("late-nested");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let kept = dir.join("dev/kept");
         std::fs::create_dir_all(kept.join("b")).expect("dir");
@@ -5938,7 +6548,8 @@ mod tests {
     #[test]
     fn a_carried_place_is_walked_through_a_link() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-carried");
+        let dir_scratch = Scratch::new("late-carried");
+        let dir = dir_scratch.0.clone();
         let ssh = dir.join("home/.ssh");
         let gnupg = dir.join("dev/gnupg");
         std::fs::create_dir_all(&ssh).expect("dir");
@@ -5960,7 +6571,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_late_target_is_denied_at_its_second_mounts() {
-        let dir = scratch("late-aliases");
+        let dir_scratch = Scratch::new("late-aliases");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         std::fs::create_dir_all(&place).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -5995,7 +6607,8 @@ mod tests {
     #[test]
     fn a_denied_entry_that_became_a_link_is_replaced_however_it_is_spelled() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-spelled");
+        let dir_scratch = Scratch::new("late-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         std::fs::create_dir_all(&real_home).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -6489,31 +7102,188 @@ mod tests {
         );
     }
 
+    /// What the profile will deny besides the list, the backend's scratch
+    /// directories, counts toward the cap as each command counts it: the
+    /// builder refuses the list the thread would start with, and so does each
+    /// command's helper, over the same denied.
+    #[cfg(unix)]
+    #[test]
+    fn the_builder_counts_the_scratch_it_will_deny_as_each_command_does() {
+        let dir = Scratch::new("builder-cap-scratch");
+        let codex = dir.0.join("codex");
+        let scratch = dir.0.join("scratch");
+        for d in [&codex, &scratch] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: Vec::new(),
+        };
+        let _table = crate::mounts::with_table(&binds_of(&scratch, MAX_LINK_TARGETS + 1));
+        assert!(denied_paths(&private, &codex, None, &[]).is_ok());
+        let refused =
+            denied_paths_with(&private, &codex, None, &[], std::slice::from_ref(&scratch))
+                .expect_err("refused")
+                .to_string();
+        assert!(
+            refused.contains("with 513 second mounts of what they deny, counted from each side"),
+            "{refused}"
+        );
+        // The scratch directory as one of the paths a command's profile
+        // denies, counted by the walk each command's helper makes before it
+        // starts the command: its own 513 second mounts, and nothing new
+        // found besides.
+        let refused = late_targets(std::slice::from_ref(&scratch), Some(&[]), &[], &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("0 second mounts of what the new ones point at"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
+    }
+
     /// The builder counts second mounts as each command does: from each
-    /// side, so a list it starts a thread with never refuses its commands
-    /// for the cap alone.
+    /// side, so a list it starts a thread with never refuses its commands for
+    /// the cap alone. A list whose second mounts come to the cap from each
+    /// side both accept; the same list with one more of them, both refuse --
+    /// the builder counting the list's own second mounts among what it
+    /// counts, and each command's helper counting the same ones again from
+    /// what the list denies.
     #[cfg(unix)]
     #[test]
     fn the_builder_counts_second_mounts_as_each_command_does() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let dir = Scratch::new("builder-cap");
         let home = dir.0.join("home");
         let place = home.join(".aws");
+        let work = dir.0.join("work");
         let codex = dir.0.join("codex");
-        for d in [&place, &codex] {
+        for d in [&place, &work, &codex] {
             std::fs::create_dir_all(d).expect("dir");
         }
-        // As many binds as the cap: the place's 512 second mounts and the
-        // place itself as theirs make 513 as a command counts them.
-        let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS));
         let private = PrivateState {
             state_dir: dir.0.join("state"),
             private: dir.0.join("private"),
             also: vec![place.clone()],
         };
-        let refused = denied_paths(&private, &codex, None, &[])
+        let guard = StateGuard::Deny(private.clone());
+        let places = [place.clone()];
+        // Binds one short of the cap: the place's 511 second mounts and the
+        // place itself as theirs come to 512, which is the cap, so neither
+        // the builder nor a command of a thread it starts with refuses.
+        let table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS - 1));
+        denied_paths(&private, &codex, Some(&work), &[]).expect("the cap counted from one side");
+        // The list as a command's helper is handed it: the paths its profile
+        // denies, the directories whose databases its patterns deny, and the
+        // places the builder carried.
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let paths = |mode: FileSystemAccessMode| -> Vec<PathBuf> {
+            policy
+                .entries
+                .iter()
+                .filter(|e| e.access == mode)
+                .filter_map(|e| match &e.path {
+                    FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let denied = paths(FileSystemAccessMode::Deny);
+        let homes: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::GlobPattern { pattern } => pattern
+                    .strip_suffix(SQLITE_FILES)
+                    .and_then(|dir| dir.strip_suffix('/'))
+                    .map(PathBuf::from),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(homes, vec![codex.clone()], "{homes:?}");
+        let under_cap = |name: &str| -> Vec<std::ffi::OsString> {
+            [
+                "codex-linux-sandbox".to_owned(),
+                "--sandbox-policy-cwd".to_owned(),
+                work.display().to_string(),
+                "--command-cwd".to_owned(),
+                work.display().to_string(),
+                "--permission-profile".to_owned(),
+                serde_json::to_string(&profile).expect("json"),
+                "--".to_owned(),
+                name.to_owned(),
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect()
+        };
+        let under = late_targets(&denied, Some(&places), &homes, &[], &[]).expect("512 accepted");
+        assert_eq!(under, Late::default(), "{under:?}");
+        assert_eq!(
+            relisted(&under_cap("one"), Some(&places)).expect("nothing new"),
+            None
+        );
+        drop(table);
+        // As many binds as the cap: the place's 512 second mounts and the
+        // place itself as theirs make 513, counted from each side.
+        let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS));
+        let refused = denied_paths(&private, &codex, Some(&work), &[])
             .expect_err("refused")
             .to_string();
-        assert!(refused.contains("counted from each side"), "{refused}");
+        assert!(
+            refused.contains("513 second mounts of what they deny, counted from each side"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
+        // The same list, counted as each of the thread's commands counts it,
+        // is over the cap for the helper too, which is what the builder's
+        // count is held to.
+        let refused = late_targets(&denied, Some(&places), &homes, &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
+        // And the helper's own entry point, which every command's start
+        // calls, is refused by the same walk; its caller logs that and leaves
+        // the command unrun.
+        let refused = relisted(&under_cap("two"), Some(&places))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
     }
 
     /// The helper, given a profile for a place named through a linked
@@ -6525,7 +7295,8 @@ mod tests {
     fn a_place_under_a_linked_directory_that_became_a_link_leaves_no_link_denied() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-spelled");
+        let dir_scratch = Scratch::new("relisted-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -6611,7 +7382,8 @@ mod tests {
     fn a_denial_inside_a_late_target_is_taken_out() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-inner");
+        let dir_scratch = Scratch::new("relisted-inner");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let kept = dir.join("dev/kept");
         let work = dir.join("work");
@@ -6677,7 +7449,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_in_the_list_is_not_walked_as_a_place() {
-        let dir = scratch("late-inferred-alias");
+        let dir_scratch = Scratch::new("late-inferred-alias");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.config/gh");
         let shown = dir.join("dev/gh");
         let again = dir.join("again/gh");
@@ -6735,7 +7508,8 @@ mod tests {
     #[test]
     fn the_helper_relists_a_turns_profile() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted");
+        let dir_scratch = Scratch::new("relisted");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -6798,7 +7572,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
-        let dir = scratch("second-mounts");
+        let dir_scratch = Scratch::new("second-mounts");
+        let dir = dir_scratch.0.clone();
         let codex = dir.join("codex");
         for d in [&codex, &dir.join("home/.aws")] {
             std::fs::create_dir_all(d).expect("dir");
@@ -6842,10 +7617,12 @@ mod tests {
             message.contains("is a second mount") && message.contains("which they need"),
             "{message}"
         );
-        // Where it lies two levels inside a directory the thread may write.
+        // Where it lies two levels inside a directory the thread may write:
+        // the whole filesystem, bound there, is the thread's to write at `/`
+        // too, and so is the place.
         let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
         assert!(
-            message.contains("is a second mount") && message.contains("two or more levels"),
+            message.contains("home/.aws is inside /, which atoms' commands may write"),
             "{message}"
         );
         // Codex's home bound two levels inside a writable directory: its
@@ -6886,7 +7663,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
-        let dir = scratch("covering");
+        let dir_scratch = Scratch::new("covering");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let codex = dir.join("codex");
         let work = dir.join("work");
@@ -6970,7 +7748,8 @@ mod tests {
     #[test]
     fn a_pipe_is_denied_and_only_programs_devices_and_others_directories_are_left() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("pipes");
+        let dir_scratch = Scratch::new("pipes");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
@@ -7062,8 +7841,307 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_place_link_that_cannot_be_resolved_refuses_the_thread() {
+        let dir = Scratch::new("place-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(dir.0.join("codex")).expect("codex home");
+        let aws = home.join(".aws");
+        // A link to itself: ELOOP, for anyone.
+        std::os::unix::fs::symlink(&aws, &aws).expect("link");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![aws.clone()],
+        };
+        let refused = denied_paths(&private, &dir.0.join("codex"), None, &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                aws.display()
+            )) && refused.contains("remove the link, or point it at something atomic can reach"),
+            "{refused}"
+        );
+        // One that leads nowhere yet is passed over, as it always was.
+        std::fs::remove_file(&aws).expect("unlink");
+        std::os::unix::fs::symlink(home.join("not-there"), &aws).expect("link");
+        denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
+    }
+
+    /// What a command could repoint refuses the thread: a place whose own
+    /// chain, there now, runs through a link in what the thread may write; a
+    /// link inside a place that does, or that leads nowhere yet into what
+    /// it may write; and a place that leads into a second mount of what it
+    /// may write, as much the thread's to write as the directory itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_or_a_link_in_one_a_command_could_repoint_refuses_the_thread() {
+        let dir = Scratch::new("place-chains");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let elsewhere = dir.0.join("elsewhere");
+        for d in [&home, &work, &codex, &elsewhere, &dir.0.join("state")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: dir.0.join("state"),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let writable = std::slice::from_ref(&work);
+        let refused = || {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // (b) The place, there now, through a link in what it may write.
+        std::fs::write(elsewhere.join("aws"), "[default]").expect("aws");
+        link(&elsewhere.join("aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                place.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // (a) A link inside the place, leading nowhere yet into what it may
+        // write, and one whose chain runs through a link there.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(&place).expect("dir");
+        let config = place.join("config");
+        link(&work.join("aws-config"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{}, inside a place denied to atoms' commands, is a link to {}, which is not \
+                 there yet and lies in {}",
+                config.display(),
+                work.join("aws-config").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        link(&work.join("hop"), &config);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} leads by way of {}, a link in {}",
+                config.display(),
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        std::fs::remove_file(&config).expect("unlink");
+        std::fs::remove_dir(&place).expect("rmdir");
+        drop(one);
+        // (c) Into a second mount of what it may write.
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /again rw - ext4 /dev/sda1 rw\n",
+            work.display()
+        );
+        let _table = crate::mounts::with_table(table.as_bytes());
+        link(Path::new("/again/aws"), &place);
+        let why = refused().expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to /again/aws, which is not there yet and lies in /again",
+                place.display()
+            )),
+            "{why}"
+        );
+        drop(_table);
+        let one = crate::mounts::with_table(ONE_MOUNT);
+        // A place not there yet, under a directory that is a link into what
+        // it may write, leading nowhere yet.
+        std::fs::remove_file(&place).expect("unlink");
+        let config = home.join(".config");
+        link(&work.join("cfg"), &config);
+        let gh = config.join("gh");
+        let listed = PrivateState {
+            also: vec![gh.clone()],
+            ..private.clone()
+        };
+        let why = denied_paths(&listed, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{}, which is not there yet, would be made at {}, in {}",
+                gh.display(),
+                work.join("cfg/gh").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // A place that is a link in what the thread may write, its target
+        // there now: a command could point it elsewhere.
+        link(&elsewhere.join("aws"), &work.join(".aws"));
+        let in_work = PrivateState {
+            also: vec![work.join(".aws")],
+            ..private.clone()
+        };
+        let why = denied_paths(&in_work, &codex, Some(&work), writable)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            why.contains(&format!(
+                "{} is a link in {}, which atoms' commands may write",
+                work.join(".aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        drop(one);
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        // A place whose chain stays out of what it may write: denied.
+        link(&elsewhere.join("aws"), &place);
+        assert_eq!(refused(), None);
+    }
+
+    /// A place that is a link leading nowhere yet refuses the thread when
+    /// where it would lead, through each further link, lies in what the
+    /// thread may write or in atomic's state, where a command could put a
+    /// file for what reads the place to find, or cannot be told; one that
+    /// leads elsewhere is passed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_place_link_into_what_the_thread_may_write_refuses_it() {
+        let dir = Scratch::new("place-dangling");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let state = dir.0.join("state");
+        for d in [&home, &work, &codex, &state] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: state.clone(),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let refused = |writable: &[PathBuf]| {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let writable = std::slice::from_ref(&work);
+        // Into what the thread may write.
+        link(&work.join("aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to {}, which is not there yet and lies in {}",
+                place.display(),
+                work.join("aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Into atomic's state, for a thread that writes nothing.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&state.join("aws"), &place);
+        let why = refused(&[]).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", state.display())),
+            "{why}"
+        );
+        // Through a further link, also leading nowhere yet.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&work.join("aws"), &dir.0.join("hop"));
+        link(&dir.0.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", work.display())),
+            "{why}"
+        );
+        // Through a link partway along, itself leading nowhere yet, into
+        // what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(dir.0.join("elsewhere")).expect("dir");
+        link(&work.join("d"), &dir.0.join("elsewhere/d"));
+        link(&dir.0.join("elsewhere/d/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "is a link to {}, which is not there yet and lies in {}",
+                work.join("d/aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Through a link a command may point elsewhere: one partway along in
+        // what the thread may write, leading out of it now.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere"), &work.join("lnk"));
+        link(&work.join("lnk/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("lnk").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // And a further link that is itself in what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Up through a directory of what the thread may write, back out of
+        // it: a command could make that directory a link.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(work.join("sub")).expect("dir");
+        link(&work.join("sub/../../elsewhere/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, and climbs back out of it, in {}",
+                work.join("sub").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Somewhere it cannot tell: up from what is not there.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("missing/../aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains("atomic cannot tell where it would lead"),
+            "{why}"
+        );
+        // Elsewhere: passed over, as before.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &place);
+        assert_eq!(refused(writable), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
-        let dir = scratch("linked-secrets");
+        let dir_scratch = Scratch::new("linked-secrets");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
         std::fs::create_dir_all(home.join("keys")).expect("keys");
@@ -7107,7 +8185,8 @@ mod tests {
 
     #[test]
     fn a_denied_path_inside_another_is_left_to_it() {
-        let dir = scratch("nested-deny");
+        let dir_scratch = Scratch::new("nested-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         let credentials = config.join("credentials");
         std::fs::create_dir_all(&credentials).expect("dirs");
@@ -7205,7 +8284,9 @@ mod tests {
     #[test]
     fn a_sign_in_sends_no_organization_or_project_headers() {
         on_codex_runtime(async {
-            let (home, auth) = (scratch("home-headers"), scratch("auth-headers"));
+            let (home_scratch, auth_scratch) =
+                (Scratch::new("home-headers"), Scratch::new("auth-headers"));
+            let (home, auth) = (home_scratch.0.clone(), auth_scratch.0.clone());
             let signed_in = ModelEndpoint {
                 base_url: crate::signin::CODEX_BACKEND.into(),
                 model: "synthetic".into(),
@@ -7236,11 +8317,22 @@ mod tests {
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
+        /// A new directory with a name not to guess, made only where
+        /// nothing is.
         fn new(tag: &str) -> Self {
-            let d = scratch(tag);
-            let _ = std::fs::remove_dir_all(&d);
-            std::fs::create_dir_all(&d).expect("mkdir");
-            Self(std::fs::canonicalize(d).expect("real"))
+            use std::hash::{BuildHasher, Hasher};
+            for _ in 0..16 {
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                let d = std::env::temp_dir()
+                    .join(format!("atomic-codex-{tag}-{:016x}", hasher.finish()));
+                match std::fs::create_dir(&d) {
+                    Ok(()) => return Self(std::fs::canonicalize(d).expect("real")),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => panic!("scratch: {e}"),
+                }
+            }
+            panic!("scratch: no new name");
         }
     }
 
@@ -7300,7 +8392,8 @@ mod tests {
             let model = FakeModel::start(vec![Reply::Text("pong".into())])
                 .await
                 .expect("fake model");
-            let (home, cwd) = (scratch("home"), scratch("cwd"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home"), Scratch::new("cwd"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -7324,13 +8417,108 @@ mod tests {
         });
     }
 
+    /// A Codex atom's key to an endpoint on this machine over plain http, in
+    /// an environment that names no proxy and exempts nothing, with Codex's
+    /// `respect_system_proxy` feature off and on. On Linux, where the feature
+    /// finds no platform settings, the configuration is made either way.
+    /// Elsewhere the platform's settings may name a proxy atomic cannot read:
+    /// with the feature off the key is refused unless NO_PROXY exempts the
+    /// host, and with it on, where NO_PROXY changes nothing, it is refused
+    /// with the feature named.
+    #[test]
+    fn a_key_the_systems_proxy_settings_may_carry_is_refused_where_they_apply() {
+        on_codex_runtime(async {
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} is set in this test's environment"
+                );
+            }
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "synthetic".into(),
+                api_key_env: Some("PATH".into()),
+                sign_in: None,
+            };
+            let plain = scratch("home-no-system-proxy");
+            let default = new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default()).await;
+            let respecting = scratch("home-system-proxy");
+            std::fs::write(
+                respecting.join("config.toml"),
+                "[features]\nrespect_system_proxy = true\n",
+            )
+            .expect("config");
+            let respected = new_config(
+                &endpoint,
+                &respecting,
+                &respecting,
+                Arg0DispatchPaths::default(),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                default.expect("no proxy is named");
+                respected.expect("no proxy is named, and Linux has no platform settings");
+                // A proxy value only Codex's own resolver takes, with a space
+                // before it: reqwest's default reads it as none, and with the
+                // feature on Codex sends the key to it, so the key is refused.
+                let spaced = |name: &str| {
+                    (name == "HTTP_PROXY").then(|| " http://proxy.example:3128".to_owned())
+                };
+                new_config_reading(
+                    &endpoint,
+                    &plain,
+                    &plain,
+                    Arg0DispatchPaths::default(),
+                    spaced,
+                )
+                .await
+                .expect("reqwest's default takes no proxy from it");
+                let message = format!(
+                    "{:#}",
+                    new_config_reading(
+                        &endpoint,
+                        &respecting,
+                        &respecting,
+                        Arg0DispatchPaths::default(),
+                        spaced,
+                    )
+                    .await
+                    .expect_err("refused")
+                );
+                assert!(message.contains("HTTP_PROXY names a proxy"), "{message}");
+            } else {
+                let message = format!("{:#}", default.expect_err("refused"));
+                assert!(
+                    message.contains("the system's proxy settings")
+                        && message.contains(
+                            "set NO_PROXY to include 127.0.0.1, or use an https endpoint"
+                        ),
+                    "{message}"
+                );
+                let message = format!("{:#}", respected.expect_err("refused"));
+                assert!(
+                    message.contains("turn respect_system_proxy off, or use an https endpoint"),
+                    "{message}"
+                );
+            }
+        });
+    }
+
     /// The configuration every Codex thread is started with leaves Codex's
     /// own repository-instruction discovery switched off, on both of the
     /// settings Codex gates it on.
     #[test]
     fn no_threads_configuration_discovers_repository_instructions() {
         on_codex_runtime(async {
-            let home = scratch("home-docs");
+            let home_scratch = Scratch::new("home-docs");
+            let home = home_scratch.0.clone();
             let endpoint = ModelEndpoint {
                 base_url: "http://127.0.0.1:9/unused".into(),
                 model: "synthetic".into(),
@@ -7682,7 +8870,8 @@ mod tests {
         on_codex_runtime(async {
             let replies = (0..TURNS).map(|i| Reply::Text(format!("r{i}"))).collect();
             let model = FakeModel::start(replies).await.expect("fake model");
-            let (home, cwd) = (scratch("home3"), scratch("cwd3"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home3"), Scratch::new("cwd3"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -7724,9 +8913,13 @@ mod tests {
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
-        let state = scratch("exec-sandbox");
+        let state_scratch = Scratch::new("exec-sandbox");
+        let state = state_scratch.0.clone();
         let scratch_dir = state.join("scratch/a1");
         std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        // A place there, as a place not there yet in what a command may
+        // write would refuse the list.
+        std::fs::create_dir_all(state.join("keys")).expect("keys");
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -7797,7 +8990,8 @@ mod tests {
     #[test]
     fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
         use atomic_exec::Confine;
-        let state = scratch("exec-held");
+        let state_scratch = Scratch::new("exec-held");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -7830,7 +9024,8 @@ mod tests {
     #[test]
     fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;
-        let state = scratch("exec-token-socket");
+        let state_scratch = Scratch::new("exec-token-socket");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -7899,7 +9094,8 @@ mod tests {
     #[test]
     fn the_profile_stays_bounded_however_many_projects_there_are() {
         use atomic_exec::Confine;
-        let home = scratch("many-projects");
+        let home_scratch = Scratch::new("many-projects");
+        let home = home_scratch.0.clone();
         let paths =
             CodexPaths::with_helpers("/opt/atomic".into(), "/opt/codex-linux-sandbox".into());
         let profile_len = |home: &Path| {
@@ -8260,7 +9456,8 @@ mod tests {
     fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
         use crate::typed::Sandbox;
         use codex_protocol::permissions::FileSystemAccessMode::*;
-        let dir = scratch("private");
+        let dir_scratch = Scratch::new("private");
+        let dir = dir_scratch.0.clone();
         let state = dir.join("state");
         let home = state.join("codex");
         for sub in [
@@ -8396,7 +9593,8 @@ mod tests {
 
     #[test]
     fn turn_directories_of_dead_processes_are_swept() {
-        let state = scratch("sweep");
+        let state_scratch = Scratch::new("sweep");
+        let state = state_scratch.0.clone();
         let tmp = state.join("tmp");
         std::fs::create_dir_all(&tmp).expect("tmp");
         // A pid that no process has: above the kernel's pid limit.
@@ -8438,7 +9636,8 @@ mod tests {
             ])
             .await
             .expect("fake model");
-            let (home, cwd) = (scratch("home2"), scratch("cwd2"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home2"), Scratch::new("cwd2"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -8747,10 +9946,11 @@ mod tests {
         limit: Limit,
     ) -> (anyhow::Result<(String, ThreadReport)>, Vec<Outcome>, usize) {
         let model = FakeModel::start(replies).await.expect("fake model");
-        let (home, cwd) = (
-            scratch(&format!("home-{tag}")),
-            scratch(&format!("cwd-{tag}")),
+        let (home_scratch, cwd_scratch) = (
+            Scratch::new(&format!("home-{tag}")),
+            Scratch::new(&format!("cwd-{tag}")),
         );
+        let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
         let endpoint = ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),

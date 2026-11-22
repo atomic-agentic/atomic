@@ -27,28 +27,73 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 
 ## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
 # The turn works in a worktree of the fixture's snapshot, never in the
-# checkout: the first compares the checkout that holds the project (its refs,
-# its worktree list, its working tree with every untracked file) before and
-# after, and the second compares the fixture repository the same way when the
-# project sits outside any repository. The third gives its turn a file to
-# write and shows that file committed in the snapshot's worktree, never in the
-# checkout. The last two run a `workspace-write` Codex atom directly and as a
-# step with no `worktree: true`: both are refused `target.unsafe` before the
-# run starts, and the checkout is left as it was.
+# checkout: the first compares the checkout that holds the project before and
+# after — its refs, where HEAD stands and what it is called, its worktree list,
+# the settings in its own configuration and the counts and sizes of its
+# objects, and the bytes of every file it holds, tracked, untracked or ignored,
+# with the repository's configuration file, its hooks and its ignore file — and
+# the second compares the fixture repository the same way when the project sits
+# outside any repository. The third gives its turn a file to write and shows
+# that file in the snapshot's own repository, at the commit atomic accepted for
+# its step, and never in the checkout. The next two run a `workspace-write`
+# Codex atom directly and as a step with no `worktree: true`: both are refused
+# `target.unsafe` before the run starts, neither records a run, and the checkout
+# is left as it was. The sixth runs the one Codex turn whose working directory
+# is the developer's checkout — a read-only Codex atom named directly, which
+# has no worktree to run in and may not write there — and shows it read a file
+# of the checkout, ran there, and left it as it was. The seventh is the control
+# on that comparison: it plants in the checkout, by hand and one at a time, each
+# change to it that git's own answer misses — HEAD detached at its own commit,
+# a hook, a file ignored by the repository's own `info/exclude`, and a file
+# under a `.git` below the top level, none of which `git status` names; the
+# repository's own configuration, which `git status` does not name either and
+# the reading of git the comparison is built on does name; a link to an
+# ancestor of the checkout, which status names but says nothing of where it
+# points, so the walk records the link by that target and never reads through
+# it; and a directory whose contents cannot be listed, which makes the
+# comparison name it and refuse rather than read an unseen file as no change.
+# That last cannot bite for root, which is told past a directory's mode, so a
+# run as root says in its output that it skipped that one plant and every other
+# row still runs. The eighth is the same control on the hooks directory: it
+# moves that directory out and leaves a link where it was, once to the moved
+# directory itself and once to a copy a turn made in hook names this checkout
+# would itself use, and shows the answer as one link and nothing under it; it
+# plants a `.git` inside the hooks directory, which the walk of the hooks must
+# not skip by name, and puts a mode on the directory that refuses the listing.
+# The ninth is it on `.git/info`, which the comparison reads by path instead of
+# walking: `info` replaced by a link to a copy holding the very same `exclude`
+# is reported as the link it is, and not as an ignore file that never changed,
+# and a directory there whose mode refuses the search is refused rather than
+# read as one holding nothing. The tenth is it on the checkout's `.git` itself,
+# which the checkout walk leaves out by name before it asks what the entry is:
+# a `.git` replaced by a link to a copy of the metadata is reported as that
+# link, with none of the copy's configuration, hooks or ignore file read as this
+# checkout's own; a `.git` that is an ordinary file is reported by its bytes; and
+# a `.git` whose mode refuses the search is refused, naming the first path asked
+# under it.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
 fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
 fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
+fixture_cli a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_was
+fixture_cli the_state_a_checkout_is_compared_by_sees_what_git_does_not
+fixture_cli the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link
+fixture_cli the_info_directory_is_compared_by_what_it_is_and_not_through_a_link
+fixture_cli the_git_directory_at_the_top_is_compared_by_what_it_is_and_not_through_a_link
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings
 # replay, the new rule rejects the recorded answer, and the model is called
 # no more than it was when they were recorded. The eval test edits a case's
 # assertion: every call is answered from the recordings (replayed 2, missed 0)
-# and the case fails on replay.
+# and the case fails on replay. The third adds a `validate` rule through
+# `atomic eval`: kept, both cases replay and pass with no model call; broken
+# by one recorded answer, that case fails on replay and the model is still not
+# called.
 atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli a_validate_edit_reuses_the_recordings_and_another_model_throws_them_away
 
 ## After kill and resume, the run keeps its ID, its completed results, its budget spent so far and its first gate deadline.
 # Resumed by the id the killed run printed, which its result names again;
@@ -78,13 +123,20 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 ## Run from directories outside the project, the coding example pins the same base commit and leaves the source repository unchanged.
 # The first runs the coding workflow from the project and from an unrelated
 # directory with `--project` and a relative fixture path, and both runs are
-# bound to the same commit of the same fixture, which is then as it was; the
-# others run the turn where the project sits: outside any repository, and in a
-# subdirectory of the developer's checkout. The last runs the coding example
-# itself, from two directories outside the project, to completion: it pins the
-# revision it was given and not the fixture's own tip, and compares the
-# fixture's refs, its worktrees and its working tree, every untracked file
-# included, once its baseline is bound and again after the change is accepted.
+# bound to the same commit of the same fixture, which is then as it was —
+# and, because a comparison of two equal states proves nothing on its own,
+# that test then plants one change of each kind the comparison reads: a ref,
+# a file in the working tree, an entry in the repository's own configuration,
+# an object in its store and a worktree registered with it, and shows the
+# comparison noticing each in turn. The others run the turn where the project
+# sits: outside any repository, and in a subdirectory of the developer's
+# checkout. The last runs the coding example itself, from two directories
+# outside the project, to completion: its fixture stays checked out on its
+# tip, which is not the revision the runs are given, so what each pins is
+# that revision and never the fixture's HEAD; and the fixture's refs, its
+# worktrees, its working tree with every untracked file, its own
+# configuration and its objects are compared once its baseline is bound and
+# again after the change is accepted.
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
@@ -103,18 +155,28 @@ run_cli a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_
 ## `--project` accepts the manifest file or the directory that holds it, and an input read from a file, from standard input or from `--data` becomes the same run input.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
 
-## A change to validation alone reuses earlier results, labelled as historical, while a change to prepared context, generation schema, tool fixtures or model settings makes the recording unusable.
-# The replay says it is a historical check; the identity is the whole request
-# body less four fields that differ between runs; a replay needs the endpoint
-# it was recorded for; and editing the atom's output schema — one property's
-# description, then a property added — leaves every case without a recording,
-# says to record it again, and calls no model.
+## A change to validation alone reuses earlier results, labelled as historical, while a change to generation schema or model settings makes the recording unusable.
+# The replay says it is a historical check; a `validate` rule added to the
+# atom, through `atomic eval`, is answered from the recordings, labelled
+# historical, and checked against the recorded answers, while another model
+# leaves every case without a recording; the identity is the whole request
+# body less four fields that differ between runs, so every other field of the
+# request, each model setting sent with it included, is part of it; a replay
+# needs the endpoint it was recorded for; and editing the atom's output
+# schema — one property's description, then a property added — leaves every
+# case without a recording, says to record it again, and calls no model.
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli a_validate_edit_reuses_the_recordings_and_another_model_throws_them_away
 atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
 atomic_core cassette::tests::the_identity_ignores_what_varies_between_runs_and_nothing_else
 eval_cli a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key
 eval_cli an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again
-pending: tool fixtures and prepared context are still not shown. No tool definition reaches a recording in this version: an atom that declares any tool is refused at load, a lite atom's request carries none, and the kind that runs with tools, a Codex atom, is refused under cassettes; and a case's `prepared` values load and are then refused by the runner, so what these tests edit is the atom's instructions, not prepared context. A test would record an atom that has a declared tool and a case with prepared values, then replay after editing each, expecting the miss that says to record again.
+# The clause's other half, that a change to prepared context or to a tool
+# fixture makes the recording unusable, moved to M39b: in this version no tool
+# definition reaches a recording (an atom that declares a tool is refused at
+# load, a lite atom's request carries none, and a Codex atom, the kind that
+# runs with tools, is refused under cassettes), and a case's `prepared` values
+# load and are then refused by the runner.
 
 ## `atomic run` returns the same result whether the target is named from inside the project or given as a path from elsewhere.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input

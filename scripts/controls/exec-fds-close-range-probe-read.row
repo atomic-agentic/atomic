@@ -1,0 +1,1 @@
+exec-fds-close-range-probe-read|crates/atomic-exec/src/inherited.rs|    let unread = flags == -1;|    let unread = false; /* CONTROL_OFF */|-p atomic-agentic-exec --lib -- inherited::tests::a_probe_whose_flags_cannot_be_read_is_an_error

@@ -899,6 +899,42 @@ async fn a_private_store_adopts_its_parks_without_a_project() {
         waiting(&before).await.expect("waiting").is_empty(),
         "still no project's"
     );
+
+    // An id is matched by its characters, not its bytes: a renamed park of
+    // a project whose directory name is not ASCII is adopted too.
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_adopt_utf8")));
+    let before = Durare::sqlite(&path).await.expect("engine");
+    let renamed = bare_park(&before, &unique("renamed"), 100).await;
+    let id = renamed.clone();
+    before
+        .control_transaction(move |mut tx| {
+            let id = id.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_park_projects (park_id, project) VALUES (?, ?)",
+                    &[Param::Text(id), Param::Text("old/projét-ü-0123".into())],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .expect("keyed");
+    let mine = Durare::open(
+        &Database::Sqlite(path.clone()),
+        None,
+        DEFAULT_VERSION,
+        "notes/projét-ü-0123",
+    )
+    .await
+    .expect("engine");
+    let ids: Vec<String> = waiting(&mine)
+        .await
+        .expect("waiting")
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(ids, vec![renamed], "a non-ASCII id's renamed park");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

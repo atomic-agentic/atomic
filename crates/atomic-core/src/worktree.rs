@@ -224,9 +224,16 @@ impl Worktrees {
     /// The worktrees of the repository the project at `state` is in, kept
     /// under `state`'s directory.
     pub fn open(state: &ProjectState) -> Result<Self> {
+        Self::open_at(state.root(), state.dir().join("worktrees"))
+    }
+
+    /// The worktrees of the repository `root` is in, kept under `dir`: what
+    /// [`Git::discover`] finds from `root`, for a caller that names the
+    /// directory and where its worktrees go itself.
+    pub fn open_at(root: &Path, dir: PathBuf) -> Result<Self> {
         let git = Git::find()?;
-        let repo = git.discover(state.root())?;
-        Ok(Self::new(repo, state.dir().join("worktrees")))
+        let repo = git.discover(root)?;
+        Ok(Self::new(repo, dir))
     }
 
     /// The worktrees of `repo` (its common git directory, as

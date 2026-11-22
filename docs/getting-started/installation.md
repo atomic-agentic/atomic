@@ -25,18 +25,43 @@ See [availability](../reference/availability.md) before trying a feature.
   API key, or a supported local provider. Subscription sign-in exists upstream;
   Atomic still needs to expose it. The API-key path detects `OPENAI_API_KEY`.
 - Git and your usual build tools for repository work.
-- Deno 2.9.8, for now. Atomic's Astro compiler runs on it, and `atomic check`
-  and `atomic render` refuse any other version. Put it on your `PATH`, or set
-  `ATOMIC_DENO` to its executable; in a checkout of this repository,
-  `python3 scripts/setup-deno.py <dir>` downloads it and verifies its checksum.
-  From v0.7, Atomic downloads and verifies its own pinned
-  [Deno](../guides/atom-code-runtime.md) the first time a project needs it,
-  and this step goes away.
+
+Atomic's Astro compiler is built into the binary and runs on the V8 engine it
+embeds, so `atomic check` and `atomic render` need no Deno, Node or npm. From
+v0.7, atom code and scripts run on a [Deno](../guides/atom-code-runtime.md)
+that Atomic downloads and verifies itself the first time a project needs it.
 
 Read [subscriptions and authentication](authentication.md) for model access:
 `atomic model login` signs Codex atoms in with ChatGPT, and an endpoint with an API key
 serves any atom. Keep credentials out of atom files and committed configuration.
 Local-model setup instructions will accompany the matching release.
+
+## Verifying a download
+
+Each release archive and SBOM is signed with [Sigstore](https://www.sigstore.dev/)
+by the repository's release workflow, with no long-lived key: the signature's
+certificate names the workflow file and the tag it ran on, and the signature is
+recorded in Sigstore's public transparency log. The signature bundle sits beside
+each file on the release page as `<file>.sigstore.json`.
+
+To check an archive before unpacking it, download it and its bundle and run
+[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) 3 or
+later, with the release's tag in place of `v<version>`:
+
+```sh
+cosign verify-blob \
+  --bundle atomic-<version>-<target>.tar.gz.sigstore.json \
+  --certificate-identity https://github.com/atomic-agentic/atomic/.github/workflows/release.yml@refs/tags/v<version> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  atomic-<version>-<target>.tar.gz
+```
+
+It prints `Verified OK` and exits 0 only when the archive is the one the
+workflow signed at that tag. On any other result, do not use the file. The SBOM, `atomic-<version>-<target>.cdx.json`, checks
+the same way with its own bundle, and it records the SHA-256 of the `atomic`
+binary inside the archive ([checking an SBOM](../development.md#releases)).
+`SHA256SUMS` lists every file's checksum but is not itself signed; the bundles
+are what tie a file to the release.
 
 ## After installation
 

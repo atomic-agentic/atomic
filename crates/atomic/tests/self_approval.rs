@@ -696,8 +696,12 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
             assert!(out.status.success(), "{out:?}");
             assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Done.");
             let output = command_output(&model);
+            // Each as a line of its own: the shell's stderr reaches the
+            // output in no fixed order with its stdout, and may fall between
+            // them.
+            let lines: Vec<&str> = output.lines().collect();
             assert!(
-                output.contains("the project\nread-exit=0"),
+                lines.contains(&"the project") && lines.contains(&"read-exit=0"),
                 "argv0 {argv0}: the turn did not see the project: {output}"
             );
             assert!(!output.contains("SQLite format"), "{output}");

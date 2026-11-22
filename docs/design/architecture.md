@@ -148,7 +148,7 @@ as systemd or a container restart policy. M3 covers the panic case.
 | [durare](https://github.com/SamuelXing/durare) | MIT OR Apache-2.0 | Durable workflows, steps, queues, timers and `send`/`recv`, through a fork |
 | [beads](https://github.com/gastownhall/beads) | MIT | The work-graph model, reimplemented in Rust and credited in the third-party notices |
 | [Astro](https://astro.build) | MIT | The `.astro` syntax of declarative atoms, read by the bundled compiler |
-| [Deno](https://deno.com) | MIT | `deno_core` and V8 are linked into the binary today for the isolates that run TypeScript helpers, and the Astro compiler currently needs a Deno 2.9.8 the user provides. A managed Deno for code atoms and scripts is planned for v0.7 |
+| [Deno](https://deno.com) | MIT | `deno_core` and V8 are linked into the binary today, for the isolates that run TypeScript helpers and for the Astro compiler, which atomic runs in a child process of its own; no Deno executable is needed. A managed Deno for code atoms and scripts is planned for v0.7 |
 | [Agent2Agent](https://a2a-protocol.org) | Apache-2.0 | The remote-agent protocol, served and consumed |
 | [Model Context Protocol](https://modelcontextprotocol.io) | MIT | Tools for models and clients, served and consumed |
 | [OpenTelemetry](https://opentelemetry.io) | Apache-2.0 | Traces, metrics and logs following the GenAI semantic conventions |

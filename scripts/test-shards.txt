@@ -46,8 +46,10 @@ test second_mounts
 test stale_roots
 test exec_caches
 test exec_network
+test exec_scratch
 test exec_network_fds
 test exec_network_relist
+test inherited_fds
 test exec_proxy_raise
 test failpoints
 test fixture_cli

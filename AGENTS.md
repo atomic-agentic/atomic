@@ -179,7 +179,7 @@ first.
    change covers every path it claims: lite, Codex and exec atoms, plain and
    `--json` output, every call site. When something becomes built, update
    `docs/reference/availability.md`; when an example changes, run the
-   example checker as CI's examples job does (its virtualenv and pinned Deno
+   example checker as CI's examples job does (its virtualenv and a built atomic
    included).
 4. **Fail closed.** No error path, empty set, unknown value or missing
    component ends up allowing, showing or passing what it should refuse.
@@ -223,17 +223,21 @@ first.
    test with an error other than NotFound, such as a mode-000 directory or a
    link to itself, and assert the error took effect, so that under root the
    test fails rather than passing vacuously. Put the list in your report.
-10. **Prove every row bites, by running it.**
+10. **Prove every row bites, by running it.** CI's Controls workflow runs
+    each row whose row file, switched file or guarding test your pull
+    request changes; quote each row's result line from its shard's summary
+    ("ok <row>: …"). Check the "Touched controls" summary's "deleted" and
+    "not run in CI" lines too, and run a row listed in
+    `scripts/controls-local.txt` yourself. Run a row locally only while you
+    debug it:
     `ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>`
-    for each row you added or touched (in a linked worktree, mount the main
-    checkout's `.git` as docs/development.md describes), and quote each
-    result line. The script refuses files that differ from HEAD, so it runs
-    on committed work; if you have not been asked to commit, say which rows
-    are unrun and why. For each row, say what the switched-off code then
-    does and which assertion fails. A guard with two halves (kill and reap,
-    the terms of a count, a check and its message) is switched off one half
-    at a time; a half whose removal
-    fails no test gets its own test and row. With any control off, the test
+    (in a linked worktree, mount the main checkout's `.git` as
+    docs/development.md describes). Rows run only on committed work; if you
+    have not been asked to commit, say which rows are unrun and why. For
+    each row, say what the switched-off code then does and which assertion
+    fails. A guard with two halves (kill and reap, the terms of a count, a
+    check and its message) is switched off one half at a time; a half whose
+    removal fails no test gets its own test and row. With any control off, the test
     still needs no network and no real provider: point every endpoint it
     could fall through to at loopback.
 

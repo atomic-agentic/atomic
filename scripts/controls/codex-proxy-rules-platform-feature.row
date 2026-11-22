@@ -1,0 +1,1 @@
+codex-proxy-rules-platform-feature|crates/atomic-core/src/lite.rs|            (false, true) => Self::Platform,|            (false, true) => Self::VariablesOrPlatform,|-p atomic-agentic-core --lib --features fake-model a_codex_atoms_proxy_rules_follow_the_platform_and_the_feature

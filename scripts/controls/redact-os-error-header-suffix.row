@@ -1,0 +1,1 @@
+redact-os-error-header-suffix|crates/atomic-core/src/redact.rs|        let header = ends_in_header(&input[name_start..name_end]);|        let header = is_header_name(&input[name_start..name_end]); // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::a_word_after_an_os_error_stays_hidden_where_the_error_is_not_kept_whole

@@ -777,17 +777,19 @@ fn bounded(mut run: Command, at: &Path) -> std::process::Output {
 /// own, named after `dir`:
 /// the tests that call this run at once, and each removes its home first.
 async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
-    look_once_prepared(dir, home, command, env, &|_| {}).await
+    look_once_prepared(dir, home, command, env, &|_| {}, false).await
 }
 
 /// [`look_once`], with `prepare` given the project's state directory, made
-/// by an earlier command, before the run.
+/// by an earlier command, before the run, and `atomic run` started with
+/// [`support::PLANTED`] open when `planted`.
 async fn look_once_prepared(
     dir: &Path,
     home: &Path,
     command: &str,
     env: &[(&str, &str)],
     prepare: &(dyn Fn(&Path) + Sync),
+    planted: bool,
 ) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
@@ -832,11 +834,13 @@ async fn look_once_prepared(
     let state = atomic(&["debug", "state-dir"]).output().unwrap();
     assert!(state.status.success(), "{state:?}");
     prepare(Path::new(String::from_utf8_lossy(&state.stdout).trim()));
-    let run = atomic(&["run", "look", "--data", r#"{"text": "the note"}"#]);
+    let mut run = atomic(&["run", "look", "--data", r#"{"text": "the note"}"#]);
+    let left = planted.then(|| support::plant(&mut run, &dir.join("left-open")));
     let at = dir.join("look");
     let out = tokio::task::spawn_blocking(move || bounded(run, &at))
         .await
         .unwrap();
+    drop(left);
     assert!(
         out.status.success(),
         "stdout: {}\nstderr: {}",
@@ -947,6 +951,7 @@ fn a_turns_command_runs_under_an_old_bubblewrap_and_never_a_planted_helper() {
             "echo command-ran",
             &[("PATH", path.as_str())],
             &unlink,
+            false,
         )
         .await;
         assert!(!ran.exists(), "the planted program ran: {printed}");
@@ -1095,6 +1100,34 @@ fn a_linked_secret_marked_executable_stays_denied() {
             !printed.contains("canary"),
             "the marked secret was read: {printed}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// `atomic run`, started with descriptors left open (a pipe, a file, a
+/// socket, one at a high number), runs a turn whose shell holds none of
+/// them. Codex's process launcher also marks, as far as it can, what a
+/// turn's commands would inherit close-on-exec, so this holds even without
+/// atomic's own sweeps (`inherited_fds` tests those); it is here so that it
+/// stays true.
+#[test]
+fn a_turns_shell_holds_none_of_the_descriptors_atomic_was_started_with() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-turn-fds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let command = "python3 -c \"import os; print('fds=' + ','.join(sorted(fd for fd in \
+                       os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + fd))))\"";
+        let printed = look_once_prepared(&dir, &home, command, &[], &|_| {}, true).await;
+        let fds: Vec<i32> = printed_value(&printed, "fds")
+            .split(',')
+            .map(|fd| fd.trim().parse().unwrap())
+            .collect();
+        for left in support::PLANTED {
+            assert!(!fds.contains(&left), "the shell holds {left}: {fds:?}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -1474,8 +1507,18 @@ async fn patch_keeps_its_registry(tag: &str, relative: bool) {
         .into_iter()
         .map(|r| r.parent().unwrap().to_owned())
         .collect();
+    // In the shared directory of the backend runs use: the project's `run`
+    // root in the home's `scratch/`. The home is the state given as
+    // `ATOMIC_HOME`, or else `atomic` in the `XDG_DATA_HOME` it was given.
+    let atomic = if relative {
+        state.clone()
+    } else {
+        state.join("atomic")
+    };
     assert!(
-        shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
+        shared.len() == 1
+            && shared[0].ends_with("run/.tmp")
+            && shared[0].starts_with(atomic.join("scratch")),
         "registries: {shared:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);

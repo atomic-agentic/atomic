@@ -28,6 +28,10 @@ fake-model = []
 # reach this machine's loopback interface on any port, for the sandbox suites
 # that serve on it. Never in a build that runs atoms.
 exec-loopback-tests = []
+# A test binary that links atomic-core serves as the Astro compiler's child
+# process, as the atomic binary does, so other crates' tests can compile atoms
+# in-process. For other crates' tests; never in a release build.
+compiler-in-tests = ["dep:ctor"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -37,6 +41,8 @@ ignore = { workspace = true }
 jsonschema = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -56,6 +62,7 @@ codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
 codex-network-proxy = { workspace = true }
 deno_core = { workspace = true }
+ctor = { workspace = true, optional = true }
 codex-keyring-store = { workspace = true }
 codex-login = { workspace = true }
 codex-process-hardening = { workspace = true }
@@ -68,4 +75,5 @@ seccompiler = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }
