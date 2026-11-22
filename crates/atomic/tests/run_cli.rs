@@ -715,6 +715,18 @@ fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path
     spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, None)
 }
 
+/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
+fn spawn_logged(
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    log: &Path,
+    out: &Path,
+) -> Child {
+    spawn_streams(Path::new(ATOMIC), dir, cwd, args, env, log, Some(out))
+}
+
 fn text(out: &Output) -> String {
     format!(
         "stdout: {}\nstderr: {}",
@@ -6819,8 +6831,7 @@ fn a_project_outside_any_repository_is_refused_only_where_a_worktree_is_asked() 
             &log,
             &out_file,
         );
-        let g = match tokio::time::timeout(Duration::from_secs(60), await_gate(&rt, "ask-1")).await
-        {
+        let g = match tokio::time::timeout(Duration::from_secs(60), open_gate(&rt, "ask-1")).await {
             Ok(g) => g,
             Err(_) => panic!("{}", said("ask-1 never opened its gate")),
         };
