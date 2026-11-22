@@ -118,7 +118,12 @@ header's name or a secret's. Where its JSON does not parse, cut short, after
 other text or written as Python writes a dict, in single quotes, it is read
 too, with up to four other fields between its name and value, either one
 first, and a name with `\u` escapes; not where a field's own name is
-written with `\u` escapes, as no JSON writer does for a plain letter.
+written with `\u` escapes, as no JSON writer does for a plain letter, and
+not with five fields or more between name and value, or a field between
+that is an object, an array or a long or escaped string, nor as a Python
+tuple or bytes. An object for a value under a name that only hints at a
+secret, such as `token`, is read for what it holds, not hidden whole, and
+a name given after its value that the text cuts short cannot be judged.
 Redaction over-matches rather than under-matches, but it does let some
 things through: a short or word-like
 value after a name that only hints at a secret (`pass: 12`, `token: expired`),

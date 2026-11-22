@@ -1458,16 +1458,32 @@ fn pair_value_len(rest: &str, level: usize, quote: u8) -> Option<usize> {
 /// outside quoted strings, or to the end of the line if none does.
 fn pair_nested_len(rest: &str) -> usize {
     let mut depth = 0usize;
-    let mut quoted: Option<u8> = None;
+    // The quote a string inside opened with and the backslashes before it:
+    // it closes as [`pair_value_len`] closes a value, so an escaped quote
+    // inside it, `"x\"}"`, does not.
+    let mut quoted: Option<(u8, usize)> = None;
+    let mut backslashes = 0;
     for (i, b) in rest.bytes().enumerate() {
         step(1);
-        match (quoted, b) {
-            (_, b'\n') => return i,
-            (Some(q), b) if b == q => quoted = None,
-            (Some(_), _) => {}
-            (None, b'"' | b'\'') => quoted = Some(b),
-            (None, b'{' | b'[') => depth += 1,
-            (None, b'}' | b']') => {
+        match b {
+            b'\n' => return i,
+            b'\\' => {
+                backslashes += 1;
+                continue;
+            }
+            b'"' | b'\'' => match quoted {
+                Some((quote, level))
+                    if b == quote
+                        && backslashes >= level
+                        && (backslashes - level).is_multiple_of(2 * (level + 1)) =>
+                {
+                    quoted = None;
+                }
+                Some(_) => {}
+                None => quoted = Some((b, backslashes)),
+            },
+            b'{' | b'[' if quoted.is_none() => depth += 1,
+            b'}' | b']' if quoted.is_none() => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return i + 1;
@@ -1475,6 +1491,7 @@ fn pair_nested_len(rest: &str) -> usize {
             }
             _ => {}
         }
+        backslashes = 0;
     }
     rest.len()
 }
@@ -1490,6 +1507,8 @@ fn pair_name(written: &str) -> Cow<'_, str> {
     while let Some(at) = rest.find('\\') {
         name.push_str(&rest[..at]);
         let escape = rest[at..].trim_start_matches('\\');
+        let run = rest.len() - at - escape.len();
+        step(run);
         let code = escape
             .strip_prefix('u')
             .and_then(|hex| hex.get(..4))
@@ -1500,9 +1519,12 @@ fn pair_name(written: &str) -> Cow<'_, str> {
                 name.push(c);
                 rest = &escape[5..];
             }
+            // Not an escape that reads, as `\\ud800` alone: the run of
+            // backslashes is kept as written, and read past once.
             None => {
-                name.push_str(&rest[at..at + 1]);
-                rest = &rest[at + 1..];
+                let past = at + run;
+                name.push_str(&rest[at..past]);
+                rest = &rest[past..];
             }
         }
     }
@@ -1556,13 +1578,15 @@ fn pairs(input: &str) -> Option<String> {
             }
             let len = pair_value_len(&input[from..], level, quote);
             let to = len.map_or_else(|| line_end(from), |len| from + len);
-            // An array is a pair only when its value ends it, or is cut:
-            // `["X-Api-Key", "…"]`, not a list of three.
-            let closed = input[to..]
+            // An array is a pair only when its value ends it, or is cut,
+            // within the value or after it, where the text or the line
+            // ends: `["X-Api-Key", "…"]`, not a list of three.
+            let after = input[to..]
                 .trim_start_matches(['\\', '"', '\''])
-                .trim_start()
-                .starts_with(']');
-            let pair = explicit || len.is_none() || closed;
+                .trim_start_matches([' ', '\t', '\r']);
+            let closed = after.starts_with(']');
+            let ended = after.split('\n').next() == Some("");
+            let pair = explicit || len.is_none() || closed || ended;
             let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
             if pair && holds(&c[1], value, explicit) {
                 hidden.push((from, to));

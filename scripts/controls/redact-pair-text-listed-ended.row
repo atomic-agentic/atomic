@@ -1,0 +1,1 @@
+redact-pair-text-listed-ended|crates/atomic-core/src/redact.rs|            let ended = after.split('\n').next() == Some("");|            let ended = false; /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- redact::tests::pair_shapes_beyond_side_by_side_fields_are_read_as_text

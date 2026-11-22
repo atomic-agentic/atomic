@@ -3244,6 +3244,24 @@ fn reading_pairs_as_text_takes_linear_steps() {
             "ladder {case}: {large} steps at sixteen times the size of {small}"
         );
     }
+    // A name holding a long run of backslashes before an escape that does
+    // not read, an unpaired surrogate, name first, as an array and value
+    // first: the run is read past once.
+    for (case, shape) in [
+        "\"name\": \"{run}ud800\", \"value\": \"x\"",
+        "[\"{run}ud800\", \"x\"]",
+        "\"value\": \"x\", \"name\": \"{run}ud800\"",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = |run: usize| shape.replace("{run}", &"\\".repeat(run));
+        let (small, large) = (steps_of(&line(1024)), steps_of(&line(16 * 1024)));
+        assert!(
+            large < 32 * small,
+            "surrogate {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
     for (case, unit) in [
         "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
         "\"value\": \\\\\\\"x \"",
@@ -3320,6 +3338,10 @@ fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
         format!("{{\"name\": \"\\u0041uthorization\", \"value\": \"{key}\""),
         format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"v\": \"{key}\"}}"),
         format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key"),
+        // An array pair cut just after its value, and an object for a value
+        // whose string holds an escaped quote and a bracket.
+        format!("[\"X-Api-Key\", \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"p\": \"x\\\"}}\", \"q\": \"{key}\"}}}}"),
     ]
     .into_iter()
     .enumerate()
