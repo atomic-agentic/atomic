@@ -637,6 +637,10 @@ fn google_named(
     Ok(())
 }
 
+/// How a name under the home directory starts, as botocore and gcloud expand
+/// one.
+const HOME_PREFIXES: [&str; 3] = ["~/", "$HOME/", "${HOME}/"];
+
 /// The places the variable `name` in `env` names, as botocore and gcloud
 /// read it: as it is when absolute; under each of `homes` when it starts
 /// `~/`, `$HOME/` or `${HOME}/`; and otherwise relative to the working
@@ -656,7 +660,7 @@ fn expanded(
     }
     let text = value.to_string_lossy();
     // `scripts/controls/expanded-home.row` switches this off.
-    let under_home: &[&str] = &["~/", "$HOME/", "${HOME}/"];
+    let under_home: &[&str] = &HOME_PREFIXES;
     if let Some(rest) = under_home.iter().find_map(|p| text.strip_prefix(p)) {
         return Ok(homes.iter().map(|home| home.join(rest)).collect());
     }
