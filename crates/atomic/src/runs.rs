@@ -644,13 +644,13 @@ pub async fn resume(
                         .text("run ")
                         .name(id)
                         .text(" is owned by executor ")
-                        .name(&owner)
+                        .name(owner)
                         .text(", not this one (")
                         .name(engine.rt.executor_id())
                         .text("), and may still be running there"),
                     Said::new()
                         .text("let executor ")
-                        .name(&owner)
+                        .name(owner)
                         .text(
                             " finish it, or restart its `atomic serve`; if that executor has \
                              stopped for good, run `atomic runs resume ",
