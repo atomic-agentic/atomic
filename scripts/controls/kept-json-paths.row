@@ -1,0 +1,1 @@
+kept-json-paths|crates/atomic-core/src/redact.rs|fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {|fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool { if true { return true; } /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::json_text_redaction_mends_does_not_hide_json_it_breaks

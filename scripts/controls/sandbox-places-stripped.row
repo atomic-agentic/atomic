@@ -1,0 +1,1 @@
+sandbox-places-stripped|crates/atomic-core/src/codex.rs|        let carried = take_env(PLACES);|        let carried = std::env::var_os(PLACES); // CONTROL_OFF|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test command_environment atom_commands_get_only_core_and_declared_variables_on_every_backend

@@ -57,6 +57,50 @@ impl Wire {
     }
 }
 
+/// The HTTP client a lite atom calls the model endpoint at `base_url` with,
+/// every request bounded by `timeout`. It follows no redirect: a redirect
+/// would resend the key, and reqwest keeps the `Authorization` header across
+/// a change from `https` to `http` on the same host and port. An endpoint
+/// on this machine over plain `http` goes by no proxy, since a proxy
+/// variable such as `HTTP_PROXY` would otherwise carry the key there in
+/// cleartext; any other endpoint uses the proxies the environment names.
+pub fn model_client(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if http_loopback(base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().context("build the HTTP client")
+}
+
+/// Whether `base_url` is plain `http` to this machine: a loopback address,
+/// an unspecified one (`0.0.0.0` or `[::]`, which connect here), either as
+/// an IPv4-mapped IPv6 address, or `localhost`.
+pub(crate) fn http_loopback(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str().filter(|_| url.scheme() == "http") else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let here = |ip: std::net::IpAddr| ip.is_loopback() || ip.is_unspecified();
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| here(v4.into())) => {
+            true
+        }
+        Ok(ip) => here(ip),
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    }
+}
+
 /// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
 /// a Responses API structured-output schema in decoding. Other servers may
 /// accept the schema on that API and ignore it.
@@ -245,10 +289,7 @@ where
         ),
         None => None,
     };
-    let client = reqwest::Client::builder()
-        .timeout(runtime.timeout)
-        .build()
-        .context("build the HTTP client")?;
+    let client = model_client(&runtime.endpoint.base_url, runtime.timeout)?;
 
     let mut exchange = vec![(Role::User, first.prompt.clone())];
     let mut schema = first.output_schema.clone();
@@ -417,18 +458,23 @@ async fn call(
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = response
             .text()
             .await
             .with_context(|| format!("read the response from {url}"))?;
-        anyhow::Ok((status, text))
+        anyhow::Ok((status, location, text))
     })
     .await;
     let failed = |answer: anyhow::Error| Called {
         answer: Err(answer),
         usage: None,
     };
-    let (status, text) = match exchanged {
+    let (status, location, text) = match exchanged {
         Ok(Ok(done)) => done,
         Ok(Err(e)) => return failed(e),
         Err(_) => {
@@ -445,7 +491,12 @@ async fn call(
         Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
     });
     let answer = if !status.is_success() {
-        Err(ProviderError::answered(&url, status, &text, value.as_ref()).into())
+        let answered =
+            anyhow::Error::from(ProviderError::answered(&url, status, &text, value.as_ref()));
+        match redirect_advice(base, &url, status, location.as_deref()) {
+            Some(advice) => Err(answered.context(format!("POST {url}: {advice}"))),
+            None => Err(answered),
+        }
     } else {
         match &value {
             None => Err(anyhow!(
@@ -460,6 +511,51 @@ async fn call(
         }
     };
     Called { answer, usage }
+}
+
+/// The longest redirect target an error repeats, in characters.
+const MAX_REDIRECT_SAID: usize = 256;
+
+/// What to say of a redirect answering the call to `url`, under the endpoint
+/// `base`, when `status` is a redirect with a `location`: where it points,
+/// without a query, a fragment or credentials, which can carry a signature or
+/// a token, and cut to [`MAX_REDIRECT_SAID`] characters. The base URL to set
+/// instead is suggested only for a redirect on the same host, no weaker in
+/// scheme, whose path keeps the call's own; a move to plain `http` or to
+/// another host is said as such, and anything else gets no suggestion.
+fn redirect_advice(
+    base: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> Option<String> {
+    if !status.is_redirection() {
+        return None;
+    }
+    let from = reqwest::Url::parse(url).ok()?;
+    let mut target = from.join(location?).ok()?;
+    target.set_query(None);
+    target.set_fragment(None);
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    let said = |text: &str| match text.char_indices().nth(MAX_REDIRECT_SAID) {
+        Some((cut, _)) => format!("{}...", &text[..cut]),
+        None => text.to_owned(),
+    };
+    let target_text = target.to_string();
+    let mut advice = format!(
+        "the endpoint redirects to {}; atomic does not follow a redirect with the key",
+        said(&target_text)
+    );
+    let call = url.strip_prefix(base).unwrap_or_default();
+    if from.scheme() == "https" && target.scheme() != "https" {
+        advice.push_str("; the redirect gives up https, which would expose the key");
+    } else if target.host_str() != from.host_str() {
+        advice.push_str("; the redirect is to another host");
+    } else if let Some(moved) = target_text.strip_suffix(call).filter(|_| !call.is_empty()) {
+        advice.push_str(&format!("; set model.base_url to {}", said(moved)));
+    }
+    Some(advice)
 }
 
 /// A provider's answer that is not a success: its status, the start of its

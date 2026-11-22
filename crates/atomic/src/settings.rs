@@ -299,10 +299,36 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
-            user_config_dir: &atomic_core::state::user_config_dir,
+            user_config_dir: &user_config_dir_here,
             sign_in: &|_| Ok(None),
         }
     }
+}
+
+/// [`Surroundings`] reads the person's own configuration directory from this
+/// process with [`atomic_core::state::user_config_dir`], which reads
+/// `XDG_CONFIG_HOME` and `HOME` as the operating system gives them and falls
+/// back to the home the password database gives: the same resolution the denial
+/// of that directory to atoms' commands and the refusal of a state directory
+/// inside it are made from.
+///
+/// A function, where every other field `without_probe` gives is a closure,
+/// because a control's switch is written in a `|`-delimited row (see
+/// `scripts/controls-check.sh`), which no closure can be written without.
+/// `scripts/controls/settings-user-config-dir.row` switches what this asks of
+/// `XDG_CONFIG_HOME` and `HOME` to what [`Surroundings::env`] already gives —
+/// the same two variables read as text — which is the one reading that sees
+/// nothing where the operating system gives bytes that are not text, and so the
+/// one that looks for a person's settings in another directory than the one the
+/// denial covers. The row runs
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`,
+/// which gives a command a configuration directory of just such bytes: that is
+/// where the two readings part, and the switch keeps the home the password
+/// database gives, since that fallback is what
+/// `scripts/controls/state-config-passwd-home.row` and
+/// `scripts/controls/state-check-passwd-wired.row` switch, in `state.rs`.
+fn user_config_dir_here() -> Option<PathBuf> {
+    atomic_core::state::user_config_dir()
 }
 
 /// The person's sign-in, if someone is signed in, found without creating
@@ -311,7 +337,13 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
     match SignIn::located(project) {
         Ok(sign_in) => found(sign_in),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => Ok(None),
-        Err(e) => Err(e.to_string()),
+        // Refused where it is kept: with no directory there no one ever
+        // signed in, and nothing is refused; with one, it may hold a
+        // sign-in, and that it cannot be used is said.
+        Err(e) => match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d)) {
+            Some(Err(gone)) if absent(&gone) => Ok(None),
+            _ => Err(e.to_string()),
+        },
     }
 }
 
@@ -321,14 +353,42 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
 /// unreachable keyring among them, is said, never taken for "signed out":
 /// that would move model calls to another account without a word.
 fn found(sign_in: SignIn) -> SignInFound {
-    if !sign_in.auth_home().is_dir() {
-        return Ok(None);
+    match std::fs::metadata(sign_in.auth_home()) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(gone) if absent(&gone) => return Ok(None),
+        // Something else there, or a directory that cannot be looked at, as
+        // under an ancestor this user cannot enter: not taken for absent.
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory",
+                sign_in.auth_home().display()
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", sign_in.auth_home().display())),
     }
     match sign_in.account() {
         Ok(Some(_)) => Ok(Some(sign_in)),
         Ok(None) => Ok(None),
         Err(e) => Err(format!("{e:#}")),
     }
+}
+
+/// The note for a sign-in that is there and cannot be used.
+fn unusable(why: &str) -> String {
+    format!(
+        "the ChatGPT sign-in could not be read: {why}; a run that calls a model is refused \
+         until it can be"
+    )
+}
+
+/// Whether looking at a path failed because nothing is there: no entry, or
+/// a component that is a file. Anything else, a permission refused among
+/// them, is no answer, and never taken for absent.
+fn absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// The root of the project configured in `dir`: `dir`, or its parent for an
@@ -529,7 +589,7 @@ pub fn resolve(
         match (around.sign_in)(project) {
             Ok(found) => sign_in = found,
             Err(why) => {
-                notes.push(format!("the ChatGPT sign-in could not be read: {why}"));
+                notes.push(unusable(&why));
                 sign_in_unreadable = Some(why);
             }
         }
@@ -1539,6 +1599,16 @@ impl Resolved {
         self.sign_in.is_some() && self.settings.model.base_url.is_none()
     }
 
+    /// Whether someone chose the model endpoint: a flag, a variable or a
+    /// configuration file set `model.base_url`. Such an endpoint comes before
+    /// the sign-in, which is then not looked for. One detection found, from
+    /// `OPENAI_API_KEY` or a local Ollama, comes only after it.
+    pub fn endpoint_chosen(&self) -> bool {
+        let source = self.sources.get("model.base_url");
+        let detected = matches!(source, Some(Source::Detected(_)));
+        self.settings.model.base_url.is_some() && !detected
+    }
+
     /// Every setting for `atomic config --explain`: its path, its value as
     /// shown, with secrets masked, and where it came from.
     pub fn explain(&self, env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, Value, String)> {
@@ -1715,9 +1785,26 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
     let signed_in = match SignIn::located(in_project.then_some(root.as_path())) {
         Ok(sign_in) => sign_in.explain(),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
+        // Said as resolution says it, when there is a sign-in's directory
+        // there to say it of.
         Err(e) => {
-            let note = format!("the ChatGPT sign-in could not be read: {e}");
-            if !notes.contains(&note) {
+            let there = match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d))
+            {
+                Some(Err(gone)) => !absent(&gone),
+                _ => true,
+            };
+            // With an endpoint configured, the sign-in is not looked for and
+            // a run uses the endpoint.
+            let configured = resolved.sign_in_unreadable.is_none() && resolved.endpoint_chosen();
+            let note = if configured {
+                format!(
+                    "the ChatGPT sign-in could not be read: {e}; not used: a model endpoint is \
+                     configured, which comes first"
+                )
+            } else {
+                unusable(&e.to_string())
+            };
+            if there && !notes.contains(&note) {
                 notes.push(note);
             }
             None

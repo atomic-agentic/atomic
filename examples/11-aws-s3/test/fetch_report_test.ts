@@ -1,6 +1,6 @@
 // The two refusals of an over-limit report, from inside the test process.
 //
-//   deno test -A --lock=deno.lock --frozen test/
+//   deno test -A --lock=deno.lock --frozen --cached-only test/
 //
 // A step that ran in a child process hands its open sockets to the kernel when
 // it exits, so a child-process test cannot tell whether the fetch ended its
@@ -54,25 +54,40 @@ const useFake = (s3: FakeS3) => {
   };
 };
 
-/** What one fetchReport call did, and how long it took. */
+/** What one fetchReport call did: the instant it came back, and what it said. */
 const refuse = async (key: string) => {
-  const started = Date.now();
   try {
     await fetchReport({ key });
-    return { ms: Date.now() - started, message: undefined };
+    return { refusedAt: Date.now(), message: undefined };
   } catch (error) {
-    return { ms: Date.now() - started, message: (error as Error).message };
+    return { refusedAt: Date.now(), message: (error as Error).message };
   }
 };
 
 /**
- * Says that this GET's transfer ended with the refusal that just happened, and
- * not later or not at all, and returns what the fake saw. The two clocks start
- * together — one when the call is made, one when its request reaches the fake —
- * so they are comparable, with a second left for scheduling. Nothing here has
- * exited, so the close the fake sees can only be the fetch's own.
+ * How long after its refusal the close may reach the fake: long enough for a
+ * close over loopback and a turn of the poll below, and far short of the
+ * seconds a body nobody is reading takes to drain.
  */
-const assertEnded = async (s3: FakeS3, refusedAfterMs: number): Promise<Transfer> => {
+const CLOSE_MARGIN_MS = 500;
+
+/**
+ * Says that this GET's transfer ended with the refusal, and returns what the
+ * fake saw. Timed from `refusedAt`, the instant the fetch came back, on this
+ * process's own clock: one clock for the refusal and for the wait, rather
+ * than two that have to be lined up. The fake's own `stoppedMs` is quoted in
+ * what follows, where it says when its handler saw the close.
+ *
+ * The two bounds do different jobs. The poll gives the close a second to
+ * arrive and then says the transfer was left running, which is what turns a
+ * refusal that ended nothing into a failure instead of a hang. The check
+ * after it is tighter: the close has to reach the fake within
+ * CLOSE_MARGIN_MS of the refusal, so a transfer that was ended only later —
+ * once the body had been read out, say — fails even though the poll saw it.
+ * Nothing here has exited, so the close the fake sees can only be the
+ * fetch's own.
+ */
+const assertEnded = async (s3: FakeS3, refusedAt: number): Promise<Transfer> => {
   let seen = transfer(s3);
   for (let waited = 0; !seen.closedEarly && waited <= 1_000; waited += 10) {
     await new Promise((r) => setTimeout(r, 10));
@@ -81,12 +96,14 @@ const assertEnded = async (s3: FakeS3, refusedAfterMs: number): Promise<Transfer
   if (!seen.closedEarly) {
     throw new Error(`left its transfer running: ${JSON.stringify(seen)}`);
   }
-  const stopped = seen.stoppedMs ?? Number.POSITIVE_INFINITY;
-  if (stopped > refusedAfterMs + 1_000) {
+  const afterRefusal = Date.now() - refusedAt;
+  if (afterRefusal > CLOSE_MARGIN_MS) {
     throw new Error(
-      `ended the transfer ${stopped}ms into the GET, whose refusal came at ${
-        refusedAfterMs
-      }ms: ${JSON.stringify(seen)}`,
+      `ended the transfer ${afterRefusal}ms after the refusal, no later than ${
+        CLOSE_MARGIN_MS
+      }ms after it (the fake saw the close ${seen.stoppedMs}ms into the GET): ${
+        JSON.stringify(seen)
+      }`,
     );
   }
   if (seen.finished) {
@@ -99,23 +116,31 @@ Deno.test("an in-process fetch ends the transfer of a report whose length was de
   withFake(async (s3) => {
     const restore = useFake(s3);
     try {
-      // 10 MB with its length declared, the first byte held back 250 ms and a
-      // chunk every 25 ms after: nothing to refuse from but the length, and
-      // some sixteen seconds of sending left running if the refusal does not
-      // end it.
+      // 10 MB with its length declared and its checksum alongside it, as S3
+      // answers a whole-object GET once checksum mode is asked for — which
+      // the SDK asks for by default, so this is the answer the step really
+      // gets, and the body it is handed is the SDK's checksum stream. The
+      // first byte is held back 250 ms and a chunk follows every 25 ms:
+      // nothing to refuse from but the length, and some sixteen seconds of
+      // sending left running if the refusal does not end it.
       s3.stream(BUCKET, report, {
         total: 10 * 1024 * 1024,
         chunkBytes: 16_384,
         firstDelayMs: 250,
         chunkDelayMs: 25,
+        checksum: true,
       });
-      const { ms, message } = await refuse(report);
+      const { refusedAt, message } = await refuse(report);
       if (message !== `${report} is larger than ${MAX_BYTES} bytes`) {
         throw new Error(`refused with: ${message}`);
       }
-      const seen = await assertEnded(s3, ms);
-      // Refused from the header alone: the body was never taken up, so there
-      // was nothing to give up on either.
+      const seen = await assertEnded(s3, refusedAt);
+      // Nothing of the body had gone out when the fetch gave up on it: the
+      // refusal came from the declared length, inside the 250 ms the fake
+      // holds the first byte back. The web view starts pulling the moment it
+      // is made — the checksum stream resumes the response as soon as
+      // something reads it — so a refusal that waited on bytes instead has
+      // some counted here.
       if (seen.sent !== 0) {
         throw new Error(`read ${seen.sent} bytes of the body: ${JSON.stringify(seen)}`);
       }
@@ -137,11 +162,11 @@ Deno.test("an in-process fetch ends the transfer of a report with no declared le
         chunkDelayMs: 25,
         contentLength: false,
       });
-      const { ms, message } = await refuse(report);
+      const { refusedAt, message } = await refuse(report);
       if (message !== `${report} is larger than ${MAX_BYTES} bytes`) {
         throw new Error(`refused with: ${message}`);
       }
-      await assertEnded(s3, ms);
+      await assertEnded(s3, refusedAt);
     } finally {
       restore();
     }

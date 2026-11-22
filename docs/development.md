@@ -297,6 +297,25 @@ and the verdict names it. The Postgres and sandbox tests it lists need their
 backends, as in the test jobs, hence `ATOMIC_DEV_SANDBOX=on`.
 `scripts/acceptance-test.sh` (in CI) tests the check itself.
 
+### The v0.1 scenario
+
+`scripts/v01-gate.py` runs the v0.1 release's own scenario on a built binary
+and prints a transcript of it. It runs the order-report example's workflow and
+kills it twice with SIGKILL: once in the middle of a step, while the lite atom's
+model call is in flight, and once while the run waits at its gate. It recovers
+the run with `atomic runs resume` and approves the gate from a second
+invocation, then runs `atomic eval`. From what the store recorded, it checks
+that the run finished under the id it started with, that no completed step ran
+again, that the run stayed within the budget caps it started with and that the
+gate kept its deadline. A fake model on a loopback port answers every call and
+counts the calls, so it needs no provider and no network; exec atoms run in the
+sandbox, hence `ATOMIC_DEV_SANDBOX=on`:
+
+```bash
+scripts/dev.sh cargo build --release --locked -p atomic-agentic
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release/atomic
+```
+
 ## The crash suite
 
 atomic's crash tests kill the process at named failpoints. A failpoint is
@@ -478,6 +497,14 @@ milestone suites pass at the candidate. Given a tag, or `latest` for Codex's
 latest release, it applies that candidate itself on any branch. To finish a
 bump, commit the `Cargo.lock` the workflow uploads, account for what
 `scripts/lock-check.sh` reports, and follow the other steps the script prints.
+
+atomic knows Codex's Linux sandbox helper by how Codex starts it, and a bump
+that changes that changes what atomic recognises as the helper. Check, in the
+candidate's `sandboxing` and `linux-sandbox` crates, that the helper's first
+arguments are still `--sandbox-policy-cwd`, alone or after
+`--inherit-pid-namespace`, and that the helper is still started under the
+name `codex-linux-sandbox`. Then update `LINUX_SANDBOX_ARG1` and
+`INHERIT_PID_NAMESPACE` in `crates/atomic-core/src/codex.rs` to match.
 
 `scripts/milestone-tests.sh` also runs locally:
 

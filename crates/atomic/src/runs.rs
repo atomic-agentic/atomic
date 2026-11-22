@@ -371,6 +371,17 @@ pub async fn run(
     // The engine treats a run id as an idempotency key: starting one that
     // exists would wait for that run, whatever it runs, instead of this one.
     // Checked under the lock, so no other local process starts it meanwhile.
+    // Taken by another project on a shared store: said with nothing of
+    // their run, which this project can neither read nor resume.
+    if engine.rt.run_id_taken_elsewhere(&run_id).await? {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "run.exists",
+            format!("the run id {run_id} is taken in this store by another project"),
+            "give a new id, or leave out --run-id for one",
+        )
+        .into());
+    }
     if let Some(existing) = engine.rt.run_record(&run_id).await? {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         let state = match existing.status {
@@ -496,7 +507,7 @@ pub async fn resume(
     )
     .await?;
     let id = &args.run_id;
-    let record = engine.rt.run_record(id).await?;
+    let record = engine.rt.own_run_record(id).await?;
     match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -601,8 +612,10 @@ pub async fn resume(
             atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
-            // A gate decided while the run was down may never have woken it.
+            // A gate decided, or a park released, while the run was down
+            // may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
+            atomic_durable::release::redeliver(&engine.rt).await?;
             finish(
                 &engine,
                 &state,
@@ -804,8 +817,13 @@ pub async fn serve(
     engine.launch().await?;
     // The engine parks a run whose workflow code panicked, and one it has
     // recovered too often, instead of recovering it once more: name each,
-    // with its cause.
-    let now = parked(engine.rt.runs_in(PARKED).await?);
+    // with its cause. Only this project's: another's run is not named.
+    let mut now = Vec::new();
+    for id in parked(engine.rt.runs_in(PARKED).await?) {
+        if engine.rt.own_run_record(&id).await?.is_some() {
+            now.push(id);
+        }
+    }
     for id in &now {
         match atomic_app::panics::of(id) {
             // Whenever it panicked, in this process's recovery or an
@@ -823,8 +841,10 @@ pub async fn serve(
             ),
         }
     }
-    // A gate decided while its run was down may never have woken it.
+    // A gate decided, or a park released, while its run was down may never
+    // have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;
+    atomic_durable::release::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
     // their layout can continue them.
     let stranded: Vec<String> = engine
@@ -856,6 +876,9 @@ pub async fn serve(
             _ = tokio::time::sleep(REDELIVERY) => {
                 if let Err(e) = atomic_durable::gate::redeliver(&engine.rt).await {
                     atomic_core::log_line!("atomic serve: waking runs whose gates were decided: {e}");
+                }
+                if let Err(e) = atomic_durable::release::redeliver(&engine.rt).await {
+                    atomic_core::log_line!("atomic serve: waking runs whose parks were released: {e}");
                 }
             }
         }

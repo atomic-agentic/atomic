@@ -1,0 +1,1 @@
+deno-lock-json-depth|tools/deno_exec.py|    except (ValueError, RecursionError) as error:|    except ValueError as error:|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read

@@ -1,0 +1,1 @@
+skill-dir-write-still-there|crates/atomic/src/setup.rs|                    still.is_some(),|                    std::hint::black_box(true),|-p atomic-agentic --bin atomic -- the_instructions_file_must_still_be_the_one_read

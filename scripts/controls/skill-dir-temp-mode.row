@@ -1,0 +1,1 @@
+skill-dir-temp-mode|crates/atomic/src/setup.rs|                        let given = file.set_permissions(std::fs::Permissions::from_mode(mode));|                        let given = Ok::<(), std::io::Error>(()); let _ = mode;|-p atomic-agentic --bin atomic -- a_temporary_has_its_files_permissions_before_it_is_written

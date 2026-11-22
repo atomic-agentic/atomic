@@ -10,6 +10,42 @@ interface StoredObject {
 
 const base64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
 
+// The byte every streamed body sends, so that one filler byte means the same
+// in the body and in the checksum sent with it.
+const FILLER = 0x78;
+
+const CRC32 = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+/**
+ * The CRC32 of `length` filler bytes, base64 as S3 sends it. The checksum
+ * travels in the response headers, before the body it covers, so it is worked
+ * out from the size the stream was asked for rather than from what went out:
+ * a client that read such a body to the end finds this to match.
+ */
+const crc32OfFiller = (length: number): string => {
+  let crc = 0xffffffff;
+  for (let at = 0; at < length; at++) {
+    crc = CRC32[(crc ^ FILLER) & 0xff] ^ (crc >>> 8);
+  }
+  crc = (crc ^ 0xffffffff) >>> 0;
+  return base64(
+    new Uint8Array([
+      (crc >>> 24) & 0xff,
+      (crc >>> 16) & 0xff,
+      (crc >>> 8) & 0xff,
+      crc & 0xff,
+    ]),
+  );
+};
+
 async function digest(body: Uint8Array) {
   const hash = new Uint8Array(
     await crypto.subtle.digest("SHA-256", new Uint8Array(body)),
@@ -47,11 +83,18 @@ export interface StreamBody {
   /** False leaves off Content-Length, so only counting the bytes as they
    * arrive can tell how big the body is. */
   contentLength?: boolean;
+  /** Send the body's CRC32 as an x-amz-checksum-crc32 header, as S3 answers a
+   * whole-object GET once checksum mode is asked for, which the SDK asks for
+   * by default. The SDK then hands the step its own checksum stream instead
+   * of the connection's body, and that stream is what a refusal has to give
+   * up on. */
+  checksum?: boolean;
 }
 
 /** What the server saw of one streamed GET. */
 export interface Transfer {
-  /** Bytes written before the GET ended. */
+  /** Bytes handed over before the GET ended. A chunk still waiting out its
+   * delay when the client gave up is not counted, because it never went. */
   sent: number;
   /** The whole body went out. */
   finished: boolean;
@@ -60,7 +103,9 @@ export interface Transfer {
    * test reads this with finished, which says whether bytes were left. */
   closedEarly: boolean;
   /** Milliseconds between this GET beginning and the stream being given up
-   * on; missing while the server is still sending. */
+   * on; missing while the server is still sending. This is the server's
+   * clock, started when its handler ran, so a test that has its own start
+   * times the close from there and quotes this beside it. */
   stoppedMs?: number;
 }
 
@@ -143,6 +188,7 @@ export class FakeS3 {
       "content-type": "text/markdown; charset=utf-8",
     };
     if (spec.contentLength !== false) headers["content-length"] = String(spec.total);
+    if (spec.checksum) headers["x-amz-checksum-crc32"] = crc32OfFiller(spec.total);
     let written = 0;
     let pulls = 0;
     // Set when the client gives up, so a pull that was waiting out its delay
@@ -169,7 +215,7 @@ export class FakeS3 {
           written += size;
           // Ordinary text bytes, so a size test is not also a decoding test.
           transfer.sent += size;
-          controller.enqueue(new Uint8Array(size).fill(0x78));
+          controller.enqueue(new Uint8Array(size).fill(FILLER));
         },
         cancel() {
           cancelled = true;

@@ -1,0 +1,1 @@
+toolset-failure-schemas-not-compiled|crates/atomic-schema/src/openapi.rs|                    if !success_key(code) {|                    if !success_key(code) && /*CONTROL_OFF*/ false {|-p atomic-agentic --test examples atomic_check_reads_openapi_toolsets

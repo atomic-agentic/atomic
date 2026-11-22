@@ -1,0 +1,1 @@
+cassette-model-client|crates/atomic-core/src/cassette.rs|        let client = crate::lite::model_client(&endpoint, std::time::Duration::from_secs(600))|        let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(600)).build()|-p atomic-agentic-core --lib --features fake-model recording_never_follows_a_redirect_with_the_key

@@ -92,14 +92,19 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
     // The store the project's runs use: its SQLite database, or PostgreSQL
     // when ATOMIC_DATABASE_URL names one.
     let database = crate::engine::database(state)?;
-    let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
-        .await
-        .with_context(|| {
-            format!(
-                "open the gate store at {}",
-                crate::engine::describe(&database)
-            )
-        })?;
+    let rt = Durare::open(
+        &database,
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &crate::engine::store_project(state)?,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "open the gate store at {}",
+            crate::engine::describe(&database)
+        )
+    })?;
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,
@@ -266,6 +271,10 @@ pub(crate) async fn decide_as_operator(
             found.run,
             found.run
         );
+    }
+    // A park released while its run was down is delivered here too.
+    if let Err(e) = atomic_durable::release::redeliver(rt).await {
+        atomic_core::log_line!("warning: waking runs whose parks were released failed: {e}");
     }
     Ok(decision)
 }
