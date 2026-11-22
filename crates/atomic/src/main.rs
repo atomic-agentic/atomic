@@ -289,6 +289,15 @@ fn real_main() -> anyhow::Result<()> {
             Ok(())
         });
     }
+    // A run id outside its rule is refused before anything is made: no state
+    // directory, no store, no Codex.
+    if let Some(Command::Run(args)) = &cli.command
+        && let Some(id) = &args.run_id
+        && let Err(refused) = runs::check_run_id(id)
+    {
+        failure::report(&refused, cli.json);
+        std::process::exit(1);
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. Without one, nothing starts: there is no Codex
     // home to give it.

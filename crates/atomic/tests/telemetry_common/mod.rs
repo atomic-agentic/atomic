@@ -544,15 +544,132 @@ pub fn signal(child: &std::process::Child, name: &str) {
     assert_eq!(sent, 0, "kill -{name}: {}", std::io::Error::last_os_error());
 }
 
-/// How long [`wait_for_gate`] waits for a run to reach its gate: far more
-/// than a run of one model call takes, however loaded the machine.
+/// A command a test started and must leave ended: as this goes out of
+/// scope, however the test ends, the command is killed if it still runs and
+/// then reaped, so a test that panicked part way through leaves neither this
+/// command running nor this command unreaped. Only this command, the direct
+/// child: what it forked of its own, a shell's `sleep` say, is left to end in
+/// its own time, and killing the direct child does not reach it.
+pub struct Child(std::process::Child);
+
+impl Child {
+    /// Wrap `child`, which this then takes responsibility for ending.
+    pub fn new(child: std::process::Child) -> Self {
+        Self(child)
+    }
+}
+
+impl std::ops::Deref for Child {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        // What a test that reaped the command itself leaves here is one
+        // `try_wait` and one `wait`, both of which answer at once.
+        if self.0.try_wait().unwrap_or(None).is_none() {
+            // Not `signal`, which asserts: a panic here, where a test may
+            // already be unwinding, aborts the binary instead of failing the
+            // test. std's own `kill` answers at once, without signalling,
+            // once std has been given the exit status of a wait, so this
+            // never signals a pid the kernel has since handed to another
+            // process.
+            // `scripts/controls/telemetry-child-killed-on-drop` switches
+            // this kill off; `telemetry-child-reaped-on-drop` switches the
+            // wait below off.
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// How long [`wait_for_gate`] waits for a run to reach its gate, and with
+/// it each `atomic gates list` it runs: far more than a run of one model
+/// call takes, however loaded the machine. No test sits through it: the ones
+/// that test the wait itself pass a limit of their own to
+/// [`wait_for_gate_by`].
 pub const GATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The lines a run has written to stderr, as its reader read them: each
+/// with its line end, and the whitespace before it, off the end. The channel
+/// hands each line out once, so every line read is kept in `seen`: a test
+/// that waits for one can still be told all the run wrote, whether or not an
+/// earlier wait took it first.
+struct Lines {
+    unread: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl Lines {
+    /// Move every line read so far into `seen`, without waiting for more.
+    fn drain(&mut self) {
+        while let Ok(line) = self.unread.try_recv() {
+            self.seen.push(line);
+        }
+    }
+
+    /// Every line read so far, whether an earlier call looked at it or not.
+    fn so_far(&mut self) -> Vec<String> {
+        self.drain();
+        self.seen.clone()
+    }
+
+    /// Whether a line read so far holds `needle`. A line the run is still
+    /// writing is not counted until its end arrives.
+    fn holds(&mut self, needle: &str) -> bool {
+        self.drain();
+        self.seen.iter().any(|l| l.contains(needle))
+    }
+
+    /// Wait until a line holds `needle`, panicking with every line read so
+    /// far once `limit` has passed, or as soon as the run's stderr closes
+    /// without it. A line that came before this call counts: the run may
+    /// have said it already.
+    fn wait_for(&mut self, needle: &str, limit: std::time::Duration) {
+        let by = std::time::Instant::now() + limit;
+        loop {
+            if self.holds(needle) {
+                return;
+            }
+            match self
+                .unread
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                // Nothing new yet: the line the run is writing now may be
+                // the one.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // The run's last word.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(line) => self.seen.push(line),
+            }
+            if std::time::Instant::now() >= by {
+                break;
+            }
+        }
+        let seen = self.so_far();
+        panic!(
+            "no stderr line holds {needle:?} within {limit:?}; the run had written:\n{}",
+            seen.join("\n"),
+        );
+    }
+}
+
 /// What a run started with piped output printed, read as it goes so the
-/// run never blocks on a full pipe.
+/// run never blocks on a full pipe. Each stderr line it reads goes to a
+/// channel too, so a test can act on what the run says while it still runs.
 pub struct Drained {
     stdout: std::thread::JoinHandle<Vec<u8>>,
     stderr: std::thread::JoinHandle<Vec<u8>>,
+    lines: Lines,
 }
 
 impl Drained {
@@ -567,6 +684,38 @@ impl Drained {
                 all
             })
         };
+        let (sent, unread) = std::sync::mpsc::channel();
+        let read_stderr = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let Some(mut pipe) = pipe else { return all };
+                let mut partial: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // A read error ends the lines as surely as the end of the
+                // pipe; either way what was read is all there is.
+                while let Ok(read) = pipe.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    all.extend_from_slice(&chunk[..read]);
+                    for byte in &chunk[..read] {
+                        if *byte != b'\n' {
+                            partial.push(*byte);
+                            continue;
+                        }
+                        let line = String::from_utf8_lossy(&partial).trim_end().to_owned();
+                        partial.clear();
+                        let _ = sent.send(line);
+                    }
+                }
+                // What the run wrote last, with no line end on it, is a
+                // line too, and is handed out the same way as one with.
+                if !partial.is_empty() {
+                    let _ = sent.send(String::from_utf8_lossy(&partial).trim_end().to_owned());
+                }
+                all
+            })
+        };
         let stdout = child
             .stdout
             .take()
@@ -577,54 +726,311 @@ impl Drained {
             .map(|p| Box::new(p) as Box<dyn Read + Send>);
         Self {
             stdout: read(stdout),
-            stderr: read(stderr),
+            stderr: read_stderr(stderr),
+            lines: Lines {
+                unread,
+                seen: Vec::new(),
+            },
         }
     }
 
-    /// Wait for `child` to end and return how it ended and all it printed.
+    /// Wait for `child` to end and return how it ended and all it printed:
+    /// the readers go on to the end of the pipes, so these bytes are the
+    /// run's whole output. A test that has to act on a line the run writes
+    /// before it ends uses [`Drained::wait_for_stderr`].
     pub fn wait(self, child: &mut std::process::Child) -> Output {
         let status = child.wait().unwrap();
+        let Self {
+            stdout,
+            stderr,
+            lines,
+        } = self;
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        // Dropped last: the readers send here until the pipes close, and a
+        // channel with no receiver on the other side loses their lines.
+        drop(lines);
         Output {
             status,
-            stdout: self.stdout.join().unwrap(),
-            stderr: self.stderr.join().unwrap(),
+            stdout,
+            stderr,
         }
+    }
+
+    /// Block until one of the run's stderr lines holds `needle`, or fail the
+    /// test with every line the run had written once `limit` passes. A line
+    /// it wrote before this call counts: the run may have said it already.
+    /// Once the run has ended, its whole stderr is in the bytes
+    /// [`Drained::wait`] returns, and that is what to test against.
+    pub fn wait_for_stderr(&mut self, needle: &str, limit: std::time::Duration) {
+        self.lines.wait_for(needle, limit);
     }
 }
 
+/// How long one `atomic gates list` inside [`wait_for_gate_by`] is waited for
+/// before it is killed and tried again: far more than that command takes,
+/// however loaded the machine, and far less than [`GATE_LIMIT`], so a CLI
+/// stuck on a lock costs one poll rather than the whole wait. A `limit`
+/// shorter than this bounds the poll instead, down to what the wait has left
+/// of its own time — which is why a poll only starts with at least
+/// [`POLL_GRACE`] of that left.
+const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How much of the wait's own time a poll must have left to be started at
+/// all: what bounds a poll that then runs past it is this, not the deadline,
+/// so a poll is killed for not answering rather than for the wait running out
+/// mid-poll. It is far more than `atomic gates list` takes and far less than
+/// [`POLL_LIMIT`]. Because no poll starts inside the last of it, a gate that
+/// opens there is never seen, and the wait says that much when it fails;
+/// [`wait_for_gate_by`] refuses a `limit` shorter than this, which would start
+/// no poll at all.
+pub(crate) const POLL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
-/// `atomic gates list` shows, reading its output meanwhile. A run that ends
-/// first, or has not reached its gate within [`GATE_LIMIT`], fails the
-/// test with how it ended and what it printed; one still running then is
-/// killed first.
-pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) -> Drained {
+/// `atomic gates list` shows, reading its output meanwhile, for no longer
+/// than [`GATE_LIMIT`]: [`wait_for_gate_by`] with that limit, which is what
+/// every test that only needs a run at its gate calls.
+pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
+    wait_for_gate_by(dir, model, child, GATE_LIMIT)
+}
+
+/// [`wait_for_gate`]'s wait with its bound given: a run that ends first, or
+/// that has not reached its gate within `limit`, fails the test with how it
+/// ended and what it printed; a run still running then is killed first. A
+/// test of the wait's own bounds passes a limit of seconds, so that it sits
+/// through seconds rather than through [`GATE_LIMIT`].
+///
+/// Each poll is spawned and waited for with `try_wait`, under a
+/// [`POLL_LIMIT`] of its own that never runs past `limit`: one that stops
+/// answering is killed, reaped and tried again. None starts once the deadline
+/// has passed, and none starts inside the last [`POLL_GRACE`] of `limit`
+/// either, which is what lets a poll be bounded by its own budget rather than
+/// by where the deadline happens to fall. The cost of that is a gap at the
+/// end: a gate that opens in the last [`POLL_GRACE`] is never polled for, and
+/// the wait fails as one that never opened and says so. The message that then
+/// fails the test counts how many polls ran and how many of them had to be
+/// killed, and quotes what the last poll that answered said with when that one
+/// started and how long it took, or, if none answered, that none did. None of
+/// it quotes a killed poll, whose output stops where the kill landed and would
+/// hide the last real answer.
+///
+/// `a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish` runs this
+/// with a limit of seconds, longer than [`POLL_GRACE`], so that it reaches its
+/// deadline in seconds: it holds the count to what happened — more than one
+/// poll, none of them killed — holds when the message says the poll it quotes
+/// started to at most `limit - POLL_GRACE` after the wait began, and reads back
+/// as an answer what the message quotes. With the guard there switched off the
+/// wait starts a poll it has no time left to answer, which happens while less
+/// than [`POLL_GRACE`] is left and usually while only a few hundred
+/// milliseconds are; the start the message then gives is past what this limit
+/// can answer, and that is what fails the test. Whether that poll is also
+/// counted as killed depends on whether the deadline arrives before the next
+/// 50 ms in which the wait looks at it, so the test keeps the kill as its
+/// second assertion and not its first.
+/// `a_wait_for_a_gate_that_never_opens_says_how_it_was_waited_for` holds
+/// what the message quotes, and when it says that poll started and how long it
+/// took, to what a run that ends before its gate really did.
+///
+/// A `limit` shorter than [`POLL_GRACE`] is refused outright: no poll could
+/// start inside it, so such a wait would sit to its deadline having asked
+/// nothing of the run and come back as though it had polled.
+///
+/// [`POLL_LIMIT`] and [`GATE_LIMIT`] have no row under `scripts/controls/`:
+/// a row needs a test that fails with the control off, and nothing in the
+/// repository makes `atomic gates list` stop answering on its own, while no
+/// test runs to [`GATE_LIMIT`]. Both are measured by hand. With the poll
+/// replaced by a command that never ends, the wait kills it, counts it and
+/// tries again, and with the poll's bound removed the same wait does not come
+/// back at all. A poll that had to be killed is kept out of what the message
+/// quotes because such a poll holds only what it got out before the kill,
+/// which for a command that never answered is nothing.
+pub(crate) fn wait_for_gate_by(
+    dir: &Path,
+    model: &str,
+    child: &mut Child,
+    limit: std::time::Duration,
+) -> Drained {
+    // A bound shorter than a poll's grace is refused rather than sat through:
+    // the guard below is then never true, so the wait starts no poll, asks
+    // nothing of the run it waits for, and comes back at its deadline as though
+    // it had polled. Refused here, before the run is taken in hand.
+    if limit < POLL_GRACE {
+        panic!(
+            "a wait for a gate bounded by {limit:?} leaves less than the {POLL_GRACE:?} a poll \
+             needs to be started and answered inside it, so it would start no poll at all"
+        );
+    }
     let drained = Drained::of(child);
-    let deadline = std::time::Instant::now() + GATE_LIMIT;
+    let began = std::time::Instant::now();
+    let deadline = began + limit;
+    let mut polls = 0usize;
+    let mut killed = 0usize;
+    // What the last poll that answered said, when it had started and how long
+    // it took. A poll killed for not answering is kept out of here on purpose:
+    // what it printed is what it had got out before the kill, usually nothing.
+    let mut answered: Option<Answered> = None;
     loop {
-        let listed = command(dir, model, &["gates", "list", "--json"], &[])
-            .output()
-            .unwrap();
-        let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
-        if open.as_array().is_some_and(|g| !g.is_empty()) {
-            return drained;
+        // A poll starts only while the wait has a real budget left to wait
+        // for one: a poll spawned with nothing left has no time to answer, is
+        // killed where it stands, and what it had printed by then is not the
+        // last thing the command said. Weighing the grace rather than the bare
+        // deadline is also what leaves a poll killed only for not answering: a
+        // poll started with [`POLL_GRACE`] left is bounded by that, not cut
+        // short where the deadline happens to fall. What that costs is the gap
+        // at the end, which the failure message names: no poll is asked in the
+        // last [`POLL_GRACE`] of the wait, so a gate that opens there is not
+        // seen. The deadline is weighed again below, so the wait ends there
+        // whether a poll ran or not.
+        // `scripts/controls/telemetry-poll-not-started-late` switches this off,
+        // and the wait then starts a poll it has no time left to answer.
+        // `a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish` fails
+        // on when the message says that last poll started, which is later than
+        // this limit could ever wait for its answer.
+        if std::time::Instant::now() + POLL_GRACE < deadline {
+            let started = std::time::Instant::now();
+            let asked_at = started.duration_since(began);
+            let mut poll = Child::new(
+                command(dir, model, &["gates", "list", "--json"], &[])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            // The poll's pipes are read as they fill, as the run's are, so a
+            // poll is never held up by output nobody is taking either.
+            let printed = Drained::of(&mut poll);
+            let by = started
+                + POLL_LIMIT.min(deadline.saturating_duration_since(std::time::Instant::now()));
+            while poll.try_wait().unwrap().is_none() && std::time::Instant::now() < by {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let took = started.elapsed();
+            polls += 1;
+            let stuck = poll.try_wait().unwrap().is_none();
+            if stuck {
+                // Not going to answer: killed and reaped here, and tried
+                // again next time round.
+                signal(&poll, "KILL");
+                killed += 1;
+            }
+            let listed = printed.wait(&mut poll);
+            // What a poll that answered said, when it had started and how long
+            // it took, kept apart from the count of killed ones: a killed
+            // poll's output stops where the kill landed, so it is never what
+            // the wait goes on to quote.
+            if !stuck {
+                answered = Some(Answered {
+                    listed,
+                    asked_at,
+                    took,
+                });
+            }
+            let open: Value = answered
+                .as_ref()
+                .map(|a| serde_json::from_slice(&a.listed.stdout).unwrap_or(json!([])))
+                .unwrap_or(json!([]));
+            if open.as_array().is_some_and(|g| !g.is_empty()) {
+                return drained;
+            }
         }
         let ended = child.try_wait().unwrap();
-        if ended.is_some() || std::time::Instant::now() >= deadline {
+        // The last thing the wait weighed before it gave up: its own bound,
+        // and what a poll still running was given, are said apart because a
+        // poll's own bound can take the wait past its bound by that much.
+        let past = std::time::Instant::now();
+        if ended.is_some() || past >= deadline {
             let why = match ended {
                 Some(_) => "the run ended before its gate".to_owned(),
                 None => {
                     signal(child, "KILL");
-                    format!("no gate opened in {GATE_LIMIT:?}, so the run was killed")
+                    // What the poll guard above costs is said here, because it
+                    // is the likeliest reason a wait that ran its whole bound
+                    // saw no gate: a gate that opened inside the last
+                    // [`POLL_GRACE`] was never asked about. A wait that asked
+                    // nothing at all says that much instead.
+                    let gap = if polls == 0 {
+                        format!(
+                            " (no poll was asked: none starts in the last {POLL_GRACE:?} of a \
+                             wait)"
+                        )
+                    } else {
+                        format!(" (no poll started in the last {POLL_GRACE:?})")
+                    };
+                    format!("no gate opened in {limit:?}{gap}, so the run was killed")
                 }
             };
             let out = drained.wait(child);
             panic!(
-                "{why}; it ended {}: {}\n`atomic gates list` last said: {}",
+                "{why}; it ended {}: {}\n{}",
                 out.status,
                 text(&out),
-                text(&listed)
+                last_poll(&answered, polls, killed),
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
+}
+
+/// What the wait for a gate keeps about the last poll that answered: what it
+/// printed, when it had started (from when the wait began) and how long it
+/// took. The start goes with the answer because the wait starts a poll only
+/// while it has [`POLL_GRACE`] left of its bound, and a test that reaches that
+/// bound needs the start to tell whether the poll quoted was asked inside it.
+struct Answered {
+    listed: Output,
+    asked_at: std::time::Duration,
+    took: std::time::Duration,
+}
+
+/// How the wait for a gate reports its polls: the last thing a poll actually
+/// answered, when that one started and how long it took, or that none
+/// answered, and separately how many polls it made and how many it had to
+/// kill.
+fn last_poll(answered: &Option<Answered>, polls: usize, killed: usize) -> String {
+    let counted = format!(
+        "({polls} poll(s), {}{})",
+        match answered {
+            Some(a) => format!(
+                "the last started at {} ms and took {} ms",
+                a.asked_at.as_millis(),
+                a.took.as_millis()
+            ),
+            None => "none answered".to_owned(),
+        },
+        if killed == 0 {
+            String::new()
+        } else {
+            format!(", {killed} killed")
+        },
+    );
+    match answered {
+        Some(a) => format!(
+            "`atomic gates list` last said: {} {counted}",
+            text(&a.listed)
+        ),
+        None => format!("no `atomic gates list` answered: {counted}"),
+    }
+}
+
+/// How long after the wait began the message `why` failed with says the poll it
+/// quotes started. A message that leaves the start out, or puts something that
+/// is not a number where it belongs, fails the test that asked rather than being
+/// read as a zero.
+pub(crate) fn last_poll_started(why: &str) -> u128 {
+    why.split(" poll(s), the last started at ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|ms| ms.parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("the message does not say when its last poll started: {why}"))
+}
+
+/// The message `call` failed with; when it did not fail, or failed with
+/// something that is no message, this test fails rather than comparing
+/// nothing: what a test that bounds a wait has to check.
+pub(crate) fn failed_wait(call: impl FnOnce()) -> String {
+    let why = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+        .expect_err("the wait did not fail, so it gave no message to compare");
+    why.downcast_ref::<String>()
+        .cloned()
+        .expect("the wait failed with no message of its own")
 }

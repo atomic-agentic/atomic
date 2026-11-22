@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Controls rows CI does not run, one per line, each with its reason: a row a
+# GitHub runner cannot run, or one known to fail until a fix lands, which
+# takes its line out with it:
+#
+#   <row>: <why CI does not run it>
+#
+# CI's Controls workflow reports a touched row listed here as "not run in CI"
+# rather than running it, so it stays a local duty: run it with
+# scripts/controls-check.sh as docs/development.md describes and quote its
+# result line. scripts/controls-touched.py refuses a line naming no row.
+
+exec-network-helper-undumpable: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed
+exec-network-token-prologue: a confined command still receives descriptors atomic inherited without close-on-exec, which CI's test jobs never hand it (test-shards.py starts cargo with close_fds); its test fails with the control on until that is fixed
+sandbox-second-mounts: its switch no longer bites, on a runner or locally; pending its re-point to the site that now guards it
