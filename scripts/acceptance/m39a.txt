@@ -41,8 +41,8 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 # is left as it was. The sixth runs the one Codex turn whose working directory
 # is the developer's checkout — a read-only Codex atom named directly, which
 # has no worktree to run in and may not write there — and shows it read a file
-# of the checkout, ran there, and left it as it was. The last is the control on
-# that comparison: it plants in the checkout, by hand and one at a time, each
+# of the checkout, ran there, and left it as it was. The seventh is the control
+# on that comparison: it plants in the checkout, by hand and one at a time, each
 # change to it that git's own answer misses — HEAD detached at its own commit,
 # a hook, a file ignored by the repository's own `info/exclude`, and a file
 # under a `.git` below the top level, none of which `git status` names; the
@@ -54,7 +54,23 @@ run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 # comparison name it and refuse rather than read an unseen file as no change.
 # That last cannot bite for root, which is told past a directory's mode, so a
 # run as root says in its output that it skipped that one plant and every other
-# row still runs.
+# row still runs. The eighth is the same control on the hooks directory: it
+# moves that directory out and leaves a link where it was, once to the moved
+# directory itself and once to a copy a turn made in hook names this checkout
+# would itself use, and shows the answer as one link and nothing under it; it
+# plants a `.git` inside the hooks directory, which the walk of the hooks must
+# not skip by name, and puts a mode on the directory that refuses the listing.
+# The ninth is it on `.git/info`, which the comparison reads by path instead of
+# walking: `info` replaced by a link to a copy holding the very same `exclude`
+# is reported as the link it is, and not as an ignore file that never changed,
+# and a directory there whose mode refuses the search is refused rather than
+# read as one holding nothing. The tenth is it on the checkout's `.git` itself,
+# which the checkout walk leaves out by name before it asks what the entry is:
+# a `.git` replaced by a link to a copy of the metadata is reported as that
+# link, with none of the copy's configuration, hooks or ignore file read as this
+# checkout's own; a `.git` that is an ordinary file is reported by its bytes; and
+# a `.git` whose mode refuses the search is refused, naming the first path asked
+# under it.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
@@ -62,6 +78,9 @@ fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
 fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
 fixture_cli a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_was
 fixture_cli the_state_a_checkout_is_compared_by_sees_what_git_does_not
+fixture_cli the_hooks_directory_is_compared_by_what_it_is_and_not_through_a_link
+fixture_cli the_info_directory_is_compared_by_what_it_is_and_not_through_a_link
+fixture_cli the_git_directory_at_the_top_is_compared_by_what_it_is_and_not_through_a_link
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings
