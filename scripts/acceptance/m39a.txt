@@ -122,7 +122,7 @@ run_cli a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_
 ## `--project` accepts the manifest file or the directory that holds it, and an input read from a file, from standard input or from `--data` becomes the same run input.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
 
-## A change to validation alone reuses earlier results, labelled as historical, while a change to prepared context, generation schema, tool fixtures or model settings makes the recording unusable.
+## A change to validation alone reuses earlier results, labelled as historical, while a change to generation schema or model settings makes the recording unusable.
 # The replay says it is a historical check; the identity is the whole request
 # body less four fields that differ between runs; a replay needs the endpoint
 # it was recorded for; and editing the atom's output schema — one property's
@@ -133,7 +133,12 @@ atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_cha
 atomic_core cassette::tests::the_identity_ignores_what_varies_between_runs_and_nothing_else
 eval_cli a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key
 eval_cli an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again
-pending: tool fixtures and prepared context are still not shown. No tool definition reaches a recording in this version: an atom that declares any tool is refused at load, a lite atom's request carries none, and the kind that runs with tools, a Codex atom, is refused under cassettes; and a case's `prepared` values load and are then refused by the runner, so what these tests edit is the atom's instructions, not prepared context. A test would record an atom that has a declared tool and a case with prepared values, then replay after editing each, expecting the miss that says to record again.
+# The clause's other half, that a change to prepared context or to a tool
+# fixture makes the recording unusable, moved to M39b: in this version no tool
+# definition reaches a recording (an atom that declares a tool is refused at
+# load, a lite atom's request carries none, and a Codex atom, the kind that
+# runs with tools, is refused under cassettes), and a case's `prepared` values
+# load and are then refused by the runner.
 
 ## `atomic run` returns the same result whether the target is named from inside the project or given as a path from elsewhere.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
