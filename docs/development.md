@@ -465,8 +465,9 @@ in turn:
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 A manual run with the `macos` input adds "Rust (macos-15)", which builds and
-tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
-requests too, and nothing in CI waits for it. The Controls workflow runs the
+tests on macOS in one job. CodeQL runs in a workflow of its own, on main only
+(each push, weekly and by hand), so an alert shows up after its change merges;
+fix it on main. Nothing in CI waits for it. The Controls workflow runs the
 controls rows a pull request touches
 ([The Controls workflow](#the-controls-workflow)).
 
