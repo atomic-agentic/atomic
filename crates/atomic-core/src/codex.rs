@@ -382,8 +382,10 @@ fn token_files(
             // `scripts/controls/gcp-external-token.row` switches this off.
             out.extend(google_token_files(&file, here)?);
         }
-        out.extend(projected_volume(file.clone()));
-        out.push(file);
+        // `scripts/controls/aws-projected-volume.row` and
+        // `scripts/controls/aws-web-identity-token.row` switch these off.
+        out.extend(projected_volume(file.clone())); // the variable's volume
+        out.push(file); // the variable's own file
     }
     Ok(out)
 }

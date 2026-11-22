@@ -63,6 +63,11 @@ jobs:
       - run: scripts/lock-check.sh
       # The V8 rule in lock-check against small lockfiles.
       - run: scripts/lock-check-test.sh
+      # Fails when a control is switched off in the commit: every row's switch
+      # text is in the file it names exactly once, and a replacement that holds
+      # its own switch text is not in that file at all, on the lines the row
+      # wrote it on or on any others.
+      - run: python3 scripts/controls-on.py
       # controls-check.sh restores the source it edits, and refuses what it
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
