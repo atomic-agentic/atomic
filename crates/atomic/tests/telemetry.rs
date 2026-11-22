@@ -414,8 +414,8 @@ fn a_wait_that_reaches_its_limit_starts_no_poll_it_cannot_finish() {
     let asked = last_poll_started(&why);
     assert!(
         asked + POLL_GRACE.as_millis() <= limit.as_millis(),
-        "the wait started its last poll {asked} ms after it began, which is later than a \
-         {limit:?} can still wait for a {POLL_GRACE:?} answer: {why}"
+        "the wait started its last poll {asked} ms after it began, later than its {limit:?} \
+         bound lets a poll start with {POLL_GRACE:?} left to answer in: {why}"
     );
     let counted = why
         .rsplit("poll(s), ")
