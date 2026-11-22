@@ -105,8 +105,12 @@ command's output starts, with `…`. A token the cut splits is dropped whole,
 so a line that is one token longer than the cut shows only `…`; and when
 redacting what comes before a cut shrinks the text enough to bring the cut
 into view, the line at the cut is dropped too, since a secret there may have
-lost the part its rule needs. Redaction over-matches rather than
-under-matches, but it does let some things through: a short or word-like
+lost the part its rule needs. JSON held in strings is read as JSON four
+levels deep; deeper, a string that starts with `[` or `{`, after any
+blanks, is hidden whole, JSON or not (`[INFO] server started` too), and
+JSON in a string that gives a key twice is hidden whole at any depth.
+Redaction over-matches rather than under-matches, but it does let some
+things through: a short or word-like
 value after a name that only hints at a secret (`pass: 12`, `token: expired`),
 a `session=` value, a password given with `curl -u` or `mysql -p`, and a value
 that runs onto further lines. A webhook URL that carries its secret in its

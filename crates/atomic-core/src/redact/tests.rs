@@ -744,8 +744,8 @@ fn nesting_as_deep_as_a_large_payload_allows_does_not_overflow() {
         .expect("no overflow");
 }
 
-/// Past the nesting limit a shape is still found, because the text rules see
-/// through the escaping.
+/// Past the nesting limit a shape is still hidden: the string there that
+/// starts as JSON does is hidden whole.
 #[test]
 fn deeply_nested_json_is_bounded() {
     let mut nested = json!(format!("{SAMPLE} "));
@@ -2778,6 +2778,151 @@ fn a_key_is_judged_by_every_reading_of_its_name() {
     );
 }
 
+/// JSON held in strings deeper than [`MAX_NESTED_JSON`] cannot be opened,
+/// so the rules that read its names and pairs never see it: a header's
+/// name and value, `{"name": "X-Api-Key", "value": "<key>"}`, which no text
+/// rule reads, is hidden with the string that holds it, under an ordinary
+/// name and under hints, beside a plain sibling or one text redaction
+/// renames, at depths 3 and 4, where its string is past the bound, and
+/// deeper, and a second pass changes nothing.
+#[test]
+fn json_held_past_the_nesting_bound_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let held = |s: &str| format!("{{\"body\": {}}}", Value::String(s.to_owned()));
+    for note in ["x\\\\q", "hi"] {
+        for sibling in ["b", "https://u:pw@h"] {
+            let inner = format!(
+                "{{\"headers\": [{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}], \
+                 \"note\": \"{note}\"}}"
+            );
+            let first = Value::String(
+                if sibling == "b" {
+                    "a"
+                } else {
+                    "https://u:[REDACTED]@h"
+                }
+                .to_owned(),
+            );
+            let mut doc = format!(
+                "{{{first}: {}, {}: \"ok\"}}",
+                Value::String(held(&inner)),
+                Value::String(sibling.to_owned())
+            );
+            for depth in 1..=MAX_NESTED_JSON + 2 {
+                for parent in ["body", "msg", "key", "token", "args", "note"] {
+                    let mut out = json!({ parent: doc.clone() });
+                    value(&mut out);
+                    let shown = out.to_string();
+                    assert!(
+                        !shown.contains(&key[4..]),
+                        "depth {depth}, note {note:?}, sibling {sibling:?}, under \
+                         {parent}: the header's value showed"
+                    );
+                    assert!(shown.contains(REDACTED), "depth {depth}, under {parent}");
+                    let mut again = out.clone();
+                    value(&mut again);
+                    assert!(
+                        again == out,
+                        "depth {depth}, note {note:?}, sibling {sibling:?}, under \
+                         {parent}: a second pass changed it"
+                    );
+                }
+                doc = held(&doc);
+            }
+        }
+    }
+}
+
+/// Past [`MAX_NESTED_JSON`], a string that starts as JSON does but does
+/// not parse, cut say, is hidden whole too, and so is one that text
+/// redaction makes start so, so a second pass changes nothing; a string
+/// that does not start so is redacted as text, as at any depth.
+#[test]
+fn a_string_past_the_nesting_bound_is_read_after_text_redaction() {
+    let token = concat!("sk-ant-", "api03-abcdefghijklmnopqrstuvwxyz0123");
+    // `deep` held in a string at depth `MAX_NESTED_JSON`.
+    let wrap = |deep: &str| {
+        let mut held = json!({ "k": deep });
+        for _ in 0..MAX_NESTED_JSON {
+            held = json!({ "k": held.to_string() });
+        }
+        held
+    };
+    let cut = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{}\"", &token[7..]);
+    let led = format!("{token} then more");
+    for (case, (deep, expected)) in [
+        (cut.as_str(), REDACTED),
+        (led.as_str(), REDACTED),
+        ("plain words", "plain words"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = wrap(deep);
+        value(&mut out);
+        assert!(
+            out == wrap(expected),
+            "case {case}: not redacted as expected"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert!(again == out, "case {case}: a second pass changed it");
+    }
+}
+
+/// Text redaction that renames a key of JSON held in a string into a
+/// sibling's name, `https://u:pw@h` into `https://u:[REDACTED]@h`, leaves a
+/// parse with only the later value: what the other held is read by no rule
+/// that reads names and pairs, a header's name and value say, so the string
+/// is hidden whole, whichever key comes first and whether the value is an
+/// object or JSON in a string, under an ordinary name and under hints, at
+/// depths 1 to 4, and a second pass changes nothing.
+#[test]
+fn a_key_text_redaction_renames_into_a_siblings_name_hides_the_string_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let in_string = |s: &str| Value::String(s.to_owned()).to_string();
+    let held_pair = in_string(&format!("{{\"headers\": [{pair}]}}"));
+    let twin = in_string("{\"headers\": [{\"name\": \"x\", \"value\": \"y\"}]}");
+    let renamed = in_string("https://u:[REDACTED]@h");
+    let sibling = in_string("https://u:pw@h");
+    for (shape, (held, beside)) in [
+        (pair.as_str(), "\"ok\""),
+        (held_pair.as_str(), "\"ok\""),
+        (held_pair.as_str(), twin.as_str()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for first in [true, false] {
+            let mut doc = if first {
+                format!("{{{renamed}: {held}, {sibling}: {beside}}}")
+            } else {
+                format!("{{{sibling}: {beside}, {renamed}: {held}}}")
+            };
+            for depth in 1..=4 {
+                for parent in ["body", "msg", "key", "token", "args", "note"] {
+                    let mut out = json!({ parent: doc.clone() });
+                    value(&mut out);
+                    assert!(
+                        !out.to_string().contains(&key[4..]),
+                        "shape {shape}, first {first}, depth {depth}, under {parent}: \
+                         the header's value showed"
+                    );
+                    let mut again = out.clone();
+                    value(&mut again);
+                    assert!(
+                        again == out,
+                        "shape {shape}, first {first}, depth {depth}, under {parent}: \
+                         a second pass changed it"
+                    );
+                }
+                doc = format!("{{\"body\": {}}}", in_string(&doc));
+            }
+        }
+    }
+}
+
 /// A value left as written is read on: an assignment inside a weak name's
 /// value, and a header inside a header's value that holds no credential,
 /// are found and hidden, however the text is read, and a second pass
@@ -3011,6 +3156,221 @@ fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
     assert_eq!(
         text("token: Permission denied (os error 13) DB_PASSWORD= hunter2"),
         "token: Permission denied (os error 13) DB_PASSWORD= [REDACTED]"
+    );
+}
+
+/// JSON in a string whose object gives a key twice, as written or once
+/// text redaction renames one key into another's name, is hidden whole: a
+/// parse keeps only the last value, and the string as written shows the
+/// others, which no rule read. That holds inside an object or a list under
+/// a key text redaction renames too, and two levels down, under an
+/// ordinary name and under hints, held one to four strings deep, and a
+/// second pass changes nothing.
+#[test]
+fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let (r, p, q) = (
+        "\"https://u:[REDACTED]@h\"",
+        "\"https://u:pw@h\"",
+        "\"https://v:pw@h\"",
+    );
+    for (shape, doc) in [
+        // As written.
+        format!("{{\"h\": {pair}, \"h\": 1}}"),
+        format!("{{\"h\": {pair}, \"\\u0068\": 1}}"),
+        format!("{{\"h\": [{pair}], \"h\": \"x\"}}"),
+        format!("{{\"a\": {{\"h\": {pair}, \"h\": 1}}}}"),
+        format!("[{{\"h\": {pair}, \"h\": 1}}]"),
+        // Once text redaction renames a key.
+        format!("{{{r}: {pair}, {p}: 1}}"),
+        format!("{{{p}: {{{r}: {pair}, {p}: 1}}}}"),
+        format!("{{{p}: {{{p}: 1, {r}: {pair}}}}}"),
+        format!("{{{p}: [{{{r}: {pair}, {p}: 1}}]}}"),
+        format!("{{{q}: {{\"x\": {{{r}: {pair}, {p}: 1}}}}}}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut held = doc;
+        for depth in 1..=4 {
+            for parent in ["body", "msg", "key", "token", "args", "note"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "shape {shape}, depth {depth}, under {parent}: the header's value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert!(
+                    again == out,
+                    "shape {shape}, depth {depth}, under {parent}: a second pass changed it"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+    }
+    // A name and value pair whose later `key` the parse keeps, so the pair
+    // reads as `note` and its value as no secret, under ordinary names and
+    // under hints (`key`, `token`), which open held JSON first.
+    let pass = concat!("hunter2", "hunter2");
+    let doc = format!(
+        "{{\"a\": \"{SAMPLE}\", \"key\": \"DB_PASSWORD\", \"value\": \"{pass}\", \"key\": \"note\"}}"
+    );
+    for parent in ["note", "data", "log", "body", "key", "token"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert_eq!(out, json!({ parent: REDACTED }), "under {parent}");
+    }
+    // An object that gives each key once is opened as before.
+    let mut once = json!({ "body": format!("{{\"h\": {pair}, \"i\": 1}}") });
+    value(&mut once);
+    assert_eq!(
+        once,
+        json!({ "body": format!("{{\"h\":{{\"name\":\"X-Api-Key\",\"value\":\"{REDACTED}\"}},\"i\":1}}") })
+    );
+}
+
+/// A held document is checked before a changed header causes its parsed
+/// value to be written back and loses the earlier names of repeated fields.
+#[test]
+fn held_json_duplicates_are_refused_before_normalization() {
+    let header = concat!("Qk9L", "x3sR2tY7uV8w");
+    let hidden = "sample-private-value";
+    let pair = format!(r#"{{"name":"X-Api-Key","value":"{header}"}}"#);
+    for (case, document) in [
+        format!(
+            "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"key\": \"note\"\n}}"
+        ),
+        format!(
+            "{{\n  \"h\": {pair},\n  \"key\": \"DB_PASSWORD\",\n  \"value\": \"{hidden}\",\n  \"\\u006bey\": \"note\"\n}}"
+        ),
+        format!(
+            "{{\n  \"h\": {pair},\n  \"https://u:pw@h\": \"{hidden}\",\n  \"https://u:[REDACTED]@h\": \"kept\"\n}}"
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for parent in ["key", "token", "note"] {
+            let mut once = json!({ parent: document.clone() });
+            value(&mut once);
+            assert!(
+                !once.to_string().contains(hidden),
+                "case {case} under {parent}: repeated-field value remained"
+            );
+            assert!(
+                once[parent] == REDACTED,
+                "case {case} under {parent}: document was normalized before refusal"
+            );
+            let mut twice = once.clone();
+            value(&mut twice);
+            assert!(twice == once, "case {case} under {parent}: second pass changed it");
+        }
+    }
+    // A unique document still retains the ordinary value while its header
+    // is redacted. Refusal is specific to the repeated field names.
+    let document = format!("{{\n  \"h\": {pair},\n  \"value\": \"ordinary\"\n}}");
+    for parent in ["key", "token", "note"] {
+        let mut out = json!({ parent: document.clone() });
+        value(&mut out);
+        let held = out[parent].as_str().expect("held document");
+        let parsed: Value = serde_json::from_str(held).expect("unique JSON remains JSON");
+        assert_eq!(parsed["value"], "ordinary");
+        assert_eq!(parsed["h"]["value"], REDACTED);
+    }
+}
+
+/// An excerpt of a JSON document that gives a key twice is written from
+/// the parse, which kept the last value, so the earlier one is left out
+/// rather than shown as written; a second excerpt changes nothing.
+#[test]
+fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    for (case, (doc, expected)) in [
+        (
+            format!("{{\"h\": {pair}, \"h\": 1}}"),
+            "{\"h\":1}".to_owned(),
+        ),
+        (
+            "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
+            "{\"h\":\"ok\",\"i\":[2]}".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shown = excerpt(&doc, 4096);
+        assert!(shown == expected, "case {case}: not written from the parse");
+        assert_eq!(
+            excerpt(&shown, 4096),
+            shown,
+            "case {case}: a second excerpt changed it"
+        );
+    }
+    // A document that gives each key once is kept as written; one whose
+    // keys only text redaction makes alike is read as any object is.
+    assert_eq!(
+        excerpt("{\"h\": 1,  \"i\": 2}", 4096),
+        "{\"h\": 1,  \"i\": 2}"
+    );
+    let renamed = format!("{{\"https://u:[REDACTED]@h\": {pair}, \"https://u:pw@h\": 1}}");
+    assert!(
+        !excerpt(&renamed, 4096).contains(&key[4..]),
+        "the renamed key's value showed"
+    );
+}
+
+#[test]
+fn original_duplicate_spellings_under_a_hint_are_refused() {
+    original_duplicate_spellings("key");
+}
+
+#[test]
+fn original_duplicate_spellings_in_an_ordinary_string_are_refused() {
+    original_duplicate_spellings("note");
+}
+
+fn original_duplicate_spellings(parent: &str) {
+    let pretty = |s: &str| {
+        s.replace('{', "{\n")
+            .replace(',', ",\n")
+            .replace('}', "\n}")
+    };
+    let document = pretty(r#"{"https:\/\/u:pw@h":"alpha","https://u:pw@h":"beta"}"#);
+    let mut out = json!({ parent: document });
+    value(&mut out);
+    assert_eq!(
+        out[parent], REDACTED,
+        "original equal decoded keys must be refused"
+    );
+    let mut twice = out.clone();
+    value(&mut twice);
+    assert_eq!(twice, out);
+
+    let mut unique = json!({ parent: pretty(r#"{"https:\/\/u:pw@h":"alpha"}"#) });
+    value(&mut unique);
+    let kept: Value = serde_json::from_str(unique[parent].as_str().expect("unique JSON"))
+        .expect("unique document remains JSON");
+    assert!(
+        kept.as_object()
+            .expect("object")
+            .values()
+            .any(|v| v == "alpha")
+    );
+
+    // Text redaction may repair invalid original JSON. An invalid escape
+    // in a URL password disappears with that password, leaving valid JSON.
+    let mut repaired = json!({ parent: pretty(r#"{"url":"https://u:p\q@h","value":"ordinary"}"#) });
+    value(&mut repaired);
+    let kept: Value = serde_json::from_str(repaired[parent].as_str().expect("repaired JSON"))
+        .expect("text-repaired document remains JSON");
+    assert_eq!(kept["value"], "ordinary");
+    assert!(
+        kept["url"] == REDACTED || kept["url"] == "https://u:[REDACTED]@h",
+        "the repaired URL field still needs redaction"
     );
 }
 

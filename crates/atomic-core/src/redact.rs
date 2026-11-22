@@ -249,7 +249,9 @@ const STOPWORDS: &[&str] = &[
 /// first (see [`excerpt`]), so a huge provider body or stderr costs little.
 pub const MAX_TEXT: usize = 64 * 1024;
 /// How deep JSON text inside JSON strings is opened. Each level doubles its
-/// escaping, and opening without a bound could overflow the stack.
+/// escaping, and opening without a bound could overflow the stack. Deeper,
+/// a string that starts as JSON does is hidden whole (see
+/// [`redact_string`]).
 const MAX_NESTED_JSON: usize = 4;
 
 /// Token formats of well-known providers: a prefix, and the least number of
@@ -1631,7 +1633,14 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            (doc != before).then(|| doc.to_string())
+            // A document that gives a key twice is written from the parse,
+            // which kept only the last value: the others, which no rule
+            // read, are left out (see [`gives_a_key_twice`]).
+            if gives_a_key_twice(trimmed) {
+                Some(doc.to_string())
+            } else {
+                (doc != before).then(|| doc.to_string())
+            }
         }
         _ => None,
     };
@@ -1689,6 +1698,7 @@ fn redact_string(string: &mut String, nested: usize) {
     // the name itself.
     let mut written: Option<Value> = None;
     let mut opened = false;
+    let mut original_duplicate_keys = false;
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string)
@@ -1700,9 +1710,21 @@ fn redact_string(string: &mut String, nested: usize) {
             let parsed = serde_json::from_str::<Value>(string);
             let read_any = serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok();
             opened = read_any;
+            original_duplicate_keys = read_any && gives_a_key_twice(string);
             written = parsed.ok();
         }
         *string = redacted;
+    }
+    // Past the depth JSON in a string is opened at, JSON cannot be read:
+    // the rules that read its names and pairs, as a header's name and
+    // value, never see it, and text redaction alone may leave their
+    // secrets. A string there that starts as JSON does once redacted as
+    // text, whether it parses or not, is hidden whole. It is read after
+    // text redaction, so one that redaction makes start so, `[REDACTED] …`,
+    // is hidden now rather than on a second pass.
+    if nested >= MAX_NESTED_JSON && string.trim_start().starts_with(['{', '[']) {
+        *string = REDACTED.to_owned();
+        return;
     }
     let pairs = written
         .as_ref()
@@ -1715,6 +1737,16 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // An object that gives a key twice, as written or once text
+        // redaction renamed one key into another's name (`https://u:pw@h`
+        // into `https://u:[REDACTED]@h`): a parse keeps only the last
+        // value, so the others are read by no rule that reads names and
+        // pairs, and the string as it stands shows them. Hidden whole.
+        let duplicate_keys = gives_a_key_twice(string) || original_duplicate_keys;
+        if duplicate_keys {
+            *string = REDACTED.to_owned();
+            return;
+        }
         // JSON that text redaction broke deeper in, in a string it holds:
         // hidden whole for the same reason.
         // One that read as JSON as written only without building a value
@@ -1744,6 +1776,61 @@ fn redact_string(string: &mut String, nested: usize) {
         // their secrets, so it is hidden whole.
         *string = REDACTED.to_owned();
     }
+}
+
+/// Whether `json`, which reads as JSON, gives a key twice in one of its
+/// objects, keys read with their escapes undone (`"h"` and `"\u0068"` are
+/// one key). A parse keeps only the last value given a key. Anything that
+/// stops the check, which reads JSON as the parse did, counts as a key
+/// given twice.
+fn gives_a_key_twice(json: &str) -> bool {
+    use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+    /// JSON read only to find a key given twice, which fails the read.
+    struct Unique;
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+            json.deserialize_any(Unique)
+        }
+    }
+    impl<'de> Visitor<'de> for Unique {
+        type Value = Unique;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_unit<E>(self) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Unique, A::Error> {
+            while items.next_element::<Unique>()?.is_some() {}
+            Ok(Unique)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Unique, A::Error> {
+            let mut keys = std::collections::HashSet::new();
+            while let Some(key) = fields.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(A::Error::custom("a key given twice"));
+                }
+                fields.next_value::<Unique>()?;
+            }
+            Ok(Unique)
+        }
+    }
+    serde_json::from_str::<Unique>(json).is_err()
 }
 
 /// Hide each value of `into` that `hidden`, the same JSON redacted from
@@ -2006,6 +2093,21 @@ fn open_held_json(string: &mut String, nested: usize) {
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return;
     };
+    // Check the bytes the parse read before rewriting its value: parsing
+    // keeps only the last duplicate field, which can erase the name that
+    // classified another field as private. Text redaction can also make
+    // previously different names equal.
+    // Equivalent escaped names can also become different raw-text names:
+    // retain the original JSON's duplicate decision when text changed it.
+    // An originally invalid document may become valid after text redaction.
+    let originally_duplicated = texted != *string
+        && serde_json::from_str::<serde::de::IgnoredAny>(string).is_ok()
+        && gives_a_key_twice(string);
+    let held_duplicate_keys = gives_a_key_twice(&texted) || originally_duplicated;
+    if held_duplicate_keys {
+        *string = REDACTED.to_owned();
+        return;
+    }
     // JSON in a string it holds that text redaction broke: hidden whole,
     // as [`redact_string`] hides it.
     if let Some(as_written) = &written
