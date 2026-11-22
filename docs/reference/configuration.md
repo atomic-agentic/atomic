@@ -288,8 +288,11 @@ the turn is refused unless `NO_PROXY` exempts the host. With Codex's
 `respect_system_proxy` feature on, the platform's settings and their own bypass
 list decide and `NO_PROXY` changes nothing, so the turn is always refused: turn
 the feature off, or use an `https` endpoint. On Linux the feature finds no
-platform settings, and Codex reads the proxy variables itself, taking the
-first of each pair that is not empty.
+platform settings, and Codex reads the proxy variables itself: the upper-case
+name of each pair wins whenever it is set, an empty value means none, and any
+other value of `HTTP_PROXY` or else `ALL_PROXY` is taken as the proxy, even one
+with spaces or a line break around it, so atomic refuses the turn for it unless
+`NO_PROXY` exempts the host.
 
 This machine is recognised as for a lite atom: a host name that only resolves
 here is not refused and goes through the proxy, so put it in `NO_PROXY`

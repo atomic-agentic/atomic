@@ -147,35 +147,53 @@ pub fn proxied_key(
              endpoint"
         ));
     }
-    // reqwest reads the first variable of each pair that is set, even
-    // empty; Codex's resolver the first that is not empty.
+    // The first variable of each pair that is set, even empty, is the one
+    // read: reqwest's rule, and Codex's resolver's.
     let first = |names: [&'static str; 2]| {
-        names.into_iter().find_map(|name| {
-            var(name)
-                .filter(|v| rules != ProxyRules::CodexVariables || !v.is_empty())
-                .map(|value| (name, value))
-        })
+        names
+            .into_iter()
+            .find_map(|name| var(name).map(|value| (name, value)))
     };
     let http = first(["HTTP_PROXY", "http_proxy"]);
     let all = first(["ALL_PROXY", "all_proxy"]);
     let no = first(["NO_PROXY", "no_proxy"])
         .map(|(_, v)| v)
         .unwrap_or_default();
-    let value = |pair: &Option<(&str, String)>| pair.as_ref().map(|(_, v)| v.clone());
-    let named = match rules {
-        // Codex's resolver takes HTTP_PROXY's pair, else ALL_PROXY's, as the
-        // one proxy for every scheme.
-        ProxyRules::CodexVariables => Matcher::builder()
-            .all(value(&http).or(value(&all)).unwrap_or_default())
-            .no(no.as_str())
-            .build(),
-        _ => Matcher::builder()
-            .http(value(&http).unwrap_or_default())
-            .all(value(&all).unwrap_or_default())
-            .no(no.as_str())
-            .build(),
+    let exempt = Matcher::builder()
+        .http("proxy.invalid:3128")
+        .no(no.as_str())
+        .build()
+        .intercept(&uri)
+        .is_none();
+    let named = |from: &str| {
+        Some(format!(
+            "{plain}, and {from} names a proxy that would carry its API key there in cleartext; \
+             {fix}"
+        ))
     };
-    if named.intercept(&uri).is_some() {
+    if rules == ProxyRules::CodexVariables {
+        // Codex's resolver takes the HTTP_PROXY pair's value, else the
+        // ALL_PROXY pair's, when it is not empty, as the one proxy for every
+        // scheme, and parses it more leniently than the matcher below would
+        // (it trims spaces and drops tabs and line breaks). Any value it
+        // takes counts as naming a proxy: one Codex cannot use fails its
+        // client before anything is sent, so refusing it costs nothing.
+        let taken = [&http, &all]
+            .into_iter()
+            .flatten()
+            .find(|(_, value)| !value.is_empty());
+        return match taken {
+            Some((from, _)) if !exempt => named(from),
+            _ => None,
+        };
+    }
+    let value = |pair: &Option<(&str, String)>| pair.as_ref().map(|(_, v)| v.clone());
+    let matcher = Matcher::builder()
+        .http(value(&http).unwrap_or_default())
+        .all(value(&all).unwrap_or_default())
+        .no(no.as_str())
+        .build();
+    if matcher.intercept(&uri).is_some() {
         // The variable the proxy came from: HTTP_PROXY's pair when it names
         // one, else ALL_PROXY's.
         let from = [http, all]
@@ -189,17 +207,8 @@ pub fn proxied_key(
                     .is_some()
             })
             .map_or("a proxy variable", |(name, _)| name);
-        return Some(format!(
-            "{plain}, and {from} names a proxy that would carry its API key there in cleartext; \
-             {fix}"
-        ));
+        return named(from);
     }
-    let exempt = Matcher::builder()
-        .http("proxy.invalid:3128")
-        .no(no.as_str())
-        .build()
-        .intercept(&uri)
-        .is_none();
     if rules == ProxyRules::VariablesOrPlatform && !exempt {
         return Some(format!(
             "{plain}, and the system's proxy settings, which atomic cannot read, may carry its \

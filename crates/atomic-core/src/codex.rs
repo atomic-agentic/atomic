@@ -3409,6 +3409,21 @@ async fn new_config(
     cwd: &Path,
     arg0_paths: Arg0DispatchPaths,
 ) -> anyhow::Result<Config> {
+    new_config_reading(endpoint, codex_home, cwd, arg0_paths, |name| {
+        std::env::var(name).ok()
+    })
+    .await
+}
+
+/// [`new_config`], with the proxy variables a key's refusal reads from
+/// `var` rather than this process's environment.
+async fn new_config_reading(
+    endpoint: &ModelEndpoint,
+    codex_home: &Path,
+    cwd: &Path,
+    arg0_paths: Arg0DispatchPaths,
+    var: fn(&str) -> Option<String>,
+) -> anyhow::Result<Config> {
     let codex_home =
         AbsolutePathBuf::from_absolute_path(codex_home).context("resolve the Codex home")?;
     let cwd = AbsolutePathBuf::from_absolute_path(cwd).context("resolve the working directory")?;
@@ -3484,11 +3499,7 @@ async fn new_config(
             let rules =
                 crate::lite::ProxyRules::for_codex(cfg!(target_os = "linux"), respect_system_proxy);
             if endpoint.api_key_env.is_some()
-                && let Some(why) = crate::lite::proxied_key(
-                    &endpoint.base_url,
-                    &|name| std::env::var(name).ok(),
-                    rules,
-                )
+                && let Some(why) = crate::lite::proxied_key(&endpoint.base_url, &var, rules)
             {
                 anyhow::bail!(why);
             }
@@ -5762,6 +5773,34 @@ mod tests {
             if cfg!(target_os = "linux") {
                 default.expect("no proxy is named");
                 respected.expect("no proxy is named, and Linux has no platform settings");
+                // A proxy value only Codex's own resolver takes, with a space
+                // before it: reqwest's default reads it as none, and with the
+                // feature on Codex sends the key to it, so the key is refused.
+                let spaced = |name: &str| {
+                    (name == "HTTP_PROXY").then(|| " http://proxy.example:3128".to_owned())
+                };
+                new_config_reading(
+                    &endpoint,
+                    &plain,
+                    &plain,
+                    Arg0DispatchPaths::default(),
+                    spaced,
+                )
+                .await
+                .expect("reqwest's default takes no proxy from it");
+                let message = format!(
+                    "{:#}",
+                    new_config_reading(
+                        &endpoint,
+                        &respecting,
+                        &respecting,
+                        Arg0DispatchPaths::default(),
+                        spaced,
+                    )
+                    .await
+                    .expect_err("refused")
+                );
+                assert!(message.contains("HTTP_PROXY names a proxy"), "{message}");
             } else {
                 let message = format!("{:#}", default.expect_err("refused"));
                 assert!(
