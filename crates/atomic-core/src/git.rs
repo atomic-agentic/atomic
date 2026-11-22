@@ -131,6 +131,10 @@ pub enum GitError {
     /// git could not be started.
     #[error("could not run git: {0}")]
     Spawn(#[from] std::io::Error),
+    /// The home git is given is there, so git was never run (see
+    /// [`crate::codex::shell_home_absent`]).
+    #[error("{0}")]
+    Home(String),
     /// An argument failed its check, so git was never run.
     #[error("{0}")]
     Invalid(&'static str),
@@ -354,7 +358,7 @@ impl Git {
         command
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
-            .env("HOME", "/nonexistent")
+            .env("HOME", crate::codex::SHELL_HOME)
             .env("LC_ALL", "C")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -391,6 +395,7 @@ impl Git {
         input: Option<Vec<u8>>,
         cap: usize,
     ) -> Result<Vec<u8>, GitError> {
+        crate::codex::shell_home_absent().map_err(GitError::Home)?;
         let started = Instant::now();
         command
             .stdin(if input.is_some() {
@@ -734,6 +739,9 @@ impl Repo {
     /// ends, so check the copy with [`Repo::has_everything`].
     pub fn copy_reachable(&self, sha: &str, to: &Repo) -> Result<(), GitError> {
         check_sha(sha)?;
+        // The two gits run here start outside `Git::run`, which holds
+        // every other to this.
+        crate::codex::shell_home_absent().map_err(GitError::Home)?;
         let deadline = Instant::now() + self.git.timeout;
         let mut pack = self.command();
         pack.args(["pack-objects", "--revs", "--stdout", "--quiet"])

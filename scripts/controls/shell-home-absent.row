@@ -1,0 +1,1 @@
+shell-home-absent|crates/atomic-core/src/codex.rs|        Ok(_) => "something is there".to_owned(),|        Ok(_) => return Ok(()),|-p atomic-agentic-core --lib --features fake-model the_home_that_must_not_exist_refuses_whatever_is_there

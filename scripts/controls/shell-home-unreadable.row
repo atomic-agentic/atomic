@@ -1,0 +1,1 @@
+shell-home-unreadable|crates/atomic-core/src/codex.rs|        Err(e) => format!("atomic cannot tell whether anything is there ({e})"),|        Err(_) => return Ok(()),|-p atomic-agentic-core --lib --features fake-model the_home_that_must_not_exist_refuses_whatever_is_there

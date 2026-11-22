@@ -417,9 +417,11 @@ time rather than passing unchecked.
 A Codex atom's shell inherits only the platform's core variables, such as
 `PATH`, `HOME`, `USER` and the locale, without any whose name holds `KEY`,
 `SECRET` or `TOKEN`, and never `ATOMIC_*`, `OPENAI_*`, `CODEX_*`, `AWS_*`,
-`PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` and `ZDOTDIR` are its
-attempt's own scratch directory, or a directory that does not exist where
-no attempt gives it one, and it is not a login shell, so none of your shell
+`PG*`, `DATABASE_URL` or any `*_API_KEY`. In a `workspace-write` turn its
+`HOME` and `ZDOTDIR` are its attempt's own scratch directory. In a
+`read-only` turn, whose scratch directory is out of its reach, and where no
+attempt gives it one, its `HOME` is `/nonexistent`, and the turn does not
+start if anything is there. It is not a login shell, so none of your shell
 startup files run, and no functions or aliases from them are replayed into
 it.
 

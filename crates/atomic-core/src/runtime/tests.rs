@@ -2840,11 +2840,6 @@ fn a_read_only_turns_home_does_not_exist_and_the_scratch_stays_denied() {
     turn_in(&workspace(ReadOnly), &mut spec).expect("read-only");
     assert_eq!(spec.env["HOME"], codex::SHELL_HOME);
     assert!(
-        !std::path::Path::new(codex::SHELL_HOME).exists(),
-        "{} exists, so a shell would read what is there",
-        codex::SHELL_HOME
-    );
-    assert!(
         !spec.env.contains_key("ZDOTDIR"),
         "ZDOTDIR is in the scratch"
     );
