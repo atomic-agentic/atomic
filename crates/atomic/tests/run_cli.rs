@@ -2459,13 +2459,15 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
         }
         third.kill().expect("SIGKILL the run");
         third.wait().expect("reap");
-        let mut serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -2821,7 +2823,11 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
             };
             // A run that has failed is finished, and not successfully: say
             // so now, with what it failed as, instead of waiting out the
-            // deadline below.
+            // deadline below. This is how the `gate-open-once` control
+            // (scripts/controls/gate-open-once.row) shows: it names the gate
+            // step's checkpoint after the process that wrote it, so a run
+            // recovered by another process re-opens its gate, and the gate
+            // store refuses a second row for the step's own id.
             if let Some(RunStatus::Failed(why)) = &status {
                 panic!(
                     "serve failed the approved run ({status:?}): {why}\nserve log: {}",
@@ -3021,13 +3027,15 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(model.calls(), 2, "rank once, summarize once");
         ran_once_live(&dir, 1);
 
-        let serve = spawn(
+        // Reaped, so that an assertion that fails below does not leave
+        // `atomic serve` running on this project's state directory.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
@@ -3060,7 +3068,6 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
         assert_eq!(stdout_json(&out)["error"]["kind"], "runtime.busy");
 
         terminate(&serve);
-        let mut serve = serve;
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
             .expect("child");
@@ -7493,6 +7500,77 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
+}
+
+/// A run named for a secret's word, such as `rotate-secret:2026-11`, is a
+/// name, not a secret: the lines `atomic runs resume` and `atomic serve`
+/// write about it name it as it is, resume hints included, while what the
+/// panic said is still redacted on its own. Redacted whole, as they were,
+/// such a line read `run rotate-secret:[REDACTED] …`, the hint with it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("named-secret");
+    let project = project(&dir);
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "rotate-secret:2026-11"],
+        &panic,
+        "",
+    );
+    let resumed = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        resumed.contains(
+            "run rotate-secret:2026-11: it was parked because atomic's own workflow code"
+        ),
+        "{resumed}"
+    );
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    let line = served
+        .lines()
+        .find(|l| l.contains("workflow code panicked"))
+        .unwrap_or_else(|| panic!("serve named no panicked run: {served}"));
+    assert!(
+        line.starts_with("atomic serve: run rotate-secret:2026-11 stopped: "),
+        "{line}"
+    );
+    assert!(
+        line.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{line}"
+    );
+    assert!(line.contains("failpoint pipeline:after:count"), "{line}");
+    assert!(!served.contains("[REDACTED]"), "{served}");
 }
 
 /// A panic in atomic's own workflow code (made at a step's failpoint, for

@@ -138,9 +138,12 @@ fn note_in(dir: Option<&Path>, run: &str, payload: &(dyn std::any::Any + Send)) 
         // The run is parked either way, and this process says why; a later
         // one cannot, so say that too.
         if let Err(e) = keep(dir, run, &kept) {
-            atomic_core::log_line!(
-                "atomic: run {run}'s panic is not kept for later processes: {e}"
-            );
+            atomic_core::redact::Line::new()
+                .plain("atomic: run ")
+                .shown(run)
+                .plain("'s panic is not kept for later processes: ")
+                .redacted(&e.to_string())
+                .log();
         }
     }
     message
@@ -149,10 +152,33 @@ fn note_in(dir: Option<&Path>, run: &str, payload: &(dyn std::any::Any + Send)) 
 /// What a person is told about run `run`, parked because its workflow code
 /// panicked with `message`.
 pub fn cause(run: &str, message: &str) -> String {
-    format!(
-        "run {run} stopped: atomic's own workflow code panicked ({message}), so the run is \
-         parked, not retried"
-    )
+    format!("run {run}{PANICKED}{message}{NOT_RETRIED}")
+}
+
+/// What [`cause`] and [`hint`] say around the run's id and the panic's
+/// message.
+const PANICKED: &str = " stopped: atomic's own workflow code panicked (";
+const NOT_RETRIED: &str = "), so the run is parked, not retried";
+const HINT: &str = "this is a bug in atomic, and the panic will likely happen again if the run \
+                    is resumed as it is: report it with the message above, then continue the \
+                    run with `atomic runs resume ";
+const HINT_END: &str = "` once an atomic without it is installed";
+
+/// What `atomic serve` says of run `run`, whose workflow code panicked with
+/// `message`: [`cause`] and [`hint`], with the run's id as it is and the
+/// message redacted on its own, so a run named for a secret, such as
+/// `rotate-secret`, is still named.
+pub fn served(run: &str, message: &str) -> atomic_core::redact::Line {
+    atomic_core::redact::Line::new()
+        .plain("atomic serve: run ")
+        .shown(run)
+        .plain(PANICKED)
+        .redacted(message)
+        .plain(NOT_RETRIED)
+        .plain("; ")
+        .plain(HINT)
+        .shown(run)
+        .plain(HINT_END)
 }
 
 /// What a person is told about run `run`, whose workflow code panicked with
@@ -166,11 +192,7 @@ pub fn unparked(run: &str, message: &str) -> String {
 
 /// What a person can do about it.
 pub fn hint(run: &str) -> String {
-    format!(
-        "this is a bug in atomic, and the panic will likely happen again if the run is resumed \
-         as it is: report it with the message above, then continue the run with `atomic runs \
-         resume {run}` once an atomic without it is installed"
-    )
+    format!("{HINT}{run}{HINT_END}")
 }
 
 /// `workflow`, the workflow code of run `run`, with a panic in it noted
@@ -208,11 +230,7 @@ impl<F: Future> Future for Caught<F> {
             Err(payload) => {
                 let message = note(&this.run, payload.as_ref());
                 if crate::workflows::serving() {
-                    atomic_core::log_line!(
-                        "atomic serve: {}; {}",
-                        cause(&this.run, &message),
-                        hint(&this.run)
-                    );
+                    served(&this.run, &message).log();
                     // Said; a server keeps no note of every run it served.
                     NOTED
                         .lock()

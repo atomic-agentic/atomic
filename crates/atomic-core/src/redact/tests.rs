@@ -589,30 +589,30 @@ fn an_excerpt_of_a_json_body_is_redacted_as_json() {
     let out = tail(&ending, 4096);
     assert!(!out.contains(&key[20..]), "tail kept the key's end");
     // Bounded before it is redacted: ten megabytes cost no more than the
-    // excerpt's margin.
+    // excerpt's margin. Counted in the steps the scan takes (see `STEPS`),
+    // which this thread's work alone sets, not in time, which a loaded
+    // machine stretches.
     let huge = "a=".repeat(5 * 1024 * 1024);
+    let steps_taken = |redact: &mut dyn FnMut()| {
+        STEPS.with(|steps| steps.set(0));
+        redact();
+        STEPS.with(std::cell::Cell::get)
+    };
+    let most = |chars: usize| 2 * super::margin(chars) as u64;
     for (name, redact) in [
         ("excerpt", excerpt as fn(&str, usize) -> String),
         ("bounded", bounded),
         ("tail", tail),
     ] {
-        let start = std::time::Instant::now();
-        let _ = redact(&huge, 500);
-        let taken = start.elapsed();
-        assert!(
-            taken < std::time::Duration::from_secs(1),
-            "{name} took {taken:?}"
-        );
+        let taken = steps_taken(&mut || {
+            let _ = redact(&huge, 500);
+        });
+        assert!(taken <= most(500), "{name} took {taken} steps");
     }
     // A JSON report's strings, and so a panic's message, are bounded too.
     let mut report = json!({"description": huge});
-    let start = std::time::Instant::now();
-    value(&mut report);
-    let taken = start.elapsed();
-    assert!(
-        taken < std::time::Duration::from_secs(1),
-        "a JSON string took {taken:?}"
-    );
+    let taken = steps_taken(&mut || value(&mut report));
+    assert!(taken <= most(MAX_TEXT), "a JSON string took {taken} steps");
     // The excerpt is bounded, and so is the tail.
     let long = format!("{shape} {}", "y".repeat(10_000_000));
     assert!(excerpt(&long, 500).chars().count() <= 501);
@@ -1377,6 +1377,31 @@ fn a_line_is_written_as_it_was_put_together() {
     let long = Line::new().shown(&"x".repeat(MAX_TEXT + 10));
     assert_eq!(long.written().chars().count(), MAX_TEXT + 1);
     assert!(long.written().ends_with('…'));
+}
+
+/// What a line quotes, such as an error, is redacted on its own, and the
+/// names beside it are not: a run named for a secret still reads as it is
+/// when the error after it holds one.
+#[test]
+fn a_lines_quoted_text_is_redacted_on_its_own() {
+    let line = Line::new()
+        .plain("run ")
+        .shown("rotate-secret")
+        .plain(" failed: ")
+        .redacted(&format!("the push said {SAMPLE}"))
+        .plain("; continue it with `atomic runs resume ")
+        .shown("rotate-secret")
+        .plain("`");
+    let written = line.written();
+    assert!(
+        !written.contains(&SAMPLE[4..]),
+        "the token showed: {written}"
+    );
+    assert_eq!(
+        written,
+        "run rotate-secret failed: the push said [REDACTED]; continue it with `atomic runs \
+         resume rotate-secret`"
+    );
 }
 
 /// A log line names what a caller or a model chose, such as a run's id, so

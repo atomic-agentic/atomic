@@ -150,8 +150,9 @@ attempts by their path. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
-command, which has a scratch directory of its own too, is not yet kept from
-the others' in the same way. (Codex's
+command, which has a scratch directory of its own too, is kept out of the
+project's other ones in the same way, its own apart, wherever its command is
+confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -184,11 +185,12 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them); AWS's workload token files (the files
-`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
-name, with the whole volume when such a file, or what a link to it leads
-to, is in a Kubernetes projected volume, so a rotated token stays denied,
-and EKS's usual token directories under `/var/run/secrets`); and what a link among them points at, up to four
+`KUBECONFIG`, put them); workload token files (the files AWS's, Azure
+workload identity's and Google's credential variables name, the token files
+Google's credentials and AWS's profiles name, with the whole volume when
+such a file, or what a link to it leads to, is in a Kubernetes projected
+volume, so a rotated token stays denied, and the usual token directories
+under `/var/run/secrets` for EKS, the pod's service account and Azure); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);

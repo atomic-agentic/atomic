@@ -1,0 +1,1 @@
+exec-scratch-deny-profile|crates/atomic-core/src/codex.rs|        for dir in denied {|        for dir in denied.iter().take(0) {|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test exec_scratch an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own

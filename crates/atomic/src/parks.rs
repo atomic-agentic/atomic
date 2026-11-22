@@ -176,12 +176,15 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                 );
             }
             if let Some(why) = &release.wake_failed {
-                atomic_core::log_line!(
-                    "warning: the release is recorded, but waking run {} failed: {why}; atomic \
-                     serve or atomic runs resume {} delivers it",
-                    released.park.run,
-                    released.park.run
-                );
+                atomic_core::redact::Line::new()
+                    .plain("warning: the release is recorded, but waking run ")
+                    .shown(&released.park.run)
+                    .plain(" failed: ")
+                    .redacted(why)
+                    .plain("; atomic serve or atomic runs resume ")
+                    .shown(&released.park.run)
+                    .plain(" delivers it")
+                    .log();
             }
             Ok(())
         }
