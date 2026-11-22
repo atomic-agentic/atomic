@@ -1,0 +1,1 @@
+scalar-one-version-number|tools/yaml_scalar.py|    why = changed_across_yaml_versions(text)|    why = None|-p atomic-agentic --test catalog_checker the_example_checker_reads_a_plain_scalar_as_the_loader_does
