@@ -1070,12 +1070,13 @@ fn assigned(input: &str) -> Option<String> {
         // one written hard against its name, `passwd:Permission denied …`,
         // or inside `Some(`, is no error message's shape. The byte after the
         // separator is tested itself, since `value_start` skips `Some(` too.
-        // Never under a header's name, such as `proxy-authorization`: what a
+        // Never under a name a header's name ends, as the header rule finds
+        // one, such as `proxy-authorization` or `X-Authorization`: what a
         // header holds is a credential, however it reads, and a later pass
         // over the same text, such as a JSON string's own, takes what this
         // one hid as the header's credential and hides the rest with it.
         let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
-        let header = is_header_name(&input[name_start..name_end]);
+        let header = ends_in_header(&input[name_start..name_end]);
         let bare = value_from == start && set_off && !header;
         if bare && is_os_error(&input[value_from..]) {
             at = at.max(value_to);
@@ -1788,6 +1789,21 @@ fn key_looks_like_credential(key: &str) -> bool {
 /// Whether `name` is one of [`HEADERS`], in any case.
 fn is_header_name(name: &str) -> bool {
     HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether `name` ends, in any case, with one of [`HEADERS`] that starts at
+/// a word boundary, as the header rule finds a header's name inside a longer
+/// one: `X-Authorization`, `http.proxy-authorization`, not `Xauthorization`.
+fn ends_in_header(name: &str) -> bool {
+    HEADERS.iter().any(|h| {
+        let Some(at) = name.len().checked_sub(h.len()) else {
+            return false;
+        };
+        let word_before = name.as_bytes()[..at]
+            .last()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(h) && !word_before
+    })
 }
 
 /// Header names whose values are credentials.

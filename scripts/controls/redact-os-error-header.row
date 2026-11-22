@@ -1,1 +1,1 @@
-redact-os-error-header|crates/atomic-core/src/redact.rs|        let header = is_header_name(&input[name_start..name_end]);|        let header = false; // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors
+redact-os-error-header|crates/atomic-core/src/redact.rs|        let header = ends_in_header(&input[name_start..name_end]);|        let header = false; // CONTROL_OFF|-p atomic-agentic-core --lib redact::tests::planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors
