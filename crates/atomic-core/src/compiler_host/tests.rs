@@ -12,6 +12,54 @@ use std::time::{Duration, Instant};
 pub(super) const PROBE_ENV: &str = "ATOMIC_COMPILER_TEST_PROBE";
 /// The child's heap limit in bytes, for the heap probe.
 pub(super) const HEAP_ENV: &str = "ATOMIC_COMPILER_TEST_HEAP";
+/// Shorten only the CPU probe, after checking the production CPU limits.
+const CPU_ENV: &str = "ATOMIC_COMPILER_TEST_CPU";
+
+/// A CPU second is not a wall-clock second: a busy test runner can schedule
+/// a child too seldom for its production CPU budget to expire before the
+/// parent's deadline. Check the real limits first, then exercise their
+/// enforcement with a smaller budget in this test binary's probe child.
+#[allow(unsafe_code)]
+pub(super) fn shorten_cpu_probe() -> Result<(), String> {
+    if std::env::var_os(CPU_ENV).is_none() {
+        return Ok(());
+    }
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `current` is a valid writable rlimit for this process's query.
+    if unsafe { libc::getrlimit(libc::RLIMIT_CPU, &mut current) } != 0 {
+        return Err(format!(
+            "cannot read the compiler CPU probe's limits: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if current.rlim_cur != limits::CPU_SECONDS as libc::rlim_t
+        || current.rlim_max != (limits::CPU_SECONDS + 1) as libc::rlim_t
+    {
+        return Err(format!(
+            "the compiler CPU probe expected production limits {}/{}, got {}/{}",
+            limits::CPU_SECONDS,
+            limits::CPU_SECONDS + 1,
+            current.rlim_cur,
+            current.rlim_max
+        ));
+    }
+    let short = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: 2,
+    };
+    // SAFETY: `short` is valid; this only lowers the probe child's own CPU
+    // limits, after the production limits have been checked above.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &short) } != 0 {
+        return Err(format!(
+            "cannot shorten the compiler CPU probe: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
 
 /// Runs `body`, an async function body, in a compiler child and returns
 /// what it returned, or the child's failure.
@@ -437,17 +485,14 @@ fn memory_outside_the_heap_is_refused_past_the_limit() {
     );
 }
 
-// CPU time over all of the child's threads is bounded too, below the wall
-// clock here so that the CPU limit is what stops it.
+// Check the production CPU limits and then lower this probe's CPU budget,
+// so its CPU limit, not the production wall deadline, stops the loop even
+// when a busy runner schedules it infrequently.
 #[test]
 fn a_compile_is_stopped_at_its_cpu_time_limit() {
     let started = Instant::now();
-    let error = probe_with(
-        "for (;;) {}",
-        &[],
-        Duration::from_secs(limits::CPU_SECONDS + 20),
-    )
-    .expect_err("stopped");
+    let error =
+        probe_with("for (;;) {}", &[(CPU_ENV, "1".to_owned())], TIME_LIMIT).expect_err("stopped");
     assert!(
         error.contains("the Astro compiler exceeded its CPU time limit"),
         "{error}"
