@@ -314,8 +314,12 @@ def rust_literals(path, text):
     return "".join(code), literals
 
 
-def literal_path(source, text, raw):
-    """Decode a Rust path literal; an unreadable path is never guessed."""
+def literal_path(source, text, raw, classification=False):
+    """Decode a Rust literal; selected paths are never guessed.
+
+    Classification admits bytes and NUL so unrelated byte/data literals can
+    be ruled out. An actual path is decoded again under the strict rules.
+    """
     if raw:
         value = text
     else:
@@ -333,7 +337,7 @@ def literal_path(source, text, raw):
             i += 1
             if escape in escapes:
                 chars.append(escapes[escape])
-            elif escape == "x" and re.fullmatch(r"[0-7][0-9A-Fa-f]", text[i : i + 2]):
+            elif escape == "x" and re.fullmatch(r"[0-9A-Fa-f]{2}" if classification else r"[0-7][0-9A-Fa-f]", text[i : i + 2]):
                 chars.append(chr(int(text[i : i + 2], 16)))
                 i += 2
             elif escape == "u" and i < len(text) and text[i] == "{":
@@ -352,7 +356,7 @@ def literal_path(source, text, raw):
             else:
                 raise Refused(f"{source} has an unsupported Rust path escape")
         value = "".join(chars)
-    if "\0" in value:
+    if "\0" in value and not classification:
         raise Refused(f"{source} has a NUL in a Rust path")
     return value
 
@@ -361,13 +365,14 @@ def in_tree(path):
     return not posixpath.isabs(path) and path != ".." and not path.startswith("../")
 
 
-def included_paths(commit, source, path, modes):
+def included_paths(commit, source, path, modes, allow_directory=False):
     """Every tracked link and final input a literal include depends on.
 
     Walk the committed tree, not the host filesystem. Resolve links before
     parent components, retaining link names so retargeting a directory link
     is a change to the includer too. A missing input name remains a dependency
     (including when the change removes it); it never means no dependency.
+    Runtime readers may consume directories as well as regular files.
     """
     if posixpath.isabs(path):
         raise Refused(f"{source} includes a path out of the repository")
@@ -412,11 +417,11 @@ def included_paths(commit, source, path, modes):
         if pending and mode != "040000":
             raise Refused(f"{current}, on an included path, is not a directory")
         if not pending:
-            if mode not in ("100644", "100755"):
+            if mode not in ("100644", "100755") and not (allow_directory and mode == "040000"):
                 raise Refused(f"{current}, which {source} includes, is not a regular file")
             names.add(current)
     final = "/".join(resolved)
-    if modes.get(final) not in ("100644", "100755"):
+    if modes.get(final) not in ("100644", "100755") and not (allow_directory and modes.get(final) == "040000"):
         raise Refused(f"{final}, which {source} includes, is not a regular file")
     names.add(final)
     return names
@@ -450,10 +455,10 @@ def source_references(commit):
         ) or (
             len(parts) == 5 and parts[0] == "crates" and parts[2] == "tests" and parts[4] == "main.rs"
         )
-        # Sources with neither include syntax nor a target's data path
-        # cannot contribute a reference. Avoid lexing unrelated fixtures.
+        # Every target must be lexed: its test path can be a bare root or
+        # use Rust escapes. Other sources need literal include syntax.
         candidate = "include" in source or ("#" in source and "path" in source)
-        if not candidate and not (target and "tests/" in source):
+        if not candidate and not target:
             continue
         code, literals = rust_literals(name, source)
         previous, depth = 0, 0
@@ -471,16 +476,27 @@ def source_references(commit):
                 path = posixpath.join(posixpath.dirname(name), literal_path(name, literal, raw))
                 for dependency in included_paths(commit, name, path, modes):
                     included.setdefault(dependency, set()).add(name)
-            if target and literal.startswith("tests/"):
-                path = posixpath.normpath(posixpath.join(*parts[:2], literal_path(name, literal, raw)))
-                if in_tree(path):
-                    readers.append((path, name))
+            if target:
+                decoded = literal_path(name, literal, raw, classification=True)
+                if posixpath.isabs(decoded):
+                    continue
+                runtime = posixpath.normpath(decoded)
+                first = next((part for part in decoded.split("/") if part not in ("", ".")), "")
+                if runtime != "tests" and not runtime.startswith("tests/") and first != "tests":
+                    continue
+                # Preserve components until committed links are resolved:
+                # tests/alias/../word need not mean tests/word.
+                path = posixpath.join(*parts[:2], literal_path(name, literal, raw))
+                dependencies = included_paths(commit, name, path, modes, allow_directory=True)
+                for dependency in dependencies:
+                    readers.append((dependency, name))
                 # Only a concrete directory below this crate's tests root
                 # can narrow the old shared-data rule. A root-wide read, a
                 # runtime filename or an unknown path keeps that fallback.
                 tests = "/".join(parts[:3]) + "/"
-                if path.startswith(tests) and path in directories:
-                    data.append((path, name))
+                for dependency in dependencies:
+                    if dependency.startswith(tests) and dependency in directories:
+                        data.append((dependency, name))
     return included, data, sources, readers
 
 

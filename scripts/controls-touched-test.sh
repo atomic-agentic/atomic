@@ -445,7 +445,7 @@ printf 'new\n' >crates/k/tests/fixtures/project/input.txt
 commit
 run
 expect "fixture directory selects the target that names it" "c"
-off data-readers 'if target and literal.startswith("tests/"):' 'if False:'
+off data-readers 'if target:' 'if False:'
 run
 [ "${code}" -eq 0 ] && [ "${OUT}" = "$(printf 'c\nf')" ] || fail "with named data readers off, shared fallback was not retained: ${OUT}"
 unset SCRIPT
@@ -593,7 +593,7 @@ for read in 'tests/data/word' 'tests/'; do
     commit
     run
     expect "directory ownership retains the other literal reader ${read}" "$(printf 'alpha\nbeta')"
-    off runtime-readers 'readers.append((path, name))' 'pass'
+    off runtime-readers 'readers.append((dependency, name))' 'pass'
     run
     [ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with other runtime readers off, missing selection was not exposed: ${OUT}"
     unset SCRIPT
@@ -606,7 +606,7 @@ for source in 'const V: &str = include_str /* trivia */ !("../src/word");' '#[ /
     commit
     run
     expect "comments between Rust tokens preserve an includer" "alpha"
-    off literal-trivia 'candidate = "include" in source or ("#" in source and "path" in source)' 'candidate = re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source)'
+    off literal-trivia 'if not candidate and not target:' 'if not re.search(r"\binclude(?:_str|_bytes)?\s*!|#\s*\[\s*path\s*=", source) and not (target and "tests/" in source):'
     run
     [ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with comment-aware discovery off, missing selection was not exposed: ${OUT}"
     unset SCRIPT
@@ -708,6 +708,80 @@ printf 'marker\n' >crates/k/src/real/marker
 commit
 run
 refused "an included trailing parent component cannot hide a directory" "not a regular file"
+
+# Equivalent spellings and tracked runtime links cannot be privatized away.
+for read in 'tests' './tests/data/word' 't\x65sts/data/word'; do
+    review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' "fn b() { let _ = std::fs::read(\"${read}\"); }"
+    printf 'after\n' >crates/k/tests/data/word
+    commit
+    run
+    expect "equivalent runtime path ${read} retains its reader" "$(printf 'alpha\nbeta')"
+    if [ "${read}" = './tests/data/word' ]; then
+        off runtime-spelling 'if runtime != "tests" and not runtime.startswith("tests/") and first != "tests":' 'if not literal.startswith("tests/"):'
+    else
+        off runtime-discovery 'if not candidate and not target:' 'if not candidate and not (target and "tests/" in source):'
+    fi
+    run
+    [ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with equivalent runtime discovery off, omitted reader was not exposed: ${OUT}"
+    unset SCRIPT
+done
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias"); }'
+ln -s word crates/k/tests/data/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/data/word
+commit
+run
+expect "runtime file link retains target-only reader" "$(printf 'alpha\nbeta')"
+off runtime-links 'dependencies = included_paths(commit, name, path, modes, allow_directory=True)' 'dependencies = {path}'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with runtime links off, target-only reader was not omitted: ${OUT}"
+unset SCRIPT
+BASE="$(git rev-parse HEAD)"
+git rm -q crates/k/tests/data/word
+commit
+run
+expect "runtime linked input deletion retains both readers" "$(printf 'alpha\nbeta')"
+BASE="$(git rev-parse HEAD)"
+printf 'restored\n' >crates/k/tests/data/word
+commit
+run
+expect "runtime linked input restoration retains both readers" "$(printf 'alpha\nbeta')"
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias/word"); }'
+mkdir -p crates/k/tests/data/real
+printf 'before\n' >crates/k/tests/data/real/word
+ln -s real crates/k/tests/data/alias
+commit
+BASE="$(git rev-parse HEAD)"
+printf 'after\n' >crates/k/tests/data/real/word
+commit
+run
+expect "runtime directory link retains target-only reader" "$(printf 'alpha\nbeta')"
+BASE="$(git rev-parse HEAD)"
+mkdir -p crates/k/tests/data/other
+printf 'other\n' >crates/k/tests/data/other/word
+rm crates/k/tests/data/alias
+ln -s other crates/k/tests/data/alias
+commit
+run
+expect "runtime directory link retarget retains its reader" "$(printf 'alpha\nbeta')"
+off runtime-retarget 'dependencies = included_paths(commit, name, path, modes, allow_directory=True)' 'dependencies = {path}'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = alpha ] || fail "with runtime links off, retargeted reader was not omitted: ${OUT}"
+unset SCRIPT
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = "\0"; let _ = b"\xff"; let _ = "/tests/"; }'
+printf 'after\n' >crates/k/tests/data/word
+commit
+run
+expect "unrelated NUL and byte literals do not become paths" "alpha"
+
+review_fixture 'fn a() { let _ = std::fs::read_dir("tests/data"); }' 'fn b() { let _ = std::fs::read("tests/data/alias"); }'
+ln -s alias crates/k/tests/data/alias
+commit
+run
+refused "runtime link loops cannot silently lose a reader" "link that does not end"
 
 # Every row, for a full sweep.
 fresh
