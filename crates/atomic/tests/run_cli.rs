@@ -7671,6 +7671,77 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
 
+/// A run named for a secret's word, such as `rotate-secret:2026-11`, is a
+/// name, not a secret: the lines `atomic runs resume` and `atomic serve`
+/// write about it name it as it is, resume hints included, while what the
+/// panic said is still redacted on its own. Redacted whole, as they were,
+/// such a line read `run rotate-secret:[REDACTED] …`, the hint with it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serves_lines_name_a_run_called_for_a_secret_as_it_is() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("named-secret");
+    let project = project(&dir);
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "rotate-secret:2026-11",
+            "--data",
+            NOTE,
+        ],
+        &panic,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "rotate-secret:2026-11"],
+        &panic,
+        "",
+    );
+    let resumed = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        resumed.contains(
+            "run rotate-secret:2026-11: it was parked because atomic's own workflow code"
+        ),
+        "{resumed}"
+    );
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    let line = served
+        .lines()
+        .find(|l| l.contains("workflow code panicked"))
+        .unwrap_or_else(|| panic!("serve named no panicked run: {served}"));
+    assert!(
+        line.starts_with("atomic serve: run rotate-secret:2026-11 stopped: "),
+        "{line}"
+    );
+    assert!(
+        line.contains("continue the run with `atomic runs resume rotate-secret:2026-11`"),
+        "{line}"
+    );
+    assert!(line.contains("failpoint pipeline:after:count"), "{line}");
+    assert!(!served.contains("[REDACTED]"), "{served}");
+}
+
 /// A panic in atomic's own workflow code (made at a step's failpoint, for
 /// the test) is named as the cause, with its message, by `atomic run`,
 /// `atomic runs resume` and `atomic serve`, and kept in the project's

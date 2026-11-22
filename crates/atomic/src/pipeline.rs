@@ -153,7 +153,14 @@ fn reached(id: &str, position: usize) -> Result<()> {
             "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
              step without finishing it, so it is not run again"
         );
-        atomic_core::log_line!("{why}");
+        atomic_core::redact::Line::new()
+            .plain(DEAD_LETTERED)
+            .plain(" run ")
+            .shown(id)
+            .plain(" stopped ")
+            .shown(&RECOVERY_LIMIT.to_string())
+            .plain(" times in this process at the same step without finishing it, so it is not run again")
+            .log();
         return Err(failed(why));
     }
     Ok(())
@@ -881,10 +888,14 @@ fn put_waiting_out_the_lock(
                     *n
                 };
                 if waits == 1 {
-                    atomic_core::log_line!(
-                        "atomic: run {id}: the artifact store is held by another process, such \
-                         as a sweep; the run waits for it and tries again"
-                    );
+                    atomic_core::redact::Line::new()
+                        .plain("atomic: run ")
+                        .shown(id)
+                        .plain(
+                            ": the artifact store is held by another process, such as a sweep; \
+                             the run waits for it and tries again",
+                        )
+                        .log();
                 }
                 retries += 1;
                 // A stopping process waits no longer: the run stops as it
@@ -1012,11 +1023,15 @@ async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
         Err(e) => e.to_string(),
     };
     {
-        atomic_core::log_line!(
-            "atomic: run {id}: its build caches at {} could not be removed ({e}); remove them by \
-             hand",
-            dir.display()
-        );
+        atomic_core::redact::Line::new()
+            .plain("atomic: run ")
+            .shown(id)
+            .plain(": its build caches at ")
+            .redacted(&dir.display().to_string())
+            .plain(" could not be removed (")
+            .redacted(&e)
+            .plain("); remove them by hand")
+            .log();
     }
 }
 
@@ -1042,10 +1057,13 @@ async fn run_pipeline_in<C: WorkflowContext>(
     match atomic_durable::history::begin(&ctx).await {
         Ok(_) => {}
         Err(e @ DurableError::Interrupted(_)) => return Err(e),
-        Err(e) => atomic_core::log_line!(
-            "atomic: run {id}: this execution of it could not be recorded ({e}); `atomic runs \
-             show` may credit its steps to an earlier one"
-        ),
+        Err(e) => atomic_core::redact::Line::new()
+            .plain("atomic: run ")
+            .shown(&id)
+            .plain(": this execution of it could not be recorded (")
+            .redacted(&e.to_string())
+            .plain("); `atomic runs show` may credit its steps to an earlier one")
+            .log(),
     }
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
@@ -1206,12 +1224,16 @@ async fn run_pipeline_in<C: WorkflowContext>(
         .into_iter()
         .collect();
     if !unvouched.is_empty() {
-        atomic_core::log_line!(
-            "atomic: run {}: under your own dollar cap, the run calls {} at prices only a \
-             layer above your own configuration sets; `atomic config --explain` says more",
-            ctx.workflow_id(),
-            unvouched.join(", ")
-        );
+        atomic_core::redact::Line::new()
+            .plain("atomic: run ")
+            .shown(ctx.workflow_id())
+            .plain(": under your own dollar cap, the run calls ")
+            .redacted(&unvouched.join(", "))
+            .plain(
+                " at prices only a layer above your own configuration sets; `atomic config \
+                 --explain` says more",
+            )
+            .log();
     }
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
