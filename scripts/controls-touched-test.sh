@@ -78,6 +78,9 @@ if old not in text:
     sys.exit(f"the text to switch off is not in {src}: {old}")
 open(dst, "w").write(text.replace(old, new, 1))
 PY
+    # A copy that could not be made is no rule removed: say so, rather than
+    # let the case run against nothing and read as passing.
+    [ $? -eq 0 ] || fail "off ${name}: the text to switch off is not in ${TOUCHED}"
 }
 fresh
 printf 'fn other() { 1; }\n' >src/other.rs
@@ -180,7 +183,7 @@ run
 expect "a test the row names, renamed away" "e"
 off test-names 'if any(test and test in text' 'if any(False and test in text'
 run
-[ "${OUT}" = "" ] || fail "with the test-name rule off, a renamed test still selected: ${OUT}"
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the test-name rule off, a renamed test still selected: ${OUT}"
 unset SCRIPT
 
 fresh
@@ -196,7 +199,7 @@ run
 expect "a change under the row's --test target" "c"
 off test-target 'if parts[3] == f"{target}.rs" or (parts[3] == target and len(parts) > 4):' 'if False:'
 run
-[ "${OUT}" = "" ] || fail "with the --test target rule off, a change under it still selected: ${OUT}"
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the --test target rule off, a change under it still selected: ${OUT}"
 unset SCRIPT
 fresh
 mkdir -p crates/k/tests
@@ -207,6 +210,143 @@ printf 'fn other() { 1; }\n' >crates/k/tests/tt.rs
 commit
 run
 expect "a change to another --test target" ""
+
+# A change to test code a crate's targets share selects each row whose
+# --test target is in that crate, and only those.
+shared_fixture() {
+    fresh
+    mkdir -p crates/k/tests/support crates/k/tests/t crates/k/tests/u crates/m/tests/fixtures
+    printf 'mod support;\n' >crates/k/tests/t.rs
+    printf 'pub fn help() {}\n' >crates/k/tests/support/mod.rs
+    printf 'pub fn own() {}\n' >crates/k/tests/t/own.rs
+    printf 'fn main() {}\n' >crates/k/tests/u/main.rs
+    printf 'fn m() {}\n' >crates/m/tests/v.rs
+    printf 'data\n' >crates/m/tests/fixtures/one.txt
+    echo 'f|src/one.rs|guard_a();|/*off*/|-p k --test u -- test_f' >scripts/controls/f.row
+    echo 'g|src/one.rs|guard_b();|/*off*/|-p m --test v -- test_g' >scripts/controls/g.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+shared_fixture
+printf 'pub fn help() { 1; }\n' >crates/k/tests/support/mod.rs
+commit
+run
+expect "a change to a crate's shared test code" "$(printf 'c\nf')"
+off shared 'crates.add(parts[1])
+    return crates' 'pass
+    return crates'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the shared test code rule off, a change to it still selected: ${OUT}"
+unset SCRIPT
+
+shared_fixture
+printf '{}\n' >crates/k/tests/data.json
+commit
+BASE="$(git rev-parse HEAD)"
+printf '{"changed": true}\n' >crates/k/tests/data.json
+commit
+run
+expect "a change to a non-Rust file at the top of a crate's tests" "$(printf 'c\nf')"
+off shared-file 'if not parts[3].endswith(".rs"):
+                crates.add(parts[1])' 'if not parts[3].endswith(".rs"):
+                pass'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the top-level shared file rule off, a change to it still selected: ${OUT}"
+unset SCRIPT
+
+# A shared test helper outside tests/, listed with the rows it serves.
+helper_fixture() {
+    fresh
+    mkdir -p crates/h/src crates/k/tests
+    printf 'pub fn fake() {}\n' >crates/h/src/testing.rs
+    printf 'fn t() {}\n' >crates/k/tests/t.rs
+    echo 'p|src/other.rs|fn other|fn o1|-p h --lib --features fake-model -- test_p' >scripts/controls/p.row
+    echo 'q|src/other.rs|fn other|fn o2|--workspace --features x/postgres-tests,x/fake-model --test t -- test_q' >scripts/controls/q.row
+    echo 'r|src/other.rs|fn other|fn o3|-p h --lib --features postgres-tests -- test_r' >scripts/controls/r.row
+    printf '# helpers\ncrates/h/src/testing.rs: %s\n' "$1" >scripts/controls-shared.txt
+    commit
+    BASE="$(git rev-parse HEAD)"
+}
+helper_fixture '--test feature=fake-model'
+printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+commit
+run
+expect "a listed helper serves --test rows and its feature's rows" "$(printf 'c\np\nq')"
+off helper 'or any(serves(row, words) for words in helpers)' ''
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the listed-helper rule off, a change to it still selected: ${OUT}"
+unset SCRIPT
+
+helper_fixture 'feature=postgres-tests'
+printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+commit
+run
+expect "a helper serving a feature, named in a list of features" "$(printf 'q\nr')"
+
+helper_fixture 'package=h'
+printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+commit
+run
+expect "a helper serving a package: its rows and the workspace's" "$(printf 'p\nq\nr')"
+off package 'if word.startswith("package=") and (built is None' 'if False and (built is None'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the package rule off, a change to the helper still selected: ${OUT}"
+unset SCRIPT
+
+# Each way cargo is told a feature turns it on.
+for spelling in '-F fake-model' '-Ffake-model' '-F=fake-model' '--features=y/fake-model' '--all-features'; do
+    helper_fixture 'feature=fake-model'
+    git rm -q scripts/controls/p.row scripts/controls/q.row
+    echo "s|src/other.rs|fn other|fn o4|-p h --lib ${spelling} -- test_s" >scripts/controls/s.row
+    commit
+    BASE="$(git rev-parse HEAD)"
+    printf 'pub fn fake() { 1; }\n' >crates/h/src/testing.rs
+    commit
+    run
+    expect "a feature turned on with ${spelling}" "s"
+done
+
+helper_fixture '--test'
+printf 'crates/h/src/testing.rs: feature=\n' >scripts/controls-shared.txt
+commit
+run
+refused "a helper line naming an empty feature" "'feature=' is none of --test"
+
+helper_fixture '--test'
+git rm -q crates/h/src/testing.rs
+commit
+run
+refused "a listed helper that is gone" "names crates/h/src/testing.rs, which is not there"
+
+helper_fixture '--test'
+printf 'crates/h/src/testing.rs: everything\n' >scripts/controls-shared.txt
+commit
+run
+refused "a helper line serving what is not known" "'everything' is none of --test, feature=<name> and package=<name>"
+
+helper_fixture '--test'
+printf 'crates/h/src/testing.rs\n' >scripts/controls-shared.txt
+commit
+run
+refused "a helper line serving nothing" "is not '<path>: <--test, feature=<name> or package=<name>> ...'"
+
+shared_fixture
+printf 'data, changed\n' >crates/m/tests/fixtures/one.txt
+commit
+run
+expect "a change to a crate's fixtures" "g"
+
+shared_fixture
+printf 'pub fn own() { 1; }\n' >crates/k/tests/t/own.rs
+commit
+run
+expect "a change to one target's own module" "c"
+
+shared_fixture
+printf 'fn main() { 1; }\n' >crates/k/tests/u/main.rs
+commit
+run
+expect "a change to a target's own directory" "f"
 
 # Every row, for a full sweep.
 fresh
@@ -235,6 +375,20 @@ run
 expect "a local-only row is not run" "a"
 run --report
 expect "a local-only row is reported" "not run in CI b: needs a device the runner lacks"
+
+# A row taken off the list is run, though nothing else of it changed.
+fresh
+printf 'b: needs a device the runner lacks\n' >scripts/controls-local.txt
+commit
+BASE="$(git rev-parse HEAD)"
+printf '# none\n' >scripts/controls-local.txt
+commit
+run
+expect "a row taken off the local-only list" "b"
+off released 'if name in released' 'if False'
+run
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the released-row rule off, a row taken off the list still ran: ${OUT}"
+unset SCRIPT
 
 fresh
 printf 'gone: no such row\n' >scripts/controls-local.txt
@@ -379,7 +533,7 @@ printf 'fn one() { guard_a(); guard_b(); } // moved\n' >src/one.rs
 commit
 off file 'or row["file"] in changed' ''
 run
-[ "${OUT}" = "" ] || fail "with the target-file rule off, a change to src/one.rs still touched: ${OUT}"
+[ "${code}" -eq 0 ] && [ "${OUT}" = "" ] || fail "with the target-file rule off, a change to src/one.rs still touched: ${OUT}"
 unset SCRIPT
 
 fresh
