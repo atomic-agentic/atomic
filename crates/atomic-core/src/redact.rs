@@ -1552,7 +1552,14 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            (doc != before).then(|| doc.to_string())
+            // A document that gives a key twice is written from the parse,
+            // which kept only the last value: the others, which no rule
+            // read, are left out (see [`gives_a_key_twice`]).
+            if gives_a_key_twice(trimmed) {
+                Some(doc.to_string())
+            } else {
+                (doc != before).then(|| doc.to_string())
+            }
         }
         _ => None,
     };
@@ -1632,6 +1639,15 @@ fn redact_string(string: &mut String, nested: usize) {
         && string.trim_start().starts_with(['{', '['])
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
+        // An object that gives a key twice, as written or once text
+        // redaction renamed one key into another's name (`https://u:pw@h`
+        // into `https://u:[REDACTED]@h`): a parse keeps only the last
+        // value, so the others are read by no rule that reads names and
+        // pairs, and the string as it stands shows them. Hidden whole.
+        if gives_a_key_twice(string) {
+            *string = REDACTED.to_owned();
+            return;
+        }
         // JSON that text redaction broke deeper in, in a string it holds:
         // hidden whole for the same reason.
         if opened && broke_json_within(&written, &inner, nested) {
@@ -1651,6 +1667,61 @@ fn redact_string(string: &mut String, nested: usize) {
     }
 }
 
+/// Whether `json`, which reads as JSON, gives a key twice in one of its
+/// objects, keys read with their escapes undone (`"h"` and `"\u0068"` are
+/// one key). A parse keeps only the last value given a key. Anything that
+/// stops the check, which reads JSON as the parse did, counts as a key
+/// given twice.
+fn gives_a_key_twice(json: &str) -> bool {
+    use serde::de::{Deserialize, Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
+    /// JSON read only to find a key given twice, which fails the read.
+    struct Unique;
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: Deserializer<'de>>(json: D) -> Result<Self, D::Error> {
+            json.deserialize_any(Unique)
+        }
+    }
+    impl<'de> Visitor<'de> for Unique {
+        type Value = Unique;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("JSON")
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_str<E>(self, _: &str) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_unit<E>(self) -> Result<Unique, E> {
+            Ok(Unique)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Unique, A::Error> {
+            while items.next_element::<Unique>()?.is_some() {}
+            Ok(Unique)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut fields: A) -> Result<Unique, A::Error> {
+            let mut keys = std::collections::HashSet::new();
+            while let Some(key) = fields.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(A::Error::custom("a key given twice"));
+                }
+                fields.next_value::<Unique>()?;
+            }
+            Ok(Unique)
+        }
+    }
+    serde_json::from_str::<Unique>(json).is_err()
+}
+
 /// Whether text redaction, which made `texted` of the JSON `written`, broke
 /// JSON held in a string inside it, so the rules that read names and pairs
 /// there no longer can: some string that reads as JSON as written, at a
@@ -1666,9 +1737,7 @@ fn broke_json_within(written: &str, texted: &Value, nested: usize) -> bool {
 /// the same keys and indices, and so in turn for what it holds. Where it
 /// cannot be told, a key gone, a list grown or shrunk, or a value of
 /// another type, a place holding JSON counts as broken; one hidden whole
-/// counts as kept, as it shows nothing. An object with fewer keys after,
-/// as when text redaction renames a key into a sibling's name, counts as
-/// broken whatever it holds. JSON that reads as
+/// counts as kept, as it shows nothing. JSON that reads as
 /// JSON only after text redaction counts for nothing, so it cannot make up
 /// for JSON broken beside it.
 fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
@@ -1687,12 +1756,6 @@ fn kept_json(written: &Value, texted: &Value, nested: usize) -> bool {
             .iter()
             .zip(texted)
             .all(|(written, texted)| kept_json(written, texted, nested)),
-        // Fewer keys after: text redaction renamed one into a sibling's
-        // name, `https://u:pw@h` into `https://u:[REDACTED]@h`, and a parse
-        // keeps only the last value given a name, so the other is read by
-        // no rule that reads names and pairs, and the texted string can
-        // show it as text redaction left it.
-        (Value::Object(written), Value::Object(texted)) if texted.len() < written.len() => false,
         (Value::Object(written), Value::Object(texted)) => written.iter().all(|(key, field)| {
             texted.get(key).map_or_else(
                 || !holds_json(field, nested),

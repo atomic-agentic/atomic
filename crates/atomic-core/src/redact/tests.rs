@@ -2972,3 +2972,117 @@ fn an_assignment_after_an_os_error_is_read_by_its_own_name() {
         "token: Permission denied (os error 13) DB_PASSWORD= [REDACTED]"
     );
 }
+
+/// JSON in a string whose object gives a key twice, as written or once
+/// text redaction renames one key into another's name, is hidden whole: a
+/// parse keeps only the last value, and the string as written shows the
+/// others, which no rule read. That holds inside an object or a list under
+/// a key text redaction renames too, and two levels down, under an
+/// ordinary name and under hints, held one to four strings deep, and a
+/// second pass changes nothing.
+#[test]
+fn json_in_a_string_that_gives_a_key_twice_is_hidden_whole() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    let (r, p, q) = (
+        "\"https://u:[REDACTED]@h\"",
+        "\"https://u:pw@h\"",
+        "\"https://v:pw@h\"",
+    );
+    for (shape, doc) in [
+        // As written.
+        format!("{{\"h\": {pair}, \"h\": 1}}"),
+        format!("{{\"h\": {pair}, \"\\u0068\": 1}}"),
+        format!("{{\"h\": [{pair}], \"h\": \"x\"}}"),
+        format!("{{\"a\": {{\"h\": {pair}, \"h\": 1}}}}"),
+        format!("[{{\"h\": {pair}, \"h\": 1}}]"),
+        // Once text redaction renames a key.
+        format!("{{{r}: {pair}, {p}: 1}}"),
+        format!("{{{p}: {{{r}: {pair}, {p}: 1}}}}"),
+        format!("{{{p}: {{{p}: 1, {r}: {pair}}}}}"),
+        format!("{{{p}: [{{{r}: {pair}, {p}: 1}}]}}"),
+        format!("{{{q}: {{\"x\": {{{r}: {pair}, {p}: 1}}}}}}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut held = doc;
+        for depth in 1..=4 {
+            for parent in ["body", "msg", "key", "token", "args", "note"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "shape {shape}, depth {depth}, under {parent}: the header's value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert!(
+                    again == out,
+                    "shape {shape}, depth {depth}, under {parent}: a second pass changed it"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+    }
+    // A name and value pair whose later `key` the parse keeps, so the pair
+    // reads as `note` and its value as no secret, under ordinary names and
+    // under hints (`key`, `token`), which open held JSON first.
+    let pass = concat!("hunter2", "hunter2");
+    let doc = format!(
+        "{{\"a\": \"{SAMPLE}\", \"key\": \"DB_PASSWORD\", \"value\": \"{pass}\", \"key\": \"note\"}}"
+    );
+    for parent in ["note", "data", "log", "body", "key", "token"] {
+        let mut out = json!({ parent: doc.clone() });
+        value(&mut out);
+        assert_eq!(out, json!({ parent: REDACTED }), "under {parent}");
+    }
+    // An object that gives each key once is opened as before.
+    let mut once = json!({ "body": format!("{{\"h\": {pair}, \"i\": 1}}") });
+    value(&mut once);
+    assert_eq!(
+        once,
+        json!({ "body": format!("{{\"h\":{{\"name\":\"X-Api-Key\",\"value\":\"{REDACTED}\"}},\"i\":1}}") })
+    );
+}
+
+/// An excerpt of a JSON document that gives a key twice is written from
+/// the parse, which kept the last value, so the earlier one is left out
+/// rather than shown as written; a second excerpt changes nothing.
+#[test]
+fn an_excerpt_of_json_that_gives_a_key_twice_leaves_out_the_dropped_value() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    let pair = format!("{{\"name\": \"X-Api-Key\", \"value\": \"{key}\"}}");
+    for (case, (doc, expected)) in [
+        (
+            format!("{{\"h\": {pair}, \"h\": 1}}"),
+            "{\"h\":1}".to_owned(),
+        ),
+        (
+            "{\"h\": 1, \"h\": \"ok\", \"i\": [2]}".to_owned(),
+            "{\"h\":\"ok\",\"i\":[2]}".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let shown = excerpt(&doc, 4096);
+        assert!(shown == expected, "case {case}: not written from the parse");
+        assert_eq!(
+            excerpt(&shown, 4096),
+            shown,
+            "case {case}: a second excerpt changed it"
+        );
+    }
+    // A document that gives each key once is kept as written; one whose
+    // keys only text redaction makes alike is read as any object is.
+    assert_eq!(
+        excerpt("{\"h\": 1,  \"i\": 2}", 4096),
+        "{\"h\": 1,  \"i\": 2}"
+    );
+    let renamed = format!("{{\"https://u:[REDACTED]@h\": {pair}, \"https://u:pw@h\": 1}}");
+    assert!(
+        !excerpt(&renamed, 4096).contains(&key[4..]),
+        "the renamed key's value showed"
+    );
+}
