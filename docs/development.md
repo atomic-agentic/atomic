@@ -328,8 +328,9 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/v01-gate.py --atomic target/release
 ```
 
 It works in a new directory under `target/` and removes it at the end;
-`--keep <dir>` works in `<dir>` and keeps it, but not under `/tmp` or
-`$TMPDIR`, where atomic refuses an atom's scratch.
+`--keep <dir>` works in `<dir>` and keeps it. Neither works under `/tmp` or
+`$TMPDIR`, where atomic refuses an atom's scratch — including a checkout that
+lives there, whose `target/` is under it too.
 
 ## The crash suite
 
