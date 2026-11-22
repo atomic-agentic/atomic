@@ -225,12 +225,25 @@ fn real_main() -> anyhow::Result<()> {
     if codex::is_helper(std::env::args_os()) {
         return codex::run_helper();
     }
+    // Whatever started atomic may have left descriptors open: they pass to
+    // none of the programs it starts, the socket a runner's secret variables
+    // come on included, which the runner reads itself and hands on afresh.
+    // A process that cannot make sure of that starts nothing.
+    #[cfg(unix)]
+    atomic_exec::inherited::keep_from_children(&[])
+        .context("keep the descriptors atomic was started with from the programs it starts")?;
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
         == Some(atomic_core::helper_runtime::CHILD_ARG.as_ref())
     {
         std::process::exit(atomic_core::helper_runtime::serve());
+    }
+    // So does the Astro compiler's child, which runs the bundled compiler on
+    // the embedded V8.
+    if std::env::args_os().nth(1).as_deref() == Some(atomic_core::compiler_host::CHILD_ARG.as_ref())
+    {
+        std::process::exit(atomic_core::compiler_host::serve());
     }
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
@@ -807,9 +820,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         };
         Some(
             if args.run_id.is_some() {
-                context::default_key_dir().and_then(|keys| {
-                    context::checkpoint(&atom, &state.context_dir(), &keys, run_id, resolve)
-                })
+                context::checkpoint(&atom, &state.context_dir(), run_id, resolve)
             } else {
                 context::resolve_fresh(&atom, run_id, resolve)
             }

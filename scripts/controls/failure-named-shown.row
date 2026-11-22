@@ -1,0 +1,1 @@
+failure-named-shown|crates/atomic/src/failure.rs|    if let Some(said) = &failure.said {|    if let Some(said) = None::<&Box<[Said; 2]>> { let _ = &failure.said; // CONTROL_OFF|-p atomic-agentic --bin atomic failure::tests::a_named_failure_keeps_its_names_and_redacts_its_text

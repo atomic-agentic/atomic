@@ -38,6 +38,12 @@ if grep -qa "ATOMIC_TEST_LOGIN_ISSUER" "${BIN}"; then
     echo "scripts/release-package.sh: ${BIN} has the fake-model test feature compiled in; build it on its own, as above" >&2
     exit 1
 fi
+# Nor one built with the compiler-in-tests feature, which serves the Astro
+# compiler before main runs.
+if grep -qa "ATOMIC_COMPILER_TEST_DISPATCH" "${BIN}"; then
+    echo "scripts/release-package.sh: ${BIN} has the compiler-in-tests feature compiled in; build it on its own, as above" >&2
+    exit 1
+fi
 
 VERSION="$(cd "${ROOT}" && cargo pkgid -p atomic-agentic)"
 VERSION="${VERSION##*@}"

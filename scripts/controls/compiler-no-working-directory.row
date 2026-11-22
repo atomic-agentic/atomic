@@ -1,0 +1,1 @@
+compiler-no-working-directory|crates/atomic-core/src/compiler_host/host.js|throw refused(`working directory to resolve|return '/' + normalized(joined, false); refused(`working directory to resolve|-p atomic-agentic-core --lib -- compiler_host::tests::the_node_modules_the_worker_imports_do_no_io

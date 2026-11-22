@@ -220,11 +220,9 @@ Naming a credential the manifest lacks fails the load. See
 There are two Deno pieces in atomic, and they differ in status.
 
 **Today.** The bundled Astro compiler, which every declarative atom passes
-through, runs in a permission-restricted Deno worker and needs Deno 2.9.8, which
-the user provisions (see
-[troubleshooting](../reference/troubleshooting.md#the-astro-compiler-needs-deno-298)).
-Separately, `deno_core` and V8 are already linked into the atomic binary to run
-helper isolates.
+through, runs on the `deno_core` and V8 linked into the atomic binary, in a child
+process of atomic itself with no network, environment, filesystem or subprocess
+access; no Deno executable is needed. The same engine runs helper isolates.
 
 **From v0.7.** Code atoms and scripts run on a Deno that atomic downloads and
 manages itself, so that no one installs it and two machines never disagree on

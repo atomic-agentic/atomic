@@ -1,0 +1,1 @@
+stranded-store-site|crates/atomic-core/src/credential.rs|crate::state::credentials_dir_in_use().map_err(CredentialError::File)?|crate::state::credentials_dir().as_ref().cloned().map_err(ToString::to_string).map_err(CredentialError::File)?|-p atomic-agentic-core --lib -- the_file_store_is_refused_while_an_older_atomics_credentials_are_stranded

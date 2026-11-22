@@ -382,8 +382,10 @@ fn token_files(
             // `scripts/controls/gcp-external-token.row` switches this off.
             out.extend(google_token_files(&file, here)?);
         }
-        out.extend(projected_volume(file.clone()));
-        out.push(file);
+        // `scripts/controls/aws-projected-volume.row` and
+        // `scripts/controls/aws-web-identity-token.row` switch these off.
+        out.extend(projected_volume(file.clone())); // the variable's volume
+        out.push(file); // the variable's own file
     }
     Ok(out)
 }
@@ -750,13 +752,24 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist. The entry
-        // from `dirs` is where that other atomic would keep its credentials
-        // (see [`crate::state::credentials_dir`]), which is not always the
-        // directory denied above: that one comes from
-        // [`crate::state::user_config_dir`], the same function
-        // [`crate::state::outside_user_config`] reads, so the directory a
-        // state directory is refused for sitting inside is denied outright.
+        // keys are another atomic's: denied too, where they exist. That
+        // atomic's credentials and keys sit under
+        // [`crate::state::user_config_dir`], the directory denied above and
+        // the same function [`crate::state::outside_user_config`] reads, so
+        // the directory a state directory is refused for sitting inside is
+        // denied outright. The entries from `dirs` are denied beside it: the
+        // state directory `base_dir` falls back to, and the configuration
+        // directory `dirs` names. That is not always the same one: on macOS
+        // (`~/Library/Application Support`) and Windows (`%APPDATA%`) it
+        // never is, and on Linux it differs only for a relative `HOME`,
+        // which `user_config_dir` gives way from (`dirs` ignores a relative
+        // `XDG_CONFIG_HOME` itself).
+        // An older atomic's credentials and checkpoint key, `ATOMIC_HOME`
+        // set or not and whether they exist yet or not: on macOS and Windows
+        // that place was never the configuration directory above.
+        also.extend(crate::state::legacy_secret_dirs(
+            crate::state::legacy_config_dir().as_deref(),
+        ));
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1787,6 +1800,18 @@ pub(crate) fn permission_profile_with(
 /// `profile` with `denied` denied as well: the backend's scratch
 /// directories. What the thread may write inside a denied directory, such as
 /// its own scratch directory, stays writable, as a writable root of its own.
+///
+/// These go into the profile spelled as they were handed over: their cap is
+/// weighed with the list's (`denied_paths_with`), but no link in them is
+/// resolved here. So a scratch or state root that is itself a link reaches
+/// each command's sandbox helper as a denial that is a link, and that walk
+/// denies what it points at instead (see `late_targets`). It refuses the
+/// command, and the command does not run, when what it points at holds a
+/// place the command needs to run, such as the command's own working
+/// directory: a turn whose root lies inside such a linked root is refused
+/// every command of its turn. That fails closed, and is what supporting
+/// scratch or state directories moved elsewhere and linked back would have to
+/// settle -- by resolving them here, before they are denied.
 fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -1866,6 +1891,9 @@ fn refuse_uncovered_store(
     }
     let mut stores = vec![crate::state::base_dir()?, crate::state::credentials_dir()?];
     stores.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+    stores.extend(crate::state::legacy_secret_dirs(
+        crate::state::legacy_config_dir().as_deref(),
+    ));
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
     for root in roots {
         let root = real(root);
@@ -2597,6 +2625,32 @@ fn helper_not_dumpable() {
     }
 }
 
+/// When this process is the outer stage of Codex's Linux sandbox helper,
+/// keep every descriptor it was started with from the programs it starts,
+/// bubblewrap and through it the command, but the socket its proxy token
+/// comes on; or exit. Whatever started the process that started this one
+/// may have left descriptors open, a CI runner's pipes or a person's shell's
+/// files and sockets, and Codex's helper and bubblewrap pass on every one
+/// without close-on-exec. Done first, before the walk that may start the
+/// helper again, which keeps the token's socket, and before Codex's helper
+/// opens what it hands bubblewrap on purpose. The inner stage is left as
+/// it is: what reaches it was handed on purpose.
+fn keep_inherited_descriptors_from_the_command() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
+        let handed: Vec<_> = atomic_exec::inherited::handed_secret_fd()
+            .into_iter()
+            .collect();
+        if let Err(e) = atomic_exec::inherited::keep_from_children(&handed) {
+            crate::log_line!(
+                "atomic: the sandbox helper cannot keep the descriptors it was started with from \
+                 the command; the command does not run: {e}"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Take `name` out of this process's environment, and what it held.
 #[cfg(target_os = "linux")]
 fn take_env(name: &str) -> Option<std::ffi::OsString> {
@@ -2786,7 +2840,11 @@ fn late_link_targets(
 /// mount of `homes`, the directories whose databases the list denies by a
 /// pattern (Codex's home and its second mounts as the list was built)
 /// ([`Late::globs`]), from one read of the mount table
-/// (two where the places are inferred, which needs the table too). Nothing
+/// (two where the places are inferred, which needs the table too). What
+/// `denied` holds is counted from each side, as when the list is built: the
+/// second mounts of its second mounts among them, which is the count
+/// `denied_paths_with` weighs a list against the cap with, so that a list a
+/// thread starts with is not refused by its own commands. Nothing
 /// runs when a place, or a new second mount, now leads to what the command
 /// needs (`needed`), or two or more levels inside a directory of
 /// `writable`, where a command could move it out from under its denial;
@@ -3102,6 +3160,7 @@ const OTHER_SYSTEMS_HELPERS: &[&str] = if cfg!(windows) {
 /// never left in a process that is dumpable again; and give a sandboxed
 /// command its own `TMPDIR`.
 fn as_any_helper() {
+    keep_inherited_descriptors_from_the_command();
     helper_not_dumpable();
     // The walk may start the helper again, so it comes before the token is
     // read: read first, the token would pass through `exec` in the
@@ -5243,6 +5302,69 @@ async fn turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An older atomic's credentials and checkpoint key, kept in the
+    /// configuration directory `dirs` names (on macOS not the one atomic
+    /// uses now), are denied to atoms' commands, with `ATOMIC_HOME` set as
+    /// with it unset, both of them whether they exist yet or not: an older
+    /// atomic can still make one after the guard is built, and a place
+    /// missing when a command starts is denied once it exists. With no such
+    /// directory, nothing is added for them. Every place the guard makes or
+    /// reads is below the case's own throwaway directory.
+    #[test]
+    fn an_older_atomics_credentials_and_keys_are_denied_where_they_are() {
+        let scratch = crate::state::TestScratch::new("legacy-denied");
+        for dir in ["home", "legacy-config/atomic/credentials", "state"] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let also = || match StateGuard::deny_state_dir(scratch.join("state")).expect("a guard") {
+            StateGuard::Deny(private) => private.also,
+            StateGuard::NoProjectState => panic!("no denial"),
+        };
+        let old =
+            ["credentials", "keys"].map(|name| scratch.join("legacy-config/atomic").join(name));
+        assert!(
+            !old[1].exists(),
+            "the older atomic's key directory is here already"
+        );
+        for atomic_home in [Some("/atomic-home"), None] {
+            let mut vars = vec![("HOME", "/home")];
+            vars.extend(atomic_home.map(|home| ("ATOMIC_HOME", home)));
+            let _process = crate::state::as_process_with_dirs(
+                &scratch,
+                &vars,
+                None,
+                Some("legacy-config"),
+                Some("data"),
+            );
+            let denied = also();
+            for place in &old {
+                assert!(
+                    denied.contains(place),
+                    "{} is not denied with ATOMIC_HOME {atomic_home:?}: {denied:?}",
+                    place.display()
+                );
+            }
+        }
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/atomic-home")],
+            None,
+            None,
+            None,
+        );
+        let none = also();
+        assert!(
+            !none
+                .iter()
+                .any(|d| d.starts_with(scratch.join("legacy-config"))),
+            "{none:?}"
+        );
+        assert!(
+            scratch.join("data/atomic/private").is_dir(),
+            "without ATOMIC_HOME the guard did not make the state home the case named"
+        );
+    }
     use crate::testing::{FakeModel, Reply};
 
     #[cfg(unix)]
@@ -6706,7 +6828,9 @@ mod tests {
     }
 
     /// What the profile will deny besides the list, the backend's scratch
-    /// directories, counts toward the cap as each command counts it.
+    /// directories, counts toward the cap as each command counts it: the
+    /// builder refuses the list the thread would start with, and so does each
+    /// command's helper, over the same denied.
     #[cfg(unix)]
     #[test]
     fn the_builder_counts_the_scratch_it_will_deny_as_each_command_does() {
@@ -6731,33 +6855,160 @@ mod tests {
             refused.contains("with 513 second mounts of what they deny, counted from each side"),
             "{refused}"
         );
+        // The scratch directory as one of the paths a command's profile
+        // denies, counted by the walk each command's helper makes before it
+        // starts the command: its own 513 second mounts, and nothing new
+        // found besides.
+        let refused = late_targets(std::slice::from_ref(&scratch), Some(&[]), &[], &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("0 second mounts of what the new ones point at"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
     }
 
     /// The builder counts second mounts as each command does: from each
-    /// side, so a list it starts a thread with never refuses its commands
-    /// for the cap alone.
+    /// side, so a list it starts a thread with never refuses its commands for
+    /// the cap alone. A list whose second mounts come to the cap from each
+    /// side both accept; the same list with one more of them, both refuse --
+    /// the builder counting the list's own second mounts among what it
+    /// counts, and each command's helper counting the same ones again from
+    /// what the list denies.
     #[cfg(unix)]
     #[test]
     fn the_builder_counts_second_mounts_as_each_command_does() {
+        use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let dir = Scratch::new("builder-cap");
         let home = dir.0.join("home");
         let place = home.join(".aws");
+        let work = dir.0.join("work");
         let codex = dir.0.join("codex");
-        for d in [&place, &codex] {
+        for d in [&place, &work, &codex] {
             std::fs::create_dir_all(d).expect("dir");
         }
-        // As many binds as the cap: the place's 512 second mounts and the
-        // place itself as theirs make 513 as a command counts them.
-        let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS));
         let private = PrivateState {
             state_dir: dir.0.join("state"),
             private: dir.0.join("private"),
             also: vec![place.clone()],
         };
-        let refused = denied_paths(&private, &codex, None, &[])
+        let guard = StateGuard::Deny(private.clone());
+        let places = [place.clone()];
+        // Binds one short of the cap: the place's 511 second mounts and the
+        // place itself as theirs come to 512, which is the cap, so neither
+        // the builder nor a command of a thread it starts with refuses.
+        let table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS - 1));
+        denied_paths(&private, &codex, Some(&work), &[]).expect("the cap counted from one side");
+        // The list as a command's helper is handed it: the paths its profile
+        // denies, the directories whose databases its patterns deny, and the
+        // places the builder carried.
+        let profile = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &guard,
+            &codex,
+            Some(&work),
+            &[],
+        )
+        .expect("profile");
+        let (policy, _) = profile.to_runtime_permissions();
+        let paths = |mode: FileSystemAccessMode| -> Vec<PathBuf> {
+            policy
+                .entries
+                .iter()
+                .filter(|e| e.access == mode)
+                .filter_map(|e| match &e.path {
+                    FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let denied = paths(FileSystemAccessMode::Deny);
+        let homes: Vec<PathBuf> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == FileSystemAccessMode::Deny)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::GlobPattern { pattern } => pattern
+                    .strip_suffix(SQLITE_FILES)
+                    .and_then(|dir| dir.strip_suffix('/'))
+                    .map(PathBuf::from),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(homes, vec![codex.clone()], "{homes:?}");
+        let under_cap = |name: &str| -> Vec<std::ffi::OsString> {
+            [
+                "codex-linux-sandbox".to_owned(),
+                "--sandbox-policy-cwd".to_owned(),
+                work.display().to_string(),
+                "--command-cwd".to_owned(),
+                work.display().to_string(),
+                "--permission-profile".to_owned(),
+                serde_json::to_string(&profile).expect("json"),
+                "--".to_owned(),
+                name.to_owned(),
+            ]
+            .into_iter()
+            .map(Into::into)
+            .collect()
+        };
+        let under = late_targets(&denied, Some(&places), &homes, &[], &[]).expect("512 accepted");
+        assert_eq!(under, Late::default(), "{under:?}");
+        assert_eq!(
+            relisted(&under_cap("one"), Some(&places)).expect("nothing new"),
+            None
+        );
+        drop(table);
+        // As many binds as the cap: the place's 512 second mounts and the
+        // place itself as theirs make 513, counted from each side.
+        let _table = crate::mounts::with_table(&binds_of(&home, MAX_LINK_TARGETS));
+        let refused = denied_paths(&private, &codex, Some(&work), &[])
             .expect_err("refused")
             .to_string();
-        assert!(refused.contains("counted from each side"), "{refused}");
+        assert!(
+            refused.contains("513 second mounts of what they deny, counted from each side"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
+        // The same list, counted as each of the thread's commands counts it,
+        // is over the cap for the helper too, which is what the builder's
+        // count is held to.
+        let refused = late_targets(&denied, Some(&places), &homes, &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
+        // And the helper's own entry point, which every command's start
+        // calls, is refused by the same walk; its caller logs that and leaves
+        // the command unrun.
+        let refused = relisted(&under_cap("two"), Some(&places))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("513 second mounts of what they deny"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("more than the 512 atomic follows"),
+            "{refused}"
+        );
     }
 
     /// The helper, given a profile for a place named through a linked

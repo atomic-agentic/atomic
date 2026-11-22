@@ -1,0 +1,1 @@
+exec-fds-entry|crates/atomic/src/main.rs|    atomic_exec::inherited::keep_from_children(&[])|    Ok::<(), std::io::Error>(()) // CONTROL_OFF|-p atomic-agentic --features atomic-agentic/sandbox-tests --test inherited_fds -- a_runners_command_holds_none_of_the_descriptors_left_open_in_its_parent

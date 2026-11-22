@@ -167,10 +167,21 @@ fn dangling_link(dir: &Path) -> Option<&Path> {
 /// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses keeps its
 /// directory, as written, whether or not [`SignIn::located`] accepts it
 /// there: a refused location that holds one may still hold a sign-in.
+/// While an older atomic's credentials are stranded at its old place (see
+/// [`crate::state::credentials_dir_in_use`]), that is where a sign-in may
+/// still be kept, so the directory there is the one named: one found there
+/// is said to be unusable rather than taken for no sign-in at all.
 pub fn location() -> Option<PathBuf> {
-    crate::state::credentials_dir()
-        .ok()
-        .map(|dir| dir.join("codex-auth"))
+    let current = crate::state::credentials_dir().ok()?;
+    let dir = match crate::state::credentials_dir_in_use() {
+        Ok(_) => current,
+        // With the place itself known, the one refusal left is the
+        // stranded one.
+        Err(_) => crate::state::legacy_config_dir()
+            .map(|old| old.join("credentials"))
+            .unwrap_or(current),
+    };
+    Some(dir.join("codex-auth"))
 }
 
 /// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
@@ -199,8 +210,8 @@ impl SignIn {
     /// from.
     pub fn located(project: Option<&Path>) -> Result<Self, SignInError> {
         protected()?;
-        let dir = crate::state::credentials_dir()
-            .map_err(|e| CredentialError::File(e.to_string()))?
+        let dir = crate::state::credentials_dir_in_use()
+            .map_err(CredentialError::File)?
             .join("codex-auth");
         // A link on the way that leads nowhere: making the directory would
         // fail, or make what it names, somewhere not checked here.
@@ -1499,5 +1510,60 @@ mod tests {
             );
             assert!(refused.contains(os), "{refused}");
         }
+    }
+
+    /// The sign-in store is refused, naming both places, while an older
+    /// atomic's credentials are still at their old place and the new one
+    /// holds none, also after the denial has made the new directory, empty:
+    /// a sign-in kept at the old place would otherwise read as signed out.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sign_in_is_refused_while_an_older_atomics_credentials_are_stranded() {
+        let scratch = crate::state::TestScratch::new("stranded-sign-in");
+        for dir in [
+            "home",
+            "legacy-config/atomic/credentials/codex-auth",
+            "state",
+        ] {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        let legacy = scratch.join("legacy-config/atomic/credentials");
+        let _process = crate::state::as_process_with_dirs(
+            &scratch,
+            &[("HOME", "/home")],
+            None,
+            Some("legacy-config"),
+            Some("data"),
+        );
+        let _guard =
+            crate::codex::StateGuard::deny_state_dir(scratch.join("state")).expect("the guard");
+        let new = scratch.join("home/.config/atomic/credentials");
+        assert_eq!(
+            std::fs::read_dir(&new).map(|entries| entries.count()).ok(),
+            Some(0),
+            "the guard did not make the new credential directory, empty"
+        );
+        assert_eq!(
+            location(),
+            Some(legacy.join("codex-auth")),
+            "the sign-in's directory at the older atomic's place is not the one named"
+        );
+        let refused = SignIn::located(None).map(|_| ());
+        let Err(SignInError::Store(CredentialError::File(why))) = refused else {
+            panic!("the sign-in was looked for beside stranded credentials: {refused:?}");
+        };
+        assert!(
+            why.starts_with(&format!(
+                "credentials are kept in {} now, which holds none of them, and an older atomic \
+                 kept them in {}, which still holds them: move everything in",
+                new.display(),
+                legacy.display()
+            )),
+            "{why}"
+        );
+        std::fs::rename(legacy.join("codex-auth"), new.join("codex-auth")).expect("moved");
+        let located = SignIn::located(None).expect("the moved sign-in store");
+        assert_eq!(located.reached, new.join("codex-auth"));
+        assert_eq!(location(), Some(new.join("codex-auth")));
     }
 }
