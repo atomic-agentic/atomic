@@ -74,6 +74,10 @@ jobs:
       # controls-touched.py, which picks the rows the Controls workflow runs,
       # in throwaway repositories.
       - run: scripts/controls-touched-test.sh
+      # setup-deno.py retries a transient download failure, within a bound,
+      # and refuses an archive that does not match its pin; against a
+      # stand-in server on loopback.
+      - run: python3 scripts/setup-deno-test.py
       - run: scripts/backends-check-audit-test.sh
       # acceptance.py fails on a listed test that failed or did not run.
       - run: scripts/acceptance-test.sh
