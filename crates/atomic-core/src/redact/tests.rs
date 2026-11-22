@@ -3463,3 +3463,50 @@ fn a_flag_quote_does_not_close_on_another_line() {
     assert!(!quotes_nest_ambiguously(input));
     assert!(text(input).contains("tail"));
 }
+
+/// Matched pairs at distinct escape depths all cover the common ordinary
+/// flags. Their nested classifications must not revisit that interior once
+/// for each enclosing pair. Exercise the public production reading.
+#[test]
+fn overlapping_quoted_flag_bodies_take_bounded_steps() {
+    let input = |depths: usize| {
+        let mut text = String::new();
+        for depth in 1..=depths {
+            text.push_str(&format!("--x {}\" ", "\\".repeat(depth)));
+        }
+        text.push_str(&"--x a ".repeat(depths * depths));
+        for depth in (1..=depths).rev() {
+            text.push_str(&format!(" {}\" end ", "\\".repeat(depth)));
+        }
+        text
+    };
+    let small = input(16);
+    let large = input(64);
+    assert_eq!(text(&small), small);
+    assert_eq!(text(&large), large);
+    let (small, large) = (steps_of(&small), steps_of(&large));
+    eprintln!("overlapping quoted flags: small={small}, large={large}");
+    assert!(
+        large < 32 * small,
+        "overlapping: {large} steps versus {small}"
+    );
+}
+
+/// A nested reading begins just after the outer opening quote, so its ^
+/// anchor recognizes the first head even though its global delimiter lies
+/// outside the nested body.
+#[test]
+fn a_nested_flag_at_the_body_start_keeps_its_anchor() {
+    assert_eq!(text("before --x \"--password '\" after"), REDACTED);
+}
+
+/// A secret flag outside this quoted body cannot make the body's
+/// ordinary words ambiguous. The public redactor still hides the credential.
+#[test]
+fn nested_flag_readings_end_with_their_body() {
+    let input = "--x \"ordinary\" --password 'secret-suffix'";
+    assert!(!quotes_nest_ambiguously(input));
+    let hidden = text(input);
+    assert!(hidden.contains("ordinary"));
+    assert!(!hidden.contains("secret-suffix"));
+}

@@ -1507,6 +1507,7 @@ fn redact_flag_within(text: &str, captures: &Captures<'_>, depth: usize) -> Stri
 /// reading it as written would.
 fn quotes_nest_ambiguously(input: &str) -> bool {
     let quotes = std::cell::OnceCell::new();
+    let readings = std::cell::OnceCell::new();
     FLAG_HEAD.captures_iter(input).any(|head| {
         let Some(whole) = head.get(0) else {
             return false;
@@ -1534,20 +1535,9 @@ fn quotes_nest_ambiguously(input: &str) -> bool {
         if attached {
             return true;
         }
-        FLAG_HEAD.captures_iter(inner).any(|nested| {
-            let Some(at) = nested.get(0) else {
-                return false;
-            };
-            if strength(&nested[1]) == Strength::None {
-                return false;
-            }
-            let value = &inner[at.end()..];
-            value.is_empty()
-                || (value.trim_start_matches('\\').starts_with(['"', '\''])
-                    && quotes
-                        .prefix(inner_at + at.end(), inner_at + inner.len())
-                        .is_none())
-        })
+        readings
+            .get_or_init(|| FlagReadings::new(input, quotes))
+            .ambiguous(inner_at, inner_at + inner.len())
     })
 }
 
@@ -1586,6 +1576,134 @@ fn hide_ambiguous_lines(input: &str) -> Option<String> {
     // Ambiguous only across lines, a flag on one and its value on the
     // next: no line alone can be hidden for it, so all of it is.
     Some(if hidden { lines } else { REDACTED.to_owned() })
+}
+
+/// One possible head, including its leading delimiter and complete separator.
+/// Adjacent heads can share the last delimiter consumed by their predecessor;
+/// a nested reading's start anchor can also begin at the flag itself.
+struct FlagHead {
+    start: usize,
+    token: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FlagJump {
+    next: usize,
+    end: usize,
+    reaches: usize,
+}
+
+/// Shared summaries of the exact nonoverlapping head-reading chains. Each
+/// head is classified once, then doubling summaries bound each nested query
+/// to at most usize::BITS lookups instead of visiting overlapping bodies.
+/// Construction is O(h log h), storage O(h log h), query O(log h), for h heads.
+struct FlagReadings {
+    heads: Vec<FlagHead>,
+    jumps: Vec<Vec<FlagJump>>,
+}
+
+impl FlagReadings {
+    fn new(input: &str, quotes: &QuotePrefixes<'_>) -> Self {
+        let mut heads = Vec::new();
+        let mut reaches = Vec::new();
+        let mut from = 0;
+        while let Some(captures) = FLAG_HEAD.captures_at(input, from) {
+            step(1);
+            let whole = captures.get(0).expect("a whole flag head");
+            let name = captures.get(1).expect("a flag name");
+            let start = whole.start();
+            let end = whole.end();
+            let token = if input.as_bytes()[start] == b'-' {
+                start
+            } else {
+                start
+                    + input[start..]
+                        .chars()
+                        .next()
+                        .expect("a delimiter")
+                        .len_utf8()
+            };
+            let reach = if strength(name.as_str()) == Strength::None {
+                0
+            } else if input[end..]
+                .trim_start_matches('\\')
+                .starts_with(['"', '\''])
+            {
+                quotes
+                    .prefix(end, input.len())
+                    .map_or(usize::MAX, |(_, all, _)| end + all.len() - 1)
+            } else {
+                // A bare value is ambiguous only when the enclosing body
+                // ends right here, leaving the secret-named head empty.
+                end
+            };
+            heads.push(FlagHead { start, token, end });
+            reaches.push(reach);
+            // Retain an overlapping head whose delimiter was the final
+            // whitespace/quote of this separator. No name occurs inside a
+            // separator, so this enumerates every possible next head once.
+            from = input[..end]
+                .char_indices()
+                .next_back()
+                .expect("a separator")
+                .0;
+        }
+        let mut jumps = vec![
+            heads
+                .iter()
+                .zip(reaches)
+                .map(|(head, reaches)| {
+                    step(1);
+                    FlagJump {
+                        next: heads.partition_point(|next| next.start < head.end),
+                        end: head.end,
+                        reaches,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let mut covered = 1usize;
+        while covered < heads.len() {
+            let previous = jumps.last().expect("the first summary");
+            let level = previous
+                .iter()
+                .map(|first| {
+                    step(1);
+                    match previous.get(first.next) {
+                        Some(second) => FlagJump {
+                            next: second.next,
+                            end: second.end,
+                            reaches: first.reaches.max(second.reaches),
+                        },
+                        None => *first,
+                    }
+                })
+                .collect();
+            jumps.push(level);
+            covered = covered.saturating_mul(2);
+        }
+        Self { heads, jumps }
+    }
+
+    fn ambiguous(&self, start: usize, end: usize) -> bool {
+        let mut at = self.heads.partition_point(|head| head.start < start);
+        if at > 0 && self.heads[at - 1].token == start {
+            at -= 1;
+        }
+        for level in self.jumps.iter().rev() {
+            step(1);
+            if let Some(jump) = level.get(at)
+                && jump.end <= end
+            {
+                if jump.reaches >= end {
+                    return true;
+                }
+                at = jump.next;
+            }
+        }
+        false
+    }
 }
 
 /// The next equally escaped quote on the same line, indexed once for all
