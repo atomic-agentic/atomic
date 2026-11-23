@@ -17,7 +17,6 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-POSTGRES="--features atomic-agentic/postgres-tests"
 
 # milestone | what it covers | cargo test arguments
 ROWS=(
@@ -52,7 +51,8 @@ for row in "${ROWS[@]}"; do
         test_args=""
     fi
     case " ${cargo_args} " in
-        *" -p atomic-agentic-durable "* | *" --workspace "*) cargo_args+=" ${POSTGRES}" ;;
+        *" -p atomic-agentic-durable "*) cargo_args+=" --features atomic-agentic-durable/postgres-tests" ;;
+        *" --workspace "*) cargo_args+=" --features atomic-agentic/postgres-tests" ;;
     esac
     # shellcheck disable=SC2086
     cargo test --locked --no-fail-fast ${cargo_args} -- ${test_args} >"${LOG}" 2>&1

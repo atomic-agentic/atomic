@@ -60,6 +60,20 @@ jobs:
     name: durare fork at the candidate
     needs: candidate
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+        env:
+          POSTGRES_USER: durare
+          POSTGRES_PASSWORD: durare
+          POSTGRES_DB: durare_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U durare -d durare_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
@@ -85,15 +99,37 @@ jobs:
       # candidate's revision.
       - name: Point the fork at the candidate's sqlx
         working-directory: durare
+        env:
+          SQLX_REV: ${{ steps.pins.outputs.sqlx_rev }}
         run: |
-          sed -i '/git = "https:\/\/github.com\/transact-rs\/sqlx"/s/rev = "[0-9a-f]*"/rev = "${{ steps.pins.outputs.sqlx_rev }}"/' Cargo.toml
+          [[ "${SQLX_REV}" =~ ^[0-9a-f]{40}$ ]]
+          sed -i '/git = "https:\/\/github.com\/transact-rs\/sqlx"/s/rev = "[0-9a-f]*"/rev = "'"${SQLX_REV}"'"/' Cargo.toml
+          sed -i -E "s|^sqlx = \{ version = \"[^\"]*\"|sqlx = { git = \"https://github.com/transact-rs/sqlx\", rev = \"${SQLX_REV}\"|" Cargo.toml
           git diff --stat
       - name: Toolchain
         run: rustup toolchain install "${{ steps.pins.outputs.toolchain }}" --profile minimal
       - name: Build and test
         id: test
         working-directory: durare
-        run: cargo "+${{ steps.pins.outputs.toolchain }}" test
+        shell: bash
+        env:
+          DATABASE_URL: postgres://durare:durare@127.0.0.1:5432/durare_test
+          SQLX_REV: ${{ steps.pins.outputs.sqlx_rev }}
+          TOOLCHAIN: ${{ steps.pins.outputs.toolchain }}
+        run: |
+          source="git+https://github.com/transact-rs/sqlx?rev=${SQLX_REV}#${SQLX_REV}"
+          cargo "+${TOOLCHAIN}" metadata --format-version 1 --features postgres |
+            python3 -c '
+          import json, sys
+
+          names = {"sqlx", "sqlx-core", "sqlx-postgres", "sqlx-sqlite"}
+          packages = [p for p in json.load(sys.stdin)["packages"] if p["name"] in names]
+          if sorted(p["name"] for p in packages) != sorted(names) or any(
+              p["source"] != sys.argv[1] for p in packages
+          ):
+              raise SystemExit("Durare did not resolve every SQLx backend at the candidate revision")
+          ' "${source}"
+          cargo "+${TOOLCHAIN}" test --locked --features postgres
       - name: Report
         if: always()
         run: |
@@ -145,15 +181,15 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
-      # The prebuilt V8 archive deps/v8.toml pins, for the milestone suites.
-      - name: V8 archive
-        run: scripts/v8-archive.sh
-
       # Codex's lockfile lacks atomic's own packages; resolving adds them at
       # the versions Codex's lockfile allows. The result is kept for the bump
       # commit.
       - name: Complete the lockfile
         run: cargo metadata --format-version 1 >/dev/null
+
+      # Select the archive from Atomic's resolved lock, after replacing Codex's seed.
+      - name: V8 archive
+        run: scripts/v8-archive.sh
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
