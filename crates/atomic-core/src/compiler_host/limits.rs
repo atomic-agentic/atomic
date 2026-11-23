@@ -42,10 +42,15 @@ pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-            return Err(format!(
-                "cannot limit the Astro compiler's {name}: {}",
-                std::io::Error::last_os_error()
-            ));
+            let error = std::io::Error::last_os_error();
+            #[cfg(target_os = "macos")]
+            if resource == libc::RLIMIT_DATA {
+                let details = crate::darwin_memory::rejected_data_limit(value, &error);
+                return Err(format!(
+                    "cannot limit the Astro compiler's {name}: {details}"
+                ));
+            }
+            return Err(format!("cannot limit the Astro compiler's {name}: {error}"));
         }
     }
     Ok(())

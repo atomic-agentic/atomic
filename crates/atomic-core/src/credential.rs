@@ -570,11 +570,19 @@ mod tests {
             "{why}"
         );
         std::fs::rename(legacy.join("6f70"), new.join("6f70")).expect("moved");
-        let store = configured_store(&scratch.join("project")).expect("the moved store");
-        assert_eq!(
-            store.load("op").ok().flatten().as_deref(),
-            Some("secret"),
-            "the moved credential is not the one read"
-        );
+        let moved_store = configured_store(&scratch.join("project"));
+        if cfg!(target_os = "linux") {
+            let store = moved_store.expect("the moved store");
+            assert_eq!(
+                store.load("op").ok().flatten().as_deref(),
+                Some("secret"),
+                "the moved credential is not the one read"
+            );
+        } else {
+            assert!(matches!(
+                moved_store,
+                Err(CredentialError::Unprotected(platform)) if platform == std::env::consts::OS
+            ));
+        }
     }
 }

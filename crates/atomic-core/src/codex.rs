@@ -8400,11 +8400,9 @@ mod tests {
         assert!(!deniable(&real(&dir.join("tools/python3")), false));
         // Whoever owns them: what the system keeps outside its program and
         // device directories, such as a cluster's credentials under /etc.
-        assert!(
-            Path::new("/etc/hostname").is_file(),
-            "a file the system keeps"
-        );
-        assert!(deniable(Path::new("/etc/hostname"), false));
+        let system_file = Path::new("/etc/hosts");
+        assert!(system_file.is_file(), "a file the system keeps");
+        assert!(deniable(system_file, false));
         assert!(!deniable(Path::new("/usr/bin/env"), false));
         assert!(!deniable(Path::new("/dev/null"), true));
         // A directory someone else owns, found by the walk, stays; one a
@@ -10149,7 +10147,15 @@ mod tests {
             // Shell snapshots are off, and none is readable.
             assert_eq!(at(&p("codex/shell_snapshots/t.sh")), Deny);
             // What Codex's shell needs, and the thread's own checkout.
-            assert_eq!(at(&p("codex/tmp/arg0-linux/codex-linux-sandbox")), Read);
+            let helper_access = if cfg!(target_os = "linux") {
+                Read
+            } else {
+                Deny
+            };
+            assert_eq!(
+                at(&p("codex/tmp/arg0-linux/codex-linux-sandbox")),
+                helper_access
+            );
             assert_eq!(at(&format!("{worktree}/src/lib.rs")), own);
             assert_eq!(at("/usr/bin/git"), Read);
             // The system temporary directory is not writable, nor a project in it.

@@ -36,10 +36,20 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Where git may be, in order. The first that exists is used.
+#[cfg(not(target_os = "macos"))]
 const GIT_PROGRAMS: &[&str] = &[
     "/usr/bin/git",
     "/usr/local/bin/git",
     "/opt/homebrew/bin/git",
+];
+
+// Apple's bundled Git may lack --no-lazy-fetch. Prefer Homebrew Git at the
+// same fixed locations atomic already trusts.
+#[cfg(target_os = "macos")]
+const GIT_PROGRAMS: &[&str] = &[
+    "/opt/homebrew/bin/git",
+    "/usr/local/bin/git",
+    "/usr/bin/git",
 ];
 
 /// How long one git command may take, by default. A checkout of a large

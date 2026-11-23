@@ -355,6 +355,7 @@ fn stores(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
 }
 
 /// What run `id` returned, once it has finished, in any store in `dir`.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn finished_output(dir: &Path, id: &str) -> Option<Value> {
     let (stores, id) = (stores(dir), id.to_owned());
     // A runtime of its own, so it may be asked from inside the tests' own.
@@ -2916,25 +2917,28 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
 
-        // The operator's credential, enrolled and kept in the file store, as
-        // `atomic gates enroll` leaves it.
-        let secret = "the operator's secret";
-        let store = atomic_core::credential::FileSecrets::open(
-            &dir.join("atomic-home/credentials"),
-            &project,
-        )
-        .expect("the file store");
-        let account = format!(
-            "operator:dev@{}",
-            state.file_name().expect("a project id").to_string_lossy()
-        );
-        atomic_core::credential::SecretStore::save(&store, &account, secret).expect("kept");
-        gate::enroll(
-            &rt,
-            &gate::HumanCredential::new(Principal::local("dev"), secret),
-        )
-        .await
-        .expect("enrolled");
+        #[cfg(target_os = "linux")]
+        {
+            // The operator's credential, enrolled and kept in the file store, as
+            // `atomic gates enroll` leaves it.
+            let secret = "the operator's secret";
+            let store = atomic_core::credential::FileSecrets::open(
+                &dir.join("atomic-home/credentials"),
+                &project,
+            )
+            .expect("the file store");
+            let account = format!(
+                "operator:dev@{}",
+                state.file_name().expect("a project id").to_string_lossy()
+            );
+            atomic_core::credential::SecretStore::save(&store, &account, secret).expect("kept");
+            gate::enroll(
+                &rt,
+                &gate::HumanCredential::new(Principal::local("dev"), secret),
+            )
+            .await
+            .expect("enrolled");
+        }
 
         // A local serve recovers it. Reaped, so that an assertion that
         // fails below does not leave `atomic serve` running.
@@ -2969,7 +2973,29 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         })
         .await
         .expect("child");
+        #[cfg(target_os = "linux")]
         assert!(out.status.success(), "{}", text(&out));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let refusal =
+                atomic_core::credential::CredentialError::Unprotected(std::env::consts::OS);
+            assert!(
+                !out.status.success() && text(&out).contains(&refusal.to_string()),
+                "{}",
+                text(&out)
+            );
+            let still_open = gate::find(&rt, &again.id)
+                .await
+                .expect("gate")
+                .expect("exists");
+            assert!(
+                still_open.resolution.is_none(),
+                "the refused approval decided the gate"
+            );
+            // Use the scripted operator to verify recovery independently of the
+            // unavailable platform credential store.
+            approve(&rt, &still_open).await;
+        }
         let started = Instant::now();
         loop {
             let status = rt.status("served-gate").await.expect("status");
@@ -4259,6 +4285,7 @@ fn an_exec_atom_reaches_only_the_hosts_it_declares() {
 /// `dir/bwrap-full` exists it fails as bubblewrap does on a full disk, and
 /// while `dir/bwrap-refuse` exists as it does where user namespaces are not
 /// allowed. Returns the `PATH` to run atomic with.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn bwrap_in_front(dir: &Path) -> String {
     use std::os::unix::fs::PermissionsExt;
     let path = std::env::var("PATH").unwrap_or_default();
@@ -4295,10 +4322,9 @@ fn bwrap_in_front(dir: &Path) -> String {
 /// full disk shows first in the sandbox's trial before the next run's first
 /// command: the run waits, records nothing, and finishes once there is room.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("sandbox-full");
     let project = project(&dir);
@@ -4352,10 +4378,9 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
 /// the exit code for a failure to try again; `atomic runs resume` continues
 /// it once there is room, and its command runs once.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("backend-wait");
     let project = project(&dir);
@@ -4432,10 +4457,9 @@ fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
 /// waiting step gives up its wait, records nothing, and `atomic runs
 /// resume` continues it.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_signal_ends_a_wait_for_room_at_once() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("wait-stop");
     let project = project(&dir);
@@ -4495,10 +4519,9 @@ fn a_signal_ends_a_wait_for_room_at_once() {
 /// apart and says so each time, stops at once when asked meanwhile, and runs
 /// the step once there is room. The wait comes from `ATOMIC_BACKEND_WAIT`.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("serve-room");
     let project = project(&dir);
@@ -4659,6 +4682,7 @@ fn the_backend_wait_is_at_least_a_second() {
 }
 
 /// `env` with an unused model endpoint, as `atomic runs resume` needs one.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
     UNUSED_MODEL
         .iter()
@@ -4673,10 +4697,9 @@ fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
 /// then, so once the machine is fixed serve itself finishes the run, its
 /// second step once. `atomic run` stops with its exit code instead.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
@@ -8240,37 +8263,42 @@ fn every_place_that_redelivers_gate_decisions_redelivers_park_releases() {
         wait_until("the resume to redeliver", || redelivered(&resumed_log) >= 1);
         let _ = resumed.kill();
         let _ = resumed.wait();
-        // A gate decided from the command line.
-        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
-        let enrolled = tokio::task::spawn_blocking(move || {
-            let mut script = command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
-            script
-                .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
-                .output()
-                .expect("script")
-        })
-        .await
-        .expect("child");
-        assert!(enrolled.status.success(), "{}", text(&enrolled));
-        let decided_log = dir.join("approve.failpoints");
-        let decided_at = decided_log.to_string_lossy().into_owned();
-        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
-        let approved = tokio::task::spawn_blocking(move || {
-            atomic(
-                &d,
-                &p,
-                &["gates", "approve", "redelivered:check"],
-                &with(&e, &[("ATOMIC_FAILPOINT_LOG", &decided_at)]),
-                "",
-            )
-        })
-        .await
-        .expect("child");
-        assert!(approved.status.success(), "{}", text(&approved));
-        assert!(
-            redelivered(&decided_log) >= 1,
-            "the gate decision redelivered nothing"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            // A gate decided from the command line.
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            let enrolled = tokio::task::spawn_blocking(move || {
+                let mut script =
+                    command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
+                script
+                    .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
+                    .output()
+                    .expect("script")
+            })
+            .await
+            .expect("child");
+            assert!(enrolled.status.success(), "{}", text(&enrolled));
+            let decided_log = dir.join("approve.failpoints");
+            let decided_at = decided_log.to_string_lossy().into_owned();
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            let approved = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &["gates", "approve", "redelivered:check"],
+                    &with(&e, &[("ATOMIC_FAILPOINT_LOG", &decided_at)]),
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            assert!(approved.status.success(), "{}", text(&approved));
+            assert!(
+                redelivered(&decided_log) >= 1,
+                "the gate decision redelivered nothing"
+            );
+        }
+
         // Served: at start, and again a few seconds later.
         let served_log = dir.join("serve.failpoints");
         let served_at = served_log.to_string_lossy().into_owned();

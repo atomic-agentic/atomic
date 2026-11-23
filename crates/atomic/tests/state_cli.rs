@@ -767,6 +767,7 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
                    database), so there is no configuration directory for credentials; set \
                    HOME, or set ATOMIC_HOME to keep them under it";
     let signed_out = "no one is signed in with ChatGPT";
+    let unsupported = atomic_core::signin::SignInError::Unprotected(std::env::consts::OS);
     let env = [("HOME", "home".to_string())];
 
     let out = atomic(&dir, &project, &["model", "status"], &env);
@@ -781,7 +782,12 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
         "the credential store was placed at the relative spelling of `HOME`, and the file \
          store refused itself there: {t}"
     );
-    if said.contains("the home directory is unknown") {
+    if !cfg!(target_os = "linux") {
+        assert!(
+            said.contains(&unsupported.to_string()),
+            "wrong refusal: {t}"
+        );
+    } else if said.contains("the home directory is unknown") {
         // Neither the environment nor the password database names an
         // absolute home: refused, saying which home is missing and what
         // to set.
@@ -813,7 +819,10 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
     // Which home the password database gives is this machine's; the unit
     // tests of the credential and key places pin that choice with a home
     // they make up.
-    if description.contains("the home directory is unknown") {
+    if !cfg!(target_os = "linux") {
+        assert_eq!(kind, "error", "{t}");
+        assert_eq!(description, unsupported.to_string(), "{t}");
+    } else if description.contains("the home directory is unknown") {
         assert_eq!(kind, "error", "{t}");
         assert_eq!(description, refusal, "the refusal of the unknown home: {t}");
     } else {

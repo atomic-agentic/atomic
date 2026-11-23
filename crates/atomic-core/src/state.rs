@@ -2658,14 +2658,14 @@ mod tests {
     /// A worktree's `.git` whose `gitdir:` names a path that is no text, and
     /// a `commondir` that names one too, are read as the paths they name, so
     /// the main checkout there is still counted.
-    #[cfg(unix)]
+    // The on-disk fixture needs a filesystem that accepts non-UTF-8 filenames.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_link_file_naming_a_path_that_is_no_text_is_still_read() {
         use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let dir = std::env::temp_dir().join(format!("atomic-link-bytes-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        // A name of bytes that are no text, which any Unix name may be: a
-        // word and one byte no UTF-8 sequence starts with.
+        // A name containing a byte that no UTF-8 sequence starts with.
         let odd = |name: &str| {
             let mut name = name.as_bytes().to_vec();
             name.push(0xff);

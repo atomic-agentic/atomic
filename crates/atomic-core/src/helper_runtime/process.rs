@@ -312,9 +312,16 @@ fn limit_self(limits: &Limits) -> Result<(), Failure> {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+            let error = std::io::Error::last_os_error();
+            #[cfg(target_os = "macos")]
+            if resource == libc::RLIMIT_DATA {
+                let details = crate::darwin_memory::rejected_data_limit(value, &error);
+                return Err(Failure::Host(format!(
+                    "cannot limit the helper process: {details}"
+                )));
+            }
             return Err(Failure::Host(format!(
-                "cannot limit the helper process: {}",
-                std::io::Error::last_os_error()
+                "cannot limit the helper process: {error}"
             )));
         }
     }

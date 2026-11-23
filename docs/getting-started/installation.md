@@ -39,6 +39,9 @@ Which commands are built and which are a later stage's plan is listed in
   API key, or a local OpenAI-compatible endpoint. Codex atoms take the
   subscription sign-in from `atomic model login`, which atomic accepts on Linux
   for now; the API-key path detects `OPENAI_API_KEY`.
+- Git that supports `--no-lazy-fetch` for worktree and fixture operations.
+  On macOS, install a current Git with Homebrew if the bundled Git lacks that
+  option. Atomic looks for Homebrew Git at its standard installation paths.
 - Git and a container engine (Docker, or Podman) to build Atomic from source; the
   executable itself runs with no container. `scripts/dev.sh` also wants `curl`,
   which fetches the pinned V8 archive the first time its cache needs it; the
