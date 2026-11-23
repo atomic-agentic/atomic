@@ -109,9 +109,10 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
-# Release binaries, as Codex builds its own, but stripped: the release
+# Optimize release binaries for size and strip their symbols. The release
 # pipeline does not yet archive separate debug symbols.
 [profile.release]
+opt-level = "z"
 lto = "thin"
 codegen-units = 4
 debug = false
