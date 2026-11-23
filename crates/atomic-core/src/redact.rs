@@ -313,6 +313,22 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
+/// A name and value pair written as JSON text, its quotes escaped to any
+/// depth, name first: `"name": "X-Api-Key", "value": "`, or with `key` or
+/// `header` for `name`, up to the value's opening quote, whose backslashes
+/// are the second group.
+static PAIR_NAME_FIRST: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r#"\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*"\s*,\s*\\*"value\\*"\s*:\s*(\\*)""#,
+    )
+});
+/// The same pair, value first: `"value": "`, up to its opening quote.
+static PAIR_VALUE_OPEN: LazyLock<Regex> = LazyLock::new(|| regex(r#"\\*"value\\*"\s*:\s*(\\*)""#));
+/// What follows a value given first, from its closing quote: `", "name":
+/// "X-Api-Key"`.
+static PAIR_NAME_AFTER: LazyLock<Regex> = LazyLock::new(|| {
+    regex(r#"^\\*"\s*,\s*\\*"(?:name|key|header)\\*"\s*:\s*\\*"([^"\\\n]{1,128})\\*""#)
+});
 /// A URL's password, to the last `@` before its host.
 static URL_PASSWORD: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/'"]+)(@)"#));
@@ -1440,6 +1456,113 @@ fn read_strength(name: &str, written: bool) -> Strength {
     surest
 }
 
+/// How many depths of escaping [`pairs`] reads: the backslashes before a
+/// quote that JSON held in strings that many deep writes, 0, 1, 3, 7 and so
+/// on to 127.
+const PAIR_LEVELS: u32 = 8;
+
+/// Whether `backslashes` before a quote are as many as JSON held in strings
+/// writes, `2^depth - 1`, at a depth under [`PAIR_LEVELS`]. A quote at any
+/// other count opens no value [`pairs`] reads.
+fn escaped_as_json(backslashes: usize) -> bool {
+    (backslashes + 1).is_power_of_two() && backslashes < (1 << PAIR_LEVELS)
+}
+
+/// The length of a JSON string's value whose opening quote follows `level`
+/// backslashes, up to its closing quote: the first quote after `level` and
+/// then any number of escaped backslashes, `2 × (level + 1)` each, so a
+/// value that ends in a backslash, `C:\\`, closes where it does; or `None`
+/// if the line ends first.
+fn pair_value_len(rest: &str, level: usize) -> Option<usize> {
+    let escaped = 2 * (level + 1);
+    let mut backslashes = 0;
+    for (i, b) in rest.bytes().enumerate() {
+        step(1);
+        match b {
+            b'\n' => return None,
+            b'\\' => backslashes += 1,
+            b'"' if backslashes >= level && (backslashes - level).is_multiple_of(escaped) => {
+                return Some(i - level);
+            }
+            _ => backslashes = 0,
+        }
+    }
+    None
+}
+
+/// Hide the secret of each name and value pair written as JSON text,
+/// `{"name": "X-Api-Key", "value": "…"}` with its quotes escaped as JSON
+/// held in strings escapes them (see [`escaped_as_json`]), name or value
+/// first, judged as the JSON rule judges such a pair (see
+/// [`header_pair`]). The JSON rule reads only JSON that parses; this reads
+/// one that is cut, follows other text or sits in a string literal. A value
+/// given after its name whose closing quote is not found before the line
+/// ends is cut, and judged and hidden to the end of the line. Linear: a
+/// value is scanned once, and only a later value's opening quote at the
+/// same depth closes an earlier one, so a scan that finds no closing quote
+/// leaves none at its depth to scan on that line; each character is read
+/// at most once for each depth and once more.
+fn pairs(input: &str) -> Option<String> {
+    let line_end = |from: usize| input[from..].find('\n').map_or(input.len(), |i| from + i);
+    let holds = |name: &str, value: &str| {
+        let value = value.replace('\\', "");
+        pair_holds_secret(name, &Value::String(value), true)
+    };
+    let mut hidden: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while let Some(c) = PAIR_NAME_FIRST.captures_at(input, at) {
+        let from = c.get(0).map_or(at, |m| m.end());
+        let level = c.get(2).map_or(0, |m| m.len());
+        at = from;
+        if !escaped_as_json(level) {
+            continue;
+        }
+        let to =
+            pair_value_len(&input[from..], level).map_or_else(|| line_end(from), |len| from + len);
+        let value = input[from..to].trim_end_matches(['}', ']', ' ', '\t', '\r']);
+        if holds(&c[1], value) {
+            hidden.push((from, to));
+        }
+        at = to.max(from);
+    }
+    at = 0;
+    while let Some(c) = PAIR_VALUE_OPEN.captures_at(input, at) {
+        let from = c.get(0).map_or(at, |m| m.end());
+        let level = c.get(1).map_or(0, |m| m.len());
+        at = from;
+        if !escaped_as_json(level) {
+            continue;
+        }
+        let Some(len) = pair_value_len(&input[from..], level) else {
+            continue;
+        };
+        if let Some(n) = PAIR_NAME_AFTER.captures(&input[from + len..])
+            && holds(&n[1], &input[from..from + len])
+        {
+            hidden.push((from, from + len));
+        }
+        at = from + len;
+    }
+    if hidden.is_empty() {
+        return None;
+    }
+    hidden.sort_unstable();
+    let mut out = String::new();
+    let mut copied = 0;
+    for (from, to) in hidden {
+        if to <= copied {
+            continue;
+        }
+        if from >= copied {
+            out.push_str(&input[copied..from]);
+            out.push_str(REDACTED);
+        }
+        copied = to;
+    }
+    out.push_str(&input[copied..]);
+    (out != input).then_some(out)
+}
+
 /// How many headers inside one another's values [`headers`] reads.
 const HEADERS_WITHIN: usize = 8;
 
@@ -1493,6 +1616,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
     apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
+    if let Some(replaced) = pairs(&output) {
+        output = Cow::Owned(replaced);
+    }
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }
@@ -1633,11 +1759,13 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            // A document that gives a key twice is written from the parse,
-            // which kept only the last value: the others, which no rule
-            // read, are left out (see [`gives_a_key_twice`]).
+            // A document that gives a key twice is hidden whole, as JSON
+            // in a string is (see [`gives_a_key_twice`]): the parse kept
+            // only the last value, so what the rest says of it, as a pair
+            // whose `key` was given twice, `DB_PASSWORD` and then `note`,
+            // cannot be told from what was read.
             if gives_a_key_twice(trimmed) {
-                Some(doc.to_string())
+                Some(REDACTED.to_owned())
             } else {
                 (doc != before).then(|| doc.to_string())
             }
