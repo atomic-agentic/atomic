@@ -918,31 +918,35 @@ fn signed_in_a_replay_still_finds_what_detection_recorded_and_a_shared_ledger_re
         let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
         assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
         assert_eq!(model.calls(), recorded, "a replay called the model");
-        // A live eval metered in a shared ledger refuses the sign-in.
-        env.push((
-            "ATOMIC_DATABASE_URL".into(),
-            "postgres://atomic:atomic@127.0.0.1:9/atomic".into(),
-        ));
-        env.push(("ATOMIC_EXECUTOR_ID".into(), "host-1".into()));
-        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
-        let shared = tokio::task::spawn_blocking(move || {
-            let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-            eval_with(&d, &p, "", &["note", "--live"], &e)
-        })
-        .await
-        .expect("eval");
-        assert!(!shared.status.success(), "{}", text(&shared));
-        assert!(
-            text(&shared).contains("a sign-in is personal"),
-            "{}",
-            text(&shared)
-        );
-        assert!(
-            text(&shared).contains("the store is shared"),
-            "{}",
-            text(&shared)
-        );
-        assert_eq!(model.calls(), recorded, "a refused eval called the model");
+        // A live eval metered in a shared ledger refuses the sign-in. A
+        // sign-in is kept on Linux only, so elsewhere there is none to refuse.
+        if cfg!(target_os = "linux") {
+            env.push((
+                "ATOMIC_DATABASE_URL".into(),
+                "postgres://atomic:atomic@127.0.0.1:9/atomic".into(),
+            ));
+            env.push(("ATOMIC_EXECUTOR_ID".into(), "host-1".into()));
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            let shared = tokio::task::spawn_blocking(move || {
+                let e: Vec<(&str, &str)> =
+                    e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                eval_with(&d, &p, "", &["note", "--live"], &e)
+            })
+            .await
+            .expect("eval");
+            assert!(!shared.status.success(), "{}", text(&shared));
+            assert!(
+                text(&shared).contains("a sign-in is personal"),
+                "{}",
+                text(&shared)
+            );
+            assert!(
+                text(&shared).contains("the store is shared"),
+                "{}",
+                text(&shared)
+            );
+            assert_eq!(model.calls(), recorded, "a refused eval called the model");
+        }
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&dir);
     });

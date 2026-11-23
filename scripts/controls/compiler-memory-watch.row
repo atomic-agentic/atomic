@@ -1,0 +1,1 @@
+compiler-memory-watch|crates/atomic-core/src/compiler_process.rs|Some(watch) => watch.check(child),|Some(_) => Ok(()),|-p atomic-agentic-core --lib -- compiler_host::tests::memory_a_compile_uses_past_its_limit_is_refused_by_its_parent

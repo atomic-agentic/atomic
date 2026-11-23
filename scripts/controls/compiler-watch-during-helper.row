@@ -1,0 +1,1 @@
+compiler-watch-during-helper|crates/atomic-core/src/compiler_process.rs|sample()?;|let _ = &mut sample;|-p atomic-agentic-core --lib -- compiler_process::the_compiler_is_sampled_during_a_helper_call

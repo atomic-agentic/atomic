@@ -517,8 +517,14 @@ in turn:
 
 Pushes to main also run two macOS jobs in parallel. "Clippy (macos-15)" runs
 formatting and Clippy while "Rust (macos-15)" builds and tests the workspace.
-A manual run on main can add both jobs with the `macos` input. Pull requests
-and merge groups run the Linux checks. CodeQL runs in its own
+A manual run, on main or on a branch, can add both jobs with the `macos`
+input, which is how a change for macOS is checked before it merges:
+
+```bash
+gh workflow run ci.yml --ref <branch> -f macos=true
+```
+
+Pull requests and merge groups run the Linux checks. CodeQL runs in its own
 workflow on main only
 (each push, weekly and by hand), so an alert shows up after its change merges;
 fix it on main. Nothing in CI waits for it. The Controls workflow runs the
@@ -680,12 +686,38 @@ embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
 environment, a 1 GiB V8 heap limit, operating-system limits of 2.5 GiB of
 writable memory (twice the heap, plus 512 MiB for what V8 keeps outside it:
 WebAssembly memories and ArrayBuffers among it), 32 seconds of CPU time and no
-core files (`compiler_host/limits.rs`), and the parent's 30-second limit. Its
+core files (`compiler_host/limits.rs`), and the parent's 30-second limit. On
+macOS the memory limit is the parent's instead, as described below. Its
 host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
 stderr for its console, its exit status, its own WASM, random bytes, SHA-256 and
 timers, and nothing else: no network, environment, filesystem or subprocess.
 atomic reads atom sources itself and sends them in the request, for loading as
 for rendering. Direct-run context checkpoints live outside the source tree.
+
+The compiler child and the child that runs a captured helper call
+(`helper_runtime/process.rs`) each have a memory limit, and the two platforms
+hold it differently:
+
+- **Linux.** The child sets `RLIMIT_DATA` on itself before V8 starts, and the
+  kernel refuses writable memory past it, written to or not.
+- **macOS.** There `RLIMIT_DATA` and `RLIMIT_AS` both bound the size of the
+  whole address map, the kernel refuses a limit below the map's present size,
+  and an arm64 process starts with hundreds of gigabytes mapped that nothing can
+  use, so a child cannot set a limit near the memory it may hold. The parent
+  holds the limit instead (`crates/atomic-core/src/child_memory.rs`): every two
+  milliseconds while it waits, including during a captured helper call, it
+  asks for the child's physical footprint. A reading over budget kills the
+  child. The interval is a requested wait and the operating system schedules
+  each reading. The footprint counts committed memory, including compressed
+  memory. A reservation or brief peak can go unobserved. A failed reading
+  kills the child, with a one-second grace period when the OS reports that
+  the child is absent and the parent has yet to collect it. Each child also
+  watches a private channel and exits if the supervisor disappears.
+
+The limits V8 holds itself (the heap limit, and for helpers the ArrayBuffer
+budget) are the same on both. The tests of the parent's limit run on Linux too,
+where they put a small limit in place of the child's own
+(`child_memory::with_limit`).
 
 A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
 it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's

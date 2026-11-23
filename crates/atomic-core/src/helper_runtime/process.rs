@@ -7,9 +7,10 @@
 //! isolate's limits. Memory V8 allocates outside its heap (flattened
 //! strings, compiled regular expressions, parser buffers) is also outside
 //! the heap limit. A process boundary contains both: the child runs one
-//! call under an operating-system limit on its writable memory, the host
-//! kills it at the call's deadline, and a child that dies takes nothing
-//! with it.
+//! call under a limit on its memory, the host kills it at the call's
+//! deadline, and a child that dies takes nothing with it. The child sets
+//! that limit on itself where the operating system has one to set; on
+//! macOS, which has none, the host holds it (see `child_memory`).
 //!
 //! The child is the atomic binary itself, started with [`CHILD_ARG`] and a
 //! cleared environment, so the host's timezone and locale never reach it.
@@ -18,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use super::{Captured, Clock, Controls, Failure, Limits};
+use crate::child_memory::{Breach, INTERVAL, Watch};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -106,14 +108,22 @@ enum Response {
     Failure(Failure),
 }
 
-/// The writable memory a child may hold for a call with `limits`.
-fn memory_limit(limits: &Limits) -> u64 {
-    // The heap may grow to twice its limit while a call unwinds (see the
-    // heap callback); results and errors are held a few times over.
-    BASE_MEMORY
-        + 2 * limits.heap_bytes as u64
-        + limits.array_buffer_bytes as u64
-        + 4 * (limits.output_bytes + limits.error_bytes) as u64
+/// The process memory budget and the maximum bytes read from stdout.
+fn byte_limits(limits: &Limits) -> Result<(u64, u64), Failure> {
+    let compute = || {
+        let heap = u64::try_from(limits.heap_bytes).ok()?.checked_mul(2)?;
+        let buffers = u64::try_from(limits.array_buffer_bytes).ok()?;
+        let result = u64::try_from(limits.output_bytes.checked_add(limits.error_bytes)?).ok()?;
+        // The heap may grow while a call unwinds, and the result and error
+        // bytes can be held several times over.
+        let memory = BASE_MEMORY
+            .checked_add(heap)?
+            .checked_add(buffers)?
+            .checked_add(result.checked_mul(4)?)?;
+        let stdout = result.checked_add(1024 * 1024)?;
+        Some((memory, stdout))
+    };
+    compute().ok_or_else(|| Failure::Host("helper byte limits are too large".into()))
 }
 
 /// Runs one call in a child process.
@@ -140,6 +150,11 @@ fn run(
     clock: Clock,
 ) -> Result<Value, Failure> {
     let host = |message: String| Failure::Host(message);
+    let (memory_limit, output_limit) = byte_limits(&limits)?;
+    let allowed_time = STARTUP
+        .checked_add(limits.deadline)
+        .filter(|time| Instant::now().checked_add(*time).is_some())
+        .ok_or_else(|| host("helper deadline is too large".into()))?;
     let request = serde_json::to_vec(&Request {
         captured: captured.clone(),
         export: export.to_owned(),
@@ -157,12 +172,17 @@ fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     crate::compiler_process::new_session(&mut process);
+    #[cfg(target_os = "macos")]
+    let mut supervisor = crate::worker_lifetime::Supervisor::prepare(&mut process)
+        .map_err(|e| host(format!("cannot supervise the helper process: {e}")))?;
     let mut child = process.spawn().map_err(|e| {
         host(format!(
             "cannot start the helper process {}: {e}",
             command.program.display()
         ))
     })?;
+    #[cfg(target_os = "macos")]
+    supervisor.child_spawned();
     let mut stdin = child.stdin.take().ok_or_else(|| host("no stdin".into()))?;
     let stdout = child
         .stdout
@@ -177,10 +197,16 @@ fn run(
     std::thread::spawn(move || {
         let _ = stdin.write_all(&request);
     });
-    let output_limit = (limits.output_bytes + limits.error_bytes) as u64 + 1024 * 1024;
     let out = std::thread::spawn(move || bounded(stdout, output_limit));
     let err = std::thread::spawn(move || bounded(stderr, 64 * 1024));
-    let deadline = Instant::now() + STARTUP + limits.deadline;
+    let mut watch = Watch::for_child(memory_limit);
+    // The startup and call allowance is for the child. Parent-side request
+    // serialization and spawn setup are outside it.
+    let Some(deadline) = Instant::now().checked_add(allowed_time) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(host("helper deadline is too large".into()));
+    };
     let status = loop {
         match child.try_wait().map_err(|e| host(e.to_string()))? {
             Some(status) => break status,
@@ -189,8 +215,25 @@ fn run(
                 let _ = child.wait();
                 return Err(Failure::Deadline);
             }
-            None => std::thread::sleep(Duration::from_millis(2)),
+            None => {}
         }
+        // Where the host holds the child's memory limit, a child found past
+        // it has exhausted its memory, as one the kernel refused has.
+        let read = match watch.as_mut() {
+            Some(watch) => watch.check(&mut child),
+            None => Ok(()),
+        };
+        if let Err(breach) = read {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(match breach {
+                Breach::Exceeded => Failure::Heap,
+                Breach::Unread(error) => host(format!(
+                    "cannot read the helper process's memory to limit it: {error}"
+                )),
+            });
+        }
+        std::thread::sleep(INTERVAL);
     };
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();
@@ -256,6 +299,11 @@ fn bounded(mut reader: impl Read, limit: u64) -> Vec<u8> {
 /// Serves one helper call: reads the request on stdin, runs it under the
 /// child's limits and writes the result line. Returns the exit status.
 pub fn serve() -> i32 {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::worker_lifetime::watch_supervisor() {
+        crate::log_line!("cannot watch the helper's supervisor: {error}");
+        return 2;
+    }
     let mut request = Vec::new();
     if std::io::stdin()
         .take(REQUEST_LIMIT)
@@ -296,12 +344,22 @@ pub fn serve() -> i32 {
     0
 }
 
-/// Limits this process: its writable memory, its CPU time, and no core
-/// file when V8 aborts.
+/// Limits this process: its CPU time, no core file when V8 aborts and,
+/// except on macOS, its writable memory. macOS refuses a data limit below
+/// the size of the whole address map, so there the host holds the memory
+/// limit (see `child_memory`).
 fn limit_self(limits: &Limits) -> Result<(), Failure> {
-    let cpu = limits.deadline.as_secs() + 2;
+    let memory = byte_limits(limits)?.0;
+    #[cfg(target_os = "macos")]
+    let _ = memory;
+    let cpu = limits
+        .deadline
+        .as_secs()
+        .checked_add(2)
+        .ok_or_else(|| Failure::Host("helper CPU limit is too large".into()))?;
     for (resource, value) in [
-        (libc::RLIMIT_DATA, memory_limit(limits)),
+        #[cfg(not(target_os = "macos"))]
+        (libc::RLIMIT_DATA, memory),
         (libc::RLIMIT_CPU, cpu),
         (libc::RLIMIT_CORE, 0),
     ] {
@@ -312,16 +370,9 @@ fn limit_self(limits: &Limits) -> Result<(), Failure> {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-            let error = std::io::Error::last_os_error();
-            #[cfg(target_os = "macos")]
-            if resource == libc::RLIMIT_DATA {
-                let details = crate::darwin_memory::rejected_data_limit(value, &error);
-                return Err(Failure::Host(format!(
-                    "cannot limit the helper process: {details}"
-                )));
-            }
             return Err(Failure::Host(format!(
-                "cannot limit the helper process: {error}"
+                "cannot limit the helper process: {}",
+                std::io::Error::last_os_error()
             )));
         }
     }
