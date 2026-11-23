@@ -396,23 +396,25 @@ jobs:
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${NEEDS}"
           jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}" >/dev/null
 
-  # Test protected main on macOS with the Linux-only backends disabled.
-  # This job keeps no build cache, leaving it available to the Linux jobs.
+  # The macOS jobs share setup and run in parallel on protected main.
+  # Linux jobs have the repository's Rust build cache.
+  clippy-macos:
+    name: Clippy (macos-15)
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.macos)) }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup-macos
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   rust-macos:
     name: Rust (macos-15)
     if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.macos)) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # rustup installs the toolchain and components rust-toolchain.toml names.
-      - name: Toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - name: V8 archive
-        run: |
-          scripts/v8-archive.sh
-          scripts/v8-archive-test.sh
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - uses: ./.github/actions/rust-setup-macos
       - run: cargo build --workspace --locked
       - name: Test (macOS)
         run: cargo test --workspace --locked --no-fail-fast

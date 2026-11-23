@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+
+name: Rust setup (macOS)
+description: Pinned Rust toolchain and verified V8 archive for macOS jobs
+
+runs:
+  using: composite
+  steps:
+    # rustup installs the toolchain and components rust-toolchain.toml names.
+    - name: Toolchain
+      shell: bash
+      run: rustup show active-toolchain || rustup toolchain install
+    - name: V8 archive
+      shell: bash
+      run: |
+        scripts/v8-archive.sh
+        scripts/v8-archive-test.sh
