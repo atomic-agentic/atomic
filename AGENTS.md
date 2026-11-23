@@ -120,8 +120,8 @@ scripts/dev.sh cargo test -p atomic-agentic-core --lib --features fake-model   #
 ```
 
 CI runs the same build, fmt, clippy and tests, plus these checks, on Linux
-for every push to main and every pull request; macOS runs only when the
-workflow is started by hand with its `macos` input. Run everything locally
+for every push to main, pull request and merge group. macOS runs on pushes to
+main and on manual main runs with the `macos` input. Run everything locally
 first. These checks also run locally:
 
 ```bash

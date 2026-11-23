@@ -515,8 +515,10 @@ in turn:
 | Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
-A manual run with the `macos` input adds "Rust (macos-15)", which builds and
-tests on macOS in one job. CodeQL runs in a workflow of its own, on main only
+Pushes to main also run "Rust (macos-15)", which builds and tests on macOS in
+one job. A manual run on main can add the job with the `macos` input. Pull
+requests and merge groups run the Linux checks. CodeQL runs in its own
+workflow on main only
 (each push, weekly and by hand), so an alert shows up after its change merges;
 fix it on main. Nothing in CI waits for it. The Controls workflow runs the
 controls rows a pull request touches
