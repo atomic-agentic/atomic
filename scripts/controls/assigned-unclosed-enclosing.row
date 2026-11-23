@@ -1,0 +1,1 @@
+assigned-unclosed-enclosing|crates/atomic-core/src/redact.rs|            if limit == input.len()|            if true /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_value_read_inside_one_left_as_written_ends_within_it

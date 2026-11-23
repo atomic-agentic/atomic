@@ -1,0 +1,1 @@
+flag-nested-anchor-index|crates/atomic-core/src/redact.rs|if at > 0 && self.heads[at - 1].token == start {|if false /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::a_nested_flag_at_the_body_start_keeps_its_anchor

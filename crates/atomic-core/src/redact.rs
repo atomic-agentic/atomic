@@ -298,11 +298,46 @@ fn regex(pattern: &str) -> Regex {
 
 /// A command-line flag and its value: `--password x`, at the start of the
 /// text or after a space, a quote, a bracket or a comma, and as two items of
-/// an argument list, `"--token", "abc"`.
-static FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    regex(
-        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+/// an argument list, `"--token", "abc"`. A value may be quoted with escaped
+/// quotes, `--password \"x\"`, as in a command held in JSON in a string, at
+/// any depth of escaping.
+static FLAG: LazyLock<Regex> = LazyLock::new(|| regex(&flag_pattern()));
+/// [`FLAG`] where a text starts, and nowhere after.
+static FLAG_AT_START: LazyLock<Regex> =
+    LazyLock::new(|| regex(&format!("^(?:{})", flag_pattern())));
+fn flag_pattern() -> String {
+    format!(
+        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*){separator})({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+        separator = FLAG_SEPARATOR,
+        escaped = escaped_quoted(),
     )
+}
+/// What separates a flag from its value: space, or the escaped or plain
+/// quotes and comma between two items of an argument list.
+const FLAG_SEPARATOR: &str = r#"(?:\s+|\\*["']\s*,\s*\\*["'])"#;
+/// The alternatives of [`FLAG`]'s value for one in escaped quotes, `\"x\"`
+/// or `\\\"x\\\"`, tried before a bare value would take the backslash:
+/// closed by the first quote after it, which must be escaped as the opening
+/// one is. A quote escaped otherwise is another value's, and the value is
+/// then read as a bare one, by its backslashes alone.
+fn escaped_quoted() -> String {
+    let mut alternatives = String::new();
+    for escapes in 1..=MAX_QUOTE_ESCAPES {
+        for quote in ['"', '\''] {
+            alternatives.push_str(&format!(
+                r"\\{{{escapes}}}{quote}(?:[^{quote}\n]*[^\\{quote}\n])?\\{{{escapes}}}{quote}|"
+            ));
+        }
+    }
+    alternatives
+}
+/// The most backslashes before a quote [`FLAG`] reads as escaping it.
+const MAX_QUOTE_ESCAPES: usize = 8;
+/// A flag and what separates it from its value, as [`FLAG`] reads them.
+static FLAG_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    regex(&format!(
+        r#"(?:^|[\s"'\[,])--?([A-Za-z0-9][A-Za-z0-9-]*){FLAG_SEPARATOR}"#
+    ))
 });
 /// An authorization, cookie or API key header and its value, to the end of
 /// the line or the quote around it.
@@ -1053,6 +1088,36 @@ fn value_after(input: &str, at: usize) -> Option<(usize, usize)> {
     }
 }
 
+/// The span of a value at `at` that opens a quote, escaped at most eight
+/// deep as [`value_after`] reads one, which nothing closes: up to the end
+/// of the line, or, for an escaped quote, the first quote escaped less,
+/// which ends the string the value is in; `None` if it is empty or `at`
+/// opens no quote.
+fn unclosed_value(input: &str, at: usize) -> Option<(usize, usize)> {
+    let rest = &input[at..];
+    let level = rest.bytes().take_while(|b| *b == b'\\').count();
+    if level > 8 || !matches!(rest.as_bytes().get(level), Some(b'"' | b'\'')) {
+        return None;
+    }
+    let start = at + level + 1;
+    let mut backslashes = 0;
+    let mut end = input.len();
+    for (i, b) in input[start..].bytes().enumerate() {
+        match b {
+            b'\n' => {
+                end = start + i;
+                break;
+            }
+            b'\\' => backslashes += 1,
+            b'"' | b'\'' if backslashes < level => {
+                end = start + i - backslashes;
+                break;
+            }
+            _ => backslashes = 0,
+        }
+    }
+    (start < end).then_some((start, end))
+}
 /// How many values left as written, one inside another, [`assigned`] reads
 /// on inside: past them, a value is passed over whole, so each character
 /// is read at most this many times and once more.
@@ -1162,6 +1227,17 @@ fn assigned_spans(input: &str, depth: usize) -> (Vec<(usize, usize)>, bool) {
         let scope = &input[..limit];
         let start = value_start(scope, sep + sep_len);
         let Some((value_from, mut value_to)) = value_after(scope, start) else {
+            // A secret value whose quote never closes is bounded by the
+            // same enclosing value as the ordinary read above. Keep looking
+            // for inner assignments when it holds another separator.
+            if limit == input.len()
+                && let Some((value_from, value_to)) = unclosed_value(scope, start)
+                && !scope[value_from..value_to].contains(['=', ':'])
+                && is_secret_value(strength, &scope[value_from..value_to])
+            {
+                spans.push((value_from, value_to));
+                at = value_to;
+            }
             continue;
         };
         // What the operating system said of the path before it, as Rust
@@ -1373,14 +1449,636 @@ fn reads_as_no_credential(word: &str) -> bool {
     path || time || url || address || identifier
 }
 
-fn redact_flag(captures: &Captures<'_>) -> String {
-    let value = captures[3].trim_matches(['"', '\'']);
-    if !is_secret_value(strength(&captures[2]), value) {
-        return captures[0].to_string();
-    }
+/// [`FLAG`]'s replacement for a match in `text`.
+fn redact_flag(text: &str, captures: &Captures<'_>) -> String {
+    redact_flag_within(text, captures, 0)
+}
+
+/// How many quotes deep [`redact_flag`] reads the flags of a quoted value
+/// that is not a secret itself, `sh -c "login --password x"`.
+const FLAG_DEPTH: usize = 4;
+
+/// [`redact_flag`] for a flag `depth` quoted values deep.
+fn redact_flag_within(text: &str, captures: &Captures<'_>, depth: usize) -> String {
     let whole = captures.get(0).map_or(0, |m| m.start());
     let value_at = captures.get(3).map_or(0, |m| m.start());
-    format!("{}{REDACTED}", &captures[0][..value_at - whole])
+    let prefix = &captures[0][..value_at - whole];
+    let raw = &captures[3];
+    let strength = strength(&captures[2]);
+    // A value in quotes, plain or escaped alike at both ends, is judged by
+    // what it holds.
+    if let Some((open, inner, close)) = quoted(raw) {
+        // Escaped quotes around what reads as more than a value, a name
+        // assigned, a flag or a quote, can close on the opening of a value
+        // inside it,
+        // which hiding them whole would leave bare: read as a bare value
+        // instead, by its backslashes, and the rest read on.
+        if open.len() > 1 && is_secret_value(strength, inner) && holds_more(inner) {
+            let (escapes, rest) = raw.split_at(open.len() - 1);
+            let escapes = if is_secret_value(strength, escapes) {
+                REDACTED
+            } else {
+                escapes
+            };
+            let inside = if depth < FLAG_DEPTH {
+                FLAG.replace_all(rest, |c: &Captures<'_>| {
+                    redact_flag_within(rest, c, depth + 1)
+                })
+            } else {
+                Cow::Borrowed(rest)
+            };
+            return format!("{prefix}{escapes}{inside}");
+        }
+        if is_secret_value(strength, inner) {
+            // Escaped quotes are kept, so they still pair, and a flag right
+            // after the closing one is still read as one.
+            return if open.len() > 1 {
+                format!("{prefix}{open}{REDACTED}{close}")
+            } else {
+                format!("{prefix}{REDACTED}")
+            };
+        }
+        // Not a secret itself, it can hold a command whose flags are, and
+        // they were read as part of it: read them again inside the quotes.
+        if depth < FLAG_DEPTH && FLAG.is_match(inner) {
+            let inside = FLAG.replace_all(inner, |c: &Captures<'_>| {
+                redact_flag_within(inner, c, depth + 1)
+            });
+            return format!("{prefix}{open}{inside}{close}");
+        }
+        return captures[0].to_string();
+    }
+    // A separator of an assignment, `--password = x`, is no value: the
+    // pair is left to the reading of assignments. Unless a secret's name is
+    // assigned right after it, `--password : api_key="x"`: that reading
+    // would take the name for the value and leave the name's own value
+    // bare, so the separator is judged as the value, and the name after it
+    // is read by its own.
+    let separator = [":", "=", "=>", ":="].contains(&raw);
+    let after = captures.get(0).map_or("", |m| &text[m.end()..]);
+    let assigns_next = separator && assigns_secret_next(after);
+    if (separator && !assigns_next) || !is_secret_value(strength, raw.trim_matches(['"', '\''])) {
+        return captures[0].to_string();
+    }
+    // A run of backslashes a bare value ends in escapes the quote after it.
+    // In an escaped argument list, `[\"--password\", \"x\"]`, that quote
+    // closes the one escaped alike before the value: the run is kept, so the
+    // quotes still pair. Any other run escapes a quote no reading paired,
+    // and is hidden with the value: JSON that this breaks is then hidden
+    // whole.
+    let value = raw.trim_end_matches('\\');
+    let run = &raw[value.len()..];
+    let closes_opening = [format!("{run}\""), format!("{run}'")]
+        .iter()
+        .any(|quote| prefix.ends_with(quote.as_str()));
+    let escape = if value.is_empty() {
+        ""
+    } else if closes_opening {
+        run
+    } else {
+        ""
+    };
+    format!("{prefix}{REDACTED}{escape}")
+}
+
+/// Whether `input` nests quotes at one escaping depth so that no reading
+/// can pair them: a flag's quoted value holds a secret-named flag whose own
+/// value the quote closing the outer one cuts off, or opens a quote
+/// nothing in it closes; or a quoted value closes on a quote that runs
+/// straight on into a flag (any flag after a secret's value, a
+/// secret-named one after another's). Such text is hidden whole, as
+/// reading it as written would.
+fn quotes_nest_ambiguously(input: &str) -> bool {
+    let quotes = std::cell::OnceCell::new();
+    let readings = std::cell::OnceCell::new();
+    FLAG_HEAD.captures_iter(input).any(|head| {
+        let Some(whole) = head.get(0) else {
+            return false;
+        };
+        if !input[whole.end()..]
+            .trim_start_matches('\\')
+            .starts_with(['"', '\''])
+        {
+            return false;
+        }
+        let quotes = quotes.get_or_init(|| QuotePrefixes::new(input));
+        let Some((inner, all, inner_at)) = quotes.prefix(whole.end(), input.len()) else {
+            return false;
+        };
+        // A quoted value closed by a quote that runs straight on into a
+        // flag, `"login ["--pw", "x"]"`: the closing quote opens a value
+        // inside it. A secret's value so closed is ambiguous whatever flag
+        // follows; another's, when a secret-named one does.
+        let after = &input[whole.end() + all.len()..];
+        let attached = if strength(&head[1]) == Strength::None {
+            secret_flag_at(after)
+        } else {
+            starts_flag(after.as_bytes())
+        };
+        if attached {
+            return true;
+        }
+        readings
+            .get_or_init(|| FlagReadings::new(input, quotes))
+            .ambiguous(inner_at, inner_at + inner.len())
+    })
+}
+
+/// Whether `text` starts with a secret-named flag, `--password` say.
+fn secret_flag_at(text: &str) -> bool {
+    let name = text.trim_start_matches('-');
+    let dashes = text.len() - name.len();
+    let end = name
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(name.len());
+    (1..=2).contains(&dashes)
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && strength(&name[..end]) != Strength::None
+}
+
+/// `input` with each line whose quotes nest ambiguously (see
+/// [`quotes_nest_ambiguously`]) hidden whole, its line end kept; `None` if
+/// there is none.
+fn hide_ambiguous_lines(input: &str) -> Option<String> {
+    if !quotes_nest_ambiguously(input) {
+        return None;
+    }
+    let mut hidden = false;
+    let lines: String = input
+        .split_inclusive('\n')
+        .map(|line| {
+            let body = line.trim_end_matches(['\n', '\r']);
+            if quotes_nest_ambiguously(body) {
+                hidden = true;
+                format!("{REDACTED}{}", &line[body.len()..])
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    // Ambiguous only across lines, a flag on one and its value on the
+    // next: no line alone can be hidden for it, so all of it is.
+    Some(if hidden { lines } else { REDACTED.to_owned() })
+}
+
+/// One possible head, including its leading delimiter and complete separator.
+/// Adjacent heads can share the last delimiter consumed by their predecessor;
+/// a nested reading's start anchor can also begin at the flag itself.
+struct FlagHead {
+    start: usize,
+    token: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FlagJump {
+    next: usize,
+    end: usize,
+    reaches: usize,
+}
+
+/// Shared summaries of the exact nonoverlapping head-reading chains. Each
+/// head is classified once, then doubling summaries bound each nested query
+/// to at most usize::BITS lookups instead of visiting overlapping bodies.
+/// Construction is O(h log h), storage O(h log h), query O(log h), for h heads.
+struct FlagReadings {
+    heads: Vec<FlagHead>,
+    jumps: Vec<Vec<FlagJump>>,
+}
+
+impl FlagReadings {
+    fn new(input: &str, quotes: &QuotePrefixes<'_>) -> Self {
+        let mut heads = Vec::new();
+        let mut reaches = Vec::new();
+        let mut from = 0;
+        while let Some(captures) = FLAG_HEAD.captures_at(input, from) {
+            step(1);
+            let whole = captures.get(0).expect("a whole flag head");
+            let name = captures.get(1).expect("a flag name");
+            let start = whole.start();
+            let end = whole.end();
+            let token = if input.as_bytes()[start] == b'-' {
+                start
+            } else {
+                start
+                    + input[start..]
+                        .chars()
+                        .next()
+                        .expect("a delimiter")
+                        .len_utf8()
+            };
+            let reach = if strength(name.as_str()) == Strength::None {
+                0
+            } else if input[end..]
+                .trim_start_matches('\\')
+                .starts_with(['"', '\''])
+            {
+                quotes
+                    .prefix(end, input.len())
+                    .map_or(usize::MAX, |(_, all, _)| end + all.len() - 1)
+            } else {
+                // A bare value is ambiguous only when the enclosing body
+                // ends right here, leaving the secret-named head empty.
+                end
+            };
+            heads.push(FlagHead { start, token, end });
+            reaches.push(reach);
+            // Retain an overlapping head whose delimiter was the final
+            // whitespace/quote of this separator. No name occurs inside a
+            // separator, so this enumerates every possible next head once.
+            from = input[..end]
+                .char_indices()
+                .next_back()
+                .expect("a separator")
+                .0;
+        }
+        let mut jumps = vec![
+            heads
+                .iter()
+                .zip(reaches)
+                .map(|(head, reaches)| {
+                    step(1);
+                    FlagJump {
+                        next: heads.partition_point(|next| next.start < head.end),
+                        end: head.end,
+                        reaches,
+                    }
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let mut covered = 1usize;
+        while covered < heads.len() {
+            let previous = jumps.last().expect("the first summary");
+            let level = previous
+                .iter()
+                .map(|first| {
+                    step(1);
+                    match previous.get(first.next) {
+                        Some(second) => FlagJump {
+                            next: second.next,
+                            end: second.end,
+                            reaches: first.reaches.max(second.reaches),
+                        },
+                        None => *first,
+                    }
+                })
+                .collect();
+            jumps.push(level);
+            covered = covered.saturating_mul(2);
+        }
+        Self { heads, jumps }
+    }
+
+    fn ambiguous(&self, start: usize, end: usize) -> bool {
+        let mut at = self.heads.partition_point(|head| head.start < start);
+        if at > 0 && self.heads[at - 1].token == start {
+            at -= 1;
+        }
+        for level in self.jumps.iter().rev() {
+            step(1);
+            if let Some(jump) = level.get(at)
+                && jump.end <= end
+            {
+                if jump.reaches >= end {
+                    return true;
+                }
+                at = jump.next;
+            }
+        }
+        false
+    }
+}
+
+/// The next equally escaped quote on the same line, indexed once for all
+/// flag readings. Reverse scanning also bounds absent/mismatched lookups:
+/// repeated openers never search overlapping suffixes of the input.
+struct QuotePrefixes<'a> {
+    input: &'a str,
+    next: std::collections::HashMap<usize, usize>,
+}
+
+impl<'a> QuotePrefixes<'a> {
+    fn new(input: &'a str) -> Self {
+        let bytes = input.as_bytes();
+        let mut latest = std::collections::HashMap::new();
+        let mut next = std::collections::HashMap::new();
+        let mut at = bytes.len();
+        // Generations avoid repeatedly clearing a map whose retained
+        // capacity came from one long line before many short ones.
+        let mut line = 0usize;
+        while at > 0 {
+            at -= 1;
+            step(1);
+            match bytes[at] {
+                b'\n' => line += 1,
+                quote @ (b'"' | b'\'') => {
+                    let mut start = at;
+                    while start > 0 && bytes[start - 1] == b'\\' {
+                        start -= 1;
+                        step(1);
+                    }
+                    let level = at - start;
+                    if let Some((seen, close)) = latest.insert((quote, level), (line, at))
+                        && seen == line
+                    {
+                        next.insert(at, close);
+                    }
+                    at = start;
+                }
+                _ => {}
+            }
+        }
+        Self { input, next }
+    }
+
+    /// A prefix within `at..limit`, returning its body, whole spelling and
+    /// absolute body offset. A nested reading cannot use an outer closer.
+    fn prefix(&self, at: usize, limit: usize) -> Option<(&'a str, &'a str, usize)> {
+        let rest = &self.input[at..limit];
+        let escapes = rest.len() - rest.trim_start_matches('\\').len();
+        step(escapes + 1);
+        let open = at + escapes;
+        if !matches!(self.input.as_bytes().get(open), Some(b'"' | b'\'')) || open >= limit {
+            return None;
+        }
+        let close = *self.next.get(&open)?;
+        if close >= limit {
+            return None;
+        }
+        let inner_at = open + 1;
+        Some((
+            &self.input[inner_at..close - escapes],
+            &self.input[at..close + 1],
+            inner_at,
+        ))
+    }
+}
+
+/// Read once more each secret-named flag's value, and hide what follows
+/// the flag where the flag readings left no clean value: one that starts with a bracket or a comma, opens a quote
+/// that no quote escaped alike closes, or runs on into more than a value.
+/// What no reading can tell apart is hidden from the flag up to the next
+/// flag, the end of the line or the end of the string the flag is in, so
+/// JSON around it still parses.
+fn unclean_flag_values(input: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut last = 0;
+    // How the last quote read so far is escaped, read on as the flags are.
+    let mut quotes = LastQuote::default();
+    for head in FLAG_HEAD.captures_iter(input) {
+        let (Some(whole), Some(flag)) = (head.get(0), head.get(1)) else {
+            continue;
+        };
+        // Up to the flag, the quote or space before it included.
+        quotes.read_to(input, flag.start());
+        if whole.start() < last || strength(&head[1]) == Strength::None {
+            continue;
+        }
+        let at = whole.end();
+        let rest = &input[at..];
+        // A secret-named flag that takes no value here, `psql --password
+        // --token=x`: the next flag is left to the readings of its own.
+        if starts_flag(rest.as_bytes()) {
+            continue;
+        }
+        if clean_value(rest) {
+            // One the readings before may not have reached, inside a value
+            // they read whole: read it here.
+            let from = &input[whole.start()..];
+            if let Some(flag) = FLAG_AT_START.captures(from)
+                && let Some(read) = flag.get(0)
+            {
+                let redacted = redact_flag(from, &flag);
+                if redacted != read.as_str() {
+                    out.push_str(&input[last..whole.start()]);
+                    out.push_str(&redacted);
+                    last = whole.start() + read.end();
+                }
+            }
+            continue;
+        }
+        let end = at + unclean_len(quotes.escapes, rest);
+        if end == at {
+            continue;
+        }
+        out.push_str(&input[last..at]);
+        out.push_str(REDACTED);
+        last = end;
+    }
+    (last > 0).then(|| {
+        out.push_str(&input[last..]);
+        out
+    })
+}
+
+/// Whether `rest`, after a flag, starts with one clean value: hidden
+/// already, a bare word, or a quote closed by the first quote after it,
+/// escaped alike; then nothing but closing quotes, brackets and commas
+/// before a space or the end.
+fn clean_value(rest: &str) -> bool {
+    let after = if let Some(after) = rest.strip_prefix(REDACTED) {
+        after
+    } else {
+        let escapes = rest.len() - rest.trim_start_matches('\\').len();
+        match rest[escapes..].chars().next() {
+            Some(quote @ ('"' | '\'')) => {
+                let inner = &rest[escapes + 1..];
+                // Looked for no further than the value can run.
+                let inner = &inner[..value_reach(inner)];
+                let Some(close) = inner.find(quote) else {
+                    return false;
+                };
+                let run = inner[..close].len() - inner[..close].trim_end_matches('\\').len();
+                if run != escapes {
+                    return false;
+                }
+                &inner[close + 1..]
+            }
+            Some(c) if escapes == 0 && !matches!(c, '[' | '{' | ',' | ']' | '}') => {
+                let word = rest
+                    .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'))
+                    .unwrap_or(rest.len());
+                &rest[word..]
+            }
+            _ => return false,
+        }
+    };
+    after
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .all(|c| matches!(c, '"' | '\'' | '\\' | ']' | '}' | ',' | ')'))
+}
+
+/// How far a flag's value can run in `rest`: to the end of the line or
+/// the next flag after a space.
+fn value_reach(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    (0..bytes.len())
+        .find(|&i| {
+            bytes[i] == b'\n' || (matches!(bytes[i], b' ' | b'\t') && starts_flag(&bytes[i + 1..]))
+        })
+        .unwrap_or(bytes.len())
+}
+
+/// Whether `bytes` starts with a flag: `-x` or `--x`.
+fn starts_flag(bytes: &[u8]) -> bool {
+    match bytes {
+        [b'-', b'-', c, ..] | [b'-', c, ..] => c.is_ascii_alphanumeric(),
+        _ => false,
+    }
+}
+
+/// The last quote read in a text, by how many backslashes escape it.
+#[derive(Default)]
+struct LastQuote {
+    escapes: Option<usize>,
+    read: usize,
+    run: usize,
+}
+
+impl LastQuote {
+    /// Read `text` on up to `to`, once over.
+    fn read_to(&mut self, text: &str, to: usize) {
+        for &b in &text.as_bytes()[self.read.min(to)..to] {
+            match b {
+                b'\\' => {
+                    self.run += 1;
+                    continue;
+                }
+                b'"' | b'\'' => self.escapes = Some(self.run),
+                _ => {}
+            }
+            self.run = 0;
+        }
+        self.read = self.read.max(to);
+    }
+}
+
+/// How much of `rest` an unclean flag value takes: up to the next flag
+/// after a space, the end of the line, or the quote that ends the string
+/// the flag is in, escaped as the nearest quote before the flag
+/// (`enclosing`) is or less, and not its backslashes; to the end if there
+/// is none. Never past the start of an assignment, or just past a `=`,
+/// `:`, `:=` or `=>`, which would leave the name it assigns hidden and its
+/// value bare.
+fn unclean_len(enclosing: Option<usize>, rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // A word that starts an assignment, `api_key= x`, `token => x`, is
+        // left to the reading of assignments, which hides its value.
+        let starts_word = i > 0 && matches!(bytes[i - 1], b' ' | b'\t' | b',' | b'[' | b'{');
+        if starts_word && assignment_at(rest, i) {
+            return i;
+        }
+        match bytes[i] {
+            // Stopped just past a separator, the span ends before the name
+            // it assigns instead, wherever that name starts: after a quote,
+            // `'x'token:= --x`, or what a reading hid, `[REDACTED]token:=`.
+            b'\n' => return before_assigned_name(rest, i),
+            b' ' | b'\t' if starts_flag(&bytes[i + 1..]) => return before_assigned_name(rest, i),
+            b'"' | b'\'' => {
+                let run = rest[..i].len() - rest[..i].trim_end_matches('\\').len();
+                let at = i - run;
+                let closes = enclosing.is_some_and(|level| run <= level);
+                let assigns = separator_before(&rest[..at]).is_some();
+                if closes && !assigns {
+                    return at;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    bytes.len()
+}
+
+/// Whether the word of `text` at `at` starts an assignment, as
+/// [`word_starts_assignment`] reads one.
+fn assignment_at(text: &str, at: usize) -> bool {
+    assigned_name_at(text, at).is_some()
+}
+
+/// The name assigned at `at` in `text`: letters, digits, `_`, `-` and
+/// `.`, then `=` or `:`, at once or after blanks. Only the name and the
+/// blanks after it are read, so reading from each word start of a text
+/// stays linear: no two names overlap.
+fn assigned_name_at(text: &str, at: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let name = name_len(&bytes[at..]);
+    if name == 0 {
+        return None;
+    }
+    let next = bytes[at + name..].iter().find(|b| {
+        step(1);
+        !is_blank(b)
+    });
+    matches!(next, Some(b'=' | b':')).then(|| &text[at..at + name])
+}
+
+/// How many bytes `bytes` starts with that a name holds: letters, digits,
+/// `_`, `-` and `.`.
+fn name_len(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|b| {
+            step(1);
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+        })
+        .count()
+}
+
+/// Whether the word `text` starts with, past blanks, assigns a secret's
+/// name, `api_key="x"`.
+fn assigns_secret_next(text: &str) -> bool {
+    let next = text.len() - text.trim_start_matches([' ', '\t']).len();
+    assigned_name_at(text, next).is_some_and(|name| strength(name) != Strength::None)
+}
+
+/// Where the separator of an assignment that `text` ends in starts, past
+/// blanks: `=`, `:`, `:=` or `=>`.
+fn separator_before(text: &str) -> Option<usize> {
+    let text = text.trim_end_matches([' ', '\t']);
+    let separator = [":=", "=>", "=", ":"]
+        .iter()
+        .find(|separator| text.ends_with(*separator))?;
+    Some(text.len() - separator.len())
+}
+
+/// `stop`, or, when `rest` ends there in an assignment's separator, where
+/// the name it assigns starts (as [`assigned`] finds the name).
+fn before_assigned_name(rest: &str, stop: usize) -> usize {
+    let name = separator_before(&rest[..stop]).and_then(|separator| name_before(rest, separator));
+    match name {
+        Some((name_start, _)) => name_start,
+        None => stop,
+    }
+}
+
+/// Whether a quoted value reads as more than one: it assigns a name,
+/// holds a flag or a quote, so the quote closing it may open a value
+/// inside it.
+fn holds_more(inner: &str) -> bool {
+    inner.contains(['=', ':', '"', '\'']) || FLAG_START.is_match(inner)
+}
+
+/// Where a flag starts, as [`FLAG`] reads one.
+static FLAG_START: LazyLock<Regex> = LazyLock::new(|| regex(r#"(?:^|[\s"'\[,])--?[A-Za-z0-9]"#));
+
+/// `raw` as a quoted value, plain or escaped alike at both ends (`"x"`,
+/// `\"x\"`, `'x'`): its opening quote, what it holds, and its closing quote.
+fn quoted(raw: &str) -> Option<(&str, &str, &str)> {
+    let escapes = raw.len() - raw.trim_start_matches('\\').len();
+    let quote = raw[escapes..]
+        .chars()
+        .next()
+        .filter(|c| matches!(c, '"' | '\''))?;
+    let open = escapes + 1;
+    // Closed as it opened: as many backslashes, then the same quote.
+    let ends = raw.len().checked_sub(open).filter(|&at| at >= open)?;
+    let closing = &raw[ends..];
+    (closing.ends_with(quote) && closing.trim_start_matches('\\').len() == 1)
+        .then(|| (&raw[..open], &raw[open..ends], closing))
 }
 
 /// "bearer authentication" is prose: a bearer token has a digit or is long,
@@ -1768,6 +2466,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
     };
+    if let Some(hidden) = hide_ambiguous_lines(&output) {
+        output = Cow::Owned(hidden);
+    }
     let mut apply = |rule: &Regex, replace: &dyn Fn(&Captures<'_>) -> String| {
         // Most text has nothing, so this avoids building a new string for
         // each rule.
@@ -1792,7 +2493,15 @@ fn text_once(input: &str) -> Cow<'_, str> {
     // of a cookie is as secret as its first part.
     apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
-    apply(&FLAG, &redact_flag);
+    if FLAG.is_match(&output) {
+        let replaced = FLAG
+            .replace_all(&output, |c: &Captures<'_>| redact_flag(&output, c))
+            .into_owned();
+        output = Cow::Owned(replaced);
+    }
+    if let Some(hidden) = unclean_flag_values(&output) {
+        output = Cow::Owned(hidden);
+    }
     if let Some(replaced) = pairs(&output) {
         output = Cow::Owned(replaced);
     }

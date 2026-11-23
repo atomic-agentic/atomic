@@ -1,0 +1,1 @@
+flag-unclean-name-kept|crates/atomic-core/src/redact.rs|        Some((name_start, _)) => name_start,|        Some(_) => stop, /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::separators_and_open_quotes_keep_the_next_value_hidden
