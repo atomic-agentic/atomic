@@ -680,12 +680,36 @@ embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
 environment, a 1 GiB V8 heap limit, operating-system limits of 2.5 GiB of
 writable memory (twice the heap, plus 512 MiB for what V8 keeps outside it:
 WebAssembly memories and ArrayBuffers among it), 32 seconds of CPU time and no
-core files (`compiler_host/limits.rs`), and the parent's 30-second limit. Its
+core files (`compiler_host/limits.rs`), and the parent's 30-second limit. On
+macOS the memory limit is the parent's instead, as described below. Its
 host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
 stderr for its console, its exit status, its own WASM, random bytes, SHA-256 and
 timers, and nothing else: no network, environment, filesystem or subprocess.
 atomic reads atom sources itself and sends them in the request, for loading as
 for rendering. Direct-run context checkpoints live outside the source tree.
+
+The compiler child and the child that runs a captured helper call
+(`helper_runtime/process.rs`) each have a memory limit, and the two platforms
+hold it differently:
+
+- **Linux.** The child sets `RLIMIT_DATA` on itself before V8 starts, and the
+  kernel refuses writable memory past it, written to or not.
+- **macOS.** There `RLIMIT_DATA` and `RLIMIT_AS` both bound the size of the
+  whole address map, the kernel refuses a limit below the map's present size,
+  and an arm64 process starts with hundreds of gigabytes mapped that nothing can
+  use, so a child cannot set a limit near the memory it may hold. The parent
+  holds the limit instead (`crates/atomic-core/src/child_memory.rs`): every two
+  milliseconds while it waits on the child it reads the child's physical
+  footprint, the count of memory in use that macOS itself limits processes by,
+  and it kills a child found past the limit. Memory a child has reserved and not
+  written to is not in use and is not counted. Between two readings a child can
+  go past its limit by what it writes in that time. A child whose memory cannot
+  be read is killed and its compile or call fails.
+
+The limits V8 holds itself (the heap limit, and for helpers the ArrayBuffer
+budget) are the same on both. The tests of the parent's limit run on Linux too,
+where they put a small limit in place of the child's own
+(`child_memory::with_limit`).
 
 A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
 it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's

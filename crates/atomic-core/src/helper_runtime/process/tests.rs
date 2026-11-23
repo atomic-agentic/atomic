@@ -80,6 +80,55 @@ fn memory_and_time_outside_the_heap_are_bounded() {
     }
 }
 
+// Where the child cannot limit its own memory, the host holds the limit on
+// the memory it uses (see `child_memory`). The host is given a limit far
+// below the call's own here, on every platform, so that a host that does
+// not hold it lets the call run to its deadline. The memory is ArrayBuffer
+// contents within the call's own budget, and is filled: memory not written
+// to is not in use.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn memory_a_call_uses_past_its_limit_is_refused_by_the_host() {
+    const LIMIT: u64 = 256 * 1024 * 1024;
+    let captured = Captured {
+        modules: [(
+            ENTRY.to_owned(),
+            "export const probe = (megabytes, spin) => { \
+               const kept = []; \
+               for (let size = 0; size < megabytes; size += 16) kept.push(new Uint8Array(16 << 20).fill(1)); \
+               while (spin) {} \
+               return kept.length; \
+             };"
+            .to_owned(),
+        )]
+        .into(),
+        entry: ENTRY.to_owned(),
+    };
+    // A deadline a busy machine does not reach while the call fills memory.
+    let limits = Limits {
+        deadline: Duration::from_secs(10),
+        array_buffer_bytes: 512 * 1024 * 1024,
+        ..Limits::default()
+    };
+    let fill = |megabytes: u64, spin: bool| {
+        crate::child_memory::with_limit(LIMIT, || {
+            invoke(&captured, "probe", &json!([megabytes, spin]), limits, CLOCK)
+        })
+    };
+    // Within the limit, a call uses what it needs.
+    assert_eq!(fill(64, false), Ok(json!(4)));
+    // Past it, the call is ended as one that exhausted its memory, while it
+    // still holds the memory; a host without the limit ends it at its
+    // deadline instead.
+    let started = Instant::now();
+    assert_eq!(fill(384, true), Err(Failure::Heap));
+    assert!(
+        started.elapsed() < limits.deadline,
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn code_cannot_be_generated_from_strings() {
     for body in ["eval('1')", "new Function('return 1')()", "(0, eval)('1')"] {

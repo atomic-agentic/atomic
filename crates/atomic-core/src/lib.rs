@@ -9,6 +9,7 @@ pub mod astro;
 pub mod atom;
 pub mod budget;
 pub mod cassette;
+mod child_memory;
 pub mod codex;
 pub mod collections;
 pub mod compile;
@@ -17,8 +18,6 @@ mod compiler_process;
 pub mod config;
 pub mod context;
 pub mod credential;
-#[cfg(target_os = "macos")]
-mod darwin_memory;
 pub mod editor;
 pub mod eval;
 pub mod evaluation;

@@ -4,6 +4,9 @@
 //! V8 heap limit does not: WebAssembly memories and ArrayBuffer contents,
 //! which V8 allocates outside its heap, and CPU time. A child that V8
 //! aborts leaves no core file, which would hold atom sources.
+//!
+//! macOS has no memory limit a child can set on itself, so there the parent
+//! that waits on the child holds it (see `child_memory`).
 
 #![allow(unsafe_code)]
 
@@ -25,12 +28,18 @@ pub(crate) fn memory_limit(heap: usize) -> u64 {
     OUTSIDE_HEAP + 2 * heap as u64
 }
 
-/// Limits this process's writable memory to `memory` bytes, its CPU time
-/// and its core files.
+/// Limits this process's CPU time and its core files and, except on macOS,
+/// its writable memory to `memory` bytes.
 pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
+    // macOS holds a data limit against the size of the whole address map and
+    // refuses one below it, which any limit on memory is before the child
+    // has done anything.
+    #[cfg(target_os = "macos")]
+    let _ = memory;
     // At the CPU limit the kernel sends SIGXCPU, which the parent reports as
     // that limit; a second later, at the hard limit, SIGKILL.
     for (name, resource, value, hard) in [
+        #[cfg(not(target_os = "macos"))]
         ("memory", libc::RLIMIT_DATA, memory, 0),
         ("CPU time", libc::RLIMIT_CPU, CPU_SECONDS, 1),
         ("core files", libc::RLIMIT_CORE, 0, 0),
@@ -42,15 +51,10 @@ pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-            let error = std::io::Error::last_os_error();
-            #[cfg(target_os = "macos")]
-            if resource == libc::RLIMIT_DATA {
-                let details = crate::darwin_memory::rejected_data_limit(value, &error);
-                return Err(format!(
-                    "cannot limit the Astro compiler's {name}: {details}"
-                ));
-            }
-            return Err(format!("cannot limit the Astro compiler's {name}: {error}"));
+            return Err(format!(
+                "cannot limit the Astro compiler's {name}: {}",
+                std::io::Error::last_os_error()
+            ));
         }
     }
     Ok(())

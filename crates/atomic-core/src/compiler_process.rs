@@ -9,6 +9,7 @@
 //! input and output. Unlike a runner, it talks to the host while it works: it
 //! asks the host to run captured helpers, one line per call and reply.
 
+use crate::child_memory::{Breach, INTERVAL, Watch};
 use atomic_exec::process;
 use std::path::Path;
 use std::time::Duration;
@@ -32,6 +33,10 @@ pub(crate) type CallHandler<'a> = dyn FnMut(&serde_json::Value) -> serde_json::V
 /// bounded per line and in total. A worker that exits successfully has
 /// answered, even if it stopped reading its request early; one that exits
 /// unsuccessfully has crashed, and the error carries its stderr.
+///
+/// The worker limits its own memory where the operating system has a limit
+/// to set (see `compiler_host`); where it has none, this holds the limit
+/// (see `child_memory`).
 pub(crate) fn run_interactive(
     program: &Path,
     args: &[String],
@@ -104,6 +109,14 @@ pub(crate) fn run_interactive(
             }
         }
     });
+    let mut memory = Watch::for_child(crate::compiler_host::memory_limit());
+    // With a limit to hold, each wait for the worker is cut into readings
+    // of its memory.
+    let pause = if memory.is_some() {
+        INTERVAL
+    } else {
+        Duration::MAX
+    };
     let started = std::time::Instant::now();
     let remaining = || time_limit.saturating_sub(started.elapsed());
     let kill = |child: &mut std::process::Child| {
@@ -127,17 +140,39 @@ pub(crate) fn run_interactive(
             }
         }
     });
+    // A worker found past its memory limit is killed and reported as the
+    // limit it hit; one whose memory cannot be read is killed as well.
+    let mut within_memory = |child: &mut std::process::Child| {
+        let read = match memory.as_mut() {
+            Some(watch) => watch.check(child),
+            None => Ok(()),
+        };
+        let Err(breach) = read else {
+            return Ok(());
+        };
+        kill(child);
+        Err(match breach {
+            Breach::Exceeded => "the Astro compiler exceeded its memory limit".to_owned(),
+            Breach::Unread(error) => {
+                format!("cannot read the Astro compiler's memory to limit it: {error}")
+            }
+        })
+    };
     // A worker that exits without reading its request has still answered.
     let _ = to_worker.send(request.to_vec());
     let mut answer = None;
     loop {
-        let line = match received.recv_timeout(remaining()) {
+        // The worker is not read while a helper call it asked for runs: it
+        // is waiting for the reply.
+        within_memory(&mut child)?;
+        let line = match received.recv_timeout(remaining().min(pause)) {
             Ok(Ok(Some(line))) => line,
             Ok(Ok(None)) => break,
             Ok(Err(message)) => {
                 kill(&mut child);
                 return Err(message);
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !remaining().is_zero() => continue,
             Err(_) => {
                 kill(&mut child);
                 return Err(format!(
@@ -173,8 +208,10 @@ pub(crate) fn run_interactive(
                     time_limit.as_secs()
                 ));
             }
-            None => std::thread::sleep(Duration::from_millis(5)),
+            None => {}
         }
+        within_memory(&mut child)?;
+        std::thread::sleep(pause.min(Duration::from_millis(5)));
     };
     let stderr = errors
         .join()

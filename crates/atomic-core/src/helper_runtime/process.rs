@@ -7,9 +7,10 @@
 //! isolate's limits. Memory V8 allocates outside its heap (flattened
 //! strings, compiled regular expressions, parser buffers) is also outside
 //! the heap limit. A process boundary contains both: the child runs one
-//! call under an operating-system limit on its writable memory, the host
-//! kills it at the call's deadline, and a child that dies takes nothing
-//! with it.
+//! call under a limit on its memory, the host kills it at the call's
+//! deadline, and a child that dies takes nothing with it. The child sets
+//! that limit on itself where the operating system has one to set; on
+//! macOS, which has none, the host holds it (see `child_memory`).
 //!
 //! The child is the atomic binary itself, started with [`CHILD_ARG`] and a
 //! cleared environment, so the host's timezone and locale never reach it.
@@ -18,6 +19,7 @@
 #![allow(unsafe_code)]
 
 use super::{Captured, Clock, Controls, Failure, Limits};
+use crate::child_memory::{Breach, INTERVAL, Watch};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -180,6 +182,7 @@ fn run(
     let output_limit = (limits.output_bytes + limits.error_bytes) as u64 + 1024 * 1024;
     let out = std::thread::spawn(move || bounded(stdout, output_limit));
     let err = std::thread::spawn(move || bounded(stderr, 64 * 1024));
+    let mut watch = Watch::for_child(memory_limit(&limits));
     let deadline = Instant::now() + STARTUP + limits.deadline;
     let status = loop {
         match child.try_wait().map_err(|e| host(e.to_string()))? {
@@ -189,8 +192,25 @@ fn run(
                 let _ = child.wait();
                 return Err(Failure::Deadline);
             }
-            None => std::thread::sleep(Duration::from_millis(2)),
+            None => {}
         }
+        // Where the host holds the child's memory limit, a child found past
+        // it has exhausted its memory, as one the kernel refused has.
+        let read = match watch.as_mut() {
+            Some(watch) => watch.check(&mut child),
+            None => Ok(()),
+        };
+        if let Err(breach) = read {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(match breach {
+                Breach::Exceeded => Failure::Heap,
+                Breach::Unread(error) => host(format!(
+                    "cannot read the helper process's memory to limit it: {error}"
+                )),
+            });
+        }
+        std::thread::sleep(INTERVAL);
     };
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();
@@ -296,11 +316,14 @@ pub fn serve() -> i32 {
     0
 }
 
-/// Limits this process: its writable memory, its CPU time, and no core
-/// file when V8 aborts.
+/// Limits this process: its CPU time, no core file when V8 aborts and,
+/// except on macOS, its writable memory. macOS refuses a data limit below
+/// the size of the whole address map, so there the host holds the memory
+/// limit (see `child_memory`).
 fn limit_self(limits: &Limits) -> Result<(), Failure> {
     let cpu = limits.deadline.as_secs() + 2;
     for (resource, value) in [
+        #[cfg(not(target_os = "macos"))]
         (libc::RLIMIT_DATA, memory_limit(limits)),
         (libc::RLIMIT_CPU, cpu),
         (libc::RLIMIT_CORE, 0),
@@ -312,16 +335,9 @@ fn limit_self(limits: &Limits) -> Result<(), Failure> {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-            let error = std::io::Error::last_os_error();
-            #[cfg(target_os = "macos")]
-            if resource == libc::RLIMIT_DATA {
-                let details = crate::darwin_memory::rejected_data_limit(value, &error);
-                return Err(Failure::Host(format!(
-                    "cannot limit the helper process: {details}"
-                )));
-            }
             return Err(Failure::Host(format!(
-                "cannot limit the helper process: {error}"
+                "cannot limit the helper process: {}",
+                std::io::Error::last_os_error()
             )));
         }
     }
