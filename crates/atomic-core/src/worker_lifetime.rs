@@ -243,14 +243,13 @@ mod tests {
     fn supervisor_entry() {
         // Pass the open worker endpoint through. Only our own parent
         // holds the other end, so our exit will not cause socket EOF.
-        let _worker = worker_command()
+        let mut worker = worker_command()
             .env(WORKER_SUPERVISOR_PID, std::process::id().to_string())
             .stdout(Stdio::inherit())
             .spawn()
             .expect("worker");
-        loop {
-            std::thread::park();
-        }
+        let status = worker.wait().expect("worker status");
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     #[test]
