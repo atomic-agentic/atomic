@@ -1243,7 +1243,8 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = runtimes(&model, "exec-env");
         let script = "import json, os, sys\njson.load(sys.stdin)\n\
-            names = sorted(n for n in os.environ if n != 'LC_CTYPE')  # Python's own locale coercion\n\
+            own = ('LC_CTYPE', '__CF_USER_TEXT_ENCODING')  # set by Python itself: its locale coercion, and on macOS its system framework\n\
+            names = sorted(n for n in os.environ if n not in own)\n\
             assert names == ['ATOMIC_EFFECT_KEY', 'ATOMIC_RUN_ID', 'ATOMIC_STEP_ID', 'HOME', 'REGION', 'TMPDIR'], names\n\
             assert os.environ['REGION'] == 'eu'\n\
             assert os.environ['ATOMIC_RUN_ID'] == 'run-1' and os.environ['ATOMIC_STEP_ID'] == 'total', dict(os.environ)\n\

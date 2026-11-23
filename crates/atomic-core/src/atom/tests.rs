@@ -10,6 +10,9 @@ pub(crate) fn project(body: &str, config: &str, component: Option<&str>) -> Path
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("mkdir");
+    // Canonical, as a project's root is: on macOS the temporary directory is
+    // reached through a symbolic link.
+    let dir = std::fs::canonicalize(dir).expect("canonical");
     let imports = if component.is_some() {
         "import Style from './Style.astro';"
     } else {
