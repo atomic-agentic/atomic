@@ -872,25 +872,18 @@ impl Drop for TableGuard {
 /// about, fails it rather than leave a place undenied. Elsewhere there is no
 /// such table, and none is found.
 pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>> {
-    let table: Option<Vec<u8>> = {
-        #[cfg(test)]
-        let injected = TABLE.with(|t| t.borrow().clone());
-        #[cfg(not(test))]
-        let injected: Option<Vec<u8>> = None;
-        match injected {
-            Some(table) => Some(table),
-            None => {
-                #[cfg(target_os = "linux")]
-                {
-                    use anyhow::Context;
-                    Some(std::fs::read("/proc/self/mountinfo").context(
-                        "read /proc/self/mountinfo, to find where else the places atomic \
-                         denies are mounted",
-                    )?)
-                }
-                #[cfg(not(target_os = "linux"))]
-                None
-            }
+    #[cfg(test)]
+    let table = TABLE.with(|t| t.borrow().clone());
+    #[cfg(not(test))]
+    let table: Option<Vec<u8>> = None;
+    #[cfg(target_os = "linux")]
+    let table = match table {
+        Some(table) => Some(table),
+        None => {
+            use anyhow::Context;
+            Some(std::fs::read("/proc/self/mountinfo").context(
+                "read /proc/self/mountinfo, to find where else the places atomic denies are mounted",
+            )?)
         }
     };
     let Some(table) = table else {
