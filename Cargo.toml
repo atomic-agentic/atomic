@@ -89,16 +89,16 @@ ctor = "=1.0.6"
 
 # Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).
 # Only atomic-core may depend on these.
-codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
-codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
-codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
-codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
-codex-login = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
-codex-process-hardening = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
+codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
+codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
+codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
+codex-login = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
+codex-process-hardening = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
 # For the shell environment policy types codex-core-api does not re-export.
-codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
 # The proxy that limits an exec command declaring network access to its hosts.
-codex-network-proxy = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-network-proxy = { git = "https://github.com/atomic-agentic/codex", rev = "8cace08a2c4be7fc8df3d4b75520b818df66c78a" }
 
 # Codex is a large dependency; full debug info for every crate makes a debug
 # build tens of gigabytes. Keep line tables for atomic's own crates (enough for
