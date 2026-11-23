@@ -556,7 +556,7 @@ table needs a matrix entry in the test job as well.
 
 ### Build caches
 
-The Rust jobs restore two caches, through `.github/actions/rust-setup`:
+The Linux Rust jobs restore two caches, through `.github/actions/rust-setup`:
 cargo's downloads (the registry and the git sources, rusty_v8's Chromium
 submodules among them), keyed on the toolchain and `Cargo.lock`, and
 `target/`, keyed on those and the manifests, one for the test features'
@@ -573,6 +573,10 @@ the test build. `scripts/test-shards-test.sh` fails if any other step saves a
 cache. Pull requests restore main's, so they never push main's caches out. A
 miss falls back to the newest cache of the same kind, or builds everything,
 which takes a few minutes longer.
+
+The macOS build and test job can restore Linux's Cargo download cache for the
+same toolchain and lockfile. Cargo fetches any missing macOS dependencies and
+builds for macOS on its own runner.
 
 ## Coding tasks
 
