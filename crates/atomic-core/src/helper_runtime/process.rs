@@ -301,7 +301,7 @@ fn bounded(mut reader: impl Read, limit: u64) -> Vec<u8> {
 pub fn serve() -> i32 {
     #[cfg(target_os = "macos")]
     if let Err(error) = crate::worker_lifetime::watch_supervisor() {
-        eprintln!("cannot watch the helper's supervisor: {error}");
+        crate::log_line!("cannot watch the helper's supervisor: {error}");
         return 2;
     }
     let mut request = Vec::new();
