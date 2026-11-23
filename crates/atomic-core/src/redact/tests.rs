@@ -3507,10 +3507,38 @@ fn reading_pairs_as_text_takes_linear_steps() {
             "ladder {case}: {large} steps at sixteen times the size of {small}"
         );
     }
+    // A name holding a long run of backslashes before an escape that does
+    // not read, an unpaired surrogate, name first, as an array and value
+    // first: the run is read past once.
+    for (case, shape) in [
+        "\"name\": \"{run}ud800\", \"value\": \"x\"",
+        "[\"{run}ud800\", \"x\"]",
+        "\"value\": \"x\", \"name\": \"{run}ud800\"",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let line = |run: usize| shape.replace("{run}", &"\\".repeat(run));
+        let (small, large) = (steps_of(&line(1024)), steps_of(&line(16 * 1024)));
+        assert!(
+            large < 32 * small,
+            "surrogate {case}: {large} steps at sixteen times the size of {small}"
+        );
+    }
     for (case, unit) in [
         "\"name\": \"X-Api-Key\", \"value\": \\\\\"x ",
         "\"value\": \\\\\\\"x \"",
         "{\"name\": \"a\", \"value\": \"b\"} ",
+        // Objects for values that open and never close, under a name they
+        // are not hidden for, so each is read on, and under one they are.
+        "{\"name\": \"a\", \"value\": {",
+        "{\"name\": \"X-Api-Key\", \"value\": {",
+        "[\"X-Api-Key\", \"x ",
+        "{'name': 'X-Api-Key', 'type': 'h', 'value': 'x'} ",
+        // Lists of three on one line: where the line ends is read from the
+        // character after each list's second item, not by reading the rest
+        // of the line for each, which would take some 256 times the steps.
+        "[\"X-Api-Key\", \"a\", \"b\"] ",
     ]
     .into_iter()
     .enumerate()
@@ -3521,6 +3549,147 @@ fn reading_pairs_as_text_takes_linear_steps() {
             "case {case}: {large} steps at sixteen times the size of {small}"
         );
     }
+}
+
+/// A pair in JSON that parses, its fields in any case as AWS writes them
+/// (`Name`, `Key`, `Value`), as `headerName` and `headerValue`, or with a
+/// value of more than a string under a header's or a secret's name, has its
+/// value hidden; one that holds no secret keeps it.
+#[test]
+fn a_parsed_pair_is_read_in_any_case_and_whatever_its_value() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, doc) in [
+        json!({"Name": "X-Api-Key", "Value": key}),
+        json!({"NAME": "X-Api-Key", "VALUE": key}),
+        json!({"Tags": [{"Key": "DB_PASSWORD", "Value": key}]}),
+        json!({"headerName": "X-Api-Key", "headerValue": key}),
+        json!({"name": "X-Api-Key", "value": {"v": key}}),
+        json!({"name": "password", "value": [key]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&key[4..]),
+            "case {case}: the pair's value showed"
+        );
+    }
+    for kept in [
+        json!({"Name": "Content-Type", "Value": "application/json"}),
+        json!({"name": "config", "value": {"retries": 3}}),
+    ] {
+        let mut out = kept.clone();
+        value(&mut out);
+        assert_eq!(out, kept, "a pair that holds no secret changed");
+    }
+}
+
+/// Pair shapes the text rule reads beside `{"name": …, "value": …}` side
+/// by side: fields in any case, `headerName` and `headerValue`, a field
+/// between name and value (either first), Python's quotes, an array pair,
+/// a `\u`-escaped name, an object for a value, and, value first, a name
+/// cut off where the text ends. Each is hidden as text and in JSON held in
+/// a string zero to two deep, cut so that it does not parse.
+#[test]
+fn pair_shapes_beyond_side_by_side_fields_are_read_as_text() {
+    let key = concat!("Qk9L", "x3sR2tY7uV8w");
+    for (case, line) in [
+        format!("{{\"Name\": \"X-Api-Key\", \"Value\": \"{key}\""),
+        format!("{{\"headerName\": \"X-Api-Key\", \"headerValue\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"type\": \"h\", \"value\": \"{key}\""),
+        format!("{{\"value\": \"{key}\", \"type\": \"h\", \"name\": \"X-Api-Key\""),
+        format!("{{'name': 'X-Api-Key', 'value': '{key}'}}"),
+        format!("[[\"X-Api-Key\", \"{key}\"], [\"a\""),
+        format!("{{\"name\": \"\\u0041uthorization\", \"value\": \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"v\": \"{key}\"}}"),
+        format!("{{\"value\": \"{key}\", \"name\": \"X-Api-Key"),
+        // An array pair cut just after its value, and an object for a value
+        // whose string holds an escaped quote and a bracket.
+        format!("[\"X-Api-Key\", \"{key}\""),
+        format!("{{\"name\": \"X-Api-Key\", \"value\": {{\"p\": \"x\\\"}}\", \"q\": \"{key}\"}}}}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(
+            !text(&line).contains(&key[4..]),
+            "case {case}: shown as text"
+        );
+        let mut held = line.clone();
+        for depth in 0..=2 {
+            for parent in ["msg", "body"] {
+                let mut out = json!({ parent: held.clone() });
+                value(&mut out);
+                assert!(
+                    !out.to_string().contains(&key[4..]),
+                    "case {case}, depth {depth}, under {parent}: shown"
+                );
+            }
+            held = json!({ "k": held }).to_string();
+        }
+    }
+    // A pair inside another's object for a value is still read, and pairs
+    // that hold no secret, lists of more than two, and a list of names cut
+    // after two, are kept.
+    let inner = format!(
+        "{{\"name\": \"config\", \"value\": {{\"name\": \"X-Api-Key\", \"value\": \"{key}\""
+    );
+    assert!(!text(&inner).contains(&key[4..]), "an inner pair showed");
+    assert_kept(&[
+        "{\"Name\": \"Content-Type\", \"Value\": \"application/json\"",
+        "[\"password\", \"email\"]",
+        "for name in [\"ATOMIC_EFFECT_KEY\", \"ATOMIC_OUTPUTS\", \"ATOMIC_INPUTS\"] {",
+        "{'name': 'region', 'value': 'us-east-1'}",
+        "{\"name\": \"config\", \"value\": {\"retries\": 3}",
+        "headers = [\"X-Api-Key\", \"X-Request-Id\"",
+        "allowed = [\"X-Auth-Token\", \"Content_Type\"\nmore",
+    ]);
+}
+
+/// An array pair cut where its line or the text ends, just after its
+/// value, is a list of names cut short only when the value reads as a
+/// header's name, each word a capital and then lower-case letters
+/// (`X-Request-Id`, `Content_Type`) or one of the credential headers.
+/// Words in lower case, or groups of letters and digits, joined by `-` or
+/// `_` are a value, and hidden under a credential header's name, as text and in a
+/// string; a header's name after it is kept.
+#[test]
+fn a_listed_pair_cut_after_its_value_is_read_unless_the_value_is_a_header_name() {
+    let mut shown = Vec::new();
+    for name in ["X-Api-Key", "X-Auth-Token"] {
+        for secret in [
+            "correct-horse-battery-staple",
+            "Zq9-xK2-pL7-mN4-bV6",
+            "a1b_c2d_e3f_g4h",
+            "blue_whale_river",
+            "Zq9-Xk2-Pl7-Mn4-Bv6",
+        ] {
+            for line in [
+                format!("[\"{name}\", \"{secret}\""),
+                format!("[\"{name}\", \"{secret}\"\nmore"),
+            ] {
+                let mut held = json!({ "msg": line });
+                value(&mut held);
+                for (how, read) in [
+                    ("text", text(&line).into_owned()),
+                    ("held", held.to_string()),
+                ] {
+                    if read.contains(secret) {
+                        shown.push(format!("{how}: {read}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(shown.is_empty(), "shown: {shown:#?}");
+    assert_kept(&[
+        "[\"X-Auth-Token\", \"X-Request-Id\"",
+        "[\"X-Api-Key\", \"Content_Type\"\nmore",
+        "[\"X-Api-Key\", \"X-Auth-Token\"",
+        "[\"X-Api-Key\", \"authorization\"\nmore",
+    ]);
 }
 
 #[test]
@@ -3581,9 +3750,9 @@ fn original_duplicate_spellings(parent: &str) {
 fn a_pair_in_json_in_a_string_is_read_by_the_name_written() {
     let secret = "correct horse";
     let shapes = [
-        json!([{"key": "DB_PASSWORD", "note": 1, "value": secret}]),
-        json!({"items": [{"value": secret, "note": 1, "key": "GITHUB_TOKEN"}]}),
-        json!({"env": [{"header": "DB_PASSWORD", "note": 1, "value": secret}]}),
+        json!([{"key": "DB_PASSWORD", "note": {}, "value": secret}]),
+        json!({"items": [{"value": secret, "note": {}, "key": "GITHUB_TOKEN"}]}),
+        json!({"env": [{"header": "DB_PASSWORD", "note": {}, "value": secret}]}),
     ];
     for (case, shape) in shapes.iter().enumerate() {
         // As a real object, for the record.
@@ -3660,8 +3829,8 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
             items.push(match next(4) {
                 // Exercise pairs that require the parsed reading as well as
                 // adjacent fields the text rule can read.
-                0 if case % 2 == 0 => json!({"name": name, "note": 1, "value": secret(&mut next)}),
-                1 if case % 2 == 0 => json!({"key": name, "note": 1, "value": secret(&mut next)}),
+                0 if case % 2 == 0 => json!({"name": name, "note": {}, "value": secret(&mut next)}),
+                1 if case % 2 == 0 => json!({"key": name, "note": {}, "value": secret(&mut next)}),
                 0 => json!({"name": name, "value": secret(&mut next)}),
                 1 => json!({"key": name, "value": secret(&mut next)}),
                 2 => json!([name, secret(&mut next)]),
@@ -3712,7 +3881,7 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
 #[test]
 fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
     let pair =
-        json!({"env": [{"key": "DB_PASSWORD", "note": 1, "value": "hunter2 x"}]}).to_string();
+        json!({"env": [{"key": "DB_PASSWORD", "note": {}, "value": "hunter2 x"}]}).to_string();
     let two = json!({"body": pair}).to_string();
     let three = json!({"body": two.clone()}).to_string();
     for (depth, doc) in [
@@ -3736,7 +3905,7 @@ fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
 #[test]
 fn held_json_is_read_by_the_names_written() {
     let doc = json!({"key": json!([
-        {"key": "DB_PASSWORD", "note": 1, "value": "correct horse"},
+        {"key": "DB_PASSWORD", "note": {}, "value": "correct horse"},
         {"note": concat!("Zx81", "kQ0pL2mN4bV6")},
     ]).to_string()});
     let mut out = doc;

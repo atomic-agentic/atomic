@@ -1,0 +1,1 @@
+redact-pair-text-between|crates/atomic-core/src/redact.rs|{{0,4}}?\s*,\s*{PAIR_VALUE_KEY}|{{0,0}}?\s*,\s*{PAIR_VALUE_KEY}|-p atomic-agentic-core --lib -- redact::tests::pair_shapes_beyond_side_by_side_fields_are_read_as_text
