@@ -1,0 +1,1 @@
+worker-supervisor-exit|crates/atomic-core/src/worker_lifetime.rs|unsafe { libc::_exit(1) };|let _ = parent;|-p atomic-agentic-core --lib -- worker_lifetime::tests::closing_the_supervisor_stops_an_active_worker

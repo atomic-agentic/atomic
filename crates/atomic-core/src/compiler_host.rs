@@ -76,6 +76,11 @@ pub fn serve() -> i32 {
 }
 
 fn serve_module(source: &str, heap_limit: usize) -> i32 {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::worker_lifetime::watch_supervisor() {
+        eprintln!("cannot watch the Astro compiler's supervisor: {error}");
+        return 1;
+    }
     // The memory limit follows the production heap limit whatever this
     // child's heap, so that a test's smaller heap is what stops it.
     let status = match limits::limit_self(memory_limit()).and_then(|()| {

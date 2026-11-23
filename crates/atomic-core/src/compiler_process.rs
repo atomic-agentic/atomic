@@ -63,7 +63,12 @@ pub(crate) fn run_interactive(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     new_session(&mut command);
+    #[cfg(target_os = "macos")]
+    let mut supervisor = crate::worker_lifetime::Supervisor::prepare(&mut command)
+        .map_err(|e| start(e.to_string()))?;
     let mut child = command.spawn().map_err(|e| start(e.to_string()))?;
+    #[cfg(target_os = "macos")]
+    supervisor.child_spawned();
     let input = child.stdin.take().ok_or("no compiler stdin")?;
     let stdout = child.stdout.take().ok_or("no compiler stdout")?;
     let stderr = child.stderr.take().ok_or("no compiler stderr")?;
@@ -162,8 +167,6 @@ pub(crate) fn run_interactive(
     let _ = to_worker.send(request.to_vec());
     let mut answer = None;
     loop {
-        // The worker is not read while a helper call it asked for runs: it
-        // is waiting for the reply.
         within_memory(&mut child)?;
         let line = match received.recv_timeout(remaining().min(pause)) {
             Ok(Ok(Some(line))) => line,
@@ -186,7 +189,20 @@ pub(crate) fn run_interactive(
             .and_then(|value| value.get("call").cloned());
         match call {
             Some(call) if answer.is_none() => {
-                let reply = serde_json::to_vec(&handler(&call)).map_err(|e| e.to_string())?;
+                let mut encode =
+                    || serde_json::to_vec(&handler(&call)).map_err(|error| error.to_string());
+                let reply = if pause == INTERVAL {
+                    monitor_during_call(|| within_memory(&mut child), encode)
+                } else {
+                    encode()
+                };
+                let reply = match reply {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        kill(&mut child);
+                        return Err(error);
+                    }
+                };
                 if to_worker.send(reply).is_err() {
                     break;
                 }
@@ -393,6 +409,61 @@ fn cpu_limit(status: &std::process::ExitStatus) -> bool {
         let _ = status;
         false
     }
+}
+
+// The compiler is waiting for the reply but can retain memory while a
+// synchronous helper runs. Keep monitoring it until that call completes.
+fn monitor_during_call<T>(
+    mut sample: impl FnMut() -> Result<(), String> + Send,
+    call: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let (finished, waiting) = std::sync::mpsc::channel::<()>();
+        let monitor = std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                loop {
+                    sample()?;
+                    match waiting.recv_timeout(INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => return Ok::<_, String>(()),
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot monitor the Astro compiler: {error}"))?;
+        let reply = call();
+        drop(finished);
+        monitor
+            .join()
+            .map_err(|_| "compiler monitor panicked".to_owned())??;
+        reply
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn the_compiler_is_sampled_during_a_helper_call() {
+    let (sampled, samples) = std::sync::mpsc::channel();
+    let reply = monitor_during_call(
+        || {
+            let _ = sampled.send(());
+            Ok(())
+        },
+        || {
+            // Both readings must happen while the callback is active.
+            samples
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first reading");
+            samples
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second reading");
+            Ok(1)
+        },
+    );
+    assert_eq!(reply, Ok(1));
+    assert_eq!(
+        monitor_during_call(|| Err("over budget".into()), || Ok(1)),
+        Err("over budget".into())
+    );
 }
 
 /// Start `command` in a session of its own, with no controlling terminal,

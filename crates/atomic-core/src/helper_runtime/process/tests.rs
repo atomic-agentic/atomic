@@ -35,6 +35,28 @@ fn probe(body: &str) -> Result<Value, Failure> {
 }
 
 #[test]
+fn oversized_helper_limits_are_rejected_before_spawning() {
+    let command = HostCommand {
+        program: std::path::PathBuf::from("/no-such-atomic-helper"),
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let captured = Captured {
+        modules: Default::default(),
+        entry: ENTRY.to_owned(),
+    };
+    let limits = Limits {
+        output_bytes: usize::MAX,
+        error_bytes: 1,
+        ..Limits::default()
+    };
+    assert_eq!(
+        run(&command, &captured, "probe", &json!([]), limits, CLOCK),
+        Err(Failure::Host("helper byte limits are too large".into()))
+    );
+}
+
+#[test]
 fn a_call_runs_in_a_child_and_returns_its_result() {
     assert_eq!(probe("({ sum: 1 + 2 })"), Ok(json!({ "sum": 3 })));
     let thrown = probe("(() => { throw new Error('no'); })()");

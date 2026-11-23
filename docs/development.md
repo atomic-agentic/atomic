@@ -705,12 +705,14 @@ hold it differently:
   and an arm64 process starts with hundreds of gigabytes mapped that nothing can
   use, so a child cannot set a limit near the memory it may hold. The parent
   holds the limit instead (`crates/atomic-core/src/child_memory.rs`): every two
-  milliseconds while it waits on the child it reads the child's physical
-  footprint, the count of memory in use that macOS itself limits processes by,
-  and it kills a child found past the limit. Memory a child has reserved and not
-  written to is not in use and is not counted. Between two readings a child can
-  go past its limit by what it writes in that time. A child whose memory cannot
-  be read is killed and its compile or call fails.
+  milliseconds while it waits, including during a captured helper call, it
+  asks for the child's physical footprint. A reading over budget kills the
+  child. The interval is a requested wait and the operating system schedules
+  each reading. The footprint counts committed memory, including compressed
+  memory. A reservation or brief peak can go unobserved. A failed reading
+  kills the child, with a one-second grace period when the OS reports that
+  the child is absent and the parent has yet to collect it. Each child also
+  watches a private channel and exits if the supervisor disappears.
 
 The limits V8 holds itself (the heap limit, and for helpers the ArrayBuffer
 budget) are the same on both. The tests of the parent's limit run on Linux too,

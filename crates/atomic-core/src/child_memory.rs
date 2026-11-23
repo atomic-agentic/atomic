@@ -20,8 +20,9 @@
 //!
 //! The kernel does not hold this limit, so it is not exact: between two
 //! readings a child can go past it by what it can write in that time, and is
-//! killed at the next. A child whose memory cannot be read is stopped at
-//! once, so the limit never passes unenforced.
+//! killed if a later reading still finds it over budget. A failed reading
+//! stops the child, with a short grace period when the OS reports the child
+//! absent so the parent can collect its exit status.
 
 #![allow(unsafe_code)]
 

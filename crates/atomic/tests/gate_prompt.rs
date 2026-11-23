@@ -224,29 +224,27 @@ impl Project {
              returns: steps.first.output\n",
         )
         .unwrap();
-        // An exec atom that leaves a process behind, out of its group and
-        // in atomic's session if it can, to type an approval into the
-        // terminal once the gate's prompt shows.
+        // A child that leaves its command's process group still must not
+        // be able to open atomic's controlling terminal.
         std::fs::write(
             root.join("tools/inject.py"),
-            "import json, os, sys, time\n\
+            "import json, os, sys\n\
              note = json.load(sys.stdin)\n\
-             if os.fork() == 0:\n\
+             child = os.fork()\n\
+             if child == 0:\n\
              \x20   os.setpgid(0, 0)\n\
-             \x20   log = open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], note['text']), 'w')\n\
              \x20   try:\n\
              \x20       tty = os.open('/dev/tty', os.O_RDWR)\n\
              \x20   except OSError as e:\n\
-             \x20       log.write(f'no tty: {e}\\n'); log.flush(); os._exit(0)\n\
-             \x20   time.sleep(3)\n\
-             \x20   import fcntl, termios\n\
-             \x20   try:\n\
-             \x20       for c in b'a\\n':\n\
-             \x20           fcntl.ioctl(tty, termios.TIOCSTI, bytes([c]))\n\
-             \x20       log.write('typed\\n')\n\
-             \x20   except OSError as e:\n\
-             \x20       log.write(f'TIOCSTI refused: {e}\\n')\n\
-             \x20   log.flush(); os._exit(0)\n\
+             \x20       result = f'no tty: {e}\\n'\n\
+             \x20   else:\n\
+             \x20       os.close(tty)\n\
+             \x20       result = 'tty available\\n'\n\
+             \x20   with open(os.path.join(os.environ['ATOMIC_CACHE_DIR'], note['text']), 'w') as log:\n\
+             \x20       log.write(result)\n\
+             \x20   os._exit(0)\n\
+             if os.waitpid(child, 0)[1] != 0:\n\
+             \x20   sys.exit('terminal probe did not finish')\n\
              json.dump({'line': 'ok'}, sys.stdout)\n",
         )
         .unwrap();
@@ -802,9 +800,7 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     let out = p.at_terminal_with(
         &["run", "injected", "--run-id", "typed-in", "--data", &data],
         &[],
-        // The prompt shows, and the command left behind has its three
-        // seconds before it would type: once the terminal has been quiet
-        // for longer than that, whatever it could do has been done.
+        // The exec step has finished its probe before the gate opens.
         &[
             ("DRIVER_STOP_MARKER", "is waiting for you"),
             ("DRIVER_QUIET", "4"),
@@ -818,7 +814,7 @@ fn an_exec_command_cannot_type_into_the_prompt() {
         .flatten()
         .flatten()
         .find_map(|run| std::fs::read_to_string(run.path().join("inject.log")).ok())
-        .unwrap_or_default();
+        .unwrap_or_else(|| panic!("the terminal probe did not report its result: {t}"));
     assert!(
         tried.starts_with("no tty"),
         "the command reached the terminal: {tried} {t}"

@@ -115,12 +115,13 @@ endpoint. See
 child process of Atomic itself, on its embedded V8; no Deno is needed. A compile
 that runs past 30 seconds is stopped with `the Astro compiler exceeded 30
 seconds`, and one that uses 32 seconds of CPU time with `the Astro compiler
-exceeded its CPU time limit`. One that outgrows its 1 GiB JavaScript heap, or
-2.5 GiB of memory in all (the heap, twice over while it unwinds, and 512 MiB
-outside it for V8, the parser's WebAssembly memory and buffers), fails, usually
-with `the Astro compiler exceeded its memory limit` in the error. On Linux the
-2.5 GiB counts writable memory the compile has asked for; on macOS it counts
-memory the compile has written to. Checking the whole
+exceeded its CPU time limit`. The compiler has a 1 GiB JavaScript heap and a
+2.5 GiB process memory budget (twice the heap to allow unwinding, plus 512 MiB
+for V8, WebAssembly memory, and buffers). Linux enforces the process budget on
+writable allocations. On macOS the parent stops the compiler when a reading of
+its physical footprint exceeds the budget. Short spikes can fall between
+readings. A memory failure usually reports `the Astro compiler exceeded its
+memory limit`. Checking the whole
 example catalog needs about 800 MiB. A smaller component graph or simpler types
 bring an atom within these limits. A compiler that crashes is reported with what
 it wrote to stderr, and leaves no core file; report it as a bug.
