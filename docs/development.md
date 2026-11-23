@@ -517,8 +517,14 @@ in turn:
 
 Pushes to main also run two macOS jobs in parallel. "Clippy (macos-15)" runs
 formatting and Clippy while "Rust (macos-15)" builds and tests the workspace.
-A manual run on main can add both jobs with the `macos` input. Pull requests
-and merge groups run the Linux checks. CodeQL runs in its own
+A manual run, on main or on a branch, can add both jobs with the `macos`
+input, which is how a change for macOS is checked before it merges:
+
+```bash
+gh workflow run ci.yml --ref <branch> -f macos=true
+```
+
+Pull requests and merge groups run the Linux checks. CodeQL runs in its own
 workflow on main only
 (each push, weekly and by hand), so an alert shows up after its change merges;
 fix it on main. Nothing in CI waits for it. The Controls workflow runs the
