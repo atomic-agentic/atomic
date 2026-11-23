@@ -115,7 +115,7 @@ atomic eval --live
 ```
 
 The command calls the configured model and writes its answer to the sample's
-cassettes. A passing result starts with `PASS summarize-note: 1 of 1 cases passed`.
+cassettes. A passing result includes `PASS summarize-note: 1 of 1 cases passed`.
 Keep the same endpoint URL and model name and replay the answer.
 
 ```sh
