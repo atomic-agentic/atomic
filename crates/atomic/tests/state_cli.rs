@@ -528,7 +528,12 @@ fn a_home_the_default_data_directory_leads_to_is_refused() {
     // configuration lives has their state inside the denial without ever
     // setting atomic's home. The refusal has no `ATOMIC_HOME` to blame, so it
     // says that nothing set it and tells the person to set one.
-    let settings = dir.join("settings");
+    let settings = if cfg!(target_os = "macos") {
+        // The macOS data directory comes from HOME, not XDG_DATA_HOME.
+        dir.join("home/Library/Application Support")
+    } else {
+        dir.join("settings")
+    };
     std::fs::create_dir_all(&settings).expect("the settings directory");
     let config = settings.join("atomic");
     refused_at_start(
@@ -877,13 +882,16 @@ fn a_relative_home_gives_a_state_directory_placed_from_the_working_directory() {
     let person = person_config("relative-home");
     let settings = person.join("settings");
     std::fs::create_dir_all(settings.join("atomic")).expect("the configuration directory");
-    // The home is `home`, relative, and the command runs in `project`, so what
-    // the platform's data directory rule gives is `home/.local/share/atomic`
-    // read from there. Left unset: `ATOMIC_HOME`, which would be made absolute
-    // before the check ever saw it, and `XDG_DATA_HOME`, which that rule takes
-    // only as an absolute path and which the command's environment carries none
-    // of.
-    let base = project.join("home/.local/share/atomic");
+    // The home is `home`, relative, and the command runs in `project`, so the
+    // platform's data directory is read from there. Leave `ATOMIC_HOME` unset
+    // so it is not made absolute before the check, and leave `XDG_DATA_HOME`
+    // unset so Linux falls back to the home directory.
+    let data = if cfg!(target_os = "macos") {
+        "home/Library/Application Support"
+    } else {
+        "home/.local/share"
+    };
+    let base = project.join(data).join("atomic");
     let id = project_id(&dir, &project);
     let (state, private) = state_and_private(&base, &id);
     let out = command_os(

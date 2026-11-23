@@ -454,8 +454,7 @@ fn ran_once_live(dir: &Path, runs: usize) {
 
 /// What an exec atom's command names on its command line for a file of its
 /// run's caches it writes (see [`run_file`]): `dir/<name>`, unique to the
-/// test, which [`pids_with`] finds its processes by; the command writes the
-/// file of that name in `$ATOMIC_CACHE_DIR`.
+/// test. A command writes the file of that name in `$ATOMIC_CACHE_DIR`.
 fn command_log(dir: &Path, name: &str) -> PathBuf {
     dir.join(name)
 }
@@ -463,6 +462,7 @@ fn command_log(dir: &Path, name: &str) -> PathBuf {
 /// The processes, as this process numbers them, whose command line has
 /// `marker`: a confined command runs in a process namespace of its own, so
 /// the ids it sees for itself are not these.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn pids_with(marker: &str) -> Vec<String> {
     let mut pids = Vec::new();
     for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
@@ -479,6 +479,7 @@ fn pids_with(marker: &str) -> Vec<String> {
 }
 
 /// The session of process `pid`, from field 6 of `/proc/<pid>/stat`.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn session_of(pid: &str) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let session = stat.rsplit(')').next()?.split_whitespace().nth(3)?;
@@ -486,6 +487,7 @@ fn session_of(pid: &str) -> Option<String> {
 }
 
 /// The parent of process `pid`, from field 4 of `/proc/<pid>/stat`.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn parent_of(pid: &str) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let parent = stat.rsplit(')').next()?.split_whitespace().nth(1)?;
@@ -494,6 +496,7 @@ fn parent_of(pid: &str) -> Option<String> {
 
 /// The `atomic runner` process that started a process whose command line
 /// has `marker`, if one did.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn runner_of(marker: &str) -> Option<String> {
     for pid in pids_with(marker) {
         let mut at = pid;
@@ -518,12 +521,14 @@ fn runner_of(marker: &str) -> Option<String> {
 /// ([`acted`](Self::acted)), and the most lines `<log>` had in the run's
 /// caches when it did ([`ran`](Self::ran)), the command's own tally of its
 /// runs. Stops when dropped.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 struct RunnerWatch {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     acted: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, (usize, usize)>>>,
 }
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 impl RunnerWatch {
     fn new(logs: Vec<PathBuf>, act: impl Fn(&str) + Send + 'static) -> Self {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -596,6 +601,7 @@ impl RunnerWatch {
     }
 }
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 impl Drop for RunnerWatch {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4857,70 +4863,74 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
     assert_eq!(stdout_json(&local), stdout_json(&split));
     assert_eq!(count_log(&dir), 2);
 
-    // A runner process starts the command. The command cannot see what
-    // started it, so it asks from here. The runner is non-dumpable, so its
-    // environment cannot be read from here; that it gets only PATH from
-    // atomic's is tested where its environment is set (atomic-exec's runner
-    // tests).
-    let log = command_log(&dir, "parent-env.log");
-    std::fs::write(
-        project.join("tools/parent-env.py"),
-        "import json, os, sys, time\n\
-         json.load(sys.stdin)\n\
-         log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
-         open(log.removesuffix('.log') + '.ask', 'w').close()\n\
-         done = log.removesuffix('.log') + '.done'\n\
-         for _ in range(500):\n\
-         \x20   if os.path.exists(done): break\n\
-         \x20   time.sleep(0.02)\n\
-         json.dump({'seen': os.path.exists(done)}, sys.stdout)\n",
-    )
-    .expect("script");
-    write_atom(
-        &project,
-        "parent-env",
-        &format!(
-            "description: 'Ask for the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/parent-env.py', '{}'] }}",
-            log.display()
-        ),
-        "",
-        object(json!({"text": {"type": "string"}})),
-        object(json!({"seen": {"type": "boolean"}})),
-    );
-    let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let seen = names.clone();
-    let watch = RunnerWatch::new(vec![log], move |runner| {
-        // Its command line stays readable, and says what it is.
-        let cmdline = std::fs::read(format!("/proc/{runner}/cmdline")).expect("cmdline");
-        let found: Vec<String> = cmdline
-            .split(|b| *b == 0)
-            .skip(1)
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .filter(|a| !a.is_empty())
-            .collect();
-        *seen.lock().expect("names") = found;
-    });
-    let out = atomic(
-        &dir,
-        &project,
-        &["run", "parent-env", "--runner", "process", "--data", NOTE],
-        &[],
-        "",
-    );
-    drop(watch);
-    assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(
-        stdout_json(&out),
-        json!({"seen": true}),
-        "a runner started it"
-    );
-    assert_eq!(*names.lock().expect("names"), ["runner"]);
+    #[cfg(target_os = "linux")]
+    {
+        // A runner process starts the command. The command cannot see what
+        // started it, so it asks from here. The runner is non-dumpable, so its
+        // environment cannot be read from here; that it gets only PATH from
+        // atomic's is tested where its environment is set (atomic-exec's runner
+        // tests).
+        let log = command_log(&dir, "parent-env.log");
+        std::fs::write(
+            project.join("tools/parent-env.py"),
+            "import json, os, sys, time\n\
+             json.load(sys.stdin)\n\
+             log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
+             open(log.removesuffix('.log') + '.ask', 'w').close()\n\
+             done = log.removesuffix('.log') + '.done'\n\
+             for _ in range(500):\n\
+             \x20   if os.path.exists(done): break\n\
+             \x20   time.sleep(0.02)\n\
+             json.dump({'seen': os.path.exists(done)}, sys.stdout)\n",
+        )
+        .expect("script");
+        write_atom(
+            &project,
+            "parent-env",
+            &format!(
+                "description: 'Ask for the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/parent-env.py', '{}'] }}",
+                log.display()
+            ),
+            "",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"seen": {"type": "boolean"}})),
+        );
+        let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = names.clone();
+        let watch = RunnerWatch::new(vec![log], move |runner| {
+            // Its command line stays readable, and says what it is.
+            let cmdline = std::fs::read(format!("/proc/{runner}/cmdline")).expect("cmdline");
+            let found: Vec<String> = cmdline
+                .split(|b| *b == 0)
+                .skip(1)
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .filter(|a| !a.is_empty())
+                .collect();
+            *seen.lock().expect("names") = found;
+        });
+        let out = atomic(
+            &dir,
+            &project,
+            &["run", "parent-env", "--runner", "process", "--data", NOTE],
+            &[],
+            "",
+        );
+        drop(watch);
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out),
+            json!({"seen": true}),
+            "a runner started it"
+        );
+        assert_eq!(*names.lock().expect("names"), ["runner"]);
+    }
 }
 
 /// An exec atom whose command logs that it ran, then, the first time or
 /// `always`, has the process that started it, with `--runner process` its
 /// runner, SIGKILLed by a [`RunnerWatch::killing`] on its log, which this
 /// returns.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn write_runner_killer(
     project: &Path,
     dir: &Path,
@@ -4966,10 +4976,9 @@ fn write_runner_killer(
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("runner-killed");
     let project = project(&dir);
@@ -5032,7 +5041,7 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
 
 /// An idempotent exec atom whose command starts a child that sleeps, logs
 /// `start`, then waits a minute before it would answer. The command and its
-/// child have the log's path on their command lines, for [`slow_pids`].
+/// child have the log's path on their command lines.
 fn write_slow(project: &Path, dir: &Path) {
     let log = command_log(dir, "slow.log");
     std::fs::write(
@@ -5076,11 +5085,13 @@ fn slow_starts(dir: &Path) -> usize {
 
 /// The processes of the slow command that run now, with everything that
 /// started it inside its sandbox, and its child.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn slow_pids(dir: &Path) -> Vec<String> {
     pids_with(&command_log(dir, "slow.log").display().to_string())
 }
 
 /// Whether serve has said it stopped or failed.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn serve_ended(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join("serve.log"))
         .is_ok_and(|l| l.contains("error") || l.contains("stopping"))
@@ -5090,6 +5101,7 @@ fn serve_ended(dir: &Path) -> bool {
 /// is not a zombie waiting to be reaped. On Linux a process whose stat can
 /// no longer be read has been reaped since `kill -0` reached it, so it is
 /// gone too.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn alive(pid: &str) -> bool {
     let reached = Command::new("/bin/sh")
         .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
@@ -5109,6 +5121,7 @@ fn alive(pid: &str) -> bool {
 }
 
 /// Wait until no process with `marker` on its command line runs.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn all_gone_with(marker: &str, what: &str) {
     let started = Instant::now();
     while let Some(pid) = pids_with(marker).first() {
@@ -5121,6 +5134,7 @@ fn all_gone_with(marker: &str, what: &str) {
 }
 
 /// Wait until none of `pids` runs.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn all_gone(pids: &[String], what: &str) {
     let started = Instant::now();
     while let Some(pid) = pids.iter().find(|pid| alive(pid)) {
@@ -5155,6 +5169,7 @@ fn signal(child: &Child, signal: &str) {
 /// command runs. Nothing can catch SIGKILL: on Linux the command's
 /// parent-death signal stops it, and the sandbox it runs in with it; this
 /// kills whatever is left. Returns the project's state.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn slow_run_killed_mid_command(dir: &Path, project: &Path, id: &str) -> PathBuf {
     write_slow(project, dir);
     let state = state_dir(dir, project);
@@ -5185,6 +5200,7 @@ fn slow_run_killed_mid_command(dir: &Path, project: &Path, id: &str) -> PathBuf 
 
 /// Stop `child` with `sig` and then again, and check it stops at once with
 /// `code`, after saying it is stopping in `log`.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn stop_twice(child: &mut Child, sig: &str, log: &Path, code: i32) -> String {
     signal(child, sig);
     wait_until("it to begin stopping", || {
@@ -5204,10 +5220,9 @@ fn stop_twice(child: &mut Child, sig: &str, log: &Path, code: i32) -> String {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twice() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("serve-stop");
     let project = project(&dir);
@@ -5289,6 +5304,7 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
 /// SIGTERM, and the grandchild leaves its process group and session and
 /// holds a gigabyte it has written, which takes the kernel a while to free
 /// once it is killed, so a process that exits before it has ended is seen.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
     signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
     note = json.load(sys.stdin)\n\
@@ -5388,10 +5404,9 @@ fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     // With the command a child of serve, and in a runner process of its own.
     for runner in ["local", "process"] {
@@ -5439,10 +5454,9 @@ fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     // Each stop signal, run and resume, both runners, and both paths: a
     // second signal at once, or one signal and the ten seconds the running
@@ -5541,10 +5555,9 @@ fn atomic_run_reading_its_input_stops_on_a_signal() {
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("dead-letter");
     let project = project(&dir);
@@ -5997,14 +6010,14 @@ fn a_leftover_holding_a_commands_output_does_not_hold_its_step_under_the_runner(
         "the step waited {:?} for the child",
         started.elapsed()
     );
+    #[cfg(target_os = "linux")]
     all_gone_with(&marker, "the child went with its runner's group");
 }
 
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     let dir = scratch("progress");
     let project = project(&dir);
@@ -7233,13 +7246,21 @@ fn runs_show_answers_while_a_run_holds_the_lock_and_a_writer_the_store() {
         (out, took)
     });
     let (out, took) = out;
-    run.kill().expect("SIGKILL atomic run");
-    run.wait().expect("reap");
-    let pids = slow_pids(&dir);
-    if !pids.is_empty() {
-        let _ = Command::new("/bin/sh")
-            .args(["-c", &format!("kill -KILL {} 2>/dev/null", pids.join(" "))])
-            .status();
+    #[cfg(target_os = "linux")]
+    {
+        run.kill().expect("SIGKILL atomic run");
+        run.wait().expect("reap");
+        let pids = slow_pids(&dir);
+        if !pids.is_empty() {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", &format!("kill -KILL {} 2>/dev/null", pids.join(" "))])
+                .status();
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        terminate(&run);
+        wait_child(&mut run, "the stopped run");
     }
     assert!(out.status.success(), "{}", text(&out));
     assert!(
@@ -8574,6 +8595,7 @@ fn the_debug_prompt_escapes_its_answer() {
 }
 
 /// What the commands of the turn that answered `model`'s first call printed.
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn first_command_output(model: &FakeModel) -> String {
     let requests = model.requests();
     let follow_up = requests.get(1).expect("Codex answered the tool call");

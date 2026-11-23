@@ -2685,6 +2685,7 @@ fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
 }
 
 /// The requests a signed-in thread makes of the Codex backend, in order.
+#[cfg(target_os = "linux")]
 fn expected_backend_requests() -> Vec<(String, String)> {
     // The model catalog, then the turn.
     [

@@ -194,7 +194,7 @@ pub fn exec_backend(
         .context("confine exec atoms' commands")?,
     ));
     #[cfg(not(target_os = "linux"))]
-    let _ = connections_per_command;
+    let _ = (paths, connections_per_command);
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
         RunnerKind::Process => atomic_exec::Backend::connect(process_runner(

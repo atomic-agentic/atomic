@@ -822,6 +822,7 @@ mod tests {
     /// A test issuer on loopback: it hands out a sign-in for `account` at
     /// its token endpoint and records the request line of everything it is
     /// asked.
+    #[cfg(target_os = "linux")]
     async fn issuer(account: &'static str) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let issuer = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -870,8 +871,10 @@ mod tests {
     /// it reads the state from the authorize URL and comes back to the
     /// login server's callback with a code.
     /// The addresses browser logins were started at, as Codex built them.
+    #[cfg(target_os = "linux")]
     static LOGIN_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+    #[cfg(target_os = "linux")]
     async fn browser_login(sign_in: &SignIn) -> anyhow::Result<()> {
         static STARTED: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, u16)>>> =
             std::sync::Mutex::new(None);
@@ -1097,6 +1100,7 @@ mod tests {
     }
 
     /// Keep `json` (or nothing) in the test keyring for `dir`.
+    #[cfg(target_os = "linux")]
     fn keep(dir: &Path, json: Option<String>) {
         KEYRING
             .lock()
@@ -1105,6 +1109,7 @@ mod tests {
     }
 
     /// A ChatGPT sign-in for `account`, as the keyring keeps it.
+    #[cfg(target_os = "linux")]
     fn signed_in(account: &str) -> String {
         let id_token = crate::testing::fake_id_token("dev@example.invalid", account);
         serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
