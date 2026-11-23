@@ -344,11 +344,12 @@ async fn the_end_of_a_command_on_a_relays_thread_does_not_wait() {
 
 /// A proxy that does not accept the relay's dial in time: the relay gives
 /// up at its own connect timeout and closes the client's connection.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(unsafe_code)]
 async fn the_relays_dial_to_the_proxy_times_out() {
     use std::os::fd::AsRawFd;
-    // A listener with no room in its queue drops every SYN past the first.
+    // Linux drops further SYNs once this zero-backlog listener holds one connection.
     let full = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
     // SAFETY: listen on a socket this test owns.
     assert_eq!(unsafe { libc::listen(full.as_raw_fd(), 0) }, 0);

@@ -1153,11 +1153,10 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     // The toolchains rustup runs are only ever read: never inside, or
     // holding, anything the turn may write.
     if let Some(rustup) = spec.env.get("RUSTUP_HOME").map(PathBuf::from) {
-        let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-        let rustup = real(&rustup);
-        let mut writable: Vec<PathBuf> = spec.writable_roots.iter().map(|r| real(r)).collect();
+        let rustup = resolved(&rustup);
+        let mut writable: Vec<PathBuf> = spec.writable_roots.iter().map(|r| resolved(r)).collect();
         if workspace.sandbox == crate::typed::Sandbox::WorkspaceWrite {
-            writable.push(real(&cwd));
+            writable.push(resolved(&cwd));
         }
         if let Some(root) = writable
             .iter()

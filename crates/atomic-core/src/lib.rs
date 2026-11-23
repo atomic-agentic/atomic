@@ -17,6 +17,8 @@ mod compiler_process;
 pub mod config;
 pub mod context;
 pub mod credential;
+#[cfg(target_os = "macos")]
+mod darwin_memory;
 pub mod editor;
 pub mod eval;
 pub mod evaluation;

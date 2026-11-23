@@ -2646,7 +2646,8 @@ mod tests {
     /// read as text. An entry weighed on a name another entry is called by can
     /// hide that other entry, so a name atomic cannot read as text is refused
     /// where it stands, and every entry is weighed on its own path.
-    #[cfg(unix)]
+    // The on-disk fixture needs a filesystem that accepts non-UTF-8 filenames.
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_name_that_is_not_text_is_refused_and_hides_nothing() {
         use std::os::unix::ffi::OsStrExt as _;
