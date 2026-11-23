@@ -2,9 +2,8 @@
 #
 # Linux and macOS are first-class platforms. Every push to main, every pull
 # request and every merge group of the merge queue runs the checks on Linux.
-# macOS is opt-in while atomic is built out:
-# start the workflow by hand (Actions > CI > Run workflow) and tick "macos" to
-# add it. Actions are pinned by commit SHA.
+# Pushes to main also run the macOS checks. A manual run on main can opt in
+# with the "macos" input. Actions are pinned by commit SHA.
 #
 # The Linux Rust checks are split into jobs that run at once, so a pull
 # request waits for the slowest of them rather than for their sum;
@@ -23,7 +22,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: Also run the Rust job on macOS
+        description: Also run the Rust job on macOS (main only)
         type: boolean
         default: false
 
@@ -397,12 +396,11 @@ jobs:
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${NEEDS}"
           jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}" >/dev/null
 
-  # macOS, started by hand with the workflow's macos input: the build and the
-  # tests without the Linux-only backends, in one job. It keeps no build
-  # cache, so that a run by hand never crowds Linux's out of the cache.
+  # Test protected main on macOS with the Linux-only backends disabled.
+  # This job keeps no build cache, leaving it available to the Linux jobs.
   rust-macos:
     name: Rust (macos-15)
-    if: ${{ inputs.macos }}
+    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.macos)) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
