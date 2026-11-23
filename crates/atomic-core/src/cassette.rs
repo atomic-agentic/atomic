@@ -23,12 +23,12 @@
 //! the same input make it, is recorded once per occurrence (`<key>.json`,
 //! then `<key>.2.json` and so on), and replayed in the same order.
 //!
-//! A recording holds the request body and the response, never a header: the
-//! API key is not stored, and the endpoint it names has no credentials or
-//! query (a cassette refuses to stand in front of one that has). Request
-//! bodies hold whatever the atom was asked, eval inputs included, so a
-//! cassette is a fixture to review like any other test data. (Redaction of
-//! secrets in bodies is not applied yet.)
+//! A recording holds redacted copies of the request and response bodies.
+//! The request identity still comes from the unredacted request. Replay
+//! serves the stored response, so redaction can change an eval's result.
+//! The cassette refuses repeated JSON object keys and JSON it cannot inspect.
+//! Headers are excluded, and endpoint URLs with credentials or queries are
+//! refused. Review cassettes before committing them as fixtures.
 //!
 //! Recordings are written whole, through a temporary file renamed into
 //! place, and never through a symbolic link: the cassette directory and every
@@ -37,6 +37,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -67,8 +68,14 @@ pub struct Recording {
     pub endpoint: String,
     /// The request path, such as `/v1/chat/completions`.
     pub path: String,
-    /// The request body, as it entered the identity.
+    /// The normalized request body, redacted for storage.
     pub request: Value,
+    /// The raw request identity. Older recordings rely on full request equality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_sha256: Option<String>,
+    /// Whether sanitizing a body changed its stored form.
+    #[serde(default)]
+    pub redacted: bool,
     /// The response's HTTP status.
     pub status: u16,
     /// The response's content type.
@@ -464,14 +471,26 @@ async fn answer(
             format!("the cassette serves model calls, not {method} {path}"),
         );
     }
-    let Ok(request) = serde_json::from_slice::<Value>(body) else {
-        return failed(
+    let invalid_json = || {
+        failed(
             "400 Bad Request",
             "the cassette records JSON requests, and this body is not JSON".into(),
-        );
+        )
     };
+    let Ok(body_text) = std::str::from_utf8(body) else {
+        return invalid_json();
+    };
+    let Ok(request) = serde_json::from_str::<Value>(body_text) else {
+        return invalid_json();
+    };
+    if crate::redact::gives_a_key_twice(body_text) {
+        return failed(
+            "400 Bad Request",
+            "the request JSON contains a repeated object key".into(),
+        );
+    }
     let endpoint = &shared.endpoint;
-    let (key, normalized) = identity(endpoint, path, &request);
+    let (key, mut normalized) = identity(endpoint, path, &request);
     let occurrence = shared
         .seen
         .lock()
@@ -526,8 +545,16 @@ async fn answer(
                 Ok(r) => r,
                 Err(e) => return corrupt(format!("it is not a whole recording ({e})")),
             };
+            if recording.redacted {
+                crate::redact::value(&mut normalized);
+            }
+            let identity_matches = match &recording.request_sha256 {
+                Some(expected) => expected == &key,
+                None => !recording.redacted,
+            };
             if recording.endpoint != *endpoint
                 || recording.path != path
+                || !identity_matches
                 || recording.request != normalized
             {
                 return corrupt(format!(
@@ -569,18 +596,25 @@ async fn answer(
             };
             // Only a successful answer is worth replaying.
             if (200..300).contains(&status) {
+                let mut stored_request = normalized.clone();
+                crate::redact::value(&mut stored_request);
+                let stored_body = match redact_response(&text) {
+                    Ok(body) => body,
+                    Err(why) => return failed("502 Bad Gateway", why.into()),
+                };
                 let recording = Recording {
                     endpoint: endpoint.clone(),
                     path: path.to_owned(),
-                    request: normalized,
+                    redacted: stored_request != normalized || stored_body != text,
+                    request: stored_request,
+                    request_sha256: Some(key),
                     status,
                     content_type: content_type.clone(),
-                    body: text.clone(),
+                    body: stored_body.into_owned(),
                 };
-                let written = write_whole(
-                    &file,
-                    &(serde_json::to_string_pretty(&recording).unwrap_or_default() + "\n"),
-                );
+                let written = serde_json::to_string_pretty(&recording)
+                    .map_err(std::io::Error::other)
+                    .and_then(|json| write_whole(&file, &(json + "\n")));
                 if let Err(e) = written {
                     return failed(
                         "500 Internal Server Error",
@@ -592,6 +626,24 @@ async fn answer(
             (format!("{status} Forwarded"), content_type, text)
         }
     }
+}
+
+fn redact_response(response: &str) -> Result<Cow<'_, str>, &'static str> {
+    let Ok(mut json) = serde_json::from_str::<Value>(response) else {
+        if crate::redact::reads_as_json(response) {
+            return Err("the model response JSON cannot be inspected; no cassette was written");
+        }
+        return Ok(crate::redact::text(response));
+    };
+    // Redaction needs the original classification as well as the value.
+    // Parsing an object with repeated keys may separate the two.
+    if crate::redact::gives_a_key_twice(response) {
+        return Err(
+            "the model response JSON contains a repeated object key; no cassette was written",
+        );
+    }
+    crate::redact::value(&mut json);
+    Ok(Cow::Owned(json.to_string()))
 }
 
 #[cfg(test)]

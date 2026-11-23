@@ -1,0 +1,1 @@
+cassette-response-redaction|crates/atomic-core/src/cassette.rs|match redact_response(&text) {|match Ok::<_, &str>(Cow::Borrowed(text.as_str())) {|-p atomic-agentic-core --lib --features fake-model -- cassette_redacts_bodies_but_replays_by_the_raw_request a_non_json_body_uses_text_redaction a_repeated_classifier_inside_a_model_string_is_redacted_for_replay

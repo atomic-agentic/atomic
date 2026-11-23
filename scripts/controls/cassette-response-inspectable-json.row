@@ -1,0 +1,1 @@
+cassette-response-inspectable-json|crates/atomic-core/src/cassette.rs|if crate::redact::reads_as_json(response) {|if false && crate::redact::reads_as_json(response) {|-p atomic-agentic-core --lib --features fake-model -- valid_json_that_cannot_be_inspected_is_not_recorded_as_text
