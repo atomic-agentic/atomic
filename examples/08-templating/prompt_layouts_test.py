@@ -393,7 +393,7 @@ def execute(
     snapshots: dict[tuple[str, str], str] = {}
     for layout, atom in ATOMS.items():
         for case in CASES:
-            code, out, err = runner.run(["render", atom, "--input", f"fixtures/triage-findings/{case}.input.json"])
+            code, out, err = runner.run(["render", atom, "--input", f"fixtures/triage-findings/{case}.input.json", "--preview-helpers"])
             if code != 0:
                 render_errors.append(f"{layout}/{case}: exit {code}: {err.strip().splitlines()[-1:]}")
                 continue
@@ -1003,7 +1003,7 @@ def execute(
     def deterministic() -> str:
         for layout, atom in ATOMS.items():
             for case in CASES:
-                code, out, err = runner.run(["render", atom, "--input", f"fixtures/triage-findings/{case}.input.json"])
+                code, out, err = runner.run(["render", atom, "--input", f"fixtures/triage-findings/{case}.input.json", "--preview-helpers"])
                 _expect(code == 0, f"{layout}/{case}: the second render exited {code}: {err.strip()}")
                 _expect(
                     out == json.dumps(
