@@ -1341,7 +1341,8 @@ impl GraphStore for SqliteStore {
                             if let Some(row) = existing {
                                 let old: String = row.try_get("trust").map_err(db)?;
                                 // CONTROL_OFF: graph-agent-memory-trust
-                                if old == "human" || old == "approved" {
+                                let trusted_memory = old == "human" || old == "approved";
+                                if trusted_memory {
                                     return Err(StoreError::NeedsHumanCredential {
                                         action: "replace trusted memory".to_owned(),
                                     });
