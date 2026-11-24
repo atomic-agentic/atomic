@@ -30,8 +30,8 @@ to M11b/M39b in v0.5.
 Declarative atoms now use Astro exclusively. The production loader supports local
 components, named slots with fallback content, frontmatter locals, template
 literals, bounded TypeScript-shaped expressions, typed validators,
-[TypeScript helpers](atom-files.md#typescript-helpers), which run in an
-embedded, capability-free isolate per call with the step's recorded clock, and
+[TypeScript helpers](atom-files.md#typescript-helpers), which run in a fresh,
+bounded Boa isolate in a short-lived child with the step's recorded clock, and
 [literal Markdown imports](atom-files.md#literal-prompt-examples), which bind a
 project file's text as authored prompt content.
 `atomic check` checks source and generates editor types, including
