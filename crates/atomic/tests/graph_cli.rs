@@ -222,6 +222,116 @@ fn enrolled_person_creates_links_claims_and_closes_with_json() {
 }
 
 #[test]
+fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
+    let fixture = Fixture::new("create-request-key");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let command = [
+        "--json",
+        "graph",
+        "create",
+        "Stable title",
+        "--body",
+        "Stable body",
+        "--kind",
+        "epic",
+        "--request-id",
+        "create-key-1",
+    ];
+    let first: Value = serde_json::from_str(&success(&fixture.run(&project, &command)))
+        .expect("first create JSON");
+    let second: Value = serde_json::from_str(&success(&fixture.run(&project, &command)))
+        .expect("replayed create JSON");
+    assert_eq!(first, second);
+    let id = first["id"].as_str().expect("generated item ID");
+    assert!(id.starts_with("at-"));
+    success(&fixture.run(&project, &["graph", "pin", id]));
+    let after_pin: Value = serde_json::from_str(&success(&fixture.run(&project, &command)))
+        .expect("replay after item changed");
+    assert_eq!(after_pin["id"], id);
+    assert_eq!(after_pin["status"], "pinned");
+
+    let changed = fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Changed title",
+            "--body",
+            "Stable body",
+            "--kind",
+            "epic",
+            "--request-id",
+            "create-key-1",
+        ],
+    );
+    assert!(!changed.status.success(), "changed replay was accepted");
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("already used"));
+    let changed_status = fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Stable title",
+            "--body",
+            "Stable body",
+            "--kind",
+            "epic",
+            "--pinned",
+            "--request-id",
+            "create-key-1",
+        ],
+    );
+    assert!(
+        !changed_status.status.success(),
+        "changed initial status was accepted"
+    );
+    assert!(String::from_utf8_lossy(&changed_status.stderr).contains("already used"));
+    let changed_id = fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Stable title",
+            "--body",
+            "Stable body",
+            "--kind",
+            "epic",
+            "--id",
+            "at-other",
+            "--request-id",
+            "create-key-1",
+        ],
+    );
+    assert!(!changed_id.status.success(), "changed target was accepted");
+    assert!(String::from_utf8_lossy(&changed_id.stderr).contains("already used"));
+
+    let database = fixture.database(&project);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let mut sql = sqlx::SqliteConnection::connect(&format!("sqlite://{}", database.display()))
+            .await
+            .expect("graph database");
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items")
+            .fetch_one(&mut sql)
+            .await
+            .expect("item count");
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+            .fetch_one(&mut sql)
+            .await
+            .expect("request count");
+        assert_eq!((items, requests), (1, 1));
+    });
+
+    let fresh_a = success(&fixture.run(&project, &["graph", "create", "Fresh title"]));
+    let fresh_b = success(&fixture.run(&project, &["graph", "create", "Fresh title"]));
+    assert_ne!(fresh_a, fresh_b, "ordinary create lost its fresh key");
+}
+
+#[test]
 fn operator_cli_reconciles_only_the_named_failed_epic_binding() {
     let fixture = Fixture::new("reconcile-failed");
     let project = fixture.project("project");

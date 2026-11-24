@@ -595,6 +595,55 @@ async fn request_seen(
     }
     Ok(true)
 }
+fn create_request_fingerprint(actor: &Actor, draft: &Draft) -> Result<String, StoreError> {
+    let payload = serde_json::json!({
+        "actor": &actor.principal,
+        "human": actor.human,
+        "id": &draft.id,
+        "title": &draft.title,
+        "body": &draft.body,
+        "kind": &draft.kind,
+        "priority": draft.priority,
+        "status": draft.status.as_str(),
+        "parent": &draft.parent,
+        "due_at_ms": draft.due_at.map(millis),
+        "notes": &draft.notes,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(db)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+async fn create_request_seen(
+    conn: &mut SqliteConnection,
+    request_id: &str,
+    target: &str,
+    fingerprint: &str,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query("SELECT kind,value FROM atomic_graph_requests WHERE request_id=?")
+        .bind(request_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(db)?;
+    let Some(row) = row else { return Ok(false) };
+    let kind: String = row.try_get("kind").map_err(db)?;
+    let value: String = row.try_get("value").map_err(db)?;
+    // Stores written before payload fingerprints kept only the item ID. They
+    // remain replayable, although their original draft cannot be recovered.
+    let same = if value == target {
+        true
+    } else if let Some(encoded) = value.strip_prefix("create-v2:") {
+        let saved: serde_json::Value = serde_json::from_str(encoded).map_err(db)?;
+        saved.get("id").and_then(serde_json::Value::as_str) == Some(target)
+            && saved.get("sha256").and_then(serde_json::Value::as_str) == Some(fingerprint)
+    } else {
+        false
+    };
+    if kind != "create" || !same {
+        return Err(StoreError::RequestConflict {
+            request_id: request_id.to_owned(),
+        });
+    }
+    Ok(true)
+}
 async fn refresh_projection(conn: &mut SqliteConnection) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM atomic_graph_blocked")
         .execute(&mut *conn)
@@ -858,14 +907,16 @@ impl GraphStore for SqliteStore {
                 return Err(StoreError::CannotCreateClosed { item_id: draft.id });
             }
             let actor = self.actor_for_write(actor, "create a human item")?;
+            let fingerprint = create_request_fingerprint(&actor, &draft)?;
             self.run_at(move |c, now|Box::pin(async move {
-   if request_seen(c,&request_id,"create",&draft.id).await? { return get_item(c,&draft.id).await?.ok_or_else(||db("create request refers to missing item")); }
+   if create_request_seen(c,&request_id,&draft.id,&fingerprint).await? { return get_item(c,&draft.id).await?.ok_or_else(||db("create request refers to missing item")); }
    if let Some(parent)=&draft.parent && get_item(c,parent).await?.is_none() { return Err(StoreError::MissingItem { item_id: parent.clone() }); }
    let status=draft.status.as_str();let closed=if draft.status==Status::Closed {Some(now)}else{None};let tr=trust(&actor);
    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&draft.id).bind(&draft.title).bind(&draft.body).bind(&draft.kind).bind(draft.priority).bind(status).bind(&draft.parent).bind(tr.as_str()).bind(&actor.principal).bind(now).bind(closed).bind(draft.due_at.map(millis)).execute(&mut *c).await.map_err(db)?;
    if let Some(parent)=&draft.parent {sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)").bind(&draft.id).bind(parent).execute(&mut *c).await.map_err(db)?;}
    for (n,text) in draft.notes.iter().enumerate(){sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?,?)").bind(&draft.id).bind(n as i64).bind(text).bind(&actor.principal).bind(tr.as_str()).execute(&mut *c).await.map_err(db)?;}
-   sqlx::query("INSERT INTO atomic_graph_requests VALUES (?,'create',?)").bind(request_id).bind(&draft.id).execute(&mut *c).await.map_err(db)?;
+   let request_value = format!("create-v2:{}", serde_json::json!({"id":&draft.id,"sha256":fingerprint}));
+   sqlx::query("INSERT INTO atomic_graph_requests VALUES (?,'create',?)").bind(request_id).bind(request_value).execute(&mut *c).await.map_err(db)?;
    get_item(c,&draft.id).await?.ok_or_else(||db("inserted item missing"))
   })).await
         }
