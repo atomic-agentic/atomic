@@ -496,6 +496,7 @@ async fn engine_at_with_endpoint(
                 ),
                 caches: None,
                 trial_cargo: None,
+                trial_denied: Vec::new(),
                 budgets: Arc::new(BudgetSettings::default()),
                 context: None,
             },

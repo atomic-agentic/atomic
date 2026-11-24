@@ -515,6 +515,7 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
                     ))),
                     caches: None,
                     trial_cargo: None,
+                    trial_denied: Vec::new(),
                     budgets: Arc::new(if scenario == Scenario::Parked {
                         // Each call reserves 150 tokens: the workflow's cap
                         // has room for one at a time.

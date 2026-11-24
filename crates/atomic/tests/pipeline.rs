@@ -586,6 +586,7 @@ async fn engine_built_with_trial(
             worktrees,
             caches: None,
             trial_cargo,
+            trial_denied: vec![dir.join("shared-scratch")],
             budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
@@ -6925,7 +6926,12 @@ fn failed_trial_check_reaches_author_repair_before_review() {
     on_codex_runtime(async {
         let dir = scratch("trial-merge-repair");
         let project = project(&dir);
-        let (mut pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(7)\"");
+        let stdout_secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let stderr_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let check = format!(
+            "\"import sys; print('{stdout_secret}'); print('{stderr_secret}', file=sys.stderr); sys.exit(7)\""
+        );
+        let (mut pipeline, base) = trial_reviewed(&project, &check);
         let Step::Atom(code) = &mut pipeline.steps[0] else {
             panic!("code step")
         };
@@ -6958,13 +6964,37 @@ fn failed_trial_check_reaches_author_repair_before_review() {
             repair_request.contains("trial_merge") && repair_request.contains("check 1"),
             "{repair_request}"
         );
-        let names: Vec<String> = rt
-            .steps("trial-merge-repair")
-            .await
-            .expect("steps")
-            .into_iter()
-            .map(|step| step.name)
-            .collect();
+        let steps = rt.steps("trial-merge-repair").await.expect("steps");
+        let trial_record = steps
+            .iter()
+            .find(|step| step.name == "code.trial_merge.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("durable trial result")
+            .to_string();
+        let terminal_error = error.to_string();
+        for (place, text) in [
+            ("durable checkpoint", trial_record.as_str()),
+            ("repair request", repair_request.as_str()),
+            ("terminal error", terminal_error.as_str()),
+        ] {
+            assert!(
+                !text.contains(stdout_secret),
+                "{place} leaked stdout: {text}"
+            );
+            assert!(
+                !text.contains(stderr_secret),
+                "{place} leaked stderr: {text}"
+            );
+            assert!(
+                text.contains("[REDACTED]"),
+                "{place} lost redaction: {text}"
+            );
+            assert!(
+                text.contains("check 1"),
+                "{place} lost check context: {text}"
+            );
+        }
+        let names: Vec<String> = steps.into_iter().map(|step| step.name).collect();
         assert!(
             names.iter().any(|name| name == "code.trial_merge.0")
                 && names.iter().any(|name| name == "code.trial_merge.1"),
@@ -6981,6 +7011,96 @@ fn failed_trial_check_reaches_author_repair_before_review() {
             .await
             .expect("shutdown");
     });
+}
+
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn confined_trial_backend(dir: &Path, through_runner: bool) -> atomic_exec::Backend {
+    use std::os::unix::fs::symlink;
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_atomic"));
+    let helper = dir.join("codex-linux-sandbox");
+    symlink(&binary, &helper).expect("sandbox helper link");
+    let paths = CodexPaths::with_helpers(binary.clone(), helper);
+    let sandbox = atomic_core::codex::ExecSandbox::new(
+        &paths,
+        atomic_core::codex::StateGuard::NoProjectState,
+        dir.join("codex"),
+    )
+    .expect("Linux sandbox");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "trial-denied-backend-{}-{}",
+        std::process::id(),
+        through_runner
+    ));
+    let local = atomic_exec::LocalBackend::in_dir(scratch).confined(Arc::new(sandbox));
+    if through_runner {
+        atomic_exec::Backend::connect(atomic_exec::runner::ProcessRunner {
+            workspaces: local,
+            ..atomic_exec::runner::ProcessRunner::atomic(binary)
+        })
+        .expect("process runner")
+    } else {
+        atomic_exec::Backend::connect(local).expect("local backend")
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn trial_checks_deny_other_projects_scratch_with_local_and_process_runners() {
+    for through_runner in [false, true] {
+        on_codex_runtime(async move {
+            let dir = scratch(if through_runner {
+                "trial-denied-process"
+            } else {
+                "trial-denied-local"
+            });
+            let project = project(&dir);
+            let sibling = dir.join("shared-scratch/another-project/run");
+            std::fs::create_dir_all(&sibling).expect("other project scratch");
+            std::fs::write(sibling.join("private"), "other-project-secret")
+                .expect("other project secret");
+            let check = format!(
+                "[python3, -c, \"import os,pathlib; other=pathlib.Path('{}'); assert not os.access(other, os.R_OK), 'other-project scratch was readable'; pathlib.Path('own-check').write_text('ok'); pathlib.Path(os.environ['HOME'], 'own-cache').write_text('ok')\"]",
+                sibling.join("private").display()
+            );
+            let (pipeline, base) = trial_reviewed_command(&project, &check);
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let backend = confined_trial_backend(&dir, through_runner);
+            let rt = engine_full(
+                &dir,
+                &model.base_url(),
+                BudgetSettings::default(),
+                "synthetic",
+                Some(backend),
+            )
+            .await;
+            rt.start(
+                PIPELINE,
+                "trial-denied",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let result: Value = rt
+                .result("trial-denied")
+                .await
+                .expect("trial and review pass");
+            assert!(result.is_object());
+            assert_eq!(model.calls(), 3, "author, self-review and reviewer");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+    }
 }
 
 #[test]

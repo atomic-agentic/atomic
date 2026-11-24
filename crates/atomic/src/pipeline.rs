@@ -3500,6 +3500,13 @@ enum TrialMergeResult {
     Repair { main: String, detail: String },
 }
 
+/// A candidate check's output enters a durable checkpoint and an author
+/// repair prompt. Redact the bounded diagnostic before either receives it.
+fn trial_diagnostic(output: &[u8]) -> String {
+    // CONTROL_OFF: trial-diagnostics-redacted
+    atomic_core::redact::excerpt(&String::from_utf8_lossy(output), 4096)
+}
+
 /// The branch head whose merge and checks passed before review. A fresh
 /// reviewer turn verifies it inside its own durable body.
 #[derive(Clone)]
@@ -4593,6 +4600,7 @@ async fn reviewed<C: WorkflowContext>(
             };
             let backend = run.services.runtimes.backend.shared();
             let trial_cargo = run.services.trial_cargo.clone();
+            let trial_denied = run.services.trial_denied.clone();
             let caches = run.caches.cloned().ok_or_else(|| {
                 failed(format!("step `{}`: trial merge has no run cache", step.id))
             })?;
@@ -4812,30 +4820,37 @@ async fn reviewed<C: WorkflowContext>(
                                 )
                                 .collect(),
                             network: Vec::new(),
-                            denied: Vec::new(),
+                            denied: trial_denied.clone(),
                             secret_env: Default::default(),
                         };
                         let done = match backend.run(&check) {
                             Ok(done) => done,
                             Err(e @ (atomic_exec::ExecError::TimedOut { .. }
                                 | atomic_exec::ExecError::TooLarge { .. })) => {
+                                let command = atomic_core::redact::excerpt(&format!("{argv:?}"), 1024);
+                                let error = atomic_core::redact::excerpt(&e.to_string(), 4096);
                                 return Ok(TrialMergeResult::Repair {
                                     main,
-                                    detail: format!("check {} ({:?}) failed: {e}", index + 1, argv),
+                                    detail: format!("check {} ({command}) failed: {error}", index + 1),
                                 });
                             }
-                            Err(e) => return Err(failed(format!(
-                                "trial merge check {} could not run in its scratch worktree: {e}", index + 1
-                            ))),
+                            Err(e) => {
+                                let error = atomic_core::redact::excerpt(&e.to_string(), 4096);
+                                return Err(failed(format!(
+                                    "trial merge check {} could not run in its scratch worktree: {error}", index + 1
+                                )));
+                            }
                         };
                         if !done.success() {
-                            let stderr = String::from_utf8_lossy(&done.stderr);
-                            let stdout = String::from_utf8_lossy(&done.stdout);
+                            // Candidate checks may print credentials. This
+                            // detail is checkpointed and sent to the author
+                            // on repair, so redact before either can see it.
+                            let stderr = trial_diagnostic(&done.stderr);
+                            let stdout = trial_diagnostic(&done.stdout);
+                            let command = atomic_core::redact::excerpt(&format!("{argv:?}"), 1024);
                             let detail = format!(
-                                "check {} ({:?}) exited {:?}; stderr: {:?}; stdout: {:?}",
-                                index + 1, argv, done.code,
-                                stderr.chars().take(4096).collect::<String>(),
-                                stdout.chars().take(4096).collect::<String>()
+                                "check {} ({command}) exited {:?}; stderr: {stderr:?}; stdout: {stdout:?}",
+                                index + 1, done.code,
                             );
                             return Ok(TrialMergeResult::Repair { main, detail });
                         }
@@ -6002,6 +6017,9 @@ pub struct Services {
     /// Trusted local registry and selected rustup toolchain for offline
     /// trial-merge Cargo checks. Nothing here comes from the candidate.
     pub trial_cargo: Option<TrialCargo>,
+    /// Project scratch directories a trial command may not read or write.
+    /// The candidate checkout and its own declared cache remain writable.
+    pub trial_denied: Vec<PathBuf>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,
     /// The public context settings a step whose atom declares a context is
