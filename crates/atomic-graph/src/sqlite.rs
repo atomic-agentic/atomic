@@ -532,7 +532,7 @@ impl SqliteStore {
                             match sqlx::query("COMMIT").execute(&mut *conn).await {
                                 Ok(_) => Ok(value),
                                 Err(_) => {
-                                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; // CONTROL_OFF: graph-commit-recovery
                                     Err(StoreError::OutcomeUnknown {
                                         operation: "commit",
                                     })
