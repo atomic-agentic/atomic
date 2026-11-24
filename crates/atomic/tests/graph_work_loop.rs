@@ -3785,9 +3785,8 @@ const LANE_CONTROL_RESULT: &str = "its test fails with the control off and passe
 
 fn lane_author_for_note() -> Value {
     let mut answer = lane_json("fixtures/lane-author/guard-held.output.json");
-    answer["summary"] = json!(
-        "Added a note explaining why the existing guard test refuses an unverified finding."
-    );
+    answer["summary"] =
+        json!("Added a note explaining why the existing guard test refuses an unverified finding.");
     answer["files_changed"] = json!(["notes/lane-change.md"]);
     answer["tests_run"] = json!([]);
     answer
@@ -4495,6 +4494,342 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
                 .count(),
             2,
             "each of the lane's two gates was decided exactly once"
+        );
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+fn lane_repair_author(repaired: bool) -> Value {
+    let mut answer = lane_author_for_note();
+    answer["summary"] = json!(if repaired {
+        "Explained that an unverified finding has confirmed: false, so the guard refuses it."
+    } else {
+        "Added an initial note saying the guard test passes, without explaining its refusal path."
+    });
+    answer
+}
+
+fn lane_repair_self_review(repaired: bool) -> Value {
+    let mut answer = lane_self_review_with_control();
+    answer["items"]["1"] = json!(if repaired {
+        "The note explains the existing confirmed: false refusal path; no executable code changes."
+    } else {
+        "The note says the guard test passes but does not explain its refusal path; no executable code changes."
+    });
+    answer
+}
+
+async fn lane_repair_model(first_release: PathBuf, repair_release: PathBuf) -> FakeModel {
+    let author_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    FakeModel::respond(move |request| {
+        let said = request.to_string();
+        if said.contains("Guard to keep:") {
+            let repair = author_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0;
+            return Reply::Gated {
+                file: if repair { repair_release.clone() } else { first_release.clone() },
+                reply: Box::new(Reply::Text(lane_repair_author(repair).to_string())),
+            };
+        }
+        let repaired = said.contains("confirmed: false");
+        if said.contains("For each checklist item") {
+            return Reply::Text(lane_repair_self_review(repaired).to_string());
+        }
+        if said.contains("Judge the patch on its own terms") {
+            return Reply::Text(json!({
+                "verdict": if repaired { "approve" } else { "request_changes" },
+                "reason": if repaired {
+                    "The note now explains the existing confirmed: false refusal path and changes no guard code."
+                } else {
+                    "The task asks why the guard test passes, but this note only says that it passes. Explain the unverified finding's refusal path."
+                },
+                "findings": if repaired {
+                    vec!["The repaired note identifies the confirmed: false path; the host test and control proof passed."]
+                } else {
+                    vec!["The first note omits the reason an unverified finding is refused."]
+                }
+            }).to_string());
+        }
+        if said.contains("Judge the evidence, not the writing around it") {
+            return Reply::Text(json!({
+                "verdict": "approve",
+                "reason": if repaired {
+                    "The second checklist describes the repaired note, covers candidate publication, and echoes the host control result."
+                } else {
+                    "The first checklist admits that the note lacks the explanation, covers candidate publication, and echoes the host control result."
+                },
+                "findings": ["The evidence matches this candidate's patch and the host control proof."]
+            }).to_string());
+        }
+        Reply::Text(r#"{"verdict":"escalate","reason":"unexpected lane request"}"#.into())
+    })
+    .await
+    .expect("scripted repair model")
+}
+
+#[test]
+fn reference_coding_lane_offline_repairs_after_request_changes() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("reference-lane-repair"))
+            .expect("physical path for git's trial worktree");
+        let first_release = root.join("release-first-author");
+        let repair_release = root.join("release-repair-author");
+        let model = lane_repair_model(first_release.clone(), repair_release.clone()).await;
+        let project = lane_project(&root);
+        let (fixture, base) = lane_fixture(&root);
+        let url = model.base_url();
+        enroll_cli(&root, &project, &url).await;
+        let cargo = root.join("controls-registry");
+        for part in ["index", "cache", "src"] {
+            std::fs::create_dir_all(cargo.join(part)).expect("offline Cargo registry layout");
+        }
+        let env = [
+            (
+                "ATOMIC_CONTROLS_CARGO_REGISTRY",
+                cargo.to_str().expect("registry path"),
+            ),
+            ("ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN", "1.95.0"),
+            ("CARGO_NET_OFFLINE", "true"),
+        ];
+        let input = json!({"task": lane_task(), "base": base}).to_string();
+        let mut run = LaneChild::start(
+            &root,
+            &project,
+            &url,
+            &[
+                "--json",
+                "run",
+                "workflows/coding-lane.workflow.yaml",
+                "--run-id",
+                LANE,
+                "--data",
+                &input,
+                "--fixture",
+                fixture.to_str().expect("fixture path"),
+                "--fixture-rev",
+                "main",
+            ],
+            &env,
+            "lane-repair-run.log",
+        );
+        wait_for("the first author worktree", || {
+            model.calls() >= 1 && lane_worktree(&root).is_some()
+        })
+        .await;
+        let worktree = lane_worktree(&root).expect("the author's worktree");
+        std::fs::create_dir_all(worktree.join("notes")).expect("notes directory");
+        std::fs::write(worktree.join("notes/lane-change.md"),
+            "The guard test passes. This draft does not yet explain why an unverified finding is refused.\n")
+            .expect("the first candidate's note");
+        std::fs::write(&first_release, "release").expect("release first author");
+
+        // The second author request proves the first panel finished and asked
+        // for repair. The repair turn has its own worktree, based on the bound
+        // base. Kill the CLI with that turn pending, then resume the same run:
+        // every finished first-round step must replay from its checkpoint.
+        wait_for("the repair author request", || model.calls() >= 5).await;
+        run.child.kill().expect("kill the pending repair turn");
+        run.child.wait().expect("reap the interrupted CLI");
+        run = LaneChild::start(
+            &root,
+            &project,
+            &url,
+            &["--json", "runs", "resume", LANE],
+            &env,
+            "lane-repair-resumed.log",
+        );
+        wait_for("the resumed repair author request", || model.calls() >= 6).await;
+        let repair_worktrees = root
+            .join("state-home/projects")
+            .join(cli_state_id(&root, &project))
+            .join("worktrees");
+        let repair_worktree = std::fs::read_dir(&repair_worktrees)
+            .expect("repair worktree directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name().is_some_and(|name| {
+                    name.to_string_lossy()
+                        .starts_with("reference-coding-lane._code_repair_1-")
+                })
+            })
+            .expect("the repair author's private worktree");
+        std::fs::create_dir_all(repair_worktree.join("notes")).expect("repair notes directory");
+        std::fs::write(repair_worktree.join("notes/lane-change.md"),
+            "The guard test still passes because decide() returns confirmed: false when a finding has no host verification. The unchanged guard refuses that unverified finding.\n")
+            .expect("the repaired candidate's note");
+        std::fs::write(&repair_release, "release").expect("release repair author");
+
+        let rt = lane_runtime(&root, &project).await;
+        let merge = lane_gate(&rt, ":authorize-merge").await;
+        assert_eq!(merge.id, format!("{LANE}:authorize-merge"));
+        decide_lane_gate(
+            &root,
+            &project,
+            &url,
+            &merge.id,
+            "lane-repair-merge-decision",
+        )
+        .await;
+        let (status, log) = run.finish(Duration::from_secs(120));
+        assert!(status.success(), "the repaired lane: {status}\n{log}");
+        let answer: Value = serde_json::from_str(
+            log.lines()
+                .find(|line| line.starts_with('{'))
+                .unwrap_or_else(|| panic!("the repaired lane answered no JSON: {log}")),
+        )
+        .expect("one JSON answer");
+        assert_eq!(answer["status"], "succeeded");
+        assert_eq!(answer["output"], lane_repair_author(true));
+        assert_eq!(
+            model.calls(),
+            9,
+            "one interrupted repair request, two completed authors, two self-reviews and four reviewer turns"
+        );
+        let requests: Vec<String> = model
+            .requests()
+            .iter()
+            .map(|request| request.to_string())
+            .collect();
+        for needle in [
+            "For each checklist item",
+            "Judge the patch on its own terms",
+            "Judge the evidence, not the writing around it",
+        ] {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.contains(needle)
+                        && request.contains("This draft does not yet explain"))
+                    .count(),
+                1,
+                "a completed first-round review did not repeat: {needle}: {requests:?}"
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(
+                        |request| request.contains(needle) && request.contains("confirmed: false")
+                    )
+                    .count(),
+                1,
+                "the repaired patch received a fresh {needle} turn: {requests:?}"
+            );
+        }
+
+        let recorded = rt.steps(LANE).await.expect("durable repair steps");
+        let names: Vec<&str> = recorded.iter().map(|step| step.name.as_str()).collect();
+        for name in [
+            "code.turn",
+            "code.review.0.0.publish",
+            "code.review.0.1.publish",
+            "code.repair.1.turn",
+            "code.trial_merge.1",
+            "code.criteria.1.0",
+            "code.criteria.1.1",
+            "code.criteria.1.2",
+            "code.controls.1.0.publish",
+            "code.self_review.1.publish",
+            "code.review.1.0.publish",
+            "code.review.1.1.publish",
+            "code.accepted",
+            "code.publish",
+            "authorize-merge.decision",
+        ] {
+            assert!(names.contains(&name), "missing {name}: {names:?}");
+        }
+        assert!(
+            !names.contains(&"code.review.gate"),
+            "both reviewers approved the repaired candidate"
+        );
+        let published = rt
+            .recorded_candidates(LANE)
+            .await
+            .expect("candidate publications");
+        assert_eq!(
+            published["code.review.0.0"].proposal.output["verdict"],
+            "request_changes"
+        );
+        assert_eq!(
+            published["code.review.0.1"].proposal.output["verdict"],
+            "approve"
+        );
+        assert_eq!(
+            published["code.review.1.0"].proposal.output["verdict"],
+            "approve"
+        );
+        assert_eq!(
+            published["code.review.1.1"].proposal.output["verdict"],
+            "approve"
+        );
+        let first_commit = recorded
+            .iter()
+            .find(|step| step.name == "code.turn")
+            .and_then(|step| step.output.as_ref())
+            .and_then(|output| output["Candidate"]["proposal"]["metadata"]["commit"].as_str())
+            .expect("the first author's candidate commit");
+        let first_diff = recorded
+            .iter()
+            .find(|step| step.name == "code.turn")
+            .and_then(|step| step.output.as_ref())
+            .and_then(|output| output["Candidate"]["proposal"]["metadata"]["diff"].as_str())
+            .expect("the first author's patch");
+        assert!(first_diff.contains("This draft does not yet explain"));
+        let final_commit = published["code"].proposal.metadata["commit"]
+            .as_str()
+            .expect("accepted commit");
+        assert_eq!(published["code"].proposal.output, lane_repair_author(true));
+        assert!(
+            published["code"].proposal.metadata["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("confirmed: false")
+        );
+        assert!(
+            !published["code"].proposal.metadata["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("This draft does not yet explain")
+        );
+        assert_eq!(
+            names.iter().filter(|name| **name == "code.publish").count(),
+            1
+        );
+        assert_eq!(
+            published["code.controls.0.0"].proposal.output["commit"],
+            first_commit
+        );
+        assert_eq!(
+            published["code.controls.0.0"].proposal.output["rows"][0]["verdict"],
+            "passed"
+        );
+        assert_eq!(
+            published["code.controls.1.0"].proposal.output["commit"],
+            final_commit
+        );
+        assert_eq!(
+            published["code.controls.1.0"].proposal.output["rows"][0]["verdict"],
+            "passed"
+        );
+        for index in 0..3 {
+            assert_eq!(
+                recorded
+                    .iter()
+                    .find(|step| step.name == format!("code.criteria.1.{index}"))
+                    .and_then(|step| step.output.as_ref())
+                    .expect("second-round criterion")["Known"]["passed"],
+                true
+            );
+        }
+        let mirror = lane_mirror(&root, &project, &base);
+        assert_eq!(
+            git(&mirror, &["rev-parse", &format!("{final_commit}^")]),
+            base
+        );
+        assert_eq!(git(&fixture, &["rev-parse", "HEAD"]), base);
+        assert_ne!(
+            first_commit, final_commit,
+            "repair must record a new candidate"
         );
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
