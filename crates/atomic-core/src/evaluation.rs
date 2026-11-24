@@ -238,6 +238,21 @@ mod tests {
         }
     }
 
+    /// The compiled scorer boundary enforces the declared context even when a
+    /// caller invokes it directly and the score expression does not read it.
+    #[test]
+    fn a_worker_scorer_requires_its_declared_context_snapshot() {
+        let atom = scoring(PER_ATOM.0, PER_ATOM.1, true);
+        let error = atom
+            .program
+            .invoke(
+                "judgeScore",
+                json!({"scorer":"quality","values":{"ok":true},"options":{}}),
+            )
+            .expect_err("worker must refuse absent declared snapshot");
+        assert!(error.contains("context snapshot required"), "{error}");
+    }
+
     #[test]
     fn judge_boundaries_enforce_full_schemas_and_thresholds() {
         let root = crate::atom::tests::project("{input.text}", "{}", None);

@@ -127,6 +127,29 @@ fn a_declared_context_without_its_snapshot_is_refused_before_anything_renders() 
     }
 }
 
+/// The bundled renderer is a separate boundary: a compiled program invocation
+/// must refuse a missing declared snapshot even when its caller skips the
+/// convenience check in `render_clocked`.
+#[test]
+fn a_worker_render_requires_its_declared_context_snapshot() {
+    let root = written(
+        "{input.text}",
+        PER_ATOM.0,
+        PER_ATOM.1,
+        &format!("{{context:{EMPTY_CONTEXT}}}"),
+    );
+    let (_, compiled) = compiled(&root);
+    let error = compiled
+        .program
+        .invoke(
+            "render",
+            json!({"input":{"text":"request"},"options":{"runId":"run-1","origin":"external"}}),
+        )
+        .expect_err("worker must refuse absent declared snapshot");
+    assert!(error.contains("context snapshot required"), "{error}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// A snapshot is refused for an atom that declares no context, rather than
 /// passed through with nothing to check it against: the author who removes an
 /// atom's `context` finds the run that already recorded a snapshot refused,
