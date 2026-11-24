@@ -2492,6 +2492,107 @@ fn sqlite_refuses_untrusted_admin_changes_and_memory_demotion() {
 }
 
 #[test]
+fn sqlite_finished_close_replay_fences_full_lease_identity() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, Finish, GraphStore, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-finished-identity-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(async {
+        store
+            .create_item(
+                actor.clone(),
+                "create".into(),
+                Draft::new("at-done", "Done"),
+            )
+            .await
+            .expect("create item");
+        let lease = store
+            .claim(
+                actor.clone(),
+                "holder".into(),
+                "at-done".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim item")
+            .expect("item was ready");
+        store
+            .finish(lease.clone(), Finish::Close)
+            .await
+            .expect("close item");
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent state reader");
+        let row = async |conn: &mut sqlx::SqliteConnection| {
+            sqlx::query_as::<_, (
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                i64,
+            )>(
+                "SELECT status,last_finish_session,last_finish_epoch,last_finish_claimant,last_finish_acquisition,terminal_outcome,closed_at,(SELECT COUNT(*) FROM atomic_graph_leases WHERE item_id='at-done') FROM atomic_graph_items WHERE id='at-done'",
+            )
+            .fetch_one(conn)
+            .await
+            .expect("read finished item and lease state")
+        };
+        let before = row(&mut conn).await;
+        let exported = store.export(actor.clone()).await.expect("export graph");
+        store
+            .finish(lease.clone(), Finish::Close)
+            .await
+            .expect("exact close replay is a no-op");
+        assert_eq!(row(&mut conn).await, before, "exact replay changed state");
+        assert_eq!(
+            store.export(actor.clone()).await.expect("export graph"),
+            exported
+        );
+
+        let mut wrong_claimant = lease.clone();
+        wrong_claimant.claimant = "intruder".into();
+        assert!(matches!(
+            store.finish(wrong_claimant, Finish::Close).await,
+            Err(StoreError::Fenced { .. })
+        ));
+        assert_eq!(
+            row(&mut conn).await,
+            before,
+            "forged claimant changed state"
+        );
+        assert_eq!(
+            store.export(actor.clone()).await.expect("export graph"),
+            exported
+        );
+
+        let mut wrong_acquisition = lease;
+        wrong_acquisition.acquisition = "forged".into();
+        assert!(matches!(
+            store.finish(wrong_acquisition, Finish::Close).await,
+            Err(StoreError::Fenced { .. })
+        ));
+        assert_eq!(
+            row(&mut conn).await,
+            before,
+            "forged acquisition changed state"
+        );
+        assert_eq!(store.export(actor).await.expect("export graph"), exported);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_import_rejects_wrong_shapes_and_preserves_signed_dates() {
     use store_contract::{Actor, GraphStore, StoreError};
     let path = std::env::temp_dir().join(format!(
