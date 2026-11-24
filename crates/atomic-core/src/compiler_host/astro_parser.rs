@@ -387,6 +387,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_fragment_span_ends_after_its_three_byte_closer() {
+        for source in ["<>x</>", "<><Section>x</Section></>"] {
+            let parsed = parse(source);
+            assert_eq!(parsed["diagnostics"], json!([]), "{source}");
+            let end = parsed["ast"]["children"][0]["position"]["end"]["offset"]
+                .as_u64()
+                .expect("fragment end offset") as usize;
+            assert_eq!(end, source.len(), "{source}");
+            assert_eq!(&source[end - 3..end], "</>", "{source}");
+            assert_eq!(&source[end - 1..end], ">", "{source}");
+        }
+        let malformed = parse("<>x</qq>");
+        assert_ne!(malformed["diagnostics"], json!([]));
+        assert_eq!(malformed["ast"]["children"], json!([]));
+    }
+
+    #[test]
     fn bare_template_identifiers_resolve_against_frontmatter() {
         let valid = parse("---\nconst placeholder = 'value';\n---\n{placeholder}");
         assert_eq!(valid["diagnostics"], json!([]));
