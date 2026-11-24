@@ -8,7 +8,7 @@
   "ok": true,
   "rows": [
     {
-      "detail": "intact lane-guard-bites: one switch text in tools/lane_guard.py, guarding test lane_guard_refuses_unverified in test_lane_guard.py; the switch itself was not made here",
+      "detail": "intact lane-guard-bites: one switch text in tools/lane_guard.py, guarding test lane_guard_refuses_unverified in lane_guard.rs,test_lane_guard.py; the switch itself was not made here",
       "name": "lane-guard-bites",
       "verdict": "intact"
     }
