@@ -37,6 +37,12 @@ fn main() {
     );
     identity(
         "ATOMIC_HELPER_HASH",
-        &["src/helper_runtime.rs", "src/helper_runtime/process.rs"],
+        &[
+            "src/helper_runtime.rs",
+            "src/helper_runtime/process.rs",
+            "src/child_memory.rs",
+            "src/worker_lifetime.rs",
+            "src/astro.rs",
+        ],
     );
 }
