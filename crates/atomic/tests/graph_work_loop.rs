@@ -3713,14 +3713,8 @@ fn copy_lane_paths(into: &Path, names: &[&str]) -> Vec<String> {
 }
 
 /// The project `atomic run` is pointed at: the example's manifest, its five
-/// atoms with their ten schemas, and its workflow.
-///
-/// `without_controls` rewrites one thing in the copy: the two `self_review`
-/// lines that wire `lane-guard-bites` to `lane-controls-proof`. Those two lines
-/// ask the host for its pinned controls proof, and `…_refuses_the_catalog_row_…`
-/// below shows that its own pinned driver cannot prove this row. Every other
-/// line of the example's workflow is used exactly as checked by `atomic check`.
-fn lane_project(root: &Path, without_controls: bool) -> PathBuf {
+/// atoms with their ten schemas, and its exact checked workflow.
+fn lane_project(root: &Path) -> PathBuf {
     let project = root.join("lane-project");
     let copied = copy_lane_paths(&project, &["atomic.yaml", "atoms", "workflows"]);
     assert_eq!(
@@ -3728,24 +3722,11 @@ fn lane_project(root: &Path, without_controls: bool) -> PathBuf {
         17,
         "the manifest, five atoms, ten schemas and the workflow: {copied:?}"
     );
-    if without_controls {
-        let file = project.join("workflows/coding-lane.workflow.yaml");
-        let source = std::fs::read_to_string(&file).expect("the lane's workflow");
-        let wired = "        selected_controls:\n        - lane-guard-bites\n        controls_atom: lane-controls-proof\n";
-        assert!(
-            source.contains(wired),
-            "the checked workflow names the row and the proof atom together"
-        );
-        std::fs::write(file, source.replace(wired, ""))
-            .expect("workflow without the controls proof");
-        let adapted = std::fs::read_to_string(project.join("workflows/coding-lane.workflow.yaml"))
-            .expect("the lane's adapted workflow");
-        assert!(
-            !adapted.contains("controls_atom") && !adapted.contains("selected_controls"),
-            "the offline lane asks the host for no controls proof"
-        );
-        assert_eq!(adapted.lines().count(), source.lines().count() - 3);
-    }
+    assert!(
+        lane_text("workflows/coding-lane.workflow.yaml")
+            .contains("        controls_atom: lane-controls-proof\n"),
+        "the copied workflow selects the production controls proof"
+    );
     project
 }
 
@@ -3756,11 +3737,24 @@ fn lane_project(root: &Path, without_controls: bool) -> PathBuf {
 /// the catalog.
 fn lane_fixture(root: &Path) -> (PathBuf, String) {
     let fixture = root.join("lane-fixture");
-    let copied = copy_lane_paths(&fixture, &["README.md", "scripts", "tests", "tools"]);
+    let copied = copy_lane_paths(
+        &fixture,
+        &[
+            "Cargo.toml",
+            "Cargo.lock",
+            "README.md",
+            "scripts",
+            "tests",
+            "tools",
+        ],
+    );
     assert!(
         copied.contains(&"scripts/controls/lane-guard-bites.row".to_owned())
             && copied.contains(&"tools/lane_guard.py".to_owned())
-            && copied.contains(&"tests/test_lane_guard.py".to_owned()),
+            && copied.contains(&"tests/test_lane_guard.py".to_owned())
+            && copied.contains(&"tests/lane_guard.rs".to_owned())
+            && copied.contains(&"Cargo.toml".to_owned())
+            && copied.contains(&"Cargo.lock".to_owned()),
         "the lane's repository holds the guard its row switches: {copied:?}"
     );
     std::fs::create_dir_all(fixture.join(".atomic")).expect("inventory directory");
@@ -3787,11 +3781,25 @@ fn lane_task() -> Value {
     })
 }
 
-/// The lane's scripted model. Each atom is answered with the example's own
-/// recorded output for it, chosen by the prompt that atom renders, so a reply
-/// never depends on the order two reviewers happen to call in. The author's
-/// answer is held until this test has written what it stands in for, so the
-/// candidate's patch is a real patch atomic reads out of git.
+const LANE_CONTROL_RESULT: &str = "its test fails with the control off and passes with it on";
+
+fn lane_self_review_with_control() -> Value {
+    let mut evidence = lane_json("fixtures/lane-self-check/patch-with-one-decision.output.json");
+    evidence["items"]["10"] = json!(
+        "The host proved lane-guard-bites by running its Cargo test with the guard off and on."
+    );
+    evidence["controls"] = json!([{
+        "row": "lane-guard-bites",
+        "result": LANE_CONTROL_RESULT
+    }]);
+    evidence
+}
+
+/// The lane's scripted model. The self-review fixture echoes the host's
+/// proved control result; the other replies are the example's recorded
+/// outputs. Replies are chosen by prompt, independent of reviewer call order.
+/// The author's answer is held until this test has written what it stands in
+/// for, so the candidate's patch is a real patch atomic reads out of git.
 async fn lane_model(release: PathBuf, author: &str) -> FakeModel {
     let author = author.to_owned();
     FakeModel::respond(move |request| {
@@ -3804,10 +3812,6 @@ async fn lane_model(release: PathBuf, author: &str) -> FakeModel {
         }
         for (needle, fixture) in [
             (
-                "For each checklist item",
-                "fixtures/lane-self-check/patch-with-one-decision.output.json",
-            ),
-            (
                 "Judge the patch on its own terms",
                 "fixtures/lane-reviewer/omitted-decision-escalates.output.json",
             ),
@@ -3819,6 +3823,9 @@ async fn lane_model(release: PathBuf, author: &str) -> FakeModel {
             if said.contains(needle) {
                 return Reply::Text(lane_text(fixture));
             }
+        }
+        if said.contains("For each checklist item") {
+            return Reply::Text(lane_self_review_with_control().to_string());
         }
         Reply::Text(
             r#"{"verdict":"escalate","reason":"no atom of this lane asked for this"}"#.into(),
@@ -4077,7 +4084,8 @@ async fn decide_lane_gate(root: &Path, project: &Path, url: &str, id: &str, comm
 ///
 /// What runs: the author's turn in a worktree of the fixture's recorded base;
 /// the trial merge with `refs/heads/main` and its `python3` check; the three
-/// declared criteria; the self-review; both reviewers; `lane-reviewer`'s
+/// declared criteria; the host's selected Cargo control proof; the self-review;
+/// both reviewers; `lane-reviewer`'s
 /// recorded `escalate`, which opens `code.review` for a person at once; the
 /// person approving that as it stands; publication; and the lane's own
 /// `authorize-merge` gate, approved by the same enrolled operator. The run
@@ -4091,10 +4099,23 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         let author = lane_text("fixtures/lane-author/guard-held.output.json");
         let release = root.join("release-the-author");
         let model = lane_model(release.clone(), &author).await;
-        let project = lane_project(&root, true);
+        let project = lane_project(&root);
         let (fixture, base) = lane_fixture(&root);
         let url = model.base_url();
         enroll_cli(&root, &project, &url).await;
+        let cargo = root.join("controls-registry");
+        for part in ["index", "cache", "src"] {
+            std::fs::create_dir_all(cargo.join(part))
+                .expect("operator offline Cargo registry layout");
+        }
+        let env = [
+            (
+                "ATOMIC_CONTROLS_CARGO_REGISTRY",
+                cargo.to_str().expect("registry path"),
+            ),
+            ("ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN", "1.95.0"),
+            ("CARGO_NET_OFFLINE", "true"),
+        ];
 
         let input = json!({"task": lane_task(), "base": base}).to_string();
         let mut run = LaneChild::start(
@@ -4114,14 +4135,15 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
                 "--fixture-rev",
                 "main",
             ],
-            &[],
+            &env,
             "lane-run.log",
         );
 
         // The author's turn is in flight in a worktree of the base. What the
         // fake model answers cannot touch a filesystem, so the change this test
         // stands in for is written here, while the turn is held open — and it
-        // avoids every file the control row names, so the host selects no row.
+        // avoids every file the control row names; the declared selected row
+        // still needs a host proof before self-review.
         wait_for("the author's worktree", || {
             model.calls() >= 1 && lane_worktree(&root).is_some()
         })
@@ -4238,6 +4260,8 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
             "code.criteria.0.1.attempt",
             "code.criteria.0.1",
             "code.criteria.0.2",
+            "code.controls.0.0.attempt",
+            "code.controls.0.0.publish",
             "code.self_review.0.turn",
             "code.self_review.0.publish",
             "code.review.0.0.turn",
@@ -4254,12 +4278,10 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         ] {
             assert!(steps.iter().any(|step| step == name), "{name}: {steps:?}");
         }
-        for absent in ["code.repair.", "code.controls."] {
-            assert!(
-                !steps.iter().any(|step| step.starts_with(absent)),
-                "nothing asked for a repair round or a controls proof: {steps:?}"
-            );
-        }
+        assert!(
+            !steps.iter().any(|step| step.starts_with("code.repair.")),
+            "nothing asked for a repair round: {steps:?}"
+        );
         // The one step of a given name, and what it recorded.
         let step_output = |name: &str| -> Value {
             let hits: Vec<&atomic_durable::StepRecord> =
@@ -4276,13 +4298,29 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
                 .unwrap_or_else(|| panic!("{name} recorded no output"))
         };
 
-        // What each step recorded, against the example's own recorded replies.
+        // The host's production proof ran the selected Cargo row with the
+        // switch removed and restored, and published its measured verdict.
         let published = rt.recorded_candidates(LANE).await.expect("candidates");
+        let proof = &published["code.controls.0.0"].proposal.output;
+        assert_eq!(proof["ok"], true, "the host controls proof: {proof}");
+        assert_eq!(proof["passed"], 1, "the selected row passed: {proof}");
+        assert_eq!(proof["failed"], 0, "no selected row failed: {proof}");
+        assert_eq!(proof["rows"].as_array().map(Vec::len), Some(1));
+        assert_eq!(proof["rows"][0]["name"], "lane-guard-bites");
+        assert_eq!(proof["rows"][0]["verdict"], "passed");
+        assert_eq!(proof["rows"][0]["detail"], LANE_CONTROL_RESULT);
+
+        // What each step recorded, against the example's own recorded replies.
         let coding = &published["code"].proposal.metadata;
         let commit = coding["commit"]
             .as_str()
             .expect("the host's candidate commit");
         assert_eq!(commit.len(), 40, "atomic recorded one commit");
+        assert_eq!(proof["commit"], commit, "the proof used this candidate");
+        assert_eq!(
+            proof["bound"]["base"], base,
+            "the proof used the bound base"
+        );
         assert_eq!(
             coding["base"], base,
             "the candidate's base is the bound base"
@@ -4291,8 +4329,8 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         assert!(diff.contains("notes/lane-change.md"), "{diff}");
         assert_eq!(
             published["code.self_review.0"].proposal.output,
-            lane_json("fixtures/lane-self-check/patch-with-one-decision.output.json"),
-            "the self-review step recorded the example's recorded evidence"
+            lane_self_review_with_control(),
+            "the self-review echoed the host result in the example's recorded evidence"
         );
         assert_eq!(
             published["code.review.0.0"].proposal.output,
@@ -4400,151 +4438,6 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
             2,
             "each of the lane's two gates was decided exactly once"
         );
-        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
-    });
-}
-
-/// The example **exactly as checked**, including the two lines that wire
-/// `lane-guard-bites` to `lane-controls-proof`, cannot reach a reviewer.
-///
-/// Those lines ask the host for its own controls proof, so the run needs the
-/// operator's offline Cargo (`ATOMIC_CONTROLS_CARGO_REGISTRY` and
-/// `ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN`, pinned by `TrialCargo::new` before the
-/// first model call even though this lane's trial checks are `python3`), and the
-/// proof step then runs atomic's pinned `scripts/controls-exec.py` rather than the
-/// example's illustrative `tools/lane_controls_proof.py`. That driver proves a row
-/// by switching it off and running the row's own command under Cargo — a row's
-/// fifth field is what follows `cargo test --locked --no-fail-fast` — so for this
-/// catalog row, which names a `python3` test in a repository with no Cargo
-/// manifest, it answers
-/// `controls-exec: refused: <commit> has no Cargo.toml for selected control
-/// targets` and the run fails at `lane-controls-proof`.
-///
-/// That is the smallest missing runtime capability: the host's pinned controls
-/// runner runs Cargo and nothing else, so a lane whose control is guarded by a
-/// non-Cargo test has no host proof it can select. It is recorded here rather than
-/// worked around, because a lane that reaches review without proving its selected
-/// row is the thing the review path refuses.
-#[test]
-fn reference_coding_lane_offline_refuses_the_catalog_row_under_the_host_driver() {
-    support::require_sandbox();
-    on_codex_runtime(async {
-        let root = std::fs::canonicalize(scratch("reference-lane-controls"))
-            .expect("physical path for git's trial worktree");
-        let author = lane_text("fixtures/lane-author/guard-held.output.json");
-        let release = root.join("release-the-author");
-        let model = lane_model(release.clone(), &author).await;
-        let project = lane_project(&root, false);
-        let (fixture, base) = lane_fixture(&root);
-        let url = model.base_url();
-        enroll_cli(&root, &project, &url).await;
-        // The operator's offline Cargo cache, as `TrialCargo::new` pins it
-        // (`crates/atomic/src/pipeline.rs:558`): a canonical directory holding
-        // `index`, `cache` and `src`. Nothing is ever fetched into it here; an
-        // empty one is enough to get past that pin, which is the point — the
-        // refusal this test records is about the row, not about the cache.
-        let cargo = root.join("controls-registry");
-        for part in ["index", "cache", "src"] {
-            std::fs::create_dir_all(cargo.join(part))
-                .expect("operator offline Cargo registry layout");
-        }
-        let env = [
-            (
-                "ATOMIC_CONTROLS_CARGO_REGISTRY",
-                cargo.to_str().expect("registry path"),
-            ),
-            ("ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN", "1.95.0"),
-        ];
-
-        let input = json!({"task": lane_task(), "base": base}).to_string();
-        let mut run = LaneChild::start(
-            &root,
-            &project,
-            &url,
-            &[
-                "--json",
-                "run",
-                "workflows/coding-lane.workflow.yaml",
-                "--run-id",
-                LANE,
-                "--data",
-                &input,
-                "--fixture",
-                fixture.to_str().expect("fixture path"),
-                "--fixture-rev",
-                "main",
-            ],
-            &env,
-            "lane-controls-refusal.log",
-        );
-        wait_for("the author's worktree", || {
-            model.calls() >= 1 && lane_worktree(&root).is_some()
-        })
-        .await;
-        let worktree = lane_worktree(&root).expect("the author's worktree");
-        std::fs::write(
-            worktree.join("notes.md"),
-            "A change that touches no control row of its own.\n",
-        )
-        .expect("the candidate's change");
-        std::fs::write(&release, "written").expect("release the author's answer");
-
-        let (status, log) = run.finish(Duration::from_secs(180));
-        assert!(
-            !status.success(),
-            "the declared controls proof passed: {log}"
-        );
-        let mut answers = log.lines().filter(|line| line.starts_with('{'));
-        let answer = answers
-            .next()
-            .unwrap_or_else(|| panic!("the refused run answered no JSON line:\n{log}"));
-        assert!(
-            answers.next().is_none(),
-            "the refused run answered more than one JSON line:\n{log}"
-        );
-        let refused: Value = serde_json::from_str(answer).expect("one JSON value");
-        assert_eq!(
-            refused["error"]["kind"], "run.failed",
-            "the run reported its own failure: {refused}"
-        );
-        let said = refused["error"]["description"]
-            .as_str()
-            .unwrap_or_else(|| panic!("the refusal names its cause: {refused}"));
-        // Which step stopped the run (the declared proof atom), what it actually
-        // ran (atomic's pinned driver, not the example's illustrative script)
-        // and the driver's own reason for refusing this row.
-        for part in [
-            "lane-controls-proof",
-            "controls-exec: refused:",
-            "has no Cargo.toml for selected control targets",
-        ] {
-            assert!(
-                said.contains(part),
-                "the refusal is missing {part:?}: {said}"
-            );
-        }
-
-        // The proof stopped the run where it stands: the author was paid for
-        // and nothing after the row was.
-        assert_eq!(model.calls(), 1, "only the author's turn ran");
-        let rt = lane_runtime(&root, &project).await;
-        let steps: Vec<String> = rt
-            .steps(LANE)
-            .await
-            .expect("the lane's steps")
-            .into_iter()
-            .map(|step| step.name)
-            .collect();
-        assert!(
-            steps.iter().any(|step| step.starts_with("code.controls.")),
-            "the run reached its controls proof: {steps:?}"
-        );
-        for absent in ["code.self_review.", "code.review.", "code.publish"] {
-            assert!(
-                !steps.iter().any(|step| step.starts_with(absent)),
-                "nothing past a failed controls proof ran: {steps:?}"
-            );
-        }
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
