@@ -2195,6 +2195,113 @@ fn sqlite_roundtrips_draft_fields_and_every_edge_kind() {
 }
 
 #[test]
+fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
+    use store_contract::{Actor, Draft, EdgeKind, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-edge-identity-{}.sqlite",
+        std::process::id()
+    ));
+    let imported_path = std::env::temp_dir().join(format!(
+        "atomic-graph-edge-identity-import-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&imported_path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::human("maintainer");
+
+    harness::block_on(async {
+        for id in ["at-child", "at-parent-one", "at-parent-two"] {
+            store
+                .create_item(actor.clone(), format!("create-{id}"), Draft::new(id, id))
+                .await
+                .expect("create graph item");
+        }
+        let before = store.export(actor.clone()).await.expect("export graph");
+        for kind in [EdgeKind::ParentChild, EdgeKind::Blocks] {
+            for (from, to, missing) in [
+                ("at-absent", "at-parent-one", "at-absent"),
+                ("at-child", "at-absent", "at-absent"),
+            ] {
+                assert!(matches!(
+                    store
+                        .add_edge(actor.clone(), from.to_owned(), kind, to.to_owned())
+                        .await,
+                    Err(StoreError::MissingItem { item_id }) if item_id == missing
+                ));
+                assert_eq!(
+                    store
+                        .export(actor.clone())
+                        .await
+                        .expect("export after refusal"),
+                    before,
+                    "refusing a missing {missing} edge must not write a parent or edge"
+                );
+            }
+        }
+
+        store
+            .add_edge(
+                actor.clone(),
+                "at-child".into(),
+                EdgeKind::ParentChild,
+                "at-parent-one".into(),
+            )
+            .await
+            .expect("link first parent");
+        let shown = store
+            .show(actor.clone(), "at-child".into())
+            .await
+            .expect("show child")
+            .expect("child exists");
+        assert_eq!(shown.item.parent.as_deref(), Some("at-parent-one"));
+        assert_eq!(shown.blocked_by, ["at-parent-one"]);
+        let first_parent = store
+            .export(actor.clone())
+            .await
+            .expect("export first parent");
+        assert!(matches!(
+            store
+                .add_edge(
+                    actor.clone(),
+                    "at-child".into(),
+                    EdgeKind::ParentChild,
+                    "at-parent-two".into(),
+                )
+                .await,
+            Err(StoreError::InvalidEdge { .. })
+        ));
+        assert_eq!(
+            store
+                .export(actor.clone())
+                .await
+                .expect("export after refusal"),
+            first_parent,
+            "refusing a second parent must not write an edge or change the item"
+        );
+
+        let imported = sqlite_authorized_for_tests(&imported_path, std::time::SystemTime::now)
+            .expect("open second graph store");
+        imported
+            .import(actor.clone(), first_parent, false)
+            .await
+            .expect("import exported graph");
+        let imported_child = imported
+            .show(actor, "at-child".into())
+            .await
+            .expect("show imported child")
+            .expect("imported child exists");
+        assert_eq!(imported_child.item.parent.as_deref(), Some("at-parent-one"));
+        assert_eq!(imported_child.blocked_by, ["at-parent-one"]);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(imported_path);
+}
+
+#[test]
 fn sqlite_works_inside_an_existing_tokio_runtime() {
     use store_contract::{Actor, Draft};
     let runtime = tokio::runtime::Builder::new_current_thread()
