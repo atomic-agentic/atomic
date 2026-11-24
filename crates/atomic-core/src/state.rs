@@ -629,7 +629,7 @@ impl ProjectState {
     /// What every backend of the project denies its commands: the home's
     /// whole `scratch/`, and the scratch roots an older atomic kept in the
     /// state directory, while they are still there.
-    fn denied_scratch(&self) -> Vec<PathBuf> {
+    pub fn denied_scratch(&self) -> Vec<PathBuf> {
         let mut denied = vec![self.scratch_home()];
         denied.extend(self.legacy_scratch_roots());
         denied
