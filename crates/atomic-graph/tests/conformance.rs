@@ -3176,6 +3176,103 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
 }
 
 #[test]
+fn sqlite_ready_and_claim_follow_a_blocker_chain_with_a_cycle() {
+    use store_contract::{Actor, Draft, EdgeKind, Finish, GraphStore, Status};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-blocker-chain-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("graph store");
+    let actor = Actor::human("owner");
+    harness::block_on(async {
+        const COUNT: usize = 16;
+        for n in 0..COUNT {
+            let id = format!("at-chain-{n:02}");
+            store
+                .create_item(actor.clone(), format!("create-{id}"), Draft::new(&id, &id))
+                .await
+                .expect("create chain item");
+        }
+        for n in 0..COUNT - 1 {
+            store
+                .add_edge(
+                    actor.clone(),
+                    format!("at-chain-{n:02}"),
+                    EdgeKind::Blocks,
+                    format!("at-chain-{:02}", n + 1),
+                )
+                .await
+                .expect("add chain blocker");
+        }
+        store
+            .add_edge(
+                actor.clone(),
+                "at-chain-15".into(),
+                EdgeKind::Blocks,
+                "at-chain-14".into(),
+            )
+            .await
+            .expect("add cycle edge");
+        assert!(
+            store
+                .ready(actor.clone(), COUNT)
+                .await
+                .expect("ready before close")
+                .is_empty()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "at-chain-00".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("direct claim check")
+                .is_none(),
+            "direct claim ignored a blocker"
+        );
+        store
+            .set_status(actor.clone(), "at-chain-15".into(), Status::Closed)
+            .await
+            .expect("human breaks cycle");
+        for n in (0..COUNT - 1).rev() {
+            let expected = format!("at-chain-{n:02}");
+            let ready = store.ready(actor.clone(), COUNT).await.expect("ready item");
+            assert_eq!(
+                ready
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                [expected.as_str()]
+            );
+            let lease = store
+                .claim_next(actor.clone(), "worker".into(), Duration::from_secs(60))
+                .await
+                .expect("claim next")
+                .expect("one item became ready");
+            assert_eq!(lease.item_id, expected);
+            store
+                .finish(lease, Finish::Close)
+                .await
+                .expect("close claimed item");
+        }
+        assert!(
+            store
+                .ready(actor, COUNT)
+                .await
+                .expect("ready after close")
+                .is_empty()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_import_refuses_undefined_dependency_kind_without_committing_items() {
     use store_contract::{Actor, GraphStore, StoreError};
     let path = std::env::temp_dir().join(format!(

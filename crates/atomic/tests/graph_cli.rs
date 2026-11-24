@@ -332,6 +332,95 @@ fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
 }
 
 #[test]
+fn distinct_create_keys_with_the_same_short_hash_keep_separate_items_and_replay() {
+    let fixture = Fixture::new("create-request-collision");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let keys = ["batch-36219", "batch-59213"];
+    let mut ids = Vec::new();
+    for key in keys {
+        let args = [
+            "--json",
+            "graph",
+            "create",
+            "Independent item",
+            "--request-id",
+            key,
+        ];
+        let first: Value = serde_json::from_str(&success(&fixture.run(&project, &args)))
+            .expect("created item JSON");
+        let replay: Value = serde_json::from_str(&success(&fixture.run(&project, &args)))
+            .expect("replayed item JSON");
+        assert_eq!(first, replay, "key {key} did not replay its own item");
+        ids.push(first["id"].as_str().expect("generated ID").to_owned());
+    }
+    assert_eq!(
+        &ids[0][..11],
+        &ids[1][..11],
+        "regression keys no longer collide under the old eight-hex-digit ID"
+    );
+    assert_ne!(ids[0], ids[1], "independent requests collided");
+    assert_eq!(ids[0].len(), 27, "generated ID lost its 96-bit hash");
+    let database = fixture.database(&project);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let mut sql = sqlx::SqliteConnection::connect(&format!("sqlite://{}", database.display()))
+            .await
+            .expect("graph database");
+        let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items")
+            .fetch_one(&mut sql)
+            .await
+            .expect("item count");
+        let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+            .fetch_one(&mut sql)
+            .await
+            .expect("request count");
+        assert_eq!((items, requests), (2, 2));
+    });
+}
+
+#[test]
+fn keyed_create_replays_its_preexisting_short_id() {
+    let fixture = Fixture::new("create-legacy-short-id");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let key = "legacy-generated-key";
+    let generated = atomic_graph::sqlite::hash_id("graph-cli", key.as_bytes());
+    let old_id = &generated[..11];
+    let original: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &[
+            "--json",
+            "graph",
+            "create",
+            "Prior item",
+            "--id",
+            old_id,
+            "--request-id",
+            key,
+        ],
+    )))
+    .expect("original item JSON");
+    let replay: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &[
+            "--json",
+            "graph",
+            "create",
+            "Prior item",
+            "--request-id",
+            key,
+        ],
+    )))
+    .expect("replayed item JSON");
+    assert_eq!(original, replay, "preexisting short ID changed on replay");
+    assert_eq!(replay["id"], old_id);
+}
+
+#[test]
 fn operator_cli_reconciles_only_the_named_failed_epic_binding() {
     let fixture = Fixture::new("reconcile-failed");
     let project = fixture.project("project");

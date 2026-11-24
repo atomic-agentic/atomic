@@ -384,8 +384,15 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
                 Some(_) => bail!("--request-id must contain 1 to 128 bytes"),
                 None => fresh_request()?,
             };
-            let id = id
-                .unwrap_or_else(|| atomic_graph::sqlite::hash_id("graph-cli", request.as_bytes()));
+            let id = match id {
+                Some(id) => id,
+                None => store
+                    .created_item_id_for_request(&request)
+                    .await?
+                    .unwrap_or_else(|| {
+                        atomic_graph::sqlite::hash_id("graph-cli", request.as_bytes())
+                    }),
+            };
             let mut draft = Draft::new(&id, &title);
             draft.body = body;
             draft.kind = kind;
