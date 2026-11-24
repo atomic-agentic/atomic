@@ -1,0 +1,7 @@
+{
+  "verdict": "escalate",
+  "reason": "The new unconditional confirmed return removes refusal of an unverified finding, and no host control result can settle the decision.",
+  "findings": [
+    "tools/lane_guard.py: the removed verified() branch allows unverified findings to be confirmed."
+  ]
+}

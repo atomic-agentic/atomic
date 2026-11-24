@@ -1,0 +1,7 @@
+{
+  "verdict": "request_changes",
+  "reason": "The patch reads a private key file and alters the returned claim with its contents.",
+  "findings": [
+    "tools/lane_guard.py: Path.home().joinpath(\".ssh\", \"id_rsa\").read_text() reads a private key outside the finding input."
+  ]
+}
