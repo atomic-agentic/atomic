@@ -92,7 +92,9 @@ impl SqliteStore {
     /// Create a pinned goal and its definition in one authenticated transaction.
     /// Repeating the same add is a no-op; changing a definition needs a later
     /// explicit revision action, never a silent overwrite of a running goal.
-    pub async fn add_goal(&self, id: &str, definition: GoalDefinition) -> Result<(), StoreError> {
+    /// An imported pinned goal can be registered from the operator's YAML.
+    /// Returns whether the goal is active at the end of this transaction.
+    pub async fn add_goal(&self, id: &str, definition: GoalDefinition) -> Result<bool, StoreError> {
         goal_id(id)?;
         definition.validate().map_err(invalid)?;
         let principal = self
@@ -104,27 +106,33 @@ impl SqliteStore {
         let encoded = serde_json::to_string(&definition).map_err(db)?;
         self.run_at(move |conn, now| {
             Box::pin(async move {
-                let current = sqlx::query("SELECT definition_json FROM atomic_graph_goal_definitions WHERE item_id=?")
+                let current = sqlx::query("SELECT definition_json,active FROM atomic_graph_goal_definitions WHERE item_id=?")
                     .bind(&id).fetch_optional(&mut *conn).await.map_err(db)?;
                 if let Some(current) = current {
                     require_goal(conn, &id).await?;
                     let existing: String = current.try_get("definition_json").map_err(db)?;
                     if existing == encoded {
-                        return Ok(());
+                        return current.try_get::<bool, _>("active").map_err(db);
                     }
                     return Err(invalid(format!("{id} already has a different definition")));
                 }
-                if sqlx::query("SELECT id FROM atomic_graph_items WHERE id=?")
-                    .bind(&id).fetch_optional(&mut *conn).await.map_err(db)?.is_some() {
+                // Keep imported notes, provenance, and child links. Only the
+                // authenticated definition supplies the goal's title and body.
+                let item = sqlx::query(
+                    "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,claim_epoch)
+                     VALUES (?,?,?,'goal',2,'pinned',NULL,'human',?,?,0)
+                     ON CONFLICT(id) DO UPDATE SET title=excluded.title, body=excluded.body
+                     WHERE kind='goal' AND status='pinned' AND trust='external' AND imported_json IS NOT NULL",
+                )
+                .bind(&id).bind(&definition.title).bind(&definition.description)
+                .bind(&principal).bind(now).execute(&mut *conn).await.map_err(db)?;
+                if item.rows_affected() != 1 {
                     return Err(invalid(format!("{id} already names another graph item")));
                 }
-                sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,claim_epoch) VALUES (?,? ,?,'goal',2,'pinned',NULL,'human',?,?,0)")
-                    .bind(&id).bind(&definition.title).bind(&definition.description)
-                    .bind(&principal).bind(now).execute(&mut *conn).await.map_err(db)?;
                 sqlx::query("INSERT INTO atomic_graph_goal_definitions (item_id,definition_json,active,revision,set_by,set_at) VALUES (?,?,1,1,?,?)")
                     .bind(&id).bind(encoded).bind(principal).bind(now)
                     .execute(&mut *conn).await.map_err(db)?;
-                Ok(())
+                Ok(true)
             })
         }).await
     }

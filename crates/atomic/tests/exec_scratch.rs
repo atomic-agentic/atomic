@@ -274,3 +274,89 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+#[test]
+fn executable_criteria_isolate_other_projects_scratch_on_both_runners() {
+    use atomic_app::criteria::evaluate;
+    use atomic_core::workflow::Criterion;
+    support::require_sandbox();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("criteria-isolation-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("bin")).expect("test bin directory");
+    let dir = dir.canonicalize().expect("canonical directory");
+    let state = dir.join("state");
+    let scratch_home = dir.join("scratch");
+    let other = scratch_home.join("other-project/run");
+    let candidate = dir.join("candidate");
+    for root in [&state, &candidate, &other] {
+        std::fs::create_dir_all(root).expect("fixture directory");
+    }
+    let helper = dir.join("bin/codex-linux-sandbox");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_atomic"), &helper).expect("sandbox helper");
+    let paths = CodexPaths::with_helpers(env!("CARGO_BIN_EXE_atomic").into(), helper);
+    let local = LocalBackend::in_dir(scratch_home.join("project/run"))
+        .denying([scratch_home])
+        .confined(Arc::new(
+            ExecSandbox::new(
+                &paths,
+                StateGuard::deny_state_dir(&state).expect("guard"),
+                state.join("codex"),
+            )
+            .expect("sandbox"),
+        ));
+    let process = atomic_exec::runner::ProcessRunner {
+        workspaces: local.clone(),
+        ..atomic_exec::runner::ProcessRunner::atomic(env!("CARGO_BIN_EXE_atomic").into())
+    };
+    for path in [candidate.join("sentinel"), other.join("sentinel")] {
+        std::fs::write(path, "harmless fixture").expect("create sentinel");
+    }
+    for backend in [&local as &dyn ExecutionBackend, &process] {
+        for (file, readable) in [
+            (candidate.join("sentinel"), true),
+            (other.join("sentinel"), false),
+        ] {
+            let check = Criterion::Test {
+                argv: vec![
+                    "test".into(),
+                    "-r".into(),
+                    file.to_str().expect("utf8").into(),
+                ],
+                timeout_ms: 5000,
+            };
+            let outcome = evaluate(&check, backend, &candidate, &[]).expect("criterion executed");
+            assert_eq!(
+                outcome.passed,
+                readable,
+                "{}: {}",
+                file.display(),
+                outcome.detail
+            );
+            assert!(
+                outcome.detail.starts_with(if readable {
+                    "test exited Some(0)"
+                } else {
+                    "test exited Some(1)"
+                }),
+                "{}",
+                outcome.detail
+            );
+        }
+    }
+    // Replacing a verified sandbox requires a fresh check, including when
+    // the replacement has no way to verify confinement on this machine.
+    struct Unverified;
+    impl atomic_exec::Confine for Unverified {
+        fn confine(
+            &self,
+            _: &atomic_exec::Command,
+            _: &Path,
+        ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+            panic!("an unverified sandbox must never dispatch")
+        }
+    }
+    let unverified = local.confined(Arc::new(Unverified));
+    assert!(matches!(unverified.criterion_exclusions(&candidate),
+        Err(atomic_exec::ExecError::Unconfinable { message }) if message == "backend provides no confinement check"));
+    std::fs::remove_dir_all(dir).expect("remove fixtures");
+}

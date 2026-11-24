@@ -1,0 +1,1 @@
+goal-inspection|crates/atomic/src/goals.rs|SqliteStore::open_for_inspection(&state.database()).await|SqliteStore::open(&state.database(), SystemTime::now)|-p atomic-agentic --test graph_cli -- goals_inspection_leaves_missing_and_older_databases_untouched

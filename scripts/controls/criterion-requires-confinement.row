@@ -1,0 +1,1 @@
+criterion-requires-confinement|crates/atomic-exec/src/lib.rs|return Err(ExecError::criterion_unconfined());|return Ok(Vec::new());|-p atomic-agentic --lib -- unconfined_backends_refuse_executable_criteria_before_dispatch

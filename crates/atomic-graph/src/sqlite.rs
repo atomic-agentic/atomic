@@ -172,6 +172,20 @@ impl SqliteStore {
             projection_pause: None,
         })
     }
+    /// Inspect a graph without creating or upgrading the project database.
+    pub async fn open_for_inspection(path: &Path) -> Result<Self, StoreError> {
+        let conn = atomic_durable::store::inspect_sqlite(path)
+            .await
+            .map_err(db)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            now: Arc::new(SystemTime::now),
+            human: None,
+            #[cfg(debug_assertions)]
+            projection_pause: None,
+        })
+    }
+
     /// Open a graph store for a person whose enrolled credential is checked
     /// inside every write transaction. The supplied actor name grants nothing.
     pub fn open_authorized(
@@ -1632,10 +1646,17 @@ impl GraphStore for SqliteStore {
                     action: "import graph".to_owned(),
                 });
             }
-            self.run_at(move |c, now| {
-                Box::pin(async move { import_jsonl(c, &jsonl, dry_run, now).await })
-            })
-            .await
+            if dry_run {
+                self.read_at(move |c, now| {
+                    Box::pin(async move { import_jsonl(c, &jsonl, true, now).await })
+                })
+                .await
+            } else {
+                self.run_at(move |c, now| {
+                    Box::pin(async move { import_jsonl(c, &jsonl, false, now).await })
+                })
+                .await
+            }
         }
     }
     fn export(&self, _actor: Actor) -> impl Future<Output = Result<String, StoreError>> + Send {
@@ -1766,6 +1787,10 @@ async fn import_jsonl(
         }
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(mut v) => {
+                // Keep the historical short ghp_ marker as well as the shared
+                // redactor's provider, field-name and structured-value rules.
+                scrub_import_text(&mut v);
+                atomic_core::redact::value(&mut v);
                 if let Some(record_type) = v.get("_type") {
                     if record_type != "memory" {
                         errors.push(format!("line {} has unsupported _type", n + 1));
@@ -1776,13 +1801,7 @@ async fn import_jsonl(
                         errors.push(format!("line {} memory needs string key and value", n + 1));
                         continue;
                     };
-                    let key = key.to_owned();
-                    let value = if value.contains("ghp_") {
-                        "[redacted]".to_owned()
-                    } else {
-                        value.to_owned()
-                    };
-                    memories.push((key, value));
+                    memories.push((key.to_owned(), value.to_owned()));
                     continue;
                 }
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
@@ -1791,6 +1810,17 @@ async fn import_jsonl(
                 let status = json_str(&v, "status").unwrap_or("");
                 if status == "pinned" || Status::parse(status).is_none() {
                     errors.push(format!("line {} has unsupported status {status}", n + 1));
+                }
+                if let Some(outcome) = v.pointer("/metadata/atomic_graph/terminal_outcome")
+                    && (v.pointer("/metadata/atomic_graph/schema_version")
+                        != Some(&serde_json::json!(1))
+                        || status != "closed"
+                        || !matches!(outcome.as_str(), Some("success" | "failure")))
+                {
+                    errors.push(format!(
+                        "line {} has invalid native terminal outcome",
+                        n + 1
+                    ));
                 }
                 if let Some(pinned) = v.get("pinned") {
                     match pinned.as_bool() {
@@ -1868,7 +1898,6 @@ async fn import_jsonl(
                         );
                     }
                 }
-                scrub_import_text(&mut v);
                 let normalized = serde_json::to_string(&v).map_err(db)?;
                 lines.push((v, normalized))
             }
@@ -1963,19 +1992,42 @@ async fn import_jsonl(
                 .and_then(|dep| json_str(dep, "depends_on_id"))
         });
         let due = import_date(&v, "due_at")?;
-        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at,imported_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(json_str(&v,"title").unwrap_or("")).bind(json_str(&v,"description").unwrap_or("")).bind(json_str(&v,"issue_type").unwrap_or("task")).bind(v.get("priority").and_then(serde_json::Value::as_i64).unwrap_or(2)).bind(status).bind(parent).bind("external").bind("bd").bind(created).bind(closed).bind(due).bind(&raw).execute(&mut *c).await.map_err(db)?;
+        if !dry_run {
+            let terminal_outcome = v
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .and_then(serde_json::Value::as_str);
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at,imported_json,terminal_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(&id)
+                .bind(json_str(&v, "title").unwrap_or(""))
+                .bind(json_str(&v, "description").unwrap_or(""))
+                .bind(json_str(&v, "issue_type").unwrap_or("task"))
+                .bind(v.get("priority").and_then(serde_json::Value::as_i64).unwrap_or(2))
+                .bind(status)
+                .bind(parent)
+                .bind("external")
+                .bind("bd")
+                .bind(created)
+                .bind(closed)
+                .bind(due)
+                .bind(&raw)
+                .bind(terminal_outcome)
+                .execute(&mut *c)
+                .await.map_err(db)?;
+        }
         report.added.push(id.clone());
         report.external += 1;
         if status == "in_progress" {
             report.in_progress += 1
         }
         if let Some(p) = parent {
-            sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)")
-                .bind(&id)
-                .bind(p)
-                .execute(&mut *c)
-                .await
-                .map_err(db)?;
+            if !dry_run {
+                sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)")
+                    .bind(&id)
+                    .bind(p)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(db)?;
+            }
             report.parents_set += 1
         }
         if let Some(deps) = v.get("dependencies").and_then(serde_json::Value::as_array) {
@@ -1983,13 +2035,15 @@ async fn import_jsonl(
             for dep in deps {
                 let target = json_str(dep, "depends_on_id").unwrap_or("");
                 let kind = json_str(dep, "type").unwrap_or("");
-                sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,?,?)")
-                    .bind(&id)
-                    .bind(kind)
-                    .bind(target)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(db)?;
+                if !dry_run {
+                    sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,?,?)")
+                        .bind(&id)
+                        .bind(kind)
+                        .bind(target)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(db)?;
+                }
                 if kind == "blocks" {
                     report.dependencies_added += 1
                 } else if kind != "parent-child" {
@@ -2004,20 +2058,11 @@ async fn import_jsonl(
         if let Some(text) = json_str(&v, "notes")
             && !text.trim().is_empty()
         {
-            notes.push((
-                "bd".to_owned(),
-                if text.contains("ghp_") {
-                    "[redacted]".to_owned()
-                } else {
-                    text.to_owned()
-                },
-            ))
+            notes.push(("bd".to_owned(), text.to_owned()))
         }
         if let Some(comments) = v.get("comments").and_then(serde_json::Value::as_array) {
             for comment in comments {
-                if let Some(text) = json_str(comment, "text")
-                    && !text.contains("ghp_")
-                {
+                if let Some(text) = json_str(comment, "text") {
                     notes.push((
                         format!("bd:{}", json_str(comment, "author").unwrap_or("unknown")),
                         text.to_owned(),
@@ -2026,14 +2071,16 @@ async fn import_jsonl(
             }
         }
         for (n, (author, text)) in notes.into_iter().enumerate() {
-            sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?, 'external')")
-                .bind(&id)
-                .bind(n as i64)
-                .bind(text)
-                .bind(author)
-                .execute(&mut *c)
-                .await
-                .map_err(db)?;
+            if !dry_run {
+                sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?, 'external')")
+                    .bind(&id)
+                    .bind(n as i64)
+                    .bind(text)
+                    .bind(author)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(db)?;
+            }
             report.notes_added += 1
         }
         for key in ["labels", "external_ref", "acceptance_criteria"] {
@@ -2042,7 +2089,21 @@ async fn import_jsonl(
             }
         }
     }
+    let mut preview_keys = std::collections::BTreeSet::new();
     for (key, value) in memories {
+        if dry_run {
+            if preview_keys.insert(key.clone())
+                && sqlx::query("SELECT 1 FROM atomic_graph_memories WHERE key=?")
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(db)?
+                    .is_none()
+            {
+                *report.kept.entry("memories".to_owned()).or_default() += 1;
+            }
+            continue;
+        }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO atomic_graph_memories (key,value,trust) VALUES (?,?,'external')",
         )
@@ -2100,6 +2161,19 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
                     meta.remove("atomic_graph");
                 }
             }
+        }
+        let outcome: Option<String> = row.try_get("terminal_outcome").map_err(db)?;
+        if let Some(outcome) = outcome {
+            if !value["metadata"]["atomic_graph"].is_object() {
+                value["metadata"]["atomic_graph"] = serde_json::json!({});
+            }
+            value["metadata"]["atomic_graph"]["schema_version"] = 1.into();
+            value["metadata"]["atomic_graph"]["terminal_outcome"] = outcome.into();
+        } else if let Some(marker) = value
+            .pointer_mut("/metadata/atomic_graph")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            marker.remove("terminal_outcome");
         }
         if !imported || value.get("created_at").is_none() {
             value["created_at"] = date_string(i.created_at).into();

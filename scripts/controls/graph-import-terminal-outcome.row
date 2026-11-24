@@ -1,0 +1,1 @@
+graph-import-terminal-outcome|crates/atomic-graph/src/sqlite.rs|.bind(terminal_outcome)|.bind(None::<&str>)|-p atomic-agentic-graph --test conformance -- sqlite_conditional_compensation_requires_persisted_terminal_failure

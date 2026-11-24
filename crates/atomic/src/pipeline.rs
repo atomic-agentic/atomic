@@ -4319,7 +4319,7 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                     Ok(outcome) => CriterionRecord::Known(outcome),
                     Err(error) => CriterionRecord::Known(CriterionOutcome {
                         passed: false,
-                        detail: error.to_string(),
+                        detail: error.diagnostic(),
                     }),
                 };
                 ctx.step(&name, move |_| async move { Ok(record) }).await?
@@ -4378,11 +4378,11 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                         let record = match result {
                             Ok(outcome) => CriterionRecord::Known(outcome),
                             Err(error) if error.outcome_unknown() => {
-                                CriterionRecord::Unknown(error.to_string())
+                                CriterionRecord::Unknown(error.diagnostic())
                             }
                             Err(error) => CriterionRecord::Known(CriterionOutcome {
                                 passed: false,
-                                detail: error.to_string(),
+                                detail: error.diagnostic(),
                             }),
                         };
                         Ok::<_, DurableError>(record)
@@ -4398,11 +4398,12 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                 return Ok(Some(format!(
                     "criterion {} failed: {}",
                     index + 1,
-                    outcome.detail
+                    atomic_core::redact::text(&outcome.detail)
                 )));
             }
             CriterionRecord::Known(_) => {}
             CriterionRecord::Unknown(detail) => {
+                let detail = atomic_core::redact::text(&detail);
                 *working = None;
                 atomic_durable::publication::park_criterion(
                     ctx,
