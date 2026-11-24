@@ -60,12 +60,12 @@ function fields(node) {
   });
 }
 
-// A diagnostic that names the authored file and line. Hosts format it; it is
+// A diagnostic that names the authored file and position. Hosts format it; it is
 // never a string the host has to parse.
 export class AtomDiagnostic extends Error {
-  constructor(message, file, line, diagnostics) {
+  constructor(message, file, line, diagnostics, column) {
     super(message);
-    this.file = file; this.line = line; this.diagnostics = diagnostics;
+    this.file = file; this.line = line; this.diagnostics = diagnostics; this.column = column;
   }
 }
 function lineOf(node) {
@@ -89,7 +89,7 @@ function relocate(unit, node, cause) {
   if (cause.sources) return cause;
   // A diagnostic from another file (an imported component) is already located.
   if (cause instanceof AtomDiagnostic && cause.file && (cause.line || cause.file !== unit?.file)) return cause;
-  return new AtomDiagnostic(cause.message ?? String(cause), cause.file ?? unit?.file, cause.line ?? lineOf(node), cause.diagnostics);
+  return new AtomDiagnostic(cause.message ?? String(cause), cause.file ?? unit?.file, cause.line ?? lineOf(node), cause.diagnostics, cause.column);
 }
 function located(unit, node, work) {
   try { return work(); } catch (cause) { throw relocate(unit, node, cause); }
@@ -278,7 +278,7 @@ export async function compile(file, options = {}) {
       throw cause;
     }
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
-    if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
+    if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line, undefined, parseError.location?.column);
     // Tags are the prompt's structure, and Astro accepts unbalanced ones
     // without a word: refused here, from Astro's own reading of them.
     const tagError = unbalanced(fenced, parsed.ast);

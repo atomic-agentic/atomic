@@ -642,7 +642,7 @@ pub const MISTAKES: &[Mistake] = &[
     Mistake {
         title: "A runtime global",
         wrong: Construct::body("", "", "{JSON.stringify(input)}"),
-        says: "unsupported expression: CallExpression",
+        says: "Cannot find name 'JSON'.",
         fix: "Interpolate the fields you need, `{input.text}`.",
     },
     Mistake {

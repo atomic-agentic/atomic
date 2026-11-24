@@ -30,6 +30,7 @@ function failure(error) {
   const body = { message: String(error?.message ?? error) };
   if (typeof error?.file === 'string') body.file = error.file;
   if (Number.isSafeInteger(error?.line) && error.line > 0) body.line = error.line;
+  if (Number.isSafeInteger(error?.column) && error.column > 0) body.column = error.column;
   if (Array.isArray(error?.diagnostics)) body.diagnostics = error.diagnostics;
   return { error: body };
 }

@@ -7,6 +7,7 @@ use oxc_allocator::Allocator;
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_parser::Parser;
+use oxc_semantic::{Semantic, SemanticBuilder, SemanticBuilderAstroExt};
 use oxc_span::{GetSpan, SourceType, Span};
 use serde_json::{Value, json};
 
@@ -165,6 +166,57 @@ struct Parts<'s, 'a> {
     children: Vec<Value>,
 }
 
+// The TypeScript checker currently misses some unbound references in Astro
+// interpolations. Resolve every reference in the authored template scope.
+struct TemplateIdentifiers<'s, 'a> {
+    source: &'s str,
+    semantic: &'s Semantic<'a>,
+    unbound: Vec<(String, Span)>,
+    expression_depth: usize,
+    slot_call_depth: usize,
+    fragment_tag_spans: Vec<Span>,
+}
+
+impl<'a> Visit<'a> for TemplateIdentifiers<'_, 'a> {
+    fn visit_jsx_element(&mut self, node: &JSXElement<'a>) {
+        if node.opening_element.name.span().source_text(self.source) == "Fragment" {
+            self.fragment_tag_spans
+                .push(node.opening_element.name.span());
+            if let Some(closing) = &node.closing_element {
+                self.fragment_tag_spans.push(closing.name.span());
+            }
+        }
+        oxc_ast_visit::walk::walk_jsx_element(self, node);
+    }
+
+    fn visit_jsx_expression_container(&mut self, node: &JSXExpressionContainer<'a>) {
+        self.expression_depth += 1;
+        oxc_ast_visit::walk::walk_jsx_expression_container(self, node);
+        self.expression_depth -= 1;
+    }
+
+    fn visit_call_expression(&mut self, node: &CallExpression<'a>) {
+        let slot_call = self.expression_depth > 0
+            && node.callee.span().source_text(self.source) == "Astro.slots.has";
+        self.slot_call_depth += usize::from(slot_call);
+        oxc_ast_visit::walk::walk_call_expression(self, node);
+        self.slot_call_depth -= usize::from(slot_call);
+    }
+
+    fn visit_identifier_reference(&mut self, id: &IdentifierReference<'a>) {
+        if self.expression_depth > 0
+            && !(id.name.as_str() == "Astro" && self.slot_call_depth > 0)
+            && !(id.name.as_str() == "Fragment" && self.fragment_tag_spans.contains(&id.span))
+            && id
+                .reference_id
+                .get()
+                .is_some_and(|reference| !self.semantic.scoping().has_binding(reference))
+        {
+            self.unbound.push((id.name.to_string(), id.span));
+        }
+    }
+}
+
 impl Parts<'_, '_> {
     fn text_to(&mut self, end: u32) {
         if self.cursor < end {
@@ -201,6 +253,61 @@ pub(super) fn parse(text: &str) -> Value {
         })
         .collect();
     let root = parsed.root;
+    if diagnostics.is_empty() {
+        let mut preceding_content = false;
+        for node in &root.body {
+            match node {
+                JSXChild::Text(value) => {
+                    preceding_content |= !source.slice(value.span).trim().is_empty();
+                }
+                JSXChild::ExpressionContainer(_) => preceding_content = true,
+                JSXChild::Element(element) if preceding_content => {
+                    let name = source.slice(element.opening_element.name.span());
+                    let named_slot = name == "slot"
+                        && element.opening_element.attributes.iter().any(|item| {
+                            matches!(item, JSXAttributeItem::Attribute(attribute)
+                                if source.slice(attribute.name.span()) == "name"
+                                    && matches!(&attribute.value,
+                                        Some(JSXAttributeValue::StringLiteral(value)) if !value.value.is_empty()))
+                        });
+                    if ["slot", "template", "noscript", "frameset"].contains(&name)
+                        && !named_slot
+                        && element.children.iter().any(|child| {
+                            matches!(child, JSXChild::Text(value) if !source.slice(value.span).trim().is_empty())
+                        })
+                        && let Some(closing) = &element.closing_element
+                    {
+                        let line = source.point(closing.span.start)["line"].as_u64().unwrap_or(1);
+                        diagnostics.push(json!({
+                            "severity": 1,
+                            "text": format!("<{name}> is closed on line {line}, but Astro does not read that `</{name}>` as its end; close it in the same expression it opens in, and put no text or expression before an element Astro moves, such as <slot>, <head> or <template>"),
+                            "location": source.point(closing.span.start)
+                        }));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if diagnostics.is_empty() {
+        let comments = oxc_allocator::Vec::new_in(&arena);
+        let bound = SemanticBuilder::new().build_astro(&root, text, &comments);
+        let mut identifiers = TemplateIdentifiers {
+            source: text,
+            semantic: &bound.semantic,
+            unbound: Vec::new(),
+            expression_depth: 0,
+            slot_call_depth: 0,
+            fragment_tag_spans: Vec::new(),
+        };
+        for node in &root.body {
+            identifiers.visit_jsx_child(node);
+        }
+        diagnostics.extend(identifiers.unbound.into_iter().map(|(name, span)| {
+            json!({"severity":1,"text":format!("TS2304: Cannot find name '{name}'."),"location":source.point(span.start)})
+        }));
+    }
     let frontmatter = root.frontmatter.as_ref().filter(|fm| !fm.span.is_empty());
     let consumed = root
         .body
@@ -280,6 +387,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bare_template_identifiers_resolve_against_frontmatter() {
+        let valid = parse("---\nconst placeholder = 'value';\n---\n{placeholder}");
+        assert_eq!(valid["diagnostics"], json!([]));
+        let invalid =
+            parse("---\nconst named = 'value';\n---\nReply with {placeholder} filled in.");
+        assert_eq!(
+            invalid["diagnostics"][0]["text"],
+            "TS2304: Cannot find name 'placeholder'."
+        );
+        assert_eq!(invalid["diagnostics"][0]["location"]["line"], 4);
+    }
+
+    #[test]
+    fn compound_template_references_use_authored_scope_and_utf16_columns() {
+        for body in ["🙂 {missing.value}", "🙂 {missing + 1}"] {
+            let result = parse(&format!("---\nconst local = {{ value: 2 }};\n---\n{body}"));
+            assert_eq!(
+                result["diagnostics"][0]["text"],
+                "TS2304: Cannot find name 'missing'."
+            );
+            assert_eq!(result["diagnostics"][0]["location"]["line"], 4);
+            assert_eq!(result["diagnostics"][0]["location"]["column"], 5);
+        }
+        let valid = parse("---\nconst local = { value: 2 };\n---\n{local.value + 1}");
+        assert_eq!(valid["diagnostics"], json!([]));
+        let slots = parse("---\n---\n{Astro.slots.has('policy')}");
+        assert_eq!(slots["diagnostics"], json!([]));
+        let fragment =
+            parse("---\nconst flag = true;\n---\n{flag ? <Fragment>hi</Fragment> : null}");
+        assert_eq!(fragment["diagnostics"], json!([]));
+        let bare_fragment = parse("---\n---\n{Fragment}");
+        assert_eq!(
+            bare_fragment["diagnostics"][0]["text"],
+            "TS2304: Cannot find name 'Fragment'."
+        );
+    }
+
+    #[test]
+    fn tricky_attribute_quotes_keep_the_following_element_in_place() {
+        let result = parse("<Note title={`a \\`b`} />\n<section>x</section>");
+        assert_eq!(result["diagnostics"], json!([]));
+        assert_eq!(result["ast"]["children"][0]["name"], "Note");
+        assert_eq!(result["ast"]["children"][2]["name"], "section");
+    }
+
+    #[test]
     fn unconsumed_source_is_a_located_parse_error() {
         let result = parse("Hello\n<étiquette>lost</étiquette>");
         assert_eq!(result["ast"]["children"], json!([]));
@@ -289,12 +442,15 @@ mod tests {
 
     #[test]
     fn jsx_in_an_expression_keeps_authored_text_and_unicode_positions() {
-        let result = parse("😀{items.map(x => <Note>{x}</Note>)}");
+        let frontmatter = "---\nconst items = ['x'];\nconst Note = null;\n---\n";
+        let result = parse(&format!(
+            "{frontmatter}😀{{items.map(x => <Note>{{x}}</Note>)}}"
+        ));
         assert_eq!(result["diagnostics"], json!([]));
-        let expression = &result["ast"]["children"][1];
+        let expression = &result["ast"]["children"][2];
         assert_eq!(
             expression["position"]["start"],
-            json!({"offset":4,"line":1,"column":3})
+            json!({"offset":frontmatter.len()+4,"line":5,"column":3})
         );
         let parts = &expression["children"];
         assert_eq!(parts[0]["value"], "items.map(x => ");
