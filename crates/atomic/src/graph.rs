@@ -336,9 +336,6 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
         bail!("work-graph commands currently require a SQLite project store");
     }
     let path = state.database();
-    // Keep the CLI's normal refusal of a store written by a newer atomic.
-    // This runs only after the configured database was shown to be SQLite.
-    atomic_durable::store::open_sqlite(&path).await?;
     let privileged = match &command {
         GraphCommand::Policy { action } => policy_write(action),
         GraphCommand::Criteria { action } => criteria_write(action),
@@ -361,7 +358,7 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             crate::gates::operator_credential(state)?,
         )
     } else {
-        SqliteStore::open(&path, SystemTime::now)
+        SqliteStore::open_for_inspection(&path).await
     }
     .with_context(|| format!("open the work graph at {}", path.display()))?;
     let actor = if privileged {

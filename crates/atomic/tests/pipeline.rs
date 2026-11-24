@@ -6070,6 +6070,17 @@ fn non_worktree_test_criterion_runs_in_a_worktree_workflow() {
             "steps:\n  read:\n    atom: read-note\n    with: {text: input.text}\n    criteria:\n      - {kind: test, argv: [/usr/bin/false], timeout_ms: 1000}\n  code:\n    after: [read]\n",
         );
         assert_ne!(source, SELF_REVIEW_WORKFLOW);
+        use std::os::unix::fs::PermissionsExt;
+        let marker = format!("sk-proj-{}", "B".repeat(48));
+        let program = dir.join("failing-check");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho 'check failed: {marker}' >&2\nexit 1\n"),
+        )
+        .expect("write criterion");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make criterion executable");
+        let source = source.replace("/usr/bin/false", program.to_str().expect("fixture path"));
         let pipeline = load(&project, "mixed-criteria.workflow.yaml", &source);
         let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(READ.into())])
             .await
@@ -6093,6 +6104,27 @@ fn non_worktree_test_criterion_runs_in_a_worktree_workflow() {
         assert!(error.contains("criteria still fail"), "{error}");
         assert!(!error.contains("host-recorded candidate commit"), "{error}");
         assert_eq!(model.calls(), 2, "coding atom was not called");
+        let steps = rt
+            .steps("mixed-criteria")
+            .await
+            .expect("criterion checkpoints");
+        let checkpoint = steps
+            .iter()
+            .find(|step| step.name == "read.criteria.0.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("first criterion output")
+            .to_string();
+        let repair = model.requests()[1].to_string();
+        for diagnostic in [&checkpoint, &repair, &error] {
+            assert!(
+                diagnostic.contains("check failed: [REDACTED]"),
+                "missing redacted diagnostic"
+            );
+            assert!(
+                !diagnostic.contains(&marker),
+                "raw credential in diagnostic"
+            );
+        }
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
@@ -6124,7 +6156,7 @@ fn unknown_test_criterion_release_terminalizes_without_running_the_effect_again(
                 program: command.program.clone(),
                 code: None,
                 message: "lost after dispatch".into(),
-                stderr: String::new(),
+                stderr: format!("runner log: sk-proj-{}", "K".repeat(48)),
             })
         }
         fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
@@ -6185,6 +6217,24 @@ fn unknown_test_criterion_release_terminalizes_without_running_the_effect_again(
             .expect_err("release terminalizes unknown outcome")
             .to_string();
         assert!(error.contains("outcome unknown"), "{error}");
+        let steps = rt
+            .steps("criterion-unknown")
+            .await
+            .expect("steps after release");
+        let record = steps
+            .iter()
+            .find(|s| s.name == "read.criteria.0.0")
+            .and_then(|s| s.output.as_ref())
+            .expect("unknown criterion record")
+            .to_string();
+        let marker = format!("sk-proj-{}", "K".repeat(48));
+        for diagnostic in [&record, &error] {
+            assert!(
+                diagnostic.contains("runner log: [REDACTED]"),
+                "missing runner diagnostic"
+            );
+            assert!(!diagnostic.contains(&marker), "raw runner credential");
+        }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(model.calls(), 1, "no repair or reviewer runs");
         rt.shutdown(std::time::Duration::from_secs(5))

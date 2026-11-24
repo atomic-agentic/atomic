@@ -1,0 +1,1 @@
+graph-export-terminal-outcome|crates/atomic-graph/src/sqlite.rs|value["metadata"]["atomic_graph"]["terminal_outcome"] = outcome.into();|let _ = outcome;|-p atomic-agentic-graph --test conformance -- sqlite_conditional_compensation_requires_persisted_terminal_failure

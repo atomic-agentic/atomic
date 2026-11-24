@@ -270,12 +270,12 @@ pub trait Confine: Send + Sync {
         Ok((self.confine(command, tmp)?, None))
     }
 
-    /// Check, once, that commands can be confined here at all, so a machine
-    /// that cannot confine them fails at connect with a reason rather than
-    /// in every command.
-    fn check(&self, tmp: &std::path::Path) -> Result<(), ExecError> {
-        let _ = tmp;
-        Ok(())
+    /// Verify that commands can be confined on this machine. The backend
+    /// caches a successful check for this confinement implementation.
+    fn check(&self, _tmp: &std::path::Path) -> Result<(), ExecError> {
+        Err(ExecError::Unconfinable {
+            message: "backend provides no confinement check".into(),
+        })
     }
 }
 
@@ -399,6 +399,12 @@ pub enum ExecError {
 }
 
 impl ExecError {
+    fn criterion_unconfined() -> Self {
+        Self::Unconfinable {
+            message: "executable criteria require a confined backend".into(),
+        }
+    }
+
     /// Whether the command may have run although no result came back, so
     /// running it again could repeat what it did. Only the caller, which
     /// knows what the command declares about its effects, may decide to.
@@ -425,6 +431,12 @@ pub trait ExecutionBackend: Send + Sync {
     /// nonzero exit is a [`Completed`] with that code, not an error: the
     /// caller decides what it means.
     fn run(&self, command: &Command) -> Result<Completed, ExecError>;
+
+    /// Verify confinement and supply the scratch exclusions for an executable
+    /// criterion in a host-prepared directory. Backends must explicitly support it.
+    fn criterion_exclusions(&self, _cwd: &std::path::Path) -> Result<Vec<PathBuf>, ExecError> {
+        Err(ExecError::criterion_unconfined())
+    }
 
     /// Release `workspace`. Closing one that is closed already succeeds.
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError>;
@@ -508,6 +520,10 @@ impl ExecutionBackend for Backend {
 
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
         self.inner.run(command)
+    }
+
+    fn criterion_exclusions(&self, cwd: &std::path::Path) -> Result<Vec<PathBuf>, ExecError> {
+        self.inner.criterion_exclusions(cwd)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
@@ -601,6 +617,7 @@ impl LocalBackend {
     /// The same backend, running every command under `confine`.
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Self {
         self.confine = Some(confine);
+        self.checked = Arc::default();
         self
     }
 
@@ -612,6 +629,29 @@ impl LocalBackend {
             Some(confine) => confine.confine_held(command, &self.tmp),
             None => Ok((command.clone(), None)),
         }
+    }
+
+    fn verify_confinement(&self, confine: &dyn Confine, label: &str) -> Result<(), ExecError> {
+        if self.checked.get().is_some() {
+            return Ok(());
+        }
+        workspace::ensure_private(&self.tmp).map_err(|e| {
+            let message = format!("create {}: {e}", self.tmp.display());
+            if workspace::transient(&e) {
+                ExecError::Unavailable {
+                    label: label.to_owned(),
+                    message,
+                }
+            } else {
+                ExecError::Workspace {
+                    label: label.to_owned(),
+                    message,
+                }
+            }
+        })?;
+        confine.check(&self.tmp)?;
+        let _ = self.checked.set(());
+        Ok(())
     }
 
     /// Where it keeps its scratch directories.
@@ -697,27 +737,28 @@ impl ExecutionBackend for LocalBackend {
     /// cannot confine commands at all. Only a check that passed is kept. A
     /// workspace with no files, such as a lite atom's, needs no check.
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        if let (Some(confine), Some(_)) = (&self.confine, &request.source)
-            && self.checked.get().is_none()
-        {
-            workspace::ensure_private(&self.tmp).map_err(|e| {
-                let message = format!("create {}: {e}", self.tmp.display());
-                if workspace::transient(&e) {
-                    ExecError::Unavailable {
-                        label: request.label.clone(),
-                        message,
-                    }
-                } else {
-                    ExecError::Workspace {
-                        label: request.label.clone(),
-                        message,
-                    }
-                }
-            })?;
-            confine.check(&self.tmp)?;
-            let _ = self.checked.set(());
+        if let (Some(confine), Some(_)) = (&self.confine, &request.source) {
+            self.verify_confinement(confine.as_ref(), &request.label)?;
         }
         workspace::open_local(&self.scratch_root, &self.tmp, &self.denying, request)
+    }
+
+    fn criterion_exclusions(&self, cwd: &std::path::Path) -> Result<Vec<PathBuf>, ExecError> {
+        let Some(confine) = self.confine.as_deref() else {
+            return Err(ExecError::criterion_unconfined());
+        };
+        self.verify_confinement(confine, "criterion")?;
+        let fail = |message| ExecError::Workspace {
+            label: "criterion".into(),
+            message,
+        };
+        workspace::command_exclusions(
+            &self.scratch_root,
+            &self.denying,
+            &[cwd.to_owned()],
+            &fail,
+            &|what, error| fail(format!("{what}: {error}")),
+        )
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {

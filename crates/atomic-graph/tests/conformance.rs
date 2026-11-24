@@ -4403,6 +4403,74 @@ fn sqlite_conditional_compensation_requires_persisted_terminal_failure() {
                 .iter()
                 .any(|item| item.id == "on-success" || item.id == "on-unknown")
         );
+        let restored_path = path.with_extension("restored.sqlite");
+        let _ = std::fs::remove_file(&restored_path);
+        let restored = sqlite_authorized_for_tests(&restored_path, std::time::SystemTime::now)
+            .expect("restored graph");
+        let export = reopened
+            .export(human.clone())
+            .await
+            .expect("export closed prerequisites");
+        restored
+            .import(human.clone(), export, false)
+            .await
+            .expect("restore closed prerequisites");
+        let restored_ready = restored
+            .ready(human.clone(), 20)
+            .await
+            .expect("ready after import");
+        assert_eq!(
+            restored_ready.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            ready.iter().map(|i| &i.id).collect::<Vec<_>>()
+        );
+        for (status, version, outcome) in [
+            ("open", 1, "failure"),
+            ("closed", 2, "failure"),
+            ("closed", 1, "retry"),
+        ] {
+            let bad = serde_json::json!({"id":"bad","title":"bad","status":status,
+                "metadata":{"atomic_graph":{"schema_version":version,"terminal_outcome":outcome}}});
+            assert!(
+                matches!(restored.import(human.clone(), bad.to_string(), false).await,
+                Err(StoreError::ImportRefused(errors)) if errors.iter().any(|e| e.contains("invalid native terminal outcome")))
+            );
+        }
+        restored
+            .set_status(human.clone(), "failure".into(), Status::Open)
+            .await
+            .expect("reopen imported failure");
+        let export = restored
+            .export(human.clone())
+            .await
+            .expect("export reopened item");
+        let entries: Vec<serde_json::Value> = export
+            .lines()
+            .map(|s| serde_json::from_str(s).expect("exported JSON"))
+            .collect();
+        let item = |id: &str| {
+            entries
+                .iter()
+                .find(|v| v["id"] == id)
+                .expect("exported item")
+        };
+        assert!(
+            item("failure")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .is_none()
+        );
+        assert_eq!(
+            item("success")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .and_then(|v| v.as_str()),
+            Some("success")
+        );
+        assert!(
+            item("unknown")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .is_none()
+        );
+        drop(restored);
+        std::fs::remove_file(restored_path).expect("remove restored database");
         assert!(
             reopened
                 .claim(

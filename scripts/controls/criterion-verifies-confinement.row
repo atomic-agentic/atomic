@@ -1,0 +1,1 @@
+criterion-verifies-confinement|crates/atomic-exec/src/lib.rs|self.verify_confinement(confine, "criterion")?;|let _ = confine;|-p atomic-agentic --features sandbox-tests --test exec_scratch -- executable_criteria_isolate_other_projects_scratch_on_both_runners

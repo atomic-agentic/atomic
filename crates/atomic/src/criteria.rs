@@ -37,6 +37,11 @@ pub enum CriterionError {
 }
 
 impl CriterionError {
+    /// A runner error can include captured stderr, including when its outcome is unknown.
+    pub(crate) fn diagnostic(&self) -> String {
+        atomic_core::redact::bounded(&self.to_string(), 4096)
+    }
+
     /// Whether the command may have run although its result was not returned.
     pub fn outcome_unknown(&self) -> bool {
         matches!(self, Self::Runner(error) if error.outcome_unknown())
@@ -85,7 +90,8 @@ pub fn evaluate(
             let (program, args) = argv
                 .split_first()
                 .ok_or_else(|| CriterionError::Declaration("test argv is empty".into()))?;
-            let command = confined_command(program, args.to_vec(), cwd, *timeout_ms, vec![])?;
+            let command =
+                confined_command(backend, program, args.to_vec(), cwd, *timeout_ms, vec![])?;
             let completed = backend.run(&command)?;
             Ok(CriterionOutcome {
                 passed: completed.success(),
@@ -123,8 +129,14 @@ pub fn evaluate(
                 args.push("--head".into());
             }
             args.push(url.clone());
-            let command =
-                confined_command("curl", args, cwd, *timeout_ms, vec![allowed_host.clone()])?;
+            let command = confined_command(
+                backend,
+                "curl",
+                args,
+                cwd,
+                *timeout_ms,
+                vec![allowed_host.clone()],
+            )?;
             let completed = backend.run(&command)?;
             let actual = std::str::from_utf8(&completed.stdout)
                 .ok()
@@ -142,6 +154,7 @@ pub fn evaluate(
 }
 
 fn confined_command(
+    backend: &dyn ExecutionBackend,
     program: &str,
     args: Vec<String>,
     cwd: &Path,
@@ -166,14 +179,13 @@ fn confined_command(
         writable: vec![cwd.to_owned()],
         read_only: Vec::new(),
         network,
-        denied: Vec::new(),
+        denied: backend.criterion_exclusions(cwd)?,
         secret_env: Default::default(),
     })
 }
 
 fn bounded_message(bytes: &[u8]) -> String {
-    let end = bytes.len().min(4096);
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
+    atomic_core::redact::excerpt(&String::from_utf8_lossy(bytes), 4096)
 }
 
 #[cfg(test)]
@@ -200,6 +212,9 @@ mod tests {
                 .expect("test command log lock")
                 .push(command.clone());
             self.result.clone()
+        }
+        fn criterion_exclusions(&self, _: &Path) -> Result<Vec<std::path::PathBuf>, ExecError> {
+            Ok(Vec::new())
         }
         fn close(&self, _: &Workspace) -> Result<(), ExecError> {
             panic!("not used")
@@ -263,6 +278,45 @@ mod tests {
         );
         assert_eq!(commands[1].network, ["health.example.test"]);
         assert_eq!(commands[1].time_limit, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn unconfined_backends_refuse_executable_criteria_before_dispatch() {
+        let cwd = std::env::temp_dir();
+        let local = atomic_exec::LocalBackend::default();
+        let process = atomic_exec::runner::ProcessRunner::atomic(cwd.join("nonexistent-runner"));
+        for backend in [&local as &dyn ExecutionBackend, &process] {
+            for criterion in [
+                Criterion::Test {
+                    argv: vec!["true".into()],
+                    timeout_ms: 1000,
+                },
+                Criterion::Http {
+                    method: "GET".into(),
+                    url: "https://127.0.0.1/".into(),
+                    allowed_host: "127.0.0.1".into(),
+                    status: 200,
+                    timeout_ms: 1000,
+                },
+            ] {
+                assert!(matches!(evaluate(&criterion, backend, &cwd, &[]),
+                    Err(CriterionError::Runner(ExecError::Unconfinable { message })) if message.contains("confined backend")));
+            }
+            for criterion in [
+                Criterion::Text {
+                    text: "review".into(),
+                },
+                Criterion::Cel {
+                    expr: "true".into(),
+                },
+            ] {
+                assert!(
+                    evaluate(&criterion, backend, &cwd, &[])
+                        .expect("pure criterion")
+                        .passed
+                );
+            }
+        }
     }
 
     #[test]

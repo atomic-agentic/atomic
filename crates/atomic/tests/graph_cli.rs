@@ -1227,3 +1227,211 @@ fn has_atomic_database(dir: &Path) -> bool {
     }
     false
 }
+
+#[test]
+fn import_redacts_provider_credentials_in_stored_rows_and_exports() {
+    let fixture = Fixture::new("import-redaction");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let pat = format!("github_pat_{}", "a".repeat(40));
+    let api_key = format!("sk-proj-{}", "b".repeat(40));
+    let item = json!({"id":"review","title":"Example","status":"open","description": format!("credential {pat}"),"comments":[{"author":"reviewer","text":format!("credential {api_key}")}]});
+    let memory = json!({"_type":"memory","key":"review-note","value":format!("credential {pat}")});
+    success(&fixture.run_stdin(
+        &project,
+        &["graph", "import", "-"],
+        &format!("{item}\n{memory}\n"),
+    ));
+    let output = success(&fixture.run(&project, &["graph", "export"]));
+    let db = fixture.database(&project);
+    let stored = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime").block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect_with(&sqlx::sqlite::SqliteConnectOptions::new().filename(db).read_only(true)).await.expect("read database");
+        sqlx::query_scalar::<_,String>("SELECT body FROM atomic_graph_items UNION ALL SELECT imported_json FROM atomic_graph_items UNION ALL SELECT text FROM atomic_graph_notes UNION ALL SELECT value FROM atomic_graph_memories")
+            .fetch_all(&mut conn).await.expect("query stored text")
+    });
+    assert_eq!(stored.len(), 4);
+    for text in stored.iter().chain([&output]) {
+        assert!(
+            text.contains("credential "),
+            "surrounding prose lost: {text}"
+        );
+        assert!(
+            !text.contains(&pat) && !text.contains(&api_key),
+            "stored a credential"
+        );
+    }
+}
+
+#[test]
+fn inspection_from_the_cli_leaves_a_missing_database_missing() {
+    let fixture = Fixture::new("inspection");
+    let project = fixture.project("project");
+    assert_eq!(success(&fixture.run(&project, &["graph", "export"])), "");
+    let report: Value = serde_json::from_str(&success(&fixture.run_stdin(
+        &project,
+        &["--json", "graph", "import", "--dry-run", "-"],
+        EXPORT,
+    )))
+    .expect("dry run report");
+    assert_eq!(report["added"], json!(["bd-epic", "bd-child"]));
+    assert!(
+        !has_atomic_database(&fixture.root),
+        "inspection created a database"
+    );
+}
+
+#[test]
+fn inspection_works_while_another_connection_holds_the_write_lock() {
+    use sqlx::{Connection, SqliteConnection};
+    let fixture = Fixture::new("inspection-lock");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let options =
+            sqlx::sqlite::SqliteConnectOptions::new().filename(fixture.database(&project));
+        let mut writer = SqliteConnection::connect_with(&options)
+            .await
+            .expect("open writer");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .expect("hold write lock");
+        assert_eq!(success(&fixture.run(&project, &["graph", "export"])), "");
+        let report: Value = serde_json::from_str(&success(&fixture.run_stdin(
+            &project,
+            &["--json", "graph", "import", "--dry-run", "-"],
+            EXPORT,
+        )))
+        .expect("preview");
+        assert_eq!(report["added"], json!(["bd-epic", "bd-child"]));
+        sqlx::query("ROLLBACK")
+            .execute(&mut writer)
+            .await
+            .expect("release write lock");
+        assert_eq!(success(&fixture.run(&project, &["graph", "export"])), "");
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_refuses_a_database_symlink_loop() {
+    let fixture = Fixture::new("inspection-loop");
+    let project = fixture.project("project");
+    success(&fixture.run(&project, &["graph", "export"]));
+    let db = fixture.database(&project);
+    std::os::unix::fs::symlink(&db, &db).expect("loop at database path");
+    let output = fixture.run(&project, &["graph", "export"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 diagnostic");
+    assert!(
+        stderr.contains("unable to open database file")
+            || stderr.contains("Too many levels of symbolic links"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn goals_inspection_leaves_missing_and_older_databases_untouched() {
+    use sqlx::SqliteConnection;
+    let fixture = Fixture::new("goal-inspection");
+    let project = fixture.project("project");
+    let inspect = || {
+        assert_eq!(
+            success(&fixture.run(&project, &["--json", "goals", "list"])).trim(),
+            "[]"
+        );
+        let show = fixture.run(&project, &["goals", "show", "unknown"]);
+        assert!(!show.status.success());
+        assert!(
+            String::from_utf8(show.stderr)
+                .expect("diagnostic")
+                .contains("is not a registered goal")
+        );
+    };
+    inspect();
+    let path = fixture.database(&project);
+    assert!(!path.try_exists().expect("check missing database"));
+    // Version zero, with existing application data and no atomic tables.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create fixture");
+        sqlx::query("CREATE TABLE legacy_data (value TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("legacy table");
+        conn.close().await.expect("close fixture");
+    });
+    let before = std::fs::read(&path).expect("legacy bytes");
+    let mut permissions = std::fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&path, permissions).expect("read-only store");
+    inspect();
+    assert_eq!(std::fs::read(path).expect("inspected bytes"), before);
+}
+
+#[test]
+fn operator_restores_an_imported_goal_from_yaml_with_its_children() {
+    let fixture = Fixture::new("goal-restore");
+    let source = fixture.project("source");
+    let destination = fixture.project("destination");
+    let yaml = "title: Registered goal\nbudget: { period: day, tokens: 80, runs: 3 }\n";
+    for project in [&source, &destination] {
+        fixture.enroll(project);
+        std::fs::create_dir(project.join("goals")).expect("goal directory");
+        std::fs::write(project.join("goals/review.goal.yaml"), yaml).expect("operator definition");
+    }
+    success(&fixture.run(&source, &["goals", "add", "review"]));
+    success(&fixture.run(&source, &["graph", "create", "Check", "--id", "child"]));
+    success(&fixture.run(
+        &source,
+        &["graph", "link", "child", "parent-child", "goal-review"],
+    ));
+    let exported = success(&fixture.run(&source, &["graph", "export"]));
+    success(&fixture.run_stdin(
+        &destination,
+        &["graph", "import", "-"],
+        &exported.replace("Registered goal", "Imported title"),
+    ));
+    assert_eq!(
+        success(&fixture.run(&destination, &["--json", "goals", "list"])).trim(),
+        "[]"
+    );
+    success(&fixture.run(&destination, &["goals", "add", "review"]));
+    let brief: Value = serde_json::from_str(&success(
+        &fixture.run(&destination, &["--json", "goals", "show", "review"]),
+    ))
+    .expect("goal brief");
+    assert_eq!(brief["open_children"][0]["id"], "child");
+    assert_eq!(brief["definition"]["title"], "Registered goal");
+    let listed: Value = serde_json::from_str(&success(
+        &fixture.run(&destination, &["--json", "goals", "list"]),
+    ))
+    .expect("list");
+    assert_eq!(listed[0]["title"], "Registered goal");
+    assert_eq!(listed[0]["active"], true);
+    // An imported ordinary task that occupies another goal's name is never adopted.
+    let task =
+        json!({"id":"goal-conflict","title":"Other task","status":"open","issue_type":"task"});
+    success(&fixture.run_stdin(&destination, &["graph", "import", "-"], &task.to_string()));
+    std::fs::write(destination.join("goals/conflict.goal.yaml"), yaml)
+        .expect("conflicting definition");
+    let collision = fixture.run(&destination, &["goals", "add", "conflict"]);
+    assert!(!collision.status.success());
+    assert!(
+        String::from_utf8(collision.stderr)
+            .expect("diagnostic")
+            .contains("already names another graph item")
+    );
+}

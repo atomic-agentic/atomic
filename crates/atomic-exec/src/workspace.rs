@@ -300,6 +300,29 @@ fn started(pid: u32) -> Option<u64> {
     }
 }
 
+/// The same scratch exclusions apply to commands run in an atom workspace
+/// and to executable criteria run in a host-prepared candidate directory.
+pub(crate) fn command_exclusions(
+    scratch_root: &Path,
+    denying: &[PathBuf],
+    writable: &[PathBuf],
+    fail: &dyn Fn(String) -> ExecError,
+    failed: &dyn Fn(&str, std::io::Error) -> ExecError,
+) -> Result<Vec<PathBuf>, ExecError> {
+    let mut denied = vec![scratch_root.to_owned()];
+    for dir in denying {
+        if !denied.contains(dir) {
+            denied.push(dir.clone());
+        }
+    }
+    for root in &denied {
+        check_outside(root, writable).map_err(fail)?;
+        check_not_within(root, writable).map_err(fail)?;
+    }
+    make_denied(&denied[1..], failed)?;
+    Ok(outermost(&denied))
+}
+
 /// Open `request` on this machine, keeping scratch directories under
 /// `scratch_root` and sharing `tmp` with every other turn of the backend:
 /// the source directory is the root, as it is; a fresh
@@ -327,20 +350,13 @@ pub(crate) fn open_local(
             fail(message)
         }
     };
-    // Its own scratch root, then the others it is told to deny.
-    let mut denied = vec![scratch_root.to_owned()];
-    for dir in denying {
-        if !denied.contains(dir) {
-            denied.push(dir.clone());
-        }
-    }
     let Some(source) = &request.source else {
-        make_denied(&denied[1..], &failed)?;
+        let denied = command_exclusions(scratch_root, denying, &[], &fail, &failed)?;
         return Ok(Workspace {
             label: request.label.clone(),
             sandbox: request.sandbox,
             env: request.env.clone(),
-            denied: outermost(&denied),
+            denied,
             ..Workspace::default()
         });
     };
@@ -350,13 +366,7 @@ pub(crate) fn open_local(
     let writable: Vec<PathBuf> = std::iter::once(source.clone())
         .chain(request.writable_roots.iter().cloned())
         .collect();
-    // No denied root may lie in a writable root, which would cover it, nor a
-    // writable root in a denied one, where Codex's sandbox would reopen it.
-    for root in &denied {
-        check_outside(root, &writable).map_err(fail)?;
-        check_not_within(root, &writable).map_err(fail)?;
-    }
-    make_denied(&denied[1..], &failed)?;
+    let denied = command_exclusions(scratch_root, denying, &writable, &fail, &failed)?;
     private_dir(scratch_root).map_err(|e| failed("create the scratch directories' parent", e))?;
     let tmp = tmp.to_owned();
     private_dir(&tmp).map_err(|e| failed("create the shared temporary directory", e))?;
@@ -406,7 +416,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
-        denied: outermost(&denied),
+        denied,
     })
 }
 

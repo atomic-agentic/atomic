@@ -1,0 +1,1 @@
+goal-restore-item|crates/atomic-graph/src/sqlite/goals.rs|WHERE kind='goal' AND status='pinned' AND trust='external' AND imported_json IS NOT NULL|WHERE true|-p atomic-agentic --test graph_cli -- operator_restores_an_imported_goal_from_yaml_with_its_children

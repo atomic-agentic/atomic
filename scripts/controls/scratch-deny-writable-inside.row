@@ -1,1 +1,1 @@
-scratch-deny-writable-inside|crates/atomic-exec/src/workspace.rs|        check_not_within(root, &writable).map_err(fail)?;|        let _ = check_not_within; // CONTROL_OFF|-p atomic-agentic-exec --lib a_writable_root_in_a_denied_directory_is_refused
+scratch-deny-writable-inside|crates/atomic-exec/src/workspace.rs|        check_not_within(root, writable).map_err(fail)?;|        let _ = check_not_within; // CONTROL_OFF|-p atomic-agentic-exec --lib a_writable_root_in_a_denied_directory_is_refused
