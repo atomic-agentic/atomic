@@ -27,6 +27,7 @@ ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, no known vulnerability; via starlark; remove when Codex drops it" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability; via serde_yaml in Codex's skills and plugins; atomic reads YAML with its own restricted loader; remove when Codex drops serde_yaml" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash: unmaintained, no known vulnerability; via starlark and bm25 in Codex; remove when Codex drops it" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2: unmaintained, no known vulnerability or safe upgrade; via tsz-core in the native TypeScript checker; remove when tsz-core replaces it" },
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },

@@ -105,8 +105,8 @@ fn memory_and_time_outside_the_heap_are_bounded() {
 // the memory it uses (see `child_memory`). The host is given a limit far
 // below the call's own here, on every platform, so that a host that does
 // not hold it lets the call run to its deadline. The memory is ArrayBuffer
-// contents within the call's own budget, and is filled: memory not written
-// to is not in use.
+// contents within the call's own budget, with one byte per page written so
+// the footprint counts it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn memory_a_call_uses_past_its_limit_is_refused_by_the_host() {
@@ -116,7 +116,11 @@ fn memory_a_call_uses_past_its_limit_is_refused_by_the_host() {
             ENTRY.to_owned(),
             "export const probe = (megabytes, spin) => { \
                const kept = []; \
-               for (let size = 0; size < megabytes; size += 16) kept.push(new Uint8Array(16 << 20).fill(1)); \
+               for (let size = 0; size < megabytes; size += 16) { \
+                 const bytes = new Uint8Array(16 << 20); \
+                 for (let page = 0; page < bytes.length; page += 4096) bytes[page] = 1; \
+                 kept.push(bytes); \
+               } \
                while (spin) {} \
                return kept.length; \
              };"

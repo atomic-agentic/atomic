@@ -594,27 +594,31 @@ mod tests {
     async fn delivery_effect_binds_human_approval_and_dispatches_each_ordered_slot_once() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("current time follows Unix epoch")
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("atomic-delivery-{}-{nonce}.db", std::process::id()));
-        let mut rt = Durare::sqlite(&path).await.unwrap();
+        let mut rt = Durare::sqlite(&path).await.expect("open delivery test store");
         rt.register(WORKFLOW, exercise);
-        rt.launch().await.unwrap();
+        rt.launch().await.expect("launch delivery test runtime");
         let credential = HumanCredential::new(Principal::local("owner"), "operator secret");
-        gate::enroll(&rt, &credential).await.unwrap();
-        rt.start(WORKFLOW, "delivery-run", plan()).await.unwrap();
+        gate::enroll(&rt, &credential)
+            .await
+            .expect("enroll delivery test operator");
+        rt.start(WORKFLOW, "delivery-run", plan())
+            .await
+            .expect("start delivery test run");
         let id = gate::gate_id("delivery-run", GATE_STEP);
         let opened = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(gate) = gate::find(&rt, &id).await.unwrap() {
+                if let Some(gate) = gate::find(&rt, &id).await.expect("find delivery gate") {
                     break gate;
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("delivery gate opens");
         gate::decide(
             &rt,
             &credential,
@@ -628,12 +632,14 @@ mod tests {
             },
         )
         .await
-        .unwrap();
-        let observed: Vec<bool> = rt.result("delivery-run").await.unwrap();
+        .expect("approve delivery gate");
+        let observed: Vec<bool> = rt.result("delivery-run").await.expect("delivery completes");
         assert_eq!(observed, vec![true; 15]);
-        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        rt.shutdown(Duration::from_secs(5))
+            .await
+            .expect("stop delivery test runtime");
         drop(rt);
-        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(path).expect("remove delivery test store");
     }
 
     async fn rename_probe(ctx: DurareContext, input: Value) -> Result<Value> {
@@ -808,7 +814,7 @@ mod tests {
     async fn legacy_pending_key_recovers_after_project_rename_and_success_is_reused() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("current time follows Unix epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
             "atomic-delivery-rename-{}-{nonce}.db",

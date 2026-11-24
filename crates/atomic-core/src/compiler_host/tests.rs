@@ -22,15 +22,18 @@ const CPU_ENV: &str = "ATOMIC_COMPILER_TEST_CPU";
 /// enforcement with a smaller budget in this test binary's probe child.
 #[allow(unsafe_code)]
 pub(super) fn shorten_cpu_probe() -> Result<(), String> {
-    let mut memory = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: the kernel writes one rlimit into a valid mutable slot.
-    if unsafe { libc::getrlimit(libc::RLIMIT_DATA, &mut memory) } != 0
-        || memory.rlim_cur == libc::RLIM_INFINITY
+    #[cfg(not(target_os = "macos"))]
     {
-        return Err("compiler writable memory must be limited".into());
+        let mut memory = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: the kernel writes one rlimit into a valid mutable slot.
+        if unsafe { libc::getrlimit(libc::RLIMIT_DATA, &mut memory) } != 0
+            || memory.rlim_cur == libc::RLIM_INFINITY
+        {
+            return Err("compiler writable memory must be limited".into());
+        }
     }
     if std::env::var_os(CPU_ENV).is_none() {
         return Ok(());
@@ -481,19 +484,21 @@ fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
 // on the memory it uses (see `child_memory`). The parent is given a limit
 // far below production's here, on every platform, so that a parent that
 // does not hold it grants memory the machine has. The memory is ArrayBuffer
-// contents, outside the V8 heap limit, and is filled: memory not written to
-// is not in use.
+// contents, and one byte per page is written so the footprint counts it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn memory_a_compile_uses_past_its_limit_is_refused_by_its_parent() {
     const LIMIT: u64 = 256 * 1024 * 1024;
-    // Fills `megabytes` and holds them for `held` milliseconds.
+    // Commits `megabytes` one page at a time and holds them for `held` milliseconds.
     let fill = |megabytes: u64, held: u64| {
         crate::child_memory::with_limit(LIMIT, || {
             probe(&format!(
                 "const kept = []; \
-                 for (let size = 0; size < {megabytes}; size += 16) \
-                   kept.push(new Uint8Array(16 << 20).fill(1)); \
+                 for (let size = 0; size < {megabytes}; size += 16) {{ \
+                   const bytes = new Uint8Array(16 << 20); \
+                   for (let page = 0; page < bytes.length; page += 4096) bytes[page] = 1; \
+                   kept.push(bytes); \
+                 }} \
                  await new Promise((resolve) => setTimeout(resolve, {held})); \
                  return kept.length;"
             ))
