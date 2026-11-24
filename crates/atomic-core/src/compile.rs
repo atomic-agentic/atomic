@@ -34,6 +34,7 @@ pub fn compile(atom: &Atom, _registry: &Registry) -> Result<Compiled, AtomError>
     let fail = |message| AtomError {
         file: atom.file.clone(),
         line: 1,
+        column: None,
         path: "/examples".into(),
         message,
     };
@@ -43,6 +44,7 @@ pub fn compile(atom: &Atom, _registry: &Registry) -> Result<Compiled, AtomError>
         atomic_schema::artifact::check_contract(output).map_err(|e| AtomError {
             file: atom.file.clone(),
             line: 1,
+            column: None,
             path: "/output".into(),
             message: format!("the output contract's artifact references: {e}"),
         })?;
