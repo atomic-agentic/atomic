@@ -6,16 +6,15 @@ The frontmatter of an `.atom.astro` file exports one literal object:
 
 ```astro
 ---
-import type { Props, Input, Output } from '../.atomic/types/<atom-name>';
-import type { AtomConfig } from '../.atomic/types/authoring';
+import type { Props, Config } from '../.atomic/types/<atom-name>';
 const { input }: Props = Astro.props;
-export const config: AtomConfig<Input, Output> = {
+export const config: Config = {
   description: '…',
 };
 ---
 ```
 
-The import paths are relative from the atom file to `.atomic/types/` in the project root; `atomic check` writes those declarations. Values are literals: no variables, calls or spreads. Only `validate` holds functions.
+The import paths are relative from the atom file to `.atomic/types/` in the project root; `atomic check` writes those declarations. `Config` is the per-atom alias for `AtomConfig` with generated input, output, case, judges and optional context contracts. The explicit `AtomConfig` import remains valid. Values are literals: no variables, calls or spreads. Only `validate` holds functions.
 
 ## Project layout
 
@@ -71,3 +70,7 @@ In the types, `I`, `O`, `C` and `R` are the generated `Input`, `Output`, case an
 ## Refused by this version
 
 `atomic check` fails on these fields, saying they are not supported yet: `extends`, `review`, `credentials`, `runtime`, `codex`, `skills`, `remote`, `auth`. Any other field name fails as unknown.
+
+## Generated type navigation
+
+Run `atomic check` to generate `.atomic/types/`. Import `Props`, `Config`, `Input` and `Output` directly from the atom's generated module; do not use a virtual `atomic:atoms/…` import. The generated `schemas/` modules expose reusable schema types. Their `@atomic-schema <path>#<JSON-pointer>` comments point back to the source schema, including a referenced definition. Follow that path and pointer to edit the contract; never edit the generated type. Stock Astro tooling can inspect `.atom.astro` files without a custom language server.

@@ -16,7 +16,7 @@
 //! variables of `all`, `exists`, `map` and `filter` are typed from their
 //! list's `items`.
 
-use cel::common::ast::{EntryExpr, Expr, IdedExpr, SourceInfo};
+use cel::common::ast::{EntryExpr, Expr, IdedExpr, LiteralValue, SourceInfo, operators};
 use cel::parser::Parser;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -98,6 +98,13 @@ enum Binding {
     Typed(Typed),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResultType {
+    Boolean,
+    Other(&'static str),
+    Unknown,
+}
+
 impl Expression {
     /// The expression as written.
     pub fn source(&self) -> &str {
@@ -169,6 +176,100 @@ impl Expression {
     pub fn check(&self, scope: &Scope<'_>) -> Result<(), ExprError> {
         let mut locals = Vec::new();
         self.walk(&self.ast, scope, &mut locals)
+    }
+
+    /// Check a condition whose result must be boolean. A dynamically typed
+    /// expression remains subject to the runtime boolean check; a result
+    /// whose type is known to be non-boolean is refused at its source.
+    pub fn check_boolean(&self, scope: &Scope<'_>) -> Result<(), ExprError> {
+        self.check(scope)?;
+        if let ResultType::Other(name) = self.result_type(&self.ast, scope)? {
+            return Err(ExprError {
+                column: self.column(self.ast.id),
+                message: format!("expected a boolean result, inferred {name}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn result_type(&self, e: &IdedExpr, scope: &Scope<'_>) -> Result<ResultType, ExprError> {
+        Ok(match &e.expr {
+            Expr::Literal(value) => match value {
+                LiteralValue::Boolean(_) => ResultType::Boolean,
+                LiteralValue::Int(_) | LiteralValue::UInt(_) => ResultType::Other("integer"),
+                LiteralValue::Double(_) => ResultType::Other("number"),
+                LiteralValue::String(_) => ResultType::Other("string"),
+                LiteralValue::Bytes(_) => ResultType::Other("bytes"),
+                LiteralValue::Null => ResultType::Other("null"),
+            },
+            Expr::List(_) => ResultType::Other("list"),
+            Expr::Map(_) | Expr::Struct(_) => ResultType::Other("object"),
+            Expr::Select(select) if select.test => ResultType::Boolean,
+            Expr::Ident(_) | Expr::Select(_) => {
+                let Some((root_id, root, path)) = path_of(e) else {
+                    return Ok(ResultType::Unknown);
+                };
+                let Some(typed) = self.resolve(root_id, &root, &path, scope, &[])? else {
+                    return Ok(ResultType::Unknown);
+                };
+                let Some(types) = types_of(&typed.doc, &typed.schema, &mut Walk::new()) else {
+                    return Ok(ResultType::Unknown);
+                };
+                match types.as_slice() {
+                    ["boolean"] => ResultType::Boolean,
+                    ["integer"] => ResultType::Other("integer"),
+                    ["number"] => ResultType::Other("number"),
+                    ["string"] => ResultType::Other("string"),
+                    ["array"] => ResultType::Other("list"),
+                    ["object"] => ResultType::Other("object"),
+                    ["null"] => ResultType::Other("null"),
+                    _ => ResultType::Unknown,
+                }
+            }
+            Expr::Call(call) => match call.func_name.as_str() {
+                operators::LOGICAL_AND
+                | operators::LOGICAL_OR
+                | operators::LOGICAL_NOT
+                | operators::EQUALS
+                | operators::NOT_EQUALS
+                | operators::GREATER_EQUALS
+                | operators::LESS_EQUALS
+                | operators::GREATER
+                | operators::LESS
+                | operators::IN
+                | operators::HAS
+                | operators::NOT_STRICTLY_FALSE
+                | "contains"
+                | "startsWith"
+                | "endsWith"
+                | "matches" => ResultType::Boolean,
+                "size" => ResultType::Other("integer"),
+                "string" => ResultType::Other("string"),
+                "int" | "uint" => ResultType::Other("integer"),
+                "double" => ResultType::Other("number"),
+                "bytes" => ResultType::Other("bytes"),
+                operators::ADD
+                | operators::SUBSTRACT
+                | operators::MULTIPLY
+                | operators::DIVIDE
+                | operators::MODULO
+                | operators::NEGATE => ResultType::Other("non-boolean value"),
+                operators::CONDITIONAL if call.args.len() == 3 => {
+                    let first = self.result_type(&call.args[1], scope)?;
+                    let second = self.result_type(&call.args[2], scope)?;
+                    match (first, second) {
+                        (ResultType::Boolean, ResultType::Boolean) => ResultType::Boolean,
+                        (ResultType::Other(_), _) | (_, ResultType::Other(_)) => {
+                            ResultType::Other("non-boolean branch")
+                        }
+                        _ => ResultType::Unknown,
+                    }
+                }
+                _ => ResultType::Unknown,
+            },
+            Expr::Comprehension(c) => self.result_type(&c.accu_init, scope)?,
+            Expr::Unspecified => ResultType::Unknown,
+        })
     }
 
     fn column(&self, id: u64) -> usize {

@@ -1,13 +1,7 @@
 # Developing atomic
 
 atomic builds and tests inside a development container, so a contributor needs
-only a container engine, git and curl on the host. You do not need Rust,
-Postgres or any other tool installed locally to build and test atomic. curl is
-there because `scripts/dev.sh` fetches the pinned V8 archive on the host, before
-the container starts, on the first run whose cache does not already hold it
-([The prebuilt V8](#the-prebuilt-v8)). The one local tool beyond those is Node,
-and only the [Astro compiler](#astro-compiler) tooling needs it: rebuilding the
-shipped assets and running `authoring/`'s own tests and probes.
+a container engine and git. Node is used to rebuild the embedded authoring worker and run the reference authoring tests.
 
 ## The development container
 
@@ -40,25 +34,6 @@ The container runs as your own user ID with no Linux capabilities, mounts the
 repository at the same path as on the host, and keeps cargo's registry and git
 cache in `~/.cache/atomic/dev`. Build output goes to `target/` in the
 repository as usual.
-
-### The prebuilt V8
-
-atomic links one V8, through `deno_core`, for the isolates captured
-TypeScript helpers run in. rusty_v8's build script normally downloads a
-prebuilt static library and checks nothing about it, so atomic pins each
-archive and its generated bindings by SHA-256 in
-[`deps/v8.toml`](../deps/v8.toml). `scripts/v8-archive.sh [TARGET]` fetches
-them once into a local mirror and verifies them on every run;
-[`.cargo/config.toml`](../.cargo/config.toml) points `RUSTY_V8_MIRROR` at
-`target/v8-mirror`, so a plain `cargo build` reads only that mirror and fails
-inside V8's build script, before linking, until the script has filled it.
-`scripts/dev.sh` verifies the archive on the host before the container starts
-and keeps its mirror in `~/.cache/atomic/dev/v8-mirror`, so builds work offline
-once it is cached. A tampered file stops the build; delete it to fetch it again.
-`atomic-core`'s build script checks the mirrored archive against its pin as
-well, and refuses a build with `RUSTY_V8_ARCHIVE` or `V8_FROM_SOURCE` set or
-with `RUSTY_V8_MIRROR` naming a remote mirror, so no environment can link
-another V8.
 
 ### Limits
 
@@ -195,6 +170,17 @@ above its attributes; the rest of those files runs in a plain `cargo test`.
 The sandbox check runs each marked test, as it runs every test of a file that
 is behind the feature as a whole.
 
+### Exec command process limits
+
+`atomic_exec::Command` may set `cpu_seconds` and `data_bytes`. Both the local
+backend and the process runner apply them to the command before `exec` on Unix:
+`RLIMIT_CPU` caps CPU seconds and `RLIMIT_DATA` caps writable data bytes.
+The limits are inherited by children, but each process has its own counter and
+address space. They are not aggregate quotas for the command's process tree.
+The fields are optional and default to no OS limit; a caller that requires
+these bounds must set them. Non-Unix backends refuse a command that sets either
+field. The command's existing wall time and output limits still apply.
+
 ## Controls are tested by removing them
 
 Each security control has a test that fails when the control is switched off.
@@ -285,6 +271,130 @@ in the file at all. A row that fails either is named. The script reads the row
 files by the same rules as `controls-check.sh`, so a row that cannot be read is
 refused there too rather than left unchecked, and
 `scripts/controls-check-test.sh` tests both with fixtures it commits.
+
+### The rows as a workflow step
+
+`scripts/controls-exec.py` is the same proof driven from inside a workflow: a
+step hands it the commit a coding step made and the row names that step
+declares, and it reports one typed result per row. It runs the real
+`scripts/controls-check.sh`, once per row, inside a copy, so nothing here is
+duplicated: the switch, the saved originals, the restore and the reasons are
+that script's, and the verdict is the script's last word about the row.
+Anything else it ends with — no result line, a reason this driver does not
+know, an `ok` under a nonzero exit, a `FAIL` that still exited 0 — is reported
+as `errored` and fails the step.
+
+What it may prove is settled before anything is read out of git. The input
+names a commit, the ref atomic keeps that commit under, and the base recorded
+beside it; the ids and the ref are checked against their shapes first, so an
+input can name a commit id or a `refs/atomic/` ref and never an option or a
+revision that means something else. The driver then requires that ref to name
+exactly that commit in exactly that repository, and that commit to have exactly
+that base as its one parent. A ref naming nothing, another commit, a second
+parent — no step's attempt makes a merge — and a row the candidate does not
+carry are each refused. Every row named is run; choosing which rows a change
+touches is a step in its own right, and this one proves the set it is handed.
+For coding reviews, the host also checks that each selected row file has the
+same Git blob and mode in the bound base and candidate. A candidate cannot
+replace the selected control's definition while asking it to approve that
+candidate.
+
+What it may run is settled the same way, out of the step's declaration rather
+than out of the change. `CONTROL_RUNNER` names the proof runner and
+`CONTROL_RUNNER_SHA256` its exact bytes; `CONTROL_DRIVER_SHA256` says what this
+file's own bytes must be, and the driver checks that before it reads anything.
+A relative `CONTROL_RUNNER` is taken against this file's own directory — the
+entry point the atom's `exec.command` already names and whose bytes the run
+pins — so an atom can name the harness that sits beside it without writing down
+a path that only exists in one checkout; the pinned hash is checked over the
+bytes either way. A candidate that carries a `scripts/controls-check.sh` which
+prints the passing line for every row is therefore never started, and a driver
+planted in the tree being checked refuses to answer. The runner is reached
+through a fresh link the driver makes inside the copy for each row, its bytes
+are hashed again through that link when the row ends, and a row that replaced
+them is reported `runner-changed` — as is every row after it, because nothing
+those bytes report is the declared runner's. The runner may not live inside the
+candidate or inside the step's own scratch, and a row that switches
+`scripts/controls-check.sh` off is refused: the runner cannot prove itself.
+
+The candidate comes out of git's object store and never out of a working tree.
+A coding worktree with uncommitted files is untrusted input, and the script
+refuses to start on a file that differs from HEAD, so the step asks the commit
+for its tree (`rev-parse --verify`), lists it (`ls-tree -r -z`) and reads its
+blobs (`cat-file --batch`), writes them into the scratch directory of its own
+attempt, and binds the copy to the candidate without making a commit: the copy's
+own repository is given one object alternate — the one git names for the source
+repository, checked to be a directory — and through it `read-tree` fills its
+index with the candidate's tree and `update-ref` gives its HEAD the candidate's
+commit. atomic makes git commits outside the sandbox, and a scratch copy needs
+no commit of its own: the candidate's commit and tree are already in the store
+the alternate names, so the copy needs a HEAD and an index. The run is refused
+unless the copy's HEAD names the candidate's tree and `git status` finds the
+copy's files exactly as that tree holds them: a file skipped, a mode changed or
+a link resolved is a copy that is not the change asked about, and nothing is
+switched off in it. Two rows naming one file are refused in one step, because
+one run saves what the other switches off — the script's own rule for a run.
+
+The step keeps to the five minutes an exec command has. `setup_seconds` (40 s
+by default) is reserved for reading the candidate out of git and copying it, and
+`report_seconds` (20 s by default) is held back at the end for what has to
+happen after the last row: stopping a process group that will not die, removing
+the copy, and writing the one JSON value the step answers with. Nothing a row or
+a git command is ever given runs into that reserve — each is cut off
+`report_seconds` before the step's own end — and a row gets `row_seconds`
+(240 s by default) or what is left before the reserve, whichever is less. A
+declared set whose setup, rows and reserve cannot all fit `step_seconds` (300 s
+at most) is refused where the reason can still be said rather than started and
+left half-proved. Once the step's own clock has less than five seconds of work
+left nothing further starts, and every row still unrun is reported `no-time` and
+fails the step, so an unproved control is never simply absent from the answer;
+and if less than five seconds are left for the answer itself once the rows have
+ended, the step refuses with that said, rather than being cut off by the backend
+mid-report. A row that overruns is ended by killing its whole process group, and
+a `cat-file` stream this driver rejects is killed, reaped and joined before its
+refusal is raised, so neither a hung build nor a hung git outlives the step.
+
+Nothing is read further than its cap allows. A row's output is drained as it
+arrives, on a thread that ends the row's command the moment the limit (2 MB) is
+passed — and what is kept for the answer is cut at the limit, not merely
+counted — so a row that floods is reported instead of buffered; git's blobs are
+streamed to disk through `cat-file --batch` with a bound per object and one on
+the whole copy; and the hashes are taken over a bounded number of bytes. A
+candidate that holds a very large file or writes hundreds of megabytes is a
+refusal or a verdict, never the step's memory.
+
+The verdicts are `passed`, `blind` (its test still passes with the control off,
+which is what fails the step), `switch-stale`, `build-failed`, `no-test`,
+`not-seen-failing`, `fails-when-on`, `timed-out`, `left-switched` (its saved
+originals are still in the copy, so a control may be off), `runner-changed`,
+`no-time` and `errored`. A refusal exits 2, a failed row 1, a passed set 0; the
+input is one JSON value on stdin and the answer one JSON value on stdout, with
+one short line per row on stderr, where atomic keeps the end of a failed
+command. The answer is written before cleanup. The driver then attempts to remove its
+scratch copy; an outer kill or a deletion error can leave it behind. A second
+attempt reads the same recorded commit and reruns the declared rows.
+
+The step is confined as any exec atom is (see
+[exec atoms](reference/atom-files.md#exec-atoms)): no network, no write outside
+its scratch directory, and none of what the backend denies it.
+`scripts/controls-exec-test.sh` (CI's Pins job) tests the driver against
+throwaway repositories with a stand-in for cargo, and
+`crates/atomic/tests/controls_exec.rs` runs the same driver through
+`runtime::run_exec` under the real sandbox, where a row whose command reaches
+the network, writes outside its scratch, reads a denied directory or writes
+through the link its runner was started through fails the step. Neither needs a
+toolchain, a model or a provider. Six rows under `scripts/controls/` switch this
+step's own guards off — that the candidate is the recorded commit, that the
+runner and the driver are the declared ones, that a relative runner name is
+resolved against the driver, that the copy is bound to the candidate's commit
+and tree, and that the declared rows and the answer reserve fit the step — and
+name that sandbox test, so CI's Controls workflow runs them as it runs every
+other row. The guard that refuses an answer the step has no room left to write
+is not among them: a row runs a `cargo test`, and that guard is reached only by
+spending real time, so `scripts/controls-exec-test.sh` is what proves it bites.
+What memory and CPU a row uses is what the container running the runner allows,
+as for `controls-check.sh` itself: atomic bounds the command's wall time (300 s)
+and its output (8 MiB), and the driver bounds each row's time and output.
 
 ### The Controls workflow
 
@@ -461,7 +571,11 @@ too.
 atomic's crash tests kill the process at named failpoints. A failpoint is
 compiled in only with the `failpoints` features of `atomic-agentic-durable` and
 `atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
-release build has none. Three variables drive them:
+release build has none. Build the CLI with `--features
+atomic-agentic/dev-failpoints` to enable `atomic run <workflow> --fail-at
+<step>`: it kills the process just after that step's accepted result is
+checkpointed, and `atomic runs resume <run-id>` continues the same run. The
+flag is absent from release builds. Three variables also drive failpoints:
 
 - `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL, so no core is dumped)
   at the first failpoint of that name;
@@ -545,6 +659,23 @@ same dependencies:
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/test-shards.py run 2
 ```
 
+The cold full-repository controls proof in `tests/pipeline.rs` runs separately
+from the broad pipeline target so its bounded Cargo row has the runner to
+itself. The broad suite reports that one test as ignored; CI runs it in a
+required shard-1 step and checks that exactly one named test passed. Run the
+same gate locally in addition to the workspace suite:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic \
+  --test pipeline --locked \
+  --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests \
+  a_full_repository_control_row_uses_host_cargo_in_normal_review \
+  -- --ignored --exact
+```
+
+Confirm its output names the test and reports `1 passed; 0 failed; 0 ignored`.
+A zero-test result does not satisfy this gate.
+
 `scripts/test-shards.py run` first checks the table against `cargo metadata`,
 so a test file in no shard, or in two, fails every shard until the table
 places it. `scripts/test-shards.py check`, in the "Acceptance and backends"
@@ -557,8 +688,7 @@ table needs a matrix entry in the test job as well.
 ### Build caches
 
 The Linux Rust jobs restore two caches, through `.github/actions/rust-setup`:
-cargo's downloads (the registry and the git sources, rusty_v8's Chromium
-submodules among them), keyed on the toolchain and `Cargo.lock`, and
+cargo's downloads (the registry and git sources), keyed on the toolchain and `Cargo.lock`, and
 `target/`, keyed on those and the manifests, one for the test features'
 build and one for clippy's. A checkout gives every source file a new time, so
 the workspace's own crates rebuild in every job; the cached `target/` holds
@@ -676,14 +806,10 @@ Declarative atoms use `.atom.astro`. The production compiler assets are bundled
 under `crates/atomic-core/assets` and included in the binary. Running atoms needs
 no Deno, npm install or project `node_modules`: atomic starts itself as the
 compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
-embedded V8 (`crates/atomic-core/src/compiler_host.rs`). The child has a cleared
-environment, a 1 GiB V8 heap limit, operating-system limits of 2.5 GiB of
-writable memory (twice the heap, plus 512 MiB for what V8 keeps outside it:
-WebAssembly memories and ArrayBuffers among it), 32 seconds of CPU time and no
-core files (`compiler_host/limits.rs`), and the parent's 30-second limit. Its
+embedded Boa engine. Oxc parses TypeScript and transpiles captured helpers. The tsz checker uses the captured sources, generated declarations and bundled ES2022 library. The compiler child has a cleared environment, 1 GiB allocation budgets for the heap and buffers, a 2.5 GiB writable-memory ceiling, a 32-second CPU limit and a 30-second parent deadline. Its
 host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
-stderr for its console, its exit status, its own WASM, random bytes, SHA-256 and
-timers, and nothing else: no network, environment, filesystem or subprocess.
+stderr for its console, its exit status, native Astro parsing and TSX conversion,
+random bytes, SHA-256 and timers, and nothing else: no network, environment, filesystem or subprocess.
 atomic reads atom sources itself and sends them in the request, for loading as
 for rendering. Direct-run context checkpoints live outside the source tree.
 

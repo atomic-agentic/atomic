@@ -1,0 +1,1 @@
+self-review-rust-reference-scan|crates/atomic/src/pipeline.rs|rust_control_references(source)|Ok::<Vec<&str>, DurableError>(Vec::new())|-p atomic-agentic --test pipeline included_fixture_and_shared_test_code_cannot_omit_control_row

@@ -67,8 +67,23 @@ pub fn render_clocked(
         .map_err(|e| RenderError(e.to_string()))?
         .validate(run.input)
         .map_err(|e| RenderError(format!("input: {e}")))?;
-    if let Some(snapshot) = snapshot {
-        jsonschema::validator_for(&compiled.program.contracts["Context"])
+    // Whether this atom reads a public context is decided from its compiled
+    // contract, not from what the caller brought: the two must agree exactly.
+    // A contextual atom is refused before anything renders when no snapshot
+    // came, so no callback of its turn ever sees a `context` that is simply
+    // absent; a snapshot is refused for an atom that declares no context for it
+    // to be checked against.
+    let declared = compiled.program.contracts.get("Context");
+    if declared.is_none() && snapshot.is_some() {
+        return Err(RenderError(
+            "this atom declares no public context".to_owned(),
+        ));
+    }
+    if declared.is_some() && snapshot.is_none() {
+        return Err(RenderError("context snapshot required".to_owned()));
+    }
+    if let (Some(schema), Some(snapshot)) = (declared, snapshot) {
+        jsonschema::validator_for(schema)
             .map_err(|e| RenderError(e.to_string()))?
             .validate(&snapshot.as_value()["context"])
             .map_err(|e| RenderError(format!("context: {e}")))?;

@@ -1,0 +1,1 @@
+exec-snapshot-matches-its-run-and-atom|crates/atomic-core/src/runtime.rs|        if let Err(mismatch) = record.verify_for(&compiled.hash, &identity.run_id) {|        if let Err(mismatch) = std::result::Result::<(), String>::Ok(()) {|-p atomic-agentic-core --lib -- runtime::tests::an_exec_atom_brought_another_runs_snapshot_is_refused_before_its_command

@@ -1,0 +1,32 @@
+{
+  "item": {
+    "id": "nt-13",
+    "title": "One finding is reported again after another file's findings",
+    "criteria": [
+      "Every money calculation multiplies by quantity.",
+      "The refund path matches the cart total."
+    ]
+  },
+  "findings": [
+    {
+      "file": "pricing.py",
+      "severity": "minor",
+      "message": "The cart total is printed before the discount."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "major",
+      "message": "The refund path ignores quantity."
+    },
+    {
+      "file": "README.md",
+      "severity": "minor",
+      "message": "The install line is stale."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "major",
+      "message": "The refund path ignores quantity."
+    }
+  ]
+}

@@ -420,6 +420,28 @@ for row in "${selected[@]}"; do
         status=1
         continue
     fi
+    # Cargo can exit 0 when a restored target selects zero tests. That is no
+    # proof that the named control now passes, even if its off run did fail.
+    passed_on="$(awk '/^test result: ok\./ { p += $4; seen=1 } END { if (seen) print p+0; else print -1 }' "${LOG}")"
+    if [ "${passed_on}" -le 0 ]; then
+        echo "FAIL ${name}: with the control on, no test passed" >&2
+        keep_log "${name}"
+        status=1
+        continue
+    fi
+    unpassed=""
+    while read -r test; do
+        if ! grep -E '^test .+ \.\.\. ok$' "${LOG}" | sed -E 's/^test (.+) \.\.\. ok$/\1/' |
+            grep -F -- "${test}" >/dev/null; then
+            unpassed="${unpassed} ${test}"
+        fi
+    done < <(named_tests "${args}")
+    if [ -n "${unpassed}" ]; then
+        echo "FAIL ${name}: with the control on, these tests were not seen passing:${unpassed}" >&2
+        keep_log "${name}"
+        status=1
+        continue
+    fi
     echo "ok ${name}: its test fails with the control off and passes with it on" >&2
 done
 exit "${status}"

@@ -1,0 +1,38 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/triage-findings.table';
+import type { AtomConfig } from '../.atomic/types/authoring';
+import TriageFrame from './TriageFrame.astro';
+import NoFindings from './NoFindings.astro';
+import FindingRow from './FindingRow.astro';
+import { findingRuns } from './layout';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Layout C of the same triage: the findings in groups by file as GitHub-flavoured Markdown table rows, one table per group and each table where its first finding was reported, with each cell's text kept verbatim beside the tables.",
+  "input": { "$ref": "./triage-findings.input.schema.yaml" },
+  "output": { "$ref": "./triage-findings.output.schema.yaml" },
+  "validate": [({input, output}) => output.decision !== 'accept' || output.must_fix.length === 0]
+};
+---
+<TriageFrame id={input.item.id} title={input.item.title} criteria={input.item.criteria}>
+{input.findings.length === 0 ? <Fragment>
+<NoFindings />
+</Fragment> : <Fragment>
+Findings, in groups by file as GitHub-flavoured Markdown table rows, one table per group and each table where its first finding was reported:
+{findingRuns(input.findings).map((run) => <Fragment>
+
+{run.file}
+
+| File | Severity | Message |
+| --- | --- | --- |{run.findings.map((f) => <Fragment>
+<FindingRow finding={f} /></Fragment>)}
+</Fragment>)}
+
+<verbatim>
+Every cell above exactly as reported, in report order, because a table cell
+holds no line break and writes a pipe escaped:
+{input.findings.map((f) => <Fragment>
+- {f.file}: {f.message}
+</Fragment>)}
+</verbatim>
+</Fragment>}
+</TriageFrame>

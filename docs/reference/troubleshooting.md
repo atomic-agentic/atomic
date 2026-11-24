@@ -80,9 +80,18 @@ step gained write or network access. See
 ## `atomic check` says a prompt snapshot changed
 
 An edit to an atom's instructions, or to a component it imports, changed the
-prompt for one of its typed examples. Print the new prompt with
-`atomic render <atom> --input <file.json>`, confirm the change is the one you
-meant, then update the snapshot. The update command is not specified yet.
+prompt for one of its input fixtures. Print the new prompt with
+`atomic render atoms/<atom>.atom.astro --input fixtures/<atom>/<case>.input.json`,
+confirm the change is the one you meant, then save that output in
+`snapshots/<atom>__<case>.prompt.json` and rerun `atomic check`. A missing snapshot
+needs a corresponding fixture, and a Codex snapshot must use the same configured
+model endpoint and profile when rendered and checked. `atomic render` resolves
+settings without probing local model discovery. It accepts `--model-base-url`
+to mirror a live run's endpoint override; snapshot checks instead resolve their
+endpoint from settings and profile. An atom using TypeScript helpers
+cannot opt in to prompt snapshots until its step clock can be recorded. For
+inspection only, `atomic render --preview-helpers` uses a fresh clock and warns
+that its output may differ from the live prompt.
 
 ## A compact schema is rejected
 
@@ -112,14 +121,10 @@ endpoint. See
 ## The Astro compiler fails or runs out of time or memory
 
 `atomic check` and `atomic render` run Atomic's bundled Astro compiler in a
-child process of Atomic itself, on its embedded V8; no Deno is needed. A compile
+child process of Atomic itself, using its embedded Boa engine. A compile
 that runs past 30 seconds is stopped with `the Astro compiler exceeded 30
 seconds`, and one that uses 32 seconds of CPU time with `the Astro compiler
-exceeded its CPU time limit`. One that outgrows its 1 GiB JavaScript heap, or
-2.5 GiB of memory in all (the heap, twice over while it unwinds, and 512 MiB
-outside it for V8, the parser's WebAssembly memory and buffers), fails, usually
-with `the Astro compiler exceeded its memory limit` in the error. Checking the whole
-example catalog needs about 800 MiB. A smaller component graph or simpler types
+exceeded its CPU time limit`. The child permits up to 1 GiB each for heap allocations and buffer storage. Its operating-system writable-memory ceiling is 2.5 GiB. Allocation failures can report `the Astro compiler exceeded its memory limit`. A smaller component graph or simpler types
 bring an atom within these limits. A compiler that crashes is reported with what
 it wrote to stderr, and leaves no core file; report it as a bug.
 

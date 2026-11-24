@@ -1,0 +1,1 @@
+schema-origin-field|crates/atomic-schema/src/typescript.rs|if let Some(origin) = origin.and_then(SchemaOrigin::written) {|if let Some(origin) = std::hint::black_box(None::<String>) {|-p atomic-agentic-schema --lib -- typescript::tests::every_generated_type_and_field_names_its_schema_file_and_pointer

@@ -1,0 +1,1 @@
+graph-human-actor-bound|crates/atomic-graph/src/sqlite.rs|let actor = self.actor_for_write(actor, "create a human item")?;|let actor = actor;|-p atomic-agentic-graph --test admin_auth forged_human_actor_and_fake_credential_write_nothing

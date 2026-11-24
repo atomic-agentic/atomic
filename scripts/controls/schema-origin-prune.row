@@ -1,0 +1,1 @@
+schema-origin-prune|crates/atomic/src/main.rs|prune_schema_declarations(root, live)?;|let _ = (root, live);|-p atomic-agentic --test astro_cli -- project_check_prunes_root_level_schema_modules_after_rename_and_removal

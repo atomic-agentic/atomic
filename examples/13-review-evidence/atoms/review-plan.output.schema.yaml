@@ -1,0 +1,126 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [decision, rows, assumptions, summary]
+properties:
+  decision:
+    type: string
+    enum: [approve, escalate, reject]
+    description: >-
+      The recommendation for this plan, never an approval. `approve` only when
+      every required outcome is covered by a task whose opened record answers
+      this candidate; `reject` when one failed; `escalate` for anything else,
+      including an outcome no task covers.
+  rows:
+    type: array
+    minItems: 1
+    maxItems: 8
+    description: One row per required outcome, in the order they were given, covered or not.
+    items:
+      type: object
+      additionalProperties: false
+      required: [requirement, required, task, acceptance_criterion, dependency, coverage, state, record, citations, finding_count, detail]
+      properties:
+        requirement:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: The outcome this row answers.
+        required:
+          type: boolean
+          description: Whether the plan requires this outcome.
+        task:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The task that covers it, or `none` when no task does.
+        acceptance_criterion:
+          type: string
+          minLength: 1
+          maxLength: 300
+          description: The criterion as it was accepted, repeated so a reader sees what was asked for.
+        dependency:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The task this one waits on, or `none`. From the plan, not from a record.
+        coverage:
+          type: string
+          enum: [covered, uncovered]
+          description: "`uncovered` when no proposed task delivers this outcome, whatever the records say."
+        state:
+          type: string
+          enum: [covered_current, covered_failed, covered_stale, covered_unassessable, covered_inaccessible, covered_no_record, uncovered_no_task, uncovered_no_record]
+          description: >-
+            What the row rests on: a record for this candidate that passed or
+            failed, a run that never reported a state, a record for another
+            revision, a record that cannot be opened, a task whose record is
+            nowhere to be found, no task at all, or no record named for an
+            outcome nothing covers.
+        record:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The record the row answers — its task's, or its own when it has no task — kept verbatim, or `none`.
+        citations:
+          type: array
+          maxItems: 4
+          description: The record IDs that are evidence for this candidate. Empty unless a record is for this revision and can be opened.
+          items:
+            type: string
+            minLength: 4
+            maxLength: 120
+        finding_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: How many findings the answered record reported. Zero from a run that could not start is not coverage.
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 400
+          description: One sentence saying what the row means for the plan's author.
+  assumptions:
+    type: array
+    maxItems: 8
+    description: The author's assumptions, repeated as they were given. Never coverage.
+    items:
+      type: string
+      minLength: 1
+      maxLength: 300
+  summary:
+    type: object
+    additionalProperties: false
+    required: [required, covered, uncovered, unassessable, missing_evidence, failed]
+    description: Counts over the required rows only.
+    properties:
+      required:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: How many outcomes the plan requires.
+      covered:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required outcomes some proposed task delivers.
+      uncovered:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required outcomes no proposed task delivers.
+      unassessable:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Covered outcomes whose only record never reported a state, however few findings it listed.
+      missing_evidence:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Covered outcomes whose record is for another revision or cannot be opened.
+      failed:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Covered outcomes whose record failed for this candidate.

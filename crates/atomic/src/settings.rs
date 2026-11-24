@@ -32,6 +32,7 @@ use atomic_core::codex::ModelEndpoint;
 use atomic_core::config::{self, ConfigError, Layers, Source};
 use atomic_core::signin::SignIn;
 use atomic_schema::yaml;
+use atomic_app::model_policy::LanePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
@@ -92,6 +93,8 @@ pub struct ModelSettings {
     /// cloned project cannot have a person's secret sent where it chooses.
     #[serde(deserialize_with = "scalar")]
     pub api_key_env: Option<String>,
+    /// Operator-owned endpoint and item routing policy for graph lanes.
+    pub lanes: Option<LanePolicy>,
 }
 
 /// atomic's own store.
@@ -500,6 +503,46 @@ fn flag_name(path: &str) -> String {
     }
 }
 
+/// The project profile selected by the command or the person's environment.
+/// Keep this separate from ordinary settings: the name chooses a file, and
+/// cannot itself come from a project file or select another directory. In
+/// particular `local` would read `atomic.local.yaml` a second time.
+fn selected_profile(
+    args: &EngineArgs,
+    around: &Surroundings<'_>,
+) -> Result<Option<(String, String)>, ConfigError> {
+    let (raw, source) = match args.profile.as_deref() {
+        Some(raw) => (raw, "--profile"),
+        None => match (around.env)("ATOMIC_PROFILE") {
+            Some(raw) => return checked_profile(&raw, "ATOMIC_PROFILE"),
+            None if around.env_names.iter().any(|name| name == "ATOMIC_PROFILE") => {
+                return Err(ConfigError::Value {
+                    name: "ATOMIC_PROFILE".into(),
+                    message: "must be UTF-8 text; clear it or pass --profile".into(),
+                });
+            }
+            None => return Ok(None),
+        },
+    };
+    checked_profile(raw, source)
+}
+
+fn checked_profile(raw: &str, source: &str) -> Result<Option<(String, String)>, ConfigError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let valid = config::valid_profile_name(raw);
+    if !valid {
+        return Err(ConfigError::Value {
+            name: source.into(),
+            message: "use a lowercase ASCII name beginning with a letter, with single '-' or \
+                      '_' separators; 'local' is reserved for atomic.local.yaml"
+                .into(),
+        });
+    }
+    Ok(Some((raw.into(), source.into())))
+}
+
 /// Resolve the settings of the project configured in `dir`, with `args`'
 /// flags on top, in `around`.
 pub fn resolve(
@@ -507,6 +550,7 @@ pub fn resolve(
     args: &EngineArgs,
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
+    let profile = selected_profile(args, around)?;
     let user = user_config(around.user_config_dir);
     // A project could supply a "personal" file inside itself, or inside the
     // checkout that holds it, as when the home directory is where the
@@ -537,13 +581,30 @@ pub fn resolve(
             }
         }
     }
+    let selected_file = profile
+        .as_ref()
+        .map(|(name, _)| dir.join(format!("atomic.{name}.yaml")));
     let resolved = config::resolve::<Settings>(&Layers {
         dir,
         user: user.as_deref(),
-        profile: None,
+        profile: profile.as_ref().map(|(name, _)| name.as_str()),
         env: around.env,
         env_names: around.env_names.clone(),
         flags: flags(args),
+    })
+    .map_err(|error| match (error, &profile) {
+        (ConfigError::Read { path, source }, Some((_, from)))
+            if selected_file.as_deref() == Some(path.as_path())
+                && source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ConfigError::Invalid(format!(
+                "selected profile from {} needs {}; create that file beside atomic.yaml or \
+                 clear the profile selection",
+                from,
+                path.display()
+            ))
+        }
+        (other, _) => other,
     })?;
     let (mut settings, mut sources) = (resolved.config, resolved.sources);
     for (path, source) in sources.iter_mut() {
@@ -574,6 +635,9 @@ pub fn resolve(
         sources.get("exec.connections_per_command"),
     )?;
     let mut notes = Vec::new();
+    if let Some((name, source)) = &profile {
+        notes.push(format!("profile {name} selected by {source}"));
+    }
     if let Some(why) = &withheld_key {
         settings.model.api_key_env = None;
         sources.insert(
@@ -857,6 +921,25 @@ fn refuse_from_project(
         line,
         message,
     };
+    if let Some(at) = project_file(sources, "model.lanes", user) {
+        return Err(refuse(
+            at,
+            "model.lanes chooses model endpoints and credentials for graph lanes; set it in your own configuration, not a project file".into(),
+        ));
+    }
+    if settings.model.lanes.is_some()
+        && !matches!(
+            sources.get("model.lanes"),
+            Some(Source::File { path, .. }) if Some(path.as_path()) == user
+        )
+    {
+        return Err(ConfigError::Invalid(
+            "model.lanes must be in the operator's configuration file so later graph lanes can reload its routes".into(),
+        ));
+    }
+    if let Some(policy) = &settings.model.lanes {
+        policy.validate().map_err(ConfigError::Invalid)?;
+    }
     if let Some(at) = project_file(sources, "model.api_key_env", user) {
         return Err(refuse(
             at,
@@ -1481,10 +1564,18 @@ fn same(written: Option<&Value>, merged: Option<&Value>) -> bool {
 }
 
 /// Read the settings of the project configured in `dir` as `atomic run`
-/// would, with no flags and no Ollama probe, so a setting it would refuse
-/// fails `atomic check` instead.
-pub fn check(dir: &Path) -> Result<Resolved, ConfigError> {
-    resolve(dir, &EngineArgs::default(), &Surroundings::without_probe())
+/// would, with no model flag and no Ollama probe, so a setting it would
+/// refuse fails `atomic check` instead. A selected profile is checked from
+/// the same resolved project's manifest directory.
+pub fn check(dir: &Path, profile: Option<&str>) -> Result<Resolved, ConfigError> {
+    resolve(
+        dir,
+        &EngineArgs {
+            profile: profile.map(str::to_owned),
+            ..EngineArgs::default()
+        },
+        &Surroundings::without_probe(),
+    )
 }
 
 /// The models a local Ollama at `addr` lists: one `GET /api/tags`, all
@@ -1826,7 +1917,13 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
         Err(e) => return Err(e),
     };
     let dir = config_dir(&root);
-    let resolved = resolve(&dir, &args.engine, &Surroundings::here())
+    let around = Surroundings::here();
+    if !in_project && selected_profile(&args.engine, &around)?.is_some() {
+        anyhow::bail!(
+            "a configuration profile needs a project; run from that project or pass --project"
+        );
+    }
+    let resolved = resolve(&dir, &args.engine, &around)
         .map_err(|e| anyhow::anyhow!("the configuration cannot be read: {e}"))?;
     let mut rows = resolved.explain(&|name| std::env::var(name).ok());
     let mut notes = resolved.notes.clone();

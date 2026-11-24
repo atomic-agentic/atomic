@@ -662,6 +662,8 @@ fn git_command(
             time: Duration::from_secs(20),
             stdout: 1 << 20,
             stderr: process::STDERR_LIMIT,
+            cpu_seconds: None,
+            data_bytes: None,
         },
     )
     .map_err(|e| e.to_string())

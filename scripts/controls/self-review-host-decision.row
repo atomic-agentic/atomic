@@ -1,0 +1,1 @@
+self-review-host-decision|crates/atomic/src/pipeline.rs|                if !self_review.decision_points.contains(point) {|                if false {|-p atomic-agentic --test pipeline host_decision_inventory_refuses_workflow_and_model_omission_before_reviewer

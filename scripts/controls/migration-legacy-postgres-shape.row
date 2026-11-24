@@ -1,0 +1,1 @@
+migration-legacy-postgres-shape|crates/atomic-durable/src/store.rs|            verify_legacy_pg(&mut tx, &path, schema, found, migrations).await?;|            /*CONTROL_OFF*/|-p atomic-agentic-durable --lib --features postgres-tests -- store::tests::postgres_bad_legacy_shape_and_changed_history_refuse_without_writes

@@ -1,0 +1,1 @@
+graph-admin-pin-epic-only|crates/atomic-graph/src/sqlite.rs|if status == Status::Pinned|if false|-p atomic-agentic-graph --test admin_auth only_enrolled_operator_can_pin_an_open_epic

@@ -90,6 +90,59 @@ fn checked_in_pack_matches_the_binary() {
 }
 
 #[test]
+fn installed_references_cover_v02_authoring_paths() {
+    let pack = pack().expect("pack generates");
+    let file = |path: &str| {
+        pack.iter()
+            .find(|file| file.path.ends_with(path))
+            .unwrap_or_else(|| panic!("missing installed {path}"))
+            .contents
+            .as_str()
+    };
+    let fields = file("references/fields.md");
+    assert!(fields.contains("import type { Props, Config }"));
+    assert!(fields.contains("@atomic-schema <path>#<JSON-pointer>"));
+    let syntax = file("references/prompt-syntax.md");
+    assert!(syntax.contains("import literalExamples from './literal-examples.md?raw'"));
+    assert!(syntax.contains("```json"));
+    assert!(syntax.contains("```ts"));
+    let skill = file("SKILL.md");
+    assert!(skill.contains("ordinary,\nempty, escaped and mixed-origin inputs"));
+}
+
+#[test]
+fn rendered_prompt_reference_keeps_literal_example_fences_nested() {
+    let rendered = prompt_reference();
+    let literal = rendered
+        .split("`literal-examples.md`:\n\n")
+        .nth(1)
+        .expect("literal example section");
+    assert!(literal.starts_with("````markdown\n```json\n"));
+    assert!(literal.contains("\n```ts\n"));
+    assert!(literal.contains("\n````\n\n## Reuse prompt text"));
+
+    // Parse the generated reference's fences as Markdown does: a closing run
+    // must be at least as long as the opening run. Inner triple fences are
+    // content of the four-backtick Markdown example.
+    let mut open = None;
+    for (line_number, line) in rendered.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let ticks = trimmed.chars().take_while(|c| *c == '`').count();
+        if ticks < 3 {
+            continue;
+        }
+        match open {
+            None => open = Some((ticks, line_number + 1)),
+            Some((length, _)) if ticks >= length && trimmed[ticks..].trim().is_empty() => {
+                open = None;
+            }
+            Some(_) => {}
+        }
+    }
+    assert_eq!(open, None, "all generated code fences close");
+}
+
+#[test]
 fn a_frontmatter_change_changes_the_generated_reference() {
     let binary = Definitions::binary();
     let before = fields_reference(&binary).expect("generates");
@@ -438,6 +491,8 @@ fn the_worked_example_checks_renders_and_its_cases_hold() {
         step_id: "preview".into(),
         context_settings: None,
         profile: None,
+        model_base_url: None,
+        preview_helpers: false,
     })
     .expect("atomic render works");
 

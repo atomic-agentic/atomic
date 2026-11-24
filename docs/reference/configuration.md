@@ -46,7 +46,7 @@ setting by setting.
 | 2 | Your own configuration: `$XDG_CONFIG_HOME/atomic/config.yaml`, by default `~/.config/atomic/config.yaml` | you, on this machine | yes |
 | 3 | `atomic.yaml` | the project, committed | yes |
 | 4 | `atomic.local.yaml`, personal and not committed | whoever holds the checkout | yes |
-| 5 | `atomic.<profile>.yaml`, when a profile is named | the project | the loader supports it; **nothing selects a profile yet** |
+| 5 | `atomic.<profile>.yaml`, when a profile is named | the project | yes |
 | 6 | `ATOMIC_*` environment variables | whoever runs the command | yes |
 | 7 | Command-line flags | whoever runs the command | yes |
 
@@ -77,11 +77,28 @@ this user when the environment names no absolute one. A relative
 `XDG_CONFIG_HOME` names no directory and gives way to `HOME`, as the XDG rule
 says.
 
-Selecting a configuration profile is planned. The loader reads
-`atomic.<profile>.yaml` when a profile is named and refuses the run when the
-file is missing, but no command names one yet. The `--profile` flag on
-`atomic render` names a *context* profile, which is a different thing; see
-[atom files](atom-files.md#context-schemas).
+Set `ATOMIC_PROFILE=nightly` or pass `--profile nightly` to `atomic config`,
+`check`, `run`, `eval`, `serve` or `runs resume`. The flag wins over the
+variable; `--profile ''` clears a variable's selection. Atomic reads
+`atomic.nightly.yaml` beside the resolved project's manifest, after
+`atomic.local.yaml` and before environment variables and setting flags.
+Run from a workspace member to select that member's profile file. `check`
+validates the selected profile of the root and every member. A selected file
+must exist; the error says where to create it. On Linux and macOS it must be
+a regular file: symlinks, even to another file in the project, are refused
+by the read itself. Other platforms refuse selected profiles until they have
+a secure file reader. Profile names start with a
+lowercase ASCII letter and use lowercase letters and digits, with single `-`
+or `_` separators. `local` is reserved for `atomic.local.yaml`.
+
+`config --explain` names the selected profile and where it came from, and
+attributes each resolved setting to its file, variable or flag. A profile is
+a project file: it cannot choose the operator's database URL or API key
+variable, and the operator's budget caps still bind it. `serve` and `runs
+resume` resolve a profile for their current process and store selection;
+they do not replace the public context already recorded for a finished step.
+The `--profile` flag on `atomic render` currently names a *context* profile,
+which is a different input; see [atom files](atom-files.md#context-schemas).
 
 ### How files merge
 

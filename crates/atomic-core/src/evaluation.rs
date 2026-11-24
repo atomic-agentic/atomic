@@ -29,6 +29,17 @@ fn options(
     step_id: Option<&str>,
     run_id: &str,
 ) -> Result<Value, String> {
+    // The atom's compiled contract says whether a public context belongs to
+    // this scorer call, and the two must agree exactly: a binding that reads a
+    // context never runs with one simply absent, and a snapshot is refused for
+    // an atom that declares no context to check it against.
+    let declared = atom.program.contracts.get("Context").is_some();
+    if !declared && snapshot.is_some() {
+        return Err("this atom declares no public context".into());
+    }
+    if declared && snapshot.is_none() {
+        return Err("context snapshot required".into());
+    }
     if let Some(snapshot) = snapshot {
         snapshot.verify_for(&atom.program.hash(), run_id)?;
     }
@@ -109,6 +120,123 @@ pub fn aggregate(atom: &Atom, scorer: &str, scores: &[f64]) -> Result<Value, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atom::Atom;
+    use crate::atom::tests::{CONTEXT, EXPLICIT_CONTEXT, PER_ATOM, frozen, written};
+
+    /// An atom whose scorer binding reads `context.profile`, and nothing else
+    /// of the context, with `context` saying whether the atom declares one.
+    fn scoring(imports: &str, annotation: &str, context: bool) -> Atom {
+        let (declared, binding) = if context {
+            (
+                format!("context:{CONTEXT},"),
+                "({input, context}) => ({text: input.text + context.profile})",
+            )
+        } else {
+            (String::new(), "({input}) => ({text: input.text})")
+        };
+        let root = written(
+            "{input.text}",
+            imports,
+            annotation,
+            &format!(
+                "{{{declared}judges:{{reviewer:{{\
+                 input:{{type:'object',additionalProperties:false,required:['text'],properties:{{text:{{type:'string',maxLength:8}}}}}},\
+                 output:{{type:'object',additionalProperties:false,required:['ok'],properties:{{ok:{{type:'boolean'}}}}}}}}}},\
+                 scorers:{{quality:{{judge:'reviewer',with:{binding},score:({{judge}}) => judge.ok ? 1 : 0,min_mean:0.75}}}}}}"
+            ),
+        );
+        crate::atom::load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect("scorer loads")
+    }
+
+    /// A scorer binding that reads the atom's public context is refused when no
+    /// snapshot came, and runs against the snapshot's values when one did —
+    /// under both spellings of the configuration type. A snapshot is refused
+    /// for an atom that declares no context, rather than bound with nothing to
+    /// check it against.
+    #[test]
+    fn a_scorer_binding_agrees_with_what_the_atom_declares() {
+        for (imports, annotation) in [EXPLICIT_CONTEXT, PER_ATOM] {
+            let atom = scoring(imports, annotation, true);
+            let input = json!({"text":"abc"});
+            let output = json!({"ticket":"ABC-1"});
+            let case = json!({"ok":true});
+            let values = Evaluation {
+                run_id: "scorer-run",
+                input: &input,
+                output: &output,
+                case: &case,
+                snapshot: None,
+                step_id: None,
+            };
+            assert_eq!(
+                judge_input(&atom, &Registry::new(), "quality", &values)
+                    .expect_err("a binding that reads a context with no snapshot"),
+                "context snapshot required",
+                "{annotation}"
+            );
+            assert_eq!(
+                judge_score(
+                    &atom,
+                    "quality",
+                    &json!({"ok": true}),
+                    None,
+                    None,
+                    "scorer-run"
+                )
+                .expect_err("a score with no snapshot"),
+                "context snapshot required",
+                "{annotation}"
+            );
+            let snapshot = frozen(&atom, "scorer-run", json!({}));
+            let values = Evaluation {
+                run_id: "scorer-run",
+                snapshot: Some(&snapshot),
+                ..values
+            };
+            // `test` is the profile the settings resolve: the binding read the
+            // snapshot rather than an absent `context`.
+            assert_eq!(
+                judge_input(&atom, &Registry::new(), "quality", &values).expect("binding"),
+                json!({"text":"abctest"}),
+                "{annotation}"
+            );
+            assert_eq!(
+                judge_score(
+                    &atom,
+                    "quality",
+                    &json!({"ok": true}),
+                    Some(&snapshot),
+                    None,
+                    "scorer-run",
+                )
+                .expect("score"),
+                1.0
+            );
+            // The same atom with its context declaration removed: its binding
+            // names no context, and the snapshot it brought is refused.
+            let plain = scoring(crate::atom::tests::PER_ATOM.0, "Config", false);
+            assert!(plain.context.is_none());
+            assert_eq!(
+                judge_input(
+                    &plain,
+                    &Registry::new(),
+                    "quality",
+                    &Evaluation {
+                        run_id: "scorer-run",
+                        input: &input,
+                        output: &output,
+                        case: &case,
+                        snapshot: Some(&snapshot),
+                        step_id: None,
+                    },
+                )
+                .expect_err("a snapshot for an atom that declares no context"),
+                "this atom declares no public context",
+                "{annotation}"
+            );
+        }
+    }
 
     #[test]
     fn judge_boundaries_enforce_full_schemas_and_thresholds() {

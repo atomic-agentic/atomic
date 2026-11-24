@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import ts from 'typescript';
-import sourceMap from 'source-map-js';
+import { originalPosition } from '#astro-source-map';
 import { convertToTSX } from '@astrojs/compiler';
 import libs from './typescript-libs.json' with { type: 'json' };
 import { FenceError, literalFences } from './fences.mjs';
@@ -13,8 +13,8 @@ export async function typecheck(sources, declarations, sourcePaths = {}) {
     let fenced;
     try { fenced = literalFences(text); } catch (cause) { if (!(cause instanceof FenceError)) throw cause; fenced = text; }
     const result = await convertToTSX(fenced, { filename: name });
-    maps.set(`${name}.tsx`, new sourceMap.SourceMapConsumer(result.map));
-    files.set(`${name}.tsx`, result.code.replace('/* @jsxImportSource astro */', ''));
+    maps.set(`${name}.tsx`, originalPosition(result, fenced));
+    files.set(`${name}.tsx`, result.code.replace('/* @jsxImportSource astro */', (text) => ' '.repeat(text.length)));
   }
   for (const [name, text] of Object.entries(libs)) files.set(`/__lib/${name}`, text);
   files.set('/__lib/atomic.d.ts', `
@@ -24,7 +24,25 @@ declare function Fragment(props: {children?: unknown; slot?: string}): JSX.Eleme
 // A component with no Props sees the ambient Astro global, as in Astro.
 declare const Astro: Readonly<import('astro').AstroGlobal<Record<string, unknown>>>;
 `);
-  for (const [name, text] of Object.entries(declarations)) files.set(name, text);
+  for (const [name, text] of Object.entries(declarations)) {
+    // Editors need a wildcard for Markdown imports. In a frozen compile only
+    // individually captured Markdown resolves through rawDeclaration below.
+    files.set(name, name.endsWith('/.atomic/types/raw-imports.d.ts') ? '' : text);
+  }
+  // A literal Markdown import — `import examples from './examples.md?raw'` — is
+  // a string, to the author, to the stock editor and here. Each one the sources
+  // ask for gets a module declaration of its own, and only when that Markdown
+  // is among the captured sources. The Markdown itself is never read as
+  // TypeScript: it is not a program file, and its contents are never parsed.
+  const rawModules = new Map();
+  const rawDeclaration = (requested) => {
+    if (!rawModules.has(requested)) {
+      const name = `/__raw/${rawModules.size}.d.ts`;
+      files.set(name, 'declare const literal: string;\nexport default literal;\n');
+      rawModules.set(requested, name);
+    }
+    return rawModules.get(requested);
+  };
   const options = { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, jsx: ts.JsxEmit.Preserve, skipLibCheck: true, allowImportingTsExtensions: true };
   const host = {
     getSourceFile: (name, language) => files.has(name) ? ts.createSourceFile(name, files.get(name), language, true, name.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS) : undefined,
@@ -37,6 +55,14 @@ declare const Astro: Readonly<import('astro').AstroGlobal<Record<string, unknown
       const parts = `${containing.slice(0, containing.lastIndexOf('/'))}/${specifier}`.split('/'), out = [];
       for (const part of parts) { if (part === '..') out.pop(); else if (part && part !== '.') out.push(part); }
       const requested = '/' + out.join('/');
+      // `?raw` is a query, not part of any file's name: the file behind the
+      // import is the Markdown beside it, and what the import holds is its text.
+      if (requested.endsWith('.md?raw')) {
+        const markdown = requested.slice(0, -'?raw'.length);
+        const source = sourcePaths[markdown] ?? markdown;
+        if (!files.has(source)) return undefined;
+        return { resolvedFileName: rawDeclaration(requested), extension: ts.Extension.Dts, isExternalLibraryImport: false };
+      }
       const base = sourcePaths[requested] ?? requested;
       const resolvedFileName = [base + '.tsx', base + '.d.ts', base + '.ts', base].find((name) => files.has(name));
       if (!resolvedFileName) return undefined;
@@ -50,7 +76,7 @@ declare const Astro: Readonly<import('astro').AstroGlobal<Record<string, unknown
   if (!errors.length) return;
   const diagnostics = errors.slice(0, 12).map((diagnostic) => {
     const at = diagnostic.file?.getLineAndCharacterOfPosition(diagnostic.start ?? 0);
-    const original = at && maps.get(diagnostic.file.fileName)?.originalPositionFor({ line: at.line + 1, column: at.character });
+    const original = at && maps.get(diagnostic.file.fileName)?.(at, diagnostic.start ?? 0);
     const file = original?.line ? diagnostic.file.fileName.replace(/\.tsx$/, '') : diagnostic.file?.fileName ?? 'types';
     const line = original?.line ?? (at?.line ?? 0) + 1;
     const column = (original?.column ?? at?.character ?? 0) + 1;

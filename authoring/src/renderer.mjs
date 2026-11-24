@@ -225,17 +225,40 @@ export async function compile(file, options = {}) {
   // Every helper graph the atom's components import, keyed by capture digest.
   const captures = new Map();
   const captureState = { cache: new Map(), modules: 0, bytes: 0 };
+  // Every authored source read so far, keyed by canonical path, so a source
+  // the graph reaches more than once is read and counted once.
+  const texts = new Map();
   let sourceBytes = 0;
   let componentCount = 0;
-  async function load(target, stack = []) {
+  let literalCount = 0;
+  // An authored source under the project root, read once, under the size
+  // limits. Components and literal Markdown imports both ask through here, so
+  // the host's source discovery sees one shape of request for either.
+  async function readUnderRoot(target, what) {
     const canonical = await realpath(target);
-    if (canonical !== root && !canonical.startsWith(root + path.sep)) throw new Error('component escapes project root');
-    if (stack.includes(canonical)) throw new Error('component import cycle');
-    if (cache.has(canonical)) return cache.get(canonical);
-    if (stack.length >= 32 || ++componentCount > 128) throw new Error('component graph limit exceeded');
+    if (canonical !== root && !canonical.startsWith(root + path.sep)) throw new Error(`${what} escapes project root`);
+    if (texts.has(canonical)) return { canonical, text: texts.get(canonical) };
     const text = await readFile(canonical, 'utf8');
     sourceBytes += text.length;
     if (text.length > 262144 || sourceBytes > 1048576) throw new Error('source size limit exceeded');
+    texts.set(canonical, text);
+    return { canonical, text };
+  }
+  // A literal Markdown import: `import examples from './examples.md?raw'`.
+  // The file's text is bound as an authored string and nothing else happens
+  // to it — no Astro parse, no Markdown rendering, no entity decoding, no
+  // helper runtime — so pasted JSON and TypeScript keep their braces, tags,
+  // generics, whitespace and fence delimiters, and the stock Astro editor
+  // reads the import as the string it is.
+  async function literalMarkdown(target) {
+    if (++literalCount > 128) throw new Error('component graph limit exceeded');
+    return (await readUnderRoot(target, 'literal Markdown')).text;
+  }
+  async function load(target, stack = []) {
+    const { canonical, text } = await readUnderRoot(target, 'component');
+    if (stack.includes(canonical)) throw new Error('component import cycle');
+    if (cache.has(canonical)) return cache.get(canonical);
+    if (stack.length >= 32 || ++componentCount > 128) throw new Error('component graph limit exceeded');
     if (options.production && /@ts-(?:ignore|nocheck|expect-error)/.test(text)) throw new Error('TypeScript diagnostic suppression is not allowed in atom sources');
     let fenced;
     try { fenced = literalFences(text); } catch (cause) {
@@ -263,7 +286,7 @@ export async function compile(file, options = {}) {
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
-    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map(), locals: [] };
+    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map(), literals: new Map(), locals: [] };
     const missingSources = new Set();
     const contractTypes = new Set();
     const propTypes = new Set();
@@ -297,11 +320,46 @@ export async function compile(file, options = {}) {
           // The host supplies declarations for these, such as generated schema types.
           if (specifier.startsWith('.')) unit.typeImports.push(path.resolve(path.dirname(canonical), specifier));
           if (path.resolve(path.dirname(canonical), `${specifier}.d.ts`) === `${root}/.atomic/types/${path.basename(canonical, '.atom.astro')}.d.ts`) {
-            for (const item of statement.importClause.namedBindings?.elements ?? []) if ((item.propertyName?.text ?? item.name.text) === 'Props') propTypes.add(item.name.text);
+            for (const item of statement.importClause.namedBindings?.elements ?? []) {
+              const imported = item.propertyName?.text ?? item.name.text;
+              // `Props` says the props are annotated from the schema; `Config`
+              // is the same contract `AtomConfig` names when it is imported from
+              // authoring directly, spelled through the per-atom alias.
+              if (imported === 'Props') propTypes.add(item.name.text);
+              if (imported === 'Config') contractTypes.add(item.name.text);
+            }
           }
           continue;
         }
         const clause = statement.importClause;
+        // A literal Markdown import: `import examples from './examples.md?raw'`.
+        // The file's own text is bound as an authored string, so pasted JSON and
+        // TypeScript fences reach the prompt with their braces, tags, generics,
+        // whitespace and fence delimiters intact, and the stock Astro editor sees
+        // a string instead of parsing the paste as Astro. It is the one import
+        // of a file that is never code: no Astro parse, no Markdown rendering, no
+        // entity decoding, no helper runtime, and nothing it holds is ever
+        // evaluated. The `?raw` suffix is stripped, so no `.md?raw` file exists.
+        if (specifier.endsWith('.md?raw')) {
+          if (!clause?.name || clause.namedBindings) error(unit, statement, 'a literal Markdown import is one default import: import examples from "./examples.md?raw"');
+          if (!specifier.startsWith('./') || path.isAbsolute(specifier) || specifier.split('/').includes('..')) error(unit, statement, 'a literal Markdown import is a project-local relative path, written ./<name>.md?raw');
+          let text = null;
+          try {
+            text = await literalMarkdown(path.resolve(path.dirname(canonical), specifier.slice(0, -'?raw'.length)));
+          } catch (cause) {
+            if (!cause.sources) throw cause;
+            // Still being discovered: the host asks for the file below, and this
+            // compile runs again with its bytes in the request.
+            for (const source of cause.sources) missingSources.add(source);
+          }
+          // A string, never branded data: the file is authored project source,
+          // and `emit` appends authored text to the developer turn byte for byte.
+          if (text !== null) {
+            if (unit.literals.has(clause.name.text)) error(unit, statement, `duplicate literal ${clause.name.text}`);
+            unit.literals.set(clause.name.text, text);
+          }
+          continue;
+        }
         // Named value imports of a local module are helpers: `./helpers/review`
         // (as editors resolve it without a tsconfig) or `./helpers/review.ts`.
         if (specifier.startsWith('.') && !specifier.endsWith('.astro') && clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
@@ -324,7 +382,7 @@ export async function compile(file, options = {}) {
           }
           continue;
         }
-        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components and named imports of local .ts helpers are supported');
+        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components, named imports of local .ts helpers and default imports of local .md?raw literals are supported');
         try {
           const imported = await load(path.resolve(path.dirname(canonical), specifier), [...stack, canonical]);
           unit.imports.set(statement.importClause.name.text, imported);
@@ -355,6 +413,13 @@ export async function compile(file, options = {}) {
             const overrides = typed ? contractConfig(declaration.initializer, unit) : literal(declaration.initializer, unit);
             if (overrides === null || Array.isArray(overrides) || typeof overrides !== 'object') error(unit, null, 'config must be a plain object');
             unit.config = Object.assign(Object.create(null), defaults, overrides);
+            // A `context` schema written in the config is a declaration even
+            // when nothing in the template reads it: the validator or scorer
+            // that reads `context` needs the snapshot. `null` is how the
+            // authoring contract spells "the sidecar beside the atom decides",
+            // which only the host's compiled contract can answer, so a null is
+            // no requirement here.
+            if (typed && unit.config.context !== undefined && unit.config.context !== null) unit.requiresContext = true;
           } else if (declaration.initializer && (ts.isIdentifier(declaration.name) || ts.isObjectBindingPattern(declaration.name))) {
             // An interpreted local, evaluated in order when the component renders.
             if (declaration.initializer.getText(script) === 'Astro.props') error(unit, null, 'destructure Astro.props in the declaration');
@@ -365,6 +430,13 @@ export async function compile(file, options = {}) {
         }
       } else error(unit, statement, `unsupported script statement: ${ts.SyntaxKind[statement.kind]}; script code is never executed`);
     } catch (cause) { throw relocate(unit, statement, cause); }
+    // A literal's name is a frontmatter binding like a component's: the body
+    // reads it by name, so it may not be a second binding of a name already
+    // taken by a component, a helper, an intrinsic or a bound prop.
+    for (const name of unit.literals.keys()) {
+      if (unit.imports.has(name) || unit.helpers.has(name) || unit.intrinsics.has(name)
+        || unit.bindings.some((binding) => (binding.local ?? binding.prop) === name)) error(unit, null, `duplicate literal ${name}`);
+    }
     if (missingSources.size) {
       const error = new Error('missing sources'); error.sources = [...missingSources]; throw error;
     }
@@ -634,8 +706,17 @@ function plainEntries(values) {
     return [key, descriptor.value];
   });
 }
+// Whether this compiled atom reads the public context anywhere: a declared
+// schema (its fifth `AtomConfig` type argument, a `context` schema in its
+// config, or what the host reported of its compiled contract), or a `context`
+// prop bound in a template. Every boundary that runs an interpreted callback
+// asks the same question, so a missing snapshot is one refusal — an operation
+// error, never a repairable rejection built on a value that is not there.
+export function needsContext(unit) {
+  return unit.requiresContext === true || unit.bindings.some((binding) => binding.prop === 'context');
+}
 function executionContext(unit, values, { contextSnapshot, stepId } = {}) {
-  if (unit.requiresContext && !contextSnapshot) throw new Error('context snapshot required');
+  if (!contextSnapshot && needsContext(unit)) throw new Error('context snapshot required');
   return contextSnapshot ? { ...values, context: contextForStep(contextSnapshot, stepId) } : values;
 }
 // A rejection that depends on the model's answer is a failed validation, which
@@ -690,7 +771,8 @@ export function render(unit, input, { runId, origin = 'external', origins, conte
   runId ??= contextSnapshot?.runId ?? 'spike-run';
   const result = { developer: '', user: '', bindings: [] };
   const budget = { remaining: 10_000, depth: 0 };
-  const seen = new Set();
+  const seen = new Map();
+  const suffixes = new Set();
   let nonce;
   function emit(value) {
     if (Array.isArray(value)) { for (const item of value) emit(item); return; }
@@ -699,22 +781,31 @@ export function render(unit, input, { runId, origin = 'external', origins, conte
       if (value.quiet) return;
       if (value.value === undefined) throw new Error(`cannot interpolate missing value ${value.at}`);
       const text = typeof value.value === 'string' ? value.value : JSON.stringify(value.value);
-      // The suffix depends on every bound value, so a payload cannot contain the
-      // wrapper of another binding: it would have to contain its own hash.
-      let suffix, counter = 0;
-      do { suffix = createHash('sha256').update(`${nonce}\0${value.at}\0${counter++}`).digest('hex').slice(0, 16); } while (text.includes(`data-${suffix}`));
-      result.developer += `[${value.at}: see <data-${suffix}> in the user turn]`;
-      if (!seen.has(value.at)) {
-        seen.add(value.at);
+      // A loop can evaluate one source path to different values. Bind each
+      // distinct path, origin and text once, with its own delimiter; only an
+      // exact repeat shares the earlier user binding.
+      const binding = JSON.stringify([value.at, value.origin, text]);
+      let suffix = seen.get(binding);
+      if (suffix === undefined) {
+        let counter = 0;
+        do {
+          suffix = createHash('sha256').update(`${nonce}\0${binding}\0${counter++}`).digest('hex').slice(0, 16);
+        } while (suffixes.has(suffix) || text.includes(`data-${suffix}`));
+        seen.set(binding, suffix);
+        suffixes.add(suffix);
         result.user += `<data-${suffix} path="${value.at}" origin="${value.origin}">${text}</data-${suffix}>\n`;
         result.bindings.push({ path: value.at, origin: value.origin });
       }
+      result.developer += `[${value.at}: see <data-${suffix}> in the user turn]`;
     } else if (value !== false && value != null) result.developer += String(value);
     if (result.developer.length + result.user.length > 1_048_576) throw new Error('prompt size limit exceeded');
   }
   function run(component, props, slots) {
     if (++budget.depth > 32) throw new Error('component depth limit exceeded');
     const scope = Object.create(null);
+    // A literal Markdown import's text: authored prompt content, so it is a
+    // plain string and goes to the developer turn as it was written.
+    for (const [name, text] of component.literals) scope[name] = text;
     for (const binding of component.bindings) {
       const value = raw(props[binding.prop]) === undefined ? binding.fallback : props[binding.prop];
       if (binding.pattern) bind(binding.pattern, value, scope); else scope[binding.local] = value;
@@ -742,7 +833,7 @@ export function render(unit, input, { runId, origin = 'external', origins, conte
       }
     }
   }
-  if ((unit.requiresContext || unit.bindings.some((binding) => binding.prop === 'context')) && !contextSnapshot) throw new Error('context snapshot required');
+  if (needsContext(unit) && !contextSnapshot) throw new Error('context snapshot required');
   // Per-field origins, as a workflow's bindings assign them; the input as a
   // whole is as trusted as its least trusted field.
   let fields;

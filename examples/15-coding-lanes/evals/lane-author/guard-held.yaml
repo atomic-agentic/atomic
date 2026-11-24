@@ -1,0 +1,9 @@
+input:
+  task:
+    title: Refuse a review finding that has no host record
+    guard: lane_guard_refuses_unverified fails when the guard line is replaced
+  base: 8b1e2c3d4f5a69708192a3b4c5d6e7f8091a2b3c
+expect:
+- output.files_changed.exists(f, f == 'tools/lane_guard.py')
+- output.tests_run.all(t, t.passed == true)
+- output.tests_run.size() >= 1

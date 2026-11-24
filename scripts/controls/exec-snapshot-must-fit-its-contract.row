@@ -1,0 +1,1 @@
+exec-snapshot-must-fit-its-contract|crates/atomic-core/src/runtime.rs|        if let Some(why) = context_misfit(atom, schema, &record.as_value()["context"])? {|        if let Some(why) = std::option::Option::<String>::None {|-p atomic-agentic-core --lib -- runtime::tests::an_exec_atom_brought_context_that_fails_its_contract_is_refused_before_its_command

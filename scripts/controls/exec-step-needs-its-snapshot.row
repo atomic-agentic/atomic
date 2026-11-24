@@ -1,0 +1,1 @@
+exec-step-needs-its-snapshot|crates/atomic-core/src/runtime.rs|    if declared.is_some() && snapshot.is_none() {|    if /*CONTROL_OFF*/ false && declared.is_some() && snapshot.is_none() {|-p atomic-agentic-core --lib -- runtime::tests::a_contextual_exec_atom_brought_no_snapshot_is_refused_before_its_command

@@ -1,0 +1,3 @@
+{
+  "diff": "diff --git a/tools/lane_guard.py b/tools/lane_guard.py\n--- a/tools/lane_guard.py\n+++ b/tools/lane_guard.py\n@@ -40,6 +40,8 @@ def decide(finding):\n     findings = [claim]\n+    # The control row switches this line.\n+    if findings and not verified(verification):\n         return {\"confirmed\": False, \"claim\": claim, \"reason\": \"unverified finding\"}"
+}

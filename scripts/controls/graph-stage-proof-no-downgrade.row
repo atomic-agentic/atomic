@@ -1,0 +1,1 @@
+graph-stage-proof-no-downgrade|crates/atomic-graph/src/transactional_claim.rs|ON CONFLICT(item_id,sha) DO NOTHING /* staged host SHA */|ON CONFLICT(item_id,sha) DO UPDATE SET indexed=0,on_branch=0 /* staged host SHA */|-p atomic-agentic-graph --test epic_run staged_graph_commit_needs_exact_host_branch_proof_and_never_downgrades_it

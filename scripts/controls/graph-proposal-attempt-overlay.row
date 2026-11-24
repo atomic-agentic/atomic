@@ -1,0 +1,1 @@
+graph-proposal-attempt-overlay|crates/atomic-graph/src/proposal.rs|if caller != &self.attempt {|if false {|-p atomic-agentic-graph --lib proposal::tests::same_attempt_sees_provisional_create_edge_note_and_close_intent

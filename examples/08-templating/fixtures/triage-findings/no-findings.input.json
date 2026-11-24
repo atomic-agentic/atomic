@@ -1,0 +1,10 @@
+{
+  "item": {
+    "id": "nt-9",
+    "title": "Nothing to change in this slice",
+    "criteria": [
+      "No new behaviour is claimed, so no new test is asked for."
+    ]
+  },
+  "findings": []
+}

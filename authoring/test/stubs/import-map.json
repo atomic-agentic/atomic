@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "@astrojs/compiler": "./compiler.mjs",
+    "typescript": "./typescript.mjs",
+    "source-map-js": "./source-map.mjs"
+  }
+}

@@ -1,0 +1,126 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [items, decisions, controls]
+properties:
+  items:
+    type: object
+    additionalProperties: false
+    required: ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
+    properties:
+      "1":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "2":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "3":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "4":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "5":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "6":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "7":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "8":
+        type: string
+        minLength: 1
+        maxLength: 2000
+      "9":
+        type: string
+        minLength: 1
+        maxLength: 2000
+        description: The decision points. With none declared, a specific "N/A:" reason.
+      "10":
+        type: string
+        minLength: 1
+        maxLength: 2000
+        description: The control rows. With none selected, a specific "N/A:" reason.
+  decisions:
+    type: array
+    maxItems: 16
+    items:
+      type: object
+      additionalProperties: false
+      required:
+      - point
+      - allow_refuse
+      - not_found
+      - permission_denied
+      - link_loop
+      - not_directory
+      - other_io
+      - parse_error
+      - timeout
+      - empty_result
+      properties:
+        point:
+          type: string
+          minLength: 1
+          maxLength: 200
+        allow_refuse:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        not_found:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        permission_denied:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        link_loop:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        not_directory:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        other_io:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        parse_error:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        timeout:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        empty_result:
+          type: string
+          minLength: 1
+          maxLength: 2000
+  controls:
+    type: array
+    maxItems: 16
+    items:
+      type: object
+      additionalProperties: false
+      required: [row, result]
+      properties:
+        row:
+          type: string
+          minLength: 1
+          maxLength: 100
+        result:
+          type: string
+          minLength: 1
+          maxLength: 2000

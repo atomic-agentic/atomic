@@ -1,0 +1,1 @@
+graph-proposal-full-schema|crates/atomic-graph/src/proposal.rs|validate_argument_schema(&raw)?;|// validate_argument_schema(&raw)?;|-p atomic-agentic-graph --lib raw_tool_arguments_obey_the_exported_full_schema

@@ -1,0 +1,1 @@
+graph-epic-binding-state|crates/atomic-graph/src/transactional_claim.rs|if held.text("state")? != "active" {|if false {|-p atomic-agentic-graph --test epic_run invalidated_epic_binding_stays_fenced_after_operator_repins

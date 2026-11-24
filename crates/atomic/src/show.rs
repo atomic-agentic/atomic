@@ -14,7 +14,7 @@ use anyhow::Context;
 use atomic_app::pipeline::LAYOUT_VERSION;
 use atomic_durable::gate::{self, GateFilter};
 use atomic_durable::history;
-use atomic_durable::{DurableRuntime, Durare, RunStatus};
+use atomic_durable::{DurableRuntime, Durare, Param, RunStatus};
 use clap::Args;
 use serde_json::{Value, json};
 
@@ -145,7 +145,30 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
     let workflow = record.input["pipeline"]["name"]
         .as_str()
         .map_or_else(|| record.workflow.clone(), str::to_owned);
-    Ok(Some(json!({
+    let graph = if let Some(epic) = record.input.get("epic").and_then(Value::as_str) {
+        let (epic, run) = (epic.to_owned(), id.to_owned());
+        Some(rt.read_transaction(move |mut tx| {
+            let (epic, run) = (epic.clone(), run.clone());
+            Box::pin(async move {
+                let row = tx.query_opt(
+                    "SELECT i.status AS epic_status,b.state AS binding_state FROM atomic_graph_items i \
+                     LEFT JOIN atomic_graph_epic_runs b ON b.epic_id=i.id AND b.run_id=? WHERE i.id=?",
+                    &[Param::Text(run), Param::Text(epic.clone())],
+                ).await?;
+                Ok(match row {
+                    Some(row) => json!({
+                        "epic": epic,
+                        "epic_status": row.text("epic_status")?,
+                        "binding": row.text_opt("binding_state")?.unwrap_or_else(|| "not_bound".into()),
+                    }),
+                    None => json!({"epic": epic, "epic_status": "missing", "binding": "not_bound"}),
+                })
+            })
+        }).await?)
+    } else {
+        None
+    };
+    let mut document = json!({
         "run": record.id,
         "workflow": workflow,
         "status": status_word(&record.status),
@@ -159,7 +182,11 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
         "usage": usage,
         "gates": gates,
         "threads": threads,
-    })))
+    });
+    if let Some(graph) = graph {
+        document["graph"] = graph;
+    }
+    Ok(Some(document))
 }
 
 /// The kind of the atom whose published checkpoint `checkpoint` is, from the
@@ -232,6 +259,16 @@ fn render(doc: &Value) -> String {
         attempts.len(),
         if attempts.len() == 1 { "" } else { "s" }
     ));
+    if let Some(epic) = doc["graph"]["epic"].as_str() {
+        let binding = doc["graph"]["binding"].as_str().unwrap_or("not_bound");
+        let status = doc["graph"]["epic_status"].as_str().unwrap_or("missing");
+        out.push_str(&format!(
+            "graph epic {}: run binding {}, epic item {}\n",
+            plain(epic),
+            plain(binding),
+            plain(status)
+        ));
+    }
     if let Some(why) = doc["error"].as_str() {
         out.push_str(&format!("error: {}\n", plain(why)));
     }
@@ -345,6 +382,27 @@ pub async fn show(
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
+
+    #[test]
+    fn graph_binding_is_named_without_claiming_the_epic_item_closed() {
+        let mut doc = json!({
+            "run": "r1", "workflow": "work", "status": "succeeded", "error": null,
+            "input": {}, "output": null, "attempts": [], "steps": [],
+            "usage": {"calls": 0, "input_tokens": 0, "output_tokens": 0},
+            "gates": [], "threads": []
+        });
+        assert!(
+            !super::render(&doc).contains("graph epic"),
+            "static display stays unchanged"
+        );
+        doc["graph"] = json!({"epic": "at-epic", "binding": "done", "epic_status": "pinned"});
+        let shown = super::render(&doc);
+        assert!(
+            shown.contains("graph epic at-epic: run binding done, epic item pinned"),
+            "{shown}"
+        );
+        assert!(!shown.contains("epic item closed"));
+    }
 
     #[test]
     fn what_a_run_recorded_cannot_drive_the_terminal() {

@@ -82,11 +82,40 @@ of what a model returned.
 
 ## Preview the prompt and the cost
 
-Before a live run, `atomic render <file.atom.astro> --input <file.json>` prints the exact
-prompt for an input without calling a model. Review its separate developer/user
-parts when changing instructions or shared components. Persisted prompt snapshots
-and regression comparison remain planned; the current check command validates
-source, types, schemas and declared examples. See [prompt components](template-tags.md).
+Before a live run, `atomic render <file.atom.astro> --input <file.json>` prints the
+developer and user messages without calling a model. For a model atom without
+public context or TypeScript helpers, the preview includes the backend's final
+developer instructions. It resolves settings without contacting a local model
+discovery endpoint, so a Codex preview needs an explicitly configured endpoint.
+Use `--profile <name>` when the run will select that profile.
+Use `--model-base-url <url>` when the run will override its configured endpoint.
+For a helper-backed atom, `atomic render` refuses a preview without the step's
+recorded clock. `--preview-helpers` allows inspection with a fresh clock and
+labels the result as a preview that may differ from the live prompt. Do not
+save that output as a prompt snapshot.
+Review both parts when changing instructions or shared components.
+
+To check a prompt, place each input at
+`fixtures/<atom>/<case>.input.json` and save the exact command output at
+`snapshots/<atom>__<case>.prompt.json` in the project directory. For example:
+
+```sh
+atomic render atoms/summarize-note.atom.astro \
+  --input fixtures/summarize-note/ordinary.input.json \
+  > snapshots/summarize-note__ordinary.prompt.json
+atomic check
+```
+
+Once a checked atom has a prompt snapshot, `atomic check` requires one for every
+input fixture under that atom's directory and rejects its snapshots without a
+fixture. Snapshots for names that are not checked atoms are outside this check.
+It compares the rendered bytes, including separate roles and the final newline.
+Use the same profile and configured model endpoint when authoring and checking a
+Codex snapshot. `atomic check` has no endpoint override flag; configure the
+endpoint through a profile or project setting for snapshots. Contextual prompt
+snapshots need a frozen context manifest;
+snapshots for atoms with TypeScript helpers need a recorded step clock. Both
+are refused by `atomic check` for now. See [prompt components](template-tags.md).
 
 A script atom fetches values as a separate workflow step. Its output becomes the
 Astro model atom's ordinary typed input. Evals use committed input/output fixtures

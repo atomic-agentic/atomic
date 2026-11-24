@@ -1,0 +1,1 @@
+self-review-panel-host-preflight|crates/atomic/src/pipeline.rs|.validate(&reviewer_input)|.validate(&reviewer_input).or(Ok(()))|-p atomic-agentic --test pipeline coding_panel_preflights_nested_host_inventory_for_every_member_before_reviewers

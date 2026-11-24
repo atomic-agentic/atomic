@@ -410,6 +410,130 @@ async fn park<C: WorkflowContext>(
 ) -> Result<()> {
     let run = ctx.workflow_id().to_owned();
     let id = format!("{run}:{position}");
+    park_named(ctx, turn, id, reason, scope).await
+}
+
+/// Park a graph claim after its checkpointed acquisition is no longer the
+/// authoritative lease. `occurrence` is the number of prior releases of this
+/// claim's park in the replayed workflow. Each wait has a distinct releasable
+/// id, while replay of the same wait keeps its id. Releasing only wakes the
+/// workflow; callers must check the same acquisition again.
+pub async fn park_claim<C: WorkflowContext>(
+    ctx: &C,
+    step: &str,
+    acquisition: &str,
+    item_id: &str,
+    occurrence: u64,
+) -> Result<()> {
+    let id = format!("{}:claim:{acquisition}:{occurrence}", ctx.workflow_id());
+    park_named(
+        ctx,
+        step,
+        id,
+        format!("claim for {item_id} was taken over; revalidate before executing"),
+        Some(item_id.to_owned()),
+    )
+    .await
+}
+
+/// Park a graph work loop when work children remain but none is ready. A
+/// person releases the park after resolving a blocker or due condition; the
+/// next durable claim step then selects against the refreshed graph.
+pub async fn park_graph_pending<C: WorkflowContext>(
+    ctx: &C,
+    step: &str,
+    epic: &str,
+    occurrence: u64,
+) -> Result<()> {
+    let id = format!("{}:graph-pending:{epic}:{occurrence}", ctx.workflow_id());
+    park_named(
+        ctx,
+        step,
+        id,
+        format!("graph epic {epic} has unfinished work children, but none is ready; resolve blockers or due dates, then release this park"),
+        Some(epic.to_owned()),
+    ).await
+}
+
+/// Wait for host branch evidence for a staged graph commit. A later check
+/// uses a new occurrence, so releasing an earlier park cannot silently
+/// authorize a commit that still lacks proof.
+pub async fn park_verified_commit<C: WorkflowContext>(
+    ctx: &C,
+    step: &str,
+    item_id: &str,
+    sha: &str,
+    occurrence: u64,
+) -> Result<()> {
+    let id = format!(
+        "{}:verified-commit:{item_id}:{sha}:{occurrence}",
+        ctx.workflow_id()
+    );
+    park_named(
+        ctx,
+        step,
+        id,
+        format!(
+            "graph item {item_id} awaits host branch proof for commit {sha}; verify the branch, then release this park"
+        ),
+        Some(item_id.to_owned()),
+    )
+    .await
+}
+
+/// Park a criterion whose external execution may have happened without a
+/// trustworthy result. Releasing this park acknowledges that the operator
+/// has seen the unknown outcome; the caller then releases any graph claim and
+/// terminalizes this run without dispatching the criterion again.
+pub async fn park_criterion<C: WorkflowContext>(
+    ctx: &C,
+    step: &str,
+    criterion: &str,
+    occurrence: u64,
+) -> Result<()> {
+    let id = format!("{}:criterion:{criterion}:{occurrence}", ctx.workflow_id());
+    park_named(
+        ctx,
+        step,
+        id,
+        format!(
+            "criterion {criterion} has an unknown external outcome; reconcile it and start a fresh run"
+        ),
+        None,
+    )
+    .await
+}
+
+/// Wait for an operator after a remote delivery's effect may have happened
+/// without a recorded receipt. Releasing the park only lets the workflow
+/// reconcile/read the remote state; it never authorizes dispatch again.
+pub async fn park_delivery<C: WorkflowContext>(
+    ctx: &C,
+    step: &str,
+    slot: &str,
+    occurrence: u64,
+) -> Result<()> {
+    let id = format!("{}:delivery:{slot}:{occurrence}", ctx.workflow_id());
+    park_named(
+        ctx,
+        step,
+        id,
+        format!(
+            "remote delivery {slot} has an unknown effect outcome; reconcile the remote receipt before release"
+        ),
+        None,
+    )
+    .await
+}
+
+async fn park_named<C: WorkflowContext>(
+    ctx: &C,
+    turn: &str,
+    id: String,
+    reason: String,
+    scope: Option<String>,
+) -> Result<()> {
+    let run = ctx.workflow_id().to_owned();
     let step = format!("{}.park", turn.strip_suffix(".turn").unwrap_or(turn));
     let row = Arc::new(Park {
         id: id.clone(),
@@ -564,6 +688,33 @@ pub async fn publish_candidate<C: WorkflowContext>(
     acceptance: &Acceptance,
     preconditions: Vec<Precondition>,
 ) -> Result<Value> {
+    let candidate = Arc::new(candidate.clone());
+    let acceptance = Arc::new(acceptance.clone());
+    let preconditions = Arc::new(preconditions);
+    let step = Arc::new(name.to_owned());
+    ctx.transaction(name, move |mut tx| {
+        let candidate = candidate.clone();
+        let acceptance = acceptance.clone();
+        let preconditions = preconditions.clone();
+        let step = step.clone();
+        Box::pin(async move {
+            publish_candidate_in(&mut tx, &step, &candidate, &acceptance, &preconditions).await
+        })
+    })
+    .await
+}
+
+/// Publish inside the caller's durable transaction, so a graph workflow can
+/// close its fenced item in the same commit as the candidate's writes and
+/// publication record. The caller uses `step` as the transaction checkpoint
+/// name. Any later error rolls back all of these writes together.
+pub async fn publish_candidate_in(
+    tx: &mut Tx<'_, '_>,
+    step: &str,
+    candidate: &Candidate,
+    acceptance: &Acceptance,
+    preconditions: &[Precondition],
+) -> Result<Value> {
     if acceptance.candidate != candidate.id
         || acceptance.digest != candidate.digest
         || !acceptance.accepted
@@ -578,16 +729,7 @@ pub async fn publish_candidate<C: WorkflowContext>(
                 .unwrap_or_default()
         )));
     }
-    let candidate = Arc::new(candidate.clone());
-    let preconditions = Arc::new(preconditions);
-    let step = Arc::new(name.to_owned());
-    ctx.transaction(name, move |tx| {
-        let candidate = candidate.clone();
-        let preconditions = preconditions.clone();
-        let step = step.clone();
-        Box::pin(async move { publish_in(tx, &candidate, &step, &preconditions).await })
-    })
-    .await
+    publish_in(tx, candidate, step, preconditions).await
 }
 
 /// Run one atom as sibling durable operations: `{name}.turn` executes the
@@ -638,7 +780,7 @@ where
 }
 
 async fn publish_in(
-    mut tx: Tx<'_, '_>,
+    tx: &mut Tx<'_, '_>,
     candidate: &Candidate,
     step: &str,
     preconditions: &[Precondition],
@@ -683,15 +825,6 @@ async fn publish_in(
         )));
     }
 
-    tx.execute(
-        "CREATE TABLE IF NOT EXISTS atomic_publications (
-             publication_key TEXT PRIMARY KEY,
-             digest TEXT NOT NULL,
-             output TEXT NOT NULL
-         )",
-        &[],
-    )
-    .await?;
     let existing = tx
         .query_opt(
             "SELECT digest, output FROM atomic_publications WHERE publication_key = ?",
@@ -736,7 +869,6 @@ async fn publish_in(
             .id
             .rsplit_once(':')
             .map_or(candidate.id.as_str(), |(run, _)| run);
-        tx.execute(crate::runtime::THREADS_TABLE, &[]).await?;
         tx.execute(
             "INSERT INTO atomic_threads (candidate, run, step, thread_id) VALUES (?, ?, ?, ?)",
             &[

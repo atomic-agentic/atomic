@@ -1,31 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
-
-//! The Astro compiler's child process: the bundled worker, run on the V8
-//! that atomic embeds through `deno_core`, with no Deno installation.
-//!
-//! atomic starts itself with [`CHILD_ARG`] and a cleared environment (see
-//! `astro::worker_with` and `compiler_process`, which keep the time limit,
-//! the message limits and the kill). The child runs the worker, embedded in
-//! the binary with its WASM, under a V8 heap limit, on a host that gives it
-//! the protocol's stdin and stdout, stderr for its console, its exit status,
-//! its own WASM, random bytes, SHA-256 and timers, and nothing else: no
-//! network, environment, process or filesystem (`compiler_host/host.js`).
-//! A worker that fails to start, exceeds a limit, or calls what the host does
-//! not provide fails its compile; nothing falls back to an external Deno.
-
-use deno_core::{
-    JsRuntime, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
-    ResolutionKind, RuntimeOptions, error::ModuleLoaderError, op2, v8,
+//! The embedded authoring worker runs in a supervised child using Boa.
+use crate::js_modules::Modules;
+use boa_engine::{
+    Context, JsArgs, JsError, JsNativeError, JsResult, JsString, JsValue, Module, NativeFunction,
+    Source,
+    object::builtins::{JsArrayBuffer, JsUint8Array},
 };
-use std::io::{Read, Write};
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io::{Read, Write},
+    rc::Rc,
+};
 
+mod astro_parser;
 mod limits;
 #[cfg(test)]
 mod tests;
+mod typescript;
 
 /// The argument that makes the atomic binary serve one compiler call.
 pub const CHILD_ARG: &str = "__atomic-compiler";
@@ -34,20 +24,12 @@ pub const CHILD_ARG: &str = "__atomic-compiler";
 // are used.
 /// The bundled worker, built from `authoring/src`.
 pub(crate) static WORKER: &str = include_str!("../assets/worker.mjs");
-/// The Go-compiled Astro parser the worker loads.
-pub(crate) static WASM: &[u8] = include_bytes!("../assets/astro.wasm");
 /// What the worker may use of Deno, Node and the web platform.
 pub(crate) const HOST: &str = include_str!("compiler_host/host.js");
 
-/// The `deno_core` release the compiler runs on (Cargo.toml pins it).
-pub(crate) const DENO_CORE: &str = "deno_core 0.413.0";
-
-/// The V8 heap one compile may use.
+/// The engine heap one compile may use.
 pub(crate) const HEAP_LIMIT: usize = 1024 * 1024 * 1024;
 
-/// Where the worker is loaded from; its WASM is next to it.
-const MAIN: &str = "atomic-compiler:///worker.mjs";
-const WASM_URL: &str = "atomic-compiler:///astro.wasm";
 /// The Node modules the worker imports, served from the host.
 const NODE_MODULES: [&str; 4] = ["fs/promises", "path", "crypto", "url"];
 
@@ -62,6 +44,18 @@ pub(crate) fn command() -> Result<crate::helper_runtime::HostCommand, String> {
     })
 }
 
+/// Dispatch the private engine modes before starting the normal CLI.
+pub fn dispatch_embedded_child() {
+    let arg = std::env::args_os().nth(1);
+    if arg.as_deref() == Some(CHILD_ARG.as_ref()) {
+        std::process::exit(serve());
+    }
+    if arg.as_deref() == Some(crate::helper_runtime::CHILD_ARG.as_ref()) {
+        std::process::exit(crate::helper_runtime::serve());
+    }
+    crate::js_budget::ordinary_process();
+}
+
 /// Serves one compiler call on stdin and stdout and returns the exit status:
 /// the worker's own, 0 when it finishes, and 1 with the reason on stderr
 /// when it fails to start, throws or exceeds the heap limit.
@@ -72,7 +66,7 @@ pub fn serve() -> i32 {
 fn serve_module(source: &str, heap_limit: usize) -> i32 {
     // The memory limit follows the production heap limit whatever this
     // child's heap, so that a test's smaller heap is what stops it.
-    let status = match limits::limit_self(limits::memory_limit(HEAP_LIMIT)).and_then(|()| {
+    let status = match limits::limit_self(limits::memory_limit(heap_limit)).and_then(|()| {
         #[cfg(test)]
         tests::shorten_cpu_probe()?;
         run(source, heap_limit)
@@ -115,62 +109,6 @@ mod test_dispatch {
             }
             std::process::exit(serve());
         }
-    }
-}
-
-struct Loader;
-
-fn node_module(specifier: &str) -> Option<&'static str> {
-    let name = specifier.strip_prefix("node:")?;
-    NODE_MODULES.into_iter().find(|module| *module == name)
-}
-
-impl ModuleLoader for Loader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        kind: ResolutionKind,
-    ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        if matches!(kind, ResolutionKind::DynamicImport) {
-            return Err(ModuleLoaderError::generic(format!(
-                "the Astro compiler imports nothing dynamically, not {specifier}"
-            )));
-        }
-        if let Some(name) = node_module(specifier) {
-            return ModuleSpecifier::parse(&format!("atomic-compiler:///node/{name}"))
-                .map_err(ModuleLoaderError::from_err);
-        }
-        let url =
-            deno_core::resolve_import(specifier, referrer).map_err(ModuleLoaderError::from_err)?;
-        if url.as_str() != MAIN {
-            return Err(ModuleLoaderError::generic(format!(
-                "the Astro compiler imports only its Node modules, not {specifier}"
-            )));
-        }
-        Ok(url)
-    }
-
-    fn load(
-        &self,
-        url: &ModuleSpecifier,
-        _: Option<&ModuleLoadReferrer>,
-        _: ModuleLoadOptions,
-    ) -> ModuleLoadResponse {
-        // Only a Node module is loaded here; the worker itself is loaded
-        // from its embedded source.
-        let name = url.as_str().strip_prefix("atomic-compiler:///node/");
-        let Some(name) = name.and_then(|name| NODE_MODULES.into_iter().find(|m| *m == name)) else {
-            return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(format!(
-                "the Astro compiler has no module {url}"
-            ))));
-        };
-        ModuleLoadResponse::Sync(Ok(ModuleSource::new(
-            ModuleType::JavaScript,
-            ModuleSourceCode::String(node_source(name).into()),
-            url,
-            None,
-        )))
     }
 }
 
@@ -217,128 +155,161 @@ fn node_source(name: &str) -> String {
     source
 }
 
-/// Reads the protocol's stdin into `buffer`: the count, -1 at its end, -2 on
-/// an error.
-#[op2(fast)]
-fn op_compiler_read(#[buffer] buffer: &mut [u8]) -> i32 {
-    match std::io::stdin().lock().read(buffer) {
-        Ok(0) if !buffer.is_empty() => -1,
-        Ok(n) => i32::try_from(n).unwrap_or(-2),
-        Err(_) => -2,
-    }
-}
-
-/// Writes to the protocol's stdout and flushes: the count, or -1 on an error.
-#[op2(fast)]
-fn op_compiler_write(#[buffer] buffer: &[u8]) -> i32 {
-    let mut stdout = std::io::stdout().lock();
-    match stdout
-        .write(buffer)
-        .and_then(|n| stdout.flush().map(|()| n))
-    {
-        Ok(n) => i32::try_from(n).unwrap_or(-1),
-        Err(_) => -1,
-    }
-}
-
-/// The embedded WASM, the one file the worker reads.
-#[op2]
-#[buffer]
-fn op_compiler_wasm() -> Vec<u8> {
-    WASM.to_vec()
-}
-
-/// Ends the process with the worker's status, its output flushed.
-#[op2(fast)]
-fn op_compiler_exit(code: i32) {
-    let _ = std::io::stdout().flush();
-    std::process::exit(code);
-}
-
-/// Fills `buffer` with random bytes; the process ends if the system has none.
-#[op2(fast)]
-fn op_compiler_random(#[buffer] buffer: &mut [u8]) {
-    if getrandom::fill(buffer).is_err() {
-        eprintln!("the Astro compiler cannot read random bytes");
-        std::process::exit(1);
-    }
-}
-
-/// The SHA-256 of `data`, in hex.
-#[op2]
-#[string]
-fn op_compiler_sha256(#[buffer] data: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    format!("{:x}", Sha256::digest(data))
-}
-
-fn extension() -> deno_core::Extension {
-    deno_core::Extension {
-        name: "atomic_compiler",
-        ops: std::borrow::Cow::Owned(vec![
-            op_compiler_read(),
-            op_compiler_write(),
-            op_compiler_wasm(),
-            op_compiler_exit(),
-            op_compiler_random(),
-            op_compiler_sha256(),
-        ]),
-        ..Default::default()
-    }
-}
-
 fn run(source: &str, heap_limit: usize) -> Result<(), String> {
-    let tokio = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
+    crate::js_budget::enter(heap_limit, heap_limit);
+    let modules = Rc::new(Modules::default());
+    let mut context = Context::builder()
+        .module_loader(modules.clone())
         .build()
-        .map_err(|e| format!("cannot start the Astro compiler: {e}"))?;
-    let _entered = tokio.enter();
-    let mut runtime = JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(Loader)),
-        extensions: vec![extension()],
-        create_params: Some(v8::CreateParams::default().heap_limits(0, heap_limit)),
-        ..Default::default()
-    });
-    // At the heap limit the compile is ended, given room to unwind rather
-    // than abort, and reported as the limit it hit.
-    let exhausted = Arc::new(AtomicBool::new(false));
-    let handle = runtime.v8_isolate().thread_safe_handle();
-    let flag = exhausted.clone();
-    runtime.add_near_heap_limit_callback(move |current, initial| {
-        flag.store(true, Ordering::Release);
-        handle.terminate_execution();
-        current
-            .saturating_add(initial / 4)
-            .min(initial.saturating_mul(2))
-            .max(current)
-    });
-    let failed = |error: &dyn std::fmt::Display| {
-        if exhausted.load(Ordering::Acquire) {
-            "the Astro compiler exceeded its memory limit".to_owned()
-        } else {
-            format!("the Astro compiler failed: {error}")
+        .map_err(|e| e.to_string())?;
+    let result = (|| -> JsResult<()> {
+        for (name, arity, op) in [
+            (
+                "op_compiler_parse_astro",
+                1,
+                parse as boa_engine::native_function::NativeFunctionPointer,
+            ),
+            ("op_compiler_typescript", 4, typescript::op),
+            ("op_compiler_tsx", 2, tsx),
+            ("op_compiler_read", 1, read),
+            ("op_compiler_write", 1, write),
+            ("op_compiler_sha256", 1, hash),
+            ("op_compiler_encode", 1, encode),
+            ("op_compiler_decode", 1, decode),
+            ("op_compiler_exit", 1, exit),
+            ("op_compiler_print", 1, print),
+            ("op_compiler_random", 1, random),
+            ("op_compiler_timer", 2, timer),
+        ] {
+            context.register_global_builtin_callable(
+                JsString::from(name),
+                arity,
+                NativeFunction::from_fn_ptr(op),
+            )?;
         }
-    };
-    runtime
-        .execute_script(
-            "atomic:compiler-host",
-            format!("{HOST}({});", serde_json::Value::from(WASM_URL)),
+        context.eval(Source::from_bytes(&format!("{HOST}();")))?;
+        for name in NODE_MODULES {
+            let module = Module::parse(Source::from_bytes(&node_source(name)), None, &mut context)?;
+            modules.insert(format!("node:{name}"), module);
+        }
+        let worker = Module::parse(
+            Source::from_bytes(source)
+                .with_path(std::path::Path::new("atomic-compiler:///worker.mjs")),
+            None,
+            &mut context,
+        )?;
+        modules.evaluate(&worker, &mut context)
+    })();
+    result.map_err(|e| format!("the Astro compiler failed: {}", error_text(e, &mut context)))
+}
+
+pub(crate) fn error_text(error: JsError, context: &mut Context) -> String {
+    error
+        .into_opaque(context)
+        .and_then(|v| v.to_string(context))
+        .map(|v| v.to_std_string_lossy())
+        .unwrap_or_else(|_| "JavaScript exception".into())
+}
+
+fn string(args: &[JsValue], n: usize, ctx: &mut Context) -> JsResult<String> {
+    Ok(args
+        .get_or_undefined(n)
+        .to_string(ctx)?
+        .to_std_string_lossy())
+}
+fn text(s: &str) -> JsValue {
+    JsString::from(s).into()
+}
+fn parse(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(text(
+        &astro_parser::parse(&string(args, 0, ctx)?).to_string(),
+    ))
+}
+fn tsx(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(text(
+        &astro_parser::tsx(&string(args, 0, ctx)?, &string(args, 1, ctx)?).to_string(),
+    ))
+}
+fn bytes(
+    args: &[JsValue],
+    ctx: &mut Context,
+    f: impl FnOnce(&mut [u8]) -> JsResult<JsValue>,
+) -> JsResult<JsValue> {
+    let invalid = || JsNativeError::typ().with_message("invalid byte view");
+    let view =
+        JsUint8Array::from_object(args.get_or_undefined(0).as_object().ok_or_else(invalid)?)?;
+    let start = view.byte_offset(ctx)?;
+    let end = start
+        .checked_add(view.byte_length(ctx)?)
+        .ok_or_else(invalid)?;
+    let buffer = JsArrayBuffer::from_object(view.buffer(ctx)?.as_object().ok_or_else(invalid)?)?;
+    let mut data = buffer.data_mut().ok_or_else(invalid)?;
+    f(data.get_mut(start..end).ok_or_else(invalid)?)
+}
+fn read(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    bytes(args, ctx, |buf| {
+        Ok(match std::io::stdin().lock().read(buf) {
+            Ok(0) if !buf.is_empty() => -1,
+            Ok(n) => i32::try_from(n).unwrap_or(-2),
+            Err(_) => -2,
+        }
+        .into())
+    })
+}
+fn write(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    bytes(args, ctx, |buf| {
+        let mut out = std::io::stdout().lock();
+        Ok(out
+            .write(buf)
+            .and_then(|n| out.flush().map(|_| n))
+            .ok()
+            .and_then(|n| i32::try_from(n).ok())
+            .unwrap_or(-1)
+            .into())
+    })
+}
+fn hash(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    use sha2::{Digest, Sha256};
+    bytes(args, ctx, |buf| {
+        Ok(text(&format!("{:x}", Sha256::digest(buf))))
+    })
+}
+fn encode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    Ok(JsUint8Array::from_iter(string(args, 0, ctx)?.bytes(), ctx)?.into())
+}
+fn decode(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    bytes(args, ctx, |buf| {
+        Ok(text(&String::from_utf8_lossy(
+            buf.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(buf),
+        )))
+    })
+}
+fn exit(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    std::process::exit(args.get_or_undefined(0).to_i32(ctx)?)
+}
+fn print(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    eprint!("{}", string(args, 0, ctx)?);
+    Ok(JsValue::undefined())
+}
+fn random(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    bytes(args, ctx, |buf| {
+        getrandom::fill(buf)
+            .map_err(|_| JsNativeError::error().with_message("random bytes unavailable"))?;
+        Ok(JsValue::undefined())
+    })
+}
+fn timer(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
+    let f = args
+        .get_or_undefined(0)
+        .as_callable()
+        .ok_or_else(|| JsNativeError::typ().with_message("expected timer callback"))?;
+    let delay = args.get_or_undefined(1).to_u32(ctx)?;
+    ctx.enqueue_job(
+        boa_engine::job::TimeoutJob::from_duration(
+            move |ctx| f.call(&JsValue::undefined(), &[], ctx),
+            std::time::Duration::from_millis(delay.into()),
         )
-        .map_err(|e| failed(&e))?;
-    let main = ModuleSpecifier::parse(MAIN).map_err(|e| failed(&e))?;
-    let result = tokio.block_on(async {
-        let id = runtime
-            .load_main_es_module_from_code(&main, source.to_owned())
-            .await?;
-        let evaluated = runtime.mod_evaluate(id);
-        runtime
-            .run_event_loop(PollEventLoopOptions::default())
-            .await?;
-        evaluated.await
-    });
-    result.map_err(|e| failed(&e))?;
-    if exhausted.load(Ordering::Acquire) {
-        return Err(failed(&"terminated"));
-    }
-    Ok(())
+        .into(),
+    );
+    Ok(JsValue::undefined())
 }

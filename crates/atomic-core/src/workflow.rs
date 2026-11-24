@@ -23,6 +23,7 @@ use crate::budget::Budget;
 use atomic_schema::expr::{self, Scope};
 use atomic_schema::registry::Registry;
 use atomic_schema::yaml;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -178,10 +179,166 @@ pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
 pub(crate) const STEP: &[&str] = &[
-    "atom", "gate", "after", "with", "origins", "worktree", "review",
+    "atom", "gate", "after", "with", "origins", "worktree", "coding", "review", "criteria",
 ];
+/// Maximum number of criteria on one step. Every executable one consumes a
+/// bounded runner call before review.
+pub const MAX_CRITERIA: usize = 16;
+/// One criterion in an operator-authored workflow. Imported issue prose is
+/// never parsed into this type or executed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Criterion {
+    /// Prose for the reviewer and operator; it does not execute.
+    Text {
+        /// Bounded prose, shown as data but never executed.
+        text: String,
+    },
+    /// Direct argv in the confined ExecutionBackend, with no shell wrapper.
+    Test {
+        /// Direct program and arguments, with no shell interpolation.
+        argv: Vec<String>,
+        /// Wall-clock limit, from 1 to 300,000 milliseconds.
+        timeout_ms: u64,
+    },
+    /// A CEL boolean over the typed candidate and visible workflow scope.
+    Cel {
+        /// Boolean expression over the typed candidate and visible scope.
+        expr: String,
+    },
+    /// A bounded GET/HEAD probe through the runner, restricted to one host.
+    Http {
+        /// `GET` or `HEAD`.
+        method: String,
+        /// Absolute HTTP or HTTPS URL, without embedded credentials.
+        url: String,
+        /// The one exact host allowed through the runner's network policy.
+        allowed_host: String,
+        /// Required response status.
+        status: u16,
+        /// Wall-clock limit, from 1 to 300,000 milliseconds.
+        timeout_ms: u64,
+    },
+}
+
+/// Parse and bound a workflow step's criteria before anything may run.
+pub fn parse_criteria(value: &Value) -> Result<Vec<Criterion>, String> {
+    let entries = value.as_array().ok_or("`criteria` is a list")?;
+    if entries.len() > MAX_CRITERIA {
+        return Err(format!("`criteria` allows at most {MAX_CRITERIA} entries"));
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let criterion: Criterion = serde_json::from_value(entry.clone())
+            .map_err(|error| format!("criteria[{index}]: {error}"))?;
+        match &criterion {
+            Criterion::Text { text } => {
+                if text.trim().is_empty() || text.len() > 8192 {
+                    return Err(format!("criteria[{index}]: text must have 1..8192 bytes"));
+                }
+            }
+            Criterion::Test { argv, timeout_ms } => {
+                if argv.is_empty()
+                    || argv.len() > 32
+                    || argv
+                        .iter()
+                        .any(|arg| arg.is_empty() || arg.len() > 4096 || arg.contains('\0'))
+                    || argv.iter().map(String::len).sum::<usize>() > 16_384
+                {
+                    return Err(format!(
+                        "criteria[{index}]: test argv must have 1..32 bounded, nonempty arguments"
+                    ));
+                }
+                let program = std::path::Path::new(&argv[0])
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if [
+                    "sh",
+                    "bash",
+                    "dash",
+                    "zsh",
+                    "fish",
+                    "cmd",
+                    "powershell",
+                    "pwsh",
+                ]
+                .contains(&program)
+                {
+                    return Err(format!(
+                        "criteria[{index}]: a directly named shell is refused; test argv runs without an implicit shell"
+                    ));
+                }
+                check_timeout(*timeout_ms, index)?;
+            }
+            Criterion::Cel { expr } => {
+                if expr.trim().is_empty() || expr.len() > 4096 {
+                    return Err(format!(
+                        "criteria[{index}]: CEL expression must have 1..4096 bytes"
+                    ));
+                }
+                expr::parse(expr).map_err(|error| format!("criteria[{index}]: {error}"))?;
+            }
+            Criterion::Http {
+                method,
+                url,
+                allowed_host,
+                status,
+                timeout_ms,
+            } => {
+                if !matches!(method.as_str(), "GET" | "HEAD") {
+                    return Err(format!(
+                        "criteria[{index}]: HTTP method must be GET or HEAD"
+                    ));
+                }
+                if url.len() > 4096
+                    || allowed_host.is_empty()
+                    || allowed_host.len() > 253
+                    || allowed_host.contains('*')
+                {
+                    return Err(format!(
+                        "criteria[{index}]: HTTP URL or allowed host is invalid"
+                    ));
+                }
+                let parsed = url::Url::parse(url)
+                    .map_err(|error| format!("criteria[{index}]: invalid HTTP URL: {error}"))?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || parsed.host_str() != Some(allowed_host.as_str())
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                    || parsed.fragment().is_some()
+                {
+                    return Err(format!(
+                        "criteria[{index}]: HTTP URL must name exactly the allowed host with no credentials or fragment"
+                    ));
+                }
+                if !(100..=599).contains(status) {
+                    return Err(format!("criteria[{index}]: HTTP status must be 100..599"));
+                }
+                check_timeout(*timeout_ms, index)?;
+            }
+        }
+        out.push(criterion);
+    }
+    Ok(out)
+}
+
+fn check_timeout(timeout_ms: u64, index: usize) -> Result<(), String> {
+    if !(1..=300_000).contains(&timeout_ms) {
+        return Err(format!("criteria[{index}]: timeout_ms must be 1..300000"));
+    }
+    Ok(())
+}
 /// The fields of an atom step's `review`.
-pub(crate) const REVIEW: &[&str] = &["reviewer", "with", "rounds"];
+pub(crate) const REVIEW: &[&str] = &[
+    "reviewer",
+    "reviewers",
+    "require",
+    "with",
+    "rounds",
+    "self_review",
+    "trial_merge",
+];
 /// The most repair rounds a review may give its author.
 pub const MAX_REVIEW_ROUNDS: u64 = 5;
 /// The verdicts a reviewer may give, as atomic's examples name them:
@@ -404,6 +561,13 @@ pub fn load(
                 return Err(fail(
                     &format!("{sp}/review"),
                     "`review` belongs to an atom step: a gate is decided by a person".into(),
+                ));
+            }
+            (None, Some(_)) if s.contains_key("criteria") => {
+                return Err(fail(
+                    &format!("{sp}/criteria"),
+                    "`criteria` belongs to an atom step: a human gate is decided by a person"
+                        .into(),
                 ));
             }
             _ => {}
@@ -666,6 +830,74 @@ pub fn load(
                     "`worktree` is true or false".into(),
                 ));
             }
+            if let Some(coding) = s.get("coding") {
+                if !coding.is_boolean() {
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "`coding` is true or false".into(),
+                    ));
+                }
+                if coding.as_bool() == Some(true)
+                    && (s.get("worktree") != Some(&Value::Bool(true))
+                        || s.get("review")
+                            .and_then(|review| review.get("self_review"))
+                            .is_none())
+                {
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "a coding step needs a worktree and self-review evidence before independent review".into(),
+                    ));
+                }
+                let coding_without_trial = coding.as_bool() == Some(true)
+                    && s.get("review")
+                        .and_then(|review| review.get("trial_merge"))
+                        .is_none();
+                if coding_without_trial {
+                    // CONTROL_OFF: coding-review-needs-trial-merge-at-load
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "a coding review needs a trial merge and checks before reviewers run"
+                            .into(),
+                    ));
+                }
+                if coding.as_bool() == Some(true)
+                    && s.get("review")
+                        .and_then(|review| review.get("with"))
+                        .and_then(|with| with.get("diff"))
+                        .and_then(Value::as_str)
+                        != Some("candidate.metadata.diff")
+                {
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "a coding review must bind `diff` to the host's `candidate.metadata.diff` beside self-review evidence".into(),
+                    ));
+                }
+                if coding.as_bool() == Some(true)
+                    && s.get("review")
+                        .and_then(|review| review.get("with"))
+                        .and_then(Value::as_object)
+                        .is_some_and(|with| with.len() != 1)
+                {
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "a coding reviewer receives the host diff and self-review evidence, without author reasoning".into(),
+                    ));
+                }
+                if coding.as_bool() == Some(true)
+                    && s.get("review")
+                        .and_then(|review| review.get("self_review"))
+                        .and_then(|self_review| self_review.get("with"))
+                        .and_then(|with| with.get("diff"))
+                        .and_then(Value::as_str)
+                        != Some("candidate.metadata.diff")
+                {
+                    return Err(fail(
+                        &format!("{sp}/coding"),
+                        "a coding self-review must read the host's `candidate.metadata.diff`"
+                            .into(),
+                    ));
+                }
+            }
             let out = atom
                 .program
                 .contracts
@@ -677,6 +909,28 @@ pub fn load(
                         format!("atom `{atom_name}` has no compiled output contract"),
                     )
                 })?;
+            if let Some(criteria) = s.get("criteria") {
+                let parsed =
+                    parse_criteria(criteria).map_err(|why| fail(&format!("{sp}/criteria"), why))?;
+                let candidate = candidate_schema(
+                    &out,
+                    s.get("worktree").and_then(Value::as_bool) == Some(true),
+                    s.get("coding").and_then(Value::as_bool) == Some(true),
+                );
+                let criterion_scope = Scope::new()
+                    .with("input", &input)
+                    .with("steps", &steps_schema)
+                    .with("candidate", &candidate);
+                for (index, criterion) in parsed.iter().enumerate() {
+                    if let Criterion::Cel { expr } = criterion {
+                        expr::parse(expr)
+                            .and_then(|parsed| parsed.check_boolean(&criterion_scope))
+                            .map_err(|error| {
+                                fail(&format!("{sp}/criteria/{index}/expr"), error.to_string())
+                            })?;
+                    }
+                }
+            }
             if let Some(review) = s.get("review") {
                 check_review(
                     review,
@@ -686,6 +940,7 @@ pub fn load(
                         atom,
                         output: &out,
                         worktree: s.get("worktree").and_then(Value::as_bool) == Some(true),
+                        coding: s.get("coding").and_then(Value::as_bool) == Some(true),
                     },
                     atoms,
                     &scope,
@@ -904,11 +1159,13 @@ pub fn load(
 
 /// The step a review is on: its atom, by name, the schema of its output and
 /// whether it runs in a worktree.
+#[derive(Clone, Copy)]
 struct Reviewed<'a> {
     name: &'a str,
     atom: &'a Atom,
     output: &'a Value,
     worktree: bool,
+    coding: bool,
 }
 
 /// The schemas a step's expressions read from.
@@ -918,14 +1175,20 @@ struct Roots<'a> {
 }
 
 /// The schema of what a reviewer sees as `candidate`: the output under
-/// review, and for a worktree step its `metadata.commit`.
-pub fn candidate_schema(output: &Value, worktree: bool) -> Value {
+/// review, for a worktree step its `metadata.commit`, and for a coding step
+/// the host-computed `metadata.diff`.
+pub fn candidate_schema(output: &Value, worktree: bool, coding: bool) -> Value {
     let mut properties = Map::new();
     properties.insert("output".into(), output.clone());
     if worktree {
+        let mut metadata = Map::new();
+        metadata.insert("commit".into(), json!({"type": "string"}));
+        if coding {
+            metadata.insert("diff".into(), json!({"type": "string"}));
+        }
         properties.insert(
             "metadata".into(),
-            json!({"type": "object", "properties": {"commit": {"type": "string"}}}),
+            json!({"type": "object", "properties": metadata}),
         );
     }
     json!({"type": "object", "properties": properties, "additionalProperties": false})
@@ -978,6 +1241,69 @@ fn check_review(
             ));
         }
     }
+    if let Some(panel) = r.get("reviewers") {
+        if !reviewed.coding || r.contains_key("reviewer") {
+            return Err(fail(
+                &format!("{rp}/reviewers"),
+                "`reviewers` is for a coding step and cannot be combined with `reviewer`".into(),
+            ));
+        }
+        if r.get("require").and_then(Value::as_str) != Some("all") {
+            return Err(fail(
+                &format!("{rp}/require"),
+                "a fixed reviewer panel requires `require: all`".into(),
+            ));
+        }
+        let names = panel
+            .as_array()
+            .filter(|names| names.len() == 2)
+            .ok_or_else(|| {
+                fail(
+                    &format!("{rp}/reviewers"),
+                    "`reviewers` names exactly two reviewer atoms".into(),
+                )
+            })?;
+        let mut seen = std::collections::BTreeSet::new();
+        for (index, entry) in names.iter().enumerate() {
+            let name = entry
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| {
+                    fail(
+                        &format!("{rp}/reviewers/{index}"),
+                        "a reviewer is an atom name".into(),
+                    )
+                })?;
+            if !seen.insert(name) {
+                return Err(fail(
+                    &format!("{rp}/reviewers/{index}"),
+                    format!("reviewer `{name}` appears twice"),
+                ));
+            }
+            let mut single = r.clone();
+            single.remove("reviewers");
+            single.remove("require");
+            single.insert("reviewer".into(), Value::String(name.to_owned()));
+            check_review(
+                &Value::Object(single),
+                rp,
+                reviewed,
+                atoms,
+                scope,
+                roots,
+                kinds,
+                warnings,
+                fail,
+            )?;
+        }
+        return Ok(());
+    }
+    if r.contains_key("require") {
+        return Err(fail(
+            &format!("{rp}/require"),
+            "`require` is only used with a reviewer panel".into(),
+        ));
+    }
     if reviewed.atom.kind == "exec" {
         return Err(fail(
             rp,
@@ -986,6 +1312,77 @@ fn check_review(
                  again with the review, which a command cannot read; review a model atom"
             ),
         ));
+    }
+    if let Some(trial) = r.get("trial_merge") {
+        if !cfg!(target_os = "linux") {
+            return Err(fail(
+                &format!("{rp}/trial_merge"),
+                "trial-merge checks need a Linux execution sandbox".into(),
+            ));
+        }
+        if !reviewed.coding || !reviewed.worktree {
+            return Err(fail(
+                &format!("{rp}/trial_merge"),
+                "a trial merge requires a coding step in a worktree".into(),
+            ));
+        }
+        let Some(spec) = trial.as_object() else {
+            return Err(fail(
+                &format!("{rp}/trial_merge"),
+                "`trial_merge` maps `main` and `checks`".into(),
+            ));
+        };
+        if spec
+            .keys()
+            .any(|key| !["main", "checks"].contains(&key.as_str()))
+        {
+            return Err(fail(
+                &format!("{rp}/trial_merge"),
+                "unknown trial-merge field".into(),
+            ));
+        }
+        let main = spec.get("main").and_then(Value::as_str).ok_or_else(|| {
+            fail(
+                &format!("{rp}/trial_merge/main"),
+                "`main` names a branch".into(),
+            )
+        })?;
+        if !main.starts_with("refs/heads/") || !crate::git::is_ref_name(main) {
+            return Err(fail(
+                &format!("{rp}/trial_merge/main"),
+                "`main` is a full `refs/heads/` branch name".into(),
+            ));
+        }
+        let Some(checks) = spec
+            .get("checks")
+            .and_then(Value::as_array)
+            .filter(|v| !v.is_empty())
+        else {
+            return Err(fail(
+                &format!("{rp}/trial_merge/checks"),
+                "`checks` is a nonempty list of command argument lists".into(),
+            ));
+        };
+        for (index, check) in checks.iter().enumerate() {
+            let Some(args) = check.as_array().filter(|args| !args.is_empty()) else {
+                return Err(fail(
+                    &format!("{rp}/trial_merge/checks/{index}"),
+                    "a check is a nonempty command argument list".into(),
+                ));
+            };
+            if args.len() > 32
+                || args.iter().any(|arg| {
+                    arg.as_str().is_none_or(|s| {
+                        s.is_empty() || s.len() > 4096 || s.chars().any(char::is_control)
+                    })
+                })
+            {
+                return Err(fail(
+                    &format!("{rp}/trial_merge/checks/{index}"),
+                    "check arguments must be nonempty plain text, at most 32 arguments of 4096 bytes".into(),
+                ));
+            }
+        }
     }
     let name = r
         .get("reviewer")
@@ -1047,8 +1444,288 @@ fn check_review(
             })?,
     };
     // The reviewer's input, from what the step sees and the candidate.
-    let candidate = candidate_schema(reviewed.output, reviewed.worktree);
+    let candidate = candidate_schema(reviewed.output, reviewed.worktree, reviewed.coding);
     let scope = scope.clone().with("candidate", &candidate);
+    let self_output = if let Some(spec) = r.get("self_review") {
+        let Value::Object(spec) = spec else {
+            return Err(fail(
+                &format!("{rp}/self_review"),
+                "`self_review` is a mapping with `atom` and `with`".into(),
+            ));
+        };
+        for key in spec.keys() {
+            if ![
+                "atom",
+                "with",
+                "decision_points",
+                "selected_controls",
+                "controls_atom",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(fail(
+                    &format!("{rp}/self_review/{key}"),
+                    "unknown self-review field".into(),
+                ));
+            }
+        }
+        for list in ["decision_points", "selected_controls"] {
+            if let Some(value) = spec.get(list) {
+                let Some(entries) = value.as_array() else {
+                    return Err(fail(
+                        &format!("{rp}/self_review/{list}"),
+                        "expected a list of names".into(),
+                    ));
+                };
+                let mut seen = std::collections::BTreeSet::new();
+                for entry in entries {
+                    let Some(name) = entry.as_str().filter(|name| !name.trim().is_empty()) else {
+                        return Err(fail(
+                            &format!("{rp}/self_review/{list}"),
+                            "each name must be nonempty text".into(),
+                        ));
+                    };
+                    if !seen.insert(name) {
+                        return Err(fail(
+                            &format!("{rp}/self_review/{list}"),
+                            format!("`{name}` appears twice"),
+                        ));
+                    }
+                }
+            }
+        }
+        let selected = spec
+            .get("selected_controls")
+            .and_then(Value::as_array)
+            .is_some_and(|rows| !rows.is_empty());
+        let controls_name = match spec.get("controls_atom") {
+            None => None,
+            Some(Value::String(name)) if !name.is_empty() => Some(name.as_str()),
+            _ => {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    "`controls_atom` names an exec atom".into(),
+                ));
+            }
+        };
+        if selected && controls_name.is_none() {
+            return Err(fail(
+                &format!("{rp}/self_review/controls_atom"),
+                "selected controls need a `controls_atom` that proves each row before review"
+                    .into(),
+            ));
+        }
+        if let Some(name) = controls_name {
+            if !cfg!(target_os = "linux") {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    "controls proof requires the Linux exec sandbox".into(),
+                ));
+            }
+            if !reviewed.coding || !selected {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    "`controls_atom` needs a coding worktree and selected controls".into(),
+                ));
+            }
+            let control = atoms.get(name).ok_or_else(|| {
+                fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!("no atom named `{name}`"),
+                )
+            })?;
+            if control.kind != "exec" {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!("atom `{name}` must be an exec atom"),
+                ));
+            }
+            if control.external().is_none() {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!(
+                        "atom `{name}` must declare an idempotent or read-only external effect for replay"
+                    ),
+                ));
+            }
+            if control
+                .frontmatter
+                .pointer("/network/allow")
+                .and_then(Value::as_array)
+                .is_some_and(|hosts| !hosts.is_empty())
+            {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!("atom `{name}` must declare no network hosts for control proof"),
+                ));
+            }
+            let input = control.program.contracts.get("Input").ok_or_else(|| {
+                fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!("atom `{name}` has no input contract"),
+                )
+            })?;
+            let supplied = json!({
+                "type": "object",
+                "required": ["source", "commit", "bound", "rows"],
+                "properties": {
+                    "source": {"type": "string"},
+                    "commit": {"type": "string"},
+                    "bound": {"type": "object", "required": ["reference", "base"],
+                        "properties": {"reference": {"type": "string"}, "base": {"type": "string"}}},
+                    "rows": {"type": "array", "items": {"type": "string"}}
+                }
+            });
+            if let Fit::No(why) = fits(Some(&supplied), input) {
+                return Err(fail(
+                    &format!("{rp}/self_review/controls_atom"),
+                    format!("the host's controls input cannot fit `{name}`: {why}"),
+                ));
+            }
+        }
+        let self_name = spec.get("atom").and_then(Value::as_str).ok_or_else(|| {
+            fail(
+                &format!("{rp}/self_review/atom"),
+                "`atom` names a self-review atom".into(),
+            )
+        })?;
+        let self_atom = atoms.get(self_name).ok_or_else(|| {
+            fail(
+                &format!("{rp}/self_review/atom"),
+                format!("no atom named `{self_name}`"),
+            )
+        })?;
+        if !matches!(self_atom.kind.as_str(), "lite" | "codex") {
+            return Err(fail(
+                &format!("{rp}/self_review/atom"),
+                "a self-reviewer is a lite or codex atom".into(),
+            ));
+        }
+        let self_input = self_atom.program.contracts.get("Input").ok_or_else(|| {
+            fail(
+                &format!("{rp}/self_review/atom"),
+                format!("atom `{self_name}` has no input contract"),
+            )
+        })?;
+        let self_fields = self_input
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                fail(
+                    &format!("{rp}/self_review/atom"),
+                    format!("atom `{self_name}`'s input is not an object"),
+                )
+            })?;
+        let self_with = match spec.get("with") {
+            Some(Value::Object(with)) => with,
+            _ => {
+                return Err(fail(
+                    &format!("{rp}/self_review/with"),
+                    "`with` maps every self-review input field to a CEL expression".into(),
+                ));
+            }
+        };
+        if controls_name.is_some() {
+            if self_with.contains_key("control_results") {
+                return Err(fail(
+                    &format!("{rp}/self_review/with/control_results"),
+                    "`control_results` is supplied by the host's exec proof".into(),
+                ));
+            }
+            let target = self_fields.get("control_results").ok_or_else(|| {
+                fail(
+                    &format!("{rp}/self_review/atom"),
+                    format!("atom `{self_name}` needs an input field `control_results`"),
+                )
+            })?;
+            let supplied = json!({"type": "array", "items": {"type": "object", "required": ["row", "result"],
+                "properties": {"row": {"type": "string"}, "result": {"type": "string"}}}});
+            if let Fit::No(why) = fits(Some(&supplied), target) {
+                return Err(fail(
+                    &format!("{rp}/self_review/atom"),
+                    format!("host control results cannot fit `{self_name}`'s input: {why}"),
+                ));
+            }
+        }
+        let self_accepts = accepted_trust(self_atom).map_err(|_| {
+            fail(
+                &format!("{rp}/self_review/atom"),
+                unknown_trust(self_atom).unwrap_or_default(),
+            )
+        })?;
+        if controls_name.is_some() && trust_rank("external") < trust_rank(self_accepts) {
+            return Err(fail(
+                &format!("{rp}/self_review/atom"),
+                format!(
+                    "host control results are external data, and `{self_name}` accepts {self_accepts} input at most"
+                ),
+            ));
+        }
+        for (field, source) in self_with {
+            let at = format!("{rp}/self_review/with/{field}");
+            let target = self_fields.get(field).ok_or_else(|| {
+                fail(
+                    &at,
+                    format!("atom `{self_name}` has no input field `{field}`"),
+                )
+            })?;
+            let source = source
+                .as_str()
+                .ok_or_else(|| fail(&at, "a mapping is a CEL expression in a string".into()))?;
+            expr::parse(source)
+                .and_then(|p| p.check(&scope))
+                .map_err(|e| fail(&at, e.to_string()))?;
+            let from = path_schema_in(
+                source,
+                &[
+                    ("input", roots.input),
+                    ("steps", roots.steps),
+                    ("candidate", &candidate),
+                ],
+            );
+            if let Fit::No(why) = fits(from.as_ref(), target) {
+                return Err(fail(
+                    &at,
+                    format!("`{source}` cannot fit `{self_name}`'s input field `{field}`: {why}"),
+                ));
+            }
+            let origin = review_origin(source, kinds).map_err(|e| fail(&at, e))?;
+            if trust_rank(origin) < trust_rank(self_accepts) {
+                return Err(fail(
+                    &at,
+                    format!(
+                        "`{source}` is {origin} data, and self-reviewer `{self_name}` accepts {self_accepts} input at most"
+                    ),
+                ));
+            }
+        }
+        for required in self_input
+            .get("required")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            if !(self_with.contains_key(required)
+                || required == "control_results" && controls_name.is_some())
+            {
+                return Err(fail(
+                    &format!("{rp}/self_review/with"),
+                    format!(
+                        "atom `{self_name}` requires input field `{required}`, which `with` does not bind"
+                    ),
+                ));
+            }
+        }
+        Some(self_atom.program.contracts.get("Output").ok_or_else(|| {
+            fail(
+                &format!("{rp}/self_review/atom"),
+                format!("atom `{self_name}` has no output contract"),
+            )
+        })?)
+    } else {
+        None
+    };
     let target = reviewer.program.contracts.get("Input").ok_or_else(|| {
         fail(
             &format!("{rp}/reviewer"),
@@ -1070,6 +1747,59 @@ fn check_review(
             ));
         }
     };
+    if self_output.is_some() && with.contains_key("self_review") {
+        return Err(fail(
+            &format!("{rp}/with/self_review"),
+            "`self_review` is supplied by the self-review step".into(),
+        ));
+    }
+    if reviewed.coding && self_output.is_some() && with.contains_key("host_review") {
+        return Err(fail(
+            &format!("{rp}/with/host_review"),
+            "`host_review` is supplied by the host's reviewed inventory".into(),
+        ));
+    }
+    if let Some(output) = self_output {
+        let field = fields.get("self_review").ok_or_else(|| {
+            fail(
+                &format!("{rp}/reviewer"),
+                format!("atom `{name}` needs an input field `self_review` for the evidence"),
+            )
+        })?;
+        if let Fit::No(why) = fits(Some(output), field) {
+            return Err(fail(
+                &format!("{rp}/reviewer"),
+                format!(
+                    "self-review evidence cannot fit `{name}`'s input field `self_review`: {why}"
+                ),
+            ));
+        }
+    }
+    if reviewed.coding && self_output.is_some() {
+        let field = fields.get("host_review").ok_or_else(|| {
+            fail(
+                &format!("{rp}/reviewer"),
+                format!("atom `{name}` needs an input field `host_review` for host inventory"),
+            )
+        })?;
+        let supplied = json!({
+            "type": "object",
+            "required": ["decision_points", "selected_controls", "control_results"],
+            "properties": {
+                "decision_points": {"type": "array", "items": {"type": "string"}},
+                "selected_controls": {"type": "array", "items": {"type": "string"}},
+                "control_results": {"type": "array", "items": {"type": "object",
+                    "required": ["row", "result"],
+                    "properties": {"row": {"type": "string"}, "result": {"type": "string"}}}}
+            }
+        });
+        if let Fit::No(why) = fits(Some(&supplied), field) {
+            return Err(fail(
+                &format!("{rp}/reviewer"),
+                format!("host inventory cannot fit `{name}`'s input field `host_review`: {why}"),
+            ));
+        }
+    }
     // An atom whose `trust` is none of the three accepts nothing: refused
     // here as any binding into it would be.
     let accepts = |atom: &Atom, at: &str| {
@@ -1081,6 +1811,17 @@ fn check_review(
     let reviewer_accepts = accepts(reviewer, &format!("{rp}/reviewer"))?;
     // What the reviewer's findings carry: a model's output on what it read.
     let mut findings = "agent";
+    if self_output.is_some() {
+        if trust_rank("external") < trust_rank(reviewer_accepts) {
+            return Err(fail(
+                &format!("{rp}/reviewer"),
+                format!(
+                    "self-review evidence is external data, and reviewer `{name}` accepts {reviewer_accepts} input at most"
+                ),
+            ));
+        }
+        findings = "external";
+    }
     for (field, e) in &with {
         let wp = format!("{rp}/with/{field}");
         let Some(field_schema) = fields.get(field) else {
@@ -1141,7 +1882,10 @@ fn check_review(
         .flatten()
         .filter_map(Value::as_str)
     {
-        if !with.contains_key(required) {
+        if !(with.contains_key(required)
+            || required == "self_review" && self_output.is_some()
+            || required == "host_review" && reviewed.coding && self_output.is_some())
+        {
             return Err(fail(
                 &format!("{rp}/with"),
                 format!(

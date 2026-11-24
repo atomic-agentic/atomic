@@ -31,13 +31,19 @@ bins
 doc
 examples
 test astro_cli
+test admin_auth
 test budgets
+test bd_differential
 test change_request
 test change_request_example
 test change_review_helpers
 test catalog_checker
 test coding_tasks
 test command_environment
+test controls_exec
+test controls_exec_driver_guard
+test conformance
+test epic_run
 test entry_point
 test examples
 test exec_private_state
@@ -50,16 +56,22 @@ test exec_scratch
 test exec_network_fds
 test exec_network_relist
 test exec_network_syn_drop
+test exec_limits
 test inherited_fds
 test exec_proxy_raise
 test failpoints
 test fixture_cli
 test gate_prompt
 test gates_cli
+test goals
+test goals_cli
+test graph_claim
+test graph_cli
 test helper_dispatch
 test large_results
 test log_lines
 test retention
+test render_cli
 test sandboxed_commit
 test self_approval
 test setup_cli
@@ -89,3 +101,5 @@ test stop_bomb
 
 [crash]
 test crash
+test delivery_recovery
+test graph_work_loop

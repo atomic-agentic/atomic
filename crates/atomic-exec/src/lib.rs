@@ -135,6 +135,12 @@ pub struct Command {
     pub time_limit: Duration,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// Optional per-process CPU seconds, inherited by children. This is not
+    /// an aggregate process-tree quota.
+    pub cpu_seconds: Option<u64>,
+    /// Optional per-process writable data bytes (Unix `RLIMIT_DATA`), inherited
+    /// by children. This is not an aggregate process-tree quota.
+    pub data_bytes: Option<u64>,
     /// The directories it may write, such as its workspace's scratch
     /// directory, when its backend confines it (see [`Confine`]). A backend
     /// that does not confine its commands ignores it.
@@ -766,6 +772,8 @@ impl LocalBackend {
                 time: command.time_limit,
                 stdout: command.output_limit,
                 stderr: process::STDERR_LIMIT,
+                cpu_seconds: command.cpu_seconds,
+                data_bytes: command.data_bytes,
             },
         )
     }

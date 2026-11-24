@@ -1,0 +1,10 @@
+{
+  "verdict": "escalate",
+  "reason": "The evidence and the patch do not describe the same change, so what this candidate publishes would rest on a record the patch itself contradicts. The host's lists are covered — the one decision point has an entry and lane-guard-bites carries the host's own result — but three of that entry's answers say no file is opened while the patch adds a helper that opens one and reads a path out of the finding. A repair round runs the author, not the self-reviewer, so the author cannot make this evidence true; a person decides whether the record path is the design and what refuses when it is missing, unreadable or not JSON.",
+  "findings": [
+    "`not_found` says no path is opened here. The patch adds _read_record(), which opens `finding[\"verification_path\"]`, so a missing record file is now reachable and nothing answers for it.",
+    "`permission_denied` and `other_io` give the same reason, and item 7 repeats it: decide() now reads a file chosen by its input, so a denied or failing read reaches the confirmation path.",
+    "The host proved lane-guard-bites against the code it read. That proof says nothing about a guard that gained an I/O path, and the row's own guarding test does not cover a missing or unreadable record file.",
+    "Item 5 reads the patch correctly: `verified(verification)` is still the branch's condition. That is why this is an evidence failure rather than a refused change, and still not something the author can settle alone."
+  ]
+}

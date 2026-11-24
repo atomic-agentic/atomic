@@ -1,0 +1,8 @@
+input:
+  packet:
+    change_id: C-3
+    candidate: Add a parser.
+    checks: []
+expect:
+  - "output.priority in ['medium', 'high']"
+  - "output.steps.size() >= 1"

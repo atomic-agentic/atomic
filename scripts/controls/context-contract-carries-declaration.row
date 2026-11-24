@@ -1,0 +1,1 @@
+context-contract-carries-declaration|crates/atomic-schema/src/typescript.rs|    let declared = schemas.contains_key("Context");|    let declared = true; /*CONTROL_OFF*/|-p atomic-agentic-schema --lib -- typescript::tests::an_atom_with_no_context_declares_no_context_type typescript::tests::atom_declarations_match_the_authoring_projection

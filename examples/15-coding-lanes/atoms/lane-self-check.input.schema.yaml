@@ -1,0 +1,27 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [diff]
+properties:
+  diff:
+    type: string
+    minLength: 1
+    maxLength: 400000
+    description: The patch atomic read from the candidate's recorded base and commit.
+  control_results:
+    type: array
+    maxItems: 16
+    items:
+      type: object
+      additionalProperties: false
+      required: [row, result]
+      properties:
+        row:
+          type: string
+          minLength: 1
+          maxLength: 100
+        result:
+          type: string
+          minLength: 1
+          maxLength: 2000
+    description: Supplied by the host's control proof, never mapped by the workflow.

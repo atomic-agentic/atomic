@@ -1,0 +1,124 @@
+{
+  "record_id": "fixture:candidate:22222222",
+  "origin": "host",
+  "candidate": {
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "source": {
+      "repository": "atomic-agentic/atomic",
+      "change": "docs-pricing-example",
+      "base_revision": "11111111a3f6c8d2e5b7a90c4d1e8f36a2b5c7d9"
+    }
+  },
+  "plan": {
+    "record_id": "fixture:plan:plan-9",
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6"
+  },
+  "required_checks": [
+    {
+      "id": "docs-links",
+      "title": "Documentation links resolve",
+      "record": "fixture:execution:docs-links",
+      "required": true
+    },
+    {
+      "id": "ownership-review",
+      "title": "Every changed file has an owner sign-off",
+      "record": "fixture:execution:ownership-review",
+      "required": true
+    },
+    {
+      "id": "docs-build",
+      "title": "The documentation build is clean",
+      "record": "fixture:execution:docs-build",
+      "required": true
+    },
+    {
+      "id": "pricing-scan",
+      "title": "The pricing example is scanned",
+      "record": "fixture:execution:pricing-scan",
+      "required": true
+    },
+    {
+      "id": "secret-scan",
+      "title": "No secret is committed",
+      "record": "fixture:execution:secret-scan",
+      "required": true
+    },
+    {
+      "id": "changelog-check",
+      "title": "The changelog names the change",
+      "record": "fixture:execution:changelog-check",
+      "required": false
+    }
+  ],
+  "required_outcomes": [
+    {
+      "id": "REQ-DOCS",
+      "statement": "The pricing docs show a multi-unit purchase.",
+      "acceptance_criterion": "docs:pricing-example renders quantity 2 and 250 cents",
+      "depends_on": "none",
+      "record": "fixture:execution:docs-links",
+      "expected_criterion": "docs-links",
+      "required": true
+    },
+    {
+      "id": "REQ-PRICING",
+      "statement": "total_cents multiplies by quantity.",
+      "acceptance_criterion": "tests/test_pricing.py::test_quantity passes",
+      "depends_on": "REQ-DOCS",
+      "record": "fixture:execution:ownership-review",
+      "expected_criterion": "pricing-scan",
+      "required": true
+    },
+    {
+      "id": "REQ-SCAN",
+      "statement": "A secret scan covers the changed example.",
+      "acceptance_criterion": "The secret scan reports a state for this revision",
+      "depends_on": "none",
+      "record": "fixture:execution:pricing-scan",
+      "expected_criterion": "secret-scan",
+      "required": true
+    },
+    {
+      "id": "REQ-POLISH",
+      "statement": "The changelog names the pricing change.",
+      "acceptance_criterion": "CHANGELOG.md names the change for this revision",
+      "depends_on": "none",
+      "record": "fixture:execution:changelog-check",
+      "expected_criterion": "changelog-check",
+      "required": true
+    },
+    {
+      "id": "REQ-TEST",
+      "statement": "A regression test covers the multi-unit case.",
+      "acceptance_criterion": "A test asserts quantity 2 prices at 250 cents",
+      "depends_on": "REQ-PRICING",
+      "record": "none",
+      "expected_criterion": "none",
+      "required": true
+    }
+  ],
+  "proposed_tasks": [
+    {
+      "id": "fixture-task-docs",
+      "title": "Rewrite the pricing example",
+      "covers": ["REQ-DOCS"],
+      "depends_on": "none",
+      "record": "fixture:execution:docs-links"
+    },
+    {
+      "id": "fixture-task-pricing",
+      "title": "Multiply the total by quantity",
+      "covers": ["REQ-PRICING"],
+      "depends_on": "fixture-task-docs",
+      "record": "fixture:execution:pricing-scan"
+    },
+    {
+      "id": "fixture-task-scan",
+      "title": "Scan the changed example",
+      "covers": ["REQ-SCAN"],
+      "depends_on": "fixture-task-pricing",
+      "record": "fixture:execution:secret-scan"
+    }
+  ]
+}

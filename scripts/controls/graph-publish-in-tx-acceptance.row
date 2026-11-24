@@ -1,0 +1,1 @@
+graph-publish-in-tx-acceptance|crates/atomic-durable/src/publication.rs|!acceptance.accepted|false|-p atomic-agentic-graph --test epic_run graph_publication_and_fenced_close_are_one_rollback_safe_transaction

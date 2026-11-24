@@ -1,0 +1,1 @@
+coding-controls-proof-required|crates/atomic/src/pipeline.rs|if unproved_controls {|if false {|-p atomic-agentic --test pipeline coding_controls_refuse_without_a_proof_atom_before_a_model_turn

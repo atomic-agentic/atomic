@@ -1,0 +1,10 @@
+---
+interface Props { finding: { file: string; severity: string; message: string } }
+const { finding }: Props = Astro.props;
+// One finding of layout B, as two labeled lines. atomic trims the whitespace
+// around a component's own text, so nothing here is indented, and the file ends
+// without a line break because the atom's map supplies each record's leading
+// newline: that is what keeps a group's records on consecutive lines.
+---
+severity: {finding.severity}
+message: {finding.message}

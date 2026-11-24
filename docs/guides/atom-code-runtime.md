@@ -46,7 +46,7 @@ workflow integrations remain separate work. The old mixed atom script-fence form
 has been removed from the authoring contract; move its executable work into a
 script step.
 
-The trusted Astro compiler is not this runtime: it runs on the V8 embedded in
-Atomic, in a child process with no network, environment, filesystem or
-subprocess access, using bundled assets and no runtime npm install. See
+Atomic parses Astro and checks TypeScript in Rust. The bundled renderer runs
+in Boa inside a child process with no network, environment, filesystem or
+subprocess access. See
 [development](../development.md) for rebuilding and testing compiler assets.

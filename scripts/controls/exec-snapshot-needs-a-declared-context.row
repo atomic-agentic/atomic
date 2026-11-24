@@ -1,0 +1,1 @@
+exec-snapshot-needs-a-declared-context|crates/atomic-core/src/runtime.rs|    if declared.is_none() && snapshot.is_some() {|    if /*CONTROL_OFF*/ false && declared.is_none() && snapshot.is_some() {|-p atomic-agentic-core --lib -- runtime::tests::an_exec_atom_that_declares_no_context_is_refused_a_snapshot

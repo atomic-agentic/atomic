@@ -763,6 +763,100 @@ mod tests {
     }
 
     #[test]
+    fn trial_merge_copies_current_main_into_a_real_bound_snapshot() {
+        use crate::git::{Signature, TrialMerge};
+        use crate::worktree::{Caches, Worktrees};
+
+        let (dir, binding, _, _) = bound("trial-current-main");
+        let source = dir.join("source");
+        git_at(&source, &["branch", "-M", "main"]);
+        let repo = Git::find()
+            .expect("git")
+            .repo(&binding.snapshot)
+            .without_filters()
+            .expect("snapshot repo");
+        let worktrees = Worktrees::new(repo, binding.worktrees.clone());
+        let author = worktrees
+            .prepare("run-trial", "code", &binding.commit)
+            .expect("author checkout");
+        std::fs::write(author.path.join("a.txt"), "candidate\n").expect("candidate change");
+        let candidate = worktrees
+            .commit(&author, "candidate", &Signature::default())
+            .expect("candidate commit");
+
+        std::fs::write(source.join("main.txt"), "current main\n").expect("main change");
+        git_at(&source, &["add", "main.txt"]);
+        git_at(&source, &["commit", "-q", "-m", "advance main after bind"]);
+        let current_main = git_at(&source, &["rev-parse", "refs/heads/main"]);
+        assert!(
+            !worktrees
+                .repo()
+                .has_everything(&current_main)
+                .expect("before copy")
+        );
+        let (scratch, head, merge, tree) = worktrees
+            .trial_merge(
+                "run-trial",
+                "code.trial_merge.0",
+                &candidate,
+                "refs/heads/main",
+                Some(&binding.source),
+            )
+            .expect("trial merge");
+        assert_eq!(head, current_main);
+        assert_eq!(merge, TrialMerge::Clean);
+        assert!(tree.is_some());
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("a.txt")).expect("candidate"),
+            "candidate\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("main.txt")).expect("merged main"),
+            "current main\n"
+        );
+        assert!(
+            worktrees
+                .repo()
+                .has_everything(&current_main)
+                .expect("after copy")
+        );
+        let caches =
+            Caches::for_run(&dir.join("cache"), "run-trial", Some("a1"), None).expect("run cache");
+        let trial_cache = caches.for_trial(&scratch).expect("trial cache");
+        trial_cache.create().expect("private trial cache");
+        let marker = trial_cache.dir().join("check-ran");
+        std::fs::write(&marker, "earlier attempt").expect("attempt write");
+        let (again, _, result, _) = worktrees
+            .trial_merge(
+                "run-trial",
+                "code.trial_merge.0",
+                &candidate,
+                "refs/heads/main",
+                Some(&binding.source),
+            )
+            .expect("retry resets scratch");
+        assert_eq!(result, TrialMerge::Clean);
+        assert_eq!(again, scratch);
+        assert!(
+            !marker.exists(),
+            "retry must clear the earlier check's cache"
+        );
+        std::fs::write(source.join(".git/info/grafts"), "# changed after bind\n")
+            .expect("grafts file");
+        let refused = worktrees
+            .trial_merge(
+                "run-trial",
+                "code.trial_merge.1",
+                &candidate,
+                "refs/heads/main",
+                Some(&binding.source),
+            )
+            .expect_err("live source grafts are refused");
+        assert!(refused.to_string().contains("grafted history"), "{refused}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn commit_fields_are_found_through_properties_and_items() {
         let schema = json!({
             "type": "object",

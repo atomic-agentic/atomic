@@ -1,0 +1,1 @@
+coding-controls-bound-source|crates/atomic/src/pipeline.rs|bound_control_source(run, &step.id)?|_controls_atom.program.root.display().to_string()|-p atomic-agentic --test pipeline a_host_control_proof_uses_the_bound_repository_not_the_atom_checkout

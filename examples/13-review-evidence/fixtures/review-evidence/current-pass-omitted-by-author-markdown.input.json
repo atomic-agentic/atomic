@@ -1,0 +1,58 @@
+{
+  "candidate": {
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example",
+    "base_revision": "11111111a3f6c8d2e5b7a90c4d1e8f36a2b5c7d9"
+  },
+  "required_checks": [
+    {
+      "id": "docs-links",
+      "title": "Documentation links resolve",
+      "record": "fixture:execution:docs-links",
+      "required": true
+    },
+    {
+      "id": "ownership-review",
+      "title": "Every changed file has an owner sign-off",
+      "record": "fixture:execution:ownership-review",
+      "required": true
+    }
+  ],
+  "host_records": [
+    {
+      "id": "fixture:execution:docs-links",
+      "origin": "host",
+      "criterion": "docs-links",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Checked 41 links in the built documentation for this revision."
+    },
+    {
+      "id": "fixture:execution:ownership-review",
+      "origin": "host",
+      "criterion": "ownership-review",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Both changed files carry a sign-off from their listed owner."
+    }
+  ],
+  "author_claims": [
+    {
+      "id": "fixture:claim:docs-links",
+      "origin": "author",
+      "criterion": "docs-links",
+      "claim": "pass",
+      "basis": "I opened every link in the pricing example in my editor."
+    }
+  ],
+  "display": {
+    "section": "markdown",
+    "link": "markdown",
+    "emphasis": "bold"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "bound": {
+    "base": "8b1e2c3d4f5a69708192a3b4c5d6e7f8091a2b3c",
+    "admitted": "8b1e2c3d4f5a69708192a3b4c5d6e7f8091a2b3c",
+    "reference": "refs/heads/main"
+  },
+  "commit": "1d2f3a4b5c6d7e8f90a1b2c3d4e5f60718293a4b",
+  "ok": true,
+  "rows": [
+    {
+      "detail": "intact lane-guard-bites: one switch text in tools/lane_guard.py, guarding test lane_guard_refuses_unverified in test_lane_guard.py; the switch itself was not made here",
+      "name": "lane-guard-bites",
+      "verdict": "intact"
+    }
+  ],
+  "source": "."
+}

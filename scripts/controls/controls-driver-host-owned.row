@@ -1,0 +1,1 @@
+controls-driver-host-owned|crates/atomic/src/pipeline.rs|        atom = trusted_controls_atom(&atom, run.caches)?;|        atom = atom.clone();|-p atomic-agentic --test pipeline -- a_fake_controls_atom_cannot_approve_a_blind_row

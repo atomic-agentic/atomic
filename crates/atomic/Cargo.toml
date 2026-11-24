@@ -14,6 +14,9 @@ publish.workspace = true
 workspace = true
 
 [features]
+# Expose crash failpoints through `atomic run --fail-at` only in development
+# builds. A release build has neither the flag nor the failpoint machinery.
+dev-failpoints = ["atomic-core/failpoints", "atomic-durable/failpoints"]
 # Run the tests that need Codex's Linux sandbox (bubblewrap and unprivileged
 # user namespaces). With this on, a sandbox that cannot start fails them.
 sandbox-tests = ["atomic-core/exec-loopback-tests"]
@@ -29,6 +32,8 @@ getrandom = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
+jsonschema = { workspace = true }
+toml = "=0.9.11"
 atomic-atoms = { workspace = true }
 atomic-core = { workspace = true }
 atomic-durable = { workspace = true }

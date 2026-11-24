@@ -28,6 +28,8 @@ pub mod fixture;
 pub mod git;
 pub mod helper_runtime;
 pub mod http_tools;
+mod js_budget;
+mod js_modules;
 pub mod lite;
 pub mod mounts;
 pub mod names;

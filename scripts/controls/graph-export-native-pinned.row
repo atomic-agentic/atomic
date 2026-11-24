@@ -1,0 +1,1 @@
+graph-export-native-pinned|crates/atomic-graph/src/sqlite.rs|value["pinned"] = true.into();|value["pinned"] = false.into();|-p atomic-agentic-graph --test conformance sqlite_native_pinned_uses_marked_beads_metadata_and_generic_pinned_is_refused

@@ -92,6 +92,8 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
                 time: Duration::from_secs(600),
                 stdout: 1024,
                 stderr: 1024,
+                cpu_seconds: None,
+                data_bytes: None,
             },
         )
     });

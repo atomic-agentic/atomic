@@ -15,13 +15,27 @@ async function project(t) {
 }
 test('schema generation is deterministic and clean output passes the stale check', async (t) => {
   const root = await project(t), first = await generate({ root });
-  assert.equal(first.changed.length, 4);
+  assert.equal(first.changed.length, 5);
   assert.deepEqual((await generate({ root })).changed, []);
   assert.deepEqual((await generate({ root, check: true })).changed, []);
   const types = await readFile(path.join(root, '.atomic/types/schemas.d.ts'), 'utf8');
   assert.match(types, /"feedback"\?: Array<string>/);
   assert.match(types, /"meeting"\?: Meeting/);
   assert.match(types, /"action": "ignore" \| "notify" \| "respond"/);
+});
+// The per-atom `Config` alias is what the stock editor and `atomic check` read
+// the contract from: the fifth argument, and so any read of `context`, is present
+// only for an atom the registry declares a context for.
+test('the per-atom Config carries a context only for an atom that declares one', async (t) => {
+  const root = await project(t);
+  await generate({ root });
+  const contextual = await readFile(path.join(root, '.atomic/types/callback-context.d.ts'), 'utf8');
+  assert.match(contextual, /export type Config = AtomConfig<Input, Reply, EvalCase, Judges, Context>;/);
+  assert.match(contextual, /export interface Props \{ input: Input; readonly context: Context \}/);
+  const plain = await readFile(path.join(root, '.atomic/types/triage-email.d.ts'), 'utf8');
+  assert.match(plain, /export type Config = AtomConfig<Input, Reply, EvalCase, Judges>;/);
+  assert.match(plain, /export interface Props \{ input: Input \}/);
+  assert(!plain.includes('Context'), plain);
 });
 test('schema edits invalidate the manifest and generated declaration content', async (t) => {
   const root = await project(t), before = await generate({ root });

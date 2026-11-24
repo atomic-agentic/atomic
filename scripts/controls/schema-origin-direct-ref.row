@@ -1,0 +1,1 @@
+schema-origin-direct-ref|crates/atomic-schema/src/typescript.rs|let origin = (if direct_reference {|let origin = (if false {|-p atomic-agentic-schema --lib -- typescript::tests::referenced_field_with_siblings_keeps_the_referenced_origin

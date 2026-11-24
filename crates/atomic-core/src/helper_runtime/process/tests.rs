@@ -44,9 +44,8 @@ fn a_call_runs_in_a_child_and_returns_its_result() {
     );
 }
 
-// V8 aborts the process on these, which no isolate limit catches.
 #[test]
-fn a_v8_fatal_error_fails_the_call_and_the_host_survives() {
+fn a_large_string_split_fails_the_call_and_the_host_survives() {
     let started = Instant::now();
     assert_eq!(
         probe("'x'.repeat(2 ** 29 - 24).split('').length"),
@@ -56,7 +55,7 @@ fn a_v8_fatal_error_fails_the_call_and_the_host_survives() {
     assert_eq!(probe("1"), Ok(json!(1)));
 }
 
-// Memory V8 allocates outside its heap, a single allocation larger than the
+// Memory allocated outside the engine heap, a single allocation larger than the
 // heap, and work inside one long built-in are each bounded.
 #[test]
 fn memory_and_time_outside_the_heap_are_bounded() {
@@ -110,7 +109,7 @@ fn the_first_call_in_a_child_sees_utc_and_en_us() {
             modules: [(
                 ENTRY.to_owned(),
                 "export const probe = () => [(1234.5).toLocaleString([]), (1234.5).toLocaleString('tlh'), \
-                 new Date(0).toLocaleString([]), 'i'.toLocaleUpperCase([]), Date.parse('January 1, 2020 00:00:00')];"
+                 new Date(0).toLocaleString([]), 'i'.toLocaleUpperCase([]), Number.isNaN(Date.parse('January 1, 2020 00:00:00'))];"
                     .to_owned(),
             )]
             .into(),
@@ -131,12 +130,6 @@ fn the_first_call_in_a_child_sees_utc_and_en_us() {
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(
         outputs[0],
-        json!([
-            "1,234.5",
-            "1,234.5",
-            "1/1/1970, 12:00:00 AM",
-            "I",
-            1_577_836_800_000u64
-        ])
+        json!(["1,234.5", "1,234.5", "1/1/70, 12:00:00 AM", "I", true])
     );
 }

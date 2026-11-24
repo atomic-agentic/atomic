@@ -1,0 +1,1 @@
+coding-controls-bound-base|crates/atomic/src/pipeline.rs|!= Some(base.as_str())|!= Some(base.as_str()) && false|-p atomic-agentic --test pipeline a_host_control_proof_refuses_a_wrong_base_before_review

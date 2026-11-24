@@ -211,6 +211,59 @@ fn a_missing_selected_profile_is_an_error() {
     ));
 }
 
+#[cfg(unix)]
+#[test]
+fn selected_profile_opens_inside_its_project_and_refuses_links_and_unreadable_files() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let d = dir(&[
+        ("atomic.yaml", "retries: 4\n"),
+        ("atomic.nightly.yaml", "retries: 6\n"),
+    ]);
+    let profile = d.join("atomic.nightly.yaml");
+    assert_eq!(
+        load(&d, Some("nightly"), &[], vec![])
+            .expect("regular profile")
+            .config
+            .retries,
+        6
+    );
+
+    std::fs::rename(&profile, d.join("inside.yaml")).expect("move profile inside project");
+    symlink("inside.yaml", &profile).expect("link inside project");
+    let link = load(&d, Some("nightly"), &[], vec![]).expect_err("profile link is refused");
+    assert!(
+        matches!(&link, ConfigError::Read { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),
+        "{link}"
+    );
+
+    std::fs::remove_file(&profile).expect("remove link");
+    let outside = dir(&[("outside.yaml", "retries: 99\n")]);
+    symlink(outside.join("outside.yaml"), &profile).expect("link outside project");
+    let escape = load(&d, Some("nightly"), &[], vec![]).expect_err("outside link is refused");
+    assert!(
+        matches!(&escape, ConfigError::Read { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),
+        "{escape}"
+    );
+
+    std::fs::remove_file(&profile).expect("remove link");
+    symlink("atomic.nightly.yaml", &profile).expect("self link");
+    let looped = load(&d, Some("nightly"), &[], vec![]).expect_err("link loop is refused");
+    assert!(
+        matches!(&looped, ConfigError::Read { source, .. } if source.raw_os_error() == Some(libc::ELOOP)),
+        "{looped}"
+    );
+
+    std::fs::remove_file(&profile).expect("remove link");
+    std::fs::write(&profile, "retries: 7\n").expect("profile file");
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o000))
+        .expect("remove read permission");
+    let denied = load(&d, Some("nightly"), &[], vec![]).expect_err("unreadable profile is refused");
+    assert!(
+        matches!(&denied, ConfigError::Read { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied),
+        "{denied}"
+    );
+}
+
 #[test]
 fn a_bad_environment_value_is_refused() {
     let d = dir(&[]);

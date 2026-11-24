@@ -82,6 +82,9 @@ const HARDENING: &[&str] = &[
     "tag.gpgSign=false",
     "log.showSignature=false",
     "core.attributesFile=/dev/null",
+    // Repository config can select a default merge driver even with no
+    // attributes. Use Git's built-in ordinary three-way text merge.
+    "merge.default=text",
     "core.excludesFile=/dev/null",
     // No network, and nothing that reaches into other repositories.
     "protocol.allow=never",
@@ -275,6 +278,7 @@ impl Git {
             git_dir: git_dir.into(),
             work_tree: None,
             overrides: Arc::default(),
+            attr_source: None,
         }
     }
 
@@ -297,6 +301,7 @@ impl Git {
             git_dir: git_dir.into(),
             work_tree: Some(work_tree.into()),
             overrides: Arc::default(),
+            attr_source: None,
         }
     }
 
@@ -484,6 +489,9 @@ pub struct Repo {
     /// Settings that switch off what the repository's own config names, such
     /// as its filter drivers, given to git as command-line config.
     overrides: Arc<Vec<(String, String)>>,
+    /// A real empty tree in this repository, used only for worktrees atomic
+    /// is allowed to write. Fixture source discovery leaves this absent.
+    attr_source: Option<String>,
 }
 
 /// A ref and the object it names.
@@ -493,6 +501,15 @@ pub struct Ref {
     pub name: String,
     /// The object, a commit ID.
     pub sha: String,
+}
+
+/// The result of a trial merge into a disposable worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrialMerge {
+    /// The candidate and main merged cleanly in scratch.
+    Clean,
+    /// Git left these paths unmerged; they are untrusted display names.
+    Conflicts(Vec<String>),
 }
 
 /// Who a commit is by: the author and committer recorded on it.
@@ -524,6 +541,29 @@ impl Repo {
         self.work_tree.as_deref()
     }
 
+    /// Whether the repository has local attributes that can override an
+    /// empty tree's attributes. Git keeps these in the common directory even
+    /// when this Repo names a linked worktree's admin directory. Even an
+    /// unreadable or linked file is treated as present by worktree callers.
+    pub fn has_info_attributes(&self) -> Result<bool, GitError> {
+        let name = self.text(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/attributes",
+        ])?;
+        let name = name.trim_end_matches('\n');
+        if name.is_empty() || name.contains('\n') || !Path::new(name).is_absolute() {
+            return Err(GitError::Unreadable);
+        }
+        let path = PathBuf::from(name);
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(GitError::Spawn(e)),
+        }
+    }
+
     /// git, hardened, with the git directory and work tree given explicitly
     /// and the current directory outside the work tree's control.
     pub(crate) fn command(&self) -> Command {
@@ -553,6 +593,9 @@ impl Repo {
                     .env(format!("GIT_CONFIG_VALUE_{i}"), value);
             }
         }
+        if let Some(empty) = &self.attr_source {
+            command.env("GIT_ATTR_SOURCE", empty);
+        }
         command
     }
 
@@ -564,6 +607,29 @@ impl Repo {
             git_dir: git_dir.into(),
             ..self.clone()
         }
+    }
+
+    /// Give worktree commands a real empty attribute tree, so neither a
+    /// tracked .gitattributes nor linked-worktree includeIf configuration
+    /// selects an external driver. Local info/attributes is refused because
+    /// Git still reads it with GIT_ATTR_SOURCE set. Call only on an
+    /// atomic-owned snapshot or a repository whose worktrees atomic is
+    /// already allowed to write; fixture source discovery remains read-only.
+    pub fn with_empty_attributes(mut self) -> Result<Repo, GitError> {
+        if self.has_info_attributes()? {
+            return Err(GitError::Invalid(
+                "repository info/attributes can override the empty attribute tree",
+            ));
+        }
+        if self.attr_source.is_none() {
+            let empty = self.text(&["hash-object", "-t", "tree", "-w", "--stdin"])?;
+            let empty = empty.trim();
+            check_sha(empty)?;
+            self.attr_source = Some(empty.to_owned());
+        }
+        // The command's core.attributesFile=/dev/null hardening disables the
+        // other file Git may read even with GIT_ATTR_SOURCE set.
+        Ok(self)
     }
 
     /// This repository with every filter driver its config defines switched
@@ -607,6 +673,34 @@ impl Repo {
                 ("required", "false"),
             ] {
                 overrides.push((format!("filter.{name}.{key}"), value.to_owned()));
+            }
+        }
+        // A repository can define a custom merge driver in its config and
+        // select it from .gitattributes in the candidate tree. Refuse such a
+        // merge instead of executing the repository's command. This applies
+        // to every git call, including a trial merge in a scratch worktree.
+        let merge_keys = match self.run(
+            &[
+                "config",
+                "--includes",
+                "--null",
+                "--name-only",
+                "--get-regexp",
+                "^merge\\.",
+            ],
+            None,
+        ) {
+            Ok(out) => out,
+            Err(GitError::Failed { code: Some(1), .. }) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        for key in merge_keys
+            .split(|b| *b == 0)
+            .filter_map(|key| std::str::from_utf8(key).ok())
+        {
+            let key = key.trim_matches('\n');
+            if key.starts_with("merge.") && key.ends_with(".driver") {
+                overrides.push((key.to_owned(), "/bin/false".to_owned()));
             }
         }
         Ok(Repo {
@@ -740,6 +834,99 @@ impl Repo {
             }
         })
         .collect()
+    }
+
+    /// Merge a pinned main commit into a disposable checkout. The caller
+    /// supplies a worktree created by atomic, never the source checkout.
+    /// No commit is made; a conflict is returned with its unmerged paths.
+    pub fn trial_merge(&self, main: &str) -> Result<TrialMerge, GitError> {
+        check_sha(main)?;
+        if self.work_tree.is_none() {
+            return Err(GitError::Invalid("trial merge needs a scratch worktree"));
+        }
+        if self.attr_source.is_none() {
+            return Err(GitError::Invalid(
+                "trial merge needs an empty attribute source",
+            ));
+        }
+        match self.run_with(
+            &[
+                "merge",
+                "--no-commit",
+                "--no-ff",
+                "--no-stat",
+                "--no-edit",
+                "--no-verify",
+                main,
+            ],
+            None,
+            &[
+                ("GIT_AUTHOR_NAME", "atomic trial merge"),
+                ("GIT_AUTHOR_EMAIL", "atomic@localhost"),
+                ("GIT_COMMITTER_NAME", "atomic trial merge"),
+                ("GIT_COMMITTER_EMAIL", "atomic@localhost"),
+            ],
+        ) {
+            Ok(_) => Ok(TrialMerge::Clean),
+            Err(error @ GitError::Failed { code: Some(1), .. }) => {
+                let names = self.run(&["diff", "--name-only", "-z", "--diff-filter=U"], None)?;
+                let conflicts: Vec<String> = names
+                    .split(|b| *b == 0)
+                    .filter(|name| !name.is_empty())
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect();
+                if conflicts.is_empty() {
+                    Err(error)
+                } else {
+                    Ok(TrialMerge::Conflicts(conflicts))
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The index's tree after a clean merge, before a check can change it.
+    pub fn index_tree(&self) -> Result<String, GitError> {
+        let tree = self.text(&["write-tree"])?;
+        let tree = tree.trim();
+        check_sha(tree)?;
+        Ok(tree.to_owned())
+    }
+
+    /// Tracked paths that a check changed in the index or working tree since
+    /// `expected` was recorded. Untracked build outputs are allowed.
+    pub fn changed_tracked(&self, expected: &str) -> Result<Vec<String>, GitError> {
+        check_sha(expected)?;
+        let mut names = std::collections::BTreeSet::new();
+        let staged = self.run(
+            &[
+                "diff",
+                "--cached",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                expected,
+                "--",
+            ],
+            None,
+        )?;
+        let working = self.run(
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+            ],
+            None,
+        )?;
+        for path in staged.split(|b| *b == 0).chain(working.split(|b| *b == 0)) {
+            if !path.is_empty() {
+                names.insert(String::from_utf8_lossy(path).into_owned());
+            }
+        }
+        Ok(names.into_iter().collect())
     }
 
     /// Copy every object reachable from commit `sha` into `to`, with no
@@ -937,6 +1124,29 @@ impl Repo {
             .collect();
         paths.sort();
         Ok(paths)
+    }
+
+    /// The exact patch between two recorded commits, for a coding review.
+    /// External diff and text-conversion drivers are disabled; a patch too
+    /// large to send to a reviewer or one that is not UTF-8 is refused.
+    pub fn review_diff(&self, from: &str, to: &str) -> Result<String, GitError> {
+        check_sha(from)?;
+        check_sha(to)?;
+        let mut command = self.command();
+        command.args([
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-renames",
+            "--no-color",
+            "--binary",
+            "--full-index",
+            from,
+            to,
+            "--",
+        ]);
+        let out = self.git.run(command, "diff", None, 512 * 1024)?;
+        String::from_utf8(out).map_err(|_| GitError::Unreadable)
     }
 
     /// Stage everything in the work tree, as `git add --all` sees it, write

@@ -1,1 +1,0 @@
-atom-compiler-fault-diagnostic|crates/atomic-core/assets/worker.mjs|String($?.message??"").includes("reading 'ast'")|String($?.message??"").includes("reading 'zz'")|-p atomic-agentic-core --lib -- atom::tests::a_source_the_compiler_faults_on_fails_the_load

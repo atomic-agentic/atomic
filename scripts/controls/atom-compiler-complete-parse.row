@@ -1,0 +1,1 @@
+atom-compiler-complete-parse|crates/atomic-core/src/compiler_host/astro_parser.rs|if diagnostics.is_empty() && !text[consumed as usize..].trim().is_empty() {|if false { // CONTROL_OFF|-p atomic-agentic-core --lib -- atom::tests::a_partial_parse_fails_the_load_at_the_authored_line

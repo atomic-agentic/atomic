@@ -1,0 +1,1 @@
+controls-cargo-host-preparation|crates/atomic/src/pipeline.rs|let host_cargo = if t.controls_cargo && replay.is_none() {|let host_cargo = if false {|-p atomic-agentic --test pipeline -- a_real_control_runner_proves_the_bound_candidate_before_review

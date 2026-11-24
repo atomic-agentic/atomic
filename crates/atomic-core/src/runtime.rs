@@ -892,12 +892,11 @@ async fn run_contract(
             request.name
         ))
     })?;
-    let developer = match backend {
-        Backend::Codex(rt, _) if !lite::is_openai_api(&rt.endpoint.base_url) => {
-            schema_in_instructions(&request.developer, &lowered.schema)
-        }
-        _ => request.developer,
-    };
+    let developer = developer_for_model(
+        request.developer,
+        &lowered.schema,
+        matches!(&backend, Backend::Codex(rt, _) if !lite::is_openai_api(&rt.endpoint.base_url)),
+    );
     let mut spec = TurnSpec {
         developer_instructions: Some(developer),
         prompt: request.prompt,
@@ -1409,6 +1408,19 @@ pub struct DispatchContext<'a> {
     pub step_id: &'a str,
 }
 
+/// What a step's validation call is told about its context: the public context
+/// its step recorded and the trusted step it is bound for, either of them
+/// `null` for an atom that declares no context. A validator's read of
+/// `context` is then a value the runtime has already checked, never a missing
+/// one — every caller refuses a contextual atom whose snapshot it cannot bring
+/// (see [`run_exec_opened_with_context`] and `render::render_clocked`).
+fn context_options(
+    snapshot: Option<&crate::context::ContextSnapshot>,
+    step_id: Option<&str>,
+) -> Value {
+    serde_json::json!({"contextSnapshot":snapshot,"stepId":step_id})
+}
+
 /// Execute a checked Astro atom with an optional frozen public context.
 pub async fn run_declarative_with_context(
     atom: &AtomFile,
@@ -1465,7 +1477,7 @@ pub async fn run_declarative_repairing(
             run_id: run.run_id.to_owned(),
             step_id: run.step.unwrap_or(&atom.name).to_owned(),
         };
-        return run_exec(
+        return run_exec_with_context(
             atom,
             compiled,
             input,
@@ -1475,6 +1487,9 @@ pub async fn run_declarative_repairing(
             // The store the model runtimes check references against.
             &runtimes.codex.artifacts,
             &runtimes.exec_meter,
+            // Its step's context, kept: an exec atom's validators are told the
+            // same snapshot a turn's are, not dropped for being a command.
+            context,
         )
         .await;
     }
@@ -1545,7 +1560,7 @@ pub async fn run_declarative_repairing(
             .clock
             .clone()
             .map(|clock| (clock, format!("validate:{round}")));
-        let values = serde_json::json!({"values":{"input":input,"output":output},"options":{"contextSnapshot":snapshot,"stepId":step_id}});
+        let values = serde_json::json!({"values":{"input":input,"output":output},"options":context_options(snapshot, step_id)});
         let has_checks = atom
             .frontmatter
             .get("validate")
@@ -1654,9 +1669,36 @@ pub async fn run_exec(
     artifacts: &Artifacts,
     meter: &Metering,
 ) -> Result<(Value, RunMetadata), AtomError> {
+    run_exec_with_context(
+        atom, compiled, input, identity, backend, clock, artifacts, meter, None,
+    )
+    .await
+}
+
+/// As [`run_exec`], for a step that brings its recorded public context:
+/// `context` is the run's snapshot and the trusted step it is bound for, and it
+/// reaches the atom's validators the same way a turn's does. An atom whose
+/// compiled contract declares a context and is brought no snapshot is refused
+/// before its command runs, and so is a snapshot that is not this atom's for
+/// this run or does not fit the contract it is checked against; an atom that
+/// declares no context is refused a snapshot it has nothing to check it
+/// against. A validator that reads only its output is unaffected: it runs on the
+/// same step, snapshot or not.
+#[allow(clippy::too_many_arguments)] // each is one thing the command needs
+pub async fn run_exec_with_context(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    input: &Value,
+    identity: &EffectIdentity,
+    backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    clock: Option<&crate::astro::StepClock>,
+    artifacts: &Artifacts,
+    meter: &Metering,
+    context: Option<DispatchContext<'_>>,
+) -> Result<(Value, RunMetadata), AtomError> {
     let workspace = open_exec_workspace(atom, identity, backend, None).await?;
-    run_exec_opened(
-        atom, compiled, input, identity, workspace, clock, artifacts, meter,
+    run_exec_opened_with_context(
+        atom, compiled, input, identity, workspace, clock, artifacts, meter, context,
     )
     .await
 }
@@ -1673,7 +1715,64 @@ pub async fn open_exec_workspace(
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     caches: Option<&crate::worktree::Caches>,
 ) -> Result<WorkspaceGuard, AtomError> {
+    open_exec_workspace_with_cargo(atom, identity, backend, caches, None).await
+}
+
+/// Trusted offline Cargo inputs selected by the host for a controls proof.
+/// These paths never come from an atom's input or declared environment.
+#[derive(Clone, Debug)]
+pub struct ExecCargo {
+    /// Fresh, private Cargo home for this exec attempt.
+    pub home: PathBuf,
+    /// Fresh target under that home, created after the author turn.
+    pub target: PathBuf,
+    /// Canonical operator-selected registry, read-only to the command.
+    pub registry: PathBuf,
+    /// Installed rustup toolchain selected by the operator.
+    pub toolchain: String,
+    /// Host-selected repository object store for the controls proof reader.
+    pub read_only_bindings: Vec<PathBuf>,
+}
+
+/// Open an exec workspace with host-selected offline Cargo inputs.
+pub async fn open_exec_workspace_with_cargo(
+    atom: &AtomFile,
+    identity: &EffectIdentity,
+    backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    caches: Option<&crate::worktree::Caches>,
+    cargo: Option<&ExecCargo>,
+) -> Result<WorkspaceGuard, AtomError> {
     let (env, writable_roots) = exec_environment(atom, caches);
+    let mut env = env;
+    if let Some(cargo) = cargo {
+        if !declared_network(atom).is_empty() {
+            return Err(AtomError::Runtime(format!(
+                "{}: a host-provisioned controls proof cannot allow network hosts",
+                atom.name
+            )));
+        }
+        for key in [
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "CARGO_NET_OFFLINE",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+        ] {
+            if declared_env(atom).contains_key(key) {
+                return Err(AtomError::Runtime(format!(
+                    "{}: host Cargo input {key} cannot be declared by the controls atom",
+                    atom.name
+                )));
+            }
+        }
+        env.insert("CARGO_HOME".into(), cargo.home.display().to_string());
+        env.insert(
+            "CARGO_TARGET_DIR".into(),
+            cargo.target.display().to_string(),
+        );
+        env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        env.insert("RUSTUP_TOOLCHAIN".into(), cargo.toolchain.clone());
+    }
     // Made in each attempt to open the workspace, so a full disk waits for
     // room as the backend's own lack of it does.
     let caches = caches.cloned();
@@ -1869,7 +1968,8 @@ async fn exchange_for(
 }
 
 /// [`run_exec`] in a workspace [`open_exec_workspace`] opened, which it
-/// closes when the command has ended.
+/// closes when the command has ended. Brought no public context; a step that
+/// has one goes through [`run_exec_opened_with_context`].
 #[allow(clippy::too_many_arguments)] // each is one thing the command needs
 pub async fn run_exec_opened(
     atom: &AtomFile,
@@ -1880,6 +1980,51 @@ pub async fn run_exec_opened(
     clock: Option<&crate::astro::StepClock>,
     artifacts: &Artifacts,
     meter: &Metering,
+) -> Result<(Value, RunMetadata), AtomError> {
+    run_exec_opened_with_context(
+        atom, compiled, input, identity, workspace, clock, artifacts, meter, None,
+    )
+    .await
+}
+
+/// As [`run_exec_opened`], with the step's recorded public context: its
+/// snapshot and the trusted step it is bound for, which reach the atom's
+/// validators the same way a turn's do. The compiled contract decides whether
+/// the step must bring a snapshot, and what it brings must agree with this atom,
+/// this run and that contract exactly. Every refusal here happens before the
+/// command is assembled, so a step that cannot answer for its context leaves no
+/// effect behind.
+#[allow(clippy::too_many_arguments)] // each is one thing the command needs
+pub async fn run_exec_opened_with_context(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    input: &Value,
+    identity: &EffectIdentity,
+    workspace: WorkspaceGuard,
+    clock: Option<&crate::astro::StepClock>,
+    artifacts: &Artifacts,
+    meter: &Metering,
+    context: Option<DispatchContext<'_>>,
+) -> Result<(Value, RunMetadata), AtomError> {
+    run_exec_opened_with_context_and_cargo(
+        atom, compiled, input, identity, workspace, clock, artifacts, meter, context, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Run an opened exec atom with host-selected offline Cargo paths.
+pub async fn run_exec_opened_with_context_and_cargo(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    input: &Value,
+    identity: &EffectIdentity,
+    workspace: WorkspaceGuard,
+    clock: Option<&crate::astro::StepClock>,
+    artifacts: &Artifacts,
+    meter: &Metering,
+    context: Option<DispatchContext<'_>>,
+    cargo: Option<&ExecCargo>,
 ) -> Result<(Value, RunMetadata), AtomError> {
     if compiled.hash != atom.program.hash() {
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
@@ -1893,6 +2038,58 @@ pub async fn run_exec_opened(
         .validator_for(contract("Input")?)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
     check_input(&input_validator, input)?;
+    // Whether this atom reads a public context is its compiled contract's, not
+    // what the caller brought, and the two must agree exactly — the same rule a
+    // turn's render applies (see `render::render_clocked`). An exec atom has no
+    // repair round, so what its validators cannot be told has to be refused here
+    // rather than discovered afterwards as a rejection of an output they could
+    // not read: a contextual step that brought no snapshot, a snapshot from
+    // another run or another atom, a snapshot whose values do not fit the
+    // contract the atom declares, and a snapshot brought for an atom that
+    // declares no context are each refused before the command is assembled. A
+    // validator that reads only its output runs once these checks pass.
+    if context
+        .as_ref()
+        .is_some_and(|dispatch| dispatch.step_id != identity.step_id.as_str())
+    {
+        return Err(AtomError::Runtime(format!(
+            "{}: context dispatch step identity does not match the command's step; its command does not run",
+            atom.name
+        )));
+    }
+    let declared = compiled.program.contracts.get("Context");
+    let snapshot = context.as_ref().map(|context| context.snapshot);
+    if declared.is_some() && snapshot.is_none() {
+        return Err(AtomError::Runtime(format!(
+            "{}: this step records no context snapshot for the public context its atom declares",
+            atom.name
+        )));
+    }
+    if declared.is_none() && snapshot.is_some() {
+        return Err(AtomError::Runtime(format!(
+            "{}: this atom declares no public context, so its step brings no snapshot",
+            atom.name
+        )));
+    }
+    if let (Some(schema), Some(record)) = (declared, snapshot) {
+        if let Some(why) = context_misfit(atom, schema, &record.as_value()["context"])? {
+            return Err(AtomError::Runtime(format!(
+                "{}: its recorded context snapshot does not fit the contract its atom declares: {why}",
+                atom.name
+            )));
+        }
+        if let Err(mismatch) = record.verify_for(&compiled.hash, &identity.run_id) {
+            return Err(AtomError::Runtime(format!(
+                "{}: {mismatch}; its command does not run",
+                atom.name
+            )));
+        }
+    }
+    let has_checks = atom
+        .frontmatter
+        .get("validate")
+        .and_then(Value::as_array)
+        .is_some_and(|checks| !checks.is_empty());
     let strings = |value: &Value| -> Vec<String> {
         value
             .as_array()
@@ -1931,7 +2128,7 @@ pub async fn run_exec_opened(
             .await?
         }
     };
-    let (exchange_env, read_only) = match exchange.as_ref().and_then(Option::as_ref) {
+    let (exchange_env, mut read_only) = match exchange.as_ref().and_then(Option::as_ref) {
         Some(x) => (
             vec![
                 (
@@ -1944,6 +2141,28 @@ pub async fn run_exec_opened(
         ),
         None => (Vec::new(), Vec::new()),
     };
+    let mut extra_writable = Vec::new();
+    if let Some(cargo) = cargo {
+        read_only.extend(cargo.read_only_bindings.iter().cloned());
+        read_only.extend([
+            cargo.registry.clone(),
+            cargo.home.clone(),
+            cargo.home.join("registry"),
+        ]);
+        read_only.extend([cargo.home.join("config"), cargo.home.join("config.toml")]);
+        for git in [
+            cargo.registry.parent().map(|p| p.join("git")),
+            Some(cargo.home.join("git")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if git.is_dir() {
+                read_only.push(git);
+            }
+        }
+        extra_writable.push(cargo.target.clone());
+    }
     // Looked up first: nothing returns early between the command's
     // admission and its settlement.
     let output_contract = contract("Output")?;
@@ -1977,7 +2196,12 @@ pub async fn run_exec_opened(
         exchange_env,
         Reach {
             read_only,
-            network: declared_network(atom),
+            writable: extra_writable,
+            network: if cargo.is_some() {
+                Vec::new()
+            } else {
+                declared_network(atom)
+            },
         },
     )
     .await;
@@ -2024,12 +2248,12 @@ pub async fn run_exec_opened(
     atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
         .map_err(|e| schema_error(e.to_string()))?;
     atomic_schema::expr::convertible(&output, contract("Output")?).map_err(schema_error)?;
-    let has_checks = atom
-        .frontmatter
-        .get("validate")
-        .and_then(Value::as_array)
-        .is_some_and(|checks| !checks.is_empty());
-    let values = serde_json::json!({"values":{"input":input,"output":output}});
+    // The step's snapshot and its trusted step id reach the validators exactly
+    // as a turn's do; the check before the command already refused a contextual
+    // atom that was brought no snapshot, so a validator's read of `context`
+    // cannot be a missing value here.
+    let step_id = context.as_ref().map(|context| context.step_id);
+    let values = serde_json::json!({"values":{"input":input,"output":output},"options":context_options(snapshot, step_id)});
     // One validation round, the same operation on every attempt.
     let clock = clock.map(|clock| (clock.clone(), "validate:0".to_owned()));
     validate_output(&compiled.program, has_checks, values, clock).await?;
@@ -2046,6 +2270,20 @@ pub async fn run_exec_opened(
             turns: 0,
         },
     ))
+}
+
+/// Why the public context a step recorded does not fit the contract its atom
+/// declares, as a message naming the atom; `Ok(None)` when it fits. Reading the
+/// contract is part of the check: one that cannot be read refuses, instead of an
+/// unread contract letting any snapshot through.
+fn context_misfit(
+    atom: &AtomFile,
+    schema: &Value,
+    context: &Value,
+) -> Result<Option<String>, AtomError> {
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|e| AtomError::Runtime(format!("{}: its context contract: {e}", atom.name)))?;
+    Ok(validator.validate(context).err().map(|why| why.to_string()))
 }
 
 /// How many times a gather that found the artifact store held by a sweep
@@ -2266,6 +2504,8 @@ struct Reach {
     /// The inputs it is given, inside its scratch directory, which it only
     /// reads.
     read_only: Vec<PathBuf>,
+    /// Writable target directory for a host-provisioned Cargo proof.
+    writable: Vec<PathBuf>,
     /// The hosts its atom declares, and nothing else; with none, no network.
     network: Vec<String>,
 }
@@ -2312,12 +2552,15 @@ async fn run_command(
         stdin,
         time_limit,
         output_limit: EXEC_OUTPUT_LIMIT,
+        cpu_seconds: None,
+        data_bytes: None,
         // A confining backend lets it write its scratch directory and its
         // run's build caches only.
         writable: workspace
             .scratch
             .iter()
             .chain(&workspace.writable_roots)
+            .chain(&reach.writable)
             .cloned()
             .collect(),
         // Inside it, the inputs it is given, which it only reads.
@@ -2448,11 +2691,59 @@ where
 /// `developer` with the output schema stated, for an endpoint that may not
 /// enforce it.
 fn schema_in_instructions(developer: &str, schema: &Value) -> String {
-    let schema = serde_json::to_string_pretty(schema).unwrap_or_default();
+    let schema = serde_json::to_string_pretty(schema).expect("a JSON value serializes");
     format!(
         "{developer}\n\nYour final answer is only a JSON object, with no other text and \
          no code fence, that follows this JSON Schema:\n\n{schema}"
     )
+}
+
+/// The developer message an initial model request sends after backend-specific
+/// schema guidance is added. `atomic render` uses the same decision as a live
+/// turn, including for Codex endpoints that may not enforce the schema.
+pub fn preview_developer_instructions(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    endpoint_base_url: Option<&str>,
+    developer: String,
+) -> Result<String, AtomError> {
+    let output = compiled.program.contracts.get("Output").ok_or_else(|| {
+        AtomError::Runtime(format!("{} has no compiled output contract", atom.name))
+    })?;
+    let lowered = lower::lower(output, &OPENAI_STRICT).map_err(|e| {
+        AtomError::Runtime(format!(
+            "the output schema of {} cannot be lowered: {e}",
+            atom.name
+        ))
+    })?;
+    match atom.kind.as_str() {
+        "codex" => {
+            let endpoint = endpoint_base_url.ok_or_else(|| {
+                AtomError::Runtime(format!(
+                    "{} needs a selected model endpoint to render the exact Codex instructions",
+                    atom.name
+                ))
+            })?;
+            Ok(developer_for_model(
+                developer,
+                &lowered.schema,
+                !lite::is_openai_api(endpoint),
+            ))
+        }
+        "lite" => Ok(developer),
+        other => Err(AtomError::Runtime(format!(
+            "{} is a {other} atom and sends no model prompt",
+            atom.name
+        ))),
+    }
+}
+
+fn developer_for_model(developer: String, schema: &Value, add_schema: bool) -> String {
+    if add_schema {
+        schema_in_instructions(&developer, schema)
+    } else {
+        developer
+    }
 }
 
 /// The contents of `answer` when it is exactly one fenced code block (with or

@@ -1,1 +1,1 @@
-atom-compiler-protocol-line|crates/atomic-core/src/compiler_host/host.js|\n`, true);|\n`, false);|-p atomic-agentic-core --lib -- atom::tests::a_source_the_compiler_faults_on_fails_the_load
+atom-compiler-protocol-line|crates/atomic-core/src/compiler_host.rs|eprint!("{}", string(args, 0, ctx)?);|print!("{}", string(args, 0, ctx)?);|-p atomic-agentic-core --lib -- compiler_host::tests::console_output_stays_off_the_protocol

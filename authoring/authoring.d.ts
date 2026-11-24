@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+/// <reference path="./raw-imports.d.ts" />
 // Typed compiler intrinsics, not a module that an atom executes.
 export interface TimeSlot { start: string; end: string }
 export interface Meeting { title: string; start: string; minutes: number }

@@ -1,0 +1,61 @@
+{
+  "origin": "host",
+  "records": [
+    {
+      "id": "fixture:execution:docs-links",
+      "criterion": "docs-links",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Checked 41 links in the built documentation for this revision."
+    },
+    {
+      "id": "fixture:execution:ownership-review",
+      "criterion": "ownership-review",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Both changed files carry a sign-off from their listed owner."
+    },
+    {
+      "id": "fixture:execution:docs-build",
+      "criterion": "docs-build",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "fail",
+      "access": "grant",
+      "findings": [
+        "F-21 docs:pricing-example still prices a single unit, so the rendered total disagrees with the table."
+      ],
+      "detail": "The documentation build reported one finding for this revision."
+    },
+    {
+      "id": "fixture:execution:pricing-scan",
+      "criterion": "pricing-scan",
+      "revision": "99999999b7e2f4a1c8d3056e9b7a4f2c1d8e6a35",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Last ran on the revision before the candidate was cut."
+    },
+    {
+      "id": "fixture:execution:secret-scan",
+      "criterion": "secret-scan",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "unavailable",
+      "access": "grant",
+      "findings": [],
+      "detail": "The scanner reported it could not start, so no state was recorded."
+    },
+    {
+      "id": "fixture:execution:changelog-check",
+      "criterion": "changelog-check",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "none",
+      "findings": [],
+      "detail": "The stored artifact expired, so its contents cannot be opened."
+    }
+  ]
+}

@@ -151,6 +151,12 @@ for n in "${names[@]}"; do
         echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"
         continue
     fi
+    # A target that only has the named test while the source is switched off
+    # must not count as a restored passing control.
+    if [ "${FAKE_CARGO}" = off-only ] && ! off; then
+        echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"
+        continue
+    fi
     fails=0
     if [ "${FAKE_CARGO}" != blind ] && off; then
         fails=1
@@ -344,6 +350,13 @@ run missing sandbox-writes
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
 
+# A zero-test restored run cannot turn a failed off run into a false proof.
+repo="$(fresh)"
+run off-only git-dir
+[ "${code}" -ne 0 ] && grep -q "FAIL git-dir: with the control on, no test passed" <<<"${out}" ||
+    fail "off-only: exit ${code}: ${out}"
+untouched || fail "off-only: the source is left modified"
+
 # A row's arguments reach cargo as written: no variable in them is expanded,
 # and none is left to be.
 repo="$(fresh)"
@@ -352,8 +365,8 @@ grep -q -- "--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-test
     fail "features: cargo was not given the row's features: $(cat "${repo}/cargo-args")"
 ! grep -q '\${' "${repo}/cargo-args" ||
     fail "features: a variable reached cargo unexpanded: $(cat "${repo}/cargo-args")"
-! grep -l '\${' "${ROOT}"/scripts/controls/*.row >/dev/null 2>&1 ||
-    fail "features: a row holds a variable: $(grep -l '\${' "${ROOT}"/scripts/controls/*.row)"
+! awk -F'|' '$5 ~ /\$\{/ { print FILENAME }' "${ROOT}"/scripts/controls/*.row | grep -q . ||
+    fail "features: a row's Cargo arguments hold a variable"
 
 # A failed test whose name has spaces in it, as a doctest's does, is seen
 # failing.

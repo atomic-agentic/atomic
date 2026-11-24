@@ -101,19 +101,26 @@ The MIT License, as it applies to the projects above that use it:
 
 ## Bundled Astro authoring compiler
 
-The binary embeds a trusted compiler worker and Astro WASM, built from pinned npm
-packages. Atom source itself is never executed. Runtime npm installation is not
-required. The bundled libraries are:
+The binary links the native Astro parser and TSX converter. The tsz checker checks the generated TypeScript against the TypeScript ES2022 library declarations. A trusted worker processes captured helper source maps.
 
 | Package | Version | License | Upstream |
 | --- | --- | --- | --- |
-| @astrojs/compiler | 4.0.0 | MIT and included Go BSD notices | https://github.com/withastro/compiler |
 | TypeScript | 5.9.3 | Apache-2.0 | https://github.com/microsoft/TypeScript |
 | source-map-js | 1.2.2 | BSD-3-Clause | https://github.com/7rulnik/source-map-js |
 
 Original licenses and generated bundle notices are retained under
 `crates/atomic-core/assets` and included in release archives under `licenses/`.
 Compiler dependency versions and payload hashes are included in the SBOM.
-The compiler runs on the V8 linked into this binary through `deno_core`; no Deno
-executable is needed or shipped. Contributor-only npm dependencies are pinned in the
+The authoring worker and captured helper modules run on Boa 0.22.0 (MIT or Unlicense). The native semantic checker is tsz 0.1.75 (Apache-2.0). Contributor-only npm dependencies are pinned in the
 authoring package lockfile.
+
+## Astro’s fork of Oxc
+
+atomic links the Astro parser from [withastro/oxc](https://github.com/withastro/oxc)
+at `e5e100abf1afb9a79ae22f97de32befe4b925d5d`, the revision used by
+Astro compiler-rs v0.5.3. Oxc and the Astro fork are MIT licensed.
+
+The native TSX converter comes from [withastro/compiler-rs](https://github.com/withastro/compiler-rs)
+at `c9bf179f77439e427a98751569d2af42ff85d78c` (MIT). Its HTML and JavaScript
+parsers come from [Biome](https://github.com/biomejs/biome) at
+`4eadd575d6890a785998279193ceeff9d3098850` (MIT or Apache-2.0).

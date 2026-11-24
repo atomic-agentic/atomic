@@ -1041,11 +1041,14 @@ fn a_codex_atom_off_openai_states_its_schema_in_its_instructions() {
     assert!(!crate::lite::is_openai_api("http://127.0.0.1:13305/api/v1"));
 }
 
-/// A project with one exec atom whose command runs `script` with python3.
-fn exec_project(
+/// A project with one exec atom whose command runs `script` with python3, whose
+/// config is annotated `annotation` with the type imports `imports` above it.
+fn exec_project_spelled(
     tag: &str,
     script: &str,
     extra: &str,
+    imports: &str,
+    annotation: &str,
 ) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
     use crate::{atom, compile};
     let dir = scratch(tag);
@@ -1056,10 +1059,9 @@ fn exec_project(
     std::fs::write(
         dir.join("atoms/total.atom.astro"),
         format!(
-            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/total';\n\
-             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+            "---\n{imports}\
              const {{ input }}: Props = Astro.props;\n\
-             export const config: AtomConfig<Input, Output> = {{ description: 'Total an order.', kind: 'exec', exec: {{ command: ['python3', 'tools/total.py'] }}{extra} }};\n---\n"
+             export const config: {annotation} = {{ description: 'Total an order.', kind: 'exec', exec: {{ command: ['python3', 'tools/total.py'] }}{extra} }};\n---\n"
         ),
     )
     .expect("atom");
@@ -1077,6 +1079,40 @@ fn exec_project(
     let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
     let compiled = compile::compile(&a, &registry).expect("compiles");
     (dir, a, compiled)
+}
+
+/// [`exec_project_spelled`] as most exec tests write it: the explicit
+/// `AtomConfig<Input, Output>`, which types no public context for a validator.
+fn exec_project(
+    tag: &str,
+    script: &str,
+    extra: &str,
+) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    exec_project_spelled(
+        tag,
+        script,
+        extra,
+        "import type { Props, Input, Output } from '../.atomic/types/total';\n\
+         import type { AtomConfig } from '../.atomic/types/authoring';",
+        "AtomConfig<Input, Output>",
+    )
+}
+
+/// [`exec_project_spelled`] written with the per-atom `Config` its own
+/// declarations generate, so a validator of an atom that declares a context may
+/// read `context`: the explicit two-argument spelling above types none.
+fn spelled_exec_project(
+    tag: &str,
+    script: &str,
+    extra: &str,
+) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    exec_project_spelled(
+        tag,
+        script,
+        extra,
+        "import type { Props, Config } from '../.atomic/types/total';",
+        "Config",
+    )
 }
 
 const TOTAL: &str = "import json, sys\norder = json.load(sys.stdin)\njson.dump({'total': sum(order['cents'])}, sys.stdout)\n";
@@ -4102,5 +4138,333 @@ fn a_store_held_while_inputs_are_given_runs_nothing() {
             .expect("joins")
             .expect("given once the sweep let go");
         assert!(dir.join("ran").exists(), "the command did not run");
+    });
+}
+
+/// An exec atom's command that notes where it ran, so a refusal can be proved to
+/// have come first: `ran` beside the project says its command started.
+const MARKED: &str = "import json, sys\norder = json.load(sys.stdin)\nopen('ran', 'w').write('ran')\njson.dump({'total': sum(order['cents'])}, sys.stdout)\n";
+
+/// An exec atom that declares a public context and validates with one rule that
+/// reads it. Nothing else about it is unusual: its command is a command.
+fn contextual_exec_atom(tag: &str) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    use crate::atom::tests::CONTEXT;
+    spelled_exec_project(
+        tag,
+        MARKED,
+        &format!(
+            ", context: {CONTEXT}, validate: [({{output, context}}) => output.total > 0 \
+             && context.config.maxReplyCharacters > 0]"
+        ),
+    )
+}
+
+/// The same, validating with a rule that reads only its output.
+fn output_checking_exec_atom(tag: &str) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    use crate::atom::tests::CONTEXT;
+    spelled_exec_project(
+        tag,
+        MARKED,
+        &format!(", context: {CONTEXT}, validate: [({{output}}) => output.total > 0]"),
+    )
+}
+
+/// An atom that declares no context at all, for the case where a step brings a
+/// snapshot its atom has nothing to check it against.
+fn plain_exec_atom(tag: &str) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    exec_project(tag, MARKED, ", validate: [({output}) => output.total > 0]")
+}
+
+/// The context one step of `run` would record, from the fixture settings the
+/// context tests use, with no environment declared so no live variable is read.
+fn step_snapshot(a: &crate::atom::Atom, run: &str, step: &str) -> crate::context::ContextSnapshot {
+    let mut settings: Value = serde_json::from_str(include_str!(
+        "../../../../authoring/fixtures/context/settings.json"
+    ))
+    .expect("settings");
+    settings["environment"] = json!({});
+    crate::context::resolve_for_step(
+        a,
+        run,
+        step,
+        &crate::context::DispatchSettings {
+            settings,
+            profile: None,
+            project: json!({"id": "example", "name": "Example"}),
+        },
+    )
+    .expect("resolves")
+}
+
+fn identity(run: &str) -> EffectIdentity {
+    EffectIdentity {
+        run_id: run.into(),
+        step_id: "total".into(),
+    }
+}
+
+/// What every one of these calls has in common, so each test says only which
+/// context it brought and what came back.
+async fn exec_with(
+    a: &crate::atom::Atom,
+    compiled: &Compiled,
+    context: Option<DispatchContext<'_>>,
+    run: &str,
+) -> Result<(Value, RunMetadata), AtomError> {
+    run_exec_with_context(
+        a,
+        compiled,
+        &json!({"cents": [1, 2]}),
+        &identity(run),
+        Arc::new(atomic_exec::LocalBackend::default()),
+        None,
+        &Artifacts::none(),
+        &crate::usage::Metering::none(),
+        context,
+    )
+    .await
+}
+
+// A contextual exec atom's validators are given the context its step recorded,
+// so a rule that reads it decides on the real values. This is what an exec atom
+// was refused before, wrongly: the read is not a missing value once the step's
+// snapshot is threaded to the validation.
+#[test]
+fn a_contextual_exec_atom_validates_with_the_snapshot_its_step_recorded() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = contextual_exec_atom("exec-ctx-checks");
+        let snapshot = step_snapshot(&a, "run-1", "total");
+        let (out, _) = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            "run-1",
+        )
+        .await
+        .expect("its validators are told the context they read");
+        assert_eq!(out, json!({"total": 3}));
+        assert!(dir.join("ran").exists(), "its command ran");
+    });
+}
+
+#[test]
+fn a_direct_declarative_exec_run_keeps_its_context_for_validation() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = contextual_exec_atom("exec-ctx-direct");
+        let snapshot = step_snapshot(&a, "run-1", "total");
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtimes(&model, "exec-ctx-direct");
+        let input = json!({"cents": [1, 2]});
+        let run = RunInput {
+            run_id: "run-1",
+            input: &input,
+            frontmatter: &a.frontmatter,
+            origin: "external",
+            origins: None,
+            step: Some("total"),
+        };
+        let (out, _) = run_declarative_with_context(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &run,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            &rt,
+        )
+        .await
+        .expect("the direct exec path keeps its recorded context");
+        assert_eq!(out, json!({"total": 3}));
+        assert!(dir.join("ran").exists(), "its command ran");
+        assert_eq!(model.calls(), 0, "an exec step makes no model call");
+    });
+}
+
+// A rule that reads only the output decides on the same step, snapshot or no
+// snapshot beside it: a contextual atom is not refused for the reads its
+// validators do not make.
+#[test]
+fn a_contextual_exec_atom_validates_a_rule_that_reads_only_its_output() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = output_checking_exec_atom("exec-ctx-output-only");
+        let snapshot = step_snapshot(&a, "run-1", "total");
+        let (out, _) = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            "run-1",
+        )
+        .await
+        .expect("its output-only rule needs nothing more");
+        assert_eq!(out, json!({"total": 3}));
+        assert!(dir.join("ran").exists(), "its command ran");
+    });
+}
+
+// A contextual atom whose step brought no snapshot is refused, whether or not
+// its rules read the context: what its contract declares and what its step
+// brings must agree exactly, and an exec atom has no repair round to spend a
+// missing value on.
+#[test]
+fn a_contextual_exec_atom_brought_no_snapshot_is_refused_before_its_command() {
+    on_codex_runtime(async {
+        for (tag, (dir, a, compiled)) in [
+            (
+                "exec-ctx-no-snapshot",
+                contextual_exec_atom("exec-ctx-no-snapshot"),
+            ),
+            (
+                "exec-ctx-output-only-no-snapshot",
+                output_checking_exec_atom("exec-ctx-output-only-no-snapshot"),
+            ),
+        ] {
+            let r = exec_with(&a, &compiled, None, "run-1").await;
+            assert!(
+                matches!(&r, Err(AtomError::Runtime(m))
+                    if m.contains("this step records no context snapshot for the public context its atom declares")),
+                "{tag}: {r:?}"
+            );
+            assert!(
+                !dir.join("ran").exists(),
+                "{tag}: its command never started: {}",
+                std::fs::read_to_string(dir.join("ran")).unwrap_or_default()
+            );
+        }
+    });
+}
+
+// A snapshot from another run is refused, named as the mismatch it is, before
+// the command that would have read it.
+#[test]
+fn an_exec_atom_brought_another_runs_snapshot_is_refused_before_its_command() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = contextual_exec_atom("exec-ctx-other-run");
+        let snapshot = step_snapshot(&a, "run-1", "total");
+        let r = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            "run-2",
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m))
+                if m.contains("context run identity mismatch")
+                    && m.contains("its command does not run")),
+            "{r:?}"
+        );
+        assert!(!dir.join("ran").exists(), "its command never started");
+    });
+}
+
+#[test]
+fn an_exec_atom_brought_another_steps_dispatch_is_refused_before_its_command() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = contextual_exec_atom("exec-ctx-other-step");
+        let snapshot = step_snapshot(&a, "run-1", "total");
+        let r = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "another-step",
+            }),
+            "run-1",
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m))
+                if m.contains("context dispatch step identity does not match")
+                    && m.contains("its command does not run")),
+            "{r:?}"
+        );
+        assert!(!dir.join("ran").exists(), "its command never started");
+    });
+}
+
+// A snapshot whose values do not fit the contract of the atom it is brought to
+// is refused by the check that reads that contract, before the command: what a
+// step recorded is measured against this atom, not against the atom it happened
+// to be resolved for. The contract below asks for a profile these settings never
+// resolve, so it is the fit that refuses here and not the run identity.
+#[test]
+fn an_exec_atom_brought_context_that_fails_its_contract_is_refused_before_its_command() {
+    use crate::atom::tests::EMPTY_CONTEXT;
+    on_codex_runtime(async {
+        let (loose_dir, loose, _) = spelled_exec_project(
+            "exec-loose-context",
+            MARKED,
+            &format!(", context: {EMPTY_CONTEXT}"),
+        );
+        let snapshot = step_snapshot(&loose, "run-1", "total");
+        let (strict_dir, a, compiled) = spelled_exec_project(
+            "exec-strict-context",
+            MARKED,
+            ", context: {type:'object',required:['profile'],properties:\
+             {profile:{type:'string',pattern:'^prod$'}}}",
+        );
+        let r = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            "run-1",
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m))
+                if m.contains("its recorded context snapshot does not fit the contract its atom declares")
+                    && !m.contains("version mismatch")),
+            "{r:?}"
+        );
+        assert!(
+            !strict_dir.join("ran").exists(),
+            "the strict atom's command never started: {}",
+            std::fs::read_to_string(strict_dir.join("ran")).unwrap_or_default()
+        );
+        assert!(
+            !loose_dir.join("ran").exists(),
+            "the atom its snapshot was resolved for ran nothing either"
+        );
+    });
+}
+
+// A snapshot brought for an atom that declares no public context is refused too:
+// there is no contract here to check it against, so nothing may read it.
+#[test]
+fn an_exec_atom_that_declares_no_context_is_refused_a_snapshot() {
+    on_codex_runtime(async {
+        let (dir, a, compiled) = plain_exec_atom("exec-no-ctx");
+        let (_, contextual, _) = contextual_exec_atom("exec-no-ctx-snapshot-source");
+        let snapshot = step_snapshot(&contextual, "run-1", "total");
+        let r = exec_with(
+            &a,
+            &compiled,
+            Some(DispatchContext {
+                snapshot: &snapshot,
+                step_id: "total",
+            }),
+            "run-1",
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m))
+                if m.contains("this atom declares no public context, so its step brings no snapshot")),
+            "{r:?}"
+        );
+        assert!(!dir.join("ran").exists(), "its command never started");
     });
 }

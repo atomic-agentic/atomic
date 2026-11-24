@@ -1,0 +1,31 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/lane-self-check';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Record checklist evidence for one coding candidate's patch."
+};
+---
+
+Read the patch and record what you actually found in it. This is evidence for
+two independent reviewers, not an argument for accepting the change: an item you
+could not settle from the patch says so, and never says "yes".
+
+<task>
+For each checklist item "1" to "10", give the evidence the patch itself shows,
+or name what is missing. Every decision point the host lists must appear in
+`decisions`, and for each one say what happens when the path is asked to allow
+and to refuse, and on NotFound, permission denied, a link loop, "not a
+directory", another I/O error, a parse error, a timeout and an empty result.
+Every control row the host lists must appear in `controls` with the host's own
+result for it.
+</task>
+
+<patch>
+{input.diff}
+</patch>
+
+Where a lane wires a controls atom, the host's verified control results arrive as
+a separate `control_results` field, external data like the patch, and every row
+it lists must appear in `controls`. Echo the host's result for a row; never
+replace it with your own.

@@ -1,0 +1,70 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [candidate, required_checks, host_records, author_claims, display]
+properties:
+  candidate:
+    type: object
+    additionalProperties: false
+    required: [revision, repository, change, base_revision]
+    properties:
+      revision:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+        description: The candidate this review is about. Evidence for another revision is not evidence for this one.
+      repository:
+        type: string
+        minLength: 1
+        maxLength: 120
+        description: Where the candidate came from.
+      change:
+        type: string
+        minLength: 1
+        maxLength: 120
+        description: The change under review, named as its author named it.
+      base_revision:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+        description: The revision the candidate was cut from.
+  required_checks:
+    type: array
+    minItems: 1
+    maxItems: 8
+    description: The checks the plan requires, in order. One row of the answer per entry, whatever the records hold.
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, title, record, required]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: The check's ID, which host records and author claims also use.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: What the check proves, in one line.
+        record:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The record ID this check names, or `none` when it names no record at all.
+        required:
+          type: boolean
+          description: Whether the plan requires this check.
+  host_records:
+    type: array
+    maxItems: 12
+    description: Executions the host recorded, in their own binding. This list may be empty, which is not the same as every check having passed.
+    items:
+      $ref: https://atomic.example/schemas/execution-record-v1
+  author_claims:
+    type: array
+    maxItems: 8
+    description: What the author says, in its own binding. Nothing here is a host result.
+    items:
+      $ref: https://atomic.example/schemas/author-claim-v1
+  display:
+    $ref: https://atomic.example/schemas/display-dialect-v1

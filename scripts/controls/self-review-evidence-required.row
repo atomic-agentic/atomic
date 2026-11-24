@@ -1,0 +1,1 @@
+self-review-evidence-required|crates/atomic/src/pipeline.rs|            checked.map_err|            Ok::<(), String>(()).map_err|-p atomic-agentic --test pipeline incomplete_self_review_evidence_refuses_before_reviewer_turn

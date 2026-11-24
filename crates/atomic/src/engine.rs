@@ -14,7 +14,9 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
+use atomic_app::pipeline::{
+    LAYOUT_VERSION, ProjectWorktrees, Services, TrialCargo, register_pipeline,
+};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
@@ -46,6 +48,10 @@ pub enum RunnerKind {
 /// [`crate::settings`]); a flag wins over both.
 #[derive(Clone, Debug, Default, Args)]
 pub struct EngineArgs {
+    /// Project configuration profile: `atomic.<profile>.yaml` beside the
+    /// resolved project's manifest. `ATOMIC_PROFILE` is used without a flag.
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Base URL of the OpenAI-compatible API that model atoms use
     /// (`model.base_url`, `ATOMIC_MODEL_BASE_URL`).
     #[arg(long)]
@@ -549,6 +555,40 @@ pub async fn open(
     // tell a directory git refused from one git could not be asked about (see
     // `runs::bind_fixture`).
     let worktrees = ProjectWorktrees::FixtureOnly;
+    // An explicit operator choice, separate from the candidate's Cargo home.
+    // The runner later exposes only its registry, read-only, to a trial check.
+    let operator_value =
+        |trial: &str, controls: &str| -> anyhow::Result<Option<std::ffi::OsString>> {
+            let (trial, controls) = (std::env::var_os(trial), std::env::var_os(controls));
+            anyhow::ensure!(
+                trial.is_none() || controls.is_none() || trial == controls,
+                "trial and controls offline Cargo settings disagree"
+            );
+            Ok(trial.or(controls))
+        };
+    let trial_cargo = match operator_value(
+        "ATOMIC_TRIAL_CARGO_REGISTRY",
+        "ATOMIC_CONTROLS_CARGO_REGISTRY",
+    )? {
+        Some(registry) => Some(
+            TrialCargo::new(
+                registry.into(),
+                operator_value(
+                    "ATOMIC_TRIAL_RUSTUP_TOOLCHAIN",
+                    "ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN",
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "operator offline Cargo toolchain is required with its registry"
+                    )
+                })?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("operator offline Cargo toolchain is not UTF-8"))?,
+            )
+            .map_err(anyhow::Error::msg)?,
+        ),
+        None => None,
+    };
     let mut rt = Durare::open(
         &database,
         executor.as_deref(),
@@ -566,6 +606,7 @@ pub async fn open(
             worktrees,
             // Each run's build caches, in a directory of its own here.
             caches: Some(state.dir().join("cache")),
+            trial_cargo,
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public
@@ -573,6 +614,7 @@ pub async fn open(
             context: None,
         },
     );
+    crate::delivery::register_delivery(&mut rt, state.clone());
     let only = match &takes {
         Takes::Own => None,
         Takes::Run(run) => Some(Some(run.as_str())),

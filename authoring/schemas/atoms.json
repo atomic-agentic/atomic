@@ -11,6 +11,13 @@
     },
     "context": "RuntimeContext"
   },
+  "callback-context": {
+    "input": "DraftInput",
+    "output": "Reply",
+    "case": "EvalCase",
+    "judges": {},
+    "context": "RuntimeContext"
+  },
   "triage-email": {
     "input": "TriageInput",
     "output": "TriageOutput",

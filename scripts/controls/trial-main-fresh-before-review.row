@@ -1,0 +1,1 @@
+trial-main-fresh-before-review|crates/atomic/src/pipeline.rs|            if let Some(trial_head) = trial_head {|            if let Some(trial_head) = None::<TrialHead> {|-p atomic-agentic --test pipeline -- recovered_panel_refuses_stale_main_before_unfinished_reviewer

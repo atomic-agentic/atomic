@@ -1,0 +1,1 @@
+migration-history-hole|crates/atomic-durable/src/store.rs|        if !baseline && *version != prior + 1 {|        if /*CONTROL_OFF*/ false && !baseline && *version != prior + 1 {|-p atomic-agentic-durable --lib -- store::tests::history_checksum_and_hole_refuse_before_any_change

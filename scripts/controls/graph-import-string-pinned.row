@@ -1,0 +1,1 @@
+graph-import-string-pinned|crates/atomic-graph/src/sqlite.rs|None => errors.push(format!("line {} pinned must be a boolean", n + 1)),|None => {},|-p atomic-agentic-graph --test conformance sqlite_native_pinned_uses_marked_beads_metadata_and_generic_pinned_is_refused

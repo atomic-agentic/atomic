@@ -1,0 +1,1 @@
+controls-exec-selected-libtest-harness|scripts/controls-exec.py|        verify_row_harnesses(git, source, env, want["admitted"], commit, copy, names, room)|        pass  # CONTROL_OFF: selected Cargo harness and target path are not checked|-p atomic-agentic --test controls_exec_driver_guard selected_control_target_requires_standard_libtest_harness

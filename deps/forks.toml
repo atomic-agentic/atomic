@@ -36,3 +36,12 @@ rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6"
 licence = "Apache-2.0"
 why = "makes the parent-death signal best effort where prctl is refused or unsupported, so commands start in AWS Lambda (and on iSH)"
 crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-utils-pty"]
+
+[[fork]]
+name = "astro-oxc"
+repository = "https://github.com/withastro/oxc"
+upstream = "https://github.com/oxc-project/oxc"
+rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d"
+licence = "MIT"
+why = "the Astro grammar pinned by compiler-rs v0.5.3"
+crates = ["oxc_allocator", "oxc_ast", "oxc_ast_macros", "oxc_ast_visit", "oxc_data_structures", "oxc_diagnostics", "oxc_ecmascript", "oxc_estree", "oxc_parser", "oxc_regular_expression", "oxc_span", "oxc_str", "oxc_syntax"]

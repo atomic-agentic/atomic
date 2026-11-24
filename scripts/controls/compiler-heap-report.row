@@ -1,1 +1,1 @@
-compiler-heap-report|crates/atomic-core/src/compiler_host.rs|flag.store(true, Ordering::Release);|let _ = &flag; // CONTROL_OFF|-p atomic-agentic-core --lib -- compiler_host::tests::a_heap_blow_up_is_refused_at_the_limit
+compiler-heap-report|crates/atomic-core/src/compiler_process.rs|"the Astro compiler exceeded its memory limit".to_owned()|"unknown child failure".to_owned()|-p atomic-agentic-core --lib -- compiler_host::tests::a_heap_blow_up_is_refused_at_the_limit

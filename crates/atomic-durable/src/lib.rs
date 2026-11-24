@@ -6,6 +6,7 @@
 //! only through this crate.
 
 pub mod attempt;
+pub mod delivery_effect;
 pub mod failpoints;
 pub mod gate;
 pub mod history;

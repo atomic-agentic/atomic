@@ -1,0 +1,1 @@
+schema-origin-module-header|crates/atomic-schema/src/typescript.rs|let origin_line = match root_origin.written_file() {|let origin_line = match std::hint::black_box(None::<&str>) {|-p atomic-agentic-schema --lib -- typescript::tests::the_origin_is_read_back_from_a_generated_module

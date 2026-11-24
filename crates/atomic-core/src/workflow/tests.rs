@@ -99,6 +99,67 @@ fn a_well_formed_workflow_loads_in_dependency_order() {
 }
 
 #[test]
+fn executable_criteria_are_bounded_and_type_checked_before_run() {
+    let criteria = "    criteria:\n      - {kind: text, text: 'Keep the summary accurate'}\n      - {kind: test, argv: [cargo, test, summary], timeout_ms: 30000}\n      - {kind: cel, expr: \"candidate.output.summary != ''\"}\n      - {kind: http, method: HEAD, url: 'https://example.test/health', allowed_host: example.test, status: 200, timeout_ms: 2000}\n";
+    let source = WORKFLOW.replace(
+        "    atom: summarize-note\n",
+        &format!("    atom: summarize-note\n{criteria}"),
+    );
+    check(&source).expect("typed criteria load");
+
+    let bad_field = source.replace("candidate.output.summary", "candidate.output.missing");
+    let failure = err(&bad_field);
+    assert_eq!(failure.path, "/steps/summarize/criteria/2/expr");
+
+    let non_boolean = source.replace(
+        "candidate.output.summary != ''",
+        "candidate.output.summary.size()",
+    );
+    let failure = err(&non_boolean);
+    assert_eq!(failure.path, "/steps/summarize/criteria/2/expr");
+    assert!(
+        failure.message.contains("expected a boolean result"),
+        "{failure}"
+    );
+    let boolean = source.replace(
+        "candidate.output.summary != ''",
+        "candidate.output.summary.size() > 0",
+    );
+    check(&boolean).expect("boolean CEL criterion loads");
+
+    assert!(
+        parse_criteria(&serde_json::json!([{
+            "kind":"test", "argv":["sh", "-c", "true"], "timeout_ms":30000
+        }]))
+        .unwrap_err()
+        .contains("directly named shell is refused")
+    );
+    assert!(
+        parse_criteria(&serde_json::json!([{
+            "kind":"test", "argv":["cargo", "test"], "timeout_ms":0
+        }]))
+        .unwrap_err()
+        .contains("timeout_ms")
+    );
+    assert!(
+        parse_criteria(&serde_json::json!([{
+            "kind":"http", "method":"POST", "url":"https://example.test/health",
+            "allowed_host":"example.test", "status":200, "timeout_ms":2000
+        }]))
+        .unwrap_err()
+        .contains("GET or HEAD")
+    );
+    assert!(
+        parse_criteria(&serde_json::json!([{
+            "kind":"http", "method":"GET", "url":"https://other.test/health",
+            "allowed_host":"example.test", "status":200, "timeout_ms":2000
+        }]))
+        .unwrap_err()
+        .contains("allowed host")
+    );
+}
+
+#[test]
 fn a_misspelled_atom_reference_fails() {
     let e = err(&WORKFLOW.replace("atom: summarize-note", "atom: summarise-note"));
     assert_eq!((e.path.as_str(), e.line), ("/steps/summarize/atom", 15));

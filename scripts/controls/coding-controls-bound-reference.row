@@ -1,0 +1,1 @@
+coding-controls-bound-reference|crates/atomic/src/pipeline.rs|!= Some(reference.as_str())|!= Some(reference.as_str()) && false|-p atomic-agentic --test pipeline a_host_control_proof_refuses_a_wrong_bound_before_review

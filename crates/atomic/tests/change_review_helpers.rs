@@ -259,6 +259,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 // Nothing offered to a worktree step, as in `atomic`.
                 worktrees: ProjectWorktrees::FixtureOnly,
                 caches: None,
+                trial_cargo: None,
                 budgets: Arc::default(),
                 context: None,
             },

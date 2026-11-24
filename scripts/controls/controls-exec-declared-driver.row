@@ -1,0 +1,1 @@
+controls-exec-declared-driver|scripts/controls-exec.py|        driver = check_driver(env)|        driver = os.path.abspath(__file__)  # CONTROL_OFF: the driver that answers is whichever file was started, not the declared one|-p atomic-agentic --features atomic-agentic/sandbox-tests --test controls_exec -- a_control_row_proves_itself_in_the_sandbox_and_a_blind_row_fails_the_step

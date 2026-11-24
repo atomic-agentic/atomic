@@ -1,0 +1,24 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://atomic.example/schemas/assumption-v1
+title: Assumption
+description: >-
+  One assumption the plan's author recorded. It is the author's, says so, and is
+  never counted as coverage.
+type: object
+additionalProperties: false
+required: [id, origin, text]
+properties:
+  id:
+    type: string
+    minLength: 4
+    maxLength: 120
+    description: The assumption's own source ID.
+  origin:
+    type: string
+    const: author
+    description: Who recorded this assumption.
+  text:
+    type: string
+    minLength: 1
+    maxLength: 300
+    description: The assumption, as its author wrote it.

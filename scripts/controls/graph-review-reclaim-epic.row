@@ -1,0 +1,1 @@
+graph-review-reclaim-epic|crates/atomic-graph/src/transactional_claim.rs|row.text_opt("parent_status")?.as_deref() == Some("pinned")|true|-p atomic-agentic-graph --test epic_run review_reclaim_requires_the_original_epic_still_pinned

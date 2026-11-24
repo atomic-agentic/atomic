@@ -498,7 +498,71 @@
           "properties": {}
         }
       },
-      "declarations": "// Generated from the full runtime contracts. Do not edit.\nexport type Input = { \"email\": string; \"free_slots\"?: Array<{ \"start\": string; \"end\": string; }>; };\nexport type Output = { \"reply\": string; \"tone\"?: \"brief\" | \"warm\"; };\nexport type ContextData = {  };\nexport type Case = unknown;\nexport type Judges = {  };\nexport type Context = Immutable<ContextData>;\nexport type Reply = Output;\nexport type EvalCase = Case;\nexport type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\nexport interface Props { input: Input; readonly context: Immutable<Context>; }\n"
+      "declarations": "// Generated from the full runtime contracts. Do not edit.\nimport type { AtomConfig } from './authoring';\nexport type Input = { \"email\": string; \"free_slots\"?: Array<{ \"start\": string; \"end\": string; }>; };\nexport type Output = { \"reply\": string; \"tone\"?: \"brief\" | \"warm\"; };\nexport type ContextData = {  };\nexport type Case = unknown;\nexport type Judges = {  };\nexport type Context = Immutable<ContextData>;\nexport type Reply = Output;\nexport type EvalCase = Case;\nexport type Config = AtomConfig<Input, Reply, EvalCase, Judges, Context>;\nexport type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\nexport interface Props { input: Input; readonly context: Immutable<Context>; }\n"
+    },
+    {
+      "name": "the same atom with no context schema declares no context type",
+      "schemas": {
+        "Input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "email"
+          ],
+          "properties": {
+            "email": {
+              "type": "string"
+            },
+            "free_slots": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start",
+                  "end"
+                ],
+                "properties": {
+                  "start": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "end": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "Output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reply"
+          ],
+          "properties": {
+            "reply": {
+              "type": "string"
+            },
+            "tone": {
+              "enum": [
+                "brief",
+                "warm"
+              ]
+            }
+          }
+        },
+        "Case": true,
+        "Judges": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {}
+        }
+      },
+      "declarations": "// Generated from the full runtime contracts. Do not edit.\nimport type { AtomConfig } from './authoring';\nexport type Input = { \"email\": string; \"free_slots\"?: Array<{ \"start\": string; \"end\": string; }>; };\nexport type Output = { \"reply\": string; \"tone\"?: \"brief\" | \"warm\"; };\nexport type Case = unknown;\nexport type Judges = {  };\nexport type Reply = Output;\nexport type EvalCase = Case;\nexport type Config = AtomConfig<Input, Reply, EvalCase, Judges>;\nexport type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\nexport interface Props { input: Input; }\n"
     }
   ]
 }

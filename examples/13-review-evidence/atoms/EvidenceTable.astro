@@ -1,0 +1,26 @@
+---
+// One host-record table, shared by both review Atoms so the two views cannot
+// drift on what a record is made of.
+//
+// Every cell is a bound value, so the table arrives as one row of data per
+// record in the user turn rather than as prose a payload could rewrite. The
+// record's `detail` is deliberately not a column: free text does not belong in
+// a cell, and verbatim detail travels beside the table, addressed by ID.
+interface HostRow {
+  readonly id: string;
+  readonly criterion: string;
+  readonly revision: string;
+  readonly outcome: 'pass' | 'fail' | 'unavailable';
+  readonly access: 'grant' | 'none';
+  readonly findings: readonly string[];
+}
+interface Props {
+  readonly records: readonly HostRow[];
+}
+const { records }: Props = Astro.props;
+---
+| Record | Criterion | Ran on | Outcome | Findings | Access |
+| --- | --- | --- | --- | --- | --- |
+{records.map((record) => <Fragment>
+| {record.id} | {record.criterion} | {record.revision} | {record.outcome} | {record.findings.length} | {record.access} |
+</Fragment>)}

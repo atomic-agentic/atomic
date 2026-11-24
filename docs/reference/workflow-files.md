@@ -111,8 +111,9 @@ The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
 own. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step
 `candidate.metadata.commit`; each binding must fit the reviewer's input. The
-reviewer runs in the project, not in the step's worktree, so of a coding
-step's change it has the commit's SHA, not the commit itself. What
+reviewer runs in the project, not in the step's worktree, so a generic
+worktree review can use the commit's SHA; a `coding: true` review below
+receives a patch computed from that commit. What
 it reads of the candidate is external data, so a reviewer that accepts only
 more trusted input is refused. `rounds` (0 to 5, default 1) is how many repair
 rounds the author gets; an author that accepts only more trusted input than the
@@ -134,6 +135,139 @@ first turn's atom budget, and later verdicts to the first verdict's, so a step
 spends at most its author's and its reviewer's atom budgets however many rounds
 it takes. An exec atom cannot be reviewed, since a command cannot read a
 verdict; a gate cannot either, and a step's name has no dot in it.
+
+### Coding reviews
+
+Mark a code-writing worktree step `coding: true`. It must have `review` and a
+`review.self_review` atom. Both the self-reviewer and independent reviewer map
+their `diff` input to `candidate.metadata.diff`, the patch atomic reads from
+the recorded base and candidate commits. The reviewer receives that mapped
+diff, the self-reviewer's output in a separate `self_review` input field, and
+`host_review` with the reviewed decision inventory, selected touched controls
+and their verified results. All three fields are external data; the author's
+reasoning is not mapped. The reviewer's input schema must accept `host_review`.
+The reviewer and self-reviewer are lite or codex atoms. The reviewer runs in
+the project, not in the author's worktree.
+
+```yaml
+code:
+  atom: code-author
+  with: {task: input.task, base: input.base}
+  worktree: true
+  coding: true
+  review:
+    reviewer: code-reviewer
+    with: {diff: candidate.metadata.diff}
+    self_review:
+      atom: code-self-check
+      with: {diff: candidate.metadata.diff}
+      decision_points: [candidate publication]
+      selected_controls: [self-review-evidence-required]
+      controls_atom: prove-controls
+    trial_merge:
+      main: refs/heads/main
+      checks: [[cargo, test, --offline, --locked]]
+    rounds: 1
+```
+
+A coding review may instead declare `reviewers: [code-reviewer,
+second-code-reviewer]` and `require: all` in place of `reviewer:`. Both names
+are fixed by the workflow source, run in separate durable sibling steps, and
+must approve the same candidate. A request for changes enters a bounded repair
+round; a rejection or exhausted rounds goes to the human review gate.
+
+For coding self-review, the original run-admitted revision must contain the regular JSON
+file `.atomic/coding-decision-inventory.json`, for example:
+
+```json
+{"version":1,"decision_points":["candidate publication"]}
+```
+
+Atomic obtains that revision from the first worktree turn's durable,
+host-recorded base. A later worktree step cannot replace its authority,
+even if an earlier step published
+a commit that changed the file. Atomic refuses a missing, malformed or
+candidate-modified inventory. Every point in that reviewed file must occur in
+both `decision_points` and the
+self-review evidence. Atomic also selects control rows from the base commit
+when the coding step changes a row's switched file, guarding test target or
+named test, including a change that reverts an earlier step. The selector
+checks each `--test` target and the final name of a
+module-qualified test filter. Every selected row must occur in
+`selected_controls`, be proved by the controls atom, and be reported in
+self-review evidence. The candidate
+cannot change row files, the shared controls driver, or a helper listed in
+`scripts/controls-shared.txt` in the same coding change. The runtime selector
+also includes all reviewed rows for any changed test-tree path and all rows
+for a possible one-level Rust include or `#[path]` reference. Ordinary Rust
+strings and comments do not count as source references. It refuses a tracked
+path alias or escaped
+Rust source reference whose target it cannot determine safely. This
+conservative selection may require more rows than CI's
+`scripts/controls-touched.py`.
+
+The self-review atom's output must be an object with `items`, `decisions` and
+`controls`. When `selected_controls` names rows, `controls_atom` names an exec
+atom that declares an idempotent or read-only external effect. Atomic runs it
+once per row as a durable sibling step, `<step>.controls.<round>.<index>`,
+before self-review. Its input comes from the private, host-recorded candidate
+commit, base and ref, the run's bound Git repository, and that one declared row.
+The self-review atom receives those host results as `control_results`; its
+input schema must accept that field. An unproved row, or self-review evidence
+that differs from the host results, stops the workflow before the independent
+reviewer. Controls proofs require Linux's exec sandbox and declare no network
+hosts; a workflow that configures one is refused on platforms without that
+sandbox. The host requires every selected row file to be the same regular Git
+blob and mode in the candidate and its bound base commit. A candidate that
+rewrites a selected row is refused before the proof step; change row definitions
+in a separate trusted update. A failed control proof stops the workflow at that
+row; later declared rows remain unrun in that failed attempt. `items` maps each
+checklist number,
+`"1"` through `"10"`, to
+nonempty evidence. A `decisions` entry has nonempty `point`, `allow_refuse`,
+`not_found`, `permission_denied`, `link_loop`, `not_directory`, `other_io`,
+`parse_error`, `timeout` and `empty_result` strings. A `controls` entry has
+nonempty `row` and `result` strings. Every declared decision point and
+selected controls row must appear. If there are no decision points or rows,
+item 9 or 10, respectively, needs a specific `N/A:` reason. Missing evidence
+stops the workflow before the independent reviewer runs. Each self-review
+turn is a durable sibling step named `<step>.self_review.<n>`.
+
+The workflow's declared names cannot omit a decision in the reviewed base
+inventory or a control row touched by the candidate. The host compares those
+sets before the self-reviewer or independent reviewer runs.
+
+`review.trial_merge` is optional. Before each review round, atomic merges the
+private candidate with the configured main ref in a separate scratch worktree
+and runs each declared check there without network access. A conflict, failed
+check, timeout or tracked-file rewrite goes to the author for repair while
+rounds remain; the independent reviewer is not called for that candidate.
+The main ref and check commands are fixed by the workflow, and this path
+requires the Linux exec sandbox. Direct Cargo checks also require the operator
+to set `ATOMIC_TRIAL_CARGO_REGISTRY` to a trusted registry cache and
+`ATOMIC_TRIAL_RUSTUP_TOOLCHAIN` to an installed toolchain. The check uses a
+scratch-local `CARGO_HOME` and target directory, reads that registry cache
+without write access, and runs Cargo offline. An absent cache refuses the run
+before the author turn. When the configured cache has Git dependencies beside
+its registry, the trial check reads that cache without write access too.
+For every offline Cargo check, the candidate's project Cargo config must be
+the same regular file and mode as in its bound base; a changed or linked config
+stops before review.
+Before each Cargo command, atomic also compares the scratch config files to
+the merged tree and makes the project `.cargo` directory read-only for that
+command. An earlier check cannot slip an untracked config into a later build.
+The scratch-local Cargo home and its config files stay read-only during each check.
+
+A coding review whose `controls_atom` runs `tools/controls-exec.py` requires
+host-selected offline Cargo inputs before the author turn. The operator sets
+`ATOMIC_CONTROLS_CARGO_REGISTRY` and `ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN`.
+The controls and trial settings can share the same values. Conflicting values
+stop the run. Each proof attempt gets a fresh private Cargo home and writable
+target, with read-only access to the selected registry and no network.
+Atomic supplies `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_NET_OFFLINE`,
+`RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`. The controls atom cannot declare them.
+Both project Cargo config spellings must match the bound base. Only empty
+settings are accepted for a controls proof.
 
 ### Where each input came from
 

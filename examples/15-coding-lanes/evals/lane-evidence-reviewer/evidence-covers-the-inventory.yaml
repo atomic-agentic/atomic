@@ -1,0 +1,48 @@
+input:
+  diff: |-
+    diff --git a/tools/lane_guard.py b/tools/lane_guard.py
+    --- a/tools/lane_guard.py
+    +++ b/tools/lane_guard.py
+    @@ -40,6 +40,8 @@ def decide(finding):
+         findings = [claim]
+    +    # The control row switches this line.
+    +    if findings and not verified(verification):
+             return {"confirmed": False, "claim": claim, "reason": "unverified finding"}
+  self_review:
+    items:
+      "1": The patch adds one branch to decide() and changes no other function.
+      "2": No import, no new file and no command are added.
+      "3": Only tools/lane_guard.py is touched; nothing outside it is written.
+      "4": No credential or token appears anywhere in the patch.
+      "5": The new branch returns before any confirmed result is built, so it cannot be bypassed by a later return.
+      "6": Nothing is repeated or retried; the branch is straight-line.
+      "7": decide() reads only the finding it is handed, which the caller already supplied.
+      "8": No lock, reservation or temporary directory is taken, so there is nothing to release on an error path.
+      "9": candidate publication is covered by the decisions entry below.
+      "10": lane-guard-bites carries the host's own result in the controls entry below.
+    decisions:
+    - point: candidate publication
+      allow_refuse: The branch refuses a finding the host did not record and confirms one it did; both halves are in the patch.
+      not_found: A finding with no verification key at all is refused by the check above the branch, not read as absent.
+      permission_denied: decide() opens no file, so no read can be denied; the proof atom that reads the row refuses it.
+      link_loop: No path is opened here, so a loop cannot be reached; the proof refuses a row or switched file that is a link.
+      not_directory: Not reachable in this function; it takes no path.
+      other_io: Not reachable in this function; it performs no I/O.
+      parse_error: The caller refuses a body that is not one JSON document before decide() runs.
+      timeout: 'This function cannot block: no I/O, no wait, no loop.'
+      empty_result: An empty claim is refused by _text(), so an empty finding never reaches the new branch.
+    controls:
+    - row: lane-guard-bites
+      result: its test fails with the control off and passes with it on
+  host_review:
+    decision_points:
+    - candidate publication
+    selected_controls:
+    - lane-guard-bites
+    control_results:
+    - row: lane-guard-bites
+      result: its test fails with the control off and passes with it on
+expect:
+- output.verdict == 'approve'
+- output.reason.size() > 0
+- output.findings.size() >= 1

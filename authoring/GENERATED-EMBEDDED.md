@@ -1,13 +1,7 @@
 # Generated schema types and embedded Deno
 
-Production adoption: the compiler now lives in `authoring/` and its bundled managed
-worker is wired into the Rust loader. The in-process host described here remains
-a separate research workspace; it does not resolve the combined native dependency
-or source-free embedded release decision.
-
-This experiment extends the authoring spike with actual schema-driven
-declarations and an in-process Rust/Deno host. Both are working experiments;
-production atom syntax and runtime pins are unchanged.
+This note records the retired Deno embedding experiment. The production compiler
+uses native Rust and runs its worker and captured helpers on Boa.
 
 ## Authoring
 
@@ -75,7 +69,7 @@ experiment; production placement remains part of the compiler/state design.
 
 ## A real embedded worker
 
-[embedded/src/main.rs](embedded/src/main.rs) creates a
+The experimental host created a
 `deno_runtime::worker::MainWorker` directly in Rust and drives its event loop on
 the same thread. It does not call `deno::main`, re-exec itself, or launch a Deno
 CLI. Rust's process ID and `Deno.pid` match. The embedding process itself is
@@ -110,51 +104,6 @@ then fails. This is an isolated experimental host, not an atom-facing CLI.
 Its trusted filesystem module loader and the SHA op are host capabilities;
 the test is not a complete OS sandbox/security certification.
 
-## Build and run the embedding test
-
-Build only through `scripts/dev.sh`, from the repository root. The new Cargo
-package has its own workspace/lockfile to keep it outside atomic's production
-dependency graph.
-
-```sh
-ATOMIC_DEV_DB=off scripts/dev.sh \
-  env CARGO_TARGET_DIR="$PWD/target/astro-embedded" \
-  cargo build --manifest-path authoring/embedded/Cargo.toml --locked
-
-cd authoring
-npm run build:embedded
-npm run probe:embedded
-```
-
-Native dependencies additionally require CMake and libclang, which the current
-development image does not include. This run supplied CMake 3.31.6 and libclang
-18.1.1 from a mounted build-tools directory using `ATOMIC_DEV_MOUNTS`, `CMAKE`,
-`LIBCLANG_PATH`, and the container GCC 14 include directory via
-`BINDGEN_EXTRA_CLANG_ARGS`. The first build used cached crates offline; the
-committed lockfile records the resolved graph. Supply these tools before using
-the build command on a fresh machine. The successful local build invocation
-was equivalent to:
-
-```sh
-ATOMIC_DEV_DB=off ATOMIC_DEV_CPUS=4 ATOMIC_DEV_MEMORY=12g \
-ATOMIC_DEV_CACHE=/tmp/atomic-deno-prototype-toolchain \
-ATOMIC_DEV_MOUNTS=/tmp/atomic-deno-build-tools \
-scripts/dev.sh env \
-  CARGO_TARGET_DIR="$PWD/target/astro-embedded" \
-  LIBCLANG_PATH=/tmp/atomic-deno-build-tools/clang/native \
-  BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/14/include \
-  CMAKE=/tmp/atomic-deno-build-tools/cmake/data/bin/cmake \
-  cargo build --manifest-path authoring/embedded/Cargo.toml --offline --locked
-```
-
-The unsnapshotted debug worker loads Deno extension sources from its build
-cache during initialization. Run the probe with the same `ATOMIC_DEV_CACHE` as
-the build. This debug artifact is **not a standalone release package**. It is
-about 264 MiB; the separate unminified compiler bundle is about 9.6 MiB and
-Astro WASM about 5 MiB. No size optimization or reliable clean-build timing
-was attempted. Snapshotting and source-free packaging of this embedded host remain untested.
-The separate production managed-worker assets are now bundled into the Rust binary.
-
 ## Evidence and boundaries
 
 At this milestone the JavaScript suite had **67 passing tests, zero skips**:
@@ -165,13 +114,4 @@ AST validation, meeting containment, score threshold and schema freshness.
 The separate native permission control also fails as required. Reports are
 written to ignored `results/generation.json` and `results/embedded.json`.
 
-The embedding does not solve the native SQLite conflict between Deno and Codex.
-No combined production link was attempted, and that decision is still open.
-The owner selected Astro as the sole declarative language. Mandatory type/schema
-gates, source-mapped type diagnostics, explicit semantics/resource limits and
-immutable full-contract fingerprints are now part of the managed-worker production
-integration. Workflow-level durable context, live judge orchestration, registry notes
-and embedded release packaging remain separate work. Neither host executes arbitrary
-atom JavaScript modules.
-
-Primary API reference: [Deno runtime MainWorker](https://docs.rs/deno_runtime/0.268.0/deno_runtime/worker/struct.MainWorker.html).
+The experiment left the combined SQLite dependency and standalone release packaging unresolved. Atomic subsequently adopted the Rust Astro compiler and Boa.

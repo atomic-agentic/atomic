@@ -2,6 +2,7 @@
   "name": "atomic-astro-authoring",
   "private": true,
   "type": "module",
+  "imports": { "#astro-source-map": "./src/reference-source-map.mjs" },
   "engines": {
     "node": ">=24.15.0"
   },
@@ -19,11 +20,12 @@
     "preprobe:lsp": "node src/generate.mjs",
     "probe:generate": "node src/generation-probe.mjs",
     "probe:workspace": "node src/workspace-probe.mjs",
-    "build:embedded": "node src/build-embedded.mjs",
-    "probe:embedded": "node src/embedded-probe.mjs",
     "prerender": "node src/generate.mjs",
     "preprobe:contracts": "node src/generate.mjs",
     "probe:inferred": "node src/inferred-probe.mjs",
+    "probe:config": "node src/config-probe.mjs",
+    "preprobe:config": "node src/generate.mjs",
+    "probe:boundaries": "deno run --no-config --no-lock --no-remote --allow-read=. --import-map=test/stubs/import-map.json test/context-boundary-probe.mjs",
     "probe:context": "node src/context-probe.mjs",
     "render:context": "node src/context-cli.mjs",
     "prerender:context": "node src/generate.mjs",

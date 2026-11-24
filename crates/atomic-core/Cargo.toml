@@ -34,6 +34,24 @@ exec-loopback-tests = []
 compiler-in-tests = ["dep:ctor"]
 
 [dependencies]
+
+# Use the native TSX converter without registering Node-API bindings in the binary.
+astro2tsx = { git = "https://github.com/withastro/compiler-rs", rev = "c9bf179f77439e427a98751569d2af42ff85d78c" }
+napi-derive = { version = "=3.5.2", features = ["noop"] }
+# The Astro grammar used by upstream compiler-rs v0.5.3.
+oxc_allocator = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+oxc_ast = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d", features = ["serialize"] }
+oxc_ast_visit = { features = ["serialize"], git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+oxc_parser = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d", features = ["astro"] }
+oxc_span = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+
+oxc_codegen = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+oxc_transformer = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+oxc_semantic = { git = "https://github.com/withastro/oxc", rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d" }
+rayon = "1.12"
+tsz-core = { git = "https://github.com/tsz-org/tsz", rev = "8d61983f4478726ebc57cbb4d0a09b156658f753" }
+tsz-common = { git = "https://github.com/tsz-org/tsz", rev = "8d61983f4478726ebc57cbb4d0a09b156658f753" }
+
 anyhow = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
@@ -61,7 +79,7 @@ codex-core-api = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
 codex-network-proxy = { workspace = true }
-deno_core = { workspace = true }
+boa_engine = { workspace = true }
 ctor = { workspace = true, optional = true }
 codex-keyring-store = { workspace = true }
 codex-login = { workspace = true }

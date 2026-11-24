@@ -1,0 +1,1 @@
+coding-controls-no-network|crates/atomic/src/pipeline.rs|if allows_network {|if false {|-p atomic-agentic --test pipeline controls_proof_refuses_declared_network_before_any_model_turn

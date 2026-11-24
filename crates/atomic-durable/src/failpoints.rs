@@ -164,6 +164,23 @@ pub const fn armed() -> bool {
     cfg!(feature = "failpoints")
 }
 
+#[cfg(feature = "failpoints")]
+static CLI_FAILPOINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Arm one named crash point from a development CLI command. The process
+/// starts only one command, so a second selection is a configuration error.
+/// The name must be a known site; callers further restrict it to a step in
+/// the run being started.
+#[cfg(feature = "failpoints")]
+pub fn arm_cli(name: &str) -> Result<(), &'static str> {
+    if site_of(name).is_none() {
+        return Err("unknown failpoint site");
+    }
+    CLI_FAILPOINT
+        .set(name.to_owned())
+        .map_err(|_| "a CLI failpoint is already armed")
+}
+
 /// A named point where a crash test can kill the process: see the module
 /// documentation. Without the `failpoints` feature it does nothing.
 pub fn failpoint(name: &str) {
@@ -188,7 +205,10 @@ pub fn failpoint(name: &str) {
                 kill_self();
             }
         }
-        if std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name) {
+        let cli = CLI_FAILPOINT.get();
+        if cli.is_some_and(|selected| selected == name)
+            || (cli.is_none() && std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name))
+        {
             eprintln!("failpoint {name}: killing the process");
             kill_self();
         }

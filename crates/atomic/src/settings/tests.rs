@@ -97,6 +97,211 @@ fn with_nothing_around_nothing_is_detected() {
 }
 
 #[test]
+fn a_selected_profile_sits_between_local_and_environment_and_a_flag_beats_its_selection() {
+    let d = dir(&[
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\nmodel:\n  name: base\n",
+        ),
+        ("atomic.local.yaml", "model:\n  name: personal\n"),
+        ("atomic.nightly.yaml", "model:\n  name: nightly\n"),
+        ("atomic.review_2.yaml", "model:\n  name: review\n"),
+    ]);
+    let file = |r: &Resolved| match source(r, "model.name") {
+        Source::File { path, .. } => path.file_name().expect("file name").to_owned(),
+        other => panic!("model.name came from {other:?}"),
+    };
+    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(r.settings.model.name.as_deref(), Some("personal"));
+    assert_eq!(file(&r), "atomic.local.yaml");
+
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("ATOMIC_PROFILE", "nightly")],
+        &nobody,
+    );
+    assert_eq!(r.settings.model.name.as_deref(), Some("nightly"));
+    assert_eq!(file(&r), "atomic.nightly.yaml");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "profile nightly selected by ATOMIC_PROFILE")
+    );
+
+    let args = EngineArgs {
+        profile: Some("review_2".into()),
+        ..EngineArgs::default()
+    };
+    let r = resolved(&d, &args, &[("ATOMIC_PROFILE", "nightly")], &nobody);
+    assert_eq!(r.settings.model.name.as_deref(), Some("review"));
+    assert_eq!(file(&r), "atomic.review_2.yaml");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "profile review_2 selected by --profile")
+    );
+
+    let r = resolved(
+        &d,
+        &args,
+        &[
+            ("ATOMIC_PROFILE", "nightly"),
+            ("ATOMIC_MODEL_NAME", "from-env"),
+        ],
+        &nobody,
+    );
+    assert_eq!(r.settings.model.name.as_deref(), Some("from-env"));
+    assert_eq!(
+        source(&r, "model.name"),
+        &Source::Env("ATOMIC_MODEL_NAME".into())
+    );
+
+    let args = EngineArgs {
+        model: Some("from-flag".into()),
+        ..args
+    };
+    let r = resolved(&d, &args, &[("ATOMIC_MODEL_NAME", "from-env")], &nobody);
+    assert_eq!(r.settings.model.name.as_deref(), Some("from-flag"));
+    assert_eq!(source(&r, "model.name"), &Source::Flag("--model".into()));
+
+    let r = resolved(
+        &d,
+        &EngineArgs {
+            profile: Some(String::new()),
+            ..EngineArgs::default()
+        },
+        &[("ATOMIC_PROFILE", "nightly")],
+        &nobody,
+    );
+    assert_eq!(r.settings.model.name.as_deref(), Some("personal"));
+    assert_eq!(file(&r), "atomic.local.yaml");
+}
+
+#[test]
+fn profile_names_and_missing_selected_files_refuse_before_config_load() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    for name in [
+        "local",
+        "../escape",
+        "nightly.yaml",
+        "Nightly",
+        "one--two",
+        "two/three",
+        " ",
+    ] {
+        for (args, vars, source) in [
+            (
+                EngineArgs {
+                    profile: Some(name.into()),
+                    ..EngineArgs::default()
+                },
+                vec![],
+                "--profile",
+            ),
+            (
+                EngineArgs::default(),
+                vec![("ATOMIC_PROFILE", name)],
+                "ATOMIC_PROFILE",
+            ),
+        ] {
+            let error = resolved_where(&d, &args, &vars, &nobody).expect_err("bad profile");
+            assert!(
+                matches!(&error, ConfigError::Value { name: found, .. } if found == source),
+                "{name:?} from {source}: {error}"
+            );
+        }
+    }
+    let error = resolved_where(
+        &d,
+        &EngineArgs {
+            profile: Some("nightly".into()),
+            ..EngineArgs::default()
+        },
+        &[],
+        &nobody,
+    )
+    .expect_err("missing selected file");
+    let text = error.to_string();
+    assert!(
+        text.contains("selected profile from --profile needs")
+            && text.contains("atomic.nightly.yaml")
+            && text.contains("create that file"),
+        "{text}"
+    );
+}
+
+#[test]
+fn non_utf8_profile_environment_value_refuses_closed() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let error = resolve(
+        &d,
+        &EngineArgs::default(),
+        &Surroundings {
+            env: &|_| None,
+            env_names: vec!["ATOMIC_PROFILE".into()],
+            ollama: &nobody,
+            user_config_dir: &|| None,
+            sign_in: &|_| Ok(None),
+        },
+    )
+    .expect_err("non-UTF8 ATOMIC_PROFILE must not silently select no profile");
+    assert!(matches!(error, ConfigError::Value { name, .. } if name == "ATOMIC_PROFILE"));
+}
+
+#[test]
+fn a_project_profile_cannot_choose_the_persons_store_or_key() {
+    for bad in [
+        "model:\n  api_key_env: PRIVATE_KEY\n",
+        "database:\n  url: postgres://user:secret@localhost/db\n",
+    ] {
+        let d = dir(&[("atomic.yaml", MANIFEST_ONLY), ("atomic.nightly.yaml", bad)]);
+        let error = resolved_where(
+            &d,
+            &EngineArgs {
+                profile: Some("nightly".into()),
+                ..EngineArgs::default()
+            },
+            &[],
+            &nobody,
+        )
+        .expect_err("profile cannot set operator-only value");
+        assert!(
+            matches!(&error, ConfigError::Setting { path, .. } if path == &d.join("atomic.nightly.yaml")),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("secret"), "{error}");
+    }
+}
+
+#[test]
+fn a_project_profile_cannot_widen_the_persons_budget_cap() {
+    let (_home, home) = person("budget:\n  atom:\n    tokens: 100000\n");
+    let d = dir(&[
+        ("atomic.yaml", MANIFEST_ONLY),
+        (
+            "atomic.nightly.yaml",
+            "budget:\n  atom:\n    tokens: 400000\n",
+        ),
+    ]);
+    let r = resolved(
+        &d,
+        &EngineArgs {
+            profile: Some("nightly".into()),
+            ..EngineArgs::default()
+        },
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert_eq!(r.settings.budget.atom.tokens, 100_000);
+    assert_eq!(
+        r.settings.budget.ceilings.atom.tokens,
+        Some(100_000),
+        "the person's ceiling remains in the effective settings"
+    );
+}
+
+#[test]
 fn an_openai_key_makes_openai_the_endpoint_without_showing_the_key() {
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let r = resolved(
@@ -573,6 +778,23 @@ fn the_projects_files_cannot_choose_the_variable_the_key_is_read_from() {
         &nobody,
     );
     assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
+}
+
+#[test]
+fn graph_lane_endpoints_are_operator_owned_and_validated() {
+    let lanes = "model:\n  lanes:\n    endpoints:\n      local:\n        base_url: http://127.0.0.1:11434/v1\n        name: qwen\n      remote:\n        base_url: https://example.test/v1\n        name: frontier\n        api_key_env: MODEL_KEY\n    routes:\n      - kind: task\n        labels_any: [security]\n        endpoint: remote\n    default: local\n";
+    let d = dir(&[("atomic.yaml", &format!("{MANIFEST_ONLY}{lanes}"))]);
+    let rejected = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
+        .expect_err("project cannot route a person's model traffic")
+        .to_string();
+    assert!(rejected.contains("model.lanes chooses model endpoints"), "{rejected}");
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let (_home, home) = person(lanes);
+    let accepted = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    let policy = accepted.settings.model.lanes.expect("operator lane policy");
+    assert_eq!(policy.select("task", ["security"]).target.name, "frontier");
+    assert_eq!(policy.select("docs", ["polish"]).target.name, "qwen");
+    assert!(matches!(source(&accepted, "model.lanes"), Source::File { .. }));
 }
 
 #[test]

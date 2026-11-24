@@ -1,0 +1,72 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [ok, source, commit, bound, rows]
+properties:
+  ok:
+    type: boolean
+  error:
+    type: [string, 'null']
+  tree:
+    type: [string, 'null']
+  passed:
+    type: integer
+    minimum: 0
+    maximum: 16
+  failed:
+    type: integer
+    minimum: 0
+    maximum: 16
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+  commit:
+    type: string
+    minLength: 40
+    maxLength: 64
+  bound:
+    type: object
+    additionalProperties: false
+    required: [reference, base, admitted]
+    properties:
+      reference:
+        type: string
+        minLength: 1
+        maxLength: 200
+      base:
+        type: string
+        minLength: 40
+        maxLength: 64
+      admitted:
+        type: string
+        minLength: 40
+        maxLength: 64
+  rows:
+    type: array
+    minItems: 1
+    maxItems: 16
+    items:
+      type: object
+      additionalProperties: false
+      required: [name, verdict, detail]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        verdict:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: >-
+            intact means the row names its switched file, its switch text sits
+            exactly once in that file and its named guarding test exists there.
+            It is not a claim that the switch was made and the test failed.
+            The host-owned production controls driver alone emits passed after
+            the named test fails with the control removed and passes restored.
+            Any other production verdict is a failed proof.
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 2000

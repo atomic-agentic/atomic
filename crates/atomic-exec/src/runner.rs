@@ -38,10 +38,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The version of the request and response format: 3 since a command's
-/// secret variables reach the runner on a socket of their own, which a
-/// runner that knows only 1 or 2 would not read.
-pub const PROTOCOL: u32 = 3;
+/// The version of the request and response format: 4 carries the optional
+/// CPU and writable-data caps, which an older runner would silently omit.
+/// Version 3 made secret variables travel on their own socket.
+pub const PROTOCOL: u32 = 4;
 
 /// The entry beside a command's secret variables, on the runner's socket,
 /// that holds the SHA-256 of the exact request bytes the control plane
@@ -192,6 +192,10 @@ pub struct Request {
     pub time_limit_ms: u64,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// Optional per-process CPU seconds for the command.
+    pub cpu_seconds: Option<u64>,
+    /// Optional per-process writable data bytes for the command.
+    pub data_bytes: Option<u64>,
 }
 
 impl Request {
@@ -206,6 +210,8 @@ impl Request {
             stdin: hex(&command.stdin),
             time_limit_ms: u64::try_from(command.time_limit.as_millis()).unwrap_or(u64::MAX),
             output_limit: command.output_limit,
+            cpu_seconds: command.cpu_seconds,
+            data_bytes: command.data_bytes,
         }
     }
 
@@ -220,6 +226,8 @@ impl Request {
             stdin: unhex(&self.stdin).ok_or("stdin is not hex")?,
             time_limit: Duration::from_millis(self.time_limit_ms),
             output_limit: self.output_limit,
+            cpu_seconds: self.cpu_seconds,
+            data_bytes: self.data_bytes,
             // Confined, if at all, before it was sent.
             writable: Vec::new(),
             read_only: Vec::new(),
@@ -460,6 +468,8 @@ impl ProcessRunner {
                     .saturating_mul(2)
                     .saturating_add(4 * process::STDERR_LIMIT),
                 stderr: process::STDERR_LIMIT,
+                cpu_seconds: None,
+                data_bytes: None,
             },
         )?;
         Ok((Exit::classify(done.code), done))

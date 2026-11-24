@@ -218,6 +218,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
                 dir.join("state/worktrees"),
             ))),
             caches: None,
+            trial_cargo: None,
             budgets: Arc::default(),
             context: None,
         },

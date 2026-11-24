@@ -1,0 +1,1 @@
+coding-review-needs-trial-merge-at-load|crates/atomic-core/src/workflow.rs|if coding_without_trial {|if false {| -p atomic-agentic --test pipeline coding_review_refuses_missing_trial_merge_before_any_turn

@@ -1,0 +1,1 @@
+graph-admin-close-enforces-policy|crates/atomic-graph/src/sqlite.rs|enforce_close_policy(c, &id).await?;|Ok::<(), StoreError>(())?;|-p atomic-agentic-graph --test conformance sqlite_human_admin_close_refuses_required_policy_and_fenced_close_succeeds_with_evidence

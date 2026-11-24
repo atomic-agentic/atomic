@@ -38,33 +38,26 @@ before any model is called.
 ---
 import type { Props, Input, Output } from '../.atomic/types/triage-findings';
 import type { AtomConfig } from '../.atomic/types/authoring';
-import TriageRules from './TriageRules.astro';
+import TriageFrame from './TriageFrame.astro';
+import NoFindings from './NoFindings.astro';
 import Finding from './Finding.astro';
 const { input }: Props = Astro.props;
 export const config: AtomConfig<Input, Output> = {
-  description: 'Decide what to do about review findings on one work item.',
-  validate: [({ input, output }) =>
-    output.decision !== 'accept' || output.must_fix.length === 0],
+  "description": "Decide what to do about review findings on one work item.",
+  "validate": [({input, output}) => output.decision !== 'accept' || output.must_fix.length === 0]
 };
 ---
-<TriageRules strict={true}>
-Findings marked blocker always go in must_fix.
-</TriageRules>
-
-Work item {input.item.id}: {input.item.title}
-
-<criteria>
-{input.item.criteria.map((c) => <Fragment>
-- {c}
-</Fragment>)}
-</criteria>
-
+<TriageFrame id={input.item.id} title={input.item.title} criteria={input.item.criteria}>
 {input.findings.length === 0 ? <Fragment>
-No findings were reported.
+<NoFindings />
 </Fragment> : <Fragment>
-Findings:
-{input.findings.map((f) => <Finding finding={f} />)}
+Findings, one bullet each, every field on the line:
+
+{input.findings.map((f) => <Fragment>
+<Finding finding={f} />
+</Fragment>)}
 </Fragment>}
+</TriageFrame>
 ```
 
 [The complete example](../../examples/08-templating/atoms/triage-findings.atom.astro)

@@ -178,9 +178,22 @@ authentication](../getting-started/authentication.md).
 | `atomic parks release <park-id>` | Release a parked run as the local operator, with your enrolled credential; `--tokens`, `--minutes` and `--cost-usd` raise the refusing allowance first (`--scope` names another of the run's own), `--comment` is recorded, `--command-id` makes a repeat safe | v0.1 local, Linux |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
+| `atomic graph import <file>` | Import beads JSONL into the local SQLite work graph; `-` reads stdin, `--dry-run` reports without writing, and a repeat leaves existing items unchanged | v0.2, SQLite |
+| `atomic graph export` | Write the local work graph as beads JSONL on stdout, one item per line | v0.2, SQLite |
+| `atomic graph pin <item>` | Pin an imported open epic with the enrolled operator credential so a graph run can work its children; repeating the command is safe | v0.2, SQLite |
+| `atomic graph reconcile-failed <epic> --run <run>` | Release the named terminal failed graph run's epic binding after checking that it holds no item lease; requires the enrolled operator credential | v0.2, SQLite |
+| `atomic graph policy set <item> --require commit` | Set an item-specific close rule; `--require verified-commit --branch refs/heads/<name>` binds host-verified evidence to a branch; `policy show` and `policy clear` inspect and remove the rule | v0.2, SQLite |
+| `atomic graph criteria set <item> --file <path>` | Replace the item's structured criteria from a JSON list; `--file -` reads stdin, and `criteria show` and `criteria clear` inspect and remove them. Writes require the enrolled operator credential | v0.2, SQLite |
+| `atomic graph verify-commit <item> --run <run> --step <step> --attempt <n>` | Check a recorded worktree attempt against the item's authorized branch and store verified commit evidence | v0.2, SQLite |
+| `atomic delivery start <source-run> --step <graph-step>` | Open a human gate for a committed coding item with two clean independent reviews, self-review, selected controls and a passing trial merge; the protected project delivery adapter supplies the exact remote target | v0.2, SQLite |
+| `atomic delivery resume <delivery-run>` | Continue approved push, pull request and merge queue effects, reconciling an unknown remote outcome before any further action | v0.2, SQLite |
+
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
-| Workflow and graph commands with `--json` | Use the supervision surface from scripts | v0.5 |
+| Workflow and graph inspection commands with `--json` | Use the supervision surface from scripts; import/export already support `--json` | v0.5 |
 | Dedicated workflow/graph/gate panes | Navigate larger sets of work in the terminal | v1.0 TUI extensions |
+
+The protected adapter and target file used by the delivery commands are
+described in [Delivery adapter](delivery-adapter.md).
 
 A gate decision carries your operator credential, a secret atomic keeps in the
 OS keyring (the Secret Service on Linux) and checks against the gate store.
@@ -346,6 +359,7 @@ Atomic refuses to start when the durable engine's own version variable
 
 | Setting | Meaning |
 | --- | --- |
+| `ATOMIC_PROFILE` (`--profile` on config, check, run, eval, serve and runs resume) | Select `atomic.<profile>.yaml` beside the resolved project or workspace member's manifest; the flag wins. A missing file is refused. On resume, this selects current process settings and does not replace a finished step's recorded context. See [configuration](configuration.md#the-layers) |
 | `ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL` (`--model-base-url`, `--model`) | The OpenAI-compatible endpoint and model that model atoms use; `ATOMIC_MODEL_API_KEY_ENV` names the variable holding its key |
 | `ATOMIC_DATABASE_URL`, `ATOMIC_DATABASE_SCHEMA` | PostgreSQL instead of the project's local SQLite store; the schema defaults to `atomic` |
 | `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |

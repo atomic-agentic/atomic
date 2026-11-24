@@ -1,0 +1,1 @@
+graph-proposal-body-bound|crates/atomic-graph/src/proposal.rs|body.chars().count() > 8192|false|-p atomic-agentic-graph --lib proposal::tests::bounds_refuse_oversized_arguments_and_full_batches

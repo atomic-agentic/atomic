@@ -1,0 +1,1 @@
+migration-legacy-sqlite-shape|crates/atomic-durable/src/store.rs|            verify_legacy_sqlite(conn, path, found, migrations).await?;|            /*CONTROL_OFF*/|-p atomic-agentic-durable --lib -- store::tests::legacy_shape_refuses_a_missing_table_without_writes

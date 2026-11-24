@@ -74,6 +74,31 @@ Prose that needs `<` or `{` uses entities; a bare `{` starts an expression.
 Write placeholders as &lt;name> or &#123;value&#125;.
 ```
 
+## Import literal JSON and TypeScript examples
+
+A local `.md?raw` default import captures authored text without parsing its braces, tags or code fences. Keep the file under the project root and use a `./` path; its text stays in developer instructions.
+
+```astro
+---
+import literalExamples from './literal-examples.md?raw';
+---
+Follow the literal examples:
+{literalExamples}
+Summarize: {input.text}
+```
+
+`literal-examples.md`:
+
+````markdown
+```json
+{"summary": "short", "labels": []}
+```
+
+```ts
+export const identity = <T,>(value: T): T => value;
+```
+````
+
 ## Reuse prompt text with a component
 
 Import a local `.astro` file by relative path; it declares `Props` and renders the caller's content at `<slot />`.
@@ -187,6 +212,10 @@ export const config: AtomConfig<Input, Output> = {
 Summarize: {input.text}
 ```
 
+## Markdown layout and provenance
+
+Keep the decision criteria and output contract near the top. Use bullets for short findings; use a table when named columns make a comparison or lookup clearer. Preview both `developer` instructions and tagged `user` bindings with `atomic render` on ordinary, empty, escaped and mixed-origin input. Static text and imported `.md?raw` text are authored instructions; values from `input`, `context` or component props retain their source path and origin as data. Preserve record IDs and distinguish author-supplied records from host-supplied records. A helper result inherits the least trusted argument's provenance. Only a `mermaid` fence is parsed literally in an atom body; put literal JSON and TypeScript fences in a `.md?raw` file. Validate cited IDs against host records before a gate.
+
 ## Mistakes `atomic check` refuses
 
 - Calling a method that is not `map`, `filter`, `some` or `every`, as in `{input.text.toUpperCase()}`. `atomic check` reports "unsupported expression: CallExpression". Write the instruction in prose ("in capitals"), or compute the value in an `exec` atom.
@@ -196,6 +225,6 @@ Summarize: {input.text}
 - A runtime global, as in `{JSON.stringify(input)}`. `atomic check` reports "unsupported expression: CallExpression". Interpolate the fields you need, `{input.text}`.
 - A continued optional chain, as in `{input.extra?.note.length}`. `atomic check` reports "continued optional chains are unsupported". Read the optional value last and fall back: `{input.extra?.note ?? ''}`.
 - Reading the clock in the frontmatter, as in `const today = new Date();`. `atomic check` reports "unsupported expression: NewExpression". Frontmatter is interpreted, not run. Pass the date as input, or compute it in a helper, which sees the step's recorded time.
-- A package import, as in `import { z } from 'zod';`. `atomic check` reports "named imports of local .ts helpers are supported". Import local `.astro` components and `.ts` helpers only; packages are not available yet.
+- A package import, as in `import { z } from 'zod';`. `atomic check` reports "only default imports of local .astro components". Import local `.astro` components, `.ts` helpers or `.md?raw` literals only; packages are not available yet.
 - A validator written as a CEL string, as in `export const config = { validate: ['output.summary.size() > 0'] };`. `atomic check` reports "validate requires interpreted typed callbacks, not CEL strings". Write an arrow function: `({output}) => output.summary.length > 0`. CEL is for eval-case `expect` lines.
 - A field the input schema does not declare, as in `Title: {input.title}`. `atomic check` reports "Property 'title' does not exist on type 'Input'". Read only declared fields, or add the field to the input schema.

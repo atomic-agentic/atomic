@@ -1,0 +1,60 @@
+{
+  "plan": {
+    "record_id": "fixture:plan:plan-9",
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example"
+  },
+  "required_outcomes": [
+    {
+      "id": "REQ-SCAN",
+      "statement": "A secret scan covers the changed example.",
+      "acceptance_criterion": "The secret scan reports a state for this revision",
+      "depends_on": "none",
+      "record": "fixture:execution:pricing-scan",
+      "expected_criterion": "secret-scan",
+      "required": true
+    }
+  ],
+  "proposed_tasks": [
+    {
+      "id": "fixture-task-scan",
+      "title": "Scan the changed example",
+      "covers": [
+        "REQ-SCAN"
+      ],
+      "depends_on": "fixture-task-pricing",
+      "record": "fixture:execution:secret-scan"
+    }
+  ],
+  "host_records": [
+    {
+      "id": "fixture:execution:secret-scan",
+      "origin": "host",
+      "criterion": "secret-scan",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "unavailable",
+      "access": "grant",
+      "findings": [],
+      "detail": "The scanner reported it could not start, so no state was recorded."
+    }
+  ],
+  "author_claims": [],
+  "assumptions": [
+    {
+      "id": "fixture:assumption:a1",
+      "origin": "author",
+      "text": "docs-build covers the rendered numbers, so the pricing example needs no new test."
+    },
+    {
+      "id": "fixture:assumption:a2",
+      "origin": "author",
+      "text": "The changelog entry can land in a later change."
+    }
+  ],
+  "display": {
+    "section": "markdown",
+    "link": "markdown",
+    "emphasis": "italic"
+  }
+}

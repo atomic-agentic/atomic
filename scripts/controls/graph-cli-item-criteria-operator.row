@@ -1,0 +1,1 @@
+graph-cli-item-criteria-operator|crates/atomic/src/graph.rs|criteria_write(action)|false|-p atomic-agentic --test graph_cli operator_sets_shows_and_clears_structured_item_criteria

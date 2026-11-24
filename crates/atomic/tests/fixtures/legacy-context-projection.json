@@ -1,0 +1,11 @@
+{
+  "context": null,
+  "program": {
+    "contracts": {
+      "Context": {
+        "type": "object",
+        "additionalProperties": false
+      }
+    }
+  }
+}

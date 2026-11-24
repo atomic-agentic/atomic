@@ -1,0 +1,1 @@
+graph-import-generic-pinned|crates/atomic-graph/src/sqlite.rs|Some(true) if !native_pinned_marker(&v) => {|Some(true) if false => {|-p atomic-agentic-graph --test conformance sqlite_native_pinned_uses_marked_beads_metadata_and_generic_pinned_is_refused

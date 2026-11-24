@@ -1,0 +1,1 @@
+scorer-refuses-an-undeclared-snapshot|crates/atomic-core/src/evaluation.rs|    if !declared && snapshot.is_some() {|    if /*CONTROL_OFF*/ false && !declared && snapshot.is_some() {|-p atomic-agentic-core --lib -- evaluation::tests::a_scorer_binding_agrees_with_what_the_atom_declares

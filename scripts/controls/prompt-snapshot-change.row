@@ -1,0 +1,1 @@
+prompt-snapshot-change|crates/atomic/src/main.rs|actual.as_bytes() == expected|true /* CONTROL_OFF: accept changed prompt snapshots */|-p atomic-agentic --test render_cli prompt_snapshot_changes_fail_check

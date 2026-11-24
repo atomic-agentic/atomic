@@ -1,7 +1,7 @@
 # Atomic Astro authoring
 
-This package contains the production Astro parser, bounded expression interpreter,
-TypeScript checker and contributor/editor probes. The Rust loader in
+This package contains the bounded expression interpreter, TypeScript checker and
+contributor/editor probes. The production parser and TSX converter run in Rust. The Rust loader in
 [`atomic-core`](../crates/atomic-core/src/atom.rs) uses its bundled worker.
 `.atom.astro` replaces both previous declarative atom formats.
 
@@ -19,9 +19,9 @@ Rust; generated TypeScript is an additional load-time and editor check.
 
 ## Run the implementation
 
-The Rust binary contains the parser, TypeScript libraries and WASM, and runs them
-on its embedded V8 in a child process of its own; projects need no Deno, runtime
-npm install, node_modules or website build.
+The compiler child parses Astro and converts it to TSX with native Rust libraries.
+Its Boa engine runs the declarative interpreter and captured TypeScript helpers. Oxc parses TypeScript and tsz checks types. The
+atomic binary contains everything a project needs to check or render.
 
 ```sh
 atomic check examples/01-classify
@@ -29,8 +29,8 @@ atomic render examples/01-classify/atoms/classify-note.atom.astro \
   --input examples/01-classify/fixtures/classify-note/export-crash.input.json
 ```
 
-The worker has a cleared environment and reads only its own embedded WASM: atomic
-reads atom sources itself and sends them in each request. Its host
+The compiler child starts with a cleared environment. The parent captures atom
+sources and sends them in each request. Its host
 (`crates/atomic-core/src/compiler_host/host.js`) offers no network, environment,
 filesystem or subprocess access. Runtime cache and direct-run context
 checkpoints live outside source. Generated `.atomic/types` declarations are
@@ -69,8 +69,7 @@ success does not establish the state of a running VS Code GUI session.
 is disabled because whitespace is prompt content. Some execution sandboxes close
 subprocess pipes; an unreachable language server fails the probe rather than skipping.
 
-The isolated `embedded/` research host demonstrates an actual in-process Deno
-`MainWorker` without runtime node_modules. It remains separate from the combined
-Atomic/Codex binary because of its native dependency and release-packaging work.
-Production runs the worker on `deno_core` alone, without Deno's runtime crates. Workflow-level durable
-context dispatch and secret credential integration are separate tracked work.
+Helper calls use logical time, UTC and seeded randomness. Boa exposes the date and internationalization operations implemented by its pinned ICU4X data. Legacy date parsing and formatted strings can differ from the former runtime, and unavailable formatting methods raise ordinary helper errors.
+
+The production worker runs on Boa. Workflow-level durable context dispatch
+and secret credential integration are separate tracked work.

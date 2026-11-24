@@ -1,0 +1,1 @@
+astro-first-type-column|crates/atomic-core/src/atom.rs|            column: error.column,|            column: None, // CONTROL_OFF|-p atomic-agentic-core --lib -- atom::tests::first_type_diagnostic_keeps_its_authored_utf16_column

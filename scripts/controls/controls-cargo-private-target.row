@@ -1,0 +1,1 @@
+controls-cargo-private-target|crates/atomic/src/pipeline.rs|    let target = home.join("target");|    let target = PathBuf::from(caches.env()["CARGO_TARGET_DIR"].clone());|-p atomic-agentic --test pipeline -- a_real_control_runner_proves_the_bound_candidate_before_review

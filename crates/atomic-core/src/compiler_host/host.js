@@ -1,30 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The host the bundled Astro compiler worker runs on: what it needs of Deno,
-// Node and the web platform, and nothing else. It runs once, before the
-// worker, with deno_core's `Deno.core` still in reach; it takes the host's
-// own operations from it and then removes it.
-//
-// Nothing here reaches the network, the environment, a process or the
-// filesystem: the only operations are the protocol's stdin and stdout,
-// stderr for the console, the embedded WASM, random bytes, SHA-256, timers
-// and the exit status. A file read
-// other than the worker's own WASM, any fetch, and every other filesystem
-// call is refused with an error.
-((wasmUrl) => {
-  const core = globalThis.Deno.core;
-  const ops = core.ops;
-  const read = ops.op_compiler_read, write = ops.op_compiler_write, wasm = ops.op_compiler_wasm;
+// The compiler worker's protocol, hashing, timer and native parsing operations.
+(() => {
+  const ops = globalThis;
+  const read = ops.op_compiler_read, write = ops.op_compiler_write;
   const exit = ops.op_compiler_exit, random = ops.op_compiler_random, sha256 = ops.op_compiler_sha256;
-  const print = core.print, encode = core.encode, decode = core.decode, createTimer = core.createTimer, cancelTimer = core.cancelTimer;
+  const print = ops.op_compiler_print, encode = ops.op_compiler_encode, decode = ops.op_compiler_decode;
+  const parseAstro = ops.op_compiler_parse_astro, tsx = ops.op_compiler_tsx, startTimer = ops.op_compiler_timer;
+  const typescript = ops.op_compiler_typescript;
+  for (const name of Object.getOwnPropertyNames(ops)) if (name.startsWith("op_compiler_")) delete ops[name];
   const freeze = Object.freeze, define = Object.defineProperty;
   const fixed = (name, value) => define(globalThis, name, { value, writable: false, configurable: false, enumerable: false });
+  fixed('__atomicTypeScript', (op, file, source, extra = {}) => JSON.parse(typescript(op, file, source, JSON.stringify(extra))));
+  fixed('__atomicAstroTsx', (source, filename) => JSON.parse(tsx(source, filename)));
+  fixed('__atomicParseAstro', (source) => JSON.parse(parseAstro(source)));
   const refused = (what) => new Error(`the Astro compiler has no ${what}`);
-
-  // deno_core's internals reach its built-in operations; the worker gets
-  // none of them. `Deno` is replaced below; deno_core removes `__infra`
-  // itself once it has bootstrapped.
-  delete globalThis.__bootstrap;
 
   const bytes = (input) => {
     if (input === undefined) return new Uint8Array(0);
@@ -33,11 +23,8 @@
     throw new TypeError('expected an ArrayBuffer or a view of one');
   };
 
-  // Deno: the protocol's stdin and stdout, the exit status, the worker's
-  // own WASM. The worker checks the Deno version it was built against;
-  // this host implements that version's API for the members it uses.
+  // Deno: the protocol's stdin and stdout and the exit status.
   fixed('Deno', freeze({
-    version: freeze({ deno: '2.9.8' }),
     stdin: freeze({
       readSync(buffer) {
         const n = read(bytes(buffer));
@@ -54,8 +41,7 @@
       },
     }),
     readFile(file) {
-      if (String(file) === wasmUrl) return Promise.resolve(wasm());
-      return Promise.reject(refused(`file ${String(file)}: it reads only its own WASM`));
+      return Promise.reject(refused(`file ${String(file)}: compiler file reads are disabled`));
     },
     exit(code) {
       exit(Number.isInteger(code) ? code : 1);
@@ -63,21 +49,20 @@
   }));
 
   // stdout is the protocol, so every console method writes to stderr, which
-  // the host reports when the compiler crashes. (deno_core's own console
-  // writes errors to stdout.) The worker reassigns console.log, so the
+  // the host reports when the compiler crashes. The worker reassigns console.log, so the
   // object stays writable.
   const show = (value) => {
     if (typeof value === 'string') return value;
     if (value instanceof Error) return value.stack ?? String(value);
     try { return typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value); } catch { return String(value); }
   };
-  const log = (...args) => print(`${args.map(show).join(' ')}\n`, true);
+  const log = (...args) => print(`${args.map(show).join(' ')}\n`);
   define(globalThis, 'console', {
     value: { log, info: log, warn: log, error: log, debug: log, trace: log },
     writable: true, configurable: true, enumerable: false,
   });
 
-  // UTF-8 only, as the worker and the WASM runtime use them.
+  // UTF-8 only, as the worker uses them.
   const utf8 = (label) => {
     const name = String(label ?? 'utf-8').trim().toLowerCase();
     if (name !== 'utf-8' && name !== 'utf8' && name !== 'unicode-1-1-utf-8') throw new RangeError(`unsupported encoding ${label}`);
@@ -147,21 +132,14 @@
     toJSON() { return this.href; }
   });
 
-  // fetch reaches nothing. The worker replaces it with one that answers its
-  // own WASM URL, with a Response of the bytes Deno.readFile gave it, and
-  // passes every other URL here.
+  // Requests for external resources are refused.
   define(globalThis, 'fetch', { value: (url) => Promise.reject(refused(`network: fetch ${String(url)}`)), writable: true, configurable: false, enumerable: false });
   fixed('Response', class Response {
     #body;
     constructor(body) { this.#body = body === undefined || body === null ? new Uint8Array(0) : bytes(body); }
     arrayBuffer() { return Promise.resolve(this.#body.slice().buffer); }
   });
-  // The compiler's loader falls back to instantiate() on fetched bytes; the
-  // streaming entry points would need deno_core's fetch machinery.
-  delete WebAssembly.instantiateStreaming;
-  delete WebAssembly.compileStreaming;
-
-  // The WASM runtime's clock, randomness and timers.
+  // The compiler worker's clock, randomness and timers.
   const origin = Date.now();
   fixed('performance', freeze({ timeOrigin: origin, now: () => Date.now() - origin }));
   fixed('crypto', freeze({
@@ -178,12 +156,12 @@
   fixed('setTimeout', (callback, delay, ...args) => {
     if (typeof callback !== 'function') throw new TypeError('setTimeout takes a function');
     const id = nextTimer++;
-    timers.set(id, createTimer(() => { timers.delete(id); callback(...args); }, delay, undefined, false, true));
+    timers.set(id, true);
+    startTimer(() => { if (timers.delete(id)) callback(...args); }, Math.max(0, delay | 0));
     return id;
   });
   fixed('clearTimeout', (id) => {
-    const timer = timers.get(id);
-    if (timer !== undefined) { timers.delete(id); cancelTimer(timer); }
+    timers.delete(id);
   });
 
   // The Node modules the worker imports, as `atomic-compiler:node/<name>`

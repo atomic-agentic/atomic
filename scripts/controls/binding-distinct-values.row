@@ -1,0 +1,1 @@
+binding-distinct-values|crates/atomic-core/assets/worker.mjs|JSON.stringify([x.at,x.origin,k])|x.at|-p atomic-agentic --test astro_cli -- repeated_source_path_renders_each_distinct_value_with_its_own_binding

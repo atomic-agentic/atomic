@@ -1,0 +1,1 @@
+profile-name-bound|crates/atomic/src/settings.rs|    if !valid {|    if false && !valid { // CONTROL_OFF: accept unsafe profile names|-p atomic-agentic --bin atomic -- settings::tests::profile_names_and_missing_selected_files_refuse_before_config_load

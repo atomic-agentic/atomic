@@ -29,12 +29,19 @@ to M11b/M39b in v0.5.
 
 Declarative atoms now use Astro exclusively. The production loader supports local
 components, named slots with fallback content, frontmatter locals, template
-literals, bounded TypeScript-shaped expressions, typed validators and
+literals, bounded TypeScript-shaped expressions, typed validators,
 [TypeScript helpers](atom-files.md#typescript-helpers), which run in an
-embedded, capability-free isolate per call with the step's recorded clock.
+embedded, capability-free isolate per call with the step's recorded clock, and
+[literal Markdown imports](atom-files.md#literal-prompt-examples), which bind a
+project file's text as authored prompt content.
 `atomic check` checks source and generates editor types, including
 [types from shared schema files](atom-files.md#types-from-shared-schema-files); `atomic render` previews
-prompts without a model. Markdown and MDX atom frontends have been removed.
+prompts without a model for atoms without helpers; helper-backed atoms require
+`--preview-helpers`, which makes a non-parity inspection preview. `atomic check`
+compares opted-in prompt snapshots
+for context-free model atoms without TypeScript helpers. Contextual snapshot
+comparison awaits a frozen context manifest; helper snapshots await a recorded
+step clock. Markdown and MDX atom frontends have been removed.
 The Astro compiler and full JSON Schema gates execute in this repository; broader
 workflow scheduling, interactive commands and integrations retain their staged status.
 
@@ -42,15 +49,69 @@ The workflow interpreter is built: a workflow file runs as one durable run, with
 no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
 gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
-A run keeps the definitions it started with. An atom step's `review` is built
-for one reviewer atom with a typed verdict: a request for changes gives the
-author repair rounds, and any other verdict but an approval, or a request for
-changes with no rounds left, goes to a person at a gate. Several reviewers,
-`require: majority`, `ai-then-human` gate policy and calibrated decision atoms
-are not built yet.
+A run keeps the definitions it started with. An atom step's `review` supports
+one reviewer atom or a fixed two-reviewer coding panel with `require: all`.
+Each reviewer produces a typed verdict in its own durable step. A request for
+changes gives the author repair rounds; a rejection or exhausted rounds goes
+to a person at a gate. `require: majority`, `ai-then-human` gate policy and
+calibrated decision atoms are not built yet.
+
+The local SQLite work graph accepts beads JSONL through
+`atomic graph import <file>` and writes it through `atomic graph export`.
+Committed import and the human `graph create`, `link`, `claim` and `close`
+commands require the enrolled operator credential; their writes verify it in
+the graph transaction. Import refuses an unusable file as a unit, and repeated
+imports leave matching items unchanged. `atomic graph import --dry-run` and
+`atomic graph export` are read-only commands. These commands accept `--json` through the
+CLI's global option. `atomic graph pin <item>` admits an imported open epic
+for graph runs after an operator approves the transition. `atomic graph
+reconcile-failed <epic> --run <run>` lets that operator release a terminal
+failed run's exclusive epic binding when it holds no graph item lease; the
+corrected run can then bind without losing already closed children. `atomic graph policy set <item> --require commit` and
+`atomic graph policy clear <item>` use the same credential to change a named
+item's close rule. `policy show` is read-only and identifies an item rule or an
+inherited legacy rule. `--require verified-commit` requires an exact
+`--branch refs/heads/<name>`. `graph verify-commit` checks a recorded worktree
+attempt against that branch before storing verified evidence. `graph criteria
+set <item> --file <path>` accepts a bounded JSON list of `text`, `test`, `cel`
+and `http` criteria from the enrolled operator; `criteria show` is read-only
+and `criteria clear` removes the list. Imported Beads acceptance prose is
+stored separately and is never executed as a criterion. The staged graph work
+loop runs each executable item criterion after the author and before reviewers
+or publication; a failed criterion enters a bounded repair round. PostgreSQL
+graph storage remains staged; this v0.2 work is not a released runtime.
+
+The staged `atomic delivery start` command reads a committed graph coding
+item's accepted candidate, two clean independent reviews, self-review,
+control proofs and trial merge before opening an enrolled-operator gate.
+`atomic delivery resume` applies the approved push, pull request and queue
+requests through an operator-installed adapter in private project state. Each
+request has a durable intent and an exact remote receipt; an ambiguous result
+parks for reconciliation and is never sent again merely because the process
+restarted.
+
+A `coding: true` worktree step now requires a sibling `review.self_review`
+turn before each independent review. atomic computes the candidate's patch
+from its recorded base and commit with its hardened git runner, checks the
+ten-item typed checklist evidence, and gives the reviewer that evidence and
+the patch as external data. The host pins the original admitted revision,
+reads its decision inventory and control rows, and selects touched controls
+from the candidate diff. Missing inventory, omitted rows or decisions, and
+uncertain path aliases stop review. The reviewer also receives this host
+inventory and verified control results as external data. See
+[coding reviews](workflow-files.md#coding-reviews).
+Coding review requires a trial merge and checks against protected main.
+Before each unfinished self-review or reviewer turn, atomic re-reads that
+branch head. If it advanced since the recorded trial, the new turn stops and
+the operator starts a new run; completed review turns remain checkpointed.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
 `atomic config --explain` and a local foreground `atomic serve` are built.
+`--profile` on `config`, `check`, `run`, `eval`, `serve` and `runs resume`
+selects a project or workspace member's `atomic.<profile>.yaml`, with
+`ATOMIC_PROFILE` as the fallback; invalid names and missing selected files
+are refused. A project's profile cannot select the operator's database URL
+or API key variable. See [configuration](configuration.md#the-layers).
 `atomic init` writes a manifest, a lite atom with its schemas, a one-step
 workflow and an eval case: at the top of an empty directory, or under
 `.atomic/` in one that already holds code. With only `OPENAI_API_KEY` set, or a
@@ -319,6 +380,12 @@ starts one is not built yet. Compact schemas, variants, the `--plan` cost previe
 and the staged `--effects preview` mode are planned for v0.5. The `file` tag
 follows with code context in v0.7. The committed `atomic.policy.lock`, and
 `atomic import` and `atomic export`, are planned for v1.0.
+
+The v0.2 host controls proof and criteria checkpoints change the durable
+pipeline layout from `atomic.pipeline.7` to `atomic.pipeline.9`. An unfinished
+run recorded under `.7` or the staged `.8` layout is not resumed or replayed
+by a `.9` binary. Finish it with the matching older binary, or inspect its
+completed effects and start a new run under `.9`.
 
 Mermaid diagrams written by hand in docs need nothing from Atomic. The
 [diagram exporters](../guides/diagrams.md) for workflows, the work graph and

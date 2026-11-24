@@ -1,0 +1,32 @@
+{
+  "record_id": "fixture:candidate:bad-join",
+  "origin": "host",
+  "candidate": {
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "source": {
+      "repository": "atomic-agentic/atomic",
+      "change": "docs-pricing-example",
+      "base_revision": "11111111a3f6c8d2e5b7a90c4d1e8f36a2b5c7d9"
+    }
+  },
+  "plan": {
+    "record_id": "fixture:plan:bad-join",
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6"
+  },
+  "required_checks": [
+    {
+      "id": "docs-links",
+      "title": "Documentation links resolve",
+      "record": "fixture:execution:docs-links",
+      "required": true
+    },
+    {
+      "id": "docs-build",
+      "title": "The documentation build is clean",
+      "record": "fixture:execution:docs-links",
+      "required": true
+    }
+  ],
+  "required_outcomes": [],
+  "proposed_tasks": []
+}

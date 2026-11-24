@@ -1,0 +1,1 @@
+graph-item-criteria-human|crates/atomic-graph/src/sqlite.rs|let missing_human = !actor.human; // graph-item-criteria-human|let missing_human = false; // graph-item-criteria-human|-p atomic-agentic-graph --test admin_auth item_criteria_require_current_operator_and_refuse_invalid_changes_atomically

@@ -1,0 +1,1 @@
+delivery-effect-plan-binding|crates/atomic-durable/src/delivery_effect.rs|if show != plan.gate_show() {|if false { /* delivery approval unbound */|-p atomic-agentic-durable --lib delivery_effect_binds_human_approval_and_dispatches_each_ordered_slot_once

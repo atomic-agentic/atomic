@@ -1,0 +1,10 @@
+---
+import { cell } from './layout';
+interface Props { finding: { file: string; severity: string; message: string } }
+const { finding }: Props = Astro.props;
+// One row of layout C's table. atomic trims the whitespace around a component's
+// own text, and the file ends without a line break on purpose: the atom's map
+// supplies each row's leading newline, which is what keeps a group's rows on
+// consecutive lines, as a Markdown table body needs.
+---
+| {cell(finding.file)} | {cell(finding.severity)} | {cell(finding.message)} |

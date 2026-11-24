@@ -16,7 +16,7 @@
 use crate::engine::{self, EngineArgs};
 use crate::failure::{Failure, Said};
 use crate::target;
-use atomic_app::pipeline::{PIPELINE, ProjectWorktrees};
+use atomic_app::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, PIPELINE, ProjectWorktrees, Step};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
 use atomic_durable::{DurableError, DurableRuntime, RunStatus};
@@ -53,6 +53,14 @@ pub struct RunArgs {
     /// The id to give the run; by default a new one.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Work every ready child of this pinned graph epic with the named workflow template.
+    #[arg(long, value_name = "EPIC_ID")]
+    pub graph_epic: Option<String>,
+    /// Kill this development build after the named workflow step commits,
+    /// so `atomic runs resume` can exercise recovery through the real CLI.
+    #[cfg(feature = "dev-failpoints")]
+    #[arg(long, value_name = "STEP")]
+    pub fail_at: Option<String>,
     /// For a workflow that changes code: the repository, already on disk,
     /// its worktrees are made from. The run never writes to it.
     #[arg(long, value_name = "REPO", requires = "fixture_rev")]
@@ -63,6 +71,18 @@ pub struct RunArgs {
     pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+#[cfg(feature = "dev-failpoints")]
+fn graph_fail_at_step(step: &str, template: &str) -> bool {
+    step.strip_prefix("graph.").is_some_and(|rest| {
+        rest.split_once('.').is_some_and(|(ordinal, name)| {
+            ordinal.len() == 5
+                && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+                && ordinal.parse::<usize>().is_ok_and(|number| number < 10_000)
+                && name == template
+        })
+    })
 }
 
 /// Bind `run` to its fixture, as `args` name one, before anything runs:
@@ -399,7 +419,45 @@ pub async fn run(
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
+    if args.graph_epic.is_some() && input.get("item").is_some() {
+        return Err(Failure::new(
+            "graph.item_reserved",
+            "graph item input is supplied by the host after a claim; omit the `item` key",
+            "remove `item` from --data or the input file; declare it optional in the workflow input schema",
+        ).into());
+    }
     let mut run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
+    if args.graph_epic.is_some()
+        && (run.pipeline.steps.len() != 1
+            || !matches!(run.pipeline.steps.first(), Some(Step::Atom(step)) if step.worktree))
+    {
+        return Err(Failure::new(
+            "graph.template",
+            "--graph-epic requires a workflow with exactly one worktree atom step",
+            "use a one-step coding workflow template and put optional `item` fields in its input schema",
+        ).into());
+    }
+    #[cfg(feature = "dev-failpoints")]
+    if let Some(step) = args.fail_at.as_deref() {
+        let valid = if args.graph_epic.is_some() {
+            graph_fail_at_step(step, run.pipeline.steps[0].id())
+        } else {
+            run.pipeline
+                .steps
+                .iter()
+                .any(|candidate| candidate.id() == step)
+        };
+        if !valid {
+            return Err(Failure::new(
+                "run.fail_at",
+                "no workflow step matches --fail-at",
+                "name a step in this workflow (for a graph run: graph.00000.<template step>), then resume the run after the crash",
+            )
+            .into());
+        }
+        atomic_durable::failpoints::arm_cli(&format!("pipeline:after:{step}"))
+            .map_err(|reason| Failure::new("run.fail_at", reason, "start a new atomic command"))?;
+    }
     // Before any model is called, and before the run is recorded.
     state.create()?;
     bind_fixture(&mut run, &args, &state, &cwd)?;
@@ -477,6 +535,22 @@ pub async fn run(
         )
         .into());
     }
+    if let Some(epic) = &args.graph_epic {
+        if engine.shared {
+            return Err(Failure::new(
+                "graph.sqlite_required",
+                "graph epic runs currently require a SQLite project store",
+                "use a SQLite project store for this graph run",
+            )
+            .into());
+        }
+        let graph = atomic_graph::sqlite::SqliteStore::open_authorized(
+            &state.database(),
+            std::time::SystemTime::now,
+            crate::gates::operator_credential(&state)?,
+        )?;
+        graph.authorize_graph_run(epic, &run_id).await?;
+    }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
     // Names only, not redacted, since a run id such as `rotate-secret` is
@@ -510,7 +584,15 @@ pub async fn run(
     let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
     let told = halt.clone();
     let (artifacts, rt) = (&engine.artifacts, &engine.rt);
-    let admission = admit(artifacts, rt, PIPELINE, &run_id, run, typed, told);
+    let (workflow_name, durable_input) = match args.graph_epic {
+        Some(epic) => (
+            GRAPH_PIPELINE,
+            serde_json::to_value(GraphPipelineRun { run, epic })?,
+        ),
+        None => (PIPELINE, serde_json::to_value(run)?),
+    };
+    #[rustfmt::skip]
+    let admission = admit(artifacts, rt, workflow_name, &run_id, durable_input, typed, told);
     tokio::pin!(admission);
     let mut signalled = None;
     let admitted = tokio::select! {
@@ -998,6 +1080,29 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dev-failpoints")]
+    #[test]
+    fn graph_fail_at_names_the_actual_after_close_site() {
+        assert!(graph_fail_at_step("graph.00000.implement", "implement"));
+        assert!(graph_fail_at_step("graph.00042.implement", "implement"));
+        for invalid in [
+            "implement",
+            "graph.0.implement",
+            "graph.00000.other",
+            "graph.00000.implement.turn",
+            "graph.abcde.implement",
+            "graph.10000.implement",
+            "graph.99999.implement",
+        ] {
+            assert!(!graph_fail_at_step(invalid, "implement"), "{invalid}");
+        }
+        assert_eq!(
+            atomic_durable::failpoints::site_of("pipeline:after:graph.00000.implement")
+                .map(|site| site.name),
+            Some("pipeline:after:{step}")
+        );
+    }
 
     /// What every refusal says: the rule, and not the id.
     const REFUSED: &str = "the run id given with --run-id is refused: a run id is 1 to 128 \

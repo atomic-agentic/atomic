@@ -1,0 +1,1 @@
+schema-origin-ref-siblings|crates/atomic-schema/src/typescript.rs|self.resolved = Some(origin);|self.resolved = None;|-p atomic-agentic-schema --lib -- typescript::tests::referenced_field_with_siblings_keeps_the_referenced_origin
