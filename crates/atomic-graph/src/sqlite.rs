@@ -207,6 +207,48 @@ impl SqliteStore {
         self
     }
 
+    /// Resolve a prior keyed create before deriving a new generated ID. Older
+    /// releases generated eight-hex-digit IDs; a replay must keep that target
+    /// even after new creates use a longer hash. `create_item` still checks the
+    /// stored target and payload fingerprint in its write transaction.
+    pub async fn created_item_id_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let request_id = request_id.to_owned();
+        self.read(move |conn| {
+            Box::pin(async move {
+                let row =
+                    sqlx::query("SELECT kind,value FROM atomic_graph_requests WHERE request_id=?")
+                        .bind(&request_id)
+                        .fetch_optional(conn)
+                        .await
+                        .map_err(db)?;
+                let Some(row) = row else { return Ok(None) };
+                let kind: String = row.try_get("kind").map_err(db)?;
+                if kind != "create" {
+                    return Err(StoreError::RequestConflict { request_id });
+                }
+                let value: String = row.try_get("value").map_err(db)?;
+                let id = if let Some(encoded) = value.strip_prefix("create-v2:") {
+                    let saved: serde_json::Value = serde_json::from_str(encoded).map_err(db)?;
+                    saved
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| db("create request has no item ID"))?
+                        .to_owned()
+                } else if !value.is_empty() {
+                    value
+                } else {
+                    return Err(db("create request has no item ID"));
+                };
+                Ok(Some(id))
+            })
+        })
+        .await
+    }
+
     /// Admit one durable graph run as the enrolled operator. Credential
     /// verification, pinned-epic preflight, and authorization insertion share
     /// the same write transaction. A different active or completed run keeps
@@ -591,13 +633,14 @@ impl SqliteStore {
     }
 }
 
-/// Make a short stable item ID from source bytes; collisions remain the caller's concern.
+/// Make a stable 96-bit item ID from source bytes. Older short IDs remain
+/// replayable through the stored request target.
 pub fn hash_id(namespace: &str, source: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(namespace.as_bytes());
     h.update([0]);
     h.update(source);
-    format!("at-{:x}", h.finalize())[..11].to_owned()
+    format!("at-{:x}", h.finalize())[..27].to_owned()
 }
 
 async fn get_item(conn: &mut SqliteConnection, id: &str) -> Result<Option<Item>, StoreError> {
@@ -707,13 +750,26 @@ async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, S
         .map(|r| r.try_get("target").map_err(db))
         .collect()
 }
+// `atomic_graph_blocked` already holds every unresolved direct blocker. Any
+// longer path starts with one of these rows, so source membership needs only
+// this indexed lookup; expanding all reachable pairs adds no information.
+const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
+const CLAIM_HAS_BLOCKER_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM atomic_graph_blocked WHERE source=?)";
 async fn ready_items(
     conn: &mut SqliteConnection,
     now: i64,
     limit: usize,
     include_unheld_in_progress: bool,
 ) -> Result<Vec<Item>, StoreError> {
-    let rows=sqlx::query("WITH RECURSIVE blocked_chain(source,target) AS (SELECT source,target FROM atomic_graph_blocked UNION SELECT chain.source,b.target FROM blocked_chain chain JOIN atomic_graph_blocked b ON b.source=chain.target) SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM blocked_chain chain WHERE chain.source=i.id) ORDER BY i.priority, i.id LIMIT ?").bind(now).bind(i64::from(include_unheld_in_progress)).bind(now).bind(limit as i64).fetch_all(conn).await.map_err(db)?;
+    let rows = sqlx::query(READY_ITEMS_SQL)
+        .bind(now)
+        .bind(i64::from(include_unheld_in_progress))
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(conn)
+        .await
+        .map_err(db)?;
     rows.iter().map(item).collect()
 }
 async fn lease_row(
@@ -1699,7 +1755,12 @@ async fn claim_id(
     if i.kind == "goal"
         || i.kind == "message"
         || i.due_at.is_some_and(|due| millis(due) > now)
-        || !blocked(c, id).await?.is_empty()
+        || sqlx::query_scalar::<_, i64>(CLAIM_HAS_BLOCKER_SQL)
+            .bind(id)
+            .fetch_one(&mut *c)
+            .await
+            .map_err(db)?
+            != 0
     {
         return Ok(None);
     }
@@ -2276,6 +2337,61 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_and_claim_use_the_blocker_source_index_without_a_recursive_closure() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-blocker-plan-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut conn = store.conn.lock().expect("graph connection");
+        let ready_sql = format!("EXPLAIN QUERY PLAN {READY_ITEMS_SQL}");
+        let claim_sql = format!("EXPLAIN QUERY PLAN {CLAIM_HAS_BLOCKER_SQL}");
+        let plans = runtime.block_on(async {
+            // The EXPLAIN prefix and queried SQL are both fixed source text.
+            let ready = sqlx::query(sqlx::AssertSqlSafe(ready_sql))
+                .bind(0_i64)
+                .bind(0_i64)
+                .bind(0_i64)
+                .bind(10_i64)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("ready query plan");
+            let claim = sqlx::query(sqlx::AssertSqlSafe(claim_sql))
+                .bind("at-item")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("claim blocker query plan");
+            [ready, claim].map(|rows| {
+                rows.iter()
+                    .map(|row| row.try_get::<String, _>("detail").expect("plan detail"))
+                    .collect::<Vec<_>>()
+            })
+        });
+        for (plan, table) in plans.iter().zip(["b", "atomic_graph_blocked"]) {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING"))
+                        && detail.contains("(source=?)")),
+                "blocker source lookup did not use its index: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("CO-ROUTINE") || detail.contains("MATERIALIZE")),
+                "blocker lookup materialized a recursive result: {plan:?}"
+            );
+        }
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn sqlite_commit_failure_rolls_back_and_next_operation_runs() {
