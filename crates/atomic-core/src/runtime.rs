@@ -67,6 +67,7 @@ pub struct Artifacts(
     Option<Arc<dyn crate::artifact::ArtifactStore + Send + Sync>>,
     crate::artifact::files::Limits,
     Arc<Holding>,
+    Option<std::path::PathBuf>,
 );
 
 /// Lets go of what a step's command handed over when dropped (see
@@ -97,6 +98,7 @@ impl Artifacts {
             None,
             Default::default(),
             Default::default(),
+            None,
         )
     }
 
@@ -106,11 +108,16 @@ impl Artifacts {
         store: crate::artifact::LocalStore,
         limits: crate::artifact::files::Limits,
     ) -> Self {
+        let root = store
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| store.root().to_path_buf());
         Self(
             Arc::new(store.clone()),
             Some(Arc::new(store)),
             limits,
             Default::default(),
+            Some(root),
         )
     }
 
@@ -408,19 +415,27 @@ pub fn sleep_unless_stopping(wait: std::time::Duration) -> bool {
     }
 }
 
-/// The runs a step of which stopped, to be run again, because the artifact
-/// store was held while its command's inputs were given.
-static HELD_STOPS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+/// The runs a step of which stopped, to be run again, because their artifact
+/// store was held while the command's inputs were given. Run IDs can repeat
+/// in another store served by this process.
+static HELD_STOPS: std::sync::Mutex<std::collections::BTreeSet<(std::path::PathBuf, String)>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
-/// Whether a step of run `run` stopped for a held store since this was last
-/// asked, which it then forgets: such a stop is not the run's doing, and a
-/// durable runner does not count it toward giving the run up.
-pub fn take_held_stop(run: &str) -> bool {
+fn mark_held_stop(store: &std::path::Path, run: &str) {
     HELD_STOPS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(run)
+        .insert((store.to_path_buf(), run.to_owned()));
+}
+
+/// Whether a step of run `run` in `store` stopped for a held store since this was last
+/// asked, which it then forgets: such a stop is not the run's doing, and a
+/// durable runner does not count it toward giving the run up.
+pub fn take_held_stop(store: &std::path::Path, run: &str) -> bool {
+    HELD_STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(store.to_path_buf(), run.to_owned()))
 }
 
 /// This process is stopping: every step waiting for a workspace gives up
@@ -1901,6 +1916,7 @@ async fn exchange_for(
     let lookup = artifacts.0.clone();
     let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
     let (name, run) = (atom.name.clone(), identity.run_id.clone());
+    let held_scope = artifacts.4.clone();
     // The workspace stays open while its inputs are copied in, even when the
     // run is cancelled meanwhile.
     let held = workspace.hold();
@@ -1944,10 +1960,9 @@ async fn exchange_for(
                     wait = (wait * 2).min(cap);
                 }
                 Err(e @ crate::artifact::ArtifactError::Locked { .. }) => {
-                    HELD_STOPS
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(run.clone());
+                    if let Some(scope) = &held_scope {
+                        mark_held_stop(scope, &run);
+                    }
                     return Err(AtomError::StoreHeld(format!(
                         "{name}: give the command its input files: {e}; its command did not \
                          run, and the step is run again"

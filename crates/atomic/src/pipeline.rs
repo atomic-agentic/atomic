@@ -149,45 +149,56 @@ fn normalize_legacy_context(
 /// which counts every recovery claim, stays at its default.
 pub const RECOVERY_LIMIT: u32 = 5;
 
+/// A run's recovery identity. A run ID, and even a project key, can be reused
+/// in a different store served by the same process.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RecoveryKey {
+    store: PathBuf,
+    project: Option<String>,
+    run: String,
+}
+
+impl RecoveryKey {
+    fn new(project: Option<&str>, run: &str, store: &LocalStore) -> Self {
+        Self {
+            store: store
+                .root()
+                .canonicalize()
+                .unwrap_or_else(|_| store.root().to_path_buf()),
+            project: project.map(str::to_owned),
+            run: run.to_owned(),
+        }
+    }
+}
+
 /// For each run this process has executed: the furthest position it has
 /// reached (the pin is 0, each step one more), and how many of this
 /// process's executions of the run have reached it.
-static PROGRESS: std::sync::Mutex<BTreeMap<String, (usize, u32)>> =
+static PROGRESS: std::sync::Mutex<BTreeMap<RecoveryKey, (usize, u32)>> =
     std::sync::Mutex::new(BTreeMap::new());
-
-/// The runs this process has dead-lettered.
-static DEAD: std::sync::Mutex<std::collections::BTreeSet<String>> =
-    std::sync::Mutex::new(std::collections::BTreeSet::new());
-
-/// Whether this process failed run `id` as dead-lettered.
-pub fn dead_lettered(id: &str) -> bool {
-    DEAD.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
-}
 
 /// Count an execution of run `id` reaching `position`, and fail the run
 /// as dead-lettered once more executions than [`RECOVERY_LIMIT`] allows
 /// have reached it without getting further. Each execution reaches each
 /// position once; one replaying positions short of the furthest counts
 /// nothing.
-fn reached(id: &str, position: usize) -> Result<()> {
+fn reached(key: &RecoveryKey, position: usize) -> Result<()> {
+    let id = &key.run;
     let entries = {
         let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
-        let (top, entries) = progress.entry(id.to_owned()).or_insert((position, 0));
+        let (top, entries) = progress.entry(key.clone()).or_insert((position, 0));
         if position > *top {
             *top = position;
             *entries = 0;
         }
         // A step that stopped for an artifact store held elsewhere, as a pin
         // does, takes nothing toward dead-lettering, nor does it get further.
-        if position == *top && !atomic_core::runtime::take_held_stop(id) {
+        if position == *top && !atomic_core::runtime::take_held_stop(&key.store, id) {
             *entries += 1;
         }
         *entries
     };
     if entries > 1 + RECOVERY_LIMIT {
-        DEAD.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.to_owned());
         let why = format!(
             "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
              step without finishing it, so it is not run again"
@@ -208,12 +219,48 @@ fn reached(id: &str, position: usize) -> Result<()> {
 /// Take back the count [`reached`] made for this execution of run `id` at
 /// `position`: it stopped there for a reason outside the run, such as a
 /// store held elsewhere, and must not bring the run nearer dead-lettering.
-fn not_reached(id: &str, position: usize) {
+fn not_reached(key: &RecoveryKey, position: usize) {
     let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((top, entries)) = progress.get_mut(id)
+    if let Some((top, entries)) = progress.get_mut(key)
         && *top == position
     {
         *entries = entries.saturating_sub(1);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::{PROGRESS, RECOVERY_LIMIT, RecoveryKey, reached};
+    use atomic_core::artifact::LocalStore;
+
+    #[test]
+    fn same_run_name_in_another_store_does_not_inherit_recovery_count() {
+        let root = std::env::temp_dir().join(format!("atomic-recovery-key-{}", std::process::id()));
+        let first_store = LocalStore::open(root.join("first")).expect("first artifact store");
+        let second_store = LocalStore::open(root.join("second")).expect("second artifact store");
+        let reopened = LocalStore::open(root.join("first")).expect("reopened artifact store");
+        let run = format!("recovery-key-scope-{}", std::process::id());
+        let first = RecoveryKey::new(Some("same-project"), &run, &first_store);
+        let second = RecoveryKey::new(Some("same-project"), &run, &second_store);
+        let another_project = RecoveryKey::new(Some("another-project"), &run, &first_store);
+        assert_eq!(
+            first,
+            RecoveryKey::new(Some("same-project"), &run, &reopened)
+        );
+        for _ in 0..=RECOVERY_LIMIT {
+            reached(&first, 0).expect("first store has its recovery allowance");
+        }
+        reached(&second, 0).expect("second store has its own recovery allowance");
+        reached(&another_project, 0).expect("another project has its own recovery allowance");
+        let failure = reached(&first, 0).expect_err("first store exhausts only its own allowance");
+        assert!(failure.to_string().contains("dead-lettered:"));
+        let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(progress.remove(&second), Some((0, 1)));
+        assert_eq!(progress.remove(&another_project), Some((0, 1)));
+        progress.remove(&first);
+        drop(progress);
+        drop((first_store, second_store, reopened));
+        std::fs::remove_dir_all(root).expect("remove artifact stores");
     }
 }
 
@@ -1616,6 +1663,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         normalize_legacy_context(name, atom.context.as_ref(), &mut atom.program.contracts)?;
     }
     let id = ctx.workflow_id().to_owned();
+    let recovery = RecoveryKey::new(ctx.project(), ctx.workflow_id(), &services.store);
     // Before anything is recorded: which execution this is, so `runs show`
     // can tell what each one ran and what it found checkpointed. Only that
     // view depends on it, so a record that cannot be written costs the run
@@ -1635,7 +1683,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
     let mut working = Some(begin_work(&id).await);
-    reached(&id, 0)?;
+    reached(&recovery, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     check_reviews(&pipeline)?;
@@ -1749,6 +1797,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     let files = pipeline.pins.clone();
     let run_id = ctx.workflow_id().to_owned();
     let pinning = run_id.clone();
+    let pin_recovery = recovery.clone();
     let replaying = replay.is_some();
     let helper_runtime = atomic_core::astro::Program::current_helper_runtime();
     let pinned: Pinned = ctx
@@ -1797,7 +1846,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 // of the run: it stops without recording anything, and
                 // recovery runs it again.
                 Err(e @ ArtifactError::Locked { .. }) => {
-                    not_reached(&pinning, 0);
+                    not_reached(&pin_recovery, 0);
                     return Err(DurableError::Interrupted(format!(
                         "store the pipeline: {e}; the run is run again, and once durare's \
                          recoveries of it run out, it waits for `atomic runs resume`"
@@ -1958,7 +2007,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         let mut closed_count = 0_usize;
         for ordinal in 0..10_000_usize {
             keep_working(&mut working, &id).await;
-            reached(&id, ordinal + 1)?;
+            reached(&recovery, ordinal + 1)?;
             let step_name = format!("graph.{ordinal:05}.{}", template.id);
             let claim_step = format!("graph.{ordinal:05}.claim");
             let (workflow, epic_id, claimant, step) =
@@ -2385,7 +2434,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
         keep_working(&mut working, &id).await;
-        reached(&id, position + 1)?;
+        reached(&recovery, position + 1)?;
         let scope = json!(steps);
         let steps_shape = Shape::Fields(shapes.clone());
         let values = [

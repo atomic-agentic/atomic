@@ -449,6 +449,11 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 }
 
 impl LocalStore {
+    /// The directory holding this store's artifacts.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// A store rooted at `root`, creating its directories. A project's store
     /// in an atomic home, `<home>/projects/<id>/artifacts`, takes the same
     /// lock as [`Self::for_project`], `<home>/private/<id>/artifacts.lock`:

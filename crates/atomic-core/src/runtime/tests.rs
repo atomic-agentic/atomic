@@ -6,6 +6,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 
+#[test]
+fn held_store_stop_is_consumed_only_by_its_store_and_run() {
+    let root = std::env::temp_dir().join(format!("atomic-held-stop-{}", std::process::id()));
+    let first = crate::artifact::LocalStore::open(root.join("first")).expect("first store");
+    let second = crate::artifact::LocalStore::open(root.join("second")).expect("second store");
+    let first_scope = Artifacts::store(first.clone(), Default::default())
+        .4
+        .expect("first store scope");
+    let second_scope = Artifacts::store(second, Default::default())
+        .4
+        .expect("second store scope");
+    let run = format!("same-run-{}", std::process::id());
+    mark_held_stop(&first_scope, &run);
+    assert!(!take_held_stop(&second_scope, &run));
+    assert!(!take_held_stop(&first_scope, "another-run"));
+    let reopened = Artifacts::store(first, Default::default())
+        .4
+        .expect("reopened store scope");
+    assert_eq!(first_scope, reopened);
+    assert!(take_held_stop(&reopened, &run));
+    assert!(!take_held_stop(&reopened, &run));
+    std::fs::remove_dir_all(root).expect("remove stores");
+}
+
 #[derive(Serialize)]
 struct Note {
     text: String,
@@ -3191,6 +3215,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
                 Some(Arc::new(stalling.clone())),
                 Default::default(),
                 Default::default(),
+                Some(store.root().canonicalize().expect("artifact store path")),
             );
             let _let_go = LetGo(stalling.clone());
             let recorded = Recording::default();
@@ -4062,6 +4087,7 @@ fn a_store_held_while_inputs_are_given_runs_nothing() {
             })),
             Default::default(),
             Default::default(),
+            Some(store.root().canonicalize().expect("artifact store path")),
         );
         let hold = || {
             let held = std::fs::File::options()
