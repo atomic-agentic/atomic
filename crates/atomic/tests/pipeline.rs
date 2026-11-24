@@ -11819,6 +11819,30 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         let out: Value = rt.result("review-2").await.expect("finishes");
         assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
         assert_eq!(model.calls(), 4);
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "author, reviewer, repair, fresh reviewer"
+        );
+        let first_review = requests[1].to_string();
+        assert!(
+            first_review.contains("Export works with accents")
+                && first_review.contains("café.txt crashes"),
+            "the reviewer must see the seeded contradiction: {first_review}"
+        );
+        let repair = requests[2].to_string();
+        assert!(
+            repair.contains("A reviewer rejected your previous output")
+                && repair.contains("the title says it works"),
+            "the author must receive the defect finding: {repair}"
+        );
+        let second_review = requests[3].to_string();
+        assert!(
+            second_review.contains("Export crashes on accents")
+                && !second_review.contains("Export works with accents"),
+            "the fresh reviewer must see the repaired candidate: {second_review}"
+        );
         let open = gate::gates(&rt, GateFilter::default())
             .await
             .expect("gates");
@@ -11835,6 +11859,14 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         assert_eq!(
             published["read.review.1"].proposal.output["verdict"],
             "approve"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["verdict"],
+            "request_changes"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["findings"][0]["message"],
+            "The note says the export crashes; the title says it works."
         );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
