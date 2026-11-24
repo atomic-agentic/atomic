@@ -2538,6 +2538,175 @@ fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
 }
 
 #[test]
+fn sqlite_agent_status_cannot_close_defer_or_bypass_close_policy() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, Evidence, GraphStore, Status, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-agent-status-authority-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph");
+    let human = Actor::human("owner");
+    let agent = Actor::agent("atom");
+    harness::block_on(async {
+        store
+            .create_item(
+                human.clone(),
+                "create-open".into(),
+                Draft::new("open", "Open"),
+            )
+            .await
+            .expect("create unprotected item");
+        store
+            .claim(
+                agent.clone(),
+                "claim-open".into(),
+                "open".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim unprotected item")
+            .expect("lease");
+        store
+            .set_close_policy(human.clone(), vec![Evidence::Commit])
+            .await
+            .expect("require commit for later item");
+        store
+            .create_item(
+                human.clone(),
+                "create-policy".into(),
+                Draft::new("policy", "Protected"),
+            )
+            .await
+            .expect("create protected item");
+
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent reader");
+        let before_items: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id,status,claim_epoch,closed_at FROM atomic_graph_items WHERE id IN ('open','policy') ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("read item rows");
+        let before_leases: Vec<(String, String, i64, i64, String, i64)> = sqlx::query_as(
+            "SELECT item_id,claimant,session,epoch,acquisition,expires_at FROM atomic_graph_leases WHERE item_id IN ('open','policy') ORDER BY item_id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("read lease rows");
+        assert_eq!(before_items.len(), 2);
+        assert_eq!(before_leases.len(), 1);
+
+        for (id, status) in [
+            ("open", Status::Closed),
+            ("open", Status::Deferred),
+            ("policy", Status::Closed),
+            ("policy", Status::Deferred),
+        ] {
+            assert!(matches!(
+                store.set_status(agent.clone(), id.into(), status).await,
+                Err(StoreError::NeedsHumanCredential { action }) if action == "set status"
+            ));
+            let after_items: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT id,status,claim_epoch,closed_at FROM atomic_graph_items WHERE id IN ('open','policy') ORDER BY id",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .expect("read unchanged item rows");
+            let after_leases: Vec<(String, String, i64, i64, String, i64)> = sqlx::query_as(
+                "SELECT item_id,claimant,session,epoch,acquisition,expires_at FROM atomic_graph_leases WHERE item_id IN ('open','policy') ORDER BY item_id",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .expect("read unchanged lease rows");
+            assert_eq!(after_items, before_items, "agent changed item rows");
+            assert_eq!(after_leases, before_leases, "agent changed lease rows");
+        }
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_agent_memory_cannot_replace_human_or_approved_rows() {
+    use sqlx::Connection;
+    use store_contract::{Actor, GraphStore, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-agent-memory-authority-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph");
+    let human = Actor::human("owner");
+    let agent = Actor::agent("atom");
+    harness::block_on(async {
+        for (request, key, value) in [
+            ("human-seed", "human-key", "owner text"),
+            ("approved-seed", "approved-key", "approved text"),
+        ] {
+            store
+                .remember(human.clone(), request.into(), key.into(), value.into())
+                .await
+                .expect("seed trusted memory");
+        }
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent reader");
+        sqlx::query("UPDATE atomic_graph_memories SET trust='approved' WHERE key='approved-key'")
+            .execute(&mut conn)
+            .await
+            .expect("model an existing approved memory");
+        let before_memories: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT key,value,trust FROM atomic_graph_memories ORDER BY key")
+                .fetch_all(&mut conn)
+                .await
+                .expect("read trusted memories");
+        let before_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+            .fetch_one(&mut conn)
+            .await
+            .expect("count requests");
+        assert_eq!(before_memories[0].2, "approved");
+        assert_eq!(before_memories[1].2, "human");
+
+        for (request, key) in [
+            ("agent-replace-human", "human-key"),
+            ("agent-replace-approved", "approved-key"),
+        ] {
+            assert!(matches!(
+                store
+                    .remember(agent.clone(), request.into(), key.into(), "agent text".into())
+                    .await,
+                Err(StoreError::NeedsHumanCredential { action }) if action == "replace trusted memory"
+            ));
+            let after_memories: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT key,value,trust FROM atomic_graph_memories ORDER BY key")
+                    .fetch_all(&mut conn)
+                    .await
+                    .expect("read unchanged memories");
+            let after_requests: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("count unchanged requests");
+            assert_eq!(
+                after_memories, before_memories,
+                "agent changed trusted memory"
+            );
+            assert_eq!(
+                after_requests, before_requests,
+                "agent recorded rejected request"
+            );
+        }
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_refuses_untrusted_admin_changes_and_memory_demotion() {
     use store_contract::{Actor, Draft, Finish, GraphStore, Status, StoreError};
     let path = std::env::temp_dir().join(format!(
