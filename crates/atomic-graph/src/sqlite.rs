@@ -134,6 +134,8 @@ pub struct SqliteStore {
     conn: Arc<Mutex<SqliteConnection>>,
     now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     human: Option<HumanCredential>,
+    #[cfg(debug_assertions)]
+    projection_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl SqliteStore {
     /// Open a graph database. Existing graph rows survive reopening.
@@ -166,6 +168,8 @@ impl SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             now: Arc::new(now),
             human: None,
+            #[cfg(debug_assertions)]
+            projection_pause: None,
         })
     }
     /// Open a graph store for a person whose enrolled credential is checked
@@ -178,6 +182,15 @@ impl SqliteStore {
         let mut store = Self::open(path, now)?;
         store.human = Some(credential);
         Ok(store)
+    }
+
+    /// Test seam for pausing between projection deletion and re-insertion.
+    /// It is absent from release builds and cannot be set through graph data.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn with_projection_pause(mut self, pause: impl Fn() + Send + Sync + 'static) -> Self {
+        self.projection_pause = Some(Arc::new(pause));
+        self
     }
 
     /// Admit one durable graph run as the enrolled operator. Credential
@@ -472,6 +485,8 @@ impl SqliteStore {
     ) -> Result<T, StoreError> {
         let connection = Arc::clone(&self.conn);
         let credential = self.human.clone();
+        #[cfg(debug_assertions)]
+        let projection_pause = self.projection_pause.clone();
         let (answer, received) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let result = (|| {
@@ -503,7 +518,14 @@ impl SqliteStore {
                     let result = f(&mut conn).await;
                     match result {
                         Ok(value) => {
-                            if write && let Err(error) = refresh_projection(&mut conn).await {
+                            if write
+                                && let Err(error) = refresh_projection(
+                                    &mut conn,
+                                    #[cfg(debug_assertions)]
+                                    projection_pause.as_deref(),
+                                )
+                                .await
+                            {
                                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                                 return Err(error);
                             }
@@ -644,11 +666,18 @@ async fn create_request_seen(
     }
     Ok(true)
 }
-async fn refresh_projection(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+async fn refresh_projection(
+    conn: &mut SqliteConnection,
+    #[cfg(debug_assertions)] pause: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM atomic_graph_blocked")
         .execute(&mut *conn)
         .await
         .map_err(db)?;
+    #[cfg(debug_assertions)]
+    if let Some(pause) = pause {
+        pause();
+    }
     sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND b.status='pinned')")
         .execute(conn).await.map_err(db)?;
     Ok(())
