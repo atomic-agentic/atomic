@@ -8051,7 +8051,17 @@ shutil.copy2(source / row, out)
         "{}",
         String::from_utf8_lossy(&copied.stderr)
     );
+    let workspace_manifest =
+        std::fs::read(project.join("Cargo.toml")).expect("copied workspace manifest");
+    let workspace_lock =
+        std::fs::read(project.join("Cargo.lock")).expect("copied workspace lockfile");
     let _ = real_control_fixture(project, false);
+    // The small fixture above writes its own one-package Cargo manifest and
+    // lockfile. This case selects a real atomic workspace package instead.
+    std::fs::write(project.join("Cargo.toml"), workspace_manifest)
+        .expect("restore copied workspace manifest");
+    std::fs::write(project.join("Cargo.lock"), workspace_lock)
+        .expect("restore copied workspace lockfile");
     let row = include_str!("../../../scripts/controls/exec-step-needs-its-snapshot.row");
     let row = row.replacen("exec-step-needs-its-snapshot|", "row-test|", 1);
     std::fs::write(project.join("scripts/controls/row-test.row"), row).expect("real row");
