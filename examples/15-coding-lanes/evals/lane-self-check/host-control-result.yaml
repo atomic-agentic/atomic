@@ -1,0 +1,15 @@
+input:
+  diff: |-
+    diff --git a/notes/lane-change.md b/notes/lane-change.md
+    new file mode 100644
+    --- /dev/null
+    +++ b/notes/lane-change.md
+    @@ -0,0 +1 @@
+    +The guard test still refuses what it refused.
+  control_results:
+  - row: lane-guard-bites
+    result: its test fails with the control off and passes with it on
+expect:
+- "output.controls.size() == 1"
+- "output.controls[0].row == input.control_results[0].row"
+- "output.controls[0].result == input.control_results[0].result"

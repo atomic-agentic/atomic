@@ -1,0 +1,9 @@
+{
+  "diff": "diff --git a/notes/lane-change.md b/notes/lane-change.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/lane-change.md\n@@ -0,0 +1 @@\n+The guard test still refuses what it refused.\n",
+  "control_results": [
+    {
+      "row": "lane-guard-bites",
+      "result": "its test fails with the control off and passes with it on"
+    }
+  ]
+}
