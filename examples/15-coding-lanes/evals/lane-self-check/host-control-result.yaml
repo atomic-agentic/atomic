@@ -5,7 +5,7 @@ input:
     --- /dev/null
     +++ b/notes/lane-change.md
     @@ -0,0 +1 @@
-    +The guard test passes because decide() returns confirmed: false when verification is missing.
+    +The guard test passes because decide() returns confirmed: false when verification is null.
   control_results:
   - row: lane-guard-bites
     result: its test fails with the control off and passes with it on
