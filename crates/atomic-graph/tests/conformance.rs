@@ -3132,6 +3132,27 @@ fn sqlite_request_ids_bind_operation_and_target() {
             .expect("note one");
         assert!(matches!(
             store
+                .create_item(
+                    actor.clone(),
+                    "note-one".into(),
+                    Draft::new("at-one", "One")
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
+        assert!(matches!(
+            store
+                .remember(
+                    actor.clone(),
+                    "note-one".into(),
+                    "at-one".into(),
+                    "wrong op".into()
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
+        assert!(matches!(
+            store
                 .note(actor.clone(), two, "note-one".into(), "two note".into())
                 .await,
             Err(StoreError::RequestConflict { .. })
