@@ -191,6 +191,7 @@ approving the same candidate.
 | Five atoms, their schemas, their eval cases and fixtures | `tools/check_examples.py`, and `atomic check` | Every golden output fits its atom's full contract and every case renders. |
 | `tools/lane_guard.py` and `tests/test_lane_guard.py` | `python3 tests/test_lane_guard.py` | The guard refuses an unverified finding, still confirms a host-recorded one, and refuses an absent record. |
 | `lane-controls-proof` | `tools/check_examples.py` and `atomic eval lane-controls-proof`, both of which run the local command | The local fixture reads a row and reports `intact` or `blind`; it cannot emit a passing proof. In a production coding run the host substitutes its pinned controls driver. |
+| Seeded `lane-reviewer` cases | `atomic eval lane-reviewer --live` and recorded replay; see [reviewer recall](reviewer-recall.md) | A local model identified two synthetic coding defects and approved one benign control in the recorded pilot. |
 | Self-review, the panel, repair rounds, criteria, trial merge, the two gates | nothing here | These need a bound base revision, a worktree, an admitted inventory, a model and a person's decision. The runtime has them; this directory has none. |
 
 Nothing in this file is a declaration the runtime ignores. Criteria, which used
