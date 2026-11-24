@@ -1,1 +1,1 @@
-exec-mount-held-not-counted|crates/atomic/src/pipeline.rs|        if position == *top && !atomic_core::runtime::take_held_stop(id) {|        if position == *top { // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again
+exec-mount-held-not-counted|crates/atomic/src/pipeline.rs|        if position == *top && !atomic_core::runtime::take_held_stop(&key.store, id) {|        if position == *top { // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again
