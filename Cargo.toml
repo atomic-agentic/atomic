@@ -35,7 +35,7 @@ atomic-schema = { path = "crates/atomic-schema", package = "atomic-agentic-schem
 
 # atomic's fork of durare, at the revision in deps/forks.toml. Only
 # atomic-durable may depend on it.
-durare = { git = "https://github.com/atomic-agentic/durare", rev = "d52426ccb8f72c089f24a03e8abd9a0dfe217603", default-features = false, features = ["sqlite", "postgres"] }
+durare = { git = "https://github.com/atomic-agentic/durare", rev = "02bf47a8a292fded97a9c147bbe7b047a8a2cc14", default-features = false, features = ["sqlite", "postgres"] }
 
 # Third-party crates.
 anyhow = "1"
