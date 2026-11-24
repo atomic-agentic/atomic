@@ -1054,7 +1054,8 @@ impl GraphStore for SqliteStore {
         async move {
             let actor = self.actor_for_write(actor, "set status")?;
             // CONTROL_OFF: graph-agent-status-human-only
-            if !actor.human {
+            let agent_status_action = !actor.human;
+            if agent_status_action {
                 return Err(StoreError::NeedsHumanCredential {
                     action: "set status".to_owned(),
                 });
