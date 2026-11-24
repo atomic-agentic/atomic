@@ -2672,10 +2672,11 @@ fn sqlite_samples_lease_clock_when_the_transaction_starts() {
         Duration::from_secs(1),
     );
     clock.advance(Duration::from_secs(30));
-    let lease = harness::block_on(pending)
+    let lease = poll_after_writer_contention(&path, pending, &clock)
         .expect("test operation")
         .expect("test operation");
     assert_eq!(lease.epoch, 1);
+    assert_lease_expiry_after(&path, "at-clock", clock.now());
     let second = harness::block_on(store.claim(
         actor,
         "second".into(),
@@ -2686,6 +2687,155 @@ fn sqlite_samples_lease_clock_when_the_transaction_starts() {
     assert!(
         second.is_none(),
         "claim was committed already expired from a stale clock sample"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Keep a separate SQLite writer open while the graph future is first polled.
+/// The future was constructed before the caller advanced its fake clock.
+fn poll_after_writer_contention<F>(path: &std::path::Path, pending: F, clock: &Clock) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    use sqlx::Connection;
+    let uri = format!("sqlite://{}", path.display());
+    let mut writer =
+        harness::block_on(sqlx::SqliteConnection::connect(&uri)).expect("open independent writer");
+    harness::block_on(sqlx::query("BEGIN IMMEDIATE").execute(&mut writer))
+        .expect("hold writer transaction");
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || {
+            let mut pending = std::pin::pin!(pending);
+            let mut first_poll = Some(started_tx);
+            harness::block_on(std::future::poll_fn(move |cx| {
+                let result = pending.as_mut().poll(cx);
+                if let Some(signal) = first_poll.take() {
+                    signal.send(()).expect("signal first graph poll");
+                }
+                result
+            }))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("graph future was polled");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !worker.is_finished(),
+            "graph operation ignored writer contention"
+        );
+        // An implementation that samples time at first poll, before BEGIN
+        // IMMEDIATE can enter, must still use the later transaction clock.
+        clock.advance(Duration::from_secs(30));
+        harness::block_on(sqlx::query("ROLLBACK").execute(&mut writer))
+            .expect("release writer transaction");
+        worker.join().expect("graph worker")
+    })
+}
+
+fn assert_lease_expiry_after(path: &std::path::Path, item: &str, now: std::time::SystemTime) {
+    use sqlx::Connection;
+    let uri = format!("sqlite://{}", path.display());
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&uri)
+            .await
+            .expect("open lease reader");
+        let expires_at: i64 =
+            sqlx::query_scalar("SELECT expires_at FROM atomic_graph_leases WHERE item_id=?")
+                .bind(item)
+                .fetch_one(&mut conn)
+                .await
+                .expect("read lease expiry");
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("positive fake clock")
+            .as_millis() as i64;
+        assert_eq!(expires_at, now_ms + 1_000, "lease used a stale clock");
+    });
+}
+
+#[test]
+fn sqlite_claim_next_samples_clock_after_poll_and_writer_contention() {
+    use store_contract::{Actor, Draft, GraphStore};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-claim-next-clock-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Clock::new();
+    let observed = clock.clone();
+    let store = sqlite_authorized_for_tests(&path, move || observed.now()).expect("graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(store.create_item(
+        actor.clone(),
+        "setup".into(),
+        Draft::new("at-next-clock", "Clock"),
+    ))
+    .expect("create item");
+    let pending = store.claim_next(actor.clone(), "first".into(), Duration::from_secs(1));
+    clock.advance(Duration::from_secs(30));
+    let lease = poll_after_writer_contention(&path, pending, &clock)
+        .expect("claim next")
+        .expect("ready item");
+    assert_eq!(lease.item_id, "at-next-clock");
+    assert_lease_expiry_after(&path, &lease.item_id, clock.now());
+    assert!(
+        harness::block_on(store.claim(
+            actor,
+            "second".into(),
+            lease.item_id.clone(),
+            Duration::from_secs(1),
+        ))
+        .expect("second claim")
+        .is_none(),
+        "second claimant took a newly committed lease"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_heartbeat_samples_clock_after_poll_and_writer_contention() {
+    use store_contract::{Actor, Draft, GraphStore};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-heartbeat-clock-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Clock::new();
+    let observed = clock.clone();
+    let store = sqlite_authorized_for_tests(&path, move || observed.now()).expect("graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(store.create_item(
+        actor.clone(),
+        "setup".into(),
+        Draft::new("at-heartbeat-clock", "Clock"),
+    ))
+    .expect("create item");
+    let lease = harness::block_on(store.claim(
+        actor.clone(),
+        "first".into(),
+        "at-heartbeat-clock".into(),
+        Duration::from_secs(1),
+    ))
+    .expect("first claim")
+    .expect("open item");
+    let pending = store.heartbeat(lease.clone(), Duration::from_secs(1));
+    clock.advance(Duration::from_secs(30));
+    poll_after_writer_contention(&path, pending, &clock).expect("heartbeat");
+    assert_lease_expiry_after(&path, &lease.item_id, clock.now());
+    assert!(
+        harness::block_on(store.claim(
+            actor,
+            "second".into(),
+            lease.item_id,
+            Duration::from_secs(1),
+        ))
+        .expect("second claim")
+        .is_none(),
+        "second claimant took a renewed lease"
     );
     drop(store);
     let _ = std::fs::remove_file(path);
