@@ -48,6 +48,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+mod support;
+
 /// Helper calls run in a child process: the atomic binary under test.
 fn helper_host() {
     use atomic_core::helper_runtime::{CHILD_ARG, HostCommand, set_host_command};
@@ -7094,9 +7097,11 @@ fn confined_trial_backend(dir: &Path, through_runner: bool) -> atomic_exec::Back
     }
 }
 
+// needs_sandbox
 #[test]
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 fn trial_checks_deny_other_projects_scratch_with_local_and_process_runners() {
+    support::require_sandbox();
     for through_runner in [false, true] {
         on_codex_runtime(async move {
             let dir = scratch(if through_runner {
