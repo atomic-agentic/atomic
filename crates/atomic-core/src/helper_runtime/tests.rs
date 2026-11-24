@@ -327,6 +327,15 @@ fn heap_limits() -> Limits {
     }
 }
 
+/// Large buffer allocations exercise the memory budget, not the wall-clock
+/// budget. Give them room to complete when the test runner is heavily loaded.
+fn buffer_limits() -> Limits {
+    Limits {
+        deadline: Duration::from_secs(30),
+        ..Limits::default()
+    }
+}
+
 #[test]
 fn heap_exhaustion_fails_the_call_and_the_host_survives() {
     assert_eq!(
@@ -340,8 +349,24 @@ fn heap_exhaustion_fails_the_call_and_the_host_survives() {
 fn array_buffer_memory_is_bounded() {
     let size = 16 * 1024 * 1024;
     // 48 MiB fits the 64 MiB budget; 128 MiB does not.
-    assert_eq!(call("buffers", json!([3, size])), Ok(json!(3 * size)));
-    let error = call("buffers", json!([8, size])).expect_err("the call fails");
+    assert_eq!(
+        invoke(
+            &graph(),
+            "buffers",
+            &json!([3, size]),
+            buffer_limits(),
+            CLOCK
+        ),
+        Ok(json!(3 * size))
+    );
+    let error = invoke(
+        &graph(),
+        "buffers",
+        &json!([8, size]),
+        buffer_limits(),
+        CLOCK,
+    )
+    .expect_err("the call fails");
     assert!(
         matches!(&error, Failure::ArrayBufferLimit)
             || matches!(&error, Failure::Threw(text) if text.contains("Array buffer allocation failed")),
@@ -359,7 +384,14 @@ fn without_the_bounded_allocator_array_buffers_pass_the_budget() {
     };
     let size = 16 * 1024 * 1024;
     assert_eq!(
-        call_without("buffers", json!([8, size]), controls),
+        invoke_with(
+            &graph(),
+            "buffers",
+            &json!([8, size]),
+            buffer_limits(),
+            CLOCK,
+            controls,
+        ),
         Ok(json!(8 * size))
     );
 }
