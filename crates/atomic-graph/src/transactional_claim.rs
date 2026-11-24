@@ -35,6 +35,22 @@ pub struct WorkItem {
     pub priority: i64,
 }
 
+/// A low-severity finding selected by the host after the review panel.
+/// Review text remains agent-authored even though the host files the item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewFollowup {
+    /// The atom that produced the verdict.
+    pub reviewer: String,
+    /// Repository-relative source path cited by the finding.
+    pub file: String,
+    /// Optional one-based source line.
+    pub line: Option<u32>,
+    /// `low`, `minor` or `nit`.
+    pub severity: String,
+    /// The reviewer's finding, kept at agent trust.
+    pub message: String,
+}
+
 /// What a durable select-and-claim step recorded for one epic iteration.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClaimNext {
@@ -339,6 +355,147 @@ fn now_millis() -> Result<i64> {
         .map_err(|error| DurableError::Engine(format!("claim clock precedes epoch: {error}")))?;
     i64::try_from(value.as_millis())
         .map_err(|_| DurableError::Engine("claim clock exceeds stored range".into()))
+}
+
+fn review_id(parts: &[&str]) -> String {
+    let mut hash = Sha256::new();
+    for part in parts {
+        hash.update((part.len() as u64).to_be_bytes());
+        hash.update(part.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
+}
+
+/// File approved, low-severity review findings atomically with publication and
+/// close. The separate goal is never a ready work item or a child of the
+/// active pinned epic, so these follow-ups cannot hold its run open. Stable
+/// IDs make a retried finalization safe if a prior result was lost.
+pub async fn file_review_followups(
+    tx: &mut Tx<'_, '_>,
+    lease: &Lease,
+    epic: &str,
+    run: &str,
+    step: &str,
+    findings: &[ReviewFollowup],
+) -> Result<()> {
+    if findings.is_empty() {
+        return Ok(());
+    }
+    validate(tx, lease).await?;
+    let goal_id = format!("atomic-review-goal-{}", &review_id(&[epic])[..24]);
+    let now = now_millis()?;
+    tx.execute(
+        "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) \
+         VALUES (?,?,?,'goal',3,'pinned',NULL,'agent','atomic-review',?) \
+         ON CONFLICT(id) DO NOTHING",
+        &[
+            text(&goal_id),
+            text(&format!("Review follow-ups for {epic}")),
+            text("Low-severity findings accepted by independent review."),
+            Param::Int(now),
+        ],
+    )
+    .await?;
+    let goal = tx
+        .query_one(
+            "SELECT kind,status,parent,trust,created_by FROM atomic_graph_items WHERE id=?",
+            &[text(&goal_id)],
+        )
+        .await?;
+    if goal.text("kind")? != "goal"
+        || goal.text("status")? != "pinned"
+        || goal.text_opt("parent")?.is_some()
+        || goal.text("trust")? != "agent"
+        || goal.text("created_by")? != "atomic-review"
+    {
+        return Err(DurableError::Failed(
+            "review follow-up goal ID is occupied".into(),
+        ));
+    }
+    for (index, finding) in findings.iter().enumerate() {
+        if !matches!(finding.severity.as_str(), "minor" | "low" | "nit")
+            || finding.file.is_empty()
+            || finding.file.len() > 256
+            || finding.message.trim().is_empty()
+            || finding.message.len() > 1000
+        {
+            return Err(DurableError::Failed(
+                "review follow-up is not a bounded low-severity finding".into(),
+            ));
+        }
+        let hash = review_id(&[epic, run, step, &lease.item_id, &index.to_string()]);
+        let item_id = format!("atomic-review-{}", &hash[..24]);
+        let request = format!("atomic-review-followup:{hash}");
+        let location = finding.line.map_or_else(
+            || finding.file.clone(),
+            |line| format!("{}:{line}", finding.file),
+        );
+        let title = format!("Review {}: {}", finding.severity, location)
+            .chars()
+            .take(200)
+            .collect::<String>();
+        let body = format!(
+            "Reviewer: {}\nLocation: {}\nSeverity: {}\nFinding: {}",
+            finding.reviewer, location, finding.severity, finding.message
+        );
+        let priority = if finding.severity == "nit" { 4 } else { 3 };
+        tx.execute(
+            "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) \
+             VALUES (?,?,?,'task',?,'open',?,'agent','atomic-review',?) \
+             ON CONFLICT(id) DO NOTHING",
+            &[
+                text(&item_id), text(&title), text(&body), Param::Int(priority),
+                text(&goal_id), Param::Int(now),
+            ],
+        )
+        .await?;
+        let item = tx
+            .query_one(
+                "SELECT kind,parent,body,trust,created_by FROM atomic_graph_items WHERE id=?",
+                &[text(&item_id)],
+            )
+            .await?;
+        if item.text("kind")? != "task"
+            || item.text_opt("parent")?.as_deref() != Some(goal_id.as_str())
+            || item.text("body")? != body
+            || item.text("trust")? != "agent"
+            || item.text("created_by")? != "atomic-review"
+        {
+            return Err(DurableError::Failed(
+                "review follow-up ID is occupied".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO atomic_graph_edges (source,kind,target) VALUES (?,'parent-child',?) \
+             ON CONFLICT(source,kind,target) DO NOTHING",
+            &[text(&item_id), text(&goal_id)],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO atomic_graph_edges (source,kind,target) VALUES (?,'discovered-from',?) \
+             ON CONFLICT(source,kind,target) DO NOTHING",
+            &[text(&item_id), text(&lease.item_id)],
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO atomic_graph_requests (request_id,kind,value) \
+             VALUES (?,'review-followup',?) ON CONFLICT(request_id) DO NOTHING",
+            &[text(&request), text(&item_id)],
+        )
+        .await?;
+        let recorded = tx
+            .query_one(
+                "SELECT kind,value FROM atomic_graph_requests WHERE request_id=?",
+                &[text(&request)],
+            )
+            .await?;
+        if recorded.text("kind")? != "review-followup" || recorded.text("value")? != item_id {
+            return Err(DurableError::Failed(
+                "review follow-up request ID is occupied".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn expiry(now: i64, duration: Duration) -> Result<i64> {

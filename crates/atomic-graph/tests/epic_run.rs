@@ -9,7 +9,7 @@ use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{
     Actor, Draft, EdgeKind, Evidence, Finish, GraphStore, Status, StoreError,
 };
-use atomic_graph::transactional_claim::{self, ClaimNext, CommitProof};
+use atomic_graph::transactional_claim::{self, ClaimNext, CommitProof, ReviewFollowup};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +74,134 @@ async fn select(rt: &Durare, step: &str) -> ClaimNext {
     })
     .await
     .expect("select and claim")
+}
+
+#[tokio::test]
+async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
+    let (rt, store, path) = setup("review-followup").await;
+    create(&store, "epic", None, true).await;
+    create(&store, "one", Some("epic"), false).await;
+    store
+        .authorize_graph_run("epic", "run-one")
+        .await
+        .expect("authorize");
+    rt.control_transaction(|mut tx| {
+        Box::pin(
+            async move { transactional_claim::bind_epic_run(&mut tx, "epic", "run-one").await },
+        )
+    })
+    .await
+    .expect("bind");
+    let ClaimNext::Claimed { lease, .. } = select(&rt, "claim-followup").await else {
+        panic!("expected claimed item");
+    };
+    let finding = ReviewFollowup {
+        reviewer: "independent-reviewer".into(),
+        file: "docs/guide.md".into(),
+        line: Some(12),
+        severity: "low".into(),
+        message: "Clarify the explanation".into(),
+    };
+    let invalid = ReviewFollowup {
+        severity: "blocker".into(),
+        ..finding.clone()
+    };
+    let failed_lease = lease.clone();
+    let failed_finding = finding.clone();
+    rt.control_transaction(move |mut tx| {
+        let failed_lease = failed_lease.clone();
+        let failed_finding = failed_finding.clone();
+        let invalid = invalid.clone();
+        Box::pin(async move {
+            transactional_claim::file_review_followups(
+                &mut tx,
+                &failed_lease,
+                "epic",
+                "run-one",
+                "one.review",
+                &[failed_finding, invalid],
+            )
+            .await
+        })
+    })
+    .await
+    .expect_err("one invalid finding rolls back the entire batch");
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE id LIKE 'atomic-review-%'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(row.int("n")?, 0, "no partial follow-up or goal");
+            Ok(())
+        })
+    })
+    .await
+    .expect("inspect rolled-back batch");
+    for _ in 0..2 {
+        let lease = lease.clone();
+        let finding = finding.clone();
+        rt.control_transaction(move |mut tx| {
+            let lease = lease.clone();
+            let finding = finding.clone();
+            Box::pin(async move {
+                transactional_claim::file_review_followups(
+                    &mut tx,
+                    &lease,
+                    "epic",
+                    "run-one",
+                    "one.review",
+                    &[finding],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("file or replay finding");
+    }
+    rt.control_transaction(|mut tx| Box::pin(async move {
+        let rows = tx.query_one(
+            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE kind='task' AND id LIKE 'atomic-review-%'",
+            &[],
+        ).await?;
+        assert_eq!(rows.int("n")?, 1, "replay cannot duplicate follow-up");
+        let row = tx.query_one(
+            "SELECT f.parent AS parent,g.kind AS parent_kind,g.status AS parent_status, \
+             g.parent AS parent_parent, \
+             e.target AS discovered FROM atomic_graph_items f \
+             JOIN atomic_graph_items g ON g.id=f.parent \
+             JOIN atomic_graph_edges e ON e.source=f.id AND e.kind='discovered-from' \
+             WHERE f.id LIKE 'atomic-review-%' AND f.kind='task'",
+            &[],
+        ).await?;
+        assert_eq!(row.text("parent_kind")?, "goal");
+        assert_eq!(row.text("parent_status")?, "pinned");
+        assert_eq!(row.text_opt("parent_parent")?, None);
+        assert!(row.text("parent")?.starts_with("atomic-review-goal-"));
+        assert_eq!(row.text("discovered")?, "one");
+        Ok(())
+    })).await.expect("inspect follow-up graph");
+    let lease_for_close = lease.clone();
+    rt.control_transaction(move |mut tx| {
+        let lease_for_close = lease_for_close.clone();
+        Box::pin(async move {
+            transactional_claim::close_with_commit(&mut tx, &lease_for_close, &"a".repeat(40)).await
+        })
+    })
+    .await
+    .expect("close original item");
+    assert!(
+        matches!(
+            select(&rt, "after-review-followup").await,
+            ClaimNext::Complete
+        ),
+        "follow-up goal cannot keep the active epic open"
+    );
+    drop(rt);
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

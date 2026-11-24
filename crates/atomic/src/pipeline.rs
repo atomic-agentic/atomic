@@ -83,13 +83,13 @@ use atomic_durable::{
 };
 use atomic_graph::{
     store::Lease,
-    transactional_claim::{self, ClaimNext, WorkItem},
+    transactional_claim::{self, ClaimNext, ReviewFollowup, WorkItem},
 };
 use atomic_schema::expr::Shape;
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -932,6 +932,10 @@ pub struct GraphPipelineRun {
     /// later route edits apply only to unstarted lanes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_source: Option<LanePolicySource>,
+    /// The admitted host review routing contract. An older recorded graph run
+    /// lacks this field and keeps its original reviewer behavior on recovery.
+    #[serde(default)]
+    pub review_routing: bool,
 }
 
 /// One durable graph finalization attempt. A missing proof or revoked lease is
@@ -1518,6 +1522,7 @@ async fn run_pipeline<C: WorkflowContext>(
     why: atomic_core::usage::Why,
     graph_epic: Option<String>,
     model_source: Option<LanePolicySource>,
+    review_routing: bool,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
@@ -1531,6 +1536,7 @@ async fn run_pipeline<C: WorkflowContext>(
         &mut caches,
         graph_epic,
         model_source,
+        review_routing,
     )
     .await;
     if let Some(caches) = caches {
@@ -1587,6 +1593,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     run_caches: &mut Option<atomic_core::worktree::Caches>,
     graph_epic: Option<String>,
     model_source: Option<LanePolicySource>,
+    review_routing: bool,
 ) -> Result<Value> {
     let PipelineRun {
         mut pipeline,
@@ -2123,7 +2130,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             } else {
                 None
             };
-            let (candidate, acceptance) = if let Some(review) = &template.review {
+            let (candidate, acceptance, followups) = if let Some(review) = &template.review {
                 let generated = AtomStep {
                     id: step_name.clone(),
                     ..template.clone()
@@ -2135,7 +2142,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     ("input", &current_input, &input_shape),
                     ("steps", &empty_steps, &steps_shape),
                 ];
-                let (accepted_candidate, accepted) = reviewed(
+                reviewed(
                     &ctx,
                     &run,
                     &mut working,
@@ -2146,9 +2153,12 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     review_input.clone(),
                     (candidate, told),
                     Some(&mut lease),
+                    review_routing,
+                    item.labels
+                        .iter()
+                        .any(|label| label.eq_ignore_ascii_case("security")),
                 )
-                .await?;
-                (accepted_candidate, accepted)
+                .await?
             } else {
                 let generated = AtomStep {
                     id: step_name.clone(),
@@ -2161,7 +2171,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     ("input", &current_input, &input_shape),
                     ("steps", &empty_steps, &steps_shape),
                 ];
-                unreviewed_with_criteria(
+                let (candidate, acceptance) = unreviewed_with_criteria(
                     &ctx,
                     &run,
                     &mut working,
@@ -2173,7 +2183,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     told,
                     Some(&lease),
                 )
-                .await?
+                .await?;
+                (candidate, acceptance, Vec::new())
             };
             let kept = acceptance.clone();
             let acceptance: Acceptance = ctx
@@ -2207,25 +2218,51 @@ async fn run_pipeline_in<C: WorkflowContext>(
             // sees the checkpointed Missing outcome and resumes that park.
             let mut occurrence = 0_u64;
             let published = loop {
-                let (candidate, acceptance, token, sha, precondition, recorded_step) = (
+                let (
+                    candidate,
+                    acceptance,
+                    token,
+                    sha,
+                    precondition,
+                    recorded_step,
+                    followups,
+                    epic,
+                    run_id,
+                ) = (
                     Arc::new(candidate.clone()),
                     Arc::new(acceptance.clone()),
                     Arc::new(lease.clone()),
                     Arc::new(commit.clone()),
                     Arc::new(precondition.clone()),
                     Arc::new(publish_step.clone()),
+                    Arc::new(followups.clone()),
+                    Arc::new(epic.clone()),
+                    Arc::new(id.clone()),
                 );
                 let finalized: GraphFinalize = ctx
                     .transaction(
                         &format!("{step_name}.finalize.{occurrence}"),
                         move |mut tx| {
-                            let (candidate, acceptance, token, sha, precondition, recorded_step) = (
+                            let (
+                                candidate,
+                                acceptance,
+                                token,
+                                sha,
+                                precondition,
+                                recorded_step,
+                                followups,
+                                epic,
+                                run_id,
+                            ) = (
                                 candidate.clone(),
                                 acceptance.clone(),
                                 token.clone(),
                                 sha.clone(),
                                 precondition.clone(),
                                 recorded_step.clone(),
+                                followups.clone(),
+                                epic.clone(),
+                                run_id.clone(),
                             );
                             Box::pin(async move {
                                 match transactional_claim::stage_commit_for_close(
@@ -2249,6 +2286,15 @@ async fn run_pipeline_in<C: WorkflowContext>(
                                                 &[(*precondition).clone()],
                                             )
                                             .await?;
+                                        transactional_claim::file_review_followups(
+                                            &mut tx,
+                                            &token,
+                                            &epic,
+                                            &run_id,
+                                            &recorded_step,
+                                            &followups,
+                                        )
+                                        .await?;
                                         let close = transactional_claim::close_with_commit;
                                         close(&mut tx, &token, &sha).await?;
                                         Ok(GraphFinalize::Applied { output })
@@ -2441,7 +2487,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         // and reviews nothing again.
         let (candidate, acceptance) = match (&step.review, &replay) {
             (Some(review), None) => {
-                let (candidate, acceptance) = reviewed(
+                let (candidate, acceptance, _) = reviewed(
                     &ctx,
                     &run,
                     &mut working,
@@ -2452,6 +2498,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     atom_input,
                     (candidate, told),
                     None,
+                    false,
+                    false,
                 )
                 .await?;
                 // What accepted it, kept with the run's record.
@@ -4439,6 +4487,256 @@ async fn unreviewed_with_criteria<C: WorkflowContext>(
     }
 }
 
+/// Only these host-known content paths can establish that a low finding is
+/// outside a security control. All code and ambiguous paths keep blocking.
+fn safe_review_followup_path(path: &str) -> bool {
+    if path.len() > 256
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path.starts_with('/')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || !(path.starts_with("docs/") || path.starts_with("examples/"))
+    {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    ![
+        "security",
+        "permission",
+        "auth",
+        "credential",
+        "secret",
+        "sandbox",
+        "gate",
+        "control",
+        "policy",
+        "signature",
+        "supply-chain",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+fn security_relevant_review_text(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "security",
+        "permission",
+        "auth",
+        "credential",
+        "secret",
+        "token",
+        "sandbox",
+        "gate",
+        "control",
+        "injection",
+        "encryption",
+        "policy",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+}
+
+/// Route typed findings conservatively. A legacy string finding carries no
+/// severity and keeps the reviewer's verdict. A structured high finding, or a
+/// low finding outside a host-proven safe path, requires repair even if the
+/// reviewer wrote `approve`.
+fn route_review_findings(
+    reviewer: &str,
+    verdict: &Value,
+    said: &str,
+    enabled: bool,
+    controls_clean: bool,
+    changed_paths: &BTreeSet<String>,
+) -> (String, Vec<ReviewFollowup>) {
+    if !enabled || !matches!(said, "approve" | "request_changes") {
+        return (said.to_owned(), Vec::new());
+    }
+    let Some(findings) = verdict.get("findings").and_then(Value::as_array) else {
+        return (said.to_owned(), Vec::new());
+    };
+    if findings.len() > 30 {
+        return ("request_changes".into(), Vec::new());
+    }
+    let mut low = Vec::new();
+    let mut blocking = false;
+    let mut typed = false;
+    let mut legacy = false;
+    for finding in findings {
+        let Some(fields) = finding.as_object() else {
+            // Older reviewer contracts use string evidence. They never get
+            // silently demoted to a non-gating follow-up.
+            legacy |= finding.is_string();
+            blocking |= !finding.is_string();
+            continue;
+        };
+        typed = true;
+        let file = fields.get("file").and_then(Value::as_str).unwrap_or("");
+        let message = fields.get("message").and_then(Value::as_str).unwrap_or("");
+        let line_field = fields.get("line");
+        let line = line_field.and_then(Value::as_u64);
+        let severity = fields.get("severity").and_then(Value::as_str).unwrap_or("");
+        let valid = !message.trim().is_empty()
+            && message.len() <= 1000
+            && line_field
+                .is_none_or(|_| line.is_some_and(|line| line > 0 && line <= u32::MAX as u64));
+        if !valid
+            || !controls_clean
+            || !safe_review_followup_path(file)
+            || !changed_paths.contains(file)
+            || security_relevant_review_text(message)
+        {
+            blocking = true;
+            continue;
+        }
+        if matches!(severity, "minor" | "low" | "nit") {
+            low.push(ReviewFollowup {
+                reviewer: reviewer.to_owned(),
+                file: file.to_owned(),
+                line: line.map(|line| line as u32),
+                severity: severity.to_owned(),
+                message: message.to_owned(),
+            });
+        } else {
+            blocking = true;
+        }
+    }
+    if typed && legacy {
+        blocking = true;
+    }
+    // CONTROL_OFF: review-severity-route
+    if blocking {
+        ("request_changes".into(), Vec::new())
+    } else if typed && !low.is_empty() {
+        ("approve".into(), low)
+    } else {
+        (said.to_owned(), Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod severity_routing_tests {
+    use super::{GraphPipelineRun, route_review_findings};
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn low_documentation_findings_become_followups_only_without_touched_controls() {
+        let verdict = json!({"verdict":"request_changes","findings":[
+            {"file":"docs/guide.md","line":12,"severity":"low","message":"Clarify the example"},
+            {"file":"examples/demo/README.md","severity":"nit","message":"Tighten the label"}
+        ]});
+        let changed = BTreeSet::from([
+            "docs/guide.md".to_owned(),
+            "examples/demo/README.md".to_owned(),
+        ]);
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "request_changes",
+            true,
+            true,
+            &changed,
+        );
+        assert_eq!(routed, "approve");
+        assert_eq!(followups.len(), 2);
+        assert_eq!(followups[0].line, Some(12));
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "request_changes",
+            true,
+            false,
+            &changed,
+        );
+        assert_eq!(routed, "request_changes");
+        assert!(followups.is_empty());
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "request_changes",
+            false,
+            true,
+            &changed,
+        );
+        assert_eq!(
+            routed, "request_changes",
+            "an older run keeps its admitted policy"
+        );
+        assert!(followups.is_empty());
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "request_changes",
+            true,
+            true,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            routed, "request_changes",
+            "invented source paths cannot be filed"
+        );
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn security_and_high_findings_cannot_be_demoted_by_approve() {
+        let changed = BTreeSet::from([
+            "docs/guide.md".to_owned(),
+            "docs/security.md".to_owned(),
+            "crates/auth.rs".to_owned(),
+        ]);
+        for finding in [
+            json!({"file":"docs/security.md","severity":"nit","message":"Risk"}),
+            json!({"file":"crates/auth.rs","severity":"low","message":"Risk"}),
+            json!({"file":"docs/guide.md","severity":"major","message":"Broken"}),
+            json!({"file":"docs/guide.md","severity":"low","message":"Leaks a token"}),
+            json!({"file":"docs/../secrets","severity":"nit","message":"Risk"}),
+            json!({"file":"docs/guide.md","line":-1,"severity":"nit","message":"Bad citation"}),
+        ] {
+            let verdict = json!({"verdict":"approve","findings":[finding]});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
+            assert_eq!(routed, "request_changes");
+            assert!(followups.is_empty());
+        }
+    }
+
+    #[test]
+    fn legacy_string_findings_keep_the_reviewer_decision() {
+        let verdict = json!({"verdict":"request_changes","findings":["missing proof"]});
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "request_changes",
+            true,
+            true,
+            &BTreeSet::new(),
+        );
+        assert_eq!(routed, "request_changes");
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn graph_run_recorded_before_routing_recovers_with_its_old_policy() {
+        let old = json!({
+            "pipeline": {"name":"old-graph","steps":[],"returns":"input",
+                "input":{},"output":{},"atoms":{},"pins":{}},
+            "input":{},"epic":"epic"
+        });
+        let recorded: GraphPipelineRun =
+            serde_json::from_value(old).expect("older graph run still deserializes");
+        assert!(!recorded.review_routing);
+        let mut current = serde_json::to_value(recorded).expect("new recording");
+        current["review_routing"] = json!(true);
+        let admitted: GraphPipelineRun =
+            serde_json::from_value(current).expect("new graph run records routing");
+        assert!(admitted.review_routing);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reviewed<C: WorkflowContext>(
     ctx: &C,
@@ -4451,7 +4749,9 @@ async fn reviewed<C: WorkflowContext>(
     input: Value,
     (mut candidate, author_turn): (Candidate, i32),
     mut claim: Option<&mut Lease>,
-) -> Result<(Candidate, Acceptance)> {
+    review_routing: bool,
+    security_item: bool,
+) -> Result<(Candidate, Acceptance, Vec<ReviewFollowup>)> {
     let author = run
         .pipeline
         .atoms
@@ -4491,6 +4791,8 @@ async fn reviewed<C: WorkflowContext>(
         None
     };
     let (verdict, said) = loop {
+        let mut controls_clean = !step.coding;
+        let mut changed_paths = BTreeSet::new();
         let mut trial_head = None;
         if let Some(trial) = &review.trial_merge {
             let worktrees = run.worktrees.cloned().ok_or_else(|| {
@@ -4936,6 +5238,21 @@ async fn reviewed<C: WorkflowContext>(
                 } else {
                     (Vec::new(), Vec::new())
                 };
+            controls_clean = touched_controls.is_empty() && !security_item;
+            if review_routing
+                && claim.is_some()
+                && let Some((commit, base, _)) = &host_commits
+            {
+                let repo = run
+                    .worktrees
+                    .ok_or_else(|| failed(format!("step `{}`: no bound repository", step.id)))?
+                    .repo();
+                changed_paths = repo
+                    .changed_paths(base, commit)
+                    .map_err(|e| failed(format!("step `{}`: inspect changed paths: {e}", step.id)))?
+                    .into_iter()
+                    .collect();
+            }
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {
                     return Err(failed(format!(
@@ -5190,6 +5507,7 @@ async fn reviewed<C: WorkflowContext>(
                 })?;
         }
         let mut decisions = Vec::new();
+        let mut round_followups = Vec::new();
         let mut reviewer_origins = review.origins.clone();
         if review.self_review.is_some() {
             reviewer_origins.insert("self_review".into(), "external".into());
@@ -5236,7 +5554,26 @@ async fn reviewed<C: WorkflowContext>(
                 .and_then(Value::as_str)
                 .unwrap_or("escalate")
                 .to_owned();
-            decisions.push(((*reviewer).to_owned(), verdict, said));
+            let (routed, mut followups) = if step.coding && claim.is_some() {
+                route_review_findings(
+                    reviewer,
+                    &verdict,
+                    &said,
+                    review_routing,
+                    controls_clean,
+                    &changed_paths,
+                )
+            } else {
+                (said.clone(), Vec::new())
+            };
+            round_followups.append(&mut followups);
+            let shown = if routed == said {
+                verdict
+            } else {
+                json!({"verdict": routed, "review": verdict,
+                    "routing": "host severity policy"})
+            };
+            decisions.push(((*reviewer).to_owned(), shown, routed));
         }
         let rejected = decisions.iter().find(|(_, _, said)| {
             !matches!(
@@ -5266,12 +5603,19 @@ async fn reviewed<C: WorkflowContext>(
                     candidate: candidate.id.clone(),
                     digest: candidate.digest.clone(),
                     accepted: true,
-                    reason: Some(format!(
-                        "approved by reviewer(s) {} in review round {round}",
-                        members.join(", ")
-                    )),
+                    reason: Some(if round_followups.is_empty() {
+                        format!(
+                            "approved by reviewer(s) {} in review round {round}",
+                            members.join(", ")
+                        )
+                    } else {
+                        format!(
+                            "accepted low findings from reviewer(s) {} as follow-up work in review round {round}",
+                            members.join(", ")
+                        )
+                    }),
                 };
-                return Ok((candidate, acceptance));
+                return Ok((candidate, acceptance, round_followups));
             }
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
@@ -5392,7 +5736,7 @@ async fn reviewed<C: WorkflowContext>(
                 accepted: true,
                 reason: Some(format!("approved by {} at gate {id}", d.by)),
             };
-            Ok((candidate, acceptance))
+            Ok((candidate, acceptance, Vec::new()))
         }
         other => Err(failed(format!(
             "step `{}`: its review went to gate `{id}`, which {}; the step's output is not \
@@ -5969,6 +6313,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 why,
                 None,
                 None,
+                false,
             ),
         );
         crate::panics::caught(id, traced)
@@ -5990,6 +6335,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 why,
                 None,
                 None,
+                false,
             ),
         );
         crate::panics::caught(id, traced)
@@ -6001,6 +6347,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 run,
                 epic,
                 model_source,
+                review_routing,
             } = graph;
             let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
             let id = ctx.workflow_id().to_owned();
@@ -6017,6 +6364,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                     why,
                     Some(epic),
                     model_source,
+                    review_routing,
                 ),
             );
             crate::panics::caught(id, traced)

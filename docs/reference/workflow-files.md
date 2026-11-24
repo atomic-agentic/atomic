@@ -107,6 +107,21 @@ with `approve` among them:
 | `request_changes`, `revise` | The author gets a repair round, while any are left; then a person decides. |
 | `reject`, `escalate`, `insufficient_context` | A person decides. |
 
+For graph-driven `coding: true` steps, a reviewer may return typed findings
+with `file`, optional `line`, `severity` (`blocker`, `major`, `minor`/`low`, or
+`nit`) and `message`. A `request_changes` verdict with only low findings that
+the host can prove are outside its selected control rows becomes an approval
+with follow-up work instead of another repair. The host currently makes that
+proof only for changed paths under `docs/` or `examples/`; security, policy,
+control and ambiguous paths or finding text, and items labeled `security`,
+require repair even if a reviewer called them low. A high-severity finding also
+requires repair when the reviewer wrote
+`approve`. Accepted low findings are filed with `discovered-from` links under
+a separate pinned goal, so they do not hold the active epic open. Older
+reviewers with plain-text findings keep their verdicts unchanged.
+The graph run records this routing policy at admission. A run recorded before
+the policy was introduced keeps its original review behavior when recovered.
+
 The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
 own. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step

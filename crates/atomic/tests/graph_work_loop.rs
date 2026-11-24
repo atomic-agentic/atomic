@@ -686,6 +686,7 @@ fn graph_loop_child() {
                 },
                 epic: EPIC.into(),
                 model_source,
+                review_routing: true,
             };
             rt.start(GRAPH_PIPELINE, RUN, run)
                 .await
@@ -1510,6 +1511,7 @@ fn graph_loop_evaluates_the_workflow_returns_expression_for_each_item() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -1560,6 +1562,7 @@ fn empty_epic_cannot_return_null_under_an_object_output_contract() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -1936,6 +1939,7 @@ fn a_policy_edit_routes_only_later_graph_lanes_and_records_each_choice() {
                 },
                 epic: EPIC.into(),
                 model_source: Some(source),
+                review_routing: true,
             },
         )
         .await
@@ -2593,6 +2597,7 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -2830,6 +2835,7 @@ fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3002,6 +3008,7 @@ fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim()
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3232,6 +3239,7 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3533,6 +3541,7 @@ fn mismatched_existing_graph_base_ref_refuses_before_the_model_turn() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
