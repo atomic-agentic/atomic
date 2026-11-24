@@ -2545,6 +2545,123 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
     let _ = std::fs::remove_file(path);
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn sqlite_projection_refresh_never_exposes_a_claimable_gap() {
+    use store_contract::{Actor, Draft, EdgeKind};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-projection-race-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let setup = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open setup graph store");
+    harness::block_on(async {
+        for id in ["at-blocked", "at-blocker"] {
+            setup
+                .create_item(
+                    Actor::agent("setup"),
+                    format!("create-{id}"),
+                    Draft::new(id, id),
+                )
+                .await
+                .expect("create item");
+        }
+        setup
+            .add_edge(
+                Actor::agent("setup"),
+                "at-blocked".into(),
+                EdgeKind::Blocks,
+                "at-blocker".into(),
+            )
+            .await
+            .expect("block item");
+    });
+    drop(setup);
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let writer_store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open writer graph handle")
+        .with_projection_pause(move || {
+            paused_tx.send(()).expect("signal deleted projection");
+            release_rx
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(15))
+                .expect("release projection refresh");
+        });
+    let claimant_store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open independent claimant graph handle");
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            harness::block_on(writer_store.create_item(
+                Actor::agent("writer"),
+                "unrelated-write".into(),
+                Draft::new("at-unrelated", "Unrelated"),
+            ))
+        });
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not reach projection gap");
+
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let claimant = scope.spawn(move || {
+            let pending = claimant_store.claim(
+                Actor::agent("claimant"),
+                "claimant".into(),
+                "at-blocked".into(),
+                Duration::from_secs(60),
+            );
+            let mut pending = std::pin::pin!(pending);
+            let mut first_poll = Some(polled_tx);
+            let result = harness::block_on(std::future::poll_fn(move |cx| {
+                let result = pending.as_mut().poll(cx);
+                if let Some(signal) = first_poll.take() {
+                    signal.send(()).expect("signal claimant poll");
+                }
+                result
+            }));
+            answer_tx.send(result).expect("send claim result");
+        });
+        polled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("claimant was not polled");
+        let during_refresh = answer_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).expect("release writer");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer mutation");
+        assert!(
+            matches!(
+                during_refresh,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "claim returned while projection rows were deleted: {during_refresh:?}"
+        );
+        let claimed = answer_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("claimant did not finish after commit")
+            .expect("claim operation");
+        assert!(claimed.is_none(), "blocked item was claimed after refresh");
+        claimant.join().expect("claimant thread");
+    });
+
+    let reopened = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("reopen graph after race");
+    let blocked = harness::block_on(reopened.show(Actor::agent("reader"), "at-blocked".into()))
+        .expect("show blocked item")
+        .expect("blocked item exists");
+    assert_eq!(blocked.blocked_by, ["at-blocker"]);
+    drop(reopened);
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn sqlite_export_includes_committed_changes_after_import() {
     use store_contract::{Actor, EdgeKind, GraphStore};
