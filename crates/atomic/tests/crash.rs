@@ -24,8 +24,10 @@
 //!   base, changing exactly what an uninterrupted run's commit changes, with
 //!   no worktree left.
 //!
-//! Across the scenarios the failpoints reached cover every site in the
-//! inventory (`atomic_durable::failpoints::SITES`), and none is outside it.
+//! Across the scenarios the failpoints reached cover every site owned by this
+//! suite, and none is outside the global inventory
+//! (`atomic_durable::failpoints::SITES`). Graph and delivery failpoints are
+//! killed in their dedicated integration suites.
 //! `ATOMIC_TEST_CRASH_ONLY=<text>` kills only at the failpoints whose names
 //! contain `<text>`, for working on one.
 //!
@@ -1165,7 +1167,36 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
             }
         }
 
-        // Every site in the inventory is reached, and nothing outside it.
+        // Every site in this suite is reached. The listed graph and delivery
+        // sites are killed by their own integration suites. Keep the list
+        // exact: a new site with no owning suite must fail this inventory.
+        const GRAPH_SITES: &[&str] = &[
+            "graph:after-review-reclaim",
+            "graph:after-proof-stage",
+            "graph:after-proof-release",
+            "graph:after-finalize-applied",
+            "graph:after-verified-publish",
+        ];
+        const DELIVERY_SITES: &[&str] = &[
+            "delivery:after-gate",
+            "delivery:after-intent",
+            "delivery:after-dispatch",
+            "delivery:after-record",
+            "delivery:after-decision",
+            "delivery:after-park-release",
+        ];
+        for (sites, source) in [
+            (GRAPH_SITES, include_str!("graph_work_loop.rs")),
+            (DELIVERY_SITES, include_str!("delivery_recovery.rs")),
+        ] {
+            for name in sites {
+                assert!(
+                    SITES.iter().any(|s| s.name == *name),
+                    "{name} is not inventoried"
+                );
+                assert!(source.contains(name), "{name} has no dedicated crash test");
+            }
+        }
         let outside: Vec<&String> = reached.iter().filter(|n| site_of(n).is_none()).collect();
         assert!(
             outside.is_empty(),
@@ -1173,7 +1204,11 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
         );
         let missed: Vec<&str> = SITES
             .iter()
-            .filter(|s| !reached.iter().any(|n| s.matches(n)))
+            .filter(|s| {
+                !GRAPH_SITES.contains(&s.name)
+                    && !DELIVERY_SITES.contains(&s.name)
+                    && !reached.iter().any(|n| s.matches(n))
+            })
             .map(|s| s.name)
             .collect();
         assert!(missed.is_empty(), "sites no scenario reaches: {missed:?}");
