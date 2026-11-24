@@ -695,6 +695,118 @@ fn a_per_atom_config_atom_is_checked_run_and_refused_by_the_cli() {
     );
 }
 
+#[test]
+fn frozen_type_modules_keep_strict_type_errors_at_the_cli() {
+    let fixture = Fixture::new("frozen-type-controls");
+    let project = fixture.0.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(project.join("lib")).expect("lib");
+    std::fs::write(
+        project.join("strict.atom.astro"),
+        "---\n\
+         import type { Props, Config } from './.atomic/types/strict';\n\
+         import { safe } from './lib/strict-case';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: Config = {};\n\
+         ---\n\
+         Check {safe(input.text)}\n",
+    )
+    .expect("atom");
+    std::fs::write(
+        project.join("strict.input.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["text"],"properties":{"text":{"type":"string"}}}"#,
+    )
+    .expect("input schema");
+    std::fs::write(
+        project.join("strict.output.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["answer"],"properties":{"answer":{"type":"string"}}}"#,
+    )
+    .expect("output schema");
+    let module = project.join("lib/strict-case.ts");
+    std::fs::write(
+        &module,
+        "export const safe = (arg: string): string => arg;\n",
+    )
+    .expect("valid type module");
+    success(fixture.run(&project, &["check", "strict.atom.astro"], ""));
+
+    for (name, source, code, message) in [
+        (
+            "score",
+            "export const safe = (arg: string): string => arg;\ntype Scorer = { score: (judge: { ok: boolean }) => number };\nexport const scorer: Scorer = { score: () => 'wrong' };\n",
+            "TS2322",
+            "Type 'string' is not assignable to type 'number'",
+        ),
+        (
+            "return",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (): string => 1;\n",
+            "TS2322",
+            "Type 'number' is not assignable to type 'string'",
+        ),
+        (
+            "implicit any",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (arg) => arg;\n",
+            "TS7006",
+            "Parameter 'arg' implicitly has an 'any' type",
+        ),
+        (
+            "nullability",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (arg: string | null) => arg.length;\n",
+            "TS18047",
+            "'arg' is possibly 'null'",
+        ),
+    ] {
+        std::fs::write(&module, source).expect("type module mutation");
+        let output = fixture.run(&project, &["check", "strict.atom.astro"], "");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("strict-case.ts"), "{name}: {stderr}");
+        assert!(stderr.contains(code), "{name}: {stderr}");
+        assert!(stderr.contains(message), "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn a_real_scorer_score_must_return_a_number_at_the_cli() {
+    let fixture = Fixture::new("scorer-return-type");
+    let project = fixture.0.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    let atom = project.join("graded.atom.astro");
+    let valid = "---\n\
+         import type { Props, Input, Output, Case, Judges } from './.atomic/types/graded';\n\
+         import type { AtomConfig } from './.atomic/types/authoring';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: AtomConfig<Input, Output, Case, Judges> = { description: 'Grade a ticket.', kind: 'lite',\n\
+           judges: {reviewer: {input: {type:'object',additionalProperties:false,required:['text'],properties:{text:{type:'string'}}},\n\
+                               output: {type:'object',additionalProperties:false,required:['ok'],properties:{ok:{type:'boolean'}}}}},\n\
+           scorers: {quality: {judge:'reviewer', with:({input}) => ({text: input.text}), score:({judge}) => judge.ok ? 1 : 0, min_mean: 0.5}} };\n\
+         ---\n\
+         Grade: {input.text}\n";
+    std::fs::write(&atom, valid).expect("valid scorer atom");
+    std::fs::write(
+        project.join("graded.input.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["text"],"properties":{"text":{"type":"string"}}}"#,
+    )
+    .expect("input schema");
+    std::fs::write(
+        project.join("graded.output.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["ticket"],"properties":{"ticket":{"type":"string"}}}"#,
+    )
+    .expect("output schema");
+    success(fixture.run(&project, &["check", "graded.atom.astro"], ""));
+
+    std::fs::write(&atom, valid.replace("judge.ok ? 1 : 0", "'wrong'")).expect("wrong score");
+    let output = fixture.run(&project, &["check", "graded.atom.astro"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("graded.atom.astro:8:"), "{stderr}");
+    assert!(stderr.contains("TS2322"), "{stderr}");
+    assert!(
+        stderr.contains("Type 'string' is not assignable to type 'number'"),
+        "{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_declarations_never_follow_a_symlink_out_of_the_project() {

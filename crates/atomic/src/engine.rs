@@ -635,6 +635,7 @@ pub async fn open(
             // Each run's build caches, in a directory of its own here.
             caches: Some(state.dir().join("cache")),
             trial_cargo,
+            trial_denied: state.denied_scratch(),
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public

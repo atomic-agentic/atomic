@@ -160,20 +160,20 @@ pub async fn run(command: GoalsCommand, state: &ProjectState, json: bool) -> any
             crate::gates::operator_credential(state)?,
         )
     } else {
-        SqliteStore::open(&state.database(), SystemTime::now)
+        SqliteStore::open_for_inspection(&state.database()).await
     }?;
     match command {
         GoalsCommand::Add { name } => {
             let id = goal_id(&name)?;
             let definition = load_goal(state.root(), &name)?;
-            store.add_goal(&id, definition).await?;
+            let active = store.add_goal(&id, definition).await?;
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"id":id,"status":"pinned","active":true})
+                    serde_json::json!({"id":id,"status":"pinned","active":active})
                 );
             } else {
-                println!("added {id}");
+                println!("{id} is {}", if active { "active" } else { "paused" });
             }
         }
         GoalsCommand::List => {

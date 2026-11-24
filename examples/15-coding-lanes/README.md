@@ -190,7 +190,9 @@ approving the same candidate.
 | Workflow shape, the `coding` preconditions, the panel's two names and `require: all`, the `diff` binding, the `host_review` contract, the criteria | `atomic check`, in `crates/atomic/tests/examples.rs` | The workflow loads against these five atoms, and the review it declares is one a coding step may have. |
 | Five atoms, their schemas, their eval cases and fixtures | `tools/check_examples.py`, and `atomic check` | Every golden output fits its atom's full contract and every case renders. |
 | `tools/lane_guard.py` and `tests/test_lane_guard.py` | `python3 tests/test_lane_guard.py` | The guard refuses an unverified finding, still confirms a host-recorded one, and refuses an absent record. |
+| `scripts/controls/lane-guard-bites.row` and `tests/lane_guard.rs` | `cargo test --locked -p lane-guard-example --test lane_guard lane_guard_refuses_unverified` | The Cargo target calls the same guard, so the host can prove this row by switching the guard off and back on. |
 | `lane-controls-proof` | `tools/check_examples.py` and `atomic eval lane-controls-proof`, both of which run the local command | The local fixture reads a row and reports `intact` or `blind`; it cannot emit a passing proof. In a production coding run the host substitutes its pinned controls driver. |
+| Seeded `lane-reviewer` cases | `atomic eval lane-reviewer --live` and recorded replay; see [reviewer recall](reviewer-recall.md) | A local model identified two synthetic coding defects and approved one benign control in the recorded pilot. |
 | Self-review, the panel, repair rounds, criteria, trial merge, the two gates | nothing here | These need a bound base revision, a worktree, an admitted inventory, a model and a person's decision. The runtime has them; this directory has none. |
 
 Nothing in this file is a declaration the runtime ignores. Criteria, which used
@@ -204,12 +206,15 @@ A control row says: replace this text in that file, and this named test fails.
 That is what makes a guard's absence visible, and this example carries a real
 one — `scripts/controls/lane-guard-bites.row`, whose switched file is
 `tools/lane_guard.py` and whose guarding test is
-`lane_guard_refuses_unverified` in `tests/test_lane_guard.py`. The pair runs:
+`lane_guard_refuses_unverified` in `tests/lane_guard.rs`. This small Cargo
+test target runs the same Python guard as the workflow's criteria and trial
+merge checks, so the production controls driver can run its bounded selector.
+The pair runs:
 
 ```bash
-python3 tests/test_lane_guard.py   # passes
+cargo test --locked -p lane-guard-example --test lane_guard lane_guard_refuses_unverified   # passes
 # replace the guard line in tools/lane_guard.py with the row's `if False:`
-python3 tests/test_lane_guard.py   # lane_guard_refuses_unverified fails
+cargo test --locked -p lane-guard-example --test lane_guard lane_guard_refuses_unverified   # fails
 ```
 
 The workflow selects that row and declares `lane-controls-proof` as the exec
@@ -248,8 +253,9 @@ as a local read-only inspection can honestly go.
 check that runs Cargo additionally needs `ATOMIC_TRIAL_CARGO_REGISTRY` and
 `ATOMIC_TRIAL_RUSTUP_TOOLCHAIN` from the operator, and a controls driver that
 runs Cargo needs `ATOMIC_CONTROLS_CARGO_REGISTRY` and
-`ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN`; the `python3` check declared here needs none
-of those, but still needs the sandbox.
+`ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN`; the `python3` trial check declared here needs
+none of those, but still needs the sandbox. The Cargo control row needs the
+controls variables.
 
 `lane-controls-proof` declares `effects: { external: 'read-only' }` for its
 local command. It opens files to read, writes nothing, and refuses rather than

@@ -587,6 +587,39 @@ impl TrialCargo {
     }
 }
 
+fn default_rustup_bin(home: &Path) -> PathBuf {
+    home.join(".cargo/bin")
+}
+
+/// Choose only operator-installed Cargo/rustc shims. The trial's HOME and
+/// CARGO_HOME are a fresh, candidate-writable cache, so this runs before the
+/// sandbox command is built and reads the operator process environment.
+fn trial_toolchain_bin(
+    cargo_home: Option<&Path>,
+    operator_home: Option<&Path>,
+    scratch: &Path,
+    cache: &Path,
+) -> Option<PathBuf> {
+    let scratch = std::fs::canonicalize(scratch).ok()?;
+    let cache = std::fs::canonicalize(cache).ok()?;
+    // CONTROL_OFF: trial-cargo-default-home
+    let default_bin = operator_home.map(default_rustup_bin);
+    let preferred = cargo_home.map(|home| home.join("bin")).or(default_bin);
+    preferred
+        .into_iter()
+        .chain([PathBuf::from("/usr/local/cargo/bin")])
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find(|bin| {
+            !bin.starts_with(&scratch)
+                && !bin.starts_with(&cache)
+                && ["cargo", "rustc"].iter().all(|name| {
+                    std::fs::canonicalize(bin.join(name)).is_ok_and(|shim| {
+                        shim.is_file() && !shim.starts_with(&scratch) && !shim.starts_with(&cache)
+                    })
+                })
+        })
+}
+
 fn trial_uses_cargo(pipeline: &Pipeline) -> bool {
     pipeline.steps.iter().any(|step| match step {
         Step::Atom(step) => step
@@ -3548,6 +3581,13 @@ enum TrialMergeResult {
     Repair { main: String, detail: String },
 }
 
+/// A candidate check's output enters a durable checkpoint and an author
+/// repair prompt. Redact the bounded diagnostic before either receives it.
+fn trial_diagnostic(output: &[u8]) -> String {
+    // CONTROL_OFF: trial-diagnostics-redacted
+    atomic_core::redact::excerpt(&String::from_utf8_lossy(output), 4096)
+}
+
 /// The branch head whose merge and checks passed before review. A fresh
 /// reviewer turn verifies it inside its own durable body.
 #[derive(Clone)]
@@ -3566,6 +3606,16 @@ fn bound_control_source(run: &RunScope<'_>, step_id: &str) -> Result<String> {
         ))
     })?;
     Ok(worktrees.repo().git_dir().display().to_string())
+}
+
+/// A controls receipt must echo the host's frozen binding, not a value from
+/// the candidate or the proof atom. This check runs before the receipt can
+/// reach either reviewer.
+fn host_control_bound_matches(output: &Value, reference: &str, base: &str, admitted: &str) -> bool {
+    let reference_matches = output["bound"]["reference"].as_str() == Some(reference);
+    let base_matches = output["bound"]["base"].as_str() == Some(base);
+    let admitted_matches = output["bound"]["admitted"].as_str() == Some(admitted);
+    reference_matches && base_matches && admitted_matches
 }
 
 /// A coding candidate may change source and tests, but it cannot redefine a
@@ -4324,7 +4374,7 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                     Ok(outcome) => CriterionRecord::Known(outcome),
                     Err(error) => CriterionRecord::Known(CriterionOutcome {
                         passed: false,
-                        detail: error.to_string(),
+                        detail: error.diagnostic(),
                     }),
                 };
                 ctx.step(&name, move |_| async move { Ok(record) }).await?
@@ -4383,11 +4433,11 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                         let record = match result {
                             Ok(outcome) => CriterionRecord::Known(outcome),
                             Err(error) if error.outcome_unknown() => {
-                                CriterionRecord::Unknown(error.to_string())
+                                CriterionRecord::Unknown(error.diagnostic())
                             }
                             Err(error) => CriterionRecord::Known(CriterionOutcome {
                                 passed: false,
-                                detail: error.to_string(),
+                                detail: error.diagnostic(),
                             }),
                         };
                         Ok::<_, DurableError>(record)
@@ -4403,11 +4453,12 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                 return Ok(Some(format!(
                     "criterion {} failed: {}",
                     index + 1,
-                    outcome.detail
+                    atomic_core::redact::text(&outcome.detail)
                 )));
             }
             CriterionRecord::Known(_) => {}
             CriterionRecord::Unknown(detail) => {
+                let detail = atomic_core::redact::text(&detail);
                 *working = None;
                 atomic_durable::publication::park_criterion(
                     ctx,
@@ -4958,6 +5009,7 @@ async fn reviewed<C: WorkflowContext>(
             };
             let backend = run.services.runtimes.backend.shared();
             let trial_cargo = run.services.trial_cargo.clone();
+            let trial_denied = run.services.trial_denied.clone();
             let caches = run.caches.cloned().ok_or_else(|| {
                 failed(format!("step `{}`: trial merge has no run cache", step.id))
             })?;
@@ -5039,8 +5091,27 @@ async fn reviewed<C: WorkflowContext>(
                     } else {
                         None
                     };
+                    // Cargo and rustc are operator-selected tools. An unset
+                    // CARGO_HOME uses rustup's default ~/.cargo/bin; CI may
+                    // set CARGO_HOME explicitly instead. Resolve that host
+                    // directory before entering the candidate sandbox;
+                    // never take a tool path from the candidate's environment.
+                    let path = if uses_cargo {
+                        let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+                        let operator_home = std::env::var_os("HOME").map(PathBuf::from);
+                        let bin = trial_toolchain_bin(
+                            cargo_home.as_deref(),
+                            operator_home.as_deref(),
+                            &scratch,
+                            cache.dir(),
+                        )
+                            .ok_or_else(|| failed("trial merge Cargo toolchain bin is missing or candidate-writable".into()))?;
+                        format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display())
+                    } else {
+                        "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin".into()
+                    };
                     env.extend([
-                        ("PATH".into(), "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin".into()),
+                        ("PATH".into(), path),
                         ("HOME".into(), cache.dir().display().to_string()),
                         ("TMPDIR".into(), cache.dir().display().to_string()),
                     ]);
@@ -5154,30 +5225,37 @@ async fn reviewed<C: WorkflowContext>(
                                 )
                                 .collect(),
                             network: Vec::new(),
-                            denied: Vec::new(),
+                            denied: trial_denied.clone(),
                             secret_env: Default::default(),
                         };
                         let done = match backend.run(&check) {
                             Ok(done) => done,
                             Err(e @ (atomic_exec::ExecError::TimedOut { .. }
                                 | atomic_exec::ExecError::TooLarge { .. })) => {
+                                let command = atomic_core::redact::excerpt(&format!("{argv:?}"), 1024);
+                                let error = atomic_core::redact::excerpt(&e.to_string(), 4096);
                                 return Ok(TrialMergeResult::Repair {
                                     main,
-                                    detail: format!("check {} ({:?}) failed: {e}", index + 1, argv),
+                                    detail: format!("check {} ({command}) failed: {error}", index + 1),
                                 });
                             }
-                            Err(e) => return Err(failed(format!(
-                                "trial merge check {} could not run in its scratch worktree: {e}", index + 1
-                            ))),
+                            Err(e) => {
+                                let error = atomic_core::redact::excerpt(&e.to_string(), 4096);
+                                return Err(failed(format!(
+                                    "trial merge check {} could not run in its scratch worktree: {error}", index + 1
+                                )));
+                            }
                         };
                         if !done.success() {
-                            let stderr = String::from_utf8_lossy(&done.stderr);
-                            let stdout = String::from_utf8_lossy(&done.stdout);
+                            // Candidate checks may print credentials. This
+                            // detail is checkpointed and sent to the author
+                            // on repair, so redact before either can see it.
+                            let stderr = trial_diagnostic(&done.stderr);
+                            let stdout = trial_diagnostic(&done.stdout);
+                            let command = atomic_core::redact::excerpt(&format!("{argv:?}"), 1024);
                             let detail = format!(
-                                "check {} ({:?}) exited {:?}; stderr: {:?}; stdout: {:?}",
-                                index + 1, argv, done.code,
-                                stderr.chars().take(4096).collect::<String>(),
-                                stdout.chars().take(4096).collect::<String>()
+                                "check {} ({command}) exited {:?}; stderr: {stderr:?}; stdout: {stdout:?}",
+                                index + 1, done.code,
                             );
                             return Ok(TrialMergeResult::Repair { main, detail });
                         }
@@ -5478,24 +5556,7 @@ async fn reviewed<C: WorkflowContext>(
                     if output.get("ok") != Some(&Value::Bool(true))
                         || output.get("source").and_then(Value::as_str) != Some(source.as_str())
                         || output.get("commit").and_then(Value::as_str) != Some(commit.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("reference"))
-                            .and_then(Value::as_str)
-                            != Some(reference.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("base"))
-                            .and_then(Value::as_str)
-                            != Some(base.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("admitted"))
-                            .and_then(Value::as_str)
-                            != Some(admitted.as_str())
+                        || !host_control_bound_matches(output, &reference, base, admitted)
                         || entry.get("name").and_then(Value::as_str) != Some(row.as_str())
                         || verdict != Some("passed")
                     {
@@ -6407,6 +6468,9 @@ pub struct Services {
     /// Trusted local registry and selected rustup toolchain for offline
     /// trial-merge Cargo checks. Nothing here comes from the candidate.
     pub trial_cargo: Option<TrialCargo>,
+    /// Project scratch directories a trial command may not read or write.
+    /// The candidate checkout and its own declared cache remain writable.
+    pub trial_denied: Vec<PathBuf>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,
     /// The public context settings a step whose atom declares a context is
@@ -6780,6 +6844,92 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn trial_cargo_finds_default_rustup_shims_without_cargo_home() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atomic-trial-cargo-{nonce}"));
+        let home = root.join("operator");
+        let bin = home.join(".cargo/bin");
+        let scratch = root.join("candidate");
+        let cache = root.join("cache");
+        for dir in [&bin, &scratch, &cache] {
+            std::fs::create_dir_all(dir).expect("fixture directory");
+        }
+        for name in ["cargo", "rustc"] {
+            std::fs::write(bin.join(name), "#!/bin/sh\nexit 0\n").expect("operator shim");
+        }
+        assert_eq!(
+            trial_toolchain_bin(None, Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&bin).expect("default bin"))
+        );
+
+        // An explicit candidate-writable CARGO_HOME must not win merely
+        // because it contains convincing filenames.
+        let untrusted = scratch.join("bin");
+        std::fs::create_dir_all(&untrusted).expect("candidate bin");
+        for name in ["cargo", "rustc"] {
+            std::fs::write(untrusted.join(name), "#!/bin/sh\nexit 0\n").expect("candidate shim");
+        }
+        assert_ne!(
+            trial_toolchain_bin(Some(&scratch), Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&untrusted).expect("candidate bin"))
+        );
+        std::fs::remove_file(bin.join("cargo")).expect("remove operator shim");
+        std::os::unix::fs::symlink(untrusted.join("cargo"), bin.join("cargo"))
+            .expect("candidate shim link");
+        assert_ne!(
+            trial_toolchain_bin(None, Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&bin).expect("default bin")),
+            "a trusted directory may not smuggle a candidate-writable shim"
+        );
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    #[test]
+    fn a_host_control_proof_refuses_a_wrong_reference_receipt() {
+        let valid = json!({"bound": {
+            "reference": "refs/atomic/run/steps/code/1", "base": "base", "admitted": "admitted"
+        }});
+        assert!(host_control_bound_matches(
+            &valid,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+        let mut forged = valid;
+        forged["bound"]["reference"] = json!("refs/atomic/other/steps/code/1");
+        assert!(!host_control_bound_matches(
+            &forged,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+    }
+
+    #[test]
+    fn a_host_control_proof_refuses_a_wrong_base_receipt() {
+        let valid = json!({"bound": {
+            "reference": "refs/atomic/run/steps/code/1", "base": "base", "admitted": "admitted"
+        }});
+        assert!(host_control_bound_matches(
+            &valid,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+        let mut forged = valid;
+        forged["bound"]["base"] = json!("other-base");
+        assert!(!host_control_bound_matches(
+            &forged,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+    }
 
     #[test]
     fn frozen_graph_criteria_stay_out_of_model_item_input() {

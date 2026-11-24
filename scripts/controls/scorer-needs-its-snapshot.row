@@ -1,1 +1,1 @@
-scorer-needs-its-snapshot|crates/atomic-core/src/evaluation.rs|    if declared && snapshot.is_none() {|    if /*CONTROL_OFF*/ false && declared && snapshot.is_none() {|-p atomic-agentic-core --lib -- evaluation::tests::a_scorer_binding_agrees_with_what_the_atom_declares
+scorer-needs-its-snapshot|crates/atomic-core/assets/worker.mjs|if(!r&&qt(e))throw new Error("context snapshot required")|if(false&&!r&&qt(e))throw new Error("context snapshot required")|-p atomic-agentic-core --lib -- evaluation::tests::a_worker_scorer_requires_its_declared_context_snapshot

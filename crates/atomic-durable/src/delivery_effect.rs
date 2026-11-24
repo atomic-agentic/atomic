@@ -482,6 +482,10 @@ mod tests {
     use crate::publication::{park_delivery, parks};
     use crate::release::{ReleaseCommand, release_park};
     use crate::{Database, DurableRuntime, Durare, DurareContext};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn plan() -> DeliveryPlan {
@@ -932,6 +936,197 @@ mod tests {
             .shutdown(Duration::from_secs(5))
             .await
             .expect("shutdown renamed");
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_process_shutdown_fences_old_delivery_before_rename_recovery() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time follows Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "atomic-delivery-shutdown-{}-{nonce}.db",
+            std::process::id()
+        ));
+        crate::store::open_sqlite(&path).await.expect("v20 store");
+        let database = Database::Sqlite(path.clone());
+        let credential = HumanCredential::new(Principal::local("owner"), "rename-test-secret");
+        let mut old_plan = plan();
+        old_plan.project = "original/stable-state-id".into();
+        let legacy_key = old_plan.legacy_key(DeliverySlot::Push);
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let mut original = Durare::open(
+            &database,
+            None,
+            "delivery-rename-test",
+            "original/stable-state-id",
+        )
+        .await
+        .expect("original project runtime");
+        let count = stopped.clone();
+        original.register(WORKFLOW, move |ctx, input| {
+            let count = count.clone();
+            async move {
+                let _on_drop = CountDrop(count);
+                rename_probe(ctx, input).await
+            }
+        });
+        original.launch().await.expect("original launch");
+        gate::enroll(&original, &credential)
+            .await
+            .expect("enroll original operator");
+        original
+            .start(
+                WORKFLOW,
+                "shutdown-pending",
+                json!({"plan":old_plan,"seed":true}),
+            )
+            .await
+            .expect("start pending legacy operation");
+        approve_rename_gate(
+            &original,
+            &credential,
+            "shutdown-pending",
+            "approve-shutdown-delivery",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !parks(&original, "shutdown-pending")
+                    .await
+                    .expect("original park")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("old execution parked");
+        assert_eq!(stopped.load(Ordering::SeqCst), 0);
+        original
+            .shutdown(Duration::from_millis(20))
+            .await
+            .expect("shutdown fences parked old execution");
+        assert_eq!(
+            stopped.load(Ordering::SeqCst),
+            1,
+            "old workflow future must be gone before a new executor adopts it"
+        );
+
+        let mut unrelated = Durare::open(
+            &database,
+            Some("unrelated-executor"),
+            "delivery-rename-test",
+            "other/separate-state-id",
+        )
+        .await
+        .expect("unrelated project runtime");
+        unrelated.register(WORKFLOW, rename_probe);
+        unrelated.launch().await.expect("unrelated launch");
+        let mut other_plan = plan();
+        other_plan.project = "other/separate-state-id".into();
+        other_plan.source_run = "other-source".into();
+        unrelated
+            .start(
+                WORKFLOW,
+                "other-pending",
+                json!({"plan":other_plan,"seed":true}),
+            )
+            .await
+            .expect("start unrelated pending operation");
+        approve_rename_gate(
+            &unrelated,
+            &credential,
+            "other-pending",
+            "approve-other-delivery",
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if !parks(&unrelated, "other-pending")
+                    .await
+                    .expect("unrelated park")
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .expect("unrelated execution parked");
+        unrelated
+            .shutdown(Duration::from_millis(20))
+            .await
+            .expect("shutdown unrelated runtime");
+
+        let mut renamed = Durare::open(
+            &database,
+            None,
+            "delivery-rename-test",
+            "renamed/stable-state-id",
+        )
+        .await
+        .expect("renamed project adopts old run");
+        renamed.register(WORKFLOW, rename_probe);
+        renamed.launch().await.expect("renamed launch");
+        assert_eq!(renamed.recover().await.expect("recover own run"), 1);
+        assert!(
+            parks(&renamed, "other-pending")
+                .await
+                .expect("inspect unrelated park")
+                .is_empty()
+        );
+        let park = parks(&renamed, "shutdown-pending")
+            .await
+            .expect("adopted park")
+            .into_iter()
+            .next()
+            .expect("old run was parked");
+        release_park(
+            &renamed,
+            &credential,
+            ReleaseCommand {
+                command_id: "release-shutdown-pending".into(),
+                park: park.id,
+                raise: None,
+                comment: Some("remote outcome reconciled".into()),
+            },
+        )
+        .await
+        .expect("release approved pending delivery");
+        let resumed: Value = renamed
+            .result("shutdown-pending")
+            .await
+            .expect("new executor reconciles old run");
+        assert_eq!(resumed["mode"], "reconcile");
+        assert_eq!(resumed["key"], legacy_key);
+        assert_eq!(resumed["receipt"], json!({"observed":"old-key"}));
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(renamed.recover().await.expect("no duplicate recovery"), 0);
+        assert_eq!(
+            parks(&unrelated, "other-pending")
+                .await
+                .expect("unrelated project keeps its park")
+                .len(),
+            1,
+            "renamed recovery must not consume another project's pending delivery"
+        );
+        renamed
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown renamed runtime");
         let _ = std::fs::remove_file(path);
     }
 }

@@ -1,0 +1,1 @@
+goal-add-replay-state|crates/atomic-graph/src/sqlite/goals.rs|return current.try_get::<bool, _>("active").map_err(db);|return Ok(true);|-p atomic-agentic --test goals_cli -- enrolled_operator_manages_goals_and_reads_persisted_brief

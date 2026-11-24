@@ -126,6 +126,13 @@ fn enrolled_operator_manages_goals_and_reads_persisted_brief() {
         ],
     ));
     success(run(&root, &project, &["goals", "pause", "review"]));
+    let replay: Value = from_str(&success(run(
+        &root,
+        &project,
+        &["--json", "goals", "add", "review"],
+    )))
+    .expect("replayed add");
+    assert_eq!(replay["active"], false);
     let paused: Value = from_str(&success(run(
         &root,
         &project,

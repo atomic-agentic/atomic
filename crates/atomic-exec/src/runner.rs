@@ -35,7 +35,7 @@ use crate::process::{self, Limits};
 use crate::{Command, Completed, ExecError, ExecutionBackend, LocalBackend};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// The version of the request and response format: 4 carries the optional
@@ -509,6 +509,10 @@ impl ExecutionBackend for ProcessRunner {
 
     fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
         self.workspaces.close(workspace)
+    }
+
+    fn criterion_exclusions(&self, cwd: &Path) -> Result<Vec<PathBuf>, ExecError> {
+        self.workspaces.criterion_exclusions(cwd)
     }
 
     /// Its workspaces are on this machine, so their exchange is too.

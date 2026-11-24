@@ -1,0 +1,1 @@
+graph-cli-inspection|crates/atomic/src/graph.rs|SqliteStore::open_for_inspection(&path).await|SqliteStore::open(&path, SystemTime::now)|-p atomic-agentic --test graph_cli -- inspection_from_the_cli_leaves_a_missing_database_missing

@@ -829,7 +829,9 @@ export const reviewLabel = (change: Change): string => `${change.id} (${change.s
   logical time and seed the step records when it first starts, so a step
   retried after a crash renders the same prompt and reaches the same validator
   decisions. Local time is UTC and an unspecified locale is `en-US`, whatever
-  the host's. Boa supports ISO date parsing. Legacy date strings, localized formatting and the available Intl methods can differ from earlier releases.
+  the host's. New runs use Boa's ISO date parsing and available `Intl`
+  methods. Legacy date parsing and localized formatting are not guaranteed to
+  match earlier helper runtimes.
 - **Durability.** A run keeps the helpers it captured when it started; editing
   a helper affects new runs only. A run cannot resume a helper step on a
   different helper runtime (a newer atomic whose engine, prelude or compiler

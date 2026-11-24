@@ -30,8 +30,8 @@ to M11b/M39b in v0.5.
 Declarative atoms now use Astro exclusively. The production loader supports local
 components, named slots with fallback content, frontmatter locals, template
 literals, bounded TypeScript-shaped expressions, typed validators,
-[TypeScript helpers](atom-files.md#typescript-helpers), which run in an
-embedded, capability-free isolate per call with the step's recorded clock, and
+[TypeScript helpers](atom-files.md#typescript-helpers), which run in a fresh,
+bounded Boa isolate in a short-lived child with the step's recorded clock, and
 [literal Markdown imports](atom-files.md#literal-prompt-examples), which bind a
 project file's text as authored prompt content.
 `atomic check` checks source and generates editor types, including
@@ -61,9 +61,17 @@ The local SQLite work graph accepts beads JSONL through
 Committed import and the human `graph create`, `link`, `claim` and `close`
 commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
-imports leave matching items unchanged. `atomic graph import --dry-run` and
-`atomic graph export` are read-only commands. These commands accept `--json` through the
-CLI's global option. `atomic graph pin <item>` admits an imported open epic
+imports leave matching items unchanged. Import redacts credentials in items,
+comments and memories before storage. Native exports preserve success and
+failure so conditional dependencies retain their readiness after a round trip.
+An ordinary closed Beads item has an unknown outcome. `atomic graph import
+--dry-run` and `atomic graph export` open the project store read-only. A
+missing database stays absent, and older stores are inspected using a migrated
+in-memory snapshot. These commands accept `--json` through the
+CLI's global option. `atomic graph create` accepts `--request-id <key>` so a
+person can retry a create with the same key and payload and receive the original
+item. Without it, each invocation creates a fresh request. `atomic graph pin
+<item>` admits an imported open epic
 for graph runs after an operator approves the transition. `atomic graph
 reconcile-failed <epic> --run <run>` lets that operator release a terminal
 failed run's exclusive epic binding when it holds no graph item lease; the
@@ -78,7 +86,18 @@ and `http` criteria from the enrolled operator; `criteria show` is read-only
 and `criteria clear` removes the list. Imported Beads acceptance prose is
 stored separately and is never executed as a criterion. The staged graph work
 loop runs each executable item criterion after the author and before reviewers
-or publication; a failed criterion enters a bounded repair round. PostgreSQL
+or publication. Test and HTTP criteria require a runner that has verified
+confinement and hides other projects’ scratch directories. A failed criterion
+enters a bounded repair round. Diagnostic text is redacted before atomic
+checkpoints it or passes it to the repair model.
+
+`atomic goals list` and `atomic goals show` use the same read-only inspection
+path as graph export. Graph JSONL preserves a pinned goal item and its child
+links. To register it in the destination, an enrolled operator runs
+`atomic goals add <name>` with the local `goals/<name>.goal.yaml`. This
+activates the restored goal using that definition. Repeating the command for
+an already registered goal preserves and reports its current active or paused
+state. PostgreSQL
 graph storage remains staged; this v0.2 work is not a released runtime.
 
 The staged `atomic delivery start` command reads a committed graph coding

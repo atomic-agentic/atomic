@@ -1,0 +1,1 @@
+graph-waits-for-fanout|crates/atomic-graph/src/sqlite.rs|e.kind IN ('blocks','parent-child','conditional-blocks','waits-for')|e.kind IN ('blocks','parent-child','conditional-blocks')|-p atomic-agentic-graph --test conformance sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensation

@@ -2068,6 +2068,150 @@ fn sqlite_authorized_for_tests(
 }
 
 #[test]
+fn sqlite_graph_first_open_uses_the_durable_migration_history() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-first-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("fresh graph open must migrate the shared store");
+    harness::block_on(async {
+        store
+            .create_item(
+                Actor::agent("setup"),
+                "first-item".into(),
+                Draft::new("at-first", "First"),
+            )
+            .await
+            .expect("graph tables are available after migration");
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open migration reader");
+        let version: i64 = sqlx::query_scalar("SELECT version FROM atomic_store_version")
+            .fetch_one(&mut conn)
+            .await
+            .expect("durable version marker");
+        assert_eq!(version, atomic_durable::store::STORE_VERSION);
+        let graph_history: String =
+            sqlx::query_scalar("SELECT name FROM atomic_store_history WHERE version=12")
+                .fetch_one(&mut conn)
+                .await
+                .expect("work-graph migration history");
+        assert_eq!(graph_history, "work-graph");
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('atomic_graph_edges_by_target','atomic_graph_ready_order')",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("graph migration indexes");
+        assert_eq!(index_count, 2);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_graph_open_refuses_a_newer_marker_before_it_returns_a_store() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-newer-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open current graph store");
+    harness::block_on(store.create_item(
+        Actor::agent("setup"),
+        "first-item".into(),
+        Draft::new("at-first", "First"),
+    ))
+    .expect("create existing graph item");
+    drop(store);
+    let newer = atomic_durable::store::STORE_VERSION + 1;
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open marker writer");
+        sqlx::query("UPDATE atomic_store_version SET version=?")
+            .bind(newer)
+            .execute(&mut conn)
+            .await
+            .expect("mark future schema");
+    });
+    let error = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .err()
+        .expect("a future schema must refuse graph open");
+    assert!(
+        error
+            .to_string()
+            .contains("newer than this atomic understands"),
+        "unexpected migration refusal: {error}"
+    );
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open unchanged store");
+        let marker: i64 = sqlx::query_scalar("SELECT version FROM atomic_store_version")
+            .fetch_one(&mut conn)
+            .await
+            .expect("version still present");
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items")
+            .fetch_one(&mut conn)
+            .await
+            .expect("existing item still present");
+        assert_eq!((marker, item_count), (newer, 1));
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_graph_open_refuses_unversioned_graph_tables_before_migrating() {
+    use sqlx::Connection;
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-unversioned-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::File::create(&path).expect("create unversioned database");
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open unversioned database");
+        sqlx::query("CREATE TABLE atomic_graph_items (id TEXT PRIMARY KEY, title TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("plant incompatible graph table");
+    });
+    let error = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .err()
+        .expect("unversioned graph table must refuse open");
+    assert!(
+        error.to_string().contains("unrecognized atomic schema"),
+        "unexpected migration refusal: {error}"
+    );
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("reopen rejected database");
+        let version_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='atomic_store_version'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("read version table inventory");
+        assert_eq!(version_tables, 0, "refusal must not stamp a version");
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_conforms_to_the_behavioral_scenarios() {
     let mut all_failures = Vec::new();
     for (index, scenario) in SCENARIOS.iter().enumerate() {
@@ -2195,6 +2339,113 @@ fn sqlite_roundtrips_draft_fields_and_every_edge_kind() {
 }
 
 #[test]
+fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
+    use store_contract::{Actor, Draft, EdgeKind, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-edge-identity-{}.sqlite",
+        std::process::id()
+    ));
+    let imported_path = std::env::temp_dir().join(format!(
+        "atomic-graph-edge-identity-import-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&imported_path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::human("maintainer");
+
+    harness::block_on(async {
+        for id in ["at-child", "at-parent-one", "at-parent-two"] {
+            store
+                .create_item(actor.clone(), format!("create-{id}"), Draft::new(id, id))
+                .await
+                .expect("create graph item");
+        }
+        let before = store.export(actor.clone()).await.expect("export graph");
+        for kind in [EdgeKind::ParentChild, EdgeKind::Blocks] {
+            for (from, to, missing) in [
+                ("at-absent", "at-parent-one", "at-absent"),
+                ("at-child", "at-absent", "at-absent"),
+            ] {
+                assert!(matches!(
+                    store
+                        .add_edge(actor.clone(), from.to_owned(), kind, to.to_owned())
+                        .await,
+                    Err(StoreError::MissingItem { item_id }) if item_id == missing
+                ));
+                assert_eq!(
+                    store
+                        .export(actor.clone())
+                        .await
+                        .expect("export after refusal"),
+                    before,
+                    "refusing a missing {missing} edge must not write a parent or edge"
+                );
+            }
+        }
+
+        store
+            .add_edge(
+                actor.clone(),
+                "at-child".into(),
+                EdgeKind::ParentChild,
+                "at-parent-one".into(),
+            )
+            .await
+            .expect("link first parent");
+        let shown = store
+            .show(actor.clone(), "at-child".into())
+            .await
+            .expect("show child")
+            .expect("child exists");
+        assert_eq!(shown.item.parent.as_deref(), Some("at-parent-one"));
+        assert_eq!(shown.blocked_by, ["at-parent-one"]);
+        let first_parent = store
+            .export(actor.clone())
+            .await
+            .expect("export first parent");
+        assert!(matches!(
+            store
+                .add_edge(
+                    actor.clone(),
+                    "at-child".into(),
+                    EdgeKind::ParentChild,
+                    "at-parent-two".into(),
+                )
+                .await,
+            Err(StoreError::InvalidEdge { .. })
+        ));
+        assert_eq!(
+            store
+                .export(actor.clone())
+                .await
+                .expect("export after refusal"),
+            first_parent,
+            "refusing a second parent must not write an edge or change the item"
+        );
+
+        let imported = sqlite_authorized_for_tests(&imported_path, std::time::SystemTime::now)
+            .expect("open second graph store");
+        imported
+            .import(actor.clone(), first_parent, false)
+            .await
+            .expect("import exported graph");
+        let imported_child = imported
+            .show(actor, "at-child".into())
+            .await
+            .expect("show imported child")
+            .expect("imported child exists");
+        assert_eq!(imported_child.item.parent.as_deref(), Some("at-parent-one"));
+        assert_eq!(imported_child.blocked_by, ["at-parent-one"]);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(imported_path);
+}
+
+#[test]
 fn sqlite_works_inside_an_existing_tokio_runtime() {
     use store_contract::{Actor, Draft};
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2281,6 +2532,175 @@ fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
                 .expect("test operation")
                 .is_none()
         );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_agent_status_cannot_close_defer_or_bypass_close_policy() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, Evidence, GraphStore, Status, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-agent-status-authority-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph");
+    let human = Actor::human("owner");
+    let agent = Actor::agent("atom");
+    harness::block_on(async {
+        store
+            .create_item(
+                human.clone(),
+                "create-open".into(),
+                Draft::new("open", "Open"),
+            )
+            .await
+            .expect("create unprotected item");
+        store
+            .claim(
+                agent.clone(),
+                "claim-open".into(),
+                "open".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim unprotected item")
+            .expect("lease");
+        store
+            .set_close_policy(human.clone(), vec![Evidence::Commit])
+            .await
+            .expect("require commit for later item");
+        store
+            .create_item(
+                human.clone(),
+                "create-policy".into(),
+                Draft::new("policy", "Protected"),
+            )
+            .await
+            .expect("create protected item");
+
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent reader");
+        let before_items: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT id,status,claim_epoch,closed_at FROM atomic_graph_items WHERE id IN ('open','policy') ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("read item rows");
+        let before_leases: Vec<(String, String, i64, i64, String, i64)> = sqlx::query_as(
+            "SELECT item_id,claimant,session,epoch,acquisition,expires_at FROM atomic_graph_leases WHERE item_id IN ('open','policy') ORDER BY item_id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("read lease rows");
+        assert_eq!(before_items.len(), 2);
+        assert_eq!(before_leases.len(), 1);
+
+        for (id, status) in [
+            ("open", Status::Closed),
+            ("open", Status::Deferred),
+            ("policy", Status::Closed),
+            ("policy", Status::Deferred),
+        ] {
+            assert!(matches!(
+                store.set_status(agent.clone(), id.into(), status).await,
+                Err(StoreError::NeedsHumanCredential { action }) if action == "set status"
+            ));
+            let after_items: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT id,status,claim_epoch,closed_at FROM atomic_graph_items WHERE id IN ('open','policy') ORDER BY id",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .expect("read unchanged item rows");
+            let after_leases: Vec<(String, String, i64, i64, String, i64)> = sqlx::query_as(
+                "SELECT item_id,claimant,session,epoch,acquisition,expires_at FROM atomic_graph_leases WHERE item_id IN ('open','policy') ORDER BY item_id",
+            )
+            .fetch_all(&mut conn)
+            .await
+            .expect("read unchanged lease rows");
+            assert_eq!(after_items, before_items, "agent changed item rows");
+            assert_eq!(after_leases, before_leases, "agent changed lease rows");
+        }
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_agent_memory_cannot_replace_human_or_approved_rows() {
+    use sqlx::Connection;
+    use store_contract::{Actor, GraphStore, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-agent-memory-authority-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph");
+    let human = Actor::human("owner");
+    let agent = Actor::agent("atom");
+    harness::block_on(async {
+        for (request, key, value) in [
+            ("human-seed", "human-key", "owner text"),
+            ("approved-seed", "approved-key", "approved text"),
+        ] {
+            store
+                .remember(human.clone(), request.into(), key.into(), value.into())
+                .await
+                .expect("seed trusted memory");
+        }
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent reader");
+        sqlx::query("UPDATE atomic_graph_memories SET trust='approved' WHERE key='approved-key'")
+            .execute(&mut conn)
+            .await
+            .expect("model an existing approved memory");
+        let before_memories: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT key,value,trust FROM atomic_graph_memories ORDER BY key")
+                .fetch_all(&mut conn)
+                .await
+                .expect("read trusted memories");
+        let before_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+            .fetch_one(&mut conn)
+            .await
+            .expect("count requests");
+        assert_eq!(before_memories[0].2, "approved");
+        assert_eq!(before_memories[1].2, "human");
+
+        for (request, key) in [
+            ("agent-replace-human", "human-key"),
+            ("agent-replace-approved", "approved-key"),
+        ] {
+            assert!(matches!(
+                store
+                    .remember(agent.clone(), request.into(), key.into(), "agent text".into())
+                    .await,
+                Err(StoreError::NeedsHumanCredential { action }) if action == "replace trusted memory"
+            ));
+            let after_memories: Vec<(String, String, String)> =
+                sqlx::query_as("SELECT key,value,trust FROM atomic_graph_memories ORDER BY key")
+                    .fetch_all(&mut conn)
+                    .await
+                    .expect("read unchanged memories");
+            let after_requests: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_requests")
+                    .fetch_one(&mut conn)
+                    .await
+                    .expect("count unchanged requests");
+            assert_eq!(
+                after_memories, before_memories,
+                "agent changed trusted memory"
+            );
+            assert_eq!(
+                after_requests, before_requests,
+                "agent recorded rejected request"
+            );
+        }
     });
     drop(store);
     let _ = std::fs::remove_file(path);
@@ -2385,6 +2805,107 @@ fn sqlite_refuses_untrusted_admin_changes_and_memory_demotion() {
 }
 
 #[test]
+fn sqlite_finished_close_replay_fences_full_lease_identity() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, Finish, GraphStore, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-finished-identity-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(async {
+        store
+            .create_item(
+                actor.clone(),
+                "create".into(),
+                Draft::new("at-done", "Done"),
+            )
+            .await
+            .expect("create item");
+        let lease = store
+            .claim(
+                actor.clone(),
+                "holder".into(),
+                "at-done".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim item")
+            .expect("item was ready");
+        store
+            .finish(lease.clone(), Finish::Close)
+            .await
+            .expect("close item");
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open independent state reader");
+        let row = async |conn: &mut sqlx::SqliteConnection| {
+            sqlx::query_as::<_, (
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+                i64,
+            )>(
+                "SELECT status,last_finish_session,last_finish_epoch,last_finish_claimant,last_finish_acquisition,terminal_outcome,closed_at,(SELECT COUNT(*) FROM atomic_graph_leases WHERE item_id='at-done') FROM atomic_graph_items WHERE id='at-done'",
+            )
+            .fetch_one(conn)
+            .await
+            .expect("read finished item and lease state")
+        };
+        let before = row(&mut conn).await;
+        let exported = store.export(actor.clone()).await.expect("export graph");
+        store
+            .finish(lease.clone(), Finish::Close)
+            .await
+            .expect("exact close replay is a no-op");
+        assert_eq!(row(&mut conn).await, before, "exact replay changed state");
+        assert_eq!(
+            store.export(actor.clone()).await.expect("export graph"),
+            exported
+        );
+
+        let mut wrong_claimant = lease.clone();
+        wrong_claimant.claimant = "intruder".into();
+        assert!(matches!(
+            store.finish(wrong_claimant, Finish::Close).await,
+            Err(StoreError::Fenced { .. })
+        ));
+        assert_eq!(
+            row(&mut conn).await,
+            before,
+            "forged claimant changed state"
+        );
+        assert_eq!(
+            store.export(actor.clone()).await.expect("export graph"),
+            exported
+        );
+
+        let mut wrong_acquisition = lease;
+        wrong_acquisition.acquisition = "forged".into();
+        assert!(matches!(
+            store.finish(wrong_acquisition, Finish::Close).await,
+            Err(StoreError::Fenced { .. })
+        ));
+        assert_eq!(
+            row(&mut conn).await,
+            before,
+            "forged acquisition changed state"
+        );
+        assert_eq!(store.export(actor).await.expect("export graph"), exported);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_import_rejects_wrong_shapes_and_preserves_signed_dates() {
     use store_contract::{Actor, GraphStore, StoreError};
     let path = std::env::temp_dir().join(format!(
@@ -2445,6 +2966,102 @@ fn sqlite_import_rejects_wrong_shapes_and_preserves_signed_dates() {
 }
 
 #[test]
+fn sqlite_pre_epoch_dates_roundtrip_through_create_import_show_and_export() {
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-signed-dates-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let created = std::time::UNIX_EPOCH - Duration::from_millis(123_456_789_123);
+    let due = created + Duration::from_millis(3_600_123);
+    let store = sqlite_authorized_for_tests(&path, move || created).expect("open graph store");
+    let actor = Actor::human("maintainer");
+    let mut draft = Draft::new("at-native-old", "Native before epoch");
+    draft.due_at = Some(due);
+    let imported_created = "1960-01-01T00:00:00.123Z";
+    let imported_due = "1960-01-02T00:00:00.456Z";
+    let imported = format!(
+        "{{\"id\":\"at-imported-old\",\"title\":\"Imported before epoch\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"{imported_created}\",\"due_at\":\"{imported_due}\"}}"
+    );
+
+    harness::block_on(async {
+        store
+            .create_item(actor.clone(), "native-old".into(), draft)
+            .await
+            .expect("create pre-epoch item");
+        store
+            .import(actor.clone(), imported, false)
+            .await
+            .expect("import pre-epoch item");
+        let native = store
+            .show(actor.clone(), "at-native-old".into())
+            .await
+            .expect("show native item")
+            .expect("native item exists")
+            .item;
+        assert_eq!(native.created_at, created);
+        assert_eq!(native.due_at, Some(due));
+        let imported = store
+            .show(actor.clone(), "at-imported-old".into())
+            .await
+            .expect("show imported item")
+            .expect("imported item exists")
+            .item;
+        let imported_created_ms = chrono::DateTime::parse_from_rfc3339(imported_created)
+            .expect("import created date")
+            .timestamp_millis();
+        let imported_due_ms = chrono::DateTime::parse_from_rfc3339(imported_due)
+            .expect("import due date")
+            .timestamp_millis();
+        assert!(imported_created_ms < 0 && imported_due_ms < 0);
+        assert_eq!(
+            imported.created_at,
+            std::time::UNIX_EPOCH - Duration::from_millis(imported_created_ms.unsigned_abs())
+        );
+        assert_eq!(
+            imported.due_at,
+            Some(std::time::UNIX_EPOCH - Duration::from_millis(imported_due_ms.unsigned_abs()))
+        );
+
+        let exported = store.export(actor).await.expect("export graph");
+        let rows: Vec<serde_json::Value> = exported
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("exported JSON row"))
+            .collect();
+        for (id, expected_created, expected_due) in [
+            ("at-native-old", created, due),
+            (
+                "at-imported-old",
+                imported.created_at,
+                imported.due_at.expect("imported due"),
+            ),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row["id"] == id)
+                .expect("exported item");
+            for (field, expected) in [("created_at", expected_created), ("due_at", expected_due)] {
+                let actual = chrono::DateTime::parse_from_rfc3339(
+                    row[field].as_str().expect("exported date string"),
+                )
+                .expect("valid exported date")
+                .timestamp_millis();
+                let expected = -(expected
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect_err("pre-epoch expected date")
+                    .duration()
+                    .as_millis() as i64);
+                assert_eq!(actual, expected, "{id} {field} changed on export");
+            }
+        }
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensation() {
     use store_contract::{Actor, Draft, EdgeKind, Finish, GraphStore};
     let path = std::env::temp_dir().join(format!(
@@ -2497,6 +3114,19 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
                 .iter()
                 .any(|item| item.id == "gate" || item.id == "message" || item.id == "comp")
         );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "message".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("message claim check")
+                .is_none(),
+            "a message must not enter the work queue through a direct claim"
+        );
         for target in ["one", "two"] {
             let lease = store
                 .claim(
@@ -2542,6 +3172,262 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
         );
     });
     drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_ready_and_claim_follow_a_blocker_chain_with_a_cycle() {
+    use store_contract::{Actor, Draft, EdgeKind, Finish, GraphStore, Status};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-blocker-chain-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("graph store");
+    let actor = Actor::human("owner");
+    harness::block_on(async {
+        const COUNT: usize = 16;
+        for n in 0..COUNT {
+            let id = format!("at-chain-{n:02}");
+            store
+                .create_item(actor.clone(), format!("create-{id}"), Draft::new(&id, &id))
+                .await
+                .expect("create chain item");
+        }
+        for n in 0..COUNT - 1 {
+            store
+                .add_edge(
+                    actor.clone(),
+                    format!("at-chain-{n:02}"),
+                    EdgeKind::Blocks,
+                    format!("at-chain-{:02}", n + 1),
+                )
+                .await
+                .expect("add chain blocker");
+        }
+        store
+            .add_edge(
+                actor.clone(),
+                "at-chain-15".into(),
+                EdgeKind::Blocks,
+                "at-chain-14".into(),
+            )
+            .await
+            .expect("add cycle edge");
+        assert!(
+            store
+                .ready(actor.clone(), COUNT)
+                .await
+                .expect("ready before close")
+                .is_empty()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "at-chain-00".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("direct claim check")
+                .is_none(),
+            "direct claim ignored a blocker"
+        );
+        store
+            .set_status(actor.clone(), "at-chain-15".into(), Status::Closed)
+            .await
+            .expect("human breaks cycle");
+        for n in (0..COUNT - 1).rev() {
+            let expected = format!("at-chain-{n:02}");
+            let ready = store.ready(actor.clone(), COUNT).await.expect("ready item");
+            assert_eq!(
+                ready
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>(),
+                [expected.as_str()]
+            );
+            let lease = store
+                .claim_next(actor.clone(), "worker".into(), Duration::from_secs(60))
+                .await
+                .expect("claim next")
+                .expect("one item became ready");
+            assert_eq!(lease.item_id, expected);
+            store
+                .finish(lease, Finish::Close)
+                .await
+                .expect("close claimed item");
+        }
+        assert!(
+            store
+                .ready(actor, COUNT)
+                .await
+                .expect("ready after close")
+                .is_empty()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_import_refuses_undefined_dependency_kind_without_committing_items() {
+    use store_contract::{Actor, GraphStore, StoreError};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-undefined-edge-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::human("owner");
+    let imported = [
+        serde_json::json!({"id":"at-blocker","title":"Blocker","status":"open","priority":2,"issue_type":"task"}),
+        serde_json::json!({"id":"at-work","title":"Work","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"at-work","depends_on_id":"at-blocker","type":"future-blocks"}]}),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    harness::block_on(async {
+        let before = store
+            .export(actor.clone())
+            .await
+            .expect("export before import");
+        let error = store
+            .import(actor.clone(), imported, false)
+            .await
+            .expect_err("undefined edge kind must be refused");
+        assert!(
+            matches!(&error, StoreError::ImportRefused(problems) if problems.iter().any(|problem| problem.contains("unsupported type future-blocks"))),
+            "unexpected import refusal: {error:?}"
+        );
+        assert_eq!(
+            store.export(actor).await.expect("export after refusal"),
+            before,
+            "refused undefined edge kind must leave no committed item"
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn sqlite_projection_refresh_never_exposes_a_claimable_gap() {
+    use store_contract::{Actor, Draft, EdgeKind};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-projection-race-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let setup = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open setup graph store");
+    harness::block_on(async {
+        for id in ["at-blocked", "at-blocker"] {
+            setup
+                .create_item(
+                    Actor::agent("setup"),
+                    format!("create-{id}"),
+                    Draft::new(id, id),
+                )
+                .await
+                .expect("create item");
+        }
+        setup
+            .add_edge(
+                Actor::agent("setup"),
+                "at-blocked".into(),
+                EdgeKind::Blocks,
+                "at-blocker".into(),
+            )
+            .await
+            .expect("block item");
+    });
+    drop(setup);
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let writer_store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open writer graph handle")
+        .with_projection_pause(move || {
+            paused_tx.send(()).expect("signal deleted projection");
+            release_rx
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(15))
+                .expect("release projection refresh");
+        });
+    let claimant_store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open independent claimant graph handle");
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            harness::block_on(writer_store.create_item(
+                Actor::agent("writer"),
+                "unrelated-write".into(),
+                Draft::new("at-unrelated", "Unrelated"),
+            ))
+        });
+        paused_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("writer did not reach projection gap");
+
+        let (polled_tx, polled_rx) = std::sync::mpsc::channel();
+        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
+        let claimant = scope.spawn(move || {
+            let pending = claimant_store.claim(
+                Actor::agent("claimant"),
+                "claimant".into(),
+                "at-blocked".into(),
+                Duration::from_secs(60),
+            );
+            let mut pending = std::pin::pin!(pending);
+            let mut first_poll = Some(polled_tx);
+            let result = harness::block_on(std::future::poll_fn(move |cx| {
+                let result = pending.as_mut().poll(cx);
+                if let Some(signal) = first_poll.take() {
+                    signal.send(()).expect("signal claimant poll");
+                }
+                result
+            }));
+            answer_tx.send(result).expect("send claim result");
+        });
+        polled_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("claimant was not polled");
+        let during_refresh = answer_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).expect("release writer");
+        writer
+            .join()
+            .expect("writer thread")
+            .expect("writer mutation");
+        assert!(
+            matches!(
+                during_refresh,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "claim returned while projection rows were deleted: {during_refresh:?}"
+        );
+        let claimed = answer_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("claimant did not finish after commit")
+            .expect("claim operation");
+        assert!(claimed.is_none(), "blocked item was claimed after refresh");
+        claimant.join().expect("claimant thread");
+    });
+
+    let reopened = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("reopen graph after race");
+    let blocked = harness::block_on(reopened.show(Actor::agent("reader"), "at-blocked".into()))
+        .expect("show blocked item")
+        .expect("blocked item exists");
+    assert_eq!(blocked.blocked_by, ["at-blocker"]);
+    drop(reopened);
     let _ = std::fs::remove_file(path);
 }
 
@@ -2672,10 +3558,11 @@ fn sqlite_samples_lease_clock_when_the_transaction_starts() {
         Duration::from_secs(1),
     );
     clock.advance(Duration::from_secs(30));
-    let lease = harness::block_on(pending)
+    let lease = poll_after_writer_contention(&path, pending, &clock)
         .expect("test operation")
         .expect("test operation");
     assert_eq!(lease.epoch, 1);
+    assert_lease_expiry_after(&path, "at-clock", clock.now());
     let second = harness::block_on(store.claim(
         actor,
         "second".into(),
@@ -2686,6 +3573,155 @@ fn sqlite_samples_lease_clock_when_the_transaction_starts() {
     assert!(
         second.is_none(),
         "claim was committed already expired from a stale clock sample"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+/// Keep a separate SQLite writer open while the graph future is first polled.
+/// The future was constructed before the caller advanced its fake clock.
+fn poll_after_writer_contention<F>(path: &std::path::Path, pending: F, clock: &Clock) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    use sqlx::Connection;
+    let uri = format!("sqlite://{}", path.display());
+    let mut writer =
+        harness::block_on(sqlx::SqliteConnection::connect(&uri)).expect("open independent writer");
+    harness::block_on(sqlx::query("BEGIN IMMEDIATE").execute(&mut writer))
+        .expect("hold writer transaction");
+    std::thread::scope(|scope| {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let worker = scope.spawn(move || {
+            let mut pending = std::pin::pin!(pending);
+            let mut first_poll = Some(started_tx);
+            harness::block_on(std::future::poll_fn(move |cx| {
+                let result = pending.as_mut().poll(cx);
+                if let Some(signal) = first_poll.take() {
+                    signal.send(()).expect("signal first graph poll");
+                }
+                result
+            }))
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("graph future was polled");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            !worker.is_finished(),
+            "graph operation ignored writer contention"
+        );
+        // An implementation that samples time at first poll, before BEGIN
+        // IMMEDIATE can enter, must still use the later transaction clock.
+        clock.advance(Duration::from_secs(30));
+        harness::block_on(sqlx::query("ROLLBACK").execute(&mut writer))
+            .expect("release writer transaction");
+        worker.join().expect("graph worker")
+    })
+}
+
+fn assert_lease_expiry_after(path: &std::path::Path, item: &str, now: std::time::SystemTime) {
+    use sqlx::Connection;
+    let uri = format!("sqlite://{}", path.display());
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&uri)
+            .await
+            .expect("open lease reader");
+        let expires_at: i64 =
+            sqlx::query_scalar("SELECT expires_at FROM atomic_graph_leases WHERE item_id=?")
+                .bind(item)
+                .fetch_one(&mut conn)
+                .await
+                .expect("read lease expiry");
+        let now_ms = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("positive fake clock")
+            .as_millis() as i64;
+        assert_eq!(expires_at, now_ms + 1_000, "lease used a stale clock");
+    });
+}
+
+#[test]
+fn sqlite_claim_next_samples_clock_after_poll_and_writer_contention() {
+    use store_contract::{Actor, Draft, GraphStore};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-claim-next-clock-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Clock::new();
+    let observed = clock.clone();
+    let store = sqlite_authorized_for_tests(&path, move || observed.now()).expect("graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(store.create_item(
+        actor.clone(),
+        "setup".into(),
+        Draft::new("at-next-clock", "Clock"),
+    ))
+    .expect("create item");
+    let pending = store.claim_next(actor.clone(), "first".into(), Duration::from_secs(1));
+    clock.advance(Duration::from_secs(30));
+    let lease = poll_after_writer_contention(&path, pending, &clock)
+        .expect("claim next")
+        .expect("ready item");
+    assert_eq!(lease.item_id, "at-next-clock");
+    assert_lease_expiry_after(&path, &lease.item_id, clock.now());
+    assert!(
+        harness::block_on(store.claim(
+            actor,
+            "second".into(),
+            lease.item_id.clone(),
+            Duration::from_secs(1),
+        ))
+        .expect("second claim")
+        .is_none(),
+        "second claimant took a newly committed lease"
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_heartbeat_samples_clock_after_poll_and_writer_contention() {
+    use store_contract::{Actor, Draft, GraphStore};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-heartbeat-clock-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let clock = Clock::new();
+    let observed = clock.clone();
+    let store = sqlite_authorized_for_tests(&path, move || observed.now()).expect("graph store");
+    let actor = Actor::agent("worker");
+    harness::block_on(store.create_item(
+        actor.clone(),
+        "setup".into(),
+        Draft::new("at-heartbeat-clock", "Clock"),
+    ))
+    .expect("create item");
+    let lease = harness::block_on(store.claim(
+        actor.clone(),
+        "first".into(),
+        "at-heartbeat-clock".into(),
+        Duration::from_secs(1),
+    ))
+    .expect("first claim")
+    .expect("open item");
+    let pending = store.heartbeat(lease.clone(), Duration::from_secs(1));
+    clock.advance(Duration::from_secs(30));
+    poll_after_writer_contention(&path, pending, &clock).expect("heartbeat");
+    assert_lease_expiry_after(&path, &lease.item_id, clock.now());
+    assert!(
+        harness::block_on(store.claim(
+            actor,
+            "second".into(),
+            lease.item_id,
+            Duration::from_secs(1),
+        ))
+        .expect("second claim")
+        .is_none(),
+        "second claimant took a renewed lease"
     );
     drop(store);
     let _ = std::fs::remove_file(path);
@@ -2731,74 +3767,96 @@ fn sqlite_fifty_contenders_have_exactly_one_claim_winner() {
 
 #[test]
 fn sqlite_does_not_block_a_current_thread_tokio_executor_while_waiting_for_a_writer() {
-    use sqlx::Connection;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use store_contract::{Actor, Draft, GraphStore};
     let path = std::env::temp_dir().join(format!(
         "atomic-graph-executor-{}.sqlite",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    let store =
+    let waiting_store =
         sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("test operation");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test operation");
-    runtime
-        .block_on(store.create_item(
-            Actor::agent("setup"),
-            "setup".into(),
-            Draft::new("at-wait", "Wait"),
-        ))
-        .expect("test operation");
-    let (locked, ready) = std::sync::mpsc::channel();
-    let database = path.clone();
-    let blocker = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    for id in ["at-writer", "at-wait"] {
+        runtime
+            .block_on(waiting_store.create_item(
+                Actor::agent("setup"),
+                format!("setup-{id}"),
+                Draft::new(id, id),
+            ))
             .expect("test operation");
-        runtime.block_on(async {
-            let mut conn =
-                sqlx::SqliteConnection::connect(&format!("sqlite://{}", database.display()))
-                    .await
-                    .expect("test operation");
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut conn)
-                .await
-                .expect("test operation");
-            locked.send(()).expect("test operation");
-            std::thread::sleep(Duration::from_millis(500));
-            sqlx::query("COMMIT")
-                .execute(&mut conn)
-                .await
-                .expect("test operation");
-        });
-    });
-    ready.recv().expect("test operation");
+    }
+
+    // The clock runs inside the writer's BEGIN IMMEDIATE transaction. Keep
+    // that graph handle's write lock until a timer on this same executor
+    // releases it, while a second graph handle attempts another write.
+    let writer_locked = std::sync::Arc::new(AtomicBool::new(false));
+    let locked_in_clock = std::sync::Arc::clone(&writer_locked);
+    let (release_writer, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    let writer_store = sqlite_authorized_for_tests(&path, move || {
+        locked_in_clock.store(true, Ordering::Release);
+        let _ = released.lock().expect("release receiver").recv();
+        std::time::SystemTime::now()
+    })
+    .expect("open independent writer graph handle");
     runtime.block_on(async {
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            store.claim(
+        let writer = tokio::spawn(async move {
+            writer_store
+                .claim(
+                    Actor::agent("writer"),
+                    "writer".into(),
+                    "at-writer".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !writer_locked.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("writer did not take its graph transaction lock");
+
+        let timer_fired = std::sync::Arc::new(AtomicBool::new(false));
+        let timer_observed = std::sync::Arc::clone(&timer_fired);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            timer_observed.store(true, Ordering::Release);
+            release_writer.send(()).expect("release writer");
+        });
+        let waiting = tokio::time::timeout(
+            Duration::from_secs(2),
+            waiting_store.claim(
                 Actor::agent("worker"),
                 "worker".into(),
                 "at-wait".into(),
                 Duration::from_secs(60),
             ),
         )
-        .await;
+        .await
+        .expect("contended graph claim blocked the current-thread executor")
+        .expect("contended graph claim failed");
         assert!(
-            result.is_err(),
-            "contended claim completed before the writer released its lock"
+            waiting.is_some(),
+            "contended graph claim lost after writer released the lock"
         );
         assert!(
-            started.elapsed() < Duration::from_millis(350),
-            "SQLite wait stalled the current-thread executor"
+            timer_fired.load(Ordering::Acquire),
+            "the same-runtime timer did not release the writer"
         );
+        release.await.expect("timer task");
+        writer
+            .await
+            .expect("writer task")
+            .expect("writer graph claim")
+            .expect("writer claim was empty");
     });
-    blocker.join().expect("test operation");
-    drop(store);
+    drop(waiting_store);
     let _ = std::fs::remove_file(path);
 }
 
@@ -3030,6 +4088,7 @@ fn sqlite_native_pinned_uses_marked_beads_metadata_and_generic_pinned_is_refused
 
 #[test]
 fn sqlite_request_ids_bind_operation_and_target() {
+    use sqlx::Connection;
     use store_contract::{Actor, Draft, GraphStore, StoreError};
     let path = std::env::temp_dir().join(format!(
         "atomic-graph-requests-{}.sqlite",
@@ -3045,22 +4104,28 @@ fn sqlite_request_ids_bind_operation_and_target() {
             .expect("create one");
         assert_eq!(
             store
-                .create_item(
-                    actor.clone(),
-                    "same".into(),
-                    Draft::new("at-one", "Changed title")
-                )
+                .create_item(actor.clone(), "same".into(), Draft::new("at-one", "One"))
                 .await
                 .expect("retry one"),
             first
         );
         assert!(matches!(
             store
+                .create_item(
+                    actor.clone(),
+                    "same".into(),
+                    Draft::new("at-one", "Changed title")
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
+        assert!(matches!(
+            store
                 .create_item(actor.clone(), "same".into(), Draft::new("at-two", "Two"))
                 .await,
             Err(StoreError::RequestConflict { .. })
         ));
-        store
+        let second = store
             .create_item(
                 actor.clone(),
                 "create-two".into(),
@@ -3068,6 +4133,26 @@ fn sqlite_request_ids_bind_operation_and_target() {
             )
             .await
             .expect("create two");
+        let mut legacy = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("legacy request database");
+        sqlx::query(
+            "UPDATE atomic_graph_requests SET value='at-two' WHERE request_id='create-two'",
+        )
+        .execute(&mut legacy)
+        .await
+        .expect("simulate a pre-fingerprint create request");
+        assert_eq!(
+            store
+                .create_item(
+                    actor.clone(),
+                    "create-two".into(),
+                    Draft::new("at-two", "Two")
+                )
+                .await
+                .expect("legacy request replays"),
+            second
+        );
         let one = store
             .claim(
                 actor.clone(),
@@ -3103,6 +4188,27 @@ fn sqlite_request_ids_bind_operation_and_target() {
             )
             .await
             .expect("note one");
+        assert!(matches!(
+            store
+                .create_item(
+                    actor.clone(),
+                    "note-one".into(),
+                    Draft::new("at-one", "One")
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
+        assert!(matches!(
+            store
+                .remember(
+                    actor.clone(),
+                    "note-one".into(),
+                    "at-one".into(),
+                    "wrong op".into()
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
         assert!(matches!(
             store
                 .note(actor.clone(), two, "note-one".into(), "two note".into())
@@ -3394,6 +4500,74 @@ fn sqlite_conditional_compensation_requires_persisted_terminal_failure() {
                 .iter()
                 .any(|item| item.id == "on-success" || item.id == "on-unknown")
         );
+        let restored_path = path.with_extension("restored.sqlite");
+        let _ = std::fs::remove_file(&restored_path);
+        let restored = sqlite_authorized_for_tests(&restored_path, std::time::SystemTime::now)
+            .expect("restored graph");
+        let export = reopened
+            .export(human.clone())
+            .await
+            .expect("export closed prerequisites");
+        restored
+            .import(human.clone(), export, false)
+            .await
+            .expect("restore closed prerequisites");
+        let restored_ready = restored
+            .ready(human.clone(), 20)
+            .await
+            .expect("ready after import");
+        assert_eq!(
+            restored_ready.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            ready.iter().map(|i| &i.id).collect::<Vec<_>>()
+        );
+        for (status, version, outcome) in [
+            ("open", 1, "failure"),
+            ("closed", 2, "failure"),
+            ("closed", 1, "retry"),
+        ] {
+            let bad = serde_json::json!({"id":"bad","title":"bad","status":status,
+                "metadata":{"atomic_graph":{"schema_version":version,"terminal_outcome":outcome}}});
+            assert!(
+                matches!(restored.import(human.clone(), bad.to_string(), false).await,
+                Err(StoreError::ImportRefused(errors)) if errors.iter().any(|e| e.contains("invalid native terminal outcome")))
+            );
+        }
+        restored
+            .set_status(human.clone(), "failure".into(), Status::Open)
+            .await
+            .expect("reopen imported failure");
+        let export = restored
+            .export(human.clone())
+            .await
+            .expect("export reopened item");
+        let entries: Vec<serde_json::Value> = export
+            .lines()
+            .map(|s| serde_json::from_str(s).expect("exported JSON"))
+            .collect();
+        let item = |id: &str| {
+            entries
+                .iter()
+                .find(|v| v["id"] == id)
+                .expect("exported item")
+        };
+        assert!(
+            item("failure")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .is_none()
+        );
+        assert_eq!(
+            item("success")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .and_then(|v| v.as_str()),
+            Some("success")
+        );
+        assert!(
+            item("unknown")
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .is_none()
+        );
+        drop(restored);
+        std::fs::remove_file(restored_path).expect("remove restored database");
         assert!(
             reopened
                 .claim(

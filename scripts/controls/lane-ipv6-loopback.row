@@ -1,0 +1,1 @@
+lane-ipv6-loopback|crates/atomic/src/model_policy.rs|Some(url::Host::Ipv6(ip)) => ip.is_loopback(),|Some(url::Host::Ipv6(_)) => false,|-p atomic-agentic --lib -- lane_http_requires_a_loopback_ip

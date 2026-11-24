@@ -163,10 +163,11 @@ impl LanePolicy {
             let url = url::Url::parse(&endpoint.base_url)
                 .map_err(|_| format!("model.lanes endpoint {id:?} has an invalid base_url"))?;
             let local_http = url.scheme() == "http"
-                && url.host_str().is_some_and(|host| {
-                    host.parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-                });
+                && match url.host() {
+                    Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                    Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                    _ => false,
+                };
             if url.scheme() != "https" && !local_http {
                 return Err(format!(
                     "model.lanes endpoint {id:?} must use https or loopback http"
@@ -270,6 +271,31 @@ mod tests {
         assert_eq!(policy.select("docs", ["polish"]).target.name, "qwen");
         assert_eq!(policy.select("task", ["polish"]).endpoint, "local");
         assert_eq!(policy.select("docs", ["security"]).endpoint, "local");
+    }
+
+    #[test]
+    fn lane_http_requires_a_loopback_ip() {
+        let mut policy = policy();
+        for (host, allowed) in [
+            ("127.0.0.1", true),
+            ("[::1]", true),
+            ("[2001:db8::1]", false),
+            ("192.0.2.1", false),
+            ("localhost", false),
+        ] {
+            policy
+                .endpoints
+                .get_mut("local")
+                .expect("local endpoint")
+                .base_url = format!("http://{host}:11434/v1");
+            match policy.validate() {
+                Ok(()) => assert!(allowed, "{host}"),
+                Err(error) => assert!(
+                    !allowed && error.contains("loopback http"),
+                    "{host}: {error}"
+                ),
+            }
+        }
     }
 
     #[test]

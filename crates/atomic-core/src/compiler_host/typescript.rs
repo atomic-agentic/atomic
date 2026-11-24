@@ -155,6 +155,72 @@ fn prepare(source: &str, file: &str) -> Result<String, String> {
     Ok(json!({"code":code,"imports":imports}).to_string())
 }
 
+// tsz 0.1.75 does not report unresolved imports from an in-memory program.
+// Its input is already the frozen, alias-rewritten source graph, so resolve
+// every request against that graph before accepting its type diagnostics.
+fn frozen_import_diagnostics(files: &BTreeMap<String, String>) -> Vec<Value> {
+    let mut errors = Vec::new();
+    for (file, source) in files {
+        if file.starts_with("/__lib/") || !(file.ends_with(".ts") || file.ends_with(".tsx")) {
+            continue;
+        }
+        let arena = Allocator::default();
+        let parsed = Parser::new(
+            &arena,
+            source,
+            if file.ends_with(".tsx") {
+                SourceType::tsx()
+            } else {
+                SourceType::ts()
+            },
+        )
+        .parse();
+        let mut visitor = LiteralText::default();
+        visitor.visit_program(&parsed.program);
+        let mut requests = visitor.type_imports;
+        for (name, items) in &parsed.module_record.requested_modules {
+            requests.extend(items.iter().map(|request| (name.to_string(), request.span)));
+        }
+        requests.sort_by_key(|(_, span)| span.start);
+        requests.dedup_by(|(left_name, left_span), (right_name, right_span)| {
+            left_name == right_name && left_span == right_span
+        });
+        for (name, span) in requests {
+            let resolved = if name.starts_with('.') {
+                let mut parts = file.rsplit_once('/').map_or(Vec::new(), |(dir, _)| {
+                    dir.split('/')
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                });
+                for part in name.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        _ => parts.push(part),
+                    }
+                }
+                let base = format!("/{}", parts.join("/"));
+                [".tsx", ".d.ts", ".ts", ""]
+                    .iter()
+                    .any(|extension| files.contains_key(&format!("{base}{extension}")))
+            } else {
+                false
+            };
+            if !resolved {
+                let byte = source.floor_char_boundary((span.start as usize).min(source.len()));
+                errors.push(json!({
+                    "file":file,
+                    "offset":source[..byte].encode_utf16().count(),
+                    "message":format!("TS2307: Cannot find module '{name}' or its corresponding type declarations.")
+                }));
+            }
+        }
+    }
+    errors
+}
+
 fn check(source: &str) -> Result<String, String> {
     use tsz_common::{CheckerOptions, options::checker::JsxMode};
     use tsz_core::{
@@ -166,6 +232,10 @@ fn check(source: &str) -> Result<String, String> {
     };
     let files: BTreeMap<String, String> =
         serde_json::from_str(source).map_err(|e| e.to_string())?;
+    let unresolved = frozen_import_diagnostics(&files);
+    if !unresolved.is_empty() {
+        return Ok(json!(unresolved).to_string());
+    }
     let bundled: BTreeMap<String, String> =
         serde_json::from_str(include_str!("../../assets/typescript-es2022.json"))
             .map_err(|e| e.to_string())?;
@@ -222,4 +292,45 @@ fn check(source: &str) -> Result<String, String> {
         }
     }
     Ok(json!(errors).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check, frozen_import_diagnostics};
+    use serde_json::{Value, json};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn missing_frozen_imports_are_located_before_tsz_checks_types() {
+        let files = json!({
+            "/p/atom.ts":"// é\nimport type { A } from './absent';\ntype B = import('uncaptured').B;",
+            "/p/other.ts":"export type { C } from './missing';"
+        });
+        let errors: Vec<Value> =
+            serde_json::from_str(&check(&files.to_string()).expect("checker response"))
+                .expect("diagnostics JSON");
+        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(errors[0]["file"], "/p/atom.ts");
+        assert_eq!(errors[0]["offset"], 28); // UTF-16, at the first import literal.
+        assert_eq!(
+            errors[0]["message"],
+            "TS2307: Cannot find module './absent' or its corresponding type declarations."
+        );
+        assert_eq!(
+            errors[1]["message"],
+            "TS2307: Cannot find module 'uncaptured' or its corresponding type declarations."
+        );
+        assert_eq!(errors[2]["file"], "/p/other.ts");
+    }
+
+    #[test]
+    fn captured_type_markdown_and_generated_tsx_imports_resolve() {
+        let files: BTreeMap<String, String> = serde_json::from_value(json!({
+            "/p/atom.astro.tsx":"import type { T } from './pkg/target.ts'; import text from './note.md?raw'; export type { T as U } from './pkg/target';",
+            "/p/pkg/target.ts":"export type { T } from './nested';",
+            "/p/pkg/nested.ts":"export type T = number;",
+            "/p/note.md?raw.d.ts":"declare const literal: string; export default literal;"
+        })).expect("frozen files");
+        assert!(frozen_import_diagnostics(&files).is_empty());
+    }
 }

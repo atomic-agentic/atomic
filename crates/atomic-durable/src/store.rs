@@ -959,6 +959,56 @@ pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
     open_sqlite_with(database, MIGRATIONS).await
 }
 
+/// Open a current store read-only for inspection. A missing database has
+/// an empty in-memory schema. For older databases, SQLite takes a consistent
+/// snapshot (including committed WAL pages) and only that snapshot migrates.
+pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let path = database.display().to_string();
+    let db = |source| StoreError::Database {
+        path: path.clone(),
+        source,
+    };
+    let mut conn = match std::fs::symlink_metadata(database) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SqliteConnection::connect("sqlite::memory:")
+                .await
+                .map_err(db)?
+        }
+        Err(error) => return Err(db(sqlx::Error::Io(error))),
+        Ok(_) => {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(database)
+                .read_only(true);
+            let mut source = SqliteConnection::connect_with(&options).await.map_err(db)?;
+            let (_, version) = sqlite_marker(&mut source, &path).await?;
+            if version >= STORE_VERSION {
+                // Reuse the normal newer-version and migration-history checks.
+                migrate(&mut source, &path, MIGRATIONS).await?;
+                return Ok(source);
+            }
+            // Named memory databases are process-local. The open destination
+            // holds this one alive until the caller finishes its inspection.
+            let name = format!("/atomic-inspect-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&name)
+                .vfs("memdb")
+                .create_if_missing(true);
+            let copy = SqliteConnection::connect_with(&options).await.map_err(db)?;
+            sqlx::query("VACUUM INTO ?")
+                .bind(format!("file:{name}?vfs=memdb"))
+                .execute(&mut source)
+                .await
+                .map_err(db)?;
+            copy
+        }
+    };
+    migrate(&mut conn, &path, MIGRATIONS).await?;
+    Ok(conn)
+}
+
 /// [`open_sqlite`], migrating with `migrations`.
 async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i64, StoreError> {
     let path = database.display().to_string();
@@ -1701,6 +1751,48 @@ mod tests {
             .get("n");
         assert_eq!(n, 0, "the migration past the gap ran");
         let _ = c.close().await;
+    }
+
+    #[tokio::test]
+    async fn inspection_reads_committed_wal_pages_and_migrates_only_its_copy() {
+        let path = db("inspection");
+        let legacy = &MIGRATIONS[..MIGRATIONS.len() - 1];
+        let version = open_sqlite_with(&path, legacy).await.expect("old store");
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let mut writer = SqliteConnection::connect_with(&options)
+            .await
+            .expect("writer");
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut writer)
+            .await
+            .expect("enable WAL");
+        sqlx::query(
+            "INSERT INTO atomic_graph_memories VALUES ('inspection','committed','external')",
+        )
+        .execute(&mut writer)
+        .await
+        .expect("commit memory");
+        let mut copy = inspect_sqlite(&path).await.expect("inspect old store");
+        assert_eq!(
+            sqlite_marker(&mut copy, "copy")
+                .await
+                .expect("copy version"),
+            (true, STORE_VERSION)
+        );
+        let text: String =
+            sqlx::query_scalar("SELECT value FROM atomic_graph_memories WHERE key='inspection'")
+                .fetch_one(&mut copy)
+                .await
+                .expect("committed WAL row");
+        assert_eq!(text, "committed");
+        assert_eq!(
+            sqlite_marker(&mut writer, "source")
+                .await
+                .expect("source version"),
+            (true, version)
+        );
+        writer.close().await.expect("close writer");
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[tokio::test]

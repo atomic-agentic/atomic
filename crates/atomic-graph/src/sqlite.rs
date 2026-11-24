@@ -134,6 +134,8 @@ pub struct SqliteStore {
     conn: Arc<Mutex<SqliteConnection>>,
     now: Arc<dyn Fn() -> SystemTime + Send + Sync>,
     human: Option<HumanCredential>,
+    #[cfg(debug_assertions)]
+    projection_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl SqliteStore {
     /// Open a graph database. Existing graph rows survive reopening.
@@ -166,8 +168,24 @@ impl SqliteStore {
             conn: Arc::new(Mutex::new(conn)),
             now: Arc::new(now),
             human: None,
+            #[cfg(debug_assertions)]
+            projection_pause: None,
         })
     }
+    /// Inspect a graph without creating or upgrading the project database.
+    pub async fn open_for_inspection(path: &Path) -> Result<Self, StoreError> {
+        let conn = atomic_durable::store::inspect_sqlite(path)
+            .await
+            .map_err(db)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            now: Arc::new(SystemTime::now),
+            human: None,
+            #[cfg(debug_assertions)]
+            projection_pause: None,
+        })
+    }
+
     /// Open a graph store for a person whose enrolled credential is checked
     /// inside every write transaction. The supplied actor name grants nothing.
     pub fn open_authorized(
@@ -178,6 +196,57 @@ impl SqliteStore {
         let mut store = Self::open(path, now)?;
         store.human = Some(credential);
         Ok(store)
+    }
+
+    /// Test seam for pausing between projection deletion and re-insertion.
+    /// It is absent from release builds and cannot be set through graph data.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn with_projection_pause(mut self, pause: impl Fn() + Send + Sync + 'static) -> Self {
+        self.projection_pause = Some(Arc::new(pause));
+        self
+    }
+
+    /// Resolve a prior keyed create before deriving a new generated ID. Older
+    /// releases generated eight-hex-digit IDs; a replay must keep that target
+    /// even after new creates use a longer hash. `create_item` still checks the
+    /// stored target and payload fingerprint in its write transaction.
+    pub async fn created_item_id_for_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let request_id = request_id.to_owned();
+        self.read(move |conn| {
+            Box::pin(async move {
+                let row =
+                    sqlx::query("SELECT kind,value FROM atomic_graph_requests WHERE request_id=?")
+                        .bind(&request_id)
+                        .fetch_optional(conn)
+                        .await
+                        .map_err(db)?;
+                let Some(row) = row else { return Ok(None) };
+                let kind: String = row.try_get("kind").map_err(db)?;
+                if kind != "create" {
+                    return Err(StoreError::RequestConflict { request_id });
+                }
+                let value: String = row.try_get("value").map_err(db)?;
+                let id = if let Some(encoded) = value.strip_prefix("create-v2:") {
+                    let saved: serde_json::Value = serde_json::from_str(encoded).map_err(db)?;
+                    saved
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| db("create request has no item ID"))?
+                        .to_owned()
+                } else if !value.is_empty() {
+                    value
+                } else {
+                    return Err(db("create request has no item ID"));
+                };
+                Ok(Some(id))
+            })
+        })
+        .await
     }
 
     /// Admit one durable graph run as the enrolled operator. Credential
@@ -472,6 +541,8 @@ impl SqliteStore {
     ) -> Result<T, StoreError> {
         let connection = Arc::clone(&self.conn);
         let credential = self.human.clone();
+        #[cfg(debug_assertions)]
+        let projection_pause = self.projection_pause.clone();
         let (answer, received) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let result = (|| {
@@ -503,14 +574,21 @@ impl SqliteStore {
                     let result = f(&mut conn).await;
                     match result {
                         Ok(value) => {
-                            if write && let Err(error) = refresh_projection(&mut conn).await {
+                            if write
+                                && let Err(error) = refresh_projection(
+                                    &mut conn,
+                                    #[cfg(debug_assertions)]
+                                    projection_pause.as_deref(),
+                                )
+                                .await
+                            {
                                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                                 return Err(error);
                             }
                             match sqlx::query("COMMIT").execute(&mut *conn).await {
                                 Ok(_) => Ok(value),
                                 Err(_) => {
-                                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; // CONTROL_OFF: graph-commit-recovery
                                     Err(StoreError::OutcomeUnknown {
                                         operation: "commit",
                                     })
@@ -555,13 +633,14 @@ impl SqliteStore {
     }
 }
 
-/// Make a short stable item ID from source bytes; collisions remain the caller's concern.
+/// Make a stable 96-bit item ID from source bytes. Older short IDs remain
+/// replayable through the stored request target.
 pub fn hash_id(namespace: &str, source: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(namespace.as_bytes());
     h.update([0]);
     h.update(source);
-    format!("at-{:x}", h.finalize())[..11].to_owned()
+    format!("at-{:x}", h.finalize())[..27].to_owned()
 }
 
 async fn get_item(conn: &mut SqliteConnection, id: &str) -> Result<Option<Item>, StoreError> {
@@ -595,11 +674,67 @@ async fn request_seen(
     }
     Ok(true)
 }
-async fn refresh_projection(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+fn create_request_fingerprint(actor: &Actor, draft: &Draft) -> Result<String, StoreError> {
+    let payload = serde_json::json!({
+        "actor": &actor.principal,
+        "human": actor.human,
+        "id": &draft.id,
+        "title": &draft.title,
+        "body": &draft.body,
+        "kind": &draft.kind,
+        "priority": draft.priority,
+        "status": draft.status.as_str(),
+        "parent": &draft.parent,
+        "due_at_ms": draft.due_at.map(millis),
+        "notes": &draft.notes,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(db)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+async fn create_request_seen(
+    conn: &mut SqliteConnection,
+    request_id: &str,
+    target: &str,
+    fingerprint: &str,
+) -> Result<bool, StoreError> {
+    let row = sqlx::query("SELECT kind,value FROM atomic_graph_requests WHERE request_id=?")
+        .bind(request_id)
+        .fetch_optional(conn)
+        .await
+        .map_err(db)?;
+    let Some(row) = row else { return Ok(false) };
+    let kind: String = row.try_get("kind").map_err(db)?;
+    let value: String = row.try_get("value").map_err(db)?;
+    // Stores written before payload fingerprints kept only the item ID. They
+    // remain replayable, although their original draft cannot be recovered.
+    let same = if value == target {
+        true
+    } else if let Some(encoded) = value.strip_prefix("create-v2:") {
+        let saved: serde_json::Value = serde_json::from_str(encoded).map_err(db)?;
+        saved.get("id").and_then(serde_json::Value::as_str) == Some(target)
+            && saved.get("sha256").and_then(serde_json::Value::as_str) == Some(fingerprint)
+    } else {
+        false
+    };
+    if kind != "create" || !same {
+        return Err(StoreError::RequestConflict {
+            request_id: request_id.to_owned(),
+        });
+    }
+    Ok(true)
+}
+async fn refresh_projection(
+    conn: &mut SqliteConnection,
+    #[cfg(debug_assertions)] pause: Option<&(dyn Fn() + Send + Sync)>,
+) -> Result<(), StoreError> {
     sqlx::query("DELETE FROM atomic_graph_blocked")
         .execute(&mut *conn)
         .await
         .map_err(db)?;
+    #[cfg(debug_assertions)]
+    if let Some(pause) = pause {
+        pause();
+    }
     sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND b.status='pinned')")
         .execute(conn).await.map_err(db)?;
     Ok(())
@@ -615,13 +750,26 @@ async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, S
         .map(|r| r.try_get("target").map_err(db))
         .collect()
 }
+// `atomic_graph_blocked` already holds every unresolved direct blocker. Any
+// longer path starts with one of these rows, so source membership needs only
+// this indexed lookup; expanding all reachable pairs adds no information.
+const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
+const CLAIM_HAS_BLOCKER_SQL: &str =
+    "SELECT EXISTS (SELECT 1 FROM atomic_graph_blocked WHERE source=?)";
 async fn ready_items(
     conn: &mut SqliteConnection,
     now: i64,
     limit: usize,
     include_unheld_in_progress: bool,
 ) -> Result<Vec<Item>, StoreError> {
-    let rows=sqlx::query("WITH RECURSIVE blocked_chain(source,target) AS (SELECT source,target FROM atomic_graph_blocked UNION SELECT chain.source,b.target FROM blocked_chain chain JOIN atomic_graph_blocked b ON b.source=chain.target) SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM blocked_chain chain WHERE chain.source=i.id) ORDER BY i.priority, i.id LIMIT ?").bind(now).bind(i64::from(include_unheld_in_progress)).bind(now).bind(limit as i64).fetch_all(conn).await.map_err(db)?;
+    let rows = sqlx::query(READY_ITEMS_SQL)
+        .bind(now)
+        .bind(i64::from(include_unheld_in_progress))
+        .bind(now)
+        .bind(limit as i64)
+        .fetch_all(conn)
+        .await
+        .map_err(db)?;
     rows.iter().map(item).collect()
 }
 async fn lease_row(
@@ -858,14 +1006,16 @@ impl GraphStore for SqliteStore {
                 return Err(StoreError::CannotCreateClosed { item_id: draft.id });
             }
             let actor = self.actor_for_write(actor, "create a human item")?;
+            let fingerprint = create_request_fingerprint(&actor, &draft)?;
             self.run_at(move |c, now|Box::pin(async move {
-   if request_seen(c,&request_id,"create",&draft.id).await? { return get_item(c,&draft.id).await?.ok_or_else(||db("create request refers to missing item")); }
+   if create_request_seen(c,&request_id,&draft.id,&fingerprint).await? { return get_item(c,&draft.id).await?.ok_or_else(||db("create request refers to missing item")); }
    if let Some(parent)=&draft.parent && get_item(c,parent).await?.is_none() { return Err(StoreError::MissingItem { item_id: parent.clone() }); }
    let status=draft.status.as_str();let closed=if draft.status==Status::Closed {Some(now)}else{None};let tr=trust(&actor);
    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&draft.id).bind(&draft.title).bind(&draft.body).bind(&draft.kind).bind(draft.priority).bind(status).bind(&draft.parent).bind(tr.as_str()).bind(&actor.principal).bind(now).bind(closed).bind(draft.due_at.map(millis)).execute(&mut *c).await.map_err(db)?;
    if let Some(parent)=&draft.parent {sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)").bind(&draft.id).bind(parent).execute(&mut *c).await.map_err(db)?;}
    for (n,text) in draft.notes.iter().enumerate(){sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?,?)").bind(&draft.id).bind(n as i64).bind(text).bind(&actor.principal).bind(tr.as_str()).execute(&mut *c).await.map_err(db)?;}
-   sqlx::query("INSERT INTO atomic_graph_requests VALUES (?,'create',?)").bind(request_id).bind(&draft.id).execute(&mut *c).await.map_err(db)?;
+   let request_value = format!("create-v2:{}", serde_json::json!({"id":&draft.id,"sha256":fingerprint}));
+   sqlx::query("INSERT INTO atomic_graph_requests VALUES (?,'create',?)").bind(request_id).bind(request_value).execute(&mut *c).await.map_err(db)?;
    get_item(c,&draft.id).await?.ok_or_else(||db("inserted item missing"))
   })).await
         }
@@ -973,7 +1123,9 @@ impl GraphStore for SqliteStore {
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
         async move {
             let actor = self.actor_for_write(actor, "set status")?;
-            if !actor.human {
+            // CONTROL_OFF: graph-agent-status-human-only
+            let agent_status_action = !actor.human;
+            if agent_status_action {
                 return Err(StoreError::NeedsHumanCredential {
                     action: "set status".to_owned(),
                 });
@@ -1259,7 +1411,9 @@ impl GraphStore for SqliteStore {
                                     .map_err(db)?;
                             if let Some(row) = existing {
                                 let old: String = row.try_get("trust").map_err(db)?;
-                                if old == "human" || old == "approved" {
+                                // CONTROL_OFF: graph-agent-memory-trust
+                                let trusted_memory = old == "human" || old == "approved";
+                                if trusted_memory {
                                     return Err(StoreError::NeedsHumanCredential {
                                         action: "replace trusted memory".to_owned(),
                                     });
@@ -1548,10 +1702,17 @@ impl GraphStore for SqliteStore {
                     action: "import graph".to_owned(),
                 });
             }
-            self.run_at(move |c, now| {
-                Box::pin(async move { import_jsonl(c, &jsonl, dry_run, now).await })
-            })
-            .await
+            if dry_run {
+                self.read_at(move |c, now| {
+                    Box::pin(async move { import_jsonl(c, &jsonl, true, now).await })
+                })
+                .await
+            } else {
+                self.run_at(move |c, now| {
+                    Box::pin(async move { import_jsonl(c, &jsonl, false, now).await })
+                })
+                .await
+            }
         }
     }
     fn export(&self, _actor: Actor) -> impl Future<Output = Result<String, StoreError>> + Send {
@@ -1594,7 +1755,12 @@ async fn claim_id(
     if i.kind == "goal"
         || i.kind == "message"
         || i.due_at.is_some_and(|due| millis(due) > now)
-        || !blocked(c, id).await?.is_empty()
+        || sqlx::query_scalar::<_, i64>(CLAIM_HAS_BLOCKER_SQL)
+            .bind(id)
+            .fetch_one(&mut *c)
+            .await
+            .map_err(db)?
+            != 0
     {
         return Ok(None);
     }
@@ -1682,6 +1848,10 @@ async fn import_jsonl(
         }
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(mut v) => {
+                // Keep the historical short ghp_ marker as well as the shared
+                // redactor's provider, field-name and structured-value rules.
+                scrub_import_text(&mut v);
+                atomic_core::redact::value(&mut v);
                 if let Some(record_type) = v.get("_type") {
                     if record_type != "memory" {
                         errors.push(format!("line {} has unsupported _type", n + 1));
@@ -1692,13 +1862,7 @@ async fn import_jsonl(
                         errors.push(format!("line {} memory needs string key and value", n + 1));
                         continue;
                     };
-                    let key = key.to_owned();
-                    let value = if value.contains("ghp_") {
-                        "[redacted]".to_owned()
-                    } else {
-                        value.to_owned()
-                    };
-                    memories.push((key, value));
+                    memories.push((key.to_owned(), value.to_owned()));
                     continue;
                 }
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
@@ -1707,6 +1871,17 @@ async fn import_jsonl(
                 let status = json_str(&v, "status").unwrap_or("");
                 if status == "pinned" || Status::parse(status).is_none() {
                     errors.push(format!("line {} has unsupported status {status}", n + 1));
+                }
+                if let Some(outcome) = v.pointer("/metadata/atomic_graph/terminal_outcome")
+                    && (v.pointer("/metadata/atomic_graph/schema_version")
+                        != Some(&serde_json::json!(1))
+                        || status != "closed"
+                        || !matches!(outcome.as_str(), Some("success" | "failure")))
+                {
+                    errors.push(format!(
+                        "line {} has invalid native terminal outcome",
+                        n + 1
+                    ));
                 }
                 if let Some(pinned) = v.get("pinned") {
                     match pinned.as_bool() {
@@ -1784,7 +1959,6 @@ async fn import_jsonl(
                         );
                     }
                 }
-                scrub_import_text(&mut v);
                 let normalized = serde_json::to_string(&v).map_err(db)?;
                 lines.push((v, normalized))
             }
@@ -1879,19 +2053,42 @@ async fn import_jsonl(
                 .and_then(|dep| json_str(dep, "depends_on_id"))
         });
         let due = import_date(&v, "due_at")?;
-        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at,imported_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(&id).bind(json_str(&v,"title").unwrap_or("")).bind(json_str(&v,"description").unwrap_or("")).bind(json_str(&v,"issue_type").unwrap_or("task")).bind(v.get("priority").and_then(serde_json::Value::as_i64).unwrap_or(2)).bind(status).bind(parent).bind("external").bind("bd").bind(created).bind(closed).bind(due).bind(&raw).execute(&mut *c).await.map_err(db)?;
+        if !dry_run {
+            let terminal_outcome = v
+                .pointer("/metadata/atomic_graph/terminal_outcome")
+                .and_then(serde_json::Value::as_str);
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at,imported_json,terminal_outcome) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                .bind(&id)
+                .bind(json_str(&v, "title").unwrap_or(""))
+                .bind(json_str(&v, "description").unwrap_or(""))
+                .bind(json_str(&v, "issue_type").unwrap_or("task"))
+                .bind(v.get("priority").and_then(serde_json::Value::as_i64).unwrap_or(2))
+                .bind(status)
+                .bind(parent)
+                .bind("external")
+                .bind("bd")
+                .bind(created)
+                .bind(closed)
+                .bind(due)
+                .bind(&raw)
+                .bind(terminal_outcome)
+                .execute(&mut *c)
+                .await.map_err(db)?;
+        }
         report.added.push(id.clone());
         report.external += 1;
         if status == "in_progress" {
             report.in_progress += 1
         }
         if let Some(p) = parent {
-            sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)")
-                .bind(&id)
-                .bind(p)
-                .execute(&mut *c)
-                .await
-                .map_err(db)?;
+            if !dry_run {
+                sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)")
+                    .bind(&id)
+                    .bind(p)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(db)?;
+            }
             report.parents_set += 1
         }
         if let Some(deps) = v.get("dependencies").and_then(serde_json::Value::as_array) {
@@ -1899,13 +2096,15 @@ async fn import_jsonl(
             for dep in deps {
                 let target = json_str(dep, "depends_on_id").unwrap_or("");
                 let kind = json_str(dep, "type").unwrap_or("");
-                sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,?,?)")
-                    .bind(&id)
-                    .bind(kind)
-                    .bind(target)
-                    .execute(&mut *c)
-                    .await
-                    .map_err(db)?;
+                if !dry_run {
+                    sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,?,?)")
+                        .bind(&id)
+                        .bind(kind)
+                        .bind(target)
+                        .execute(&mut *c)
+                        .await
+                        .map_err(db)?;
+                }
                 if kind == "blocks" {
                     report.dependencies_added += 1
                 } else if kind != "parent-child" {
@@ -1920,20 +2119,11 @@ async fn import_jsonl(
         if let Some(text) = json_str(&v, "notes")
             && !text.trim().is_empty()
         {
-            notes.push((
-                "bd".to_owned(),
-                if text.contains("ghp_") {
-                    "[redacted]".to_owned()
-                } else {
-                    text.to_owned()
-                },
-            ))
+            notes.push(("bd".to_owned(), text.to_owned()))
         }
         if let Some(comments) = v.get("comments").and_then(serde_json::Value::as_array) {
             for comment in comments {
-                if let Some(text) = json_str(comment, "text")
-                    && !text.contains("ghp_")
-                {
+                if let Some(text) = json_str(comment, "text") {
                     notes.push((
                         format!("bd:{}", json_str(comment, "author").unwrap_or("unknown")),
                         text.to_owned(),
@@ -1942,14 +2132,16 @@ async fn import_jsonl(
             }
         }
         for (n, (author, text)) in notes.into_iter().enumerate() {
-            sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?, 'external')")
-                .bind(&id)
-                .bind(n as i64)
-                .bind(text)
-                .bind(author)
-                .execute(&mut *c)
-                .await
-                .map_err(db)?;
+            if !dry_run {
+                sqlx::query("INSERT INTO atomic_graph_notes VALUES (?,?,?,?, 'external')")
+                    .bind(&id)
+                    .bind(n as i64)
+                    .bind(text)
+                    .bind(author)
+                    .execute(&mut *c)
+                    .await
+                    .map_err(db)?;
+            }
             report.notes_added += 1
         }
         for key in ["labels", "external_ref", "acceptance_criteria"] {
@@ -1958,7 +2150,21 @@ async fn import_jsonl(
             }
         }
     }
+    let mut preview_keys = std::collections::BTreeSet::new();
     for (key, value) in memories {
+        if dry_run {
+            if preview_keys.insert(key.clone())
+                && sqlx::query("SELECT 1 FROM atomic_graph_memories WHERE key=?")
+                    .bind(&key)
+                    .fetch_optional(&mut *c)
+                    .await
+                    .map_err(db)?
+                    .is_none()
+            {
+                *report.kept.entry("memories".to_owned()).or_default() += 1;
+            }
+            continue;
+        }
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO atomic_graph_memories (key,value,trust) VALUES (?,?,'external')",
         )
@@ -2016,6 +2222,19 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
                     meta.remove("atomic_graph");
                 }
             }
+        }
+        let outcome: Option<String> = row.try_get("terminal_outcome").map_err(db)?;
+        if let Some(outcome) = outcome {
+            if !value["metadata"]["atomic_graph"].is_object() {
+                value["metadata"]["atomic_graph"] = serde_json::json!({});
+            }
+            value["metadata"]["atomic_graph"]["schema_version"] = 1.into();
+            value["metadata"]["atomic_graph"]["terminal_outcome"] = outcome.into();
+        } else if let Some(marker) = value
+            .pointer_mut("/metadata/atomic_graph")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            marker.remove("terminal_outcome");
         }
         if !imported || value.get("created_at").is_none() {
             value["created_at"] = date_string(i.created_at).into();
@@ -2118,6 +2337,61 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_and_claim_use_the_blocker_source_index_without_a_recursive_closure() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-blocker-plan-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut conn = store.conn.lock().expect("graph connection");
+        let ready_sql = format!("EXPLAIN QUERY PLAN {READY_ITEMS_SQL}");
+        let claim_sql = format!("EXPLAIN QUERY PLAN {CLAIM_HAS_BLOCKER_SQL}");
+        let plans = runtime.block_on(async {
+            // The EXPLAIN prefix and queried SQL are both fixed source text.
+            let ready = sqlx::query(sqlx::AssertSqlSafe(ready_sql))
+                .bind(0_i64)
+                .bind(0_i64)
+                .bind(0_i64)
+                .bind(10_i64)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("ready query plan");
+            let claim = sqlx::query(sqlx::AssertSqlSafe(claim_sql))
+                .bind("at-item")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("claim blocker query plan");
+            [ready, claim].map(|rows| {
+                rows.iter()
+                    .map(|row| row.try_get::<String, _>("detail").expect("plan detail"))
+                    .collect::<Vec<_>>()
+            })
+        });
+        for (plan, table) in plans.iter().zip(["b", "atomic_graph_blocked"]) {
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.contains(&format!("SEARCH {table} USING"))
+                        && detail.contains("(source=?)")),
+                "blocker source lookup did not use its index: {plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|detail| detail.contains("CO-ROUTINE") || detail.contains("MATERIALIZE")),
+                "blocker lookup materialized a recursive result: {plan:?}"
+            );
+        }
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn sqlite_commit_failure_rolls_back_and_next_operation_runs() {

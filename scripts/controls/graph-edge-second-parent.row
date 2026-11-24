@@ -1,0 +1,1 @@
+graph-edge-second-parent|crates/atomic-graph/src/sqlite.rs|&& parent != to|&& std::hint::black_box(false) && parent != to|-p atomic-agentic-graph --test conformance sqlite_edge_endpoints_and_parent_identity_are_atomic

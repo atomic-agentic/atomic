@@ -261,6 +261,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 worktrees: ProjectWorktrees::FixtureOnly,
                 caches: None,
                 trial_cargo: None,
+                trial_denied: Vec::new(),
                 budgets: Arc::default(),
                 context: None,
             },

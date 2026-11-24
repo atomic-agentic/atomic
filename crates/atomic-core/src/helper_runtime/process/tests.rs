@@ -196,7 +196,10 @@ fn the_first_call_in_a_child_sees_utc_and_en_us() {
                 &captured,
                 "probe",
                 &json!([]),
-                Limits::default(),
+                Limits {
+                    deadline: Duration::from_secs(10),
+                    ..Limits::default()
+                },
                 CLOCK,
             )
             .expect("runs"),

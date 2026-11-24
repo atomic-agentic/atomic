@@ -220,6 +220,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             ))),
             caches: None,
             trial_cargo: None,
+            trial_denied: Vec::new(),
             budgets: Arc::default(),
             context: None,
         },

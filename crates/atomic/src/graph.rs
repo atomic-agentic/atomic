@@ -32,6 +32,9 @@ pub enum GraphCommand {
         /// Explicit item ID; otherwise a fresh short hash is used.
         #[arg(long)]
         id: Option<String>,
+        /// Stable key for retrying this create; otherwise a fresh key is used.
+        #[arg(long)]
+        request_id: Option<String>,
         /// Body or acceptance criteria.
         #[arg(long, default_value = "")]
         body: String,
@@ -333,9 +336,6 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
         bail!("work-graph commands currently require a SQLite project store");
     }
     let path = state.database();
-    // Keep the CLI's normal refusal of a store written by a newer atomic.
-    // This runs only after the configured database was shown to be SQLite.
-    atomic_durable::store::open_sqlite(&path).await?;
     let privileged = match &command {
         GraphCommand::Policy { action } => policy_write(action),
         GraphCommand::Criteria { action } => criteria_write(action),
@@ -358,7 +358,7 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             crate::gates::operator_credential(state)?,
         )
     } else {
-        SqliteStore::open(&path, SystemTime::now)
+        SqliteStore::open_for_inspection(&path).await
     }
     .with_context(|| format!("open the work graph at {}", path.display()))?;
     let actor = if privileged {
@@ -370,14 +370,26 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
         GraphCommand::Create {
             title,
             id,
+            request_id,
             body,
             kind,
             priority,
             pinned,
         } => {
-            let request = fresh_request()?;
-            let id = id
-                .unwrap_or_else(|| atomic_graph::sqlite::hash_id("graph-cli", request.as_bytes()));
+            let request = match request_id {
+                Some(request) if !request.is_empty() && request.len() <= 128 => request,
+                Some(_) => bail!("--request-id must contain 1 to 128 bytes"),
+                None => fresh_request()?,
+            };
+            let id = match id {
+                Some(id) => id,
+                None => store
+                    .created_item_id_for_request(&request)
+                    .await?
+                    .unwrap_or_else(|| {
+                        atomic_graph::sqlite::hash_id("graph-cli", request.as_bytes())
+                    }),
+            };
             let mut draft = Draft::new(&id, &title);
             draft.body = body;
             draft.kind = kind;

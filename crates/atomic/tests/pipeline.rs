@@ -586,6 +586,7 @@ async fn engine_built_with_trial(
             worktrees,
             caches: None,
             trial_cargo,
+            trial_denied: vec![dir.join("shared-scratch")],
             budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
@@ -6070,6 +6071,17 @@ fn non_worktree_test_criterion_runs_in_a_worktree_workflow() {
             "steps:\n  read:\n    atom: read-note\n    with: {text: input.text}\n    criteria:\n      - {kind: test, argv: [/usr/bin/false], timeout_ms: 1000}\n  code:\n    after: [read]\n",
         );
         assert_ne!(source, SELF_REVIEW_WORKFLOW);
+        use std::os::unix::fs::PermissionsExt;
+        let marker = format!("sk-proj-{}", "B".repeat(48));
+        let program = dir.join("failing-check");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho 'check failed: {marker}' >&2\nexit 1\n"),
+        )
+        .expect("write criterion");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make criterion executable");
+        let source = source.replace("/usr/bin/false", program.to_str().expect("fixture path"));
         let pipeline = load(&project, "mixed-criteria.workflow.yaml", &source);
         let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(READ.into())])
             .await
@@ -6093,6 +6105,27 @@ fn non_worktree_test_criterion_runs_in_a_worktree_workflow() {
         assert!(error.contains("criteria still fail"), "{error}");
         assert!(!error.contains("host-recorded candidate commit"), "{error}");
         assert_eq!(model.calls(), 2, "coding atom was not called");
+        let steps = rt
+            .steps("mixed-criteria")
+            .await
+            .expect("criterion checkpoints");
+        let checkpoint = steps
+            .iter()
+            .find(|step| step.name == "read.criteria.0.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("first criterion output")
+            .to_string();
+        let repair = model.requests()[1].to_string();
+        for diagnostic in [&checkpoint, &repair, &error] {
+            assert!(
+                diagnostic.contains("check failed: [REDACTED]"),
+                "missing redacted diagnostic"
+            );
+            assert!(
+                !diagnostic.contains(&marker),
+                "raw credential in diagnostic"
+            );
+        }
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
@@ -6124,7 +6157,7 @@ fn unknown_test_criterion_release_terminalizes_without_running_the_effect_again(
                 program: command.program.clone(),
                 code: None,
                 message: "lost after dispatch".into(),
-                stderr: String::new(),
+                stderr: format!("runner log: sk-proj-{}", "K".repeat(48)),
             })
         }
         fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
@@ -6185,6 +6218,24 @@ fn unknown_test_criterion_release_terminalizes_without_running_the_effect_again(
             .expect_err("release terminalizes unknown outcome")
             .to_string();
         assert!(error.contains("outcome unknown"), "{error}");
+        let steps = rt
+            .steps("criterion-unknown")
+            .await
+            .expect("steps after release");
+        let record = steps
+            .iter()
+            .find(|s| s.name == "read.criteria.0.0")
+            .and_then(|s| s.output.as_ref())
+            .expect("unknown criterion record")
+            .to_string();
+        let marker = format!("sk-proj-{}", "K".repeat(48));
+        for diagnostic in [&record, &error] {
+            assert!(
+                diagnostic.contains("runner log: [REDACTED]"),
+                "missing runner diagnostic"
+            );
+            assert!(!diagnostic.contains(&marker), "raw runner credential");
+        }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(model.calls(), 1, "no repair or reviewer runs");
         rt.shutdown(std::time::Duration::from_secs(5))
@@ -6925,7 +6976,12 @@ fn failed_trial_check_reaches_author_repair_before_review() {
     on_codex_runtime(async {
         let dir = scratch("trial-merge-repair");
         let project = project(&dir);
-        let (mut pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(7)\"");
+        let stdout_secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let stderr_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let check = format!(
+            "\"import sys; print('{stdout_secret}'); print('{stderr_secret}', file=sys.stderr); sys.exit(7)\""
+        );
+        let (mut pipeline, base) = trial_reviewed(&project, &check);
         let Step::Atom(code) = &mut pipeline.steps[0] else {
             panic!("code step")
         };
@@ -6958,13 +7014,37 @@ fn failed_trial_check_reaches_author_repair_before_review() {
             repair_request.contains("trial_merge") && repair_request.contains("check 1"),
             "{repair_request}"
         );
-        let names: Vec<String> = rt
-            .steps("trial-merge-repair")
-            .await
-            .expect("steps")
-            .into_iter()
-            .map(|step| step.name)
-            .collect();
+        let steps = rt.steps("trial-merge-repair").await.expect("steps");
+        let trial_record = steps
+            .iter()
+            .find(|step| step.name == "code.trial_merge.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("durable trial result")
+            .to_string();
+        let terminal_error = error.to_string();
+        for (place, text) in [
+            ("durable checkpoint", trial_record.as_str()),
+            ("repair request", repair_request.as_str()),
+            ("terminal error", terminal_error.as_str()),
+        ] {
+            assert!(
+                !text.contains(stdout_secret),
+                "{place} leaked stdout: {text}"
+            );
+            assert!(
+                !text.contains(stderr_secret),
+                "{place} leaked stderr: {text}"
+            );
+            assert!(
+                text.contains("[REDACTED]"),
+                "{place} lost redaction: {text}"
+            );
+            assert!(
+                text.contains("check 1"),
+                "{place} lost check context: {text}"
+            );
+        }
+        let names: Vec<String> = steps.into_iter().map(|step| step.name).collect();
         assert!(
             names.iter().any(|name| name == "code.trial_merge.0")
                 && names.iter().any(|name| name == "code.trial_merge.1"),
@@ -6981,6 +7061,96 @@ fn failed_trial_check_reaches_author_repair_before_review() {
             .await
             .expect("shutdown");
     });
+}
+
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn confined_trial_backend(dir: &Path, through_runner: bool) -> atomic_exec::Backend {
+    use std::os::unix::fs::symlink;
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_atomic"));
+    let helper = dir.join("codex-linux-sandbox");
+    symlink(&binary, &helper).expect("sandbox helper link");
+    let paths = CodexPaths::with_helpers(binary.clone(), helper);
+    let sandbox = atomic_core::codex::ExecSandbox::new(
+        &paths,
+        atomic_core::codex::StateGuard::NoProjectState,
+        dir.join("codex"),
+    )
+    .expect("Linux sandbox");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "trial-denied-backend-{}-{}",
+        std::process::id(),
+        through_runner
+    ));
+    let local = atomic_exec::LocalBackend::in_dir(scratch).confined(Arc::new(sandbox));
+    if through_runner {
+        atomic_exec::Backend::connect(atomic_exec::runner::ProcessRunner {
+            workspaces: local,
+            ..atomic_exec::runner::ProcessRunner::atomic(binary)
+        })
+        .expect("process runner")
+    } else {
+        atomic_exec::Backend::connect(local).expect("local backend")
+    }
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn trial_checks_deny_other_projects_scratch_with_local_and_process_runners() {
+    for through_runner in [false, true] {
+        on_codex_runtime(async move {
+            let dir = scratch(if through_runner {
+                "trial-denied-process"
+            } else {
+                "trial-denied-local"
+            });
+            let project = project(&dir);
+            let sibling = dir.join("shared-scratch/another-project/run");
+            std::fs::create_dir_all(&sibling).expect("other project scratch");
+            std::fs::write(sibling.join("private"), "other-project-secret")
+                .expect("other project secret");
+            let check = format!(
+                "[python3, -c, \"import os,pathlib; other=pathlib.Path('{}'); assert not os.access(other, os.R_OK), 'other-project scratch was readable'; pathlib.Path('own-check').write_text('ok'); pathlib.Path(os.environ['HOME'], 'own-cache').write_text('ok')\"]",
+                sibling.join("private").display()
+            );
+            let (pipeline, base) = trial_reviewed_command(&project, &check);
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let backend = confined_trial_backend(&dir, through_runner);
+            let rt = engine_full(
+                &dir,
+                &model.base_url(),
+                BudgetSettings::default(),
+                "synthetic",
+                Some(backend),
+            )
+            .await;
+            rt.start(
+                PIPELINE,
+                "trial-denied",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let result: Value = rt
+                .result("trial-denied")
+                .await
+                .expect("trial and review pass");
+            assert!(result.is_object());
+            assert_eq!(model.calls(), 3, "author, self-review and reviewer");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+    }
 }
 
 #[test]
@@ -8062,8 +8232,11 @@ shutil.copy2(source / row, out)
         .expect("restore copied workspace manifest");
     std::fs::write(project.join("Cargo.lock"), workspace_lock)
         .expect("restore copied workspace lockfile");
-    let row = include_str!("../../../scripts/controls/exec-step-needs-its-snapshot.row");
-    let row = row.replacen("exec-step-needs-its-snapshot|", "row-test|", 1);
+    // This is a cold full-workspace proof with a fresh private Cargo target.
+    // Select a real schema control so its rebuild fits the row's fixed budget
+    // on the smaller CI runner while still exercising the host Cargo driver.
+    let row = include_str!("../../../scripts/controls/context-contract-carries-declaration.row");
+    let row = row.replacen("context-contract-carries-declaration|", "row-test|", 1);
     std::fs::write(project.join("scripts/controls/row-test.row"), row).expect("real row");
     std::fs::remove_file(project.join("bin/cargo")).expect("remove stand-in Cargo");
     let atom = project.join("atoms/prove-controls.atom.astro");
@@ -8512,7 +8685,12 @@ fn a_real_control_runner_proves_the_bound_candidate_before_review() {
             .expect("run cache")
             .expect("run cache entry")
             .path();
-        let predictable_target = run_cache.join("cargo-target/code.controls.0.0");
+        // Exec cache components include the stable step hash when a name has
+        // dots. Seed the target the old shared-cache behavior would reuse.
+        let step = "code.controls.0.0";
+        let digest = format!("{:x}", Sha256::digest(step.as_bytes()));
+        let predictable_target =
+            run_cache.join(format!("cargo-target/_code_controls_0_0-{}", &digest[..12]));
         std::fs::create_dir_all(&predictable_target).expect("preseed old target");
         std::fs::write(
             predictable_target.join("poison"),
@@ -11811,6 +11989,30 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         let out: Value = rt.result("review-2").await.expect("finishes");
         assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
         assert_eq!(model.calls(), 4);
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "author, reviewer, repair, fresh reviewer"
+        );
+        let first_review = requests[1].to_string();
+        assert!(
+            first_review.contains("Export works with accents")
+                && first_review.contains("café.txt crashes"),
+            "the reviewer must see the seeded contradiction: {first_review}"
+        );
+        let repair = requests[2].to_string();
+        assert!(
+            repair.contains("A reviewer rejected your previous output")
+                && repair.contains("the title says it works"),
+            "the author must receive the defect finding: {repair}"
+        );
+        let second_review = requests[3].to_string();
+        assert!(
+            second_review.contains("Export crashes on accents")
+                && !second_review.contains("Export works with accents"),
+            "the fresh reviewer must see the repaired candidate: {second_review}"
+        );
         let open = gate::gates(&rt, GateFilter::default())
             .await
             .expect("gates");
@@ -11827,6 +12029,14 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         assert_eq!(
             published["read.review.1"].proposal.output["verdict"],
             "approve"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["verdict"],
+            "request_changes"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["findings"][0]["message"],
+            "The note says the export crashes; the title says it works."
         );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
