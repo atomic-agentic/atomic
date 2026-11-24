@@ -906,7 +906,7 @@ for raw in filter(None, names.split(b'\0')):
         out.symlink_to(os.readlink(src))
     elif src.is_file():
         shutil.copy2(src, out)
-row = pathlib.Path('scripts/controls/exec-step-needs-its-snapshot.row')
+row = pathlib.Path('scripts/controls/context-contract-carries-declaration.row')
 out = dest / row
 out.parent.mkdir(parents=True, exist_ok=True)
 shutil.copy2(source / row, out)
@@ -1128,7 +1128,7 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
             &fixture,
             &backend,
             &caches,
-            &fixture.input(&["exec-step-needs-its-snapshot"]),
+            &fixture.input(&["context-contract-carries-declaration"]),
         )
         .await
         .expect("real row off/fail/on/pass");
@@ -1158,11 +1158,11 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
             "blind-real",
             "A row whose named test ignores its switch",
             &|tree| {
-                let row = tree.join("scripts/controls/exec-step-needs-its-snapshot.row");
+                let row = tree.join("scripts/controls/context-contract-carries-declaration.row");
                 let original = std::fs::read_to_string(&row).expect("real row");
                 let changed = original.replace(
-                    "runtime::tests::a_contextual_exec_atom_brought_no_snapshot_is_refused_before_its_command",
-                    "git::tests::only_hex_commits_pass",
+                    "typescript::tests::an_atom_with_no_context_declares_no_context_type typescript::tests::atom_declarations_match_the_authoring_projection",
+                    "typescript::tests::output_is_deterministic",
                 );
                 assert_ne!(original, changed, "row test was replaced");
                 std::fs::write(row, changed).expect("blind row");
@@ -1173,7 +1173,7 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
             &fixture,
             &backend,
             &caches,
-            &fixture.bound_by(&blind, &["exec-step-needs-its-snapshot"]),
+            &fixture.bound_by(&blind, &["context-contract-carries-declaration"]),
         )
         .await
         .expect_err("blind real row must fail")
