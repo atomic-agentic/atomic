@@ -1,0 +1,1 @@
+trial-cargo-default-home|crates/atomic/src/pipeline.rs|let default_bin = operator_home.map(default_rustup_bin);|let default_bin = None;|-p atomic-agentic --lib trial_cargo_finds_default_rustup_shims_without_cargo_home

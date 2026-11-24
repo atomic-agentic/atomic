@@ -587,6 +587,39 @@ impl TrialCargo {
     }
 }
 
+fn default_rustup_bin(home: &Path) -> PathBuf {
+    home.join(".cargo/bin")
+}
+
+/// Choose only operator-installed Cargo/rustc shims. The trial's HOME and
+/// CARGO_HOME are a fresh, candidate-writable cache, so this runs before the
+/// sandbox command is built and reads the operator process environment.
+fn trial_toolchain_bin(
+    cargo_home: Option<&Path>,
+    operator_home: Option<&Path>,
+    scratch: &Path,
+    cache: &Path,
+) -> Option<PathBuf> {
+    let scratch = std::fs::canonicalize(scratch).ok()?;
+    let cache = std::fs::canonicalize(cache).ok()?;
+    // CONTROL_OFF: trial-cargo-default-home
+    let default_bin = operator_home.map(default_rustup_bin);
+    let preferred = cargo_home.map(|home| home.join("bin")).or(default_bin);
+    preferred
+        .into_iter()
+        .chain([PathBuf::from("/usr/local/cargo/bin")])
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .find(|bin| {
+            !bin.starts_with(&scratch)
+                && !bin.starts_with(&cache)
+                && ["cargo", "rustc"].iter().all(|name| {
+                    std::fs::canonicalize(bin.join(name)).is_ok_and(|shim| {
+                        shim.is_file() && !shim.starts_with(&scratch) && !shim.starts_with(&cache)
+                    })
+                })
+        })
+}
+
 fn trial_uses_cargo(pipeline: &Pipeline) -> bool {
     pipeline.steps.iter().any(|step| match step {
         Step::Atom(step) => step
@@ -4674,24 +4707,20 @@ async fn reviewed<C: WorkflowContext>(
                     } else {
                         None
                     };
-                    // Cargo and rustc are operator-selected tools. CI installs
-                    // their rustup shims under CARGO_HOME/bin rather than the
-                    // development image's /usr/local/cargo/bin. Resolve that
-                    // host directory before entering the candidate sandbox;
+                    // Cargo and rustc are operator-selected tools. An unset
+                    // CARGO_HOME uses rustup's default ~/.cargo/bin; CI may
+                    // set CARGO_HOME explicitly instead. Resolve that host
+                    // directory before entering the candidate sandbox;
                     // never take a tool path from the candidate's environment.
                     let path = if uses_cargo {
-                        let homes = std::env::var_os("CARGO_HOME")
-                            .map(|home| PathBuf::from(home).join("bin"))
-                            .into_iter()
-                            .chain([PathBuf::from("/usr/local/cargo/bin")]);
-                        let bin = homes
-                            .filter_map(|path| std::fs::canonicalize(path).ok())
-                            .find(|bin| {
-                                !bin.starts_with(&scratch)
-                                    && !bin.starts_with(cache.dir())
-                                    && bin.join("cargo").is_file()
-                                    && bin.join("rustc").is_file()
-                            })
+                        let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+                        let operator_home = std::env::var_os("HOME").map(PathBuf::from);
+                        let bin = trial_toolchain_bin(
+                            cargo_home.as_deref(),
+                            operator_home.as_deref(),
+                            &scratch,
+                            cache.dir(),
+                        )
                             .ok_or_else(|| failed("trial merge Cargo toolchain bin is missing or candidate-writable".into()))?;
                         format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display())
                     } else {
@@ -6371,6 +6400,50 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn trial_cargo_finds_default_rustup_shims_without_cargo_home() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("atomic-trial-cargo-{nonce}"));
+        let home = root.join("operator");
+        let bin = home.join(".cargo/bin");
+        let scratch = root.join("candidate");
+        let cache = root.join("cache");
+        for dir in [&bin, &scratch, &cache] {
+            std::fs::create_dir_all(dir).expect("fixture directory");
+        }
+        for name in ["cargo", "rustc"] {
+            std::fs::write(bin.join(name), "#!/bin/sh\nexit 0\n").expect("operator shim");
+        }
+        assert_eq!(
+            trial_toolchain_bin(None, Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&bin).expect("default bin"))
+        );
+
+        // An explicit candidate-writable CARGO_HOME must not win merely
+        // because it contains convincing filenames.
+        let untrusted = scratch.join("bin");
+        std::fs::create_dir_all(&untrusted).expect("candidate bin");
+        for name in ["cargo", "rustc"] {
+            std::fs::write(untrusted.join(name), "#!/bin/sh\nexit 0\n").expect("candidate shim");
+        }
+        assert_ne!(
+            trial_toolchain_bin(Some(&scratch), Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&untrusted).expect("candidate bin"))
+        );
+        std::fs::remove_file(bin.join("cargo")).expect("remove operator shim");
+        std::os::unix::fs::symlink(untrusted.join("cargo"), bin.join("cargo"))
+            .expect("candidate shim link");
+        assert_ne!(
+            trial_toolchain_bin(None, Some(&home), &scratch, &cache),
+            Some(std::fs::canonicalize(&bin).expect("default bin")),
+            "a trusted directory may not smuggle a candidate-writable shim"
+        );
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
 
     #[test]
     fn a_host_control_proof_refuses_a_wrong_reference_receipt() {
