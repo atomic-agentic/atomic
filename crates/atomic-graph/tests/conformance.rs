@@ -2068,6 +2068,150 @@ fn sqlite_authorized_for_tests(
 }
 
 #[test]
+fn sqlite_graph_first_open_uses_the_durable_migration_history() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-first-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("fresh graph open must migrate the shared store");
+    harness::block_on(async {
+        store
+            .create_item(
+                Actor::agent("setup"),
+                "first-item".into(),
+                Draft::new("at-first", "First"),
+            )
+            .await
+            .expect("graph tables are available after migration");
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open migration reader");
+        let version: i64 = sqlx::query_scalar("SELECT version FROM atomic_store_version")
+            .fetch_one(&mut conn)
+            .await
+            .expect("durable version marker");
+        assert_eq!(version, atomic_durable::store::STORE_VERSION);
+        let graph_history: String =
+            sqlx::query_scalar("SELECT name FROM atomic_store_history WHERE version=12")
+                .fetch_one(&mut conn)
+                .await
+                .expect("work-graph migration history");
+        assert_eq!(graph_history, "work-graph");
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('atomic_graph_edges_by_target','atomic_graph_ready_order')",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("graph migration indexes");
+        assert_eq!(index_count, 2);
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_graph_open_refuses_a_newer_marker_before_it_returns_a_store() {
+    use sqlx::Connection;
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-newer-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .expect("open current graph store");
+    harness::block_on(store.create_item(
+        Actor::agent("setup"),
+        "first-item".into(),
+        Draft::new("at-first", "First"),
+    ))
+    .expect("create existing graph item");
+    drop(store);
+    let newer = atomic_durable::store::STORE_VERSION + 1;
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open marker writer");
+        sqlx::query("UPDATE atomic_store_version SET version=?")
+            .bind(newer)
+            .execute(&mut conn)
+            .await
+            .expect("mark future schema");
+    });
+    let error = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .err()
+        .expect("a future schema must refuse graph open");
+    assert!(
+        error
+            .to_string()
+            .contains("newer than this atomic understands"),
+        "unexpected migration refusal: {error}"
+    );
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open unchanged store");
+        let marker: i64 = sqlx::query_scalar("SELECT version FROM atomic_store_version")
+            .fetch_one(&mut conn)
+            .await
+            .expect("version still present");
+        let item_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items")
+            .fetch_one(&mut conn)
+            .await
+            .expect("existing item still present");
+        assert_eq!((marker, item_count), (newer, 1));
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_graph_open_refuses_unversioned_graph_tables_before_migrating() {
+    use sqlx::Connection;
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-unversioned-migration-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::File::create(&path).expect("create unversioned database");
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("open unversioned database");
+        sqlx::query("CREATE TABLE atomic_graph_items (id TEXT PRIMARY KEY, title TEXT)")
+            .execute(&mut conn)
+            .await
+            .expect("plant incompatible graph table");
+    });
+    let error = atomic_graph::sqlite::SqliteStore::open(&path, std::time::SystemTime::now)
+        .err()
+        .expect("unversioned graph table must refuse open");
+    assert!(
+        error.to_string().contains("unrecognized atomic schema"),
+        "unexpected migration refusal: {error}"
+    );
+    harness::block_on(async {
+        let mut conn = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("reopen rejected database");
+        let version_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='atomic_store_version'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("read version table inventory");
+        assert_eq!(version_tables, 0, "refusal must not stamp a version");
+    });
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_conforms_to_the_behavioral_scenarios() {
     let mut all_failures = Vec::new();
     for (index, scenario) in SCENARIOS.iter().enumerate() {
