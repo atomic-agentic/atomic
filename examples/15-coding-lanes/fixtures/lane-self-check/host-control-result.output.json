@@ -1,0 +1,34 @@
+{
+  "items": {
+    "1": "The patch adds one note and changes no executable code.",
+    "2": "The patch adds no import or command; the note is the only new file.",
+    "3": "Only notes/lane-change.md is added.",
+    "4": "The note contains no credential or token.",
+    "5": "The patch does not alter the guard's allow or refuse branches; the host test checks the existing behavior.",
+    "6": "The note introduces no retry or repeated effect.",
+    "7": "The note reads no input.",
+    "8": "The note takes no lock, reservation or temporary directory.",
+    "9": "Candidate publication is the host's decision point; the note adds no decision branch.",
+    "10": "The host proved lane-guard-bites by running its Cargo test with the guard off and on."
+  },
+  "decisions": [
+    {
+      "point": "candidate publication",
+      "allow_refuse": "The patch adds no publication path; the host's review and human gates decide whether this candidate publishes.",
+      "not_found": "The note performs no lookup; an absent gate decision cannot authorize publication.",
+      "permission_denied": "The note performs no read; a denied gate decision cannot authorize publication.",
+      "link_loop": "The note opens no path, so a link loop is unreachable in the patch.",
+      "not_directory": "The note opens no path, so this error is unreachable in the patch.",
+      "other_io": "The note performs no I/O at runtime, so this error is unreachable in the patch.",
+      "parse_error": "The note parses no input, so this error is unreachable in the patch.",
+      "timeout": "The note waits for nothing; the host gate handles its own timeout.",
+      "empty_result": "The note returns no result; an empty gate decision cannot authorize publication."
+    }
+  ],
+  "controls": [
+    {
+      "row": "lane-guard-bites",
+      "result": "its test fails with the control off and passes with it on"
+    }
+  ]
+}
