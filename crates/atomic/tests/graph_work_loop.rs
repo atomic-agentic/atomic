@@ -4,9 +4,10 @@
 
 #![recursion_limit = "512"]
 
+use atomic_app::model_policy::{LanePolicy, LanePolicySource};
 use atomic_app::pipeline::{
-    GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Pipeline, PipelineRun, ProjectWorktrees,
-    Services, prepare, register_pipeline,
+    GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, PIPELINE, Pipeline, PipelineRun,
+    ProjectWorktrees, Services, prepare, register_pipeline,
 };
 use atomic_core::artifact::LocalStore;
 use atomic_core::budget::BudgetSettings;
@@ -437,6 +438,17 @@ async fn engine_at(
     database: PathBuf,
     project_id: &str,
 ) -> Durare {
+    engine_at_with_endpoint(root, url, graph_registered, database, project_id, true).await
+}
+
+async fn engine_at_with_endpoint(
+    root: &Path,
+    url: &str,
+    graph_registered: bool,
+    database: PathBuf,
+    project_id: &str,
+    model_endpoint_configured: bool,
+) -> Durare {
     helper_host();
     let mut rt = Durare::open(
         &Database::Sqlite(database),
@@ -474,6 +486,7 @@ async fn engine_at(
             &mut rt,
             Services {
                 runtimes,
+                model_endpoint_configured,
                 store: LocalStore::open(root.join("artifacts")).expect("artifacts"),
                 deployment: Deployment::Local {
                     operator: Principal::local("owner"),
@@ -643,7 +656,7 @@ fn graph_loop_child() {
             return;
         }
         let rt = engine(&root, &url, true).await;
-        if role == "start" || role == "start-panel" {
+        if role == "start" || role == "start-panel" || role == "start-routed" {
             let mut prepared = if role == "start-panel" {
                 panel_pipeline(&root.join("project"))
             } else {
@@ -652,12 +665,27 @@ fn graph_loop_child() {
             if let Ok(frozen) = std::fs::read(root.join("graph-fixture.json")) {
                 prepared.fixture = Some(serde_json::from_slice(&frozen).expect("frozen fixture"));
             }
+            let model_source = if role == "start-routed" {
+                let path = root.join("operator.yaml");
+                let value: Value =
+                    serde_json::from_slice(&std::fs::read(&path).expect("policy file"))
+                        .expect("policy document");
+                let policy: LanePolicy = serde_json::from_value(value["model"]["lanes"].clone())
+                    .expect("operator lane policy");
+                Some(LanePolicySource {
+                    path,
+                    endpoints: policy.endpoints,
+                })
+            } else {
+                None
+            };
             let run = GraphPipelineRun {
                 run: PipelineRun {
                     pipeline: prepared,
                     input: json!({"base": base}),
                 },
                 epic: EPIC.into(),
+                model_source,
             };
             rt.start(GRAPH_PIPELINE, RUN, run)
                 .await
@@ -1481,6 +1509,7 @@ fn graph_loop_evaluates_the_workflow_returns_expression_for_each_item() {
                     input: json!({"base": base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -1530,6 +1559,7 @@ fn empty_epic_cannot_return_null_under_an_object_output_contract() {
                     input: json!({"base": base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -1841,6 +1871,229 @@ fn reviewed_graph_gate_releases_with_handoff_and_reclaims_after_kill_restart() {
         assert!(steps.contains(&"graph.00000.fix.review.gate".into()));
         assert!(steps.contains(&"graph.00000.fix.publish".into()));
         assert!(steps.contains(&"graph.00000.fix.close".into()));
+    });
+}
+
+#[test]
+fn a_policy_edit_routes_only_later_graph_lanes_and_records_each_choice() {
+    on_codex_runtime(async {
+        let first = FakeModel::start(vec![
+            Reply::Text(r#"{"done":true}"#.into()),
+            Reply::Text(r#"{"verdict":"reject"}"#.into()),
+        ])
+        .await
+        .expect("first endpoint");
+        let later = FakeModel::start(vec![
+            Reply::Text(r#"{"done":true}"#.into()),
+            Reply::Text(r#"{"verdict":"reject"}"#.into()),
+        ])
+        .await
+        .expect("later endpoint");
+        let root = scratch("route-later-lanes");
+        let base = seed(&root).await;
+        review_project(&root.join("project"));
+        let policy_path = root.join("operator.yaml");
+        let mut policy: LanePolicy = serde_json::from_value(json!({
+            "endpoints": {
+                "first": {"base_url": first.base_url(), "name": "first-model"},
+                "later": {"base_url": later.base_url(), "name": "later-model"}
+            },
+            "default": "first"
+        }))
+        .expect("operator policy");
+        let write_policy = |policy: &LanePolicy| {
+            std::fs::write(
+                &policy_path,
+                json!({"model": {"lanes": policy}}).to_string(),
+            )
+            .expect("operator route file");
+        };
+        write_policy(&policy);
+        let source = LanePolicySource {
+            path: policy_path.clone(),
+            endpoints: policy.endpoints.clone(),
+        };
+        let rt = engine(&root, &first.base_url(), true).await;
+        rt.control_transaction(|mut tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_graph_items SET status='closed' WHERE id=?",
+                    &[Param::Text(CHILDREN[2].into())],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("leave two graph children");
+        rt.start(
+            GRAPH_PIPELINE,
+            RUN,
+            GraphPipelineRun {
+                run: PipelineRun {
+                    pipeline: pipeline(&root.join("project")),
+                    input: json!({"base": base}),
+                },
+                epic: EPIC.into(),
+                model_source: Some(source),
+            },
+        )
+        .await
+        .expect("start routed graph run");
+        let gate = wait_for_review_gate(&rt).await;
+        assert_eq!(
+            first.calls(),
+            2,
+            "first author and reviewer use first route"
+        );
+        assert_eq!(later.calls(), 0);
+        policy.default = "later".into();
+        write_policy(&policy);
+        approve_review_gate(&rt, &gate, "approve-first-routed-lane").await;
+        let second = wait_for_review_gate(&rt).await;
+        assert_eq!(first.calls(), 2, "completed lane kept its model");
+        assert_eq!(later.calls(), 2, "later author and reviewer use new route");
+        let steps = rt.steps(RUN).await.expect("durable graph steps");
+        for (ordinal, endpoint, model) in [(0, "first", "first-model"), (1, "later", "later-model")]
+        {
+            let choice = format!("graph.{ordinal:05}.model_choice");
+            let recorded = steps
+                .iter()
+                .find(|step| step.name == choice)
+                .and_then(|step| step.output.as_ref())
+                .expect("checkpointed model choice");
+            assert_eq!(recorded["endpoint"], endpoint);
+            let turn = format!("graph.{ordinal:05}.fix.turn");
+            let candidate: Candidate = serde_json::from_value(
+                steps
+                    .iter()
+                    .find(|step| step.name == turn)
+                    .and_then(|step| step.output.as_ref())
+                    .and_then(|output| output.get("Candidate"))
+                    .cloned()
+                    .expect("checkpointed author candidate"),
+            )
+            .expect("author candidate");
+            assert_eq!(candidate.proposal.metadata["lane_endpoint"], endpoint);
+            assert_eq!(candidate.proposal.metadata["model"], model);
+            let review = format!("graph.{ordinal:05}.fix.review.0.turn");
+            let reviewer: Candidate = serde_json::from_value(
+                steps
+                    .iter()
+                    .find(|step| step.name == review)
+                    .and_then(|step| step.output.as_ref())
+                    .and_then(|output| output.get("Candidate"))
+                    .cloned()
+                    .expect("checkpointed reviewer candidate"),
+            )
+            .expect("reviewer candidate");
+            assert_eq!(reviewer.proposal.metadata["lane_endpoint"], endpoint);
+            assert_eq!(reviewer.proposal.metadata["model"], model);
+        }
+        approve_review_gate(&rt, &second, "approve-second-routed-lane").await;
+        rt.result::<Value>(RUN).await.expect("routed graph result");
+        assert_eq!(first.calls(), 2);
+        assert_eq!(later.calls(), 2);
+    });
+}
+
+#[test]
+fn a_crash_after_model_choice_keeps_that_lane_on_its_recorded_endpoint() {
+    on_codex_runtime(async {
+        let first = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into())])
+            .await
+            .expect("first endpoint");
+        let later = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 2])
+            .await
+            .expect("later endpoint");
+        let root = scratch("routed-choice-recovery");
+        let base = seed(&root).await;
+        let path = root.join("operator.yaml");
+        let mut policy: LanePolicy = serde_json::from_value(json!({
+            "endpoints": {
+                "first": {"base_url": first.base_url(), "name": "first-model"},
+                "later": {"base_url": later.base_url(), "name": "later-model"}
+            },
+            "default": "first"
+        }))
+        .expect("operator policy");
+        let write = |policy: &LanePolicy| {
+            std::fs::write(&path, json!({"model": {"lanes": policy}}).to_string())
+                .expect("operator route file");
+        };
+        write(&policy);
+        let stopped = child(
+            &root,
+            &first.base_url(),
+            &base,
+            "start-routed",
+            Some("checkpoint:after:graph.00000.model_choice"),
+        );
+        assert!(!stopped.success(), "failpoint must stop the first lane");
+        assert_eq!(first.calls(), 0, "choice checkpoint precedes model call");
+        policy.default = "later".into();
+        write(&policy);
+        assert!(
+            child(&root, &first.base_url(), &base, "recover", None).success(),
+            "recover routed graph run"
+        );
+        assert_eq!(first.calls(), 1, "completed checkpoint froze first lane");
+        assert_eq!(later.calls(), 2, "later lanes saw changed policy");
+        let rt = durable(&root).await;
+        let steps = rt.steps(RUN).await.expect("durable steps");
+        for (ordinal, endpoint) in [(0, "first"), (1, "later"), (2, "later")] {
+            let name = format!("graph.{ordinal:05}.model_choice");
+            let choice = steps
+                .iter()
+                .find(|step| step.name == name)
+                .and_then(|step| step.output.as_ref())
+                .expect("model choice checkpoint");
+            assert_eq!(choice["endpoint"], endpoint);
+        }
+    });
+}
+
+#[test]
+fn an_ordinary_run_cannot_use_a_graph_only_model_endpoint() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into())])
+            .await
+            .expect("scripted model");
+        let root = scratch("ordinary-with-graph-only-model");
+        let (_project, base) = project(&root);
+        let rt = engine_at_with_endpoint(
+            &root,
+            &model.base_url(),
+            true,
+            root.join("atomic.db"),
+            "graph-loop/test",
+            false,
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            RUN,
+            PipelineRun {
+                pipeline: pipeline(&root.join("project")),
+                input: json!({"base": base}),
+            },
+        )
+        .await
+        .expect("start ordinary run");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            rt.status(RUN).await.expect("ordinary run status"),
+            Some(atomic_durable::RunStatus::Pending),
+            "missing default endpoint must leave a resumable run"
+        );
+        assert!(
+            rt.steps(RUN)
+                .await
+                .expect("ordinary run checkpoints")
+                .is_empty(),
+            "refusal must precede the first durable step"
+        );
+        assert_eq!(model.calls(), 0, "ordinary run reached a model endpoint");
     });
 }
 
@@ -2339,6 +2592,7 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
                     input: json!({"base":base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -2575,6 +2829,7 @@ fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
                     input: json!({"base":base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -2746,6 +3001,7 @@ fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim()
                     input: json!({"base":base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -2975,6 +3231,7 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
                     input: json!({"base":base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await
@@ -3117,7 +3374,7 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
                             &[Param::Text(CHILDREN[0].into())],
                         )
                         .await?;
-                    Ok(row.text("sha")?)
+                    row.text("sha")
                 })
             })
             .await
@@ -3275,6 +3532,7 @@ fn mismatched_existing_graph_base_ref_refuses_before_the_model_turn() {
                     input: json!({"base":base}),
                 },
                 epic: EPIC.into(),
+                model_source: None,
             },
         )
         .await

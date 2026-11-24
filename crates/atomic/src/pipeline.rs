@@ -61,6 +61,7 @@ use crate::graph_claim::{
     ClaimTurnLimits, bounded_claimed_turn, reclaim_review_gate, validate_before_turn,
 };
 use crate::metering::{BudgetPlan, RunBudget};
+use crate::model_policy::{LaneChoice, LanePolicySource};
 use crate::workflows::propose_at;
 use atomic_core::artifact::{ArtifactError, ArtifactRef, ArtifactStore, LocalStore, Provenance};
 use atomic_core::astro::StepClock;
@@ -110,7 +111,7 @@ pub const GRAPH_PIPELINE: &str = "atomic.graph.pipeline.v1";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.9";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.10";
 
 /// Older runs projected an empty `Context` contract even when the atom had no
 /// public context. Repair only that exact, inert projection in the in-memory
@@ -927,6 +928,10 @@ pub struct GraphPipelineRun {
     pub run: PipelineRun,
     /// The pinned epic whose direct work children are selected dynamically.
     pub epic: String,
+    /// The operator's endpoint catalog at admission and the file whose
+    /// later route edits apply only to unstarted lanes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<LanePolicySource>,
 }
 
 /// One durable graph finalization attempt. A missing proof or revoked lease is
@@ -1467,9 +1472,43 @@ fn plan_budgets(
     })
 }
 
+fn plan_routed_budgets(
+    pipeline: &Pipeline,
+    source: &LanePolicySource,
+    settings: &BudgetSettings,
+) -> std::result::Result<BudgetPlan, String> {
+    source.validate_catalog()?;
+    let models = source
+        .endpoints
+        .values()
+        .map(|endpoint| endpoint.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let atoms = pipeline
+        .atoms
+        .iter()
+        .filter(|(_, atom)| matches!(atom.kind.as_str(), "codex" | "lite"))
+        .map(|(name, atom)| (name.as_str(), &atom.budget))
+        .collect::<Vec<_>>();
+    let exec = pipeline
+        .atoms
+        .iter()
+        .filter(|(_, atom)| atom.kind == "exec")
+        .map(|(name, atom)| (name.as_str(), &atom.budget))
+        .collect::<Vec<_>>();
+    BudgetPlan::resolve_routed(settings, &pipeline.budget, &atoms, &exec, &models).map_err(
+        |(atom, error)| match atom {
+            Some(atom) => format!("atom {atom}: budget: {error}"),
+            None => format!("workflow {}: budget: {error}", pipeline.name),
+        },
+    )
+}
+
 /// Run one pipeline. Workflow code: everything that touches a model or the
 /// store goes through durable steps. Every model call is metered against
 /// the run's and its atom's budget (see [`crate::metering`]).
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
@@ -1478,6 +1517,7 @@ async fn run_pipeline<C: WorkflowContext>(
     replay: Option<Arc<Replay>>,
     why: atomic_core::usage::Why,
     graph_epic: Option<String>,
+    model_source: Option<LanePolicySource>,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
@@ -1490,6 +1530,7 @@ async fn run_pipeline<C: WorkflowContext>(
         &why,
         &mut caches,
         graph_epic,
+        model_source,
     )
     .await;
     if let Some(caches) = caches {
@@ -1545,11 +1586,25 @@ async fn run_pipeline_in<C: WorkflowContext>(
     why: &atomic_core::usage::Why,
     run_caches: &mut Option<atomic_core::worktree::Caches>,
     graph_epic: Option<String>,
+    model_source: Option<LanePolicySource>,
 ) -> Result<Value> {
     let PipelineRun {
         mut pipeline,
         input,
     } = run;
+    if replay.is_none()
+        && !services.model_endpoint_configured
+        && (graph_epic.is_none() || model_source.is_none())
+        && pipeline
+            .atoms
+            .values()
+            .any(|atom| matches!(atom.kind.as_str(), "codex" | "lite"))
+    {
+        return Err(DurableError::Interrupted(
+            "this run needs a project-wide model endpoint; model.lanes applies only to graph runs that recorded its policy"
+                .into(),
+        ));
+    }
     for (name, atom) in &mut pipeline.atoms {
         normalize_legacy_context(name, atom.context.as_ref(), &mut atom.program.contracts)?;
     }
@@ -1626,6 +1681,31 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| atom.kind == "exec")
                 .map(|(name, _)| name.as_str())
                 .collect();
+            let routes_match = || -> std::result::Result<(), String> {
+                if let Some(source) = &model_source {
+                    let admitted = source
+                        .endpoints
+                        .values()
+                        .map(|endpoint| endpoint.name.as_str())
+                        .collect::<std::collections::BTreeSet<_>>();
+                    for atom in &model_atoms {
+                        let options = plan.routed_models.get(*atom).ok_or_else(|| {
+                            format!("atom {atom}: the pinned budget has no routed models")
+                        })?;
+                        if options
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            != admitted
+                        {
+                            return Err(format!(
+                                "atom {atom}: the pinned budget's models differ from the admitted graph endpoint catalog"
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            };
             // And held to the ceilings and prices of the person running it
             // now, as well as to the ceilings it carries: a plan made
             // elsewhere, or with none, cannot raise what their own
@@ -1643,13 +1723,17 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 })
                 .and_then(|()| plan.priced_no_lower(&services.budgets))
                 .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
+                .and_then(|()| routes_match())
                 .map(|()| BudgetPlan {
                     held: true,
                     ..plan.clone()
                 })
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
-        None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
+        None => match &model_source {
+            Some(source) => plan_routed_budgets(&pipeline, source, &services.budgets),
+            None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
+        },
     };
     // Store the definitions the run uses before anything runs. The snapshot
     // is content-addressed, so a retried step stores the same artifact.
@@ -1947,6 +2031,36 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     break;
                 }
             };
+            // This durable step is the boundary between policy edits and a
+            // lane already under way. A recovered lane reads its choice from
+            // the checkpoint; only a new lane reloads the operator's routes.
+            let lane_choice: Option<LaneChoice> = if let Some(source) = &model_source {
+                let (source, kind, labels) =
+                    (source.clone(), item.kind.clone(), item.labels.clone());
+                let choice: LaneChoice = ctx
+                    .step(
+                        &format!("graph.{ordinal:05}.model_choice"),
+                        move |_| async move {
+                            source
+                                .select(&kind, labels.iter().map(String::as_str))
+                                .map_err(failed)
+                        },
+                    )
+                    .await?;
+                if model_source
+                    .as_ref()
+                    .and_then(|source| source.endpoints.get(&choice.endpoint))
+                    != Some(&choice.target)
+                {
+                    return Err(failed(format!(
+                        "graph item {}: its recorded model choice differs from the admitted endpoint catalog",
+                        item.id
+                    )));
+                }
+                Some(choice)
+            } else {
+                None
+            };
             let (current_input, atom_input) = graph_atom_input(
                 &pipeline,
                 &template,
@@ -1962,6 +2076,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 caps: &caps,
                 exec_caps: &exec_caps,
                 models: &models,
+                routed_models: &plan.routed_models,
+                lane_choice: lane_choice.as_ref(),
                 replay: &replay,
                 pinned: &pinned,
                 worktrees: run_worktrees.as_ref(),
@@ -2273,6 +2389,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
             caps: &caps,
             exec_caps: &exec_caps,
             models: &models,
+            routed_models: &plan.routed_models,
+            lane_choice: None,
             replay: &replay,
             pinned: &pinned,
             worktrees: run_worktrees.as_ref(),
@@ -2579,6 +2697,10 @@ struct RunScope<'a> {
     /// Each exec atom's caps, which its command's active time is charged to.
     exec_caps: &'a BTreeMap<String, atomic_core::budget::Resolved>,
     models: &'a BTreeMap<String, String>,
+    /// All model names admitted for a graph atom before route selection.
+    routed_models: &'a BTreeMap<String, Vec<String>>,
+    /// The host item's checkpointed choice, shared by its author and reviews.
+    lane_choice: Option<&'a LaneChoice>,
     replay: &'a Option<Arc<Replay>>,
     pinned: &'a Pinned,
     /// The run's worktrees: its fixture's, or the project's.
@@ -2642,6 +2764,8 @@ async fn turn<C: WorkflowContext>(
         budget,
         caps,
         models,
+        routed_models,
+        lane_choice,
         replay,
         pinned,
         why,
@@ -2658,6 +2782,17 @@ async fn turn<C: WorkflowContext>(
         atom = trusted_controls_atom(&atom, run.caches)?;
     }
     let mut runtimes = (*services.runtimes).clone();
+    if let Some(choice) = lane_choice {
+        let endpoint = choice.model_endpoint();
+        runtimes.codex.endpoint = endpoint.clone();
+        runtimes.lite.wire = atomic_core::lite::Wire::for_base_url(&endpoint.base_url);
+        runtimes.lite.endpoint = endpoint;
+        if matches!(atom.kind.as_str(), "codex" | "lite")
+            && let Value::Object(frontmatter) = &mut atom.frontmatter
+        {
+            frontmatter.insert("model".into(), Value::String(choice.target.name.clone()));
+        }
+    }
     // What this run's spans say of a failure. Each run of this step notes on a
     // handle of its own, which the run takes up only when that step failed
     // (see [`atomic_core::usage::Why`] and [`crate::telemetry::traced_step`]).
@@ -2725,7 +2860,22 @@ async fn turn<C: WorkflowContext>(
     // A model atom runs on the model its budget was resolved for, and
     // only with caps: never unmetered, never at another model's price.
     if let Some(model) = model_of(&atom, &runtimes) {
-        let pinned = match (&atom_caps, models.get(&t.atom)) {
+        let selected = match lane_choice {
+            Some(choice) => {
+                let allowed = routed_models
+                    .get(&t.atom)
+                    .is_some_and(|models| models.contains(&choice.target.name));
+                if !allowed {
+                    return Err(failed(format!(
+                        "step `{}`: model {:?} was not admitted for `{}`",
+                        t.name, choice.target.name, t.atom
+                    )));
+                }
+                Some(&choice.target.name)
+            }
+            None => models.get(&t.atom),
+        };
+        let pinned = match (&atom_caps, selected) {
             (Some(_), Some(pinned)) => pinned.clone(),
             _ => {
                 return Err(failed(format!(
@@ -2887,6 +3037,11 @@ async fn turn<C: WorkflowContext>(
     let claim_context = ctx.clone();
     let claim = t.claim.clone();
     let trial_head = t.trial_head.clone();
+    let lane_endpoint = if matches!(atom.kind.as_str(), "codex" | "lite") {
+        lane_choice.map(|choice| choice.endpoint.clone())
+    } else {
+        None
+    };
     // What an exec step's command hands over is held until the turn has
     // recorded the output that references it, then let go; and let go too
     // when the turn is dropped or panics before that.
@@ -2910,6 +3065,7 @@ async fn turn<C: WorkflowContext>(
         let claim_context = claim_context.clone();
         let claim = claim.clone();
         let trial_head = trial_head.clone();
+        let lane_endpoint = lane_endpoint.clone();
         let place = place.clone();
         // In a replay, the step's recorded result, with no model call
         // and no command run; a step with none fails rather than run
@@ -3092,6 +3248,9 @@ async fn turn<C: WorkflowContext>(
                 return Err(failed("an atom step's metadata is not an object".into()));
             };
             metadata.insert("input_sha256".into(), Value::String(input_sha256));
+            if let Some(endpoint) = lane_endpoint {
+                metadata.insert("lane_endpoint".into(), Value::String(endpoint));
+            }
             failpoint(&ran);
             Ok(proposal)
         };
@@ -5759,6 +5918,9 @@ async fn run_gate<C: WorkflowContext>(
 pub struct Services {
     /// Where atoms run.
     pub runtimes: Arc<Runtimes>,
+    /// An ordinary model run must never use the unconfigured endpoint that a
+    /// graph-only routing policy allows the engine to carry while resuming.
+    pub model_endpoint_configured: bool,
     /// Where each run's definitions are stored.
     pub store: LocalStore,
     /// Where the project runs, which decides who may decide its gates.
@@ -5798,7 +5960,16 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
         let traced = crate::telemetry::traced(
             span,
             why.clone(),
-            run_pipeline(ctx, run, services.clone(), ledger.clone(), None, why, None),
+            run_pipeline(
+                ctx,
+                run,
+                services.clone(),
+                ledger.clone(),
+                None,
+                why,
+                None,
+                None,
+            ),
         );
         crate::panics::caught(id, traced)
     });
@@ -5818,6 +5989,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 Some(Arc::new(Replay { of, recorded })),
                 why,
                 None,
+                None,
             ),
         );
         crate::panics::caught(id, traced)
@@ -5825,7 +5997,11 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     rt.register(
         GRAPH_PIPELINE,
         move |ctx: R::Context, graph: GraphPipelineRun| {
-            let GraphPipelineRun { run, epic } = graph;
+            let GraphPipelineRun {
+                run,
+                epic,
+                model_source,
+            } = graph;
             let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
             let id = ctx.workflow_id().to_owned();
             let why = atomic_core::usage::Why::default();
@@ -5840,6 +6016,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                     None,
                     why,
                     Some(epic),
+                    model_source,
                 ),
             );
             crate::panics::caught(id, traced)

@@ -473,9 +473,21 @@ pub async fn run(
         engine::Takes::Own,
     )
     .await?;
+    if args.graph_epic.is_none() && target::needs_model(&run) && !engine.model_endpoint_configured {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "config.model",
+            "this workflow needs a project-wide model endpoint; model.lanes applies only to graph runs",
+            "configure model.base_url and model.name, or run a coding workflow with --graph-epic",
+        )
+        .into());
+    }
     // Refused before it starts, not at its first lite step.
     let lite = target::lite_atoms(&run);
-    if engine.signed_in && !lite.is_empty() {
+    if engine.signed_in
+        && !lite.is_empty()
+        && !(args.graph_epic.is_some() && engine.lane_policy.is_some())
+    {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         return Err(Failure::new(
             "config.model",
@@ -587,7 +599,11 @@ pub async fn run(
     let (workflow_name, durable_input) = match args.graph_epic {
         Some(epic) => (
             GRAPH_PIPELINE,
-            serde_json::to_value(GraphPipelineRun { run, epic })?,
+            serde_json::to_value(GraphPipelineRun {
+                run,
+                epic,
+                model_source: engine.lane_policy.clone(),
+            })?,
         ),
         None => (PIPELINE, serde_json::to_value(run)?),
     };

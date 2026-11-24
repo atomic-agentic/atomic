@@ -254,6 +254,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
             &mut rt,
             Services {
                 runtimes: runtimes(&dir, &model.base_url()),
+                model_endpoint_configured: true,
                 store,
                 deployment,
                 // Nothing offered to a worktree step, as in `atomic`.

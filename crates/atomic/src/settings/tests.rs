@@ -794,7 +794,12 @@ fn graph_lane_endpoints_are_operator_owned_and_validated() {
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let (_home, home) = person(lanes);
     let accepted = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
-    let policy = accepted.settings.model.lanes.as_ref().expect("operator lane policy");
+    let policy = accepted
+        .settings
+        .model
+        .lanes
+        .as_ref()
+        .expect("operator lane policy");
     assert_eq!(policy.select("task", ["security"]).target.name, "frontier");
     assert_eq!(policy.select("docs", ["polish"]).target.name, "qwen");
     assert!(matches!(

@@ -264,7 +264,7 @@ a layer can express. The committed `atomic.policy.lock` is planned for v1.0, as
 depend on it: detection grants nothing, and the settings above cannot come from a
 project.
 
-## Models: one endpoint today
+## Models
 
 Built is one model endpoint per command: an OpenAI-compatible API at
 `model.base_url`, serving the model named by `model.name`, unless an atom's own
@@ -279,6 +279,38 @@ model:
   base_url: http://127.0.0.1:8000/v1
   name: Qwen3-8B
 ```
+
+For `atomic run --graph-epic`, the operator can route each claimed work item
+to a named endpoint. Put `model.lanes` in your own configuration file, not in
+the project's `atomic.yaml`:
+
+```yaml
+model:
+  lanes:
+    endpoints:
+      local:
+        base_url: http://127.0.0.1:11434/v1
+        name: local-coder
+      remote:
+        base_url: https://models.example.com/v1
+        name: review-coder
+        api_key_env: REVIEW_MODEL_KEY
+    routes:
+      - kind: task
+        labels_any: [security, durability]
+        endpoint: remote
+    default: local
+```
+
+Routes read the item's host graph kind and labels, in written order. The run
+records one endpoint and model choice before each lane's first model turn;
+author, reviewer and repair turns in that lane use the recorded choice. Editing
+routes changes later lanes only. The endpoint catalog is frozen at run
+admission, so changing an endpoint requires a new run. Endpoint model names
+must be distinct because the budget price table is keyed by model name.
+`api_key_env` records only the variable name; the key's value stays in the
+operator's environment. Ordinary runs continue to use `model.base_url` and
+`model.name`.
 
 A lite atom's key goes only to the endpoint `model.base_url` names, and the same
 holds for the key `atomic eval --live` forwards while recording. The client

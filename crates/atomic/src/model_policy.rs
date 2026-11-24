@@ -59,7 +59,8 @@ pub struct LaneChoice {
 
 /// The admission-time endpoint catalog and the operator file from which only
 /// later route edits may be read. A running lane uses its recorded choice.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LanePolicySource {
     /// The operator's own configuration, never a project file.
     pub path: PathBuf,
@@ -67,7 +68,36 @@ pub struct LanePolicySource {
     pub endpoints: BTreeMap<String, LaneEndpoint>,
 }
 
+impl LaneChoice {
+    /// The provider configuration a recorded lane choice gives its turns.
+    /// A credential's value is read by the model runtime from the named
+    /// environment variable; it is never put in the durable receipt.
+    pub fn model_endpoint(&self) -> atomic_core::codex::ModelEndpoint {
+        atomic_core::codex::ModelEndpoint {
+            base_url: self.target.base_url.clone(),
+            model: self.target.name.clone(),
+            api_key_env: self.target.api_key_env.clone(),
+            sign_in: None,
+        }
+    }
+}
+
 impl LanePolicySource {
+    /// Check the admitted endpoint catalog even when the source was restored
+    /// from a durable run rather than built from current operator settings.
+    pub fn validate_catalog(&self) -> Result<(), String> {
+        let default =
+            self.endpoints.keys().next().ok_or_else(|| {
+                "model.lanes.endpoints must name at least one endpoint".to_owned()
+            })?;
+        LanePolicy {
+            endpoints: self.endpoints.clone(),
+            routes: Vec::new(),
+            default: default.clone(),
+        }
+        .validate()
+    }
+
     /// Read the latest operator route declarations for an unstarted lane.
     /// Endpoint changes require a fresh run and fresh budget admission.
     pub fn select<'a>(
@@ -116,12 +146,19 @@ impl LanePolicy {
                 self.default
             ));
         }
+        let mut models = BTreeMap::<&str, &str>::new();
         for (id, endpoint) in &self.endpoints {
             if id.is_empty() || id.trim() != id {
                 return Err("model.lanes endpoint names must be nonempty and trimmed".into());
             }
             if endpoint.name.trim().is_empty() {
                 return Err(format!("model.lanes endpoint {id:?} needs a model name"));
+            }
+            if let Some(other) = models.insert(&endpoint.name, id) {
+                return Err(format!(
+                    "model.lanes endpoints {other:?} and {id:?} share model {:?}; each endpoint needs a distinct model name so its price is unambiguous",
+                    endpoint.name
+                ));
             }
             let url = url::Url::parse(&endpoint.base_url)
                 .map_err(|_| format!("model.lanes endpoint {id:?} has an invalid base_url"))?;
@@ -221,13 +258,13 @@ mod tests {
             ],
             "default":"local"
         }))
-        .unwrap()
+        .expect("valid lane policy")
     }
 
     #[test]
     fn ordered_kind_and_label_routes_select_exact_endpoint() {
         let policy = policy();
-        policy.validate().unwrap();
+        policy.validate().expect("valid policy");
         assert_eq!(policy.select("task", ["security"]).endpoint, "remote");
         assert_eq!(policy.select("task", ["durability"]).endpoint, "remote");
         assert_eq!(policy.select("docs", ["polish"]).target.name, "qwen");
@@ -239,22 +276,47 @@ mod tests {
     fn refuses_unknown_routes_and_unsafe_endpoint_addresses() {
         let mut unknown = policy();
         unknown.routes[0].endpoint = "missing".into();
-        assert!(unknown.validate().unwrap_err().contains("unknown endpoint"));
+        assert!(
+            unknown
+                .validate()
+                .expect_err("unknown route endpoint")
+                .contains("unknown endpoint")
+        );
         let mut unsafe_url = policy();
-        unsafe_url.endpoints.get_mut("remote").unwrap().base_url = "http://outside.test/v1".into();
+        unsafe_url
+            .endpoints
+            .get_mut("remote")
+            .expect("remote endpoint")
+            .base_url = "http://outside.test/v1".into();
         assert!(
             unsafe_url
                 .validate()
-                .unwrap_err()
+                .expect_err("unsafe endpoint URL")
                 .contains("https or loopback")
         );
         let mut invalid_key = policy();
-        invalid_key.endpoints.get_mut("remote").unwrap().api_key_env = Some("BAD-NAME".into());
+        invalid_key
+            .endpoints
+            .get_mut("remote")
+            .expect("remote endpoint")
+            .api_key_env = Some("BAD-NAME".into());
         assert!(
             invalid_key
                 .validate()
-                .unwrap_err()
+                .expect_err("invalid key name")
                 .contains("environment variable")
+        );
+        let mut ambiguous_price = policy();
+        ambiguous_price
+            .endpoints
+            .get_mut("remote")
+            .expect("remote endpoint")
+            .name = "qwen".into();
+        assert!(
+            ambiguous_price
+                .validate()
+                .expect_err("same model ID at two endpoints")
+                .contains("price is unambiguous")
         );
     }
 
@@ -275,25 +337,32 @@ mod tests {
                 &path,
                 serde_json::json!({"model":{"lanes":policy}}).to_string(),
             )
-            .unwrap();
+            .expect("write policy");
         };
         write(&policy);
-        let first = source.select("task", ["security"]).unwrap();
+        let first = source.select("task", ["security"]).expect("first choice");
         assert_eq!(first.endpoint, "remote");
         let mut changed = policy.clone();
         changed.routes[0].endpoint = "local".into();
         write(&changed);
         assert_eq!(
-            source.select("task", ["security"]).unwrap().endpoint,
+            source
+                .select("task", ["security"])
+                .expect("later choice")
+                .endpoint,
             "local"
         );
         assert_eq!(first.endpoint, "remote", "earlier choice stays frozen");
-        changed.endpoints.get_mut("local").unwrap().name = "different".into();
+        changed
+            .endpoints
+            .get_mut("local")
+            .expect("local endpoint")
+            .name = "different".into();
         write(&changed);
         assert!(
             source
                 .select("task", ["security"])
-                .unwrap_err()
+                .expect_err("changed endpoint catalog")
                 .contains("catalog changed")
         );
         let _ = std::fs::remove_file(path);

@@ -381,11 +381,12 @@ and the staged `--effects preview` mode are planned for v0.5. The `file` tag
 follows with code context in v0.7. The committed `atomic.policy.lock`, and
 `atomic import` and `atomic export`, are planned for v1.0.
 
-The v0.2 host controls proof and criteria checkpoints change the durable
-pipeline layout from `atomic.pipeline.7` to `atomic.pipeline.9`. An unfinished
-run recorded under `.7` or the staged `.8` layout is not resumed or replayed
-by a `.9` binary. Finish it with the matching older binary, or inspect its
-completed effects and start a new run under `.9`.
+The v0.2 host controls proof, criteria checkpoints and graph lane model choices
+change the durable pipeline layout from `atomic.pipeline.7` to
+`atomic.pipeline.10`. An unfinished run recorded under `.7` or the staged `.8`
+or `.9` layouts is not resumed or replayed by a `.10` binary. Finish it with
+the matching older binary, or inspect its completed effects and start a new run
+under `.10`.
 
 Mermaid diagrams written by hand in docs need nothing from Atomic. The
 [diagram exporters](../guides/diagrams.md) for workflows, the work graph and
