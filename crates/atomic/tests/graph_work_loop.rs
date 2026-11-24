@@ -3786,7 +3786,7 @@ const LANE_CONTROL_RESULT: &str = "its test fails with the control off and passe
 fn lane_author_for_note() -> Value {
     let mut answer = lane_json("fixtures/lane-author/guard-held.output.json");
     answer["summary"] = json!(
-        "Added a note recording that the existing guard test still refuses an unverified finding."
+        "Added a note explaining why the existing guard test refuses an unverified finding."
     );
     answer["files_changed"] = json!(["notes/lane-change.md"]);
     answer["tests_run"] = json!([]);
@@ -4196,7 +4196,7 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         std::fs::create_dir_all(worktree.join("notes")).expect("notes directory");
         std::fs::write(
             worktree.join("notes/lane-change.md"),
-            "The guard test still refuses what it refused.\n",
+            "The guard test still passes because decide() returns confirmed: false when a finding has no host verification. This change leaves the guard code intact.\n",
         )
         .expect("the candidate's change");
         std::fs::write(&release, "written").expect("release the author's answer");

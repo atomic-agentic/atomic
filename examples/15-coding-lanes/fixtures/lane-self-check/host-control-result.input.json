@@ -1,5 +1,5 @@
 {
-  "diff": "diff --git a/notes/lane-change.md b/notes/lane-change.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/lane-change.md\n@@ -0,0 +1 @@\n+The guard test still refuses what it refused.\n",
+  "diff": "diff --git a/notes/lane-change.md b/notes/lane-change.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/lane-change.md\n@@ -0,0 +1 @@\n+The guard test passes because decide() returns confirmed: false when verification is missing.",
   "control_results": [
     {
       "row": "lane-guard-bites",
