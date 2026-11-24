@@ -321,6 +321,55 @@ fn render_and_check_share_project_schema_discovery() {
 }
 
 #[test]
+fn check_project_flag_selects_a_project_without_a_positional_path() {
+    let fixture = Fixture::new("check-project-flag");
+    let project = fixture.0.join("project");
+    let outside = fixture.0.join("outside");
+    copy_tree(&repository().join("examples/01-classify"), &project);
+    std::fs::create_dir_all(&outside).expect("outside directory");
+
+    let manifest = project.join("atomic.yaml");
+    for named in [&project, &manifest] {
+        let checked = fixture.run(
+            &outside,
+            &[
+                "--json",
+                "check",
+                "--project",
+                named.to_str().expect("project path"),
+            ],
+            "",
+        );
+        let checked: serde_json::Value =
+            serde_json::from_str(&success(checked)).expect("check JSON");
+        assert_eq!(checked["checked"]["atoms"], 1);
+        assert_eq!(checked["checked"]["workflows"], 0);
+    }
+
+    let missing = outside.join("missing-project");
+    let refused = fixture.run(
+        &outside,
+        &[
+            "--json",
+            "check",
+            "--project",
+            missing.to_str().expect("missing project path"),
+        ],
+        "",
+    );
+    assert!(!refused.status.success(), "missing project was checked");
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stdout).expect("refusal JSON");
+    assert_eq!(refusal["error"]["kind"], "project.not_found");
+    assert!(
+        refusal["error"]["description"]
+            .as_str()
+            .expect("refusal description")
+            .contains(missing.to_str().expect("missing project path")),
+        "{refusal}"
+    );
+}
+
+#[test]
 fn repeated_source_path_renders_each_distinct_value_with_its_own_binding() {
     let fixture = Fixture::new("repeated-binding");
     let project = fixture.0.join("project");

@@ -469,6 +469,10 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         Some(Command::Parks(command)) => parks::run(command, &state).await,
         Some(Command::Model(_)) => unreachable!("`atomic model` runs without a state directory"),
         Some(Command::Check { path, profile }) => {
+            // `--project` selects the project even when CHECK's optional
+            // positional path is omitted. The state root was already
+            // resolved from that flag, including its manifest-file form.
+            let path = path.or_else(|| project.map(|_| state.root().to_path_buf()));
             tokio::task::spawn_blocking(move || check_with_profile(path, profile, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
