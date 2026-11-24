@@ -8515,7 +8515,12 @@ fn a_real_control_runner_proves_the_bound_candidate_before_review() {
             .expect("run cache")
             .expect("run cache entry")
             .path();
-        let predictable_target = run_cache.join("cargo-target/code.controls.0.0");
+        // Exec cache components include the stable step hash when a name has
+        // dots. Seed the target the old shared-cache behavior would reuse.
+        let step = "code.controls.0.0";
+        let digest = format!("{:x}", Sha256::digest(step.as_bytes()));
+        let predictable_target =
+            run_cache.join(format!("cargo-target/_code_controls_0_0-{}", &digest[..12]));
         std::fs::create_dir_all(&predictable_target).expect("preseed old target");
         std::fs::write(
             predictable_target.join("poison"),

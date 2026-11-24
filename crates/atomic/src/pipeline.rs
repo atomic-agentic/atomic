@@ -3520,6 +3520,16 @@ fn bound_control_source(run: &RunScope<'_>, step_id: &str) -> Result<String> {
     Ok(worktrees.repo().git_dir().display().to_string())
 }
 
+/// A controls receipt must echo the host's frozen binding, not a value from
+/// the candidate or the proof atom. This check runs before the receipt can
+/// reach either reviewer.
+fn host_control_bound_matches(output: &Value, reference: &str, base: &str, admitted: &str) -> bool {
+    let reference_matches = output["bound"]["reference"].as_str() == Some(reference);
+    let base_matches = output["bound"]["base"].as_str() == Some(base);
+    let admitted_matches = output["bound"]["admitted"].as_str() == Some(admitted);
+    reference_matches && base_matches && admitted_matches
+}
+
 /// A coding candidate may change source and tests, but it cannot redefine a
 /// selected control while asking that control to approve the same candidate.
 /// The row name comes from the pinned workflow; its definition comes from the
@@ -5107,24 +5117,7 @@ async fn reviewed<C: WorkflowContext>(
                     if output.get("ok") != Some(&Value::Bool(true))
                         || output.get("source").and_then(Value::as_str) != Some(source.as_str())
                         || output.get("commit").and_then(Value::as_str) != Some(commit.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("reference"))
-                            .and_then(Value::as_str)
-                            != Some(reference.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("base"))
-                            .and_then(Value::as_str)
-                            != Some(base.as_str())
-                        || output
-                            .get("bound")
-                            .and_then(Value::as_object)
-                            .and_then(|bound| bound.get("admitted"))
-                            .and_then(Value::as_str)
-                            != Some(admitted.as_str())
+                        || !host_control_bound_matches(output, &reference, base, admitted)
                         || entry.get("name").and_then(Value::as_str) != Some(row.as_str())
                         || verdict != Some("passed")
                     {
@@ -6378,6 +6371,48 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_host_control_proof_refuses_a_wrong_reference_receipt() {
+        let valid = json!({"bound": {
+            "reference": "refs/atomic/run/steps/code/1", "base": "base", "admitted": "admitted"
+        }});
+        assert!(host_control_bound_matches(
+            &valid,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+        let mut forged = valid;
+        forged["bound"]["reference"] = json!("refs/atomic/other/steps/code/1");
+        assert!(!host_control_bound_matches(
+            &forged,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+    }
+
+    #[test]
+    fn a_host_control_proof_refuses_a_wrong_base_receipt() {
+        let valid = json!({"bound": {
+            "reference": "refs/atomic/run/steps/code/1", "base": "base", "admitted": "admitted"
+        }});
+        assert!(host_control_bound_matches(
+            &valid,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+        let mut forged = valid;
+        forged["bound"]["base"] = json!("other-base");
+        assert!(!host_control_bound_matches(
+            &forged,
+            "refs/atomic/run/steps/code/1",
+            "base",
+            "admitted"
+        ));
+    }
 
     #[test]
     fn frozen_graph_criteria_stay_out_of_model_item_input() {
