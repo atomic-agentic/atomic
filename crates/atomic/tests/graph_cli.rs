@@ -1050,7 +1050,7 @@ fn unreadable_link_loop_is_refused_without_importing() {
 }
 
 #[test]
-fn configured_postgres_graph_refuses_instead_of_using_local_sqlite() {
+fn configured_remote_graph_refuses_instead_of_using_local_sqlite() {
     let fixture = Fixture::new("postgres");
     let project = fixture.project("project");
     let input = fixture.root.join("beads.jsonl");
