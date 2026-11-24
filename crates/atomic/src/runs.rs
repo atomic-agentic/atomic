@@ -348,7 +348,13 @@ async fn finish(
             let hint = Said::new().text(HINT).name(run_id).text(HINT_END);
             Err(Failure::named("run.panicked", cause, hint).into())
         }
-        Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
+        Err(DurableError::Failed(why))
+            if why.starts_with(&format!(
+                "{} run {run_id} stopped {} times ",
+                atomic_app::pipeline::DEAD_LETTERED,
+                atomic_app::pipeline::RECOVERY_LIMIT
+            )) =>
+        {
             Err(Failure::named(
                 "run.dead_lettered",
                 Said::new()
