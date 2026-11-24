@@ -1053,6 +1053,7 @@ impl GraphStore for SqliteStore {
     ) -> impl Future<Output = Result<(), StoreError>> + Send {
         async move {
             let actor = self.actor_for_write(actor, "set status")?;
+            // CONTROL_OFF: graph-agent-status-human-only
             if !actor.human {
                 return Err(StoreError::NeedsHumanCredential {
                     action: "set status".to_owned(),
@@ -1339,6 +1340,7 @@ impl GraphStore for SqliteStore {
                                     .map_err(db)?;
                             if let Some(row) = existing {
                                 let old: String = row.try_get("trust").map_err(db)?;
+                                // CONTROL_OFF: graph-agent-memory-trust
                                 if old == "human" || old == "approved" {
                                     return Err(StoreError::NeedsHumanCredential {
                                         action: "replace trusted memory".to_owned(),

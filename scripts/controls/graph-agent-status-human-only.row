@@ -1,0 +1,1 @@
+graph-agent-status-human-only|crates/atomic-graph/src/sqlite.rs|if !actor.human {|if false {|-p atomic-agentic-graph --test conformance sqlite_agent_status_cannot_close_defer_or_bypass_close_policy
