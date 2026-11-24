@@ -193,7 +193,7 @@ fn reached(key: &RecoveryKey, position: usize) -> Result<()> {
         }
         // A step that stopped for an artifact store held elsewhere, as a pin
         // does, takes nothing toward dead-lettering, nor does it get further.
-        if position == *top && !atomic_core::runtime::take_held_stop(id) {
+        if position == *top && !atomic_core::runtime::take_held_stop(&key.store, id) {
             *entries += 1;
         }
         *entries
