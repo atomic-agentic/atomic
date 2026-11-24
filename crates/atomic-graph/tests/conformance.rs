@@ -2445,6 +2445,102 @@ fn sqlite_import_rejects_wrong_shapes_and_preserves_signed_dates() {
 }
 
 #[test]
+fn sqlite_pre_epoch_dates_roundtrip_through_create_import_show_and_export() {
+    use store_contract::{Actor, Draft, GraphStore};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-signed-dates-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let created = std::time::UNIX_EPOCH - Duration::from_millis(123_456_789_123);
+    let due = created + Duration::from_millis(3_600_123);
+    let store = sqlite_authorized_for_tests(&path, move || created).expect("open graph store");
+    let actor = Actor::human("maintainer");
+    let mut draft = Draft::new("at-native-old", "Native before epoch");
+    draft.due_at = Some(due);
+    let imported_created = "1960-01-01T00:00:00.123Z";
+    let imported_due = "1960-01-02T00:00:00.456Z";
+    let imported = format!(
+        "{{\"id\":\"at-imported-old\",\"title\":\"Imported before epoch\",\"status\":\"open\",\"priority\":2,\"issue_type\":\"task\",\"created_at\":\"{imported_created}\",\"due_at\":\"{imported_due}\"}}"
+    );
+
+    harness::block_on(async {
+        store
+            .create_item(actor.clone(), "native-old".into(), draft)
+            .await
+            .expect("create pre-epoch item");
+        store
+            .import(actor.clone(), imported, false)
+            .await
+            .expect("import pre-epoch item");
+        let native = store
+            .show(actor.clone(), "at-native-old".into())
+            .await
+            .expect("show native item")
+            .expect("native item exists")
+            .item;
+        assert_eq!(native.created_at, created);
+        assert_eq!(native.due_at, Some(due));
+        let imported = store
+            .show(actor.clone(), "at-imported-old".into())
+            .await
+            .expect("show imported item")
+            .expect("imported item exists")
+            .item;
+        let imported_created_ms = chrono::DateTime::parse_from_rfc3339(imported_created)
+            .expect("import created date")
+            .timestamp_millis();
+        let imported_due_ms = chrono::DateTime::parse_from_rfc3339(imported_due)
+            .expect("import due date")
+            .timestamp_millis();
+        assert!(imported_created_ms < 0 && imported_due_ms < 0);
+        assert_eq!(
+            imported.created_at,
+            std::time::UNIX_EPOCH - Duration::from_millis(imported_created_ms.unsigned_abs())
+        );
+        assert_eq!(
+            imported.due_at,
+            Some(std::time::UNIX_EPOCH - Duration::from_millis(imported_due_ms.unsigned_abs()))
+        );
+
+        let exported = store.export(actor).await.expect("export graph");
+        let rows: Vec<serde_json::Value> = exported
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("exported JSON row"))
+            .collect();
+        for (id, expected_created, expected_due) in [
+            ("at-native-old", created, due),
+            (
+                "at-imported-old",
+                imported.created_at,
+                imported.due_at.expect("imported due"),
+            ),
+        ] {
+            let row = rows
+                .iter()
+                .find(|row| row["id"] == id)
+                .expect("exported item");
+            for (field, expected) in [("created_at", expected_created), ("due_at", expected_due)] {
+                let actual = chrono::DateTime::parse_from_rfc3339(
+                    row[field].as_str().expect("exported date string"),
+                )
+                .expect("valid exported date")
+                .timestamp_millis();
+                let expected = -(expected
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect_err("pre-epoch expected date")
+                    .duration()
+                    .as_millis() as i64);
+                assert_eq!(actual, expected, "{id} {field} changed on export");
+            }
+        }
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensation() {
     use store_contract::{Actor, Draft, EdgeKind, Finish, GraphStore};
     let path = std::env::temp_dir().join(format!(
