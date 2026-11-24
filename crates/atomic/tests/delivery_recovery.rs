@@ -60,7 +60,7 @@ fn cli(root: &Path, args: &[&str], failpoint: Option<&str>) -> Output {
     if let Some(name) = failpoint {
         cmd.env("ATOMIC_FAILPOINT", name);
     }
-    cmd.output().unwrap()
+    cmd.output().expect("run atomic CLI child")
 }
 
 fn success(out: Output) -> Vec<u8> {
@@ -75,9 +75,9 @@ fn resume(root: &Path, failpoint: Option<&str>) -> Output {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "seed subprocess used by the delivery recovery test"]
 async fn seed_admitted_delivery() {
-    let root = PathBuf::from(std::env::var_os("DELIVERY_RECOVERY_ROOT").unwrap());
-    let state = ProjectState::resolve(&project(&root)).unwrap();
-    state.create().unwrap();
+    let root = PathBuf::from(std::env::var_os("DELIVERY_RECOVERY_ROOT").expect("seed root"));
+    let state = ProjectState::resolve(&project(&root)).expect("resolve seed project");
+    state.create().expect("create seed project state");
     let id = format!("project/{}", state.id());
     let mut rt = Durare::open(
         &Database::Sqlite(state.database()),
@@ -86,7 +86,7 @@ async fn seed_admitted_delivery() {
         &id,
     )
     .await
-    .unwrap();
+    .expect("open seed durable runtime");
     // Enter the store through the real durable APIs. This fixture starts
     // downstream of source admission and exercises the production source
     // revalidation against committed acceptance, publication and close rows.
@@ -110,35 +110,43 @@ async fn seed_admitted_delivery() {
     rt.register(WORKFLOW, |_: DurareContext, _: Value| {
         std::future::pending::<atomic_durable::Result<()>>()
     });
-    rt.launch().await.unwrap();
-    rt.start(GRAPH_PIPELINE, SOURCE, ()).await.unwrap();
-    rt.result::<()>(SOURCE).await.unwrap();
+    rt.launch().await.expect("launch seed runtime");
+    rt.start(GRAPH_PIPELINE, SOURCE, ())
+        .await
+        .expect("start reviewed source");
+    rt.result::<()>(SOURCE)
+        .await
+        .expect("finish reviewed source");
     let credential = HumanCredential::new(Principal::local(OWNER), "delivery operator secret");
-    gate::enroll(&rt, &credential).await.unwrap();
-    let files = FileSecrets::open(&root.join("state/credentials"), &project(&root)).unwrap();
+    gate::enroll(&rt, &credential)
+        .await
+        .expect("enroll delivery operator");
+    let files = FileSecrets::open(&root.join("state/credentials"), &project(&root))
+        .expect("open operator credentials");
     files
         .save(
             &format!("operator:{OWNER}@{}", state.id()),
             "delivery operator secret",
         )
-        .unwrap();
+        .expect("save delivery operator credential");
     let dir = state.private_dir().join("delivery");
-    fs::create_dir(&dir).unwrap();
+    fs::create_dir(&dir).expect("create delivery fixture directory");
     fs::write(
         dir.join("adapter"),
         include_bytes!("support/delivery_remote.py"),
     )
-    .unwrap();
-    fs::set_permissions(dir.join("adapter"), fs::Permissions::from_mode(0o700)).unwrap();
+    .expect("install fake remote adapter");
+    fs::set_permissions(dir.join("adapter"), fs::Permissions::from_mode(0o700))
+        .expect("make fake remote executable");
     let target = json!({"repository":"test/repo","branch_ref":"refs/heads/lane","expected_old":null,
         "base_ref":"refs/heads/main","title":"Reviewed","body":"Green"});
     fs::write(
         dir.join("target.json"),
-        serde_json::to_vec(&target).unwrap(),
+        serde_json::to_vec(&target).expect("encode delivery target"),
     )
-    .unwrap();
-    fs::write(dir.join("drop-response-push"), "").unwrap();
-    fs::write(dir.join("unreadable-push"), "").unwrap();
+    .expect("write delivery target");
+    fs::write(dir.join("drop-response-push"), "").expect("drop push response");
+    fs::write(dir.join("unreadable-push"), "").expect("block push inspection");
     let push = json!({"repository":target["repository"],"branch_ref":target["branch_ref"],"head":HEAD,"expected_old":null});
     let enqueue = json!({"repository":target["repository"],"branch_ref":target["branch_ref"],"base_ref":target["base_ref"],"head":HEAD});
     let mut pull_request = enqueue.clone();
@@ -178,8 +186,8 @@ async fn seed_admitted_delivery() {
         json!({"plan":plan,"operator":OWNER,"source":source}),
     )
     .await
-    .unwrap();
-    fs::write(root.join("state-id"), state.id()).unwrap();
+    .expect("start admitted delivery");
+    fs::write(root.join("state-id"), state.id()).expect("record seed state id");
     // End this dedicated seed worker before it could execute a delivery step.
     std::process::exit(0);
 }
@@ -188,15 +196,15 @@ async fn seed_admitted_delivery() {
 async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_each_effect_once() {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("current time follows Unix epoch")
         .as_nanos();
     let root = std::env::temp_dir().join(format!(
         "atomic-delivery-recovery-{}-{nonce}",
         std::process::id()
     ));
-    fs::create_dir_all(project(&root)).unwrap();
-    fs::create_dir(root.join("home")).unwrap();
-    let seed = command(&root, &std::env::current_exe().unwrap())
+    fs::create_dir_all(project(&root)).expect("create recovery project");
+    fs::create_dir(root.join("home")).expect("create recovery home");
+    let seed = command(&root, &std::env::current_exe().expect("test binary path"))
         .args([
             "--ignored",
             "--exact",
@@ -205,9 +213,9 @@ async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_e
         ])
         .env("DELIVERY_RECOVERY_ROOT", &root)
         .output()
-        .unwrap();
+        .expect("start seed child");
     success(seed);
-    let id = fs::read_to_string(root.join("state-id")).unwrap();
+    let id = fs::read_to_string(root.join("state-id")).expect("read seed state id");
     let private = root.join("state/private").join(&id);
     let dir = private.join("delivery");
     let rt = Durare::open(
@@ -217,8 +225,9 @@ async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_e
         &format!("project/{id}"),
     )
     .await
-    .unwrap();
-    let open: Value = serde_json::from_slice(&success(resume(&root, None))).unwrap();
+    .expect("open recovery ledger");
+    let open: Value =
+        serde_json::from_slice(&success(resume(&root, None))).expect("parse opened delivery gate");
     let gate = open["gate"].as_str().expect("open delivery gate");
     assert!(
         !dir.join("remote-state.json").exists(),
@@ -235,26 +244,30 @@ async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_e
         Some(9),
         "did not SIGKILL after unknown checkpoint: {first:?}"
     );
-    let steps = rt.steps(RUN).await.unwrap();
+    let steps = rt.steps(RUN).await.expect("read first delivery steps");
     let decision = steps
         .iter()
         .find(|s| s.name == "delivery.push.decision.0")
-        .unwrap();
+        .expect("unknown push decision");
     assert_eq!(decision.output.as_ref(), Some(&json!("Unknown")));
     let fake = || {
-        serde_json::from_slice::<Value>(&fs::read(dir.join("remote-state.json")).unwrap()).unwrap()
+        serde_json::from_slice::<Value>(
+            &fs::read(dir.join("remote-state.json")).expect("read fake remote state"),
+        )
+        .expect("parse fake remote state")
     };
     assert_eq!(fake()["apply_calls"], json!({"push":1}));
     assert_eq!(fake()["mutations"], json!({"push":1}));
-    fs::remove_file(dir.join("unreadable-push")).unwrap();
-    let waiting: Value = serde_json::from_slice(&success(resume(&root, None))).unwrap();
+    fs::remove_file(dir.join("unreadable-push")).expect("restore push inspection");
+    let waiting: Value =
+        serde_json::from_slice(&success(resume(&root, None))).expect("parse uncertainty park");
     assert_eq!(waiting["status"], "outcome_unknown");
     let park = waiting["park"].as_str().expect("durable unknown park");
     assert_eq!(fake()["apply_calls"], json!({"push":1}));
     assert!(
         !rt.steps(RUN)
             .await
-            .unwrap()
+            .expect("read parked delivery steps")
             .iter()
             .any(|s| s.name == "delivery.push.done")
     );
@@ -278,13 +291,20 @@ async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_e
     assert!(
         !rt.steps(RUN)
             .await
-            .unwrap()
+            .expect("read released delivery steps")
             .iter()
             .any(|s| s.name == "delivery.push.decision.1")
     );
-    let final_output: Value = serde_json::from_slice(&success(resume(&root, None))).unwrap();
-    assert_eq!(final_output["effects"].as_array().unwrap().len(), 3);
-    let steps = rt.steps(RUN).await.unwrap();
+    let final_output: Value = serde_json::from_slice(&success(resume(&root, None)))
+        .expect("parse completed delivery result");
+    assert_eq!(
+        final_output["effects"]
+            .as_array()
+            .expect("three delivered effects")
+            .len(),
+        3
+    );
+    let steps = rt.steps(RUN).await.expect("read completed delivery steps");
     assert_eq!(
         steps
             .iter()
@@ -311,10 +331,153 @@ async fn offline_visibility_waits_for_operator_release_and_recovery_dispatches_e
             }
         )
         .await
-        .unwrap()
+        .expect("read delivery gates")
         .len(),
         1
     );
     drop(rt);
-    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(root).expect("remove delivery recovery fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_delivery_effect_boundary_recovers_without_repeating_remote_mutations() {
+    for site in [
+        "delivery:after-gate",
+        "delivery:after-intent",
+        "delivery:after-dispatch",
+        "delivery:after-record",
+    ] {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time follows Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "atomic-delivery-{site}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(project(&root)).expect("create test project");
+        fs::create_dir(root.join("home")).expect("create test home");
+        let seed = command(&root, &std::env::current_exe().expect("test binary path"))
+            .args([
+                "--ignored",
+                "--exact",
+                "seed_admitted_delivery",
+                "--nocapture",
+            ])
+            .env("DELIVERY_RECOVERY_ROOT", &root)
+            .output()
+            .expect("start seed process");
+        success(seed);
+        let id = fs::read_to_string(root.join("state-id")).expect("read project id");
+        let private = root.join("state/private").join(&id);
+        let dir = private.join("delivery");
+        let rt = Durare::open(
+            &Database::Sqlite(private.join("atomic.db")),
+            None,
+            LAYOUT_VERSION,
+            &format!("project/{id}"),
+        )
+        .await
+        .expect("open delivery ledger");
+        let open: Value =
+            serde_json::from_slice(&success(resume(&root, None))).expect("open gate output");
+        let gate = open["gate"].as_str().expect("open delivery gate");
+        assert!(!dir.join("remote-state.json").exists(), "{site}");
+        success(cli(
+            &root,
+            &["gates", "approve", gate, "--command-id", "approve-delivery"],
+            None,
+        ));
+        // This series exercises successful remote responses. The original
+        // fixture's dropped response and unreadable inspection are covered by
+        // the separate outcome_unknown test above.
+        fs::remove_file(dir.join("drop-response-push")).expect("enable push response");
+        fs::remove_file(dir.join("unreadable-push")).expect("enable push inspection");
+
+        let killed = resume(&root, Some(site));
+        assert_eq!(killed.status.signal(), Some(9), "{site}: {killed:?}");
+        if site == "delivery:after-gate" || site == "delivery:after-intent" {
+            assert!(!dir.join("remote-state.json").exists(), "{site}");
+        } else {
+            let state: Value = serde_json::from_slice(
+                &fs::read(dir.join("remote-state.json")).expect("read fake remote"),
+            )
+            .expect("parse fake remote");
+            assert_eq!(state["mutations"], json!({"push":1}), "{site}");
+        }
+
+        let resumed: Value =
+            serde_json::from_slice(&success(resume(&root, None))).expect("recovery output");
+        if site == "delivery:after-intent" {
+            assert_eq!(resumed["status"], "outcome_unknown", "{site}: {resumed}");
+            let park = resumed["park"].as_str().expect("intent uncertainty park");
+            let state: Value = serde_json::from_slice(
+                &fs::read(dir.join("remote-state.json")).expect("read inspection state"),
+            )
+            .expect("parse inspection state");
+            assert_eq!(state["mutations"], json!({}), "{site}");
+            assert_eq!(state["apply_calls"], json!({}), "{site}");
+            assert!(
+                !rt.steps(RUN)
+                    .await
+                    .expect("read pending steps")
+                    .iter()
+                    .any(|step| step.name == "delivery.push.done"),
+                "{site} silently completed an uncertain push"
+            );
+            success(cli(
+                &root,
+                &["parks", "release", park, "--command-id", "release-intent"],
+                None,
+            ));
+            let still_uncertain: Value = serde_json::from_slice(&success(resume(&root, None)))
+                .expect("rechecked intent output");
+            assert_eq!(
+                still_uncertain["status"], "outcome_unknown",
+                "{site}: release without remote evidence must not dispatch again"
+            );
+            let state: Value = serde_json::from_slice(
+                &fs::read(dir.join("remote-state.json")).expect("read reinspection state"),
+            )
+            .expect("parse reinspection state");
+            assert_eq!(state["mutations"], json!({}), "{site}");
+            assert_eq!(state["apply_calls"], json!({}), "{site}");
+            assert!(
+                !rt.steps(RUN)
+                    .await
+                    .expect("read rechecked steps")
+                    .iter()
+                    .any(|step| step.name == "delivery.push.done"),
+                "{site} silently completed an uncertain push"
+            );
+            drop(rt);
+            fs::remove_dir_all(root).expect("remove uncertain fixture");
+            continue;
+        }
+        let finished = resumed;
+        assert_eq!(
+            finished["effects"].as_array().map(Vec::len),
+            Some(3),
+            "{site}"
+        );
+        let state: Value = serde_json::from_slice(
+            &fs::read(dir.join("remote-state.json")).expect("read completed fake remote"),
+        )
+        .expect("parse completed fake remote");
+        assert_eq!(
+            state["mutations"],
+            json!({"push":1,"pull_request":1,"enqueue":1}),
+            "{site}"
+        );
+        assert_eq!(state["apply_calls"], state["mutations"], "{site}");
+        assert_eq!(
+            state["keys"].as_object().map(|keys| keys.len()),
+            Some(3),
+            "{site}"
+        );
+        assert_eq!(finished["effects"][1]["receipt"]["number"], 1, "{site}");
+        assert_eq!(finished["effects"][2]["receipt"]["number"], 1, "{site}");
+        drop(rt);
+        fs::remove_dir_all(root).expect("remove recovery fixture");
+    }
 }

@@ -598,7 +598,9 @@ mod tests {
             .as_nanos();
         let path =
             std::env::temp_dir().join(format!("atomic-delivery-{}-{nonce}.db", std::process::id()));
-        let mut rt = Durare::sqlite(&path).await.expect("open delivery test store");
+        let mut rt = Durare::sqlite(&path)
+            .await
+            .expect("open delivery test store");
         rt.register(WORKFLOW, exercise);
         rt.launch().await.expect("launch delivery test runtime");
         let credential = HumanCredential::new(Principal::local("owner"), "operator secret");

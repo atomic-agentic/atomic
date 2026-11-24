@@ -654,7 +654,7 @@ mod tests {
             id: id.into(),
             digest: format!(
                 "{:x}",
-                Sha256::digest(serde_json::to_vec(&proposal).unwrap())
+                Sha256::digest(serde_json::to_vec(&proposal).expect("serialize test proposal"))
             ),
             proposal,
         }
@@ -692,7 +692,8 @@ mod tests {
             accepted: true,
             reason: None,
         };
-        let (round, found, _) = round_for("graph.00000.fix", &steps, &current, "run").unwrap();
+        let (round, found, _) = round_for("graph.00000.fix", &steps, &current, "run")
+            .expect("locate repaired test round");
         assert_eq!(round, 1);
         assert_eq!(found.id, repaired.id);
     }
@@ -700,7 +701,7 @@ mod tests {
     #[test]
     fn checkpoint_decoder_rejects_bad_padding() {
         assert_eq!(
-            decode_base64("eyJvayI6dHJ1ZX0=").unwrap(),
+            decode_base64("eyJvayI6dHJ1ZX0=").expect("decode valid test payload"),
             br#"{"ok":true}"#
         );
         assert!(decode_base64("=yJvayI6dHJ1ZX0=").is_err());

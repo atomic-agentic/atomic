@@ -607,8 +607,8 @@ async fn only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate
         agent
             .show(Actor::agent("agent"), "verified".into())
             .await
-            .unwrap()
-            .unwrap()
+            .expect("graph admin test operation succeeds")
+            .expect("graph admin test operation succeeds")
             .item
             .status,
         Status::InProgress
@@ -659,7 +659,7 @@ async fn only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate
     assert!(
         worktrees
             .recorded_step_commit("run-proof", "write", 2)
-            .unwrap()
+            .expect("graph admin test operation succeeds")
             .is_none(),
         "a nonexistent attempt is not evidence"
     );
@@ -705,8 +705,8 @@ async fn only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate
         agent
             .show(Actor::agent("agent"), "branch-changed".into())
             .await
-            .unwrap()
-            .unwrap()
+            .expect("graph admin test operation succeeds")
+            .expect("graph admin test operation succeeds")
             .item
             .status,
         Status::InProgress
@@ -752,7 +752,13 @@ async fn item_policy_isolated_between_items_for_admin_and_fenced_close() {
     assert_eq!(a_policy.source, ClosePolicySource::Item);
     assert_eq!(a_policy.requires, vec![Evidence::Commit]);
     assert_eq!(a_policy.set_by.as_deref(), Some("local:owner"));
-    assert_eq!(human.item_close_policy("at-policy-b").await.unwrap(), None);
+    assert_eq!(
+        human
+            .item_close_policy("at-policy-b")
+            .await
+            .expect("graph admin test operation succeeds"),
+        None
+    );
     assert!(matches!(
         human.item_close_policy("at-missing").await,
         Err(StoreError::MissingItem { .. })
@@ -951,8 +957,8 @@ async fn per_item_override_and_clear_preserve_legacy_global_policy() {
     let override_policy = owner
         .item_close_policy("at-legacy-a")
         .await
-        .unwrap()
-        .unwrap();
+        .expect("graph admin test operation succeeds")
+        .expect("graph admin test operation succeeds");
     assert_eq!(override_policy.source, ClosePolicySource::Item);
     assert_eq!(override_policy.requires, vec![Evidence::VerifiedCommit]);
     assert_eq!(
@@ -962,8 +968,8 @@ async fn per_item_override_and_clear_preserve_legacy_global_policy() {
     let fallback = owner
         .item_close_policy("at-legacy-b")
         .await
-        .unwrap()
-        .unwrap();
+        .expect("graph admin test operation succeeds")
+        .expect("graph admin test operation succeeds");
     assert_eq!(fallback.source, ClosePolicySource::LegacyGlobal);
     assert_eq!(fallback.requires, vec![Evidence::Commit]);
     assert!(matches!(
@@ -987,8 +993,8 @@ async fn per_item_override_and_clear_preserve_legacy_global_policy() {
     let restored = owner
         .item_close_policy("at-legacy-a")
         .await
-        .unwrap()
-        .unwrap();
+        .expect("graph admin test operation succeeds")
+        .expect("graph admin test operation succeeds");
     assert_eq!(restored.source, ClosePolicySource::LegacyGlobal);
     assert_eq!(restored.requires, vec![Evidence::Commit]);
     assert!(matches!(

@@ -195,7 +195,10 @@ mod tests {
             panic!("not used")
         }
         fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-            self.commands.lock().unwrap().push(command.clone());
+            self.commands
+                .lock()
+                .expect("test command log lock")
+                .push(command.clone());
             self.result.clone()
         }
         fn close(&self, _: &Workspace) -> Result<(), ExecError> {
@@ -227,7 +230,7 @@ mod tests {
             &cwd,
             &[],
         )
-        .unwrap();
+        .expect("test criterion executes");
         assert!(checked.passed);
         let probed = evaluate(
             &Criterion::Http {
@@ -241,9 +244,9 @@ mod tests {
             &cwd,
             &[],
         )
-        .unwrap();
+        .expect("HTTP criterion executes");
         assert!(probed.passed);
-        let commands = backend.commands.lock().unwrap();
+        let commands = backend.commands.lock().expect("test command log lock");
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "cargo");
         assert_eq!(commands[0].args, ["test", "--locked"]);
@@ -303,7 +306,13 @@ mod tests {
             &[],
         );
         assert!(matches!(result, Err(CriterionError::Declaration(_))));
-        assert!(backend.commands.lock().unwrap().is_empty());
+        assert!(
+            backend
+                .commands
+                .lock()
+                .expect("test command log lock")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -325,7 +334,7 @@ mod tests {
                 &std::env::temp_dir(),
                 &values
             )
-            .unwrap()
+            .expect("true CEL criterion evaluates")
             .passed
         );
         assert!(
@@ -337,7 +346,7 @@ mod tests {
                 &std::env::temp_dir(),
                 &values
             )
-            .unwrap()
+            .expect("false CEL criterion evaluates")
             .passed
         );
         assert!(matches!(
@@ -351,6 +360,12 @@ mod tests {
             ),
             Err(CriterionError::Cel(_))
         ));
-        assert!(backend.commands.lock().unwrap().is_empty());
+        assert!(
+            backend
+                .commands
+                .lock()
+                .expect("test command log lock")
+                .is_empty()
+        );
     }
 }

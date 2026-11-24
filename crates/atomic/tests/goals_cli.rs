@@ -2,7 +2,7 @@
 //! Real goal commands against a private enrolled project store.
 
 use serde_json::{Value, from_str};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
@@ -151,5 +151,5 @@ fn enrolled_operator_manages_goals_and_reads_persisted_brief() {
     )))
     .expect("resumed JSON");
     assert_eq!(resumed["active"], true);
-    let _ = std::fs::remove_dir_all(PathBuf::from(root));
+    let _ = std::fs::remove_dir_all(root);
 }

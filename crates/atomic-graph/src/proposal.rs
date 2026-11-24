@@ -562,7 +562,8 @@ mod tests {
     use std::time::SystemTime;
 
     fn attempt(number: u32) -> AttemptKey {
-        AttemptKey::new("run-one", "graph.00000.fix", number).unwrap()
+        AttemptKey::new("run-one", "graph.00000.fix", number)
+            .expect("valid graph proposal test operation")
     }
 
     fn create() -> Value {
@@ -572,23 +573,37 @@ mod tests {
     #[test]
     fn identities_are_stable_and_host_owned() {
         let mut first = ProposalBuffer::new(attempt(1));
-        let a = first.propose_raw(create()).unwrap();
-        let b = first.propose_raw(create()).unwrap();
+        let a = first
+            .propose_raw(create())
+            .expect("valid graph proposal test operation");
+        let b = first
+            .propose_raw(create())
+            .expect("valid graph proposal test operation");
         let mut replay = ProposalBuffer::new(attempt(1));
-        assert_eq!(replay.propose_raw(create()).unwrap(), a);
+        assert_eq!(
+            replay
+                .propose_raw(create())
+                .expect("valid graph proposal test operation"),
+            a
+        );
         assert_ne!(a.request_id, b.request_id);
         assert_ne!(a.provisional_id, b.provisional_id);
         assert_ne!(
             ProposalBuffer::new(attempt(2))
                 .propose_raw(create())
-                .unwrap(),
+                .expect("valid graph proposal test operation"),
             a
         );
-        assert!(a.provisional_id.as_deref().unwrap().starts_with("at-p"));
+        assert!(
+            a.provisional_id
+                .as_deref()
+                .expect("valid graph proposal test operation")
+                .starts_with("at-p")
+        );
         for field in ["actor", "trust", "sql", "request_id", "id", "status"] {
             let mut raw = create();
             raw.as_object_mut()
-                .unwrap()
+                .expect("valid graph proposal test operation")
                 .insert(field.into(), json!("forged"));
             assert!(first.propose_raw(raw).is_err(), "{field}");
         }
@@ -675,7 +690,9 @@ mod tests {
     #[test]
     fn divergent_operations_share_one_append_log_and_get_distinct_ids() {
         let mut buffer = ProposalBuffer::new(attempt(1));
-        let first = buffer.propose_raw(create()).unwrap();
+        let first = buffer
+            .propose_raw(create())
+            .expect("valid graph proposal test operation");
         let second = buffer
             .propose(GraphOp::Create {
                 title: "Different follow up".into(),
@@ -685,7 +702,7 @@ mod tests {
                 parent: None,
                 due_at: None,
             })
-            .unwrap();
+            .expect("valid graph proposal test operation");
         assert_eq!((first.index, second.index), (0, 1));
         assert_ne!(first.request_id, second.request_id);
         assert_ne!(first.provisional_id, second.provisional_id);
@@ -699,29 +716,31 @@ mod tests {
         let mut buffer = ProposalBuffer::new(owner.clone());
         let id = buffer
             .propose_raw(create())
-            .unwrap()
+            .expect("valid graph proposal test operation")
             .provisional_id
-            .unwrap();
+            .expect("valid graph proposal test operation");
         buffer
             .propose(GraphOp::DepAdd {
                 from: id.clone(),
                 kind: "discovered-from".into(),
                 to: "at-original".into(),
             })
-            .unwrap();
+            .expect("valid graph proposal test operation");
         buffer
             .propose(GraphOp::Remember {
                 item_id: id.clone(),
                 text: "What was found".into(),
             })
-            .unwrap();
+            .expect("valid graph proposal test operation");
         buffer
             .propose(GraphOp::CloseIntent {
                 item_id: id.clone(),
                 reason: "complete".into(),
             })
-            .unwrap();
-        let mine = buffer.show(&owner, &id, None).unwrap();
+            .expect("valid graph proposal test operation");
+        let mine = buffer
+            .show(&owner, &id, None)
+            .expect("valid graph proposal test operation");
         assert!(mine.provisional);
         assert_eq!(
             mine.status, "open",
@@ -730,7 +749,10 @@ mod tests {
         assert_eq!(mine.due_at, Some(12345));
         assert_eq!(mine.trust, ViewTrust::External);
         assert_eq!(mine.author, "atom:run-one:graph.00000.fix:1");
-        let close = mine.close_intent.as_ref().unwrap();
+        let close = mine
+            .close_intent
+            .as_ref()
+            .expect("valid graph proposal test operation");
         assert_eq!(close.text, "complete");
         assert_eq!(close.trust, ViewTrust::External);
         assert_eq!(close.author, mine.author);
@@ -751,7 +773,8 @@ mod tests {
             attempt(1).attempt,
         ));
         let _ = std::fs::remove_file(&database);
-        let store = SqliteStore::open(&database, SystemTime::now).unwrap();
+        let store = SqliteStore::open(&database, SystemTime::now)
+            .expect("valid graph proposal test operation");
         let owner = attempt(1);
         let mut buffer = ProposalBuffer::new(owner.clone());
         let committed = GraphView {
@@ -780,10 +803,10 @@ mod tests {
                 item_id: "at-original".into(),
                 text: "draft note".into(),
             })
-            .unwrap();
+            .expect("valid graph proposal test operation");
         let shown = buffer
             .show(&owner, "at-original", Some(committed.clone()))
-            .unwrap();
+            .expect("valid graph proposal test operation");
         assert!(shown.provisional);
         assert_eq!(shown.due_at, Some(98765));
         assert_eq!(
@@ -811,11 +834,11 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap();
+            .expect("valid graph proposal test operation");
         assert!(
             runtime
                 .block_on(store.all_items(Actor::agent("other attempt")))
-                .unwrap()
+                .expect("valid graph proposal test operation")
                 .is_empty()
         );
         drop(store);
@@ -847,7 +870,9 @@ mod tests {
         assert!(buffer.propose_raw(json!({"op":"create","title":"x","body":"","kind":"task","priority":2,"due_at":-1})).is_err());
         assert_eq!(buffer.operations().len(), 0);
         for _ in 0..MAX_OPERATIONS {
-            buffer.propose_raw(create()).unwrap();
+            buffer
+                .propose_raw(create())
+                .expect("valid graph proposal test operation");
         }
         assert_eq!(buffer.propose_raw(create()), Err(ProposalError::Full));
     }

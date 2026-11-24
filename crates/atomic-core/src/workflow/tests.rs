@@ -131,14 +131,14 @@ fn executable_criteria_are_bounded_and_type_checked_before_run() {
         parse_criteria(&serde_json::json!([{
             "kind":"test", "argv":["sh", "-c", "true"], "timeout_ms":30000
         }]))
-        .unwrap_err()
+        .expect_err("shell criterion is refused")
         .contains("directly named shell is refused")
     );
     assert!(
         parse_criteria(&serde_json::json!([{
             "kind":"test", "argv":["cargo", "test"], "timeout_ms":0
         }]))
-        .unwrap_err()
+        .expect_err("zero criterion timeout is refused")
         .contains("timeout_ms")
     );
     assert!(
@@ -146,7 +146,7 @@ fn executable_criteria_are_bounded_and_type_checked_before_run() {
             "kind":"http", "method":"POST", "url":"https://example.test/health",
             "allowed_host":"example.test", "status":200, "timeout_ms":2000
         }]))
-        .unwrap_err()
+        .expect_err("POST criterion is refused")
         .contains("GET or HEAD")
     );
     assert!(
@@ -154,7 +154,7 @@ fn executable_criteria_are_bounded_and_type_checked_before_run() {
             "kind":"http", "method":"GET", "url":"https://other.test/health",
             "allowed_host":"example.test", "status":200, "timeout_ms":2000
         }]))
-        .unwrap_err()
+        .expect_err("mismatched HTTP host is refused")
         .contains("allowed host")
     );
 }

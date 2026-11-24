@@ -1054,7 +1054,7 @@ async fn graph_publication_and_fenced_close_are_one_rollback_safe_transaction() 
     };
     let digest = format!(
         "{:x}",
-        Sha256::digest(serde_json::to_vec(&proposal).unwrap())
+        Sha256::digest(serde_json::to_vec(&proposal).expect("serialize graph proposal"))
     );
     let candidate = Candidate {
         id: "run-one:accepted".into(),

@@ -1563,7 +1563,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(home.join("registry/src/index.test/serde-1.0.0/src/lib.rs"))
-                .unwrap(),
+                .expect("read trusted serde source"),
             "trusted serde"
         );
         let _ = std::fs::remove_dir_all(dir);

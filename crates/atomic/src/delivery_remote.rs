@@ -433,25 +433,27 @@ mod tests {
         fn new() -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap()
+                .expect("delivery remote test operation succeeds")
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
                 "atomic-delivery-adapter-{}-{nonce}",
                 std::process::id()
             ));
             let dir = path.join("delivery");
-            fs::create_dir_all(&dir).unwrap();
-            fs::write(dir.join("adapter"), PROVIDER).unwrap();
-            fs::set_permissions(dir.join("adapter"), fs::Permissions::from_mode(0o700)).unwrap();
+            fs::create_dir_all(&dir).expect("delivery remote test operation succeeds");
+            fs::write(dir.join("adapter"), PROVIDER)
+                .expect("delivery remote test operation succeeds");
+            fs::set_permissions(dir.join("adapter"), fs::Permissions::from_mode(0o700))
+                .expect("delivery remote test operation succeeds");
             fs::write(dir.join("target.json"), serde_json::to_vec(&json!({
                 "repository":"trusted/repo", "branch_ref":"refs/heads/lane", "base_ref":"refs/heads/main",
                 "expected_old":null, "title":"Reviewed change", "body":"Green checks",
-            })).unwrap()).unwrap();
+            })).expect("delivery remote test operation succeeds")).expect("delivery remote test operation succeeds");
             Self(path)
         }
 
         fn remote(&self) -> DeliveryRemote {
-            DeliveryRemote::from_private(&self.0).unwrap()
+            DeliveryRemote::from_private(&self.0).expect("delivery remote test operation succeeds")
         }
     }
 
@@ -468,32 +470,44 @@ mod tests {
         let dir = &remote.dir;
         let plan = remote
             .plan("project", "source", "fix", HEAD, None, None)
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         let push = &"0".repeat(64);
         let pr = &"1".repeat(64);
         let enqueue = &"2".repeat(64);
         let slot = DeliverySlot::Push;
-        fs::write(dir.join("drop-response-push"), "").unwrap();
+        fs::write(dir.join("drop-response-push"), "")
+            .expect("delivery remote test operation succeeds");
         assert!(
             remote
                 .inspect(&plan, slot, push, None)
                 .await
-                .unwrap()
+                .expect("delivery remote test operation succeeds")
                 .is_none()
         );
         assert!(remote.apply(&plan, slot, push, None).await.is_err());
-        fs::write(dir.join("unreadable-push"), "").unwrap();
+        fs::write(dir.join("unreadable-push"), "")
+            .expect("delivery remote test operation succeeds");
         assert!(remote.inspect(&plan, slot, push, None).await.is_err());
-        fs::remove_file(dir.join("unreadable-push")).unwrap();
+        fs::remove_file(dir.join("unreadable-push"))
+            .expect("delivery remote test operation succeeds");
         assert_eq!(
-            remote.inspect(&plan, slot, push, None).await.unwrap(),
+            remote
+                .inspect(&plan, slot, push, None)
+                .await
+                .expect("delivery remote test operation succeeds"),
             Some(plan.push.clone())
         );
         let slot = DeliverySlot::PullRequest;
-        let receipt = remote.apply(&plan, slot, pr, None).await.unwrap();
+        let receipt = remote
+            .apply(&plan, slot, pr, None)
+            .await
+            .expect("delivery remote test operation succeeds");
         assert_eq!(receipt["number"], 1);
         assert_eq!(
-            remote.inspect(&plan, slot, pr, None).await.unwrap(),
+            remote
+                .inspect(&plan, slot, pr, None)
+                .await
+                .expect("delivery remote test operation succeeds"),
             Some(receipt.clone())
         );
         let slot = DeliverySlot::Enqueue;
@@ -508,9 +522,12 @@ mod tests {
         let queued = remote
             .apply(&plan, slot, enqueue, Some(&receipt))
             .await
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         let state = dir.join("remote-state.json");
-        let mut s: Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        let mut s: Value = serde_json::from_slice(
+            &fs::read(&state).expect("delivery remote test operation succeeds"),
+        )
+        .expect("delivery remote test operation succeeds");
         assert_eq!(
             s["apply_calls"],
             json!({"push":1,"pull_request":1,"enqueue":1})
@@ -518,27 +535,35 @@ mod tests {
         assert_eq!(s["mutations"], s["apply_calls"]);
         let id = s["queue"]
             .as_object()
-            .unwrap()
+            .expect("delivery remote test operation succeeds")
             .keys()
             .next()
-            .unwrap()
+            .expect("delivery remote test operation succeeds")
             .clone();
         s["queue"][&id]["status"] = json!("merged");
-        fs::write(&state, serde_json::to_vec(&s).unwrap()).unwrap();
+        fs::write(
+            &state,
+            serde_json::to_vec(&s).expect("delivery remote test operation succeeds"),
+        )
+        .expect("delivery remote test operation succeeds");
         assert_eq!(
             remote
                 .inspect(&plan, slot, enqueue, Some(&receipt))
                 .await
-                .unwrap(),
+                .expect("delivery remote test operation succeeds"),
             Some(queued)
         );
         s["queue"][&id]["head"] = json!(SECOND);
-        fs::write(&state, serde_json::to_vec(&s).unwrap()).unwrap();
+        fs::write(
+            &state,
+            serde_json::to_vec(&s).expect("delivery remote test operation succeeds"),
+        )
+        .expect("delivery remote test operation succeeds");
         assert!(
             remote
                 .inspect(&plan, slot, enqueue, Some(&receipt))
                 .await
-                .unwrap()
+                .expect("delivery remote test operation succeeds")
                 .is_none()
         );
     }
@@ -549,21 +574,28 @@ mod tests {
         let remote = fixture.remote();
         let first = remote
             .plan("project", "source", "fix", HEAD, None, None)
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         remote
             .apply(&first, DeliverySlot::Push, &"0".repeat(64), None)
             .await
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         let original = remote
             .apply(&first, DeliverySlot::PullRequest, &"1".repeat(64), None)
             .await
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         let config = remote.dir.join("target.json");
-        let mut target: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        let mut target: Value = serde_json::from_slice(
+            &fs::read(&config).expect("delivery remote test operation succeeds"),
+        )
+        .expect("delivery remote test operation succeeds");
         target["expected_old"] = json!(HEAD);
         target["title"] = json!("Updated change");
         target["pull_request_number"] = json!(1);
-        fs::write(&config, serde_json::to_vec(&target).unwrap()).unwrap();
+        fs::write(
+            &config,
+            serde_json::to_vec(&target).expect("delivery remote test operation succeeds"),
+        )
+        .expect("delivery remote test operation succeeds");
         let updated = fixture.remote();
         assert!(
             updated
@@ -573,22 +605,22 @@ mod tests {
         );
         let plan = updated
             .plan("project", "updated-run", "fix", SECOND, None, None)
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         updated
             .apply(&plan, DeliverySlot::Push, &"3".repeat(64), None)
             .await
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         let pr = updated
             .apply(&plan, DeliverySlot::PullRequest, &"4".repeat(64), None)
             .await
-            .unwrap();
+            .expect("delivery remote test operation succeeds");
         assert_eq!(pr["number"], original["number"]);
         assert_eq!(pr["head"], SECOND);
         assert!(
             remote
                 .inspect(&first, DeliverySlot::PullRequest, &"1".repeat(64), None)
                 .await
-                .unwrap()
+                .expect("delivery remote test operation succeeds")
                 .is_none()
         );
     }
@@ -598,11 +630,14 @@ mod tests {
         let fixture = Fixture::new();
         let dir = fixture.0.join("delivery");
         let target = dir.join("target.json");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o666))
+            .expect("delivery remote test operation succeeds");
         assert!(DeliveryRemote::from_private(&fixture.0).is_err());
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::rename(dir.join("adapter"), dir.join("elsewhere")).unwrap();
-        symlink("elsewhere", dir.join("adapter")).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))
+            .expect("delivery remote test operation succeeds");
+        fs::rename(dir.join("adapter"), dir.join("elsewhere"))
+            .expect("delivery remote test operation succeeds");
+        symlink("elsewhere", dir.join("adapter")).expect("delivery remote test operation succeeds");
         assert!(DeliveryRemote::from_private(&fixture.0).is_err());
     }
 }
