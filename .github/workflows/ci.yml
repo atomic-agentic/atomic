@@ -2,8 +2,9 @@
 #
 # Linux and macOS are first-class platforms. Every push to main, every pull
 # request and every merge group of the merge queue runs the checks on Linux.
-# Pushes to main also run the macOS checks. A manual run on main can opt in
-# with the "macos" input. Actions are pinned by commit SHA.
+# Pushes to main also run the macOS checks. A manual run, on main or on a
+# branch, can opt in with the "macos" input, so a change for macOS can be
+# checked there before it merges. Actions are pinned by commit SHA.
 #
 # The Linux Rust checks are split into jobs that run at once, so a pull
 # request waits for the slowest of them rather than for their sum;
@@ -22,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       macos:
-        description: Also run the Rust job on macOS (main only)
+        description: Also run the Rust jobs on macOS
         type: boolean
         default: false
 
@@ -458,11 +459,13 @@ jobs:
           jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${NEEDS}"
           jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}" >/dev/null
 
-  # The macOS jobs share setup and run in parallel on protected main.
+  # The macOS jobs share setup and run in parallel, on pushes to main and on a
+  # manual run that asks for them. Pull requests and merge groups never start
+  # them.
   # Linux jobs have the repository's Rust build cache.
   clippy-macos:
     name: Clippy (macos-15)
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.macos)) }}
+    if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.macos) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -472,7 +475,7 @@ jobs:
 
   rust-macos:
     name: Rust (macos-15)
-    if: ${{ github.ref == 'refs/heads/main' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.macos)) }}
+    if: ${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && inputs.macos) }}
     runs-on: macos-15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

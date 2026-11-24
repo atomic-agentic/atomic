@@ -75,10 +75,18 @@ impl LanePolicySource {
         kind: &str,
         labels: impl IntoIterator<Item = &'a str>,
     ) -> Result<LaneChoice, String> {
-        let text = std::fs::read_to_string(&self.path)
-            .map_err(|e| format!("read operator model lanes from {}: {e}", self.path.display()))?;
-        let document = atomic_schema::yaml::load(&self.path, &text)
-            .map_err(|e| format!("read operator model lanes from {}: {e}", self.path.display()))?;
+        let text = std::fs::read_to_string(&self.path).map_err(|e| {
+            format!(
+                "read operator model lanes from {}: {e}",
+                self.path.display()
+            )
+        })?;
+        let document = atomic_schema::yaml::load(&self.path, &text).map_err(|e| {
+            format!(
+                "read operator model lanes from {}: {e}",
+                self.path.display()
+            )
+        })?;
         let value = document
             .value
             .pointer("/model/lanes")
@@ -138,7 +146,10 @@ impl LanePolicy {
             }
             if let Some(env) = &endpoint.api_key_env
                 && (env.is_empty()
-                    || !env.bytes().next().is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
+                    || !env
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b == b'_' || b.is_ascii_alphabetic())
                     || !env.bytes().all(|b| b == b'_' || b.is_ascii_alphanumeric()))
             {
                 return Err(format!(
@@ -158,12 +169,13 @@ impl LanePolicy {
                     "model.lanes.routes[{index}] needs kind or labels_any"
                 ));
             }
-            if route.kind.as_ref().is_some_and(|kind| kind.trim().is_empty())
+            if route
+                .kind
+                .as_ref()
+                .is_some_and(|kind| kind.trim().is_empty())
                 || route.labels_any.iter().any(|label| label.trim().is_empty())
             {
-                return Err(format!(
-                    "model.lanes.routes[{index}] has an empty selector"
-                ));
+                return Err(format!("model.lanes.routes[{index}] has an empty selector"));
             }
         }
         Ok(())
@@ -179,7 +191,10 @@ impl LanePolicy {
             .find(|route| {
                 route.kind.as_deref().is_none_or(|wanted| wanted == kind)
                     && (route.labels_any.is_empty()
-                        || route.labels_any.iter().any(|label| labels.contains(label.as_str())))
+                        || route
+                            .labels_any
+                            .iter()
+                            .any(|label| labels.contains(label.as_str())))
             })
             .map_or(self.default.as_str(), |route| route.endpoint.as_str());
         LaneChoice {
@@ -227,10 +242,20 @@ mod tests {
         assert!(unknown.validate().unwrap_err().contains("unknown endpoint"));
         let mut unsafe_url = policy();
         unsafe_url.endpoints.get_mut("remote").unwrap().base_url = "http://outside.test/v1".into();
-        assert!(unsafe_url.validate().unwrap_err().contains("https or loopback"));
+        assert!(
+            unsafe_url
+                .validate()
+                .unwrap_err()
+                .contains("https or loopback")
+        );
         let mut invalid_key = policy();
         invalid_key.endpoints.get_mut("remote").unwrap().api_key_env = Some("BAD-NAME".into());
-        assert!(invalid_key.validate().unwrap_err().contains("environment variable"));
+        assert!(
+            invalid_key
+                .validate()
+                .unwrap_err()
+                .contains("environment variable")
+        );
     }
 
     #[test]
@@ -258,14 +283,19 @@ mod tests {
         let mut changed = policy.clone();
         changed.routes[0].endpoint = "local".into();
         write(&changed);
-        assert_eq!(source.select("task", ["security"]).unwrap().endpoint, "local");
+        assert_eq!(
+            source.select("task", ["security"]).unwrap().endpoint,
+            "local"
+        );
         assert_eq!(first.endpoint, "remote", "earlier choice stays frozen");
         changed.endpoints.get_mut("local").unwrap().name = "different".into();
         write(&changed);
-        assert!(source
-            .select("task", ["security"])
-            .unwrap_err()
-            .contains("catalog changed"));
+        assert!(
+            source
+                .select("task", ["security"])
+                .unwrap_err()
+                .contains("catalog changed")
+        );
         let _ = std::fs::remove_file(path);
     }
 }

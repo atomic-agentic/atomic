@@ -27,12 +27,12 @@
 //! belongs to the application, is never read.
 
 use crate::engine::{EngineArgs, RunnerKind};
+use atomic_app::model_policy::LanePolicy;
 use atomic_core::budget::{BudgetSettings, CallCaps, Caps, Ceilings};
 use atomic_core::codex::ModelEndpoint;
 use atomic_core::config::{self, ConfigError, Layers, Source};
 use atomic_core::signin::SignIn;
 use atomic_schema::yaml;
-use atomic_app::model_policy::LanePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;

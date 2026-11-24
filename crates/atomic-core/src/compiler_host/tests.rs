@@ -458,6 +458,9 @@ fn console_output_stays_off_the_protocol() {
     );
 }
 
+// The child bounds ArrayBuffer contents even when a call does not touch them.
+// On macOS its parent holds the process memory limit (see the next test).
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
     assert_eq!(probe("return typeof WebAssembly;"), Ok(json!("undefined")));
@@ -471,6 +474,45 @@ fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
     assert!(
         error.contains("the Astro compiler exceeded its memory limit"),
         "{error}"
+    );
+}
+
+// Where the child cannot limit its own memory, its parent holds the limit
+// on the memory it uses (see `child_memory`). The parent is given a limit
+// far below production's here, on every platform, so that a parent that
+// does not hold it grants memory the machine has. The memory is ArrayBuffer
+// contents, outside the V8 heap limit, and is filled: memory not written to
+// is not in use.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn memory_a_compile_uses_past_its_limit_is_refused_by_its_parent() {
+    const LIMIT: u64 = 256 * 1024 * 1024;
+    // Fills `megabytes` and holds them for `held` milliseconds.
+    let fill = |megabytes: u64, held: u64| {
+        crate::child_memory::with_limit(LIMIT, || {
+            probe(&format!(
+                "const kept = []; \
+                 for (let size = 0; size < {megabytes}; size += 16) \
+                   kept.push(new Uint8Array(16 << 20).fill(1)); \
+                 await new Promise((resolve) => setTimeout(resolve, {held})); \
+                 return kept.length;"
+            ))
+        })
+    };
+    // Within the limit, a compile uses what it needs.
+    assert_eq!(fill(64, 0), Ok(json!(4)));
+    // Past it, the compile is stopped while it still holds the memory; a
+    // parent without the limit would have its answer twenty seconds later.
+    let started = Instant::now();
+    let error = fill(512, 20_000).expect_err("refused");
+    assert!(
+        error.contains("the Astro compiler exceeded its memory limit"),
+        "{error}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
     );
 }
 

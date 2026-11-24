@@ -664,8 +664,8 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
             std::fs::create_dir_all(&other).unwrap();
             std::fs::write(other.join("left"), "another turn's\n").unwrap();
             let command = format!(
-                "cat a.txt; echo read-exit=$?; head -c 15 {}; echo; \
-                 echo db-exit=$?; cat {}; echo other-exit=$?; echo home=$HOME; \
+                "cat a.txt; echo read-exit=$?; head -c 15 {} 2>/dev/null; db_exit=$?; echo; \
+                 echo db-exit=$db_exit; cat {} 2>/dev/null; echo other-exit=$?; echo home=$HOME; \
                  echo bash=$BASH_VERSION",
                 db.display(),
                 other.join("left").display()
@@ -702,15 +702,17 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
             assert!(out.status.success(), "{out:?}");
             assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Done.");
             let output = command_output(&model);
-            // Each as a line of its own: the shell's stderr reaches the
-            // output in no fixed order with its stdout, and may fall between
-            // them.
+            // The denial probes keep their stderr out of the merged tool
+            // output so partial diagnostics cannot split the status lines.
             let lines: Vec<&str> = output.lines().collect();
             assert!(
                 lines.contains(&"the project") && lines.contains(&"read-exit=0"),
                 "argv0 {argv0}: the turn did not see the project: {output}"
             );
-            assert!(!output.contains("SQLite format"), "{output}");
+            assert!(
+                !output.contains("SQLite format") && lines.contains(&"db-exit=1"),
+                "argv0 {argv0}: the turn read the private database: {output}"
+            );
             // Another turn's scratch stays out of reach, and the read-only
             // turn's shell starts silently, at a HOME that does not exist.
             assert!(

@@ -787,14 +787,20 @@ fn graph_lane_endpoints_are_operator_owned_and_validated() {
     let rejected = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
         .expect_err("project cannot route a person's model traffic")
         .to_string();
-    assert!(rejected.contains("model.lanes chooses model endpoints"), "{rejected}");
+    assert!(
+        rejected.contains("model.lanes chooses model endpoints"),
+        "{rejected}"
+    );
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let (_home, home) = person(lanes);
     let accepted = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
     let policy = accepted.settings.model.lanes.expect("operator lane policy");
     assert_eq!(policy.select("task", ["security"]).target.name, "frontier");
     assert_eq!(policy.select("docs", ["polish"]).target.name, "qwen");
-    assert!(matches!(source(&accepted, "model.lanes"), Source::File { .. }));
+    assert!(matches!(
+        source(&accepted, "model.lanes"),
+        Source::File { .. }
+    ));
 }
 
 #[test]

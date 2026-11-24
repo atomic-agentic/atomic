@@ -9,6 +9,7 @@
 //! input and output. Unlike a runner, it talks to the host while it works: it
 //! asks the host to run captured helpers, one line per call and reply.
 
+use crate::child_memory::{Breach, INTERVAL, Watch};
 use atomic_exec::process;
 use std::path::Path;
 use std::time::Duration;
@@ -32,6 +33,10 @@ pub(crate) type CallHandler<'a> = dyn FnMut(&serde_json::Value) -> serde_json::V
 /// bounded per line and in total. A worker that exits successfully has
 /// answered, even if it stopped reading its request early; one that exits
 /// unsuccessfully has crashed, and the error carries its stderr.
+///
+/// The worker limits its own memory where the operating system has a limit
+/// to set (see `compiler_host`); where it has none, this holds the limit
+/// (see `child_memory`).
 pub(crate) fn run_interactive(
     program: &Path,
     args: &[String],
@@ -58,7 +63,12 @@ pub(crate) fn run_interactive(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     new_session(&mut command);
+    #[cfg(target_os = "macos")]
+    let mut supervisor = crate::worker_lifetime::Supervisor::prepare(&mut command)
+        .map_err(|e| start(e.to_string()))?;
     let mut child = command.spawn().map_err(|e| start(e.to_string()))?;
+    #[cfg(target_os = "macos")]
+    supervisor.child_spawned();
     let input = child.stdin.take().ok_or("no compiler stdin")?;
     let stdout = child.stdout.take().ok_or("no compiler stdout")?;
     let stderr = child.stderr.take().ok_or("no compiler stderr")?;
@@ -104,6 +114,14 @@ pub(crate) fn run_interactive(
             }
         }
     });
+    let mut memory = Watch::for_child(crate::compiler_host::memory_limit());
+    // With a limit to hold, each wait for the worker is cut into readings
+    // of its memory.
+    let pause = if memory.is_some() {
+        INTERVAL
+    } else {
+        Duration::MAX
+    };
     let started = std::time::Instant::now();
     let remaining = || time_limit.saturating_sub(started.elapsed());
     let kill = |child: &mut std::process::Child| {
@@ -127,17 +145,37 @@ pub(crate) fn run_interactive(
             }
         }
     });
+    // A worker found past its memory limit is killed and reported as the
+    // limit it hit; one whose memory cannot be read is killed as well.
+    let mut within_memory = |child: &mut std::process::Child| {
+        let read = match memory.as_mut() {
+            Some(watch) => watch.check(child),
+            None => Ok(()),
+        };
+        let Err(breach) = read else {
+            return Ok(());
+        };
+        kill(child);
+        Err(match breach {
+            Breach::Exceeded => "the Astro compiler exceeded its memory limit".to_owned(),
+            Breach::Unread(error) => {
+                format!("cannot read the Astro compiler's memory to limit it: {error}")
+            }
+        })
+    };
     // A worker that exits without reading its request has still answered.
     let _ = to_worker.send(request.to_vec());
     let mut answer = None;
     loop {
-        let line = match received.recv_timeout(remaining()) {
+        within_memory(&mut child)?;
+        let line = match received.recv_timeout(remaining().min(pause)) {
             Ok(Ok(Some(line))) => line,
             Ok(Ok(None)) => break,
             Ok(Err(message)) => {
                 kill(&mut child);
                 return Err(message);
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !remaining().is_zero() => continue,
             Err(_) => {
                 kill(&mut child);
                 return Err(format!(
@@ -151,7 +189,20 @@ pub(crate) fn run_interactive(
             .and_then(|value| value.get("call").cloned());
         match call {
             Some(call) if answer.is_none() => {
-                let reply = serde_json::to_vec(&handler(&call)).map_err(|e| e.to_string())?;
+                let mut encode =
+                    || serde_json::to_vec(&handler(&call)).map_err(|error| error.to_string());
+                let reply = if pause == INTERVAL {
+                    monitor_during_call(|| within_memory(&mut child), encode)
+                } else {
+                    encode()
+                };
+                let reply = match reply {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        kill(&mut child);
+                        return Err(error);
+                    }
+                };
                 if to_worker.send(reply).is_err() {
                     break;
                 }
@@ -173,8 +224,10 @@ pub(crate) fn run_interactive(
                     time_limit.as_secs()
                 ));
             }
-            None => std::thread::sleep(Duration::from_millis(5)),
+            None => {}
         }
+        within_memory(&mut child)?;
+        std::thread::sleep(pause.min(Duration::from_millis(5)));
     };
     let stderr = errors
         .join()
@@ -359,6 +412,61 @@ fn cpu_limit(status: &std::process::ExitStatus) -> bool {
         let _ = status;
         false
     }
+}
+
+// The compiler is waiting for the reply but can retain memory while a
+// synchronous helper runs. Keep monitoring it until that call completes.
+fn monitor_during_call<T>(
+    mut sample: impl FnMut() -> Result<(), String> + Send,
+    call: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    std::thread::scope(|scope| {
+        let (finished, waiting) = std::sync::mpsc::channel::<()>();
+        let monitor = std::thread::Builder::new()
+            .spawn_scoped(scope, move || {
+                loop {
+                    sample()?;
+                    match waiting.recv_timeout(INTERVAL) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => return Ok::<_, String>(()),
+                    }
+                }
+            })
+            .map_err(|error| format!("cannot monitor the Astro compiler: {error}"))?;
+        let reply = call();
+        drop(finished);
+        monitor
+            .join()
+            .map_err(|_| "compiler monitor panicked".to_owned())??;
+        reply
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn the_compiler_is_sampled_during_a_helper_call() {
+    let (sampled, samples) = std::sync::mpsc::channel();
+    let reply = monitor_during_call(
+        || {
+            let _ = sampled.send(());
+            Ok(())
+        },
+        || {
+            // Both readings must happen while the callback is active.
+            samples
+                .recv_timeout(Duration::from_secs(5))
+                .expect("first reading");
+            samples
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second reading");
+            Ok(1)
+        },
+    );
+    assert_eq!(reply, Ok(1));
+    assert_eq!(
+        monitor_during_call(|| Err("over budget".into()), || Ok(1)),
+        Err("over budget".into())
+    );
 }
 
 /// Start `command` in a session of its own, with no controlling terminal,

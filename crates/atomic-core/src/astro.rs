@@ -636,6 +636,9 @@ mod tests {
     fn an_oversized_component_is_refused_before_the_compiler_runs() {
         let dir = std::env::temp_dir().join(format!("atomic-astro-size-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
+        // The root is canonical, as a project's is: on macOS the temporary
+        // directory is reached through a symbolic link.
+        let dir = std::fs::canonicalize(dir).expect("canonical");
         let file = dir.join("big.atom.astro");
         std::fs::write(&file, "x".repeat(262_145)).expect("big source");
         let error = worker(json!({"action": "load", "file": path_text(&file).expect("utf-8"), "root": path_text(&dir).expect("utf-8")}))

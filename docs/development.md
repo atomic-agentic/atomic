@@ -631,8 +631,14 @@ in turn:
 
 Pushes to main also run two macOS jobs in parallel. "Clippy (macos-15)" runs
 formatting and Clippy while "Rust (macos-15)" builds and tests the workspace.
-A manual run on main can add both jobs with the `macos` input. Pull requests
-and merge groups run the Linux checks. CodeQL runs in its own
+A manual run, on main or on a branch, can add both jobs with the `macos`
+input, which is how a change for macOS is checked before it merges:
+
+```bash
+gh workflow run ci.yml --ref <branch> -f macos=true
+```
+
+Pull requests and merge groups run the Linux checks. CodeQL runs in its own
 workflow on main only
 (each push, weekly and by hand), so an alert shows up after its change merges;
 fix it on main. Nothing in CI waits for it. The Controls workflow runs the
@@ -806,12 +812,42 @@ Declarative atoms use `.atom.astro`. The production compiler assets are bundled
 under `crates/atomic-core/assets` and included in the binary. Running atoms needs
 no Deno, npm install or project `node_modules`: atomic starts itself as the
 compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
-embedded Boa engine. Oxc parses TypeScript and transpiles captured helpers. The tsz checker uses the captured sources, generated declarations and bundled ES2022 library. The compiler child has a cleared environment, 1 GiB allocation budgets for the heap and buffers, a 2.5 GiB writable-memory ceiling, a 32-second CPU limit and a 30-second parent deadline. Its
+embedded Boa engine. Oxc parses TypeScript and transpiles captured helpers.
+The tsz checker uses the captured sources, generated declarations and bundled
+ES2022 library. The compiler child has a cleared environment, 1 GiB allocation
+budgets for the heap and buffers, a 2.5 GiB writable-memory ceiling, a 32-second
+CPU limit, no core files and a 30-second parent deadline. On macOS the parent
+enforces the memory ceiling as described below. Its
 host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
 stderr for its console, its exit status, native Astro parsing and TSX conversion,
 random bytes, SHA-256 and timers, and nothing else: no network, environment, filesystem or subprocess.
 atomic reads atom sources itself and sends them in the request, for loading as
 for rendering. Direct-run context checkpoints live outside the source tree.
+
+The compiler child and the child that runs a captured helper call
+(`helper_runtime/process.rs`) each have a memory limit, and the two platforms
+hold it differently:
+
+- **Linux.** The child sets `RLIMIT_DATA` on itself before compilation starts, and the
+  kernel refuses writable memory past it, written to or not.
+- **macOS.** There `RLIMIT_DATA` and `RLIMIT_AS` both bound the size of the
+  whole address map, the kernel refuses a limit below the map's present size,
+  and an arm64 process starts with hundreds of gigabytes mapped that nothing can
+  use, so a child cannot set a limit near the memory it may hold. The parent
+  holds the limit instead (`crates/atomic-core/src/child_memory.rs`): every two
+  milliseconds while it waits, including during a captured helper call, it
+  asks for the child's physical footprint. A reading over budget kills the
+  child. The interval is a requested wait and the operating system schedules
+  each reading. The footprint counts committed memory, including compressed
+  memory. A reservation or brief peak can go unobserved. A failed reading
+  kills the child, with a one-second grace period when the OS reports that
+  the child is absent and the parent has yet to collect it. Each child also
+  watches a private channel and exits if the supervisor disappears.
+
+The host allocation budgets (the heap and, for helpers, the buffer budget)
+are the same on both. The tests of the parent's limit run on Linux too,
+where they put a small limit in place of the child's own
+(`child_memory::with_limit`).
 
 A test binary cannot dispatch `__atomic-compiler` from `main`, since libtest owns
 it, so atomic-core's tests and the `compiler-in-tests` feature (atomic's

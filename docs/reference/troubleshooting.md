@@ -124,7 +124,12 @@ endpoint. See
 child process of Atomic itself, using its embedded Boa engine. A compile
 that runs past 30 seconds is stopped with `the Astro compiler exceeded 30
 seconds`, and one that uses 32 seconds of CPU time with `the Astro compiler
-exceeded its CPU time limit`. The child permits up to 1 GiB each for heap allocations and buffer storage. Its operating-system writable-memory ceiling is 2.5 GiB. Allocation failures can report `the Astro compiler exceeded its memory limit`. A smaller component graph or simpler types
+exceeded its CPU time limit`. The child permits up to 1 GiB each for heap
+allocations and buffer storage. Linux enforces its 2.5 GiB writable-memory
+ceiling. On macOS the parent stops the child when a reading of its physical
+footprint exceeds that ceiling; short spikes can fall between readings.
+Allocation failures can report `the Astro compiler exceeded its memory limit`.
+A smaller component graph or simpler types
 bring an atom within these limits. A compiler that crashes is reported with what
 it wrote to stderr, and leaves no core file; report it as a bug.
 

@@ -1,0 +1,1 @@
+worker-supervisor-parent-exit|crates/atomic-core/src/worker_lifetime.rs|while has_parent(parent) {|loop {|-p atomic-agentic-core --lib -- worker_lifetime::tests::losing_the_direct_parent_stops_a_worker_with_a_live_socket

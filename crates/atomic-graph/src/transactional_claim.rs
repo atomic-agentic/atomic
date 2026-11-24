@@ -261,11 +261,15 @@ pub async fn claim_next_for_epic(
             .map(|value| {
                 value
                     .as_array()
-                    .ok_or_else(|| DurableError::Failed("graph item's imported labels must be an array".into()))?
+                    .ok_or_else(|| {
+                        DurableError::Failed("graph item's imported labels must be an array".into())
+                    })?
                     .iter()
                     .map(|value| {
                         value.as_str().map(str::to_owned).ok_or_else(|| {
-                            DurableError::Failed("graph item's imported labels must be strings".into())
+                            DurableError::Failed(
+                                "graph item's imported labels must be strings".into(),
+                            )
                         })
                     })
                     .collect::<Result<Vec<_>>>()
@@ -276,14 +280,12 @@ pub async fn claim_next_for_epic(
             id: row.text("id")?,
             title: row.text("title")?,
             body: row.text("body")?,
-            acceptance_criteria: imported
-                .as_ref()
-                .and_then(|record| {
-                    record
-                        .get("acceptance_criteria")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                }),
+            acceptance_criteria: imported.as_ref().and_then(|record| {
+                record
+                    .get("acceptance_criteria")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            }),
             labels,
             criteria: row
                 .text_opt("criteria_json")?

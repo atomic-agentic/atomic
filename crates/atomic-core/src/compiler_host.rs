@@ -30,6 +30,12 @@ pub(crate) const HOST: &str = include_str!("compiler_host/host.js");
 /// The engine heap one compile may use.
 pub(crate) const HEAP_LIMIT: usize = 1024 * 1024 * 1024;
 
+/// The memory one compile may hold, including the engine heap: what the child
+/// is limited to, by itself or by the parent that waits on it.
+pub(crate) fn memory_limit() -> u64 {
+    limits::memory_limit(HEAP_LIMIT)
+}
+
 /// The Node modules the worker imports, served from the host.
 const NODE_MODULES: [&str; 4] = ["fs/promises", "path", "crypto", "url"];
 
@@ -64,6 +70,11 @@ pub fn serve() -> i32 {
 }
 
 fn serve_module(source: &str, heap_limit: usize) -> i32 {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::worker_lifetime::watch_supervisor() {
+        crate::log_line!("cannot watch the Astro compiler's supervisor: {error}");
+        return 1;
+    }
     // The memory limit follows the production heap limit whatever this
     // child's heap, so that a test's smaller heap is what stops it.
     let status = match limits::limit_self(limits::memory_limit(heap_limit)).and_then(|()| {
