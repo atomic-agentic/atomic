@@ -1,0 +1,1 @@
+graph-message-claim-exclusion|crates/atomic-graph/src/sqlite.rs|i.kind == "message"|false|-p atomic-agentic-graph --test conformance sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensation
