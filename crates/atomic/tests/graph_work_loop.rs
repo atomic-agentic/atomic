@@ -899,7 +899,14 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
         // through that project's runtime and open an actual human gate.
         cli_success(&cli(&root, &root.join("project"), &url, &["graph", "export"]).await);
         let cli_db = cli_database(&root, &root.join("project"));
-        std::fs::remove_file(&cli_db).expect("replace fresh CLI database");
+        // Read-only export leaves an absent CLI database absent. A previous
+        // fixture or a writable command may have created it, in which case
+        // replace it with the source run's consistent snapshot.
+        match std::fs::remove_file(&cli_db) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("replace CLI database: {error}"),
+        }
         let mut source_db = sqlx::SqliteConnection::connect(&format!(
             "sqlite://{}?mode=rw",
             root.join("atomic.db").display()
