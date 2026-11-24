@@ -318,6 +318,7 @@ fn render_matches_the_first_live_lite_request_without_calling_the_model() {
 
 /// Codex on a non-OpenAI endpoint adds the lowered output schema to the
 /// developer instructions. A preview must include those exact bytes too.
+// needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn render_matches_non_openai_codex_developer_instructions() {
@@ -388,6 +389,7 @@ fn render_matches_non_openai_codex_developer_instructions() {
 }
 
 /// The profile flag must resolve the same model endpoint for render and run.
+// needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn render_profile_matches_live_codex_endpoint() {
@@ -519,6 +521,7 @@ fn render_profile_matches_live_codex_endpoint() {
 
 /// A command-line endpoint override changes Codex's schema guidance on both
 /// preview and live dispatch, even when the project default is OpenAI.
+// needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn render_model_base_url_matches_live_codex_override() {
