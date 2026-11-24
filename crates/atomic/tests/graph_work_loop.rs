@@ -3783,21 +3783,73 @@ fn lane_task() -> Value {
 
 const LANE_CONTROL_RESULT: &str = "its test fails with the control off and passes with it on";
 
-fn lane_self_review_with_control() -> Value {
-    let mut evidence = lane_json("fixtures/lane-self-check/patch-with-one-decision.output.json");
-    evidence["items"]["10"] = json!(
-        "The host proved lane-guard-bites by running its Cargo test with the guard off and on."
+fn lane_author_for_note() -> Value {
+    let mut answer = lane_json("fixtures/lane-author/guard-held.output.json");
+    answer["summary"] = json!(
+        "Added a note recording that the existing guard test still refuses an unverified finding."
     );
-    evidence["controls"] = json!([{
-        "row": "lane-guard-bites",
-        "result": LANE_CONTROL_RESULT
-    }]);
-    evidence
+    answer["files_changed"] = json!(["notes/lane-change.md"]);
+    answer["tests_run"] = json!([]);
+    answer
 }
 
-/// The lane's scripted model. The self-review fixture echoes the host's
-/// proved control result; the other replies are the example's recorded
-/// outputs. Replies are chosen by prompt, independent of reviewer call order.
+fn lane_self_review_with_control() -> Value {
+    json!({
+        "items": {
+            "1": "The patch adds one note and changes no executable code.",
+            "2": "The patch adds no import or command; the note is the only new file.",
+            "3": "Only notes/lane-change.md is added.",
+            "4": "The note contains no credential or token.",
+            "5": "The patch does not alter the guard's allow or refuse branches; the host test checks the existing behavior.",
+            "6": "The note introduces no retry or repeated effect.",
+            "7": "The note reads no input.",
+            "8": "The note takes no lock, reservation or temporary directory.",
+            "9": "Candidate publication is the host's decision point; the note adds no decision branch.",
+            "10": "The host proved lane-guard-bites by running its Cargo test with the guard off and on."
+        },
+        "decisions": [{
+            "point": "candidate publication",
+            "allow_refuse": "The patch adds no publication path; the host's review and human gates decide whether this candidate publishes.",
+            "not_found": "The note performs no lookup; an absent gate decision cannot authorize publication.",
+            "permission_denied": "The note performs no read; a denied gate decision cannot authorize publication.",
+            "link_loop": "The note opens no path, so a link loop is unreachable in the patch.",
+            "not_directory": "The note opens no path, so this error is unreachable in the patch.",
+            "other_io": "The note performs no I/O at runtime, so this error is unreachable in the patch.",
+            "parse_error": "The note parses no input, so this error is unreachable in the patch.",
+            "timeout": "The note waits for nothing; the host gate handles its own timeout.",
+            "empty_result": "The note returns no result; an empty gate decision cannot authorize publication."
+        }],
+        "controls": [{"row": "lane-guard-bites", "result": LANE_CONTROL_RESULT}]
+    })
+}
+
+fn lane_patch_reviewer_for_note() -> Value {
+    json!({
+        "verdict": "escalate",
+        "reason": "The patch only records a claim about the existing guard. The host test and control proof support that claim, but the patch itself contains no guard code to judge; a person decides whether to publish the note.",
+        "findings": [
+            "Only notes/lane-change.md was added; no executable guard code changed.",
+            "The host proved lane-guard-bites, but that result is separate from the note's patch.",
+            "The candidate publication decision belongs to the host and its human gate."
+        ]
+    })
+}
+
+fn lane_evidence_reviewer_for_note() -> Value {
+    json!({
+        "verdict": "approve",
+        "reason": "The checklist describes the note that is in the patch, covers the host's candidate publication decision point, and echoes the selected lane-guard-bites result exactly.",
+        "findings": [
+            "The patch adds only notes/lane-change.md, as the checklist says.",
+            "The candidate publication decision is covered without claiming the note implements it.",
+            "The control result matches the host's lane-guard-bites proof."
+        ]
+    })
+}
+
+/// The lane's scripted model. Its typed replies describe the actual note patch
+/// and the host's proved control result. They are chosen by prompt, independent
+/// of reviewer call order.
 /// The author's answer is held until this test has written what it stands in
 /// for, so the candidate's patch is a real patch atomic reads out of git.
 async fn lane_model(release: PathBuf, author: &str) -> FakeModel {
@@ -3810,19 +3862,11 @@ async fn lane_model(release: PathBuf, author: &str) -> FakeModel {
                 reply: Box::new(Reply::Text(author.clone())),
             };
         }
-        for (needle, fixture) in [
-            (
-                "Judge the patch on its own terms",
-                "fixtures/lane-reviewer/omitted-decision-escalates.output.json",
-            ),
-            (
-                "Judge the evidence, not the writing around it",
-                "fixtures/lane-evidence-reviewer/evidence-covers-the-inventory.output.json",
-            ),
-        ] {
-            if said.contains(needle) {
-                return Reply::Text(lane_text(fixture));
-            }
+        if said.contains("Judge the patch on its own terms") {
+            return Reply::Text(lane_patch_reviewer_for_note().to_string());
+        }
+        if said.contains("Judge the evidence, not the writing around it") {
+            return Reply::Text(lane_evidence_reviewer_for_note().to_string());
         }
         if said.contains("For each checklist item") {
             return Reply::Text(lane_self_review_with_control().to_string());
@@ -4096,7 +4140,7 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
     on_codex_runtime(async {
         let root = std::fs::canonicalize(scratch("reference-lane"))
             .expect("physical path for git's trial worktree");
-        let author = lane_text("fixtures/lane-author/guard-held.output.json");
+        let author = lane_author_for_note().to_string();
         let release = root.join("release-the-author");
         let model = lane_model(release.clone(), &author).await;
         let project = lane_project(&root);
@@ -4181,8 +4225,8 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         );
         assert_eq!(
             review.show["output"],
-            lane_json("fixtures/lane-author/guard-held.output.json"),
-            "the gate shows the candidate's own recorded output"
+            lane_author_for_note(),
+            "the gate shows the candidate's truthful recorded output"
         );
         decide_lane_gate(&root, &project, &url, &review.id, "lane-review-decision").await;
 
@@ -4211,8 +4255,8 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         assert_eq!(finished["status"], "succeeded");
         assert_eq!(
             finished["output"],
-            lane_json("fixtures/lane-author/guard-held.output.json"),
-            "`returns: steps.code.output` returns the author's recorded output"
+            lane_author_for_note(),
+            "`returns: steps.code.output` returns the author's truthful output"
         );
 
         // Four calls, no more: the author, the self-review and both reviewers.
@@ -4231,6 +4275,16 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
                 "exactly one turn was asked of {needle:?}: {requests:?}"
             );
         }
+        let self_request = requests
+            .iter()
+            .find(|request| request.contains("For each checklist item"))
+            .expect("the self-review request");
+        for required in ["control_results", "lane-guard-bites", LANE_CONTROL_RESULT] {
+            assert!(
+                self_request.contains(required),
+                "self-review was not handed the host's {required}: {self_request}"
+            );
+        }
         // The reviewers read the patch atomic computed, not the author's word
         // for it: the file this test wrote is in what they were sent.
         assert!(
@@ -4245,6 +4299,10 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
             assert!(
                 request.contains("candidate publication"),
                 "the reviewed decision inventory reached a reviewer: {request}"
+            );
+            assert!(
+                request.contains(LANE_CONTROL_RESULT),
+                "the host's control result reached a reviewer: {request}"
             );
         }
 
@@ -4330,17 +4388,17 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         assert_eq!(
             published["code.self_review.0"].proposal.output,
             lane_self_review_with_control(),
-            "the self-review echoed the host result in the example's recorded evidence"
+            "the self-review echoed the host result and described the note patch"
         );
         assert_eq!(
             published["code.review.0.0"].proposal.output,
-            lane_json("fixtures/lane-reviewer/omitted-decision-escalates.output.json"),
-            "the first reviewer recorded the example's recorded verdict"
+            lane_patch_reviewer_for_note(),
+            "the first reviewer described the actual patch"
         );
         assert_eq!(
             published["code.review.0.1"].proposal.output,
-            lane_json("fixtures/lane-evidence-reviewer/evidence-covers-the-inventory.output.json"),
-            "the second reviewer recorded the example's recorded verdict"
+            lane_evidence_reviewer_for_note(),
+            "the second reviewer described the actual evidence"
         );
         assert_eq!(
             published["code.review.0.0"].proposal.output["verdict"], "escalate",
@@ -4368,8 +4426,8 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         // Published once, as one typed output: the author's recorded answer.
         assert_eq!(
             published["code"].proposal.output,
-            lane_json("fixtures/lane-author/guard-held.output.json"),
-            "the one published candidate is the author's recorded output"
+            lane_author_for_note(),
+            "the one published candidate is the author's truthful output"
         );
         assert_eq!(
             steps

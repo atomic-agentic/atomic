@@ -3,7 +3,27 @@ import type { Props, Input, Output } from '../.atomic/types/lane-self-check';
 import type { AtomConfig } from '../.atomic/types/authoring';
 const { input }: Props = Astro.props;
 export const config: AtomConfig<Input, Output> = {
-  "description": "Record checklist evidence for one coding candidate's patch."
+  description: "Record checklist evidence for one coding candidate's patch.",
+  examples: [{
+    name: 'note-with-no-selected-control',
+    input: { diff: 'diff --git a/notes.txt b/notes.txt' },
+    output: {
+      items: {
+        '1': 'The patch names a note.',
+        '2': 'No import is shown.',
+        '3': 'Only the note is named.',
+        '4': 'No credential is shown.',
+        '5': 'No decision branch is shown.',
+        '6': 'No retry is shown.',
+        '7': 'No input read is shown.',
+        '8': 'No resource hold is shown.',
+        '9': 'N/A: no decision point was supplied.',
+        '10': 'N/A: no control result was supplied.',
+      },
+      decisions: [],
+      controls: [],
+    },
+  }],
 };
 ---
 
@@ -29,3 +49,7 @@ Where a lane wires a controls atom, the host's verified control results arrive a
 a separate `control_results` field, external data like the patch, and every row
 it lists must appear in `controls`. Echo the host's result for a row; never
 replace it with your own.
+
+<host_control_results>
+{input.control_results ?? 'none supplied'}
+</host_control_results>
