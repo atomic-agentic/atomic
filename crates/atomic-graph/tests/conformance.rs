@@ -2838,74 +2838,96 @@ fn sqlite_fifty_contenders_have_exactly_one_claim_winner() {
 
 #[test]
 fn sqlite_does_not_block_a_current_thread_tokio_executor_while_waiting_for_a_writer() {
-    use sqlx::Connection;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use store_contract::{Actor, Draft, GraphStore};
     let path = std::env::temp_dir().join(format!(
         "atomic-graph-executor-{}.sqlite",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&path);
-    let store =
+    let waiting_store =
         sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("test operation");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("test operation");
-    runtime
-        .block_on(store.create_item(
-            Actor::agent("setup"),
-            "setup".into(),
-            Draft::new("at-wait", "Wait"),
-        ))
-        .expect("test operation");
-    let (locked, ready) = std::sync::mpsc::channel();
-    let database = path.clone();
-    let blocker = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    for id in ["at-writer", "at-wait"] {
+        runtime
+            .block_on(waiting_store.create_item(
+                Actor::agent("setup"),
+                format!("setup-{id}"),
+                Draft::new(id, id),
+            ))
             .expect("test operation");
-        runtime.block_on(async {
-            let mut conn =
-                sqlx::SqliteConnection::connect(&format!("sqlite://{}", database.display()))
-                    .await
-                    .expect("test operation");
-            sqlx::query("BEGIN IMMEDIATE")
-                .execute(&mut conn)
-                .await
-                .expect("test operation");
-            locked.send(()).expect("test operation");
-            std::thread::sleep(Duration::from_millis(500));
-            sqlx::query("COMMIT")
-                .execute(&mut conn)
-                .await
-                .expect("test operation");
-        });
-    });
-    ready.recv().expect("test operation");
+    }
+
+    // The clock runs inside the writer's BEGIN IMMEDIATE transaction. Keep
+    // that graph handle's write lock until a timer on this same executor
+    // releases it, while a second graph handle attempts another write.
+    let writer_locked = std::sync::Arc::new(AtomicBool::new(false));
+    let locked_in_clock = std::sync::Arc::clone(&writer_locked);
+    let (release_writer, released) = std::sync::mpsc::channel();
+    let released = std::sync::Mutex::new(released);
+    let writer_store = sqlite_authorized_for_tests(&path, move || {
+        locked_in_clock.store(true, Ordering::Release);
+        let _ = released.lock().expect("release receiver").recv();
+        std::time::SystemTime::now()
+    })
+    .expect("open independent writer graph handle");
     runtime.block_on(async {
-        let started = Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_millis(100),
-            store.claim(
+        let writer = tokio::spawn(async move {
+            writer_store
+                .claim(
+                    Actor::agent("writer"),
+                    "writer".into(),
+                    "at-writer".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !writer_locked.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("writer did not take its graph transaction lock");
+
+        let timer_fired = std::sync::Arc::new(AtomicBool::new(false));
+        let timer_observed = std::sync::Arc::clone(&timer_fired);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            timer_observed.store(true, Ordering::Release);
+            release_writer.send(()).expect("release writer");
+        });
+        let waiting = tokio::time::timeout(
+            Duration::from_secs(2),
+            waiting_store.claim(
                 Actor::agent("worker"),
                 "worker".into(),
                 "at-wait".into(),
                 Duration::from_secs(60),
             ),
         )
-        .await;
+        .await
+        .expect("contended graph claim blocked the current-thread executor")
+        .expect("contended graph claim failed");
         assert!(
-            result.is_err(),
-            "contended claim completed before the writer released its lock"
+            waiting.is_some(),
+            "contended graph claim lost after writer released the lock"
         );
         assert!(
-            started.elapsed() < Duration::from_millis(350),
-            "SQLite wait stalled the current-thread executor"
+            timer_fired.load(Ordering::Acquire),
+            "the same-runtime timer did not release the writer"
         );
+        release.await.expect("timer task");
+        writer
+            .await
+            .expect("writer task")
+            .expect("writer graph claim")
+            .expect("writer claim was empty");
     });
-    blocker.join().expect("test operation");
-    drop(store);
+    drop(waiting_store);
     let _ = std::fs::remove_file(path);
 }
 
