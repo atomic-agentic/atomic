@@ -2801,6 +2801,19 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
                 .iter()
                 .any(|item| item.id == "gate" || item.id == "message" || item.id == "comp")
         );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "message".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("message claim check")
+                .is_none(),
+            "a message must not enter the work queue through a direct claim"
+        );
         for target in ["one", "two"] {
             let lease = store
                 .claim(
@@ -2843,6 +2856,48 @@ fn sqlite_waits_for_every_child_and_never_queues_messages_or_unresolved_compensa
                 .expect("test operation")
                 .iter()
                 .any(|item| item.id == "comp")
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_import_refuses_undefined_dependency_kind_without_committing_items() {
+    use store_contract::{Actor, GraphStore, StoreError};
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-undefined-edge-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::human("owner");
+    let imported = [
+        serde_json::json!({"id":"at-blocker","title":"Blocker","status":"open","priority":2,"issue_type":"task"}),
+        serde_json::json!({"id":"at-work","title":"Work","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"at-work","depends_on_id":"at-blocker","type":"future-blocks"}]}),
+    ]
+    .into_iter()
+    .map(|row| row.to_string())
+    .collect::<Vec<_>>()
+    .join("\n");
+    harness::block_on(async {
+        let before = store
+            .export(actor.clone())
+            .await
+            .expect("export before import");
+        let error = store
+            .import(actor.clone(), imported, false)
+            .await
+            .expect_err("undefined edge kind must be refused");
+        assert!(
+            matches!(&error, StoreError::ImportRefused(problems) if problems.iter().any(|problem| problem.contains("unsupported type future-blocks"))),
+            "unexpected import refusal: {error:?}"
+        );
+        assert_eq!(
+            store.export(actor).await.expect("export after refusal"),
+            before,
+            "refused undefined edge kind must leave no committed item"
         );
     });
     drop(store);

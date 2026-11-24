@@ -1,0 +1,1 @@
+graph-undefined-edge-refusal|crates/atomic-graph/src/sqlite.rs|if parse_edge(kind).is_none() {|if false {|-p atomic-agentic-graph --test conformance sqlite_import_refuses_undefined_dependency_kind_without_committing_items
