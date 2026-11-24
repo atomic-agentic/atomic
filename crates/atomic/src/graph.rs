@@ -32,6 +32,9 @@ pub enum GraphCommand {
         /// Explicit item ID; otherwise a fresh short hash is used.
         #[arg(long)]
         id: Option<String>,
+        /// Stable key for retrying this create; otherwise a fresh key is used.
+        #[arg(long)]
+        request_id: Option<String>,
         /// Body or acceptance criteria.
         #[arg(long, default_value = "")]
         body: String,
@@ -370,12 +373,17 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
         GraphCommand::Create {
             title,
             id,
+            request_id,
             body,
             kind,
             priority,
             pinned,
         } => {
-            let request = fresh_request()?;
+            let request = match request_id {
+                Some(request) if !request.is_empty() && request.len() <= 128 => request,
+                Some(_) => bail!("--request-id must contain 1 to 128 bytes"),
+                None => fresh_request()?,
+            };
             let id = id
                 .unwrap_or_else(|| atomic_graph::sqlite::hash_id("graph-cli", request.as_bytes()));
             let mut draft = Draft::new(&id, &title);

@@ -63,7 +63,9 @@ commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
 imports leave matching items unchanged. `atomic graph import --dry-run` and
 `atomic graph export` are read-only commands. These commands accept `--json` through the
-CLI's global option. `atomic graph pin <item>` admits an imported open epic
+CLI's global option. `atomic graph create` accepts `--request-id <key>` so a
+person can retry a create with the same key and payload and receive the original
+item. Without it, each invocation creates a fresh request. `atomic graph pin <item>` admits an imported open epic
 for graph runs after an operator approves the transition. `atomic graph
 reconcile-failed <epic> --run <run>` lets that operator release a terminal
 failed run's exclusive epic binding when it holds no graph item lease; the

@@ -3030,6 +3030,7 @@ fn sqlite_native_pinned_uses_marked_beads_metadata_and_generic_pinned_is_refused
 
 #[test]
 fn sqlite_request_ids_bind_operation_and_target() {
+    use sqlx::Connection;
     use store_contract::{Actor, Draft, GraphStore, StoreError};
     let path = std::env::temp_dir().join(format!(
         "atomic-graph-requests-{}.sqlite",
@@ -3045,22 +3046,28 @@ fn sqlite_request_ids_bind_operation_and_target() {
             .expect("create one");
         assert_eq!(
             store
-                .create_item(
-                    actor.clone(),
-                    "same".into(),
-                    Draft::new("at-one", "Changed title")
-                )
+                .create_item(actor.clone(), "same".into(), Draft::new("at-one", "One"))
                 .await
                 .expect("retry one"),
             first
         );
         assert!(matches!(
             store
+                .create_item(
+                    actor.clone(),
+                    "same".into(),
+                    Draft::new("at-one", "Changed title")
+                )
+                .await,
+            Err(StoreError::RequestConflict { .. })
+        ));
+        assert!(matches!(
+            store
                 .create_item(actor.clone(), "same".into(), Draft::new("at-two", "Two"))
                 .await,
             Err(StoreError::RequestConflict { .. })
         ));
-        store
+        let second = store
             .create_item(
                 actor.clone(),
                 "create-two".into(),
@@ -3068,6 +3075,26 @@ fn sqlite_request_ids_bind_operation_and_target() {
             )
             .await
             .expect("create two");
+        let mut legacy = sqlx::SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("legacy request database");
+        sqlx::query(
+            "UPDATE atomic_graph_requests SET value='at-two' WHERE request_id='create-two'",
+        )
+        .execute(&mut legacy)
+        .await
+        .expect("simulate a pre-fingerprint create request");
+        assert_eq!(
+            store
+                .create_item(
+                    actor.clone(),
+                    "create-two".into(),
+                    Draft::new("at-two", "Two")
+                )
+                .await
+                .expect("legacy request replays"),
+            second
+        );
         let one = store
             .claim(
                 actor.clone(),
