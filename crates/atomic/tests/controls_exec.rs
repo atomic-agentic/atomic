@@ -952,7 +952,12 @@ fn real_cargo_caches(fixture: &Fixture) -> Caches {
     caches.create().expect("fresh run cache");
     let home = caches.dir().join("cargo-home");
     std::fs::create_dir(&home).expect("cargo home");
-    let trusted = Path::new("/cache/cargo");
+    let trusted = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").expect("operator home")).join(".cargo")
+        });
+    let trusted = trusted.canonicalize().expect("operator Cargo home");
     assert!(
         trusted.join("git").is_dir(),
         "trusted offline Cargo git cache"
@@ -967,6 +972,20 @@ fn real_cargo_caches(fixture: &Fixture) -> Caches {
         std::os::unix::fs::symlink(source, registry.join(name)).expect("read-only registry link");
     }
     caches
+}
+
+fn operator_toolchain_bin() -> PathBuf {
+    let output = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .expect("operator rustc");
+    assert!(output.status.success(), "operator Rust sysroot");
+    let sysroot = String::from_utf8(output.stdout).expect("UTF-8 Rust sysroot");
+    let bin = PathBuf::from(sysroot.trim()).join("bin");
+    for executable in ["cargo", "rustc"] {
+        assert!(bin.join(executable).is_file(), "operator {executable}");
+    }
+    bin.canonicalize().expect("operator toolchain bin")
 }
 
 async fn real_row_step(
@@ -1041,10 +1060,10 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
         )
         .trim()
         .to_owned();
-        let trusted_bin = "/usr/local/rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/bin";
+        let trusted_bin = operator_toolchain_bin();
         let home = fixture.dir.join("real-row-cache/cargo-home");
         let declared = format!(
-            "{}         \x20\x20 CARGO_HOME: '{}',\n         \x20\x20 CARGO_NET_OFFLINE: 'true',\n         \x20\x20 RUSTUP_HOME: '/usr/local/rustup',\n         \x20\x20 RUSTUP_TOOLCHAIN: '1.95.0',\n",
+            "{}         \x20\x20 CARGO_HOME: '{}',\n         \x20\x20 CARGO_NET_OFFLINE: 'true',\n",
             relative_pins(
                 &sha256_of(&fixture.dir.join("harness/controls-check.sh")),
                 &sha256_of(&fixture.project.join("tools/controls-exec.py")),
@@ -1058,7 +1077,7 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
                 "tools/controls-exec.py",
                 &declared,
                 &Probe {
-                    bin: Path::new(trusted_bin),
+                    bin: &trusted_bin,
                     project: &fixture.project,
                     source: &fixture.source,
                     secret: &fixture.private.join("secret"),
@@ -1073,9 +1092,11 @@ fn a_real_repository_row_proves_with_cold_target_and_a_blind_variant_fails() {
     let target = PathBuf::from(&caches.env()["CARGO_TARGET_DIR"]);
     assert!(!target.exists(), "real row begins with a cold target cache");
     eprintln!(
-        "real controls row cache provenance: target={}, home={}, trusted=/cache/cargo, network=off",
+        "real controls row cache provenance: target={}, home={}, trusted={}, toolchain={}, network=off",
         target.display(),
         caches.dir().join("cargo-home").display(),
+        std::env::var("CARGO_HOME").unwrap_or_else(|_| "$HOME/.cargo".into()),
+        operator_toolchain_bin().display(),
     );
     on_codex_runtime(async move {
         let scratch = fixture.dir.join("real-scratch");
