@@ -695,6 +695,77 @@ fn a_per_atom_config_atom_is_checked_run_and_refused_by_the_cli() {
     );
 }
 
+#[test]
+fn frozen_type_modules_keep_strict_type_errors_at_the_cli() {
+    let fixture = Fixture::new("frozen-type-controls");
+    let project = fixture.0.join("project");
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::create_dir_all(project.join("lib")).expect("lib");
+    std::fs::write(
+        project.join("strict.atom.astro"),
+        "---\n\
+         import type { Props, Config } from './.atomic/types/strict';\n\
+         import { safe } from './lib/strict-case';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: Config = {};\n\
+         ---\n\
+         Check {safe(input.text)}\n",
+    )
+    .expect("atom");
+    std::fs::write(
+        project.join("strict.input.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["text"],"properties":{"text":{"type":"string"}}}"#,
+    )
+    .expect("input schema");
+    std::fs::write(
+        project.join("strict.output.schema.json"),
+        r#"{"type":"object","additionalProperties":false,"required":["answer"],"properties":{"answer":{"type":"string"}}}"#,
+    )
+    .expect("output schema");
+    let module = project.join("lib/strict-case.ts");
+    std::fs::write(
+        &module,
+        "export const safe = (arg: string): string => arg;\n",
+    )
+    .expect("valid type module");
+    success(fixture.run(&project, &["check", "strict.atom.astro"], ""));
+
+    for (name, source, code, message) in [
+        (
+            "score",
+            "export const safe = (arg: string): string => arg;\ntype Scorer = { score: (judge: { ok: boolean }) => number };\nexport const scorer: Scorer = { score: () => 'wrong' };\n",
+            "TS2322",
+            "Type 'string' is not assignable to type 'number'",
+        ),
+        (
+            "return",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (): string => 1;\n",
+            "TS2322",
+            "Type 'number' is not assignable to type 'string'",
+        ),
+        (
+            "implicit any",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (arg) => arg;\n",
+            "TS7006",
+            "Parameter 'arg' implicitly has an 'any' type",
+        ),
+        (
+            "nullability",
+            "export const safe = (arg: string): string => arg;\nexport const wrong = (arg: string | null) => arg.length;\n",
+            "TS18047",
+            "'arg' is possibly 'null'",
+        ),
+    ] {
+        std::fs::write(&module, source).expect("type module mutation");
+        let output = fixture.run(&project, &["check", "strict.atom.astro"], "");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{name}: {stderr}");
+        assert!(stderr.contains("strict-case.ts"), "{name}: {stderr}");
+        assert!(stderr.contains(code), "{name}: {stderr}");
+        assert!(stderr.contains(message), "{name}: {stderr}");
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn generated_declarations_never_follow_a_symlink_out_of_the_project() {
