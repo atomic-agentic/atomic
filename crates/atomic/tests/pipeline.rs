@@ -8062,8 +8062,11 @@ shutil.copy2(source / row, out)
         .expect("restore copied workspace manifest");
     std::fs::write(project.join("Cargo.lock"), workspace_lock)
         .expect("restore copied workspace lockfile");
-    let row = include_str!("../../../scripts/controls/exec-step-needs-its-snapshot.row");
-    let row = row.replacen("exec-step-needs-its-snapshot|", "row-test|", 1);
+    // This is a cold full-workspace proof with a fresh private Cargo target.
+    // Select a real schema control so its rebuild fits the row's fixed budget
+    // on the smaller CI runner while still exercising the host Cargo driver.
+    let row = include_str!("../../../scripts/controls/context-contract-carries-declaration.row");
+    let row = row.replacen("context-contract-carries-declaration|", "row-test|", 1);
     std::fs::write(project.join("scripts/controls/row-test.row"), row).expect("real row");
     std::fs::remove_file(project.join("bin/cargo")).expect("remove stand-in Cargo");
     let atom = project.join("atoms/prove-controls.atom.astro");

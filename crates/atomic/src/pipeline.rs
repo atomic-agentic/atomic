@@ -4664,8 +4664,31 @@ async fn reviewed<C: WorkflowContext>(
                     } else {
                         None
                     };
+                    // Cargo and rustc are operator-selected tools. CI installs
+                    // their rustup shims under CARGO_HOME/bin rather than the
+                    // development image's /usr/local/cargo/bin. Resolve that
+                    // host directory before entering the candidate sandbox;
+                    // never take a tool path from the candidate's environment.
+                    let path = if uses_cargo {
+                        let homes = std::env::var_os("CARGO_HOME")
+                            .map(|home| PathBuf::from(home).join("bin"))
+                            .into_iter()
+                            .chain([PathBuf::from("/usr/local/cargo/bin")]);
+                        let bin = homes
+                            .filter_map(|path| std::fs::canonicalize(path).ok())
+                            .find(|bin| {
+                                !bin.starts_with(&scratch)
+                                    && !bin.starts_with(cache.dir())
+                                    && bin.join("cargo").is_file()
+                                    && bin.join("rustc").is_file()
+                            })
+                            .ok_or_else(|| failed("trial merge Cargo toolchain bin is missing or candidate-writable".into()))?;
+                        format!("{}:/usr/local/bin:/usr/bin:/bin", bin.display())
+                    } else {
+                        "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin".into()
+                    };
                     env.extend([
-                        ("PATH".into(), "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin".into()),
+                        ("PATH".into(), path),
                         ("HOME".into(), cache.dir().display().to_string()),
                         ("TMPDIR".into(), cache.dir().display().to_string()),
                     ]);
