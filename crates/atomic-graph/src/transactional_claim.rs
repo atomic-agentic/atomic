@@ -47,6 +47,8 @@ pub struct ReviewFollowup {
     pub line: Option<u32>,
     /// `low`, `minor` or `nit`.
     pub severity: String,
+    /// The reviewer's narrow editorial category accepted by host policy.
+    pub category: String,
     /// The reviewer's finding, kept at agent trust.
     pub message: String,
 }
@@ -416,6 +418,10 @@ pub async fn file_review_followups(
         if !matches!(finding.severity.as_str(), "minor" | "low" | "nit")
             || finding.file.is_empty()
             || finding.file.len() > 256
+            || !matches!(
+                finding.category.as_str(),
+                "spelling" | "grammar" | "formatting" | "broken_link"
+            )
             || finding.message.trim().is_empty()
             || finding.message.len() > 1000
         {
@@ -435,8 +441,8 @@ pub async fn file_review_followups(
             .take(200)
             .collect::<String>();
         let body = format!(
-            "Reviewer: {}\nLocation: {}\nSeverity: {}\nFinding: {}",
-            finding.reviewer, location, finding.severity, finding.message
+            "Reviewer: {}\nLocation: {}\nSeverity: {}\nCategory: {}\nFinding: {}",
+            finding.reviewer, location, finding.severity, finding.category, finding.message
         );
         let priority = if finding.severity == "nit" { 4 } else { 3 };
         tx.execute(

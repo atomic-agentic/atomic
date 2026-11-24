@@ -100,6 +100,7 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
         file: "docs/guide.md".into(),
         line: Some(12),
         severity: "low".into(),
+        category: "grammar".into(),
         message: "Clarify the explanation".into(),
     };
     let invalid = ReviewFollowup {

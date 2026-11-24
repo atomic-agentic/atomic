@@ -67,7 +67,7 @@ use atomic_core::artifact::{ArtifactError, ArtifactRef, ArtifactStore, LocalStor
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings};
-use atomic_core::git::{Git, Signature};
+use atomic_core::git::{Git, Signature, TreeEntry};
 use atomic_core::render::RunInput;
 use atomic_core::runtime::{Runtimes, contained, run_declarative_repairing};
 use atomic_core::workflow::{Criterion, Workflow, parse_criteria};
@@ -4547,6 +4547,7 @@ fn safe_review_followup_path(path: &str) -> bool {
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
         || !(path.starts_with("docs/") || path.starts_with("examples/"))
+        || !(path.ends_with(".md") || path.ends_with(".markdown"))
     {
         return false;
     }
@@ -4583,9 +4584,25 @@ fn security_relevant_review_text(message: &str) -> bool {
         "injection",
         "encryption",
         "policy",
+        "jwt",
+        "bypass",
+        "access",
     ]
     .iter()
     .any(|word| lower.contains(word))
+}
+
+fn eligible_review_paths(changed: &BTreeSet<String>, entries: &[TreeEntry]) -> BTreeSet<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            changed.contains(&entry.path)
+                && entry.kind == "blob"
+                && matches!(entry.mode.as_str(), "100644" | "100755")
+                && safe_review_followup_path(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
 /// Route typed findings conservatively. A legacy string finding carries no
@@ -4600,7 +4617,7 @@ fn route_review_findings(
     controls_clean: bool,
     changed_paths: &BTreeSet<String>,
 ) -> (String, Vec<ReviewFollowup>) {
-    if !enabled || !matches!(said, "approve" | "request_changes") {
+    if !enabled || !matches!(said, "approve" | "request_changes" | "revise") {
         return (said.to_owned(), Vec::new());
     }
     let Some(findings) = verdict.get("findings").and_then(Value::as_array) else {
@@ -4627,6 +4644,7 @@ fn route_review_findings(
         let line_field = fields.get("line");
         let line = line_field.and_then(Value::as_u64);
         let severity = fields.get("severity").and_then(Value::as_str).unwrap_or("");
+        let category = fields.get("category").and_then(Value::as_str).unwrap_or("");
         let valid = !message.trim().is_empty()
             && message.len() <= 1000
             && line_field
@@ -4635,6 +4653,10 @@ fn route_review_findings(
             || !controls_clean
             || !safe_review_followup_path(file)
             || !changed_paths.contains(file)
+            || !matches!(
+                category,
+                "spelling" | "grammar" | "formatting" | "broken_link"
+            )
             || security_relevant_review_text(message)
         {
             blocking = true;
@@ -4646,6 +4668,7 @@ fn route_review_findings(
                 file: file.to_owned(),
                 line: line.map(|line| line as u32),
                 severity: severity.to_owned(),
+                category: category.to_owned(),
                 message: message.to_owned(),
             });
         } else {
@@ -4667,15 +4690,16 @@ fn route_review_findings(
 
 #[cfg(test)]
 mod severity_routing_tests {
-    use super::{GraphPipelineRun, route_review_findings};
+    use super::{GraphPipelineRun, eligible_review_paths, route_review_findings};
+    use atomic_core::git::TreeEntry;
     use serde_json::json;
     use std::collections::BTreeSet;
 
     #[test]
     fn low_documentation_findings_become_followups_only_without_touched_controls() {
         let verdict = json!({"verdict":"request_changes","findings":[
-            {"file":"docs/guide.md","line":12,"severity":"low","message":"Clarify the example"},
-            {"file":"examples/demo/README.md","severity":"nit","message":"Tighten the label"}
+            {"file":"docs/guide.md","line":12,"severity":"low","category":"grammar","message":"Clarify the example"},
+            {"file":"examples/demo/README.md","severity":"nit","category":"formatting","message":"Tighten the label"}
         ]});
         let changed = BTreeSet::from([
             "docs/guide.md".to_owned(),
@@ -4692,6 +4716,14 @@ mod severity_routing_tests {
         assert_eq!(routed, "approve");
         assert_eq!(followups.len(), 2);
         assert_eq!(followups[0].line, Some(12));
+        assert_eq!(followups[0].category, "grammar");
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "revise", true, true, &changed);
+        assert_eq!(
+            routed, "approve",
+            "revise follows the same low-finding policy"
+        );
+        assert_eq!(followups.len(), 2);
         let (routed, followups) = route_review_findings(
             "reviewer",
             &verdict,
@@ -4738,12 +4770,15 @@ mod severity_routing_tests {
             "crates/auth.rs".to_owned(),
         ]);
         for finding in [
-            json!({"file":"docs/security.md","severity":"nit","message":"Risk"}),
-            json!({"file":"crates/auth.rs","severity":"low","message":"Risk"}),
-            json!({"file":"docs/guide.md","severity":"major","message":"Broken"}),
-            json!({"file":"docs/guide.md","severity":"low","message":"Leaks a token"}),
-            json!({"file":"docs/../secrets","severity":"nit","message":"Risk"}),
-            json!({"file":"docs/guide.md","line":-1,"severity":"nit","message":"Bad citation"}),
+            json!({"file":"docs/security.md","severity":"nit","category":"grammar","message":"Risk"}),
+            json!({"file":"crates/auth.rs","severity":"low","category":"grammar","message":"Risk"}),
+            json!({"file":"docs/guide.md","severity":"major","category":"grammar","message":"Broken"}),
+            json!({"file":"docs/guide.md","severity":"low","category":"grammar","message":"Leaks a token"}),
+            json!({"file":"docs/guide.md","severity":"low","category":"grammar","message":"JWT bypass permits access"}),
+            json!({"file":"docs/../secrets","severity":"nit","category":"grammar","message":"Risk"}),
+            json!({"file":"docs/guide.md","line":-1,"severity":"nit","category":"grammar","message":"Bad citation"}),
+            json!({"file":"docs/guide.md","severity":"low","message":"No category"}),
+            json!({"file":"docs/guide.md","severity":"low","category":"performance","message":"Wrong category"}),
         ] {
             let verdict = json!({"verdict":"approve","findings":[finding]});
             let (routed, followups) =
@@ -4764,6 +4799,44 @@ mod severity_routing_tests {
             true,
             &BTreeSet::new(),
         );
+        assert_eq!(routed, "request_changes");
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn changed_symlink_cannot_supply_a_followup_citation() {
+        let changed = BTreeSet::from([
+            "docs/guide.md".to_owned(),
+            "docs/link.md".to_owned(),
+            "docs/note.txt".to_owned(),
+        ]);
+        let entries = [
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                id: "a".into(),
+                path: "docs/guide.md".into(),
+            },
+            TreeEntry {
+                mode: "120000".into(),
+                kind: "blob".into(),
+                id: "b".into(),
+                path: "docs/link.md".into(),
+            },
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                id: "c".into(),
+                path: "docs/note.txt".into(),
+            },
+        ];
+        let eligible = eligible_review_paths(&changed, &entries);
+        assert_eq!(eligible, BTreeSet::from(["docs/guide.md".to_owned()]));
+        let verdict = json!({"verdict":"revise","findings":[
+            {"file":"docs/link.md","severity":"nit","category":"spelling","message":"Typo"}
+        ]});
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "revise", true, true, &eligible);
         assert_eq!(routed, "request_changes");
         assert!(followups.is_empty());
     }
@@ -5296,11 +5369,15 @@ async fn reviewed<C: WorkflowContext>(
                     .worktrees
                     .ok_or_else(|| failed(format!("step `{}`: no bound repository", step.id)))?
                     .repo();
-                changed_paths = repo
+                let changed: BTreeSet<String> = repo
                     .changed_paths(base, commit)
                     .map_err(|e| failed(format!("step `{}`: inspect changed paths: {e}", step.id)))?
                     .into_iter()
                     .collect();
+                let entries = repo.entries(commit).map_err(|e| {
+                    failed(format!("step `{}`: inspect candidate tree: {e}", step.id))
+                })?;
+                changed_paths = eligible_review_paths(&changed, &entries);
             }
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {

@@ -109,16 +109,17 @@ with `approve` among them:
 
 For graph-driven `coding: true` steps, a reviewer may return typed findings
 with `file`, optional `line`, `severity` (`blocker`, `major`, `minor`/`low`, or
-`nit`) and `message`. A `request_changes` verdict with only low findings that
-the host can prove are outside its selected control rows becomes an approval
-with follow-up work instead of another repair. The host currently makes that
-proof only for changed paths under `docs/` or `examples/`; security, policy,
-control and ambiguous paths or finding text, and items labeled `security`,
-require repair even if a reviewer called them low. A high-severity finding also
-requires repair when the reviewer wrote
-`approve`. Accepted low findings are filed with `discovered-from` links under
-a separate pinned goal, so they do not hold the active epic open. Older
-reviewers with plain-text findings keep their verdicts unchanged.
+`nit`), `message`, and an editorial `category` (`spelling`, `grammar`,
+`formatting`, or `broken_link`). A `request_changes` or `revise` verdict with
+only low editorial findings becomes an approval with follow-up work if the host
+can prove the cited paths are changed regular Markdown blobs outside selected
+control rows. That proof is limited to `docs/` and `examples/`; a symlink,
+missing or ambiguous category, security-relevant path or finding text, or an
+item labeled `security` requires repair even if the reviewer called it low.
+A high-severity finding requires repair even when the reviewer wrote `approve`.
+Accepted low findings are filed with `discovered-from` links under a separate
+pinned goal, so they do not hold the active epic open. Older reviewers with
+plain-text findings keep their verdicts unchanged.
 The graph run records this routing policy at admission. A run recorded before
 the policy was introduced keeps its original review behavior when recovered.
 
