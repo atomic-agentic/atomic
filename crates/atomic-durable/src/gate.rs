@@ -402,8 +402,12 @@ pub fn gate_id(run: &str, step: &str) -> String {
 
 // The gate store owns this namespace. Graph rows are disposable copies: a
 // decision never derives authority from their presence or status.
-fn graph_gate_id(gate: &str) -> String {
-    format!("gate:{gate}")
+fn graph_gate_id(gate: &str, suffix: u64) -> String {
+    if suffix == 0 {
+        format!("gate:{gate}")
+    } else {
+        format!("gate:{gate}#{suffix}")
+    }
 }
 
 async fn project_open_gate(
@@ -413,17 +417,44 @@ async fn project_open_gate(
     run: &str,
     at: i64,
 ) -> Result<()> {
-    tx.execute(
-        "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,?,'gate',0,'blocked',NULL,'agent','gate-store',?)",
-        &[Param::Text(graph_gate_id(gate)), Param::Text(title.to_owned()), Param::Text(format!("Open human gate for run {run}")), Param::Int(at)],
-    ).await?;
-    Ok(())
+    let mut suffix = 0_u64;
+    loop {
+        let inserted = tx.execute(
+            "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES (?,?,?,'gate',0,'blocked',NULL,'agent','gate-store',?,?) ON CONFLICT(id) DO NOTHING",
+            &[Param::Text(graph_gate_id(gate, suffix)), Param::Text(title.to_owned()), Param::Text(format!("Open human gate for run {run}")), Param::Int(at), Param::Text(gate.to_owned())],
+        ).await?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| DurableError::Failed("gate projection name space exhausted".into()))?;
+    }
 }
 
 async fn remove_gate_projection(tx: &mut Tx<'_, '_>, gate: &str) -> Result<()> {
+    let rows = tx
+        .query_all(
+            "SELECT id FROM atomic_graph_items WHERE projected_gate_id=?",
+            &[Param::Text(gate.to_owned())],
+        )
+        .await?;
+    for row in rows {
+        let id = row.text("id")?;
+        tx.execute(
+            "DELETE FROM atomic_graph_edges WHERE source=? OR target=?",
+            &[Param::Text(id.clone()), Param::Text(id.clone())],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM atomic_graph_blocked WHERE source=? OR target=?",
+            &[Param::Text(id.clone()), Param::Text(id)],
+        )
+        .await?;
+    }
     tx.execute(
-        "DELETE FROM atomic_graph_items WHERE id=? AND kind='gate' AND created_by='gate-store'",
-        &[Param::Text(graph_gate_id(gate))],
+        "DELETE FROM atomic_graph_items WHERE projected_gate_id=? AND kind='gate' AND created_by='gate-store'",
+        &[Param::Text(gate.to_owned())],
     )
     .await?;
     Ok(())
