@@ -147,6 +147,47 @@ async fn cli(root: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
     .expect("CLI worker")
 }
 
+/// A serve refusal should exit promptly. Reap an accidentally admitted
+/// server in the removed-control run so the controls row never hangs.
+async fn cli_serve_with_limit(root: &Path, project: &Path, url: &str) -> Output {
+    let (root, project, url) = (root.to_owned(), project.to_owned(), url.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .args(["--json", "serve"])
+            .current_dir(project)
+            .env("HOME", root.join("home"))
+            .env("ATOMIC_HOME", root.join("state-home"))
+            .env("ATOMIC_CREDENTIAL_STORE", "file")
+            .env("USER", "graph-cli-test")
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env("ATOMIC_MODEL_BASE_URL", url)
+            .env("ATOMIC_MODEL", "synthetic")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("serve process");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if child.try_wait().expect("serve status").is_some() {
+                return child.wait_with_output().expect("serve output");
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().expect("stop mistakenly admitted serve");
+                return child
+                    .wait_with_output()
+                    .expect("reap mistakenly admitted serve");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+    .await
+    .expect("serve worker")
+}
+
 #[track_caller]
 fn cli_success(output: &Output) -> String {
     assert!(
@@ -4785,6 +4826,76 @@ fn cli_refuses_parallel_lanes_before_it_records_a_run() {
             !root.join("state-home").exists(),
             "an unsupported graph run must not touch its durable state"
         );
+    });
+}
+
+#[test]
+fn cli_resume_and_serve_refuse_a_recorded_parallel_graph_run() {
+    on_codex_runtime(async {
+        let root = scratch("recorded-unbounded-parallel-lanes");
+        let (project, base) = project(&root);
+        let url = "http://127.0.0.1:9/v1";
+        cli_success(&cli(&root, &project, url, &["graph", "export"]).await);
+        let state_id = cli_state_id(&root, &project);
+        let database = cli_database(&root, &project);
+        let mut rt = Durare::open(
+            &Database::Sqlite(database),
+            None,
+            LAYOUT_VERSION,
+            &format!("graph-loop/{state_id}"),
+        )
+        .await
+        .expect("project durable store");
+        rt.register(GRAPH_PIPELINE, |_ctx, _run: GraphPipelineRun| async {
+            std::future::pending::<Result<Value, atomic_durable::DurableError>>().await
+        });
+        rt.start(
+            GRAPH_PIPELINE,
+            RUN,
+            GraphPipelineRun {
+                run: PipelineRun {
+                    pipeline: pipeline(&project),
+                    input: json!({"base": base}),
+                },
+                epic: EPIC.into(),
+                model_source: None,
+                review_routing: true,
+                lanes: 2,
+            },
+        )
+        .await
+        .expect("record pending parallel graph run");
+        assert_eq!(
+            rt.status(RUN).await.expect("run status"),
+            Some(atomic_durable::RunStatus::Pending)
+        );
+        rt.shutdown(Duration::from_secs(1))
+            .await
+            .expect("stop seed engine");
+        for command in [&["runs", "resume", RUN][..], &["serve"][..]] {
+            let mut args = vec!["--json"];
+            args.extend_from_slice(command);
+            let output = if command == ["serve"] {
+                cli_serve_with_limit(&root, &project, url).await
+            } else {
+                cli(&root, &project, url, &args).await
+            };
+            assert!(
+                !output.status.success(),
+                "{command:?} resumed the parallel run: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: Value = serde_json::from_slice(&output.stdout).expect("structured refusal");
+            assert_eq!(
+                result["error"]["kind"], "graph.command_pool_unavailable",
+                "{command:?}: {result}"
+            );
+            assert_eq!(
+                rt.status(RUN).await.expect("run still pending"),
+                Some(atomic_durable::RunStatus::Pending)
+            );
+        }
     });
 }
 

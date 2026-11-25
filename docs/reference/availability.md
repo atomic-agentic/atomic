@@ -97,6 +97,8 @@ and Git worktrees, but the CLI refuses `--lanes` above one before creating
 project state. Its process-local command slot covers backend commands only;
 Codex shell commands and other Atomic processes do not share that slot. A
 host-wide command pool must cover both paths before parallel runs are admitted.
+`atomic runs resume` and `atomic serve` also refuse unfinished parallel graph
+runs recorded by an earlier binary with the same durable layout.
 
 `atomic goals list` and `atomic goals show` use the same read-only inspection
 path as graph export. Graph JSONL preserves a pinned goal item and its child

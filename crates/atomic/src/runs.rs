@@ -20,7 +20,7 @@ use crate::target;
 use atomic_app::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, PIPELINE, ProjectWorktrees, Step};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
-use atomic_durable::{DurableError, DurableRuntime, RunStatus};
+use atomic_durable::{DurableError, DurableRuntime, RunRecord, RunStatus};
 use clap::Args;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -173,6 +173,42 @@ pub fn admit_command_pool(args: &RunArgs) -> Result<(), Failure> {
         ));
     }
     Ok(())
+}
+
+/// An older binary may have recorded a parallel graph run before new-run
+/// admission became fail-closed. Inspect its frozen input before resume or
+/// serve dispatches it. An invalid graph input is refused as well.
+fn admit_recorded_command_pool(record: &RunRecord) -> Result<(), Failure> {
+    if record.workflow != GRAPH_PIPELINE {
+        return Ok(());
+    }
+    let lanes = record
+        .input
+        .as_object()
+        .ok_or_else(invalid_graph_run)?
+        .get("lanes")
+        .map_or(Ok(1), |value| {
+            value
+                .as_u64()
+                .filter(|lanes| (1..=16).contains(lanes))
+                .ok_or_else(invalid_graph_run)
+        })?;
+    if lanes > 1 {
+        return Err(Failure::new(
+            "graph.command_pool_unavailable",
+            "a recorded parallel graph run cannot be bounded across Codex shell and backend commands on this host",
+            "continue it with an atomic that has a host-wide command pool; do not resume it here",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_graph_run() -> Failure {
+    Failure::new(
+        "graph.record_invalid",
+        "the recorded graph run has no valid lane count",
+        "inspect the run's frozen input and continue it with the atomic layout that recorded it",
+    )
 }
 
 #[cfg(feature = "dev-failpoints")]
@@ -873,6 +909,10 @@ pub async fn resume(
                 )
                 .into());
             }
+            if let Err(refused) = admit_recorded_command_pool(record) {
+                let _ = engine.rt.shutdown(SHUTDOWN).await;
+                return Err(refused.into());
+            }
             // A run parked because atomic's own workflow code panicked will
             // likely panic again: say so, and note afresh what this resume
             // finds.
@@ -1107,6 +1147,17 @@ pub async fn serve(
         engine::Takes::Waiting,
     )
     .await?;
+    // Recovery queues unfinished runs before the engine dispatches them. A
+    // recorded parallel run from an earlier binary must not bypass the new
+    // CLI admission guard through this batch recovery path.
+    for record in engine.rt.own_unfinished().await? {
+        if record.version == engine.rt.version()
+            && let Err(refused) = admit_recorded_command_pool(&record)
+        {
+            let _ = engine.rt.shutdown(SHUTDOWN).await;
+            return Err(refused.into());
+        }
+    }
     atomic_core::log_line!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),
