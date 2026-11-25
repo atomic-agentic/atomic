@@ -919,8 +919,9 @@ pub trait GraphStore: Send + Sync {
     ) -> impl Future<Output = Result<Report, StoreError>> + Send;
 
     /// The whole graph as beads' JSONL, so a project can leave atomic as
-    /// straightforwardly as it arrives. Every item appears once, in id order,
-    /// with its edges, notes and canonical beads memory records. Native pinned
+    /// straightforwardly as it arrives. Persisted work items appear once, in
+    /// id order, with their edges, notes and canonical beads memory records;
+    /// gate-store copies are derived and omitted. Native pinned
     /// items use the versioned metadata marker described by [`Self::import`].
     fn export(&self, actor: Actor) -> impl Future<Output = Result<String, StoreError>> + Send;
 }
