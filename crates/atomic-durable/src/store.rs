@@ -1057,7 +1057,7 @@ pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreEr
 // decides whether it exists. A candidate colliding with a pre-v23 user item
 // is skipped without renaming that item.
 async fn backfill_gate_projection_sqlite(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
-    let gates = sqlx::query("SELECT gate_id FROM atomic_gates WHERE state='open' ORDER BY gate_id")
+    let gates = sqlx::query("SELECT g.gate_id FROM atomic_gates g WHERE g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items i WHERE i.projected_gate_id=g.gate_id) ORDER BY g.gate_id")
         .fetch_all(&mut *conn)
         .await?;
     for gate in gates {
@@ -1290,9 +1290,14 @@ async fn open_postgres_with(
 async fn backfill_gate_projection_pg(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), sqlx::Error> {
-    let gates = sqlx::query("SELECT gate_id FROM atomic_gates WHERE state='open' ORDER BY gate_id")
-        .fetch_all(&mut **tx)
-        .await?;
+    // A decision updates this same row. Holding its lock until the insert
+    // commits prevents a decision from deleting an absent copy and then
+    // having backfill publish a stale blocked copy from its earlier snapshot.
+    let gates = sqlx::query(
+        "SELECT g.gate_id FROM atomic_gates g WHERE g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items i WHERE i.projected_gate_id=g.gate_id) ORDER BY g.gate_id FOR UPDATE OF g",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
     for gate in gates {
         let gate_id: String = gate.try_get("gate_id")?;
         let mut suffix = 0_u64;
@@ -2110,6 +2115,75 @@ mod tests {
                 .await
                 .expect("older item");
         assert_eq!(old, "Older user item");
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[tokio::test]
+    async fn postgres_gate_backfill_waits_for_a_decision_in_progress() {
+        let schema = crate::testing::schema("hist_gate_race").await;
+        open_postgres(schema.url(), schema.name())
+            .await
+            .expect("current schema");
+        let mut owner = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("connect gate owner");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {}",
+            schema.name()
+        )))
+        .execute(&mut owner)
+        .await
+        .expect("select schema");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:race','run','wf','race','Racing gate','{}','[]','digest','[]','low',1,NULL,'reject','open')")
+            .execute(&mut owner)
+            .await
+            .expect("open gate without projection");
+
+        let mut deciding = owner.begin().await.expect("begin decision");
+        sqlx::query("UPDATE atomic_gates SET state='approved' WHERE gate_id='run:race'")
+            .execute(&mut *deciding)
+            .await
+            .expect("hold decision row lock");
+        let app = "gate_backfill_race";
+        let separator = if schema.url().contains('?') { '&' } else { '?' };
+        let url = format!("{}{separator}application_name={app}", schema.url());
+        let name = schema.name().to_owned();
+        let backfill = tokio::spawn(async move { open_postgres(&url, &name).await });
+        let mut observer = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("observe backfill");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: Option<String> = sqlx::query_scalar("SELECT COALESCE(wait_event_type,'') FROM pg_stat_activity WHERE application_name=$1 AND state='active' AND query LIKE '%atomic_gates%'")
+                .bind(app)
+                .fetch_optional(&mut observer)
+                .await
+                .expect("observe gate lock");
+            if waiting.as_deref() == Some("Lock") {
+                break;
+            }
+            assert!(
+                !backfill.is_finished(),
+                "backfill passed the uncommitted decision"
+            );
+            assert!(
+                std::time::Instant::now() < until,
+                "backfill never waited on the gate row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        deciding.commit().await.expect("commit decision");
+        backfill
+            .await
+            .expect("backfill task")
+            .expect("backfill completed");
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id='run:race'",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .expect("projection after decision");
+        assert_eq!(stale, 0, "a resolved gate has no blocked graph copy");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
