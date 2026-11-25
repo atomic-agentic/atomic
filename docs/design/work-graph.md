@@ -94,6 +94,16 @@ can come into atomic or leave it. Importing one export twice leaves the graph
 unchanged, and differential tests compare the `ready` results with those of a
 pinned `bd` release.
 
+An atomic-native pinned item uses a versioned JSONL extension so it remains a
+valid beads issue: `status` is `open`, `pinned` is `true`, and
+`metadata.atomic_graph` contains `{"schema_version":1,"native_status":"pinned"}`.
+atomic restores `pinned` only when all three fields agree. A generic beads
+`pinned: true` flag or an unsupported marker paired with that flag is refused
+rather than silently converted to an ordinary item. Imported items and
+`_type: "memory"` records have external trust even if their JSON claims a
+higher trust level. Export includes memories, including when the graph has no
+items.
+
 ## How workflows use the graph
 
 | Graph concept | What atomic does with it |
