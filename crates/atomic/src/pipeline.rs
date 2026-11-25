@@ -67,7 +67,7 @@ use atomic_core::artifact::{ArtifactError, ArtifactRef, ArtifactStore, LocalStor
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings};
-use atomic_core::git::{Git, Repo, Signature, TreeEntry};
+use atomic_core::git::{Git, Signature, TreeEntry};
 use atomic_core::render::RunInput;
 use atomic_core::runtime::{Runtimes, contained, run_declarative_repairing};
 use atomic_core::workflow::{Criterion, Workflow, parse_criteria};
@@ -89,7 +89,7 @@ use atomic_schema::expr::Shape;
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1016,16 +1016,6 @@ pub struct GraphPipelineRun {
     /// lacks this field and keeps its original reviewer behavior on recovery.
     #[serde(default)]
     pub review_routing: bool,
-}
-
-/// The host records a formatting citation here only after checking the
-/// candidate, item labels, touched controls and every finding in the panel.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct GraphAcceptance {
-    #[serde(flatten)]
-    pub(crate) acceptance: Acceptance,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) verified_formatting_path: Option<String>,
 }
 
 /// One durable graph finalization attempt. A missing proof or revoked lease is
@@ -2278,16 +2268,12 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .await?;
                 (candidate, acceptance, Vec::new())
             };
-            let kept = GraphAcceptance {
-                acceptance,
-                verified_formatting_path: followups.first().map(|finding| finding.file.clone()),
-            };
-            let receipt: GraphAcceptance = ctx
+            let kept = acceptance.clone();
+            let acceptance: Acceptance = ctx
                 .step(&format!("{step_name}.accepted"), move |_| async move {
                     Ok(kept)
                 })
                 .await?;
-            let acceptance = receipt.acceptance;
             let commit = candidate
                 .proposal
                 .metadata
@@ -2331,6 +2317,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     Arc::new(commit.clone()),
                     Arc::new(precondition.clone()),
                     Arc::new(publish_step.clone()),
+                    // CONTROL_OFF: review-followup-file
                     Arc::new(followups.clone()),
                     Arc::new(epic.clone()),
                     Arc::new(id.clone()),
@@ -4601,114 +4588,58 @@ async fn unreviewed_with_criteria<C: WorkflowContext>(
     }
 }
 
-/// Restrict formatting follow-ups to documentation paths outside sensitive areas.
-fn safe_review_followup_path(path: &str) -> bool {
-    if path.len() > 256
-        || path.contains('\\')
-        || path.chars().any(char::is_control)
-        || path.starts_with('/')
-        || path
+/// Bound the citation and refuse path aliases. The operator decides what the
+/// finding means, regardless of which file it cites.
+fn valid_review_path(path: &str) -> bool {
+    path.len() <= 256
+        && !path.contains('\\')
+        && !path.chars().any(char::is_control)
+        && !path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
-        || !(path.starts_with("docs/") || path.starts_with("examples/"))
-        || !(path.ends_with(".md") || path.ends_with(".markdown"))
-    {
-        return false;
-    }
-    let lower = path.to_ascii_lowercase();
-    ![
-        "security",
-        "permission",
-        "auth",
-        "credential",
-        "secret",
-        "sandbox",
-        "gate",
-        "control",
-        "policy",
-        "signature",
-        "supply-chain",
-    ]
-    .iter()
-    .any(|word| lower.contains(word))
 }
 
-const TRAILING_SPACE: &str = "Remove the trailing space.";
-
-/// A single regular Markdown blob changed, including mode and gitlink checks
-/// on every other entry. Git returns both recursive listings in tree order.
-fn changed_prose_blob<'a>(
-    before: &'a [TreeEntry],
-    after: &'a [TreeEntry],
-) -> Option<(&'a TreeEntry, &'a TreeEntry)> {
-    if before.len() != after.len() {
-        return None;
-    }
-    let mut changed = before.iter().zip(after).filter(|(a, b)| a != b);
-    let (a, b) = changed.next()?;
-    (changed.next().is_none()
-        && a.path == b.path
-        && safe_review_followup_path(&a.path)
-        && a.kind == "blob"
-        && b.kind == "blob"
-        && a.mode == "100644"
-        && b.mode == "100644")
-        .then_some((a, b))
+fn eligible_review_paths(changed: &BTreeSet<String>, entries: &[TreeEntry]) -> BTreeSet<String> {
+    entries
+        .iter()
+        .filter(|entry| {
+            changed.contains(&entry.path)
+                && entry.kind == "blob"
+                && matches!(entry.mode.as_str(), "100644" | "100755")
+                && valid_review_path(&entry.path)
+        })
+        .map(|entry| entry.path.clone())
+        .collect()
 }
 
-/// Only plain, single-line ASCII prose qualifies. A second space can make a
-/// Markdown hard break. Indentation, markup, embedded code and CRLF are excluded.
-fn added_prose_space(before: &[u8], after: &[u8]) -> bool {
-    let Some(line) = before.strip_suffix(b"\n") else {
-        return false;
-    };
-    line.first().is_some_and(u8::is_ascii_alphabetic)
-        && !line.ends_with(b" ")
-        && line
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b','))
-        && after.strip_suffix(b" \n") == Some(line)
-}
-
-/// An unavailable tree or blob leaves the candidate without proof. The review
-/// may proceed, but a typed finding for it must then take the blocking path.
-fn verified_formatting_path(repo: &Repo, base: &str, commit: &str, diff: &str) -> Option<String> {
-    if diff.len() > 2048 || !diff.ends_with(" \n") {
-        return None;
-    }
-    let before = repo.entries(base).ok()?;
-    let after = repo.entries(commit).ok()?;
-    let (a, b) = changed_prose_blob(&before, &after)?;
-    let old = repo.blob_by_id(&a.id).ok()?;
-    let new = repo.blob_by_id(&b.id).ok()?;
-    if !added_prose_space(&old, &new) {
-        return None;
-    }
-    Some(a.path.clone())
-}
-
-pub(crate) fn route_review_findings(
+/// Route typed findings conservatively. A legacy string finding carries no
+/// severity and keeps the reviewer's verdict. A structured high finding, or a
+/// low finding without a valid citation, requires repair. A proposed follow-up
+/// has no authority until the operator classifies it at the candidate gate.
+fn route_review_findings(
     reviewer: &str,
     verdict: &Value,
     said: &str,
     enabled: bool,
     controls_clean: bool,
-    verified_path: Option<&str>,
+    changed_paths: &BTreeSet<String>,
 ) -> (String, Vec<ReviewFollowup>) {
-    if !enabled || said != "approve" {
+    if !enabled {
         return (said.to_owned(), Vec::new());
     }
-    let Some(findings) = verdict.get("findings") else {
+    // Editorial metadata cannot override a reviewer's explicit verdict.
+    // CONTROL_OFF: review-explicit-changes
+    if said != "approve" {
         return (said.to_owned(), Vec::new());
-    };
-    let Some(findings) = findings.as_array() else {
-        return ("request_changes".into(), Vec::new());
+    }
+    let Some(findings) = verdict.get("findings").and_then(Value::as_array) else {
+        return (said.to_owned(), Vec::new());
     };
     // Legacy reviewers use strings as evidence for their own verdict.
     if findings.iter().all(Value::is_string) {
         return (said.to_owned(), Vec::new());
     }
-    if findings.len() > 30 || verdict.as_object().is_none_or(|fields| fields.len() != 2) {
+    if findings.len() > 30 {
         return ("request_changes".into(), Vec::new());
     }
     let mut low = Vec::new();
@@ -4720,22 +4651,23 @@ pub(crate) fn route_review_findings(
         };
         let file = fields.get("file").and_then(Value::as_str).unwrap_or("");
         let message = fields.get("message").and_then(Value::as_str).unwrap_or("");
+        let line_field = fields.get("line");
+        let line = line_field.and_then(Value::as_u64);
         let severity = fields.get("severity").and_then(Value::as_str).unwrap_or("");
-        let category = fields.get("category").and_then(Value::as_str).unwrap_or("");
-        if controls_clean
-            && verified_path == Some(file)
-            && fields.len() == 5
-            && fields.get("line").and_then(Value::as_u64) == Some(1)
-            && category == "formatting"
-            && message == TRAILING_SPACE
-            && matches!(severity, "minor" | "low" | "nit")
-        {
+        let valid = !message.trim().is_empty()
+            && message.len() <= 1000
+            && line_field
+                .is_none_or(|_| line.is_some_and(|line| line > 0 && line <= u32::MAX as u64));
+        if !valid || !controls_clean || !valid_review_path(file) || !changed_paths.contains(file) {
+            blocking = true;
+            continue;
+        }
+        if matches!(severity, "minor" | "low" | "nit") {
             low.push(ReviewFollowup {
                 reviewer: reviewer.to_owned(),
                 file: file.to_owned(),
-                line: Some(1),
+                line: line.map(|line| line as u32),
                 severity: severity.to_owned(),
-                category: category.to_owned(),
                 message: message.to_owned(),
             });
         } else {
@@ -4752,115 +4684,79 @@ pub(crate) fn route_review_findings(
 
 #[cfg(test)]
 mod severity_routing_tests {
-    use super::{GraphPipelineRun, TRAILING_SPACE, added_prose_space, route_review_findings};
+    use super::{GraphPipelineRun, eligible_review_paths, route_review_findings};
+    use atomic_core::git::TreeEntry;
     use serde_json::json;
+    use std::collections::BTreeSet;
 
     #[test]
-    fn formatting_proof_requires_one_unchanged_path_and_mode() {
-        let entry = |mode: &str, kind: &str, id: &str, path: &str| super::TreeEntry {
-            mode: mode.into(),
-            kind: kind.into(),
-            id: id.into(),
-            path: path.into(),
-        };
-        let old = entry("100644", "blob", "old", "docs/guide.md");
-        let new = entry("100644", "blob", "new", "docs/guide.md");
-        let gitlink = entry("160000", "commit", "before", "vendor");
-        let base = [old.clone(), gitlink.clone()];
-        assert!(super::changed_prose_blob(&base, &[new.clone(), gitlink.clone()]).is_some());
-        for head in [
-            vec![new.clone()],
-            vec![new.clone(), entry("160000", "commit", "after", "vendor")],
-            vec![
-                entry("100755", "blob", "new", "docs/guide.md"),
-                gitlink.clone(),
-            ],
-            vec![
-                entry("120000", "blob", "new", "docs/guide.md"),
-                gitlink.clone(),
-            ],
-            vec![
-                entry("100644", "blob", "new", "docs/renamed.md"),
-                gitlink.clone(),
-            ],
-            vec![old, gitlink],
-        ] {
-            assert!(super::changed_prose_blob(&base, &head).is_none());
+    fn low_documentation_findings_become_followups_only_without_touched_controls() {
+        let verdict = json!({"verdict":"approve","findings":[
+            {"file":"docs/guide.md","line":12,"severity":"low","category":"grammar","message":"Clarify the example"},
+            {"file":"examples/demo/README.md","severity":"nit","category":"formatting","message":"Tighten the label"}
+        ]});
+        let changed = BTreeSet::from([
+            "docs/guide.md".to_owned(),
+            "examples/demo/README.md".to_owned(),
+        ]);
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
+        assert_eq!(routed, "approve");
+        assert_eq!(followups.len(), 2);
+        assert_eq!(followups[0].line, Some(12));
+        assert_eq!(followups[0].message, "Clarify the example");
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", true, false, &changed);
+        assert_eq!(routed, "request_changes");
+        assert!(followups.is_empty());
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", false, true, &changed);
+        assert_eq!(routed, "approve", "an older run keeps its admitted policy");
+        assert!(followups.is_empty());
+        let (routed, followups) = route_review_findings(
+            "reviewer",
+            &verdict,
+            "approve",
+            true,
+            true,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            routed, "request_changes",
+            "invented source paths cannot be filed"
+        );
+        assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn explicit_changes_stay_blocking_with_low_editorial_metadata() {
+        let changed = BTreeSet::from(["docs/guide.md".to_owned()]);
+        for said in ["request_changes", "revise"] {
+            let verdict = json!({"verdict":said,"reason":"Example disables TLS verification",
+                "findings":[{"file":"docs/guide.md","severity":"nit",
+                    "category":"spelling","message":"Correct the typo."}]});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, said, true, true, &changed);
+            assert_eq!(routed, said);
+            assert!(followups.is_empty());
         }
     }
 
     #[test]
-    fn only_a_single_added_space_on_plain_prose_is_verified() {
-        let old = b"Example text.\n";
-        assert!(added_prose_space(old, b"Example text. \n"));
-        for (before, after) in [
-            (old.as_slice(), b"Changed text. \n".as_slice()),
-            (old, b"Example text.  \n"),
-            (b"Example text. \n", b"Example text.  \n"),
-            (b"    code\n", b"    code \n"),
-            (b"Example\ntext\n", b"Example\ntext \n"),
-            (b"Example *text*\n", b"Example *text* \n"),
-            (b"Example\r\n", b"Example \r\n"),
+    fn malformed_and_high_findings_cannot_be_deferred() {
+        let changed = BTreeSet::from(["docs/guide.md".to_owned()]);
+        for finding in [
+            json!({"file":"docs/guide.md","severity":"major","message":"Broken"}),
+            json!({"file":"docs/../secrets","severity":"nit","message":"Invalid citation"}),
+            json!({"file":"docs/guide.md","line":-1,"severity":"nit","message":"Bad line"}),
+            json!({"file":"docs/guide.md","severity":"unknown","message":"Unknown severity"}),
+            json!({"file":"docs/guide.md","severity":"nit","message":""}),
         ] {
-            assert!(!added_prose_space(before, after));
-        }
-    }
-
-    #[test]
-    fn security_and_high_findings_cannot_be_demoted_by_approve() {
-        let nit = json!({"file":"docs/guide.md","line":1,"severity":"nit","category":"formatting","message":TRAILING_SPACE});
-        let route = |findings, clean| {
-            route_review_findings(
-                "reviewer",
-                &json!({"verdict":"approve","findings":findings}),
-                "approve",
-                true,
-                clean,
-                Some("docs/guide.md"),
-            )
-        };
-        for verdict in [
-            json!({"verdict":"approve","findings":{} }),
-            json!({"verdict":"approve","findings":[nit],"reason":"The patch publishes names."}),
-        ] {
-            assert_eq!(
-                route_review_findings(
-                    "reviewer",
-                    &verdict,
-                    "approve",
-                    true,
-                    true,
-                    Some("docs/guide.md")
-                ),
-                ("request_changes".into(), vec![])
-            );
-        }
-        assert_eq!(route(vec![nit.clone(); 30], true).1.len(), 30);
-        for (key, value) in [
-            ("file", json!("docs/other.md")),
-            ("line", json!(2)),
-            ("line", json!(null)),
-            ("severity", json!("major")),
-            ("category", json!("grammar")),
-            (
-                "message",
-                json!("Keep customer addresses out of this guide."),
-            ),
-            ("detail", json!("There is also an unresolved objection.")),
-        ] {
-            let mut finding = nit.clone();
-            finding[key] = value;
-            assert_eq!(
-                route(vec![finding], true),
-                ("request_changes".into(), vec![])
-            );
-        }
-        for (findings, clean) in [
-            (vec![nit.clone()], false),
-            (vec![nit.clone(); 31], true),
-            (vec![nit, json!("legacy evidence")], true),
-        ] {
-            assert_eq!(route(findings, clean), ("request_changes".into(), vec![]));
+            let verdict = json!({"verdict":"approve","findings":[finding]});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
+            assert_eq!(routed, "request_changes", "{verdict}");
+            assert!(followups.is_empty());
         }
     }
 
@@ -4870,11 +4766,70 @@ mod severity_routing_tests {
             for said in ["approve", "revise", "request_changes"] {
                 let verdict = json!({"verdict":said, "findings":vec!["legacy evidence"; count]});
                 let (routed, followups) =
-                    route_review_findings("reviewer", &verdict, said, true, true, None);
+                    route_review_findings("reviewer", &verdict, said, true, true, &BTreeSet::new());
                 assert_eq!(routed, said);
                 assert!(followups.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn typed_findings_remain_bounded_and_mixed_arrays_require_changes() {
+        let changed = BTreeSet::from(["docs/guide.md".to_owned()]);
+        let nit =
+            json!({"file":"docs/guide.md","message":"Typo","severity":"nit","category":"spelling"});
+        for (findings, expected, count) in [
+            (vec![nit.clone(); 30], "approve", 30),
+            (vec![nit.clone(); 31], "request_changes", 0),
+            (vec![nit, json!("legacy evidence")], "request_changes", 0),
+        ] {
+            let verdict = json!({"verdict":"approve", "findings":findings});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
+            assert_eq!(routed, expected);
+            assert_eq!(followups.len(), count);
+        }
+    }
+
+    #[test]
+    fn changed_symlink_cannot_supply_a_followup_citation() {
+        let changed = BTreeSet::from([
+            "docs/guide.md".to_owned(),
+            "docs/link.md".to_owned(),
+            "docs/note.txt".to_owned(),
+        ]);
+        let entries = [
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                id: "a".into(),
+                path: "docs/guide.md".into(),
+            },
+            TreeEntry {
+                mode: "120000".into(),
+                kind: "blob".into(),
+                id: "b".into(),
+                path: "docs/link.md".into(),
+            },
+            TreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                id: "c".into(),
+                path: "docs/note.txt".into(),
+            },
+        ];
+        let eligible = eligible_review_paths(&changed, &entries);
+        assert_eq!(
+            eligible,
+            BTreeSet::from(["docs/guide.md".to_owned(), "docs/note.txt".to_owned()])
+        );
+        let verdict = json!({"verdict":"approve","findings":[
+            {"file":"docs/link.md","severity":"nit","category":"spelling","message":"Typo"}
+        ]});
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", true, true, &eligible);
+        assert_eq!(routed, "request_changes");
+        assert!(followups.is_empty());
     }
 
     #[test]
@@ -4895,6 +4850,8 @@ mod severity_routing_tests {
     }
 }
 
+/// Distinguishes independent acceptance with classified findings from a
+/// plain panel approval, including in older published draft receipts.
 pub(crate) const FOLLOWUP_REASON_PREFIX: &str = "accepted low findings from reviewer(s) ";
 
 /// The two acceptance reasons written by an independently reviewed panel.
@@ -4960,8 +4917,14 @@ async fn reviewed<C: WorkflowContext>(
     } else {
         None
     };
-    let (verdict, said, followups) = loop {
+    let members: Vec<&str> = if review.reviewers.is_empty() {
+        vec![review.reviewer.as_str()]
+    } else {
+        review.reviewers.iter().map(String::as_str).collect()
+    };
+    let (verdict, said, followups, host_requires_changes, deferral_only) = loop {
         let mut controls_clean = !step.coding;
+        let mut changed_paths = BTreeSet::new();
         let mut trial_head = None;
         if let Some(trial) = &review.trial_merge {
             let worktrees = run.worktrees.cloned().ok_or_else(|| {
@@ -5434,7 +5397,26 @@ async fn reviewed<C: WorkflowContext>(
                 } else {
                     (Vec::new(), Vec::new())
                 };
+            // CONTROL_OFF: review-followup-touched-controls, review-followup-security-label
             controls_clean = touched_controls.is_empty() && !security_item;
+            if review_routing
+                && claim.is_some()
+                && let Some((commit, base, _)) = &host_commits
+            {
+                let repo = run
+                    .worktrees
+                    .ok_or_else(|| failed(format!("step `{}`: no bound repository", step.id)))?
+                    .repo();
+                let changed: BTreeSet<String> = repo
+                    .changed_paths(base, commit)
+                    .map_err(|e| failed(format!("step `{}`: inspect changed paths: {e}", step.id)))?
+                    .into_iter()
+                    .collect();
+                let entries = repo.entries(commit).map_err(|e| {
+                    failed(format!("step `{}`: inspect candidate tree: {e}", step.id))
+                })?;
+                changed_paths = eligible_review_paths(&changed, &entries);
+            }
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {
                     return Err(failed(format!(
@@ -5633,11 +5615,6 @@ async fn reviewed<C: WorkflowContext>(
                 );
             }
         }
-        let members: Vec<&str> = if review.reviewers.is_empty() {
-            vec![review.reviewer.as_str()]
-        } else {
-            review.reviewers.iter().map(String::as_str).collect()
-        };
         // A panel is fixed by the workflow. Check the actual nested host
         // inventory against every member's full input schema before the
         // first reviewer turn; a shallow shape check cannot prove array item
@@ -5726,31 +5703,28 @@ async fn reviewed<C: WorkflowContext>(
                     &said,
                     review_routing,
                     controls_clean,
-                    candidate
-                        .proposal
-                        .metadata
-                        .get("verified_formatting_path")
-                        .and_then(Value::as_str),
+                    &changed_paths,
                 )
             } else {
                 (said.clone(), Vec::new())
             };
             round_followups.append(&mut followups);
-            let shown = if routed == said {
+            let host_routed = routed != said;
+            let shown = if !host_routed {
                 verdict
             } else {
                 json!({"verdict": routed, "review": verdict,
                     "routing": "host severity policy"})
             };
-            decisions.push(((*reviewer).to_owned(), shown, routed));
+            decisions.push(((*reviewer).to_owned(), shown, routed, host_routed));
         }
-        let rejected = decisions.iter().find(|(_, _, said)| {
+        let rejected = decisions.iter().find(|(_, _, said, _)| {
             !matches!(
                 atomic_core::workflow::Verdict::of(said),
                 atomic_core::workflow::Verdict::Approve | atomic_core::workflow::Verdict::Changes
             )
         });
-        let changes = decisions.iter().find(|(_, _, said)| {
+        let changes = decisions.iter().find(|(_, _, said, _)| {
             matches!(
                 atomic_core::workflow::Verdict::of(said),
                 atomic_core::workflow::Verdict::Changes
@@ -5758,27 +5732,28 @@ async fn reviewed<C: WorkflowContext>(
         });
         let said = rejected
             .or(changes)
-            .map(|(_, _, said)| said.clone())
+            .map(|(_, _, said, _)| said.clone())
             .unwrap_or_else(|| "approve".into());
         let verdict = if review.reviewers.is_empty() {
             decisions[0].1.clone()
         } else {
-            json!({"reviewers": decisions.iter().map(|(atom, verdict, _)|
+            json!({"reviewers": decisions.iter().map(|(atom, verdict, _, _)|
                 json!({"atom": atom, "verdict": verdict})).collect::<Vec<_>>()})
         };
+        let host_requires_changes = changes.is_some_and(|row| row.3);
         match atomic_core::workflow::Verdict::of(&said) {
             atomic_core::workflow::Verdict::Approve => {
+                // CONTROL_OFF: review-classification-required
+                if !round_followups.is_empty() {
+                    break (verdict, said, round_followups, false, true);
+                }
                 let acceptance = Acceptance {
                     candidate: candidate.id.clone(),
                     digest: candidate.digest.clone(),
                     accepted: true,
-                    reason: Some(panel_acceptance_reason(
-                        &members.join(", "),
-                        round,
-                        !round_followups.is_empty(),
-                    )),
+                    reason: Some(panel_acceptance_reason(&members.join(", "), round, false)),
                 };
-                return Ok((candidate, acceptance, round_followups));
+                return Ok((candidate, acceptance, Vec::new()));
             }
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
@@ -5805,13 +5780,18 @@ async fn reviewed<C: WorkflowContext>(
                 )
                 .await?;
             }
-            _ => break (verdict, said, round_followups),
+            _ => break (verdict, said, round_followups, host_requires_changes, false),
         }
     };
     // A person decides. The gate's title is atomic's own words; what the
     // reviewer and the author said is what it shows.
     let id = format!("{}.review", step.id);
     let why = match (atomic_core::workflow::Verdict::of(&said), said.as_str()) {
+        (atomic_core::workflow::Verdict::Changes, _) if host_requires_changes => {
+            format!(
+                "reported findings that host review rules require addressing after {round} repair round(s), the most this step allows"
+            )
+        }
         (atomic_core::workflow::Verdict::Changes, _) => {
             format!("asked for changes after {round} repair round(s), the most this step allows")
         }
@@ -5830,9 +5810,13 @@ async fn reviewed<C: WorkflowContext>(
             .cloned()
             .unwrap_or(Value::Null);
     }
-    let spec = GateSpec {
-        workflow: run.pipeline.name.clone(),
-        title: format!(
+    let mut title = if deferral_only {
+        format!(
+            "Step {} of {}: reviewers approved this candidate. Classify its proposed follow-ups before publication",
+            step.id, run.pipeline.name,
+        )
+    } else {
+        format!(
             "Step {} of {}: {} {why}. Approve its output as it stands, or reject it",
             step.id,
             run.pipeline.name,
@@ -5841,7 +5825,18 @@ async fn reviewed<C: WorkflowContext>(
             } else {
                 format!("reviewers {}", review.reviewers.join(", "))
             }
-        ),
+        )
+    };
+    if !followups.is_empty() {
+        show["candidate"] = json!({"id": candidate.id, "digest": candidate.digest});
+        show["review_round"] = json!(round);
+        show["proposed_followups"] = json!(followups);
+        show["deferral_only"] = json!(deferral_only);
+        title.push_str(". Approval classifies the listed findings as follow-up work. Reject if any finding needs a fix first.");
+    }
+    let spec = GateSpec {
+        workflow: run.pipeline.name.clone(),
+        title,
         show,
         evidence: Vec::new(),
         approvers,
@@ -5897,7 +5892,11 @@ async fn reviewed<C: WorkflowContext>(
                 candidate: candidate.id.clone(),
                 digest: candidate.digest.clone(),
                 accepted: true,
-                reason: Some(format!("approved by {} at gate {id}", d.by)),
+                reason: Some(if deferral_only {
+                    panel_acceptance_reason(&members.join(", "), round, true)
+                } else {
+                    format!("approved by {} at gate {id}", d.by)
+                }),
             };
             Ok((candidate, acceptance, followups))
         }
@@ -6307,9 +6306,6 @@ async fn in_worktree(
                     "the committed worktree diff could not be read: {e}"
                 ))
             })?;
-        if let Some(path) = verified_formatting_path(&repo, &commit.base, &commit.commit, &diff) {
-            metadata["verified_formatting_path"] = Value::String(path);
-        }
         metadata["diff"] = Value::String(diff);
     }
     Ok(Proposal {

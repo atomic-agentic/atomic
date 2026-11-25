@@ -1,0 +1,1 @@
+review-followup-touched-controls|crates/atomic/src/pipeline.rs|controls_clean = touched_controls.is_empty()|controls_clean = true|-p atomic-agentic --features sandbox-tests --test graph_work_loop -- host_touched_control_excludes_editorial_followups

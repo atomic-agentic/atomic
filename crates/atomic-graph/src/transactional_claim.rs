@@ -35,9 +35,9 @@ pub struct WorkItem {
     pub priority: i64,
 }
 
-/// A low-severity finding selected by the host after the review panel.
-/// Review text remains agent-authored even though the host files the item.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A review finding proposed for human classification after the panel.
+/// Review text remains agent-authored even when the operator defers it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewFollowup {
     /// The atom that produced the verdict.
     pub reviewer: String,
@@ -47,8 +47,6 @@ pub struct ReviewFollowup {
     pub line: Option<u32>,
     /// `low`, `minor` or `nit`.
     pub severity: String,
-    /// The reviewer's narrow editorial category accepted by host policy.
-    pub category: String,
     /// The reviewer's finding, kept at agent trust.
     pub message: String,
 }
@@ -369,9 +367,9 @@ fn review_id(parts: &[&str]) -> String {
 }
 
 /// File approved, low-severity review findings atomically with publication and
-/// close. The separate goal is never a ready work item or a child of the
-/// active pinned epic, so these follow-ups cannot hold its run open. Stable
-/// IDs make a retried finalization safe if a prior result was lost.
+/// close. Follow-ups start without a parent and do not extend the active epic.
+/// An operator can assign them to a pinned epic using the ordinary graph link.
+/// Stable IDs make a retried finalization safe if a prior result was lost.
 pub async fn file_review_followups(
     tx: &mut Tx<'_, '_>,
     lease: &Lease,
@@ -384,44 +382,11 @@ pub async fn file_review_followups(
         return Ok(());
     }
     validate(tx, lease).await?;
-    let goal_id = format!("atomic-review-goal-{}", &review_id(&[epic])[..24]);
     let now = now_millis()?;
-    tx.execute(
-        "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) \
-         VALUES (?,?,?,'goal',3,'pinned',NULL,'agent','atomic-review',?) \
-         ON CONFLICT(id) DO NOTHING",
-        &[
-            text(&goal_id),
-            text(&format!("Review follow-ups for {epic}")),
-            text("Low-severity findings accepted by independent review."),
-            Param::Int(now),
-        ],
-    )
-    .await?;
-    let goal = tx
-        .query_one(
-            "SELECT kind,status,parent,trust,created_by FROM atomic_graph_items WHERE id=?",
-            &[text(&goal_id)],
-        )
-        .await?;
-    if goal.text("kind")? != "goal"
-        || goal.text("status")? != "pinned"
-        || goal.text_opt("parent")?.is_some()
-        || goal.text("trust")? != "agent"
-        || goal.text("created_by")? != "atomic-review"
-    {
-        return Err(DurableError::Failed(
-            "review follow-up goal ID is occupied".into(),
-        ));
-    }
     for (index, finding) in findings.iter().enumerate() {
         if !matches!(finding.severity.as_str(), "minor" | "low" | "nit")
             || finding.file.is_empty()
             || finding.file.len() > 256
-            || !matches!(
-                finding.category.as_str(),
-                "spelling" | "grammar" | "formatting" | "broken_link"
-            )
             || finding.message.trim().is_empty()
             || finding.message.len() > 1000
         {
@@ -441,28 +406,27 @@ pub async fn file_review_followups(
             .take(200)
             .collect::<String>();
         let body = format!(
-            "Reviewer: {}\nLocation: {}\nSeverity: {}\nCategory: {}\nFinding: {}",
-            finding.reviewer, location, finding.severity, finding.category, finding.message
+            "Reviewer: {}\nLocation: {}\nSeverity: {}\nFinding: {}",
+            finding.reviewer, location, finding.severity, finding.message
         );
         let priority = if finding.severity == "nit" { 4 } else { 3 };
         tx.execute(
             "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) \
-             VALUES (?,?,?,'task',?,'open',?,'agent','atomic-review',?) \
+             VALUES (?,?,?,'task',?,'open',NULL,'agent','atomic-review',?) \
              ON CONFLICT(id) DO NOTHING",
             &[
                 text(&item_id), text(&title), text(&body), Param::Int(priority),
-                text(&goal_id), Param::Int(now),
+                Param::Int(now),
             ],
         )
         .await?;
         let item = tx
             .query_one(
-                "SELECT kind,parent,body,trust,created_by FROM atomic_graph_items WHERE id=?",
+                "SELECT kind,body,trust,created_by FROM atomic_graph_items WHERE id=?",
                 &[text(&item_id)],
             )
             .await?;
         if item.text("kind")? != "task"
-            || item.text_opt("parent")?.as_deref() != Some(goal_id.as_str())
             || item.text("body")? != body
             || item.text("trust")? != "agent"
             || item.text("created_by")? != "atomic-review"
@@ -471,12 +435,6 @@ pub async fn file_review_followups(
                 "review follow-up ID is occupied".into(),
             ));
         }
-        tx.execute(
-            "INSERT INTO atomic_graph_edges (source,kind,target) VALUES (?,'parent-child',?) \
-             ON CONFLICT(source,kind,target) DO NOTHING",
-            &[text(&item_id), text(&goal_id)],
-        )
-        .await?;
         tx.execute(
             "INSERT INTO atomic_graph_edges (source,kind,target) VALUES (?,'discovered-from',?) \
              ON CONFLICT(source,kind,target) DO NOTHING",

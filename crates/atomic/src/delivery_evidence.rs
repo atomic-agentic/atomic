@@ -4,15 +4,17 @@
 //! attest its own review or to recreate evidence from a source run.
 
 use crate::pipeline::{
-    FOLLOWUP_REASON_PREFIX, GRAPH_PIPELINE, GraphAcceptance, GraphPipelineRun, LAYOUT_VERSION,
-    Step, panel_acceptance_reason, route_review_findings,
+    FOLLOWUP_REASON_PREFIX, GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step,
+    panel_acceptance_reason,
 };
 use anyhow::{Context, Result, bail, ensure};
+use atomic_durable::gate::{self, Resolution, Verdict};
 use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{DurableRuntime, Durare, Param, StepRecord, Tx};
-use atomic_graph::transactional_claim::ClaimNext;
+use atomic_graph::store::Lease;
+use atomic_graph::transactional_claim::{ClaimNext, ReviewFollowup};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// Immutable facts the delivery workflow pins before opening its human gate.
@@ -72,8 +74,7 @@ fn output<'a>(steps: &'a [StepRecord], name: &str) -> Result<&'a Value> {
 }
 
 fn turn(steps: &[StepRecord], name: &str, source_run: &str) -> Result<Candidate> {
-    let value = output(steps, name)?;
-    candidate_from_turn(value, name, source_run)
+    candidate_from_turn(output(steps, name)?, name, source_run)
 }
 
 fn candidate_from_turn(value: &Value, name: &str, source_run: &str) -> Result<Candidate> {
@@ -258,28 +259,27 @@ pub async fn approved_graph_item(
         "source claim has wrong run or item"
     );
     let accepted_name = format!("{base_step}.accepted");
-    let receipt: GraphAcceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
-    let accepted = &receipt.acceptance;
+    let accepted: Acceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
     ensure!(accepted.accepted, "source candidate was not accepted");
-    ensure!(
-        !steps
-            .iter()
-            .any(|s| s.name == format!("{base_step}.review.gate")
-                || s.name == format!("{base_step}.review")),
-        "human-overridden review cannot authorize delivery"
-    );
-    let (round, candidate, turn_name) = round_for(base_step, &steps, accepted, source_run)?;
+    let (round, candidate, turn_name) = round_for(base_step, &steps, &accepted, source_run)?;
     ensure!(
         round <= review.rounds,
         "accepted repair exceeds frozen policy"
     );
     let members = review.reviewers.join(", ");
     let reason = accepted.reason.as_deref();
-    let routing_enabled = frozen.review_routing;
-    let followup_reason = reason == Some(panel_acceptance_reason(&members, round, true).as_str());
+    let deferred = frozen.review_routing
+        && reason == Some(panel_acceptance_reason(&members, round, true).as_str());
     ensure!(
-        reason == Some(panel_acceptance_reason(&members, round, false).as_str())
-            || (routing_enabled && followup_reason),
+        deferred
+            || !steps
+                .iter()
+                .any(|s| s.name == format!("{base_step}.review.gate")
+                    || s.name == format!("{base_step}.review")),
+        "human-overridden review cannot authorize delivery"
+    );
+    ensure!(
+        deferred || reason == Some(panel_acceptance_reason(&members, round, false).as_str()),
         "source acceptance was human-overridden or mismatched"
     );
     let head = candidate
@@ -362,30 +362,26 @@ pub async fn approved_graph_item(
         step(&steps, &format!("{self_name}.publish"))?,
     )?;
     previous = step(&steps, &format!("{self_name}.publish"))?;
-    let mut has_followups = false;
-    let verified_path = receipt.verified_formatting_path.as_deref().filter(|path| {
-        candidate
-            .proposal
-            .metadata
-            .get("verified_formatting_path")
-            .and_then(Value::as_str)
-            == Some(*path)
-            && !item
-                .labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case("security"))
-    });
+    let mut panel = Vec::new();
     for index in 0..2 {
         let name = format!("{base_step}.review.{round}.{index}");
         let reviewer = turn(&steps, &format!("{name}.turn"), source_run)?;
         let verdict = output(&steps, &format!("{name}.publish"))?;
-        has_followups |= verified_reviewer_findings(verdict, routing_enabled, verified_path)?;
+        ensure!(
+            verdict.get("verdict").and_then(Value::as_str) == Some("approve"),
+            "independent reviewer did not approve"
+        );
+        ensure!(
+            !frozen.review_routing || deferred || !has_structured_findings(verdict),
+            "structured source review findings lack human classification"
+        );
         ordered(previous, step(&steps, &format!("{name}.turn"))?)?;
         ordered(
             step(&steps, &format!("{name}.turn"))?,
             step(&steps, &format!("{name}.publish"))?,
         )?;
         previous = step(&steps, &format!("{name}.publish"))?;
+        panel.push(json!({"atom":review.reviewers[index], "verdict":verdict}));
         rt.control_transaction({
             let reviewer = reviewer.clone();
             let output = verdict.clone();
@@ -401,10 +397,52 @@ pub async fn approved_graph_item(
         })
         .await?;
     }
-    ensure!(
-        has_followups == followup_reason,
-        "source panel reason differs from its verified findings"
-    );
+    let lease = if deferred {
+        let gate_step = format!("{base_step}.review");
+        let gate = gate::find(rt, &gate::gate_id(source_run, &gate_step))
+            .await?
+            .context("accepted follow-ups lack a human classification gate")?;
+        verify_classification(
+            &gate,
+            &json!({"id":candidate.id, "digest":candidate.digest}),
+            &head,
+            round,
+            &json!({"reviewers":panel}),
+        )?;
+        let release_name = format!("{gate_step}.claim.release");
+        let release = step(&steps, &release_name)?;
+        ordered(previous, release)?;
+        let opened = step(&steps, &format!("{gate_step}.gate"))?;
+        ordered(release, opened)?;
+        let released: i64 = serde_json::from_value(output(&steps, &release_name)?.clone())?;
+        let prefix = format!("{gate_step}.claim.reclaim.");
+        let completed: Vec<_> = steps
+            .iter()
+            .filter(|record| {
+                record
+                    .name
+                    .strip_prefix(&prefix)
+                    .is_some_and(|suffix| suffix.parse::<u64>().is_ok())
+                    && record.output.as_ref().is_some_and(|value| !value.is_null())
+            })
+            .collect();
+        let [record] = completed.as_slice() else {
+            bail!("classification gate has no unique completed graph re-claim");
+        };
+        let token: Lease = serde_json::from_value(output(&steps, &record.name)?.clone())?;
+        ensure!(
+            token.item_id == item.id
+                && token.claimant == source_run
+                && lease.epoch < released
+                && released < token.epoch,
+            "classification re-claim does not match the original graph item"
+        );
+        ordered(opened, record)?;
+        previous = record;
+        token
+    } else {
+        lease
+    };
     ordered(previous, step(&steps, &accepted_name)?)?;
     // The finalizer may have parked for branch proof before it applied. Freeze
     // the exact successful occurrence for the delivery plan.
@@ -485,31 +523,41 @@ pub async fn approved_graph_item(
     Ok(source)
 }
 
-/// The same exact finding contract as graph review. A verified receipt also
-/// attests that the item and its touched controls allowed a follow-up.
-fn verified_reviewer_findings(
-    verdict: &Value,
-    routing_enabled: bool,
-    verified_path: Option<&str>,
-) -> Result<bool> {
-    let said = verdict.get("verdict").and_then(Value::as_str);
+fn has_structured_findings(verdict: &Value) -> bool {
+    verdict
+        .get("findings")
+        .and_then(Value::as_array)
+        .is_some_and(|findings| findings.iter().any(|finding| !finding.is_string()))
+}
+
+fn verify_classification(
+    gate: &gate::Gate,
+    candidate: &Value,
+    head: &str,
+    round: u64,
+    panel: &Value,
+) -> Result<()> {
+    let proposed: Vec<ReviewFollowup> = serde_json::from_value(
+        gate.show
+            .get("proposed_followups")
+            .context("gate has no proposed follow-ups")?
+            .clone(),
+    )
+    .context("invalid proposed follow-ups at the classification gate")?;
+    // CONTROL_OFF: delivery-panel-followups
     ensure!(
-        said == Some("approve"),
-        "independent reviewer did not approve"
+        gate.question.is_none()
+            && gate.proposal == gate::proposal_digest(&gate.title, &gate.show, &gate.evidence)
+            && matches!(gate.resolution, Some(Resolution::Decided(ref d)) if d.verdict == Verdict::Approve && gate.approvers.contains(&d.by))
+            && gate.show["deferral_only"] == true
+            && gate.show["candidate"] == *candidate
+            && gate.show["review_round"] == round
+            && gate.show["commit"] == head
+            && gate.show["verdict"] == *panel
+            && !proposed.is_empty(),
+        "follow-up classification does not approve the accepted candidate and panel"
     );
-    let (routed, findings) = route_review_findings(
-        "delivery",
-        verdict,
-        "approve",
-        routing_enabled,
-        true,
-        verified_path,
-    );
-    ensure!(
-        routed == "approve",
-        "source review finding lacks host-verified formatting evidence"
-    );
-    Ok(!findings.is_empty())
+    Ok(())
 }
 
 async fn checkpoint_in(tx: &mut Tx<'_, '_>, run: &str, name: &str) -> Result<Value> {
@@ -528,17 +576,33 @@ async fn checkpoint_in(tx: &mut Tx<'_, '_>, run: &str, name: &str) -> Result<Val
     )?)?)
 }
 
-async fn recheck_followups_in(
+async fn recheck_classification_in(
     tx: &mut Tx<'_, '_>,
     source: &DeliverySource,
-    receipt: &GraphAcceptance,
+    project: Option<&str>,
 ) -> Result<()> {
-    let path = receipt
-        .verified_formatting_path
-        .as_deref()
-        .context("delivery follow-ups lack a host-verified formatting receipt")?;
     let base = &source.base_step;
     let round = source.review_round;
+    let gate_step = format!("{base}.review");
+    let gate = gate::find_in(tx, &gate::gate_id(&source.source_run, &gate_step), project)
+        .await?
+        .context("delivery follow-ups lack a human classification gate")?;
+    let opened: gate::Gate = serde_json::from_value(
+        checkpoint_in(tx, &source.source_run, &format!("{gate_step}.gate")).await?,
+    )
+    .context("invalid opened classification gate checkpoint")?;
+    ensure!(
+        opened.id == gate.id
+            && opened.run == source.source_run
+            && opened.step == gate_step
+            && gate.run == source.source_run
+            && gate.step == gate_step
+            && opened.show == gate.show
+            && opened.title == gate.title
+            && opened.approvers == gate.approvers
+            && opened.evidence == gate.evidence,
+        "delivery classification differs from the opened candidate gate"
+    );
     let author = if round == 0 {
         format!("{base}.turn")
     } else {
@@ -552,22 +616,35 @@ async fn recheck_followups_in(
             && candidate
                 .proposal
                 .metadata
-                .get("verified_formatting_path")
+                .get("commit")
                 .and_then(Value::as_str)
-                == Some(path),
-        "delivery formatting proof differs from its accepted candidate"
+                == Some(source.head.as_str()),
+        "delivery classification differs from its accepted candidate"
     );
-    let mut has_followups = false;
-    for index in 0..2 {
+    let reviewers = opened.show["verdict"]["reviewers"]
+        .as_array()
+        .filter(|reviewers| reviewers.len() == 2)
+        .context("classification gate has no independent panel")?;
+    let mut panel = Vec::new();
+    for (index, entry) in reviewers.iter().enumerate() {
         let name = format!("{base}.review.{round}.{index}.publish");
         let verdict = checkpoint_in(tx, &source.source_run, &name).await?;
-        has_followups |= verified_reviewer_findings(&verdict, true, Some(path))?;
+        ensure!(
+            verdict["verdict"] == "approve",
+            "independent reviewer did not approve"
+        );
+        let atom = entry["atom"]
+            .as_str()
+            .context("classification gate has no reviewer identity")?;
+        panel.push(json!({"atom":atom, "verdict":verdict}));
     }
-    ensure!(
-        has_followups,
-        "delivery follow-up receipt has no verified finding"
-    );
-    Ok(())
+    verify_classification(
+        &gate,
+        &json!({"id":candidate.id, "digest":candidate.digest}),
+        &source.head,
+        round,
+        &json!({"reviewers":panel}),
+    )
 }
 
 /// Recheck the frozen source immediately before a remote effect is dispatched.
@@ -607,8 +684,7 @@ pub async fn revalidate_delivery_source_in(
         "source acceptance failed"
     );
     let bytes = decode_base64(&accepted.text("output")?)?;
-    let stored: GraphAcceptance = serde_json::from_slice(&bytes)?;
-    let receipt = &stored.acceptance;
+    let receipt: Acceptance = serde_json::from_slice(&bytes)?;
     ensure!(
         receipt.accepted
             && receipt.candidate == source.candidate_id
@@ -619,12 +695,17 @@ pub async fn revalidate_delivery_source_in(
         .reason
         .as_deref()
         .is_some_and(|reason| reason.starts_with(FOLLOWUP_REASON_PREFIX));
-    ensure!(
-        stored.verified_formatting_path.is_none() || followup_receipt,
-        "source formatting receipt has a different acceptance reason"
-    );
+    let project = row.text_opt("project")?;
+    // CONTROL_OFF: delivery-classification-revalidation
     if followup_receipt {
-        recheck_followups_in(tx, source, &stored).await?;
+        recheck_classification_in(tx, source, project.as_deref()).await?;
+    } else {
+        let step = format!("{}.review", source.base_step);
+        let id = gate::gate_id(&source.source_run, &step);
+        ensure!(
+            gate::find_in(tx, &id, project.as_deref()).await?.is_none(),
+            "source review gate is missing its human classification acceptance"
+        );
     }
     let publication = tx
         .query_opt(
