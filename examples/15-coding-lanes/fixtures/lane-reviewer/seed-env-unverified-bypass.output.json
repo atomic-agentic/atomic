@@ -1,0 +1,7 @@
+{
+  "verdict": "request_changes",
+  "findings": [
+    "The new ATOMIC_ALLOW_UNVERIFIED environment override makes verified(None) true, so an unverified finding can be confirmed without a host record.",
+    "tools/lane_guard.py: the existing guard still calls verified(), but that helper now accepts process environment as proof."
+  ]
+}
