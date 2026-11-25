@@ -47,7 +47,7 @@ impl SqliteStore {
         let query = query.to_owned();
         let status = status.map(str::to_owned);
         self.read(move |conn| Box::pin(async move {
-            let exact = sqlx::query("SELECT id,title,body,status FROM atomic_graph_items WHERE id=? AND (? IS NULL OR status=?)")
+            let exact = sqlx::query("SELECT id,title,body,status FROM atomic_graph_items WHERE id=? AND projected_gate_id IS NULL AND (? IS NULL OR status=?)")
                 .bind(&query)
                 .bind(&status)
                 .bind(&status)
@@ -70,7 +70,7 @@ impl SqliteStore {
                 "SELECT i.id,i.title,i.status,snippet(atomic_graph_search_fts,-1,'','',' … ',24) AS excerpt \
                  FROM atomic_graph_search_fts JOIN atomic_graph_search_keys k ON k.key=atomic_graph_search_fts.rowid \
                  JOIN atomic_graph_items i ON i.id=k.item_id \
-                 WHERE atomic_graph_search_fts MATCH ? AND (? IS NULL OR i.status=?) \
+                 WHERE atomic_graph_search_fts MATCH ? AND i.projected_gate_id IS NULL AND (? IS NULL OR i.status=?) \
                  ORDER BY bm25(atomic_graph_search_fts,10.0,1.0),i.id LIMIT ?",
             )
             .bind(literal)

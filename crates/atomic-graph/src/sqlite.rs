@@ -2453,6 +2453,8 @@ mod tests {
                     .bind(id).bind(title).bind(body).bind(status)
                     .execute(&mut *conn).await.map_err(db)?;
             }
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES ('gate:search','violet sample gate','violet sample private gate','gate',0,'blocked',NULL,'agent','gate-store',1,'run:search')")
+                .execute(&mut *conn).await.map_err(db)?;
             Ok(())
         })).await.expect("seed items");
         let hits = store
@@ -2479,6 +2481,13 @@ mod tests {
                 .expect("filtered id")
                 .len(),
             0
+        );
+        assert!(
+            store
+                .search_items("gate:search", None, 10)
+                .await
+                .expect("private gate ID")
+                .is_empty()
         );
         assert_eq!(
             store
