@@ -761,6 +761,11 @@ cannot. A manual run of the workflow on any branch does steps 1 to 4 and keeps
 the results as workflow artifacts; its signatures name that branch, not a tag,
 so they never pass the check a user runs on a release download
 ([verifying a download](getting-started/installation.md#verifying-a-download)).
+Selecting `windows_only` on a manual run builds, tests and signs just the Windows
+ZIP and its SBOM. The Windows test extracts the ZIP and runs a coding atom
+against a local scripted Responses endpoint. The shell must copy a fixture file
+in its worktree and receive access denied when reading private atomic state.
+
 To package a build locally:
 
 ```bash

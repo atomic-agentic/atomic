@@ -354,11 +354,10 @@ the run goes on once the sandbox starts. A sandbox that fails in a way that may 
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's
-execution lock. On macOS and Windows it kills each command's process group and
-does not wait, so a process that left its group may outlive atomic and the
-lock. On macOS and
-Windows this has not been verified: exec atoms' commands run unconfined there,
-so atomic keeps no operator credential and refuses credentialed gate decisions.
+execution lock. On macOS it kills each command's process group and does not wait, so a
+process that left its group may outlive atomic and the lock. Standalone exec
+commands run unconfined on macOS. On Windows, atomic refuses standalone exec
+commands. Both platforms refuse credentialed gate decisions.
 
 An exec atom's command hands large results over by reference: it writes a
 file to its outputs directory and names it in its output, and the next step's

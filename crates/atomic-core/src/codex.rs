@@ -279,6 +279,7 @@ const AZURE_CONFIG: &str = "AZURE_CONFIG_DIR";
 /// there, though on RHEL a container's subscription entitlements are
 /// mounted under `/run/secrets` too, so a command cannot reach the entitled
 /// repositories with them.
+#[cfg(unix)]
 const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     // `scripts/controls/secrets-dir-var-run.row` switches this off.
     "/var/run/secrets",
@@ -1104,6 +1105,7 @@ pub fn home_secrets(
     // name, a relative one resolved against atomic's working directory as
     // an SDK resolves it, and, for one in a projected volume, the volume
     // itself.
+    #[cfg(unix)]
     out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
     out.extend(token_files(env, &homes, &std::env::current_dir)?);
     // Those named inside a configuration rather than by a variable: an AWS
@@ -1841,10 +1843,17 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
     use std::path::Component;
     let refuse = |why: String| Err(anyhow::Error::new(DenyRefused(why)));
     // What is walked so far, every link in it followed, and what is left.
-    let mut done = PathBuf::from("/");
+    let root_part = |c: &Component<'_>| matches!(c, Component::RootDir | Component::Prefix(_));
+    let mut done: PathBuf = path.components().take_while(root_part).collect();
+    if !done.is_absolute() {
+        return refuse(format!(
+            "cannot resolve a denied path without an absolute root: {}",
+            path.display()
+        ));
+    }
     let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
         .components()
-        .filter(|c| !matches!(c, Component::RootDir))
+        .skip_while(root_part)
         .map(|c| c.as_os_str().to_owned())
         .collect();
     let mut hops = 0;
@@ -1901,6 +1910,9 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
             }
         };
         if !link {
+            #[cfg(windows)]
+            let next = std::fs::canonicalize(&next)
+                .map_err(|e| DenyRefused(format!("cannot resolve {}: {e}", next.display())))?;
             done = next;
             continue;
         }
@@ -1943,14 +1955,16 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
                 ));
             }
         };
-        if to.is_absolute() {
-            done = PathBuf::from("/");
+        if to.has_root() {
+            let root: PathBuf = to.components().take_while(root_part).collect();
+            done = done.join(root);
+        } else if matches!(to.components().next(), Some(Component::Prefix(_))) {
+            return refuse(format!(
+                "cannot resolve drive-relative link {}",
+                next.display()
+            ));
         }
-        for part in to
-            .components()
-            .filter(|c| !matches!(c, Component::RootDir))
-            .rev()
-        {
+        for part in to.components().rev().filter(|c| !root_part(c)) {
             rest.push_front(part.as_os_str().to_owned());
         }
     }

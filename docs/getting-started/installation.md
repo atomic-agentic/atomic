@@ -33,8 +33,9 @@ Which commands are built and which are a later stage's plan is listed in
 
 ## What you will need
 
-- A supported development machine. Linux and macOS are the initial local targets;
-  Windows support is planned on a best-effort basis.
+- Linux AMD64, macOS on Apple silicon, or Windows AMD64 for the v0.2 release
+  build. Windows coding atoms use the bundled Codex elevated sandbox. Windows
+  may prompt an administrator during initial sandbox setup.
 - Model access through an eligible ChatGPT subscription with Codex access, an
   API key, or a local OpenAI-compatible endpoint. Codex atoms take the
   subscription sign-in from `atomic model login`, which atomic accepts on Linux
@@ -42,6 +43,8 @@ Which commands are built and which are a later stage's plan is listed in
 - Git that supports `--no-lazy-fetch` for worktree and fixture operations.
   On macOS, install a current Git with Homebrew if the bundled Git lacks that
   option. Atomic looks for Homebrew Git at its standard installation paths.
+  On Windows, use the machine-wide Git for Windows installation at
+  `C:\Program Files\Git`.
 - Git and a container engine (Docker, or Podman) to build Atomic from source; the
   executable itself runs with no container. The Rust toolchain and other build tools are in the
   [development container](../development.md#the-development-container).

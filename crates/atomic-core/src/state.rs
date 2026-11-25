@@ -1966,10 +1966,10 @@ pub fn passwd_home() -> Option<PathBuf> {
     home.is_absolute().then_some(home)
 }
 
-/// See the Unix version: there is no password database to read here.
-#[cfg(not(unix))]
+/// The current user's Windows profile directory, from the OS known-folder API.
+#[cfg(windows)]
 pub fn passwd_home() -> Option<PathBuf> {
-    None
+    dirs::home_dir()
 }
 
 /// The name the password database gives `uid`; `None` when it has no entry

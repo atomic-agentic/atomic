@@ -8,8 +8,7 @@
 #
 # Writes to target/dist/:
 #
-#   atomic-<version>-<triple>.tar.gz          the binary, LICENSE, NOTICE and
-#                                             THIRD-PARTY-NOTICES.md
+#   atomic-<version>-<triple>.{tar.gz,zip}    executable(s), notices and licences
 #   atomic-<version>-<triple>.cdx.json        the CycloneDX SBOM, which records
 #                                             the binary's SHA-256
 #   <each of the above>.sha256                its checksum, in sha256sum format

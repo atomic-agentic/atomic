@@ -7,8 +7,7 @@
 # signature bundles to a draft GitHub release for a maintainer to publish. A
 # manual run on any branch does the same build, packaging and signing and keeps
 # the results as workflow artifacts, with no release. Nothing else starts it:
-# each run builds all three platforms in release mode. Actions are pinned by commit
-# SHA.
+# manual runs can select just Windows. Actions are pinned by commit SHA.
 
 name: Release
 
@@ -141,6 +140,9 @@ jobs:
           $before = @{}
           Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
           & "$vs\Common7\Tools\Launch-VsDevShell.ps1" -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+          $linker = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+          if (!(Test-Path -LiteralPath $linker -PathType Leaf)) { throw "Missing MSVC linker at $linker" }
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker" >> $env:GITHUB_ENV
           Get-ChildItem Env: | Where-Object { $before[$_.Name] -cne $_.Value } | ForEach-Object {
             if ($_.Name -eq 'PATH') {
               $_.Value.Split(';') | Where-Object { $_ -and $_ -notin $before['PATH'].Split(';') } >> $env:GITHUB_PATH
@@ -188,11 +190,13 @@ jobs:
       # The checkout and cargo-home paths are remapped so the binary does not
       # carry this runner's directory layout.
       - name: Build
+        shell: pwsh
+        env:
+          CFLAGS_x86_64_pc_windows_msvc: -DCURL_ENABLE_NTLM
+          LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
         run: |
-          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/atomic --remap-path-prefix=${CARGO_HOME:-${HOME}/.cargo}=/cargo"
-          export RUSTFLAGS="$RUSTFLAGS -C link-arg=/STACK:8388608 -C target-feature=+crt-static"
-          export CFLAGS_x86_64_pc_windows_msvc=-DCURL_ENABLE_NTLM
-          export LIBSQLITE3_FLAGS=SQLITE_DISABLE_INTRINSIC
+          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+          $env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$env:GITHUB_WORKSPACE=/atomic", "--remap-path-prefix=$cargoHome=/cargo", '-C', 'link-arg=/STACK:8388608', '-C', 'target-feature=+crt-static') -join [char]31
           cargo build --release --locked -p atomic-agentic --target ${{ env.WINDOWS_TARGET }}
 
       - name: Build pinned Windows sandbox helpers
@@ -232,6 +236,9 @@ jobs:
   sign:
     name: Sign
     needs: [build, windows]
+    if: >-
+      ${{ !cancelled() && needs.windows.result == 'success' &&
+          (needs.build.result == 'success' || (inputs.windows_only && needs.build.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -260,6 +267,7 @@ jobs:
       - name: Sign
         working-directory: dist
         run: |
+          shopt -s nullglob
           for f in *.tar.gz *.zip *.cdx.json; do
             [ -f "$f" ] || { echo "nothing to sign: $f" >&2; exit 1; }
             cosign sign-blob --yes --bundle "$f.sigstore.json" "$f"
@@ -271,10 +279,15 @@ jobs:
       # that signed nothing, or signed as anyone else, fails here.
       - name: Verify
         working-directory: dist
+        env:
+          WINDOWS_ONLY: ${{ inputs.windows_only }}
         run: |
           identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
           # Require one archive and one SBOM per target.
-          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc; do
+          targets=(x86_64-pc-windows-msvc)
+          if [[ "$WINDOWS_ONLY" != true ]]; then targets+=(x86_64-unknown-linux-gnu aarch64-apple-darwin); fi
+          shopt -s nullglob
+          for target in "${targets[@]}"; do
             archive=tar.gz
             if [[ "$target" == x86_64-pc-windows-msvc ]]; then archive=zip; fi
             for kind in "$archive" cdx.json; do

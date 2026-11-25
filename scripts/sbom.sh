@@ -47,7 +47,7 @@ python3 -I - "${SBOM}" "${ROOT}" <<'PY_ASTRO'
 import json, pathlib, sys
 file, root = sys.argv[1:]
 manifest = json.loads((pathlib.Path(root) / "crates/atomic-core/assets/manifest.json").read_text())
-doc = json.loads(pathlib.Path(file).read_text())
+doc = json.loads(pathlib.Path(file).read_text(encoding="utf-8"))
 refs = []
 licenses = {"@astrojs/compiler":"MIT", "typescript":"Apache-2.0", "source-map-js":"BSD-3-Clause"}
 for name, version in manifest["dependencies"].items():
@@ -65,7 +65,7 @@ if dependency is None:
     dependency = {"ref":owner,"dependsOn":[]}
     doc["dependencies"].append(dependency)
 dependency.setdefault("dependsOn", []).extend(refs)
-pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n")
+pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 print("SBOM includes pinned Astro/TypeScript libraries and bundled payload hashes")
 PY_ASTRO
 
