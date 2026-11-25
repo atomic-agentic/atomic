@@ -1183,6 +1183,7 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
             "delivery:after-intent",
             "delivery:after-dispatch",
             "delivery:after-record",
+            "delivery:after-observation",
             "delivery:after-decision",
             "delivery:after-park-release",
         ];

@@ -13,6 +13,7 @@
 //! process may recover and keeps running, so gates decided from another
 //! terminal let their runs go on, until it is stopped.
 
+use crate::delivery;
 use crate::engine::{self, EngineArgs};
 use crate::failure::{Failure, Said};
 use crate::target;
@@ -27,6 +28,80 @@ use std::time::Duration;
 
 /// How often `atomic serve` wakes runs whose gates were decided.
 const REDELIVERY: Duration = Duration::from_secs(5);
+const QUEUE_POLL_TICK: Duration = Duration::from_secs(1);
+
+fn queue_poll_now() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+/// A separate runtime reads one due row at a time. In particular, the
+/// protected provider read never holds the serve loop or a store transaction.
+async fn poll_queue_outcomes(state: ProjectState) {
+    let rt = match delivery::open_local_observation_runtime(&state).await {
+        Ok(rt) => rt,
+        Err(_) => {
+            atomic_core::log_line!("atomic serve: queue outcome poller unavailable");
+            return;
+        }
+    };
+    let Some(project) = rt.project().map(str::to_owned) else {
+        return;
+    };
+    loop {
+        let now = queue_poll_now();
+        if let Some(now) = now {
+            let scoped_project = project.clone();
+            let due = rt
+                .control_transaction(move |mut tx| {
+                    let project = scoped_project.clone();
+                    Box::pin(async move {
+                        atomic_durable::delivery_effect::due_queue_observation_in(
+                            &mut tx, &project, now,
+                        )
+                        .await
+                    })
+                })
+                .await;
+            match due {
+                Ok(Some(run)) => {
+                    if delivery::observe_one(&rt, &state, &run).await.is_err() {
+                        atomic_core::log_line!("atomic serve: queue outcome refresh failed");
+                        let deferred_at = queue_poll_now().unwrap_or(now);
+                        let scoped_project = project.clone();
+                        let deferred = rt
+                            .control_transaction(move |mut tx| {
+                                let project = scoped_project.clone();
+                                let run = run.clone();
+                                Box::pin(async move {
+                                    atomic_durable::delivery_effect::defer_queue_observation_in(
+                                        &mut tx,
+                                        &project,
+                                        &run,
+                                        deferred_at,
+                                    )
+                                    .await
+                                })
+                            })
+                            .await;
+                        if deferred.is_err() {
+                            atomic_core::log_line!("atomic serve: queue outcome deferral failed");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    atomic_core::log_line!("atomic serve: queue outcome lookup failed");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+        tokio::time::sleep(QUEUE_POLL_TICK).await;
+    }
+}
 
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
@@ -1080,6 +1155,11 @@ pub async fn serve(
     atomic_core::log_line!(
         "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"
     );
+    let queue_poller = if !engine.shared {
+        Some(tokio::spawn(poll_queue_outcomes(state.clone())))
+    } else {
+        None
+    };
     // A decider that stopped before waking its run is caught up within a
     // few seconds, not only at the next start.
     let signal = loop {
@@ -1095,6 +1175,10 @@ pub async fn serve(
             }
         }
     };
+    if let Some(queue_poller) = queue_poller {
+        queue_poller.abort();
+        let _ = queue_poller.await;
+    }
     atomic_core::log_line!("atomic serve: {signal}");
     stop(&mut signals, "atomic serve", Exit::Served).await
 }
