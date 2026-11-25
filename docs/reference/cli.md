@@ -187,6 +187,7 @@ authentication](../getting-started/authentication.md).
 | `atomic graph verify-commit <item> --run <run> --step <step> --attempt <n>` | Check a recorded worktree attempt against the item's authorized branch and store verified commit evidence | v0.2, SQLite |
 | `atomic delivery start <source-run> --step <graph-step>` | Open a human gate for a committed coding item with two clean independent reviews, self-review, selected controls and a passing trial merge; the protected project delivery adapter supplies the exact remote target | v0.2, SQLite |
 | `atomic delivery resume <delivery-run>` | Continue approved push, pull request and merge queue effects, reconciling an unknown remote outcome before any further action | v0.2, SQLite |
+| `atomic delivery observe <delivery-run>` | Read the protected provider's queue state after enqueue and durably record pending, merged, dropped or failed observation for the approved PR head; rerun to refresh a nonterminal result | v0.2, SQLite |
 
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
 | Workflow and graph inspection commands with `--json` | Use the supervision surface from scripts; import/export already support `--json` | v0.5 |

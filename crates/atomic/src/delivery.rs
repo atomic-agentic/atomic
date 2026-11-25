@@ -8,7 +8,7 @@ use crate::delivery_remote::DeliveryRemote;
 use anyhow::{Context, bail};
 use atomic_app::delivery_evidence::{self, DeliverySource};
 use atomic_core::state::ProjectState;
-use atomic_durable::delivery_effect::{self, Admission, DeliveryPlan, DeliverySlot};
+use atomic_durable::delivery_effect::{self, Admission, DeliveryPlan, DeliverySlot, QueueOutcome};
 use atomic_durable::gate::{self, Deployment, GateFilter, GateSpec, OnTimeout, Principal, Tier};
 use atomic_durable::publication::park_delivery;
 use atomic_durable::{
@@ -17,6 +17,7 @@ use atomic_durable::{
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum DeliveryDecision {
@@ -73,6 +74,8 @@ pub(crate) enum DeliveryCommand {
     },
     /// Continue a delivery run after its gate or remote outcome park is released.
     Resume { run_id: String },
+    /// Read and record the merge queue outcome of a completed delivery.
+    Observe { run_id: String },
 }
 
 fn operator_name() -> String {
@@ -133,6 +136,24 @@ async fn open_runtime(state: &ProjectState, resume: Option<&str>) -> anyhow::Res
     Ok(rt)
 }
 
+/// An observation reads a terminal delivery and must not launch or recover any
+/// other workflow while it queries the protected provider.
+async fn open_observation_runtime(state: &ProjectState) -> anyhow::Result<Durare> {
+    state.create()?;
+    let database = crate::engine::database(state)?;
+    if matches!(database, Database::Postgres { .. }) {
+        bail!("v0.2 queue observation requires the local SQLite project store");
+    }
+    atomic_durable::store::open_sqlite(&state.database()).await?;
+    Ok(Durare::open(
+        &database,
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &crate::engine::store_project(state)?,
+    )
+    .await?)
+}
+
 /// Start or resume the delivery workflow without selecting a model endpoint.
 pub(crate) async fn command(
     command: DeliveryCommand,
@@ -158,10 +179,10 @@ pub(crate) async fn command(
             {
                 bail!("reviewed graph item belongs to another project");
             }
-            if remote.base_ref() != source.trial_main_ref {
+            if remote.base_ref()? != source.trial_main_ref {
                 bail!(
                     "delivery base {} differs from the trial-merged base {}",
-                    remote.base_ref(),
+                    remote.base_ref()?,
                     source.trial_main_ref
                 );
             }
@@ -302,6 +323,101 @@ pub(crate) async fn command(
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             bail!("delivery run {run_id} is still working; resume it later")
+        }
+        DeliveryCommand::Observe { run_id } => {
+            let remote = DeliveryRemote::open_observer(state)?;
+            let rt = open_observation_runtime(state).await?;
+            let record = rt
+                .own_run_record(&run_id)
+                .await?
+                .with_context(|| format!("no delivery run {run_id} in this project"))?;
+            if record.workflow != delivery_effect::WORKFLOW
+                || record.version != rt.version()
+                || !matches!(record.status, RunStatus::Succeeded)
+            {
+                bail!("queue observation requires a completed delivery run at this layout");
+            }
+            let frozen: DeliveryRun =
+                serde_json::from_value(record.input).context("invalid frozen delivery run")?;
+            if frozen.plan.source_run != frozen.source.source_run
+                || frozen.plan.occurrence
+                    != format!("{}:{}", frozen.source.base_step, frozen.source.occurrence)
+                || frozen.plan.push["head"].as_str() != Some(frozen.source.head.as_str())
+                || !frozen
+                    .source
+                    .project
+                    .as_deref()
+                    .zip(rt.project())
+                    .is_some_and(|(source_project, current_project)| {
+                        same_project_state(source_project, current_project)
+                    })
+            {
+                bail!("queue observation source differs from its frozen delivery");
+            }
+            let source = frozen.source.clone();
+            let plan = frozen.plan.clone();
+            let run = run_id.clone();
+            let project = rt.project().map(str::to_owned);
+            let (pr, queue) = rt
+                .control_transaction(move |mut tx| {
+                    let (source, plan, run, project) =
+                        (source.clone(), plan.clone(), run.clone(), project.clone());
+                    Box::pin(async move {
+                        delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
+                            .await
+                            .map_err(|error| failed(format!("delivery source: {error}")))?;
+                        delivery_effect::queue_receipts_in(&mut tx, &plan, &run, project.as_deref())
+                            .await
+                    })
+                })
+                .await?;
+            let outcome = match remote.observe_queue(&frozen.plan, &pr, &queue).await {
+                Ok(outcome) => outcome,
+                Err(_) => QueueOutcome::Failed {
+                    detail: "provider observation unavailable or inconsistent".into(),
+                },
+            };
+            let observed_at =
+                i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
+                    .context("observation time exceeds stored range")?;
+            let source = frozen.source;
+            let plan = frozen.plan;
+            let run = run_id.clone();
+            let project = rt.project().map(str::to_owned);
+            let observation = rt
+                .control_transaction(move |mut tx| {
+                    let (source, plan, run, project, outcome) = (
+                        source.clone(),
+                        plan.clone(),
+                        run.clone(),
+                        project.clone(),
+                        outcome.clone(),
+                    );
+                    Box::pin(async move {
+                        delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
+                            .await
+                            .map_err(|error| failed(format!("delivery source: {error}")))?;
+                        delivery_effect::record_queue_observation_in(
+                            &mut tx,
+                            &plan,
+                            &run,
+                            project.as_deref(),
+                            outcome,
+                            observed_at,
+                        )
+                        .await
+                    })
+                })
+                .await?;
+            if as_json {
+                println!("{}", serde_json::to_string(&observation)?);
+            } else {
+                println!(
+                    "delivery run {run_id} queue outcome: {}",
+                    serde_json::to_string(&observation.outcome)?
+                );
+            }
+            Ok(())
         }
     }
 }

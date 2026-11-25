@@ -8,10 +8,11 @@
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use atomic_core::git::{is_ref_name, is_sha};
 use atomic_core::state::ProjectState;
-use atomic_durable::delivery_effect::{DeliveryPlan, DeliverySlot};
+use atomic_durable::delivery_effect::{DeliveryPlan, DeliverySlot, QueueOutcome};
 use atomic_exec::process::{self, Limits};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -71,7 +72,7 @@ impl DeliveryTarget {
 #[derive(Clone)]
 pub(crate) struct DeliveryRemote {
     dir: PathBuf,
-    target: DeliveryTarget,
+    target: Option<DeliveryTarget>,
 }
 
 /// Reject symlinks and group/other writes to operator-owned inputs. Private
@@ -112,6 +113,7 @@ fn protected(path: &Path, directory: bool) -> Result<()> {
 enum Method {
     Apply,
     Inspect,
+    Observe,
 }
 
 #[derive(Deserialize)]
@@ -149,6 +151,9 @@ enum Observed {
         head: String,
         number: u64,
         status: QueueStatus,
+        event_id: Option<String>,
+        merge_sha: Option<String>,
+        happened_at: Option<i64>,
     },
 }
 
@@ -161,9 +166,15 @@ enum QueueStatus {
 }
 
 impl DeliveryRemote {
+    fn target(&self) -> Result<&DeliveryTarget> {
+        self.target
+            .as_ref()
+            .context("mutating delivery operation has no protected target")
+    }
+
     /// Protected integration branch checked by the source trial merge.
-    pub(crate) fn base_ref(&self) -> &str {
-        &self.target.base_ref
+    pub(crate) fn base_ref(&self) -> Result<&str> {
+        Ok(&self.target()?.base_ref)
     }
     pub(crate) fn open(state: &ProjectState) -> Result<Self> {
         let private = state.private_dir();
@@ -172,6 +183,22 @@ impl DeliveryRemote {
             "delivery settings must be outside the project checkout"
         );
         Self::from_private(&private)
+    }
+
+    /// A completed delivery observes its frozen target, so it needs only the
+    /// protected adapter installation. The operator may replace or remove the
+    /// target file after a later delivery is configured.
+    pub(crate) fn open_observer(state: &ProjectState) -> Result<Self> {
+        let private = state.private_dir();
+        ensure!(
+            private.is_absolute() && !private.starts_with(state.root()),
+            "delivery settings must be outside the project checkout"
+        );
+        protected(&private, true)?;
+        let dir = private.join("delivery");
+        protected(&dir, true)?;
+        protected(&dir.join("adapter"), false)?;
+        Ok(Self { dir, target: None })
     }
 
     fn from_private(private: &Path) -> Result<Self> {
@@ -192,7 +219,10 @@ impl DeliveryRemote {
         let target: DeliveryTarget =
             serde_json::from_slice(&bytes).context("invalid protected delivery target")?;
         target.validate()?;
-        Ok(Self { dir, target })
+        Ok(Self {
+            dir,
+            target: Some(target),
+        })
     }
 
     /// Build the exact proposal for display to the operator. The host supplies
@@ -213,7 +243,7 @@ impl DeliveryRemote {
         );
         if let Some(checked_ref) = trial_ref {
             ensure!(
-                checked_ref == self.base_ref(),
+                checked_ref == self.base_ref()?,
                 "delivery base differs from checked trial ref"
             );
         }
@@ -223,7 +253,7 @@ impl DeliveryRemote {
                 "delivery needs a full checked trial SHA"
             );
         }
-        let target = &self.target;
+        let target = self.target()?;
         let mut push =
             json!({"repository":target.repository,"branch_ref":target.branch_ref,"head":head});
         push["expected_old"] = json!(target.expected_old);
@@ -269,6 +299,133 @@ impl DeliveryRemote {
     ) -> Result<Option<Value>> {
         self.invoke(Method::Inspect, plan, slot, key, prior_pr_receipt)
             .await
+    }
+
+    /// Read one queue outcome against the approved plan and applied receipts.
+    /// This method never compares a later operator target.json with the old
+    /// plan, and it never asks the adapter to apply a remote effect.
+    pub(crate) async fn observe_queue(
+        &self,
+        plan: &DeliveryPlan,
+        pull_request: &Value,
+        enqueue: &Value,
+    ) -> Result<QueueOutcome> {
+        let number = pull_request["number"]
+            .as_u64()
+            .filter(|number| *number > 0)
+            .context("queue observation needs the applied pull request number")?;
+        let mut expected_pr = plan.pull_request.clone();
+        expected_pr["number"] = json!(number);
+        let mut expected_queue = plan.enqueue.clone();
+        expected_queue["number"] = json!(number);
+        ensure!(
+            *pull_request == expected_pr && *enqueue == expected_queue,
+            "queue observation receipts differ from the frozen plan"
+        );
+        let head = plan.enqueue["head"]
+            .as_str()
+            .filter(|head| is_sha(head))
+            .context("queue observation has no approved head")?;
+        let key = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!([
+                "atomic.delivery.observe.v1",
+                plan.project,
+                plan.source_run,
+                plan.occurrence,
+                pull_request,
+                enqueue
+            ]))?)
+        );
+        let input = serde_json::to_vec(&json!({
+            "version":1,"method":Method::Observe,"slot":DeliverySlot::Enqueue,
+            "key":key,"request":plan.enqueue,"number":number
+        }))?;
+        ensure!(
+            input.len() <= WIRE_LIMIT,
+            "queue observation request exceeds its bound"
+        );
+        let response = self.call(input).await?;
+        ensure!(
+            response.version == 1 && response.key == key,
+            "queue observation response does not match request"
+        );
+        let Some(Observed::Queue {
+            repository,
+            branch_ref,
+            base_ref,
+            head: seen,
+            number: observed_number,
+            status,
+            event_id,
+            merge_sha,
+            happened_at,
+        }) = response.state
+        else {
+            bail!("delivery provider has no matching queue observation");
+        };
+        ensure!(
+            Some(repository.as_str()) == plan.enqueue["repository"].as_str()
+                && Some(branch_ref.as_str()) == plan.enqueue["branch_ref"].as_str()
+                && Some(base_ref.as_str()) == plan.enqueue["base_ref"].as_str()
+                && seen == head
+                && observed_number == number,
+            "delivery provider queue observation differs from approved PR and head"
+        );
+        let outcome = match status {
+            QueueStatus::Queued
+                if event_id.is_none() && merge_sha.is_none() && happened_at.is_none() =>
+            {
+                QueueOutcome::Pending
+            }
+            QueueStatus::Merged
+                if merge_sha.is_some() && event_id.is_some() && happened_at.is_some() =>
+            {
+                QueueOutcome::Merged {
+                    event_id: event_id.expect("checked"),
+                    merge_sha: merge_sha.expect("checked"),
+                    happened_at: happened_at.expect("checked"),
+                }
+            }
+            QueueStatus::Removed
+                if merge_sha.is_none() && event_id.is_some() && happened_at.is_some() =>
+            {
+                QueueOutcome::Dropped {
+                    event_id: event_id.expect("checked"),
+                    happened_at: happened_at.expect("checked"),
+                }
+            }
+            _ => bail!("delivery provider returned incomplete queue event evidence"),
+        };
+        outcome
+            .check()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        Ok(outcome)
+    }
+
+    async fn call(&self, input: Vec<u8>) -> Result<Response> {
+        let dir = self.dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let adapter = dir.join("adapter");
+            protected(&dir, true)?;
+            protected(&adapter, false)?;
+            let limits = Limits {
+                time: Duration::from_secs(30),
+                stdout: WIRE_LIMIT,
+                stderr: 4096,
+                cpu_seconds: Some(30),
+                data_bytes: None,
+            };
+            let completed = process::run(&adapter, &[], Some(&dir), &[], &input, limits)
+                .map_err(|_| anyhow!("could not obtain a bounded delivery provider response"))?;
+            if !completed.success() {
+                bail!("delivery provider did not complete successfully");
+            }
+            serde_json::from_slice::<Response>(&completed.stdout)
+                .map_err(|_| anyhow!("malformed delivery provider response"))
+        })
+        .await
+        .context("delivery provider worker stopped")?
     }
 
     async fn invoke(
@@ -321,28 +478,7 @@ impl DeliveryRemote {
             input.len() <= WIRE_LIMIT,
             "delivery provider request exceeds its bound"
         );
-        let dir = self.dir.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let adapter = dir.join("adapter");
-            protected(&dir, true)?;
-            protected(&adapter, false)?;
-            let limits = Limits {
-                time: Duration::from_secs(30),
-                stdout: WIRE_LIMIT,
-                stderr: 4096,
-                cpu_seconds: Some(30),
-                data_bytes: None,
-            };
-            let completed = process::run(&adapter, &[], Some(&dir), &[], &input, limits)
-                .map_err(|_| anyhow!("could not obtain a bounded delivery provider response"))?;
-            if !completed.success() {
-                bail!("delivery provider did not complete successfully");
-            }
-            serde_json::from_slice::<Response>(&completed.stdout)
-                .map_err(|_| anyhow!("malformed delivery provider response"))
-        })
-        .await
-        .context("delivery provider worker stopped")??;
+        let result = self.call(input).await?;
         ensure!(
             result.version == 1 && result.key == key,
             "delivery response does not match request version and key"
@@ -350,7 +486,7 @@ impl DeliveryRemote {
         let Some(state) = result.state else {
             return Ok(None);
         };
-        let target = &self.target;
+        let target = self.target()?;
         let observed = match state {
             Observed::Push {
                 repository,
@@ -394,6 +530,7 @@ impl DeliveryRemote {
                 head: queued_head,
                 number: observed_number,
                 status: QueueStatus::Queued | QueueStatus::Merged,
+                ..
             } if slot == DeliverySlot::Enqueue
                 && Some(observed_number) == number
                 && repository == target.repository

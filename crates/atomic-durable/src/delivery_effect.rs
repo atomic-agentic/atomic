@@ -152,6 +152,104 @@ pub enum Admission {
     },
 }
 
+/// A read-only observation after the enqueue effect has a recorded receipt.
+/// A failed read is distinct from a provider-confirmed pending queue entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum QueueOutcome {
+    /// The provider still has the approved pull request in its queue.
+    Pending,
+    /// The provider reports a merge with an immutable event identity.
+    Merged {
+        /// Provider-scoped stable event identity.
+        event_id: String,
+        /// Commit placed on the protected branch by the merge.
+        merge_sha: String,
+        /// Provider event time in Unix milliseconds.
+        happened_at: i64,
+    },
+    /// The provider removed or rejected the queued pull request.
+    Dropped {
+        /// Provider-scoped stable event identity.
+        event_id: String,
+        /// Provider event time in Unix milliseconds.
+        happened_at: i64,
+    },
+    /// The provider read failed or did not match the approved identity.
+    Failed {
+        /// Bounded host diagnostic with no provider response body.
+        detail: String,
+    },
+}
+
+impl QueueOutcome {
+    fn terminal(&self) -> bool {
+        matches!(self, Self::Merged { .. } | Self::Dropped { .. })
+    }
+
+    /// Validate the bounded event identity before it enters durable state.
+    pub fn check(&self) -> Result<()> {
+        match self {
+            Self::Pending => Ok(()),
+            Self::Merged {
+                event_id,
+                merge_sha,
+                happened_at,
+            } => {
+                if !valid_event_id(event_id) || !valid_sha(merge_sha) || *happened_at <= 0 {
+                    return Err(refuse("invalid provider merge event"));
+                }
+                Ok(())
+            }
+            Self::Dropped {
+                event_id,
+                happened_at,
+            } => {
+                if !valid_event_id(event_id) || *happened_at <= 0 {
+                    return Err(refuse("invalid provider queue drop event"));
+                }
+                Ok(())
+            }
+            Self::Failed { detail } => {
+                if detail.is_empty() || detail.len() > 256 || detail.chars().any(char::is_control) {
+                    return Err(refuse("invalid queue observation failure"));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn valid_event_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn valid_sha(value: &str) -> bool {
+    (value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// One row per delivery run. Repeated reads update pending/failure state but
+/// never multiply a provider terminal event in flow metrics.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueObservation {
+    /// Delivery run that owned the approved enqueue effect.
+    pub delivery_run: String,
+    /// Provider repository identity frozen in the plan.
+    pub repository: String,
+    /// Applied pull request number.
+    pub pull_request_number: u64,
+    /// Approved pull request head.
+    pub head: String,
+    /// Latest read or immutable terminal outcome.
+    pub outcome: QueueOutcome,
+    /// Time of the read in Unix milliseconds.
+    pub observed_at: i64,
+}
+
 fn refuse(why: &str) -> DurableError {
     DurableError::Failed(why.to_owned())
 }
@@ -434,6 +532,206 @@ pub async fn applied_receipt<C: WorkflowContext>(
         })
     })
     .await
+}
+
+/// Read the two applied receipts in the same transaction as source validation.
+/// This never creates an effect intent or a dispatch permit.
+pub async fn queue_receipts_in(
+    tx: &mut Tx<'_, '_>,
+    plan: &DeliveryPlan,
+    run: &str,
+    project: Option<&str>,
+) -> Result<(Value, Value)> {
+    authorize(tx, plan, run, project).await?;
+    let mut receipts = Vec::new();
+    for slot in [DeliverySlot::PullRequest, DeliverySlot::Enqueue] {
+        let effect = effect_row(tx, plan, slot)
+            .await?
+            .ok_or_else(|| refuse("queue observation requires an applied delivery slot"))?;
+        let receipt: Value = serde_json::from_str(
+            &effect
+                .receipt
+                .ok_or_else(|| refuse("queue observation requires an applied delivery receipt"))?,
+        )
+        .map_err(|_| refuse("invalid stored delivery receipt"))?;
+        receipts.push(receipt);
+    }
+    let [pull_request, enqueue] = receipts.as_slice() else {
+        unreachable!("two delivery slots are fixed")
+    };
+    let number = pull_request["number"]
+        .as_u64()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| refuse("invalid applied pull request number"))?;
+    let mut expected_pr = plan.pull_request.clone();
+    expected_pr["number"] = json!(number);
+    let mut expected_queue = plan.enqueue.clone();
+    expected_queue["number"] = json!(number);
+    if *pull_request != expected_pr || *enqueue != expected_queue {
+        return Err(refuse(
+            "queue observation receipts differ from the approved plan",
+        ));
+    }
+    Ok((pull_request.clone(), enqueue.clone()))
+}
+
+fn observation_from_row(row: &crate::Row) -> Result<QueueObservation> {
+    let outcome = match row.text("status")?.as_str() {
+        "pending" => QueueOutcome::Pending,
+        "merged" => QueueOutcome::Merged {
+            event_id: row
+                .text_opt("provider_event_id")?
+                .ok_or_else(|| refuse("stored merge event has no identity"))?,
+            merge_sha: row
+                .text_opt("merge_sha")?
+                .ok_or_else(|| refuse("stored merge event has no SHA"))?,
+            happened_at: row.int("happened_at")?,
+        },
+        "dropped" => QueueOutcome::Dropped {
+            event_id: row
+                .text_opt("provider_event_id")?
+                .ok_or_else(|| refuse("stored queue drop has no identity"))?,
+            happened_at: row.int("happened_at")?,
+        },
+        "failed" => QueueOutcome::Failed {
+            detail: row.text("detail")?,
+        },
+        _ => return Err(refuse("invalid stored queue observation status")),
+    };
+    outcome.check()?;
+    Ok(QueueObservation {
+        delivery_run: row.text("delivery_run")?,
+        repository: row.text("repository")?,
+        pull_request_number: u64::try_from(row.int("pull_request_number")?)
+            .map_err(|_| refuse("invalid stored pull request number"))?,
+        head: row.text("head")?,
+        outcome,
+        observed_at: row.int("observed_at")?,
+    })
+}
+
+/// A terminal provider event is immutable. Pending and failed reads occupy one
+/// row that a later observation may replace, so restart cannot double-count.
+pub async fn record_queue_observation_in(
+    tx: &mut Tx<'_, '_>,
+    plan: &DeliveryPlan,
+    run: &str,
+    project: Option<&str>,
+    outcome: QueueOutcome,
+    observed_at: i64,
+) -> Result<QueueObservation> {
+    outcome.check()?;
+    if observed_at <= 0 || run.is_empty() {
+        return Err(refuse("invalid queue observation identity or timestamp"));
+    }
+    let (pr, _) = queue_receipts_in(tx, plan, run, project).await?;
+    let number = pr["number"]
+        .as_u64()
+        .ok_or_else(|| refuse("invalid applied pull request number"))?;
+    let repository = plan.enqueue["repository"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| refuse("queue observation has no repository identity"))?;
+    let head = plan.enqueue["head"]
+        .as_str()
+        .filter(|value| valid_sha(value))
+        .ok_or_else(|| refuse("queue observation has no approved head"))?;
+    let plan_digest = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(plan).map_err(|_| refuse("invalid queue observation plan"))?
+        )
+    );
+    let existing = tx.query_opt(
+        "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+        &[text(run)],
+    ).await?;
+    if let Some(row) = &existing {
+        if row.text("plan_digest")? != plan_digest
+            || row.text("repository")? != repository
+            || row.int("pull_request_number")?
+                != i64::try_from(number)
+                    .map_err(|_| refuse("pull request number exceeds stored range"))?
+            || row.text("head")? != head
+        {
+            return Err(refuse(
+                "queue observation conflicts with its frozen delivery",
+            ));
+        }
+        let prior = observation_from_row(row)?;
+        // CONTROL_OFF: delivery-queue-outcome-stable
+        if prior.outcome.terminal() {
+            if outcome.terminal() && outcome != prior.outcome {
+                return Err(refuse(
+                    "provider queue outcome conflicts with a recorded terminal event",
+                ));
+            }
+            return Ok(prior);
+        }
+    }
+    let (status, event, merge_sha, happened_at, detail): (
+        &str,
+        Option<&str>,
+        Option<&str>,
+        Option<i64>,
+        &str,
+    ) = match &outcome {
+        QueueOutcome::Pending => ("pending", None, None, None, ""),
+        QueueOutcome::Merged {
+            event_id,
+            merge_sha,
+            happened_at,
+        } => (
+            "merged",
+            Some(event_id),
+            Some(merge_sha),
+            Some(*happened_at),
+            "",
+        ),
+        QueueOutcome::Dropped {
+            event_id,
+            happened_at,
+        } => ("dropped", Some(event_id), None, Some(*happened_at), ""),
+        QueueOutcome::Failed { detail } => ("failed", None, None, None, detail),
+    };
+    let params = [
+        text(run),
+        text(&plan_digest),
+        text(repository),
+        Param::Int(
+            i64::try_from(number)
+                .map_err(|_| refuse("pull request number exceeds stored range"))?,
+        ),
+        text(head),
+        text(status),
+        event.map_or(Param::Null, text),
+        merge_sha.map_or(Param::Null, text),
+        happened_at.map_or(Param::Null, Param::Int),
+        Param::Int(observed_at),
+        text(detail),
+    ];
+    if existing.is_some() {
+        tx.execute(
+            "UPDATE atomic_delivery_queue_observations SET status=?,provider_event_id=?,merge_sha=?,happened_at=?,observed_at=?,detail=? WHERE delivery_run=? AND status IN ('pending','failed')",
+            &[params[5].clone(), params[6].clone(), params[7].clone(), params[8].clone(), params[9].clone(), params[10].clone(), params[0].clone()],
+        ).await?;
+    } else {
+        tx.execute(
+            "INSERT INTO atomic_delivery_queue_observations (delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(delivery_run) DO NOTHING",
+            &params,
+        ).await?;
+    }
+    let row = tx.query_one(
+        "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+        &[text(run)],
+    ).await?;
+    let recorded = observation_from_row(&row)?;
+    if recorded.outcome != outcome && (outcome.terminal() || !recorded.outcome.terminal()) {
+        return Err(refuse(
+            "provider queue outcome conflicts with a recorded observation",
+        ));
+    }
+    Ok(recorded)
 }
 
 /// Record success only after the host receives a successful response or
