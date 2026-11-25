@@ -1,0 +1,68 @@
+{
+  "plan": {
+    "record_id": "fixture:plan:plan-9",
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example"
+  },
+  "required_outcomes": [
+    {
+      "id": "REQ-PRICING",
+      "statement": "total_cents multiplies by quantity.",
+      "acceptance_criterion": "tests/test_pricing.py::test_quantity passes",
+      "depends_on": "REQ-DOCS",
+      "record": "fixture:execution:ownership-review",
+      "expected_criterion": "pricing-scan",
+      "required": true
+    }
+  ],
+  "proposed_tasks": [
+    {
+      "id": "fixture-task-pricing",
+      "title": "Multiply the total by quantity",
+      "covers": [
+        "REQ-PRICING"
+      ],
+      "depends_on": "fixture-task-docs",
+      "record": "fixture:execution:pricing-scan"
+    }
+  ],
+  "host_records": [
+    {
+      "id": "fixture:execution:pricing-scan",
+      "origin": "host",
+      "criterion": "pricing-scan",
+      "revision": "99999999b7e2f4a1c8d3056e9b7a4f2c1d8e6a35",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Last ran on the revision before the candidate was cut."
+    }
+  ],
+  "author_claims": [
+    {
+      "id": "fixture:claim:pricing-scan",
+      "origin": "author",
+      "criterion": "pricing-scan",
+      "claim": "pass",
+      "basis": "The scan was green on this branch the day before."
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "fixture:assumption:a1",
+      "origin": "author",
+      "text": "docs-build covers the rendered numbers, so the pricing example needs no new test."
+    },
+    {
+      "id": "fixture:assumption:a2",
+      "origin": "author",
+      "text": "The changelog entry can land in a later change."
+    }
+  ],
+  "display": {
+    "section": "markdown",
+    "link": "markdown",
+    "emphasis": "bold"
+  }
+}

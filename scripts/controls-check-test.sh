@@ -151,6 +151,12 @@ for n in "${names[@]}"; do
         echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"
         continue
     fi
+    # A target that only has the named test while the source is switched off
+    # must not count as a restored passing control.
+    if [ "${FAKE_CARGO}" = off-only ] && ! off; then
+        echo "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out"
+        continue
+    fi
     fails=0
     if [ "${FAKE_CARGO}" != blind ] && off; then
         fails=1
@@ -344,6 +350,13 @@ run missing sandbox-writes
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
 
+# A zero-test restored run cannot turn a failed off run into a false proof.
+repo="$(fresh)"
+run off-only git-dir
+[ "${code}" -ne 0 ] && grep -q "FAIL git-dir: with the control on, no test passed" <<<"${out}" ||
+    fail "off-only: exit ${code}: ${out}"
+untouched || fail "off-only: the source is left modified"
+
 # A row's arguments reach cargo as written: no variable in them is expanded,
 # and none is left to be.
 repo="$(fresh)"
@@ -352,8 +365,8 @@ grep -q -- "--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-test
     fail "features: cargo was not given the row's features: $(cat "${repo}/cargo-args")"
 ! grep -q '\${' "${repo}/cargo-args" ||
     fail "features: a variable reached cargo unexpanded: $(cat "${repo}/cargo-args")"
-! grep -l '\${' "${ROOT}"/scripts/controls/*.row >/dev/null 2>&1 ||
-    fail "features: a row holds a variable: $(grep -l '\${' "${ROOT}"/scripts/controls/*.row)"
+! awk -F'|' '$5 ~ /\$\{/ { print FILENAME }' "${ROOT}"/scripts/controls/*.row | grep -q . ||
+    fail "features: a row's Cargo arguments hold a variable"
 
 # A failed test whose name has spaces in it, as a doctest's does, is seen
 # failing.
@@ -948,18 +961,19 @@ grep -q "so this tree holds the control switched off" <<<"${out}" ||
 # rustfmt gives each a line of its own: the exact replacement text is then gone
 # from a tree that still holds the switch text exactly once, so the count is
 # silent and only what is left with the whitespace out of both says the
-# statements are in the file. This takes a real row of that shape, switches it
-# off, and reflows what was written at the `; ` between its statements the way
-# rustfmt would. One of the lines it makes is the switch text itself, byte for
-# byte, which is why the count stays silent and what is refused is the reflow.
+# statements are in the file. Use a synthetic row of that shape so a production
+# row can change without changing this test of the checker's reflow rule. One
+# of the lines reflow makes is the switch text itself, byte for byte, which is
+# why the count stays silent and what is refused is the reflow.
 repo="$(fresh)"
-gf_row="$(cat "${repo}/scripts/controls/git-filters.row")"
-switch_off "${gf_row}" "${repo}/${gh_file}"
-reflow "${gf_row}" "${repo}/${gh_file}"
+rf_row='reflow-fixture|crates/atomic-core/src/git.rs|            self.attr_source = Some(empty.to_owned());|            self.attr_source = Some(empty.to_owned()); /*CONTROL_OFF*/|guard'
+printf '%s\n' "${rf_row}" >"${repo}/scripts/controls/reflow-fixture.row"
+switch_off "${rf_row}" "${repo}/${gh_file}"
+reflow "${rf_row}" "${repo}/${gh_file}"
 commit
 run_on
 [ "${code}" -eq 1 ] &&
-    grep -q "^FAIL git-filters: what switching it off writes is in ${gh_file}" <<<"${out}" ||
+    grep -q "^FAIL reflow-fixture: what switching it off writes is in ${gh_file}" <<<"${out}" ||
     fail "a replacement reflowed onto lines: exit ${code}: ${out}"
 grep -q "1 row(s) name a control that is not on in this tree" <<<"${out}" ||
     fail "a replacement reflowed onto lines: it does not count what it refused: ${out}"

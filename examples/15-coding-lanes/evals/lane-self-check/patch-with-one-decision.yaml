@@ -1,0 +1,14 @@
+input:
+  diff: |-
+    diff --git a/tools/lane_guard.py b/tools/lane_guard.py
+    --- a/tools/lane_guard.py
+    +++ b/tools/lane_guard.py
+    @@ -40,6 +40,8 @@ def decide(finding):
+         findings = [claim]
+    +    # The control row switches this line.
+    +    if findings and not verified(verification):
+             return {"confirmed": False, "claim": claim, "reason": "unverified finding"}
+expect:
+- output.decisions.size() == 1
+- output.decisions[0].point == 'candidate publication'
+- output.controls.size() == 0

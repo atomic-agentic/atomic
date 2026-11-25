@@ -20,7 +20,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
+FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests,atomic-agentic/dev-failpoints"
 LOG="$(mktemp)"
 FAILING="$(mktemp)"
 trap 'rm -f "${LOG}" "${FAILING}"' EXIT
@@ -74,8 +74,9 @@ postgres)
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
     fi
-    # The command-line tests in crates/atomic/tests/run_cli.rs, and one in
-    # crates/atomic/tests/failpoints.rs, also use the database. That
+    # The command-line tests in crates/atomic/tests/run_cli.rs, and tests in
+    # crates/atomic/tests/failpoints.rs and crates/atomic/tests/graph_claim.rs,
+    # also use the database. That
     # package's tests are too many and too slow to run wholesale without it,
     # so its Postgres tests are selected by name, as their names say
     # postgres; test_database.rs keeps the users of the database to these

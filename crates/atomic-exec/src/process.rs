@@ -1010,6 +1010,10 @@ pub struct Limits {
     pub stdout: usize,
     /// The most stderr kept, in bytes; more is dropped.
     pub stderr: usize,
+    /// Optional per-process CPU seconds, inherited by children on Unix.
+    pub cpu_seconds: Option<u64>,
+    /// Optional per-process writable data bytes, inherited by children on Unix.
+    pub data_bytes: Option<u64>,
 }
 
 /// `program` as a path: as given when it names a path, else the first match
@@ -1056,6 +1060,34 @@ pub fn run_in(
 ) -> Result<Completed, ExecError> {
     let none = crate::SecretEnv::default();
     run_in_with_secret(group, program, args, cwd, env, &none, stdin, limits)
+}
+
+/// Convert a declared Unix cap before fork. `RLIM_INFINITY` would silently
+/// turn a cap into no cap, and a narrowing cast could do the same on a platform
+/// with a smaller `rlim_t`.
+#[cfg(unix)]
+fn checked_rlimit(
+    program: &str,
+    name: &str,
+    value: Option<u64>,
+    hard_extra: u64,
+) -> Result<Option<(libc::rlim_t, libc::rlim_t)>, ExecError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let soft = libc::rlim_t::try_from(value).ok();
+    let hard = value
+        .checked_add(hard_extra)
+        .and_then(|v| libc::rlim_t::try_from(v).ok());
+    match (soft, hard) {
+        (Some(soft), Some(hard)) if soft < libc::RLIM_INFINITY && hard < libc::RLIM_INFINITY => {
+            Ok(Some((soft, hard)))
+        }
+        _ => Err(ExecError::Start {
+            program: program.to_owned(),
+            message: format!("{name} limit is too large to enforce on this machine"),
+        }),
+    }
 }
 
 /// A connected Unix socket holding `secret`'s entries, with its other end
@@ -1231,6 +1263,10 @@ pub fn run_in_with_secret(
     limits: Limits,
 ) -> Result<Completed, ExecError> {
     let name = program.display().to_string();
+    #[cfg(unix)]
+    let cpu = checked_rlimit(&name, "CPU", limits.cpu_seconds, 1)?;
+    #[cfg(unix)]
+    let data = checked_rlimit(&name, "writable data", limits.data_bytes, 0)?;
     let mut command = std::process::Command::new(program);
     command
         .args(args)
@@ -1275,6 +1311,13 @@ pub fn run_in_with_secret(
             message: "secret variables are handed on a socket only on Unix".into(),
         });
     }
+    #[cfg(not(unix))]
+    if limits.cpu_seconds.is_some() || limits.data_bytes.is_some() {
+        return Err(ExecError::Start {
+            program: name,
+            message: "CPU and writable-data limits require Unix".into(),
+        });
+    }
     #[cfg(unix)]
     {
         let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
@@ -1312,6 +1355,24 @@ pub fn run_in_with_secret(
                 }
                 #[cfg(not(target_os = "linux"))]
                 let _ = parent;
+                if let Some((soft, hard)) = cpu {
+                    let limit = libc::rlimit {
+                        rlim_cur: soft,
+                        rlim_max: hard,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_CPU, &limit) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if let Some((soft, hard)) = data {
+                    let limit = libc::rlimit {
+                        rlim_cur: soft,
+                        rlim_max: hard,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_DATA, &limit) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }

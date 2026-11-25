@@ -3,6 +3,21 @@
 use super::*;
 use std::path::{Path, PathBuf};
 
+fn test_target() -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("target"))
+        .join("atomic-exec-tests")
+}
+
 fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecError> {
     LocalBackend::default().run(&Command {
         program: "/bin/sh".into(),
@@ -12,6 +27,8 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         stdin: stdin.to_vec(),
         time_limit: time,
         output_limit: 1024,
+        cpu_seconds: None,
+        data_bytes: None,
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
@@ -70,6 +87,8 @@ fn no_shell_expands_the_arguments() {
             stdin: Vec::new(),
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
+            cpu_seconds: None,
+            data_bytes: None,
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
@@ -91,6 +110,8 @@ fn a_missing_program_cannot_start() {
             stdin: Vec::new(),
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
+            cpu_seconds: None,
+            data_bytes: None,
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
@@ -112,9 +133,7 @@ fn source(tag: &str) -> PathBuf {
 /// build's target directory: a scratch root under the system's temporary
 /// directory is refused at connect.
 fn backend(tag: &str) -> LocalBackend {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atomic-exec-tests")
-        .join(format!("scratch-{tag}-{}", std::process::id()));
+    let root = test_target().join(format!("scratch-{tag}-{}", std::process::id()));
     let _ = workspace::remove_tree(&root);
     LocalBackend::in_dir(root)
 }
@@ -652,6 +671,8 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         stdin: b" and stdin".to_vec(),
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
+        cpu_seconds: None,
+        data_bytes: None,
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
@@ -669,6 +690,8 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
             time: command.time_limit,
             stdout: command.output_limit,
             stderr: process::STDERR_LIMIT,
+            cpu_seconds: None,
+            data_bytes: None,
         },
     )
     .expect("runs");
@@ -916,9 +939,7 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
 #[cfg(unix)]
 #[test]
 fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atomic-exec-tests")
-        .join(format!("outermost-{}", std::process::id()));
+    let base = test_target().join(format!("outermost-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (home, elsewhere) = (base.join("scratch"), base.join("elsewhere"));
     std::fs::create_dir_all(home.join("p")).expect("home");
@@ -946,9 +967,7 @@ fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
 #[test]
 fn an_old_scratch_root_goes_only_once_nothing_live_is_in_it() {
     let make = |tag: &str| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/atomic-exec-tests")
-            .join(format!("retire-{tag}-{}", std::process::id()));
+        let root = test_target().join(format!("retire-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dead = root.join("fix-0123/999999999.1-a0");
         std::fs::create_dir_all(&dead).expect("dead attempt");

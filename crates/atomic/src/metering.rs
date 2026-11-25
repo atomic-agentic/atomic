@@ -63,6 +63,11 @@ pub struct BudgetPlan {
     pub atoms: BTreeMap<String, Resolved>,
     /// The model each model atom calls, by atom name.
     pub models: BTreeMap<String, String>,
+    /// Additional models a graph atom may call when its host item route is
+    /// selected. The endpoint catalog and every model's price are admitted
+    /// before the first lane, while a lane's exact choice is checkpointed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub routed_models: BTreeMap<String, Vec<String>>,
     /// Each exec atom's caps, by atom name: its command's active time is
     /// charged to them and to the run's. A plan without them reads, as one
     /// with none, but a run that needs them refuses it.
@@ -157,6 +162,7 @@ impl BudgetPlan {
                 .iter()
                 .map(|(name, _, model)| ((*name).to_owned(), (*model).to_owned()))
                 .collect(),
+            routed_models: BTreeMap::new(),
             call: PlannedCall {
                 input_tokens: settings.call.input_tokens,
                 output_tokens: settings.call.output_tokens,
@@ -181,6 +187,60 @@ impl BudgetPlan {
             ceilings: settings.ceilings.clone(),
             held: true,
         })
+    }
+
+    /// Admit every model in an operator's graph endpoint catalog before the
+    /// run begins. All models share the same atom and workflow caps; resolving
+    /// each cap against the whole catalog checks the largest call reservation
+    /// and refuses an unpriced option under a dollar cap.
+    pub fn resolve_routed(
+        settings: &BudgetSettings,
+        declared: &Budget,
+        atoms: &[(&str, &Budget)],
+        exec: &[(&str, &Budget)],
+        models: &[&str],
+    ) -> Result<Self, (Option<String>, BudgetError)> {
+        let Some(primary) = models.first() else {
+            return Err((
+                None,
+                BudgetError::Default {
+                    setting: "model.lanes.endpoints".into(),
+                    message: "must name at least one model".into(),
+                },
+            ));
+        };
+        let single = atoms
+            .iter()
+            .map(|(name, budget)| (*name, *budget, *primary))
+            .collect::<Vec<_>>();
+        let mut plan = Self::resolve(settings, declared, &single, exec)?;
+        plan.run = resolve(declared, Level::Workflow, settings, models).map_err(|e| (None, e))?;
+        for (name, budget) in atoms {
+            let caps = resolve(budget, Level::Atom, settings, models)
+                .map_err(|e| (Some((*name).to_owned()), e))?;
+            plan.atoms.insert((*name).to_owned(), caps);
+            plan.routed_models.insert(
+                (*name).to_owned(),
+                models.iter().map(|model| (*model).to_owned()).collect(),
+            );
+        }
+        plan.pricing = settings
+            .pricing
+            .iter()
+            .filter(|(model, _)| models.contains(&model.as_str()))
+            .map(|(model, price)| {
+                (
+                    model.clone(),
+                    PlannedPrice {
+                        input_usd_per_mtok: price.input_usd_per_mtok,
+                        output_usd_per_mtok: price.output_usd_per_mtok,
+                        max_input_tokens: price.max_input_tokens,
+                        max_output_tokens: price.max_output_tokens,
+                    },
+                )
+            })
+            .collect();
+        Ok(plan)
     }
 
     /// The call bound and prices the plan meters under, held to the caps its
@@ -341,6 +401,7 @@ impl BudgetPlan {
             && let Some(model) = self
                 .models
                 .values()
+                .chain(self.routed_models.values().flatten())
                 .find(|model| !current.pricing.contains_key(*model))
         {
             return Err(format!(
@@ -398,14 +459,22 @@ impl BudgetPlan {
             let caps = self.atoms.get(atom).ok_or_else(|| {
                 format!("atom {atom} calls {model:?} and the plan has no caps for it")
             })?;
-            settings
-                .check_room(caps, Level::Atom, model)
-                .map_err(|e| format!("atom {atom}: {e}"))?;
-            settings
-                .check_room(&self.run, Level::Workflow, model)
-                .map_err(|e| format!("the run: {e}"))?;
-            priced(model, caps, &format!("atom {atom}"))?;
-            priced(model, &self.run, "the run")?;
+            let options = self.routed_models.get(atom);
+            if options.is_some_and(|options| options.is_empty() || !options.contains(model)) {
+                return Err(format!(
+                    "atom {atom}: its routed model list omits its primary model"
+                ));
+            }
+            for option in options.map_or_else(|| vec![model], |options| options.iter().collect()) {
+                settings
+                    .check_room(caps, Level::Atom, option)
+                    .map_err(|e| format!("atom {atom}: {e}"))?;
+                settings
+                    .check_room(&self.run, Level::Workflow, option)
+                    .map_err(|e| format!("the run: {e}"))?;
+                priced(option, caps, &format!("atom {atom}"))?;
+                priced(option, &self.run, "the run")?;
+            }
         }
         for (atom, caps) in &self.exec {
             check_work_room(caps, Level::Atom).map_err(|e| format!("atom {atom}: {e}"))?;
@@ -912,5 +981,29 @@ mod tests {
         // With no dollar ceiling, a model the table here does not price is
         // the plan's to price.
         assert_eq!(unpriced.priced_no_lower(&BudgetSettings::default()), Ok(()));
+    }
+
+    #[test]
+    fn a_graph_route_to_an_unpriced_model_cannot_evade_a_dollar_cap() {
+        let mut settings = BudgetSettings::default();
+        settings.ceilings.workflow.cost_usd = Some(1.0);
+        settings.pricing.insert("priced".into(), priced(1.0, 2.0));
+        let budget = Budget::default();
+        let atoms = [("author", &budget)];
+        let error =
+            BudgetPlan::resolve_routed(&settings, &budget, &atoms, &[], &["priced", "unpriced"])
+                .expect_err("every route must be priced under a dollar cap");
+        assert!(error.1.to_string().contains("unpriced"), "{error:?}");
+
+        settings.pricing.insert("unpriced".into(), priced(0.0, 0.0));
+        let plan =
+            BudgetPlan::resolve_routed(&settings, &budget, &atoms, &[], &["priced", "unpriced"])
+                .expect("all options priced");
+        assert_eq!(plan.routed_models["author"], ["priced", "unpriced"]);
+        assert!(plan.pricing.contains_key("unpriced"));
+        assert_eq!(plan.validate(), Ok(()));
+        let mut changed = plan.clone();
+        changed.pricing.remove("unpriced");
+        assert!(changed.validate().is_err());
     }
 }

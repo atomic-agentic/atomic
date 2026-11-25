@@ -1,0 +1,26 @@
+{
+  "item": {
+    "id": "nt-14",
+    "title": "The same finding is reported twice in a row",
+    "criteria": [
+      "Every money calculation multiplies by quantity."
+    ]
+  },
+  "findings": [
+    {
+      "file": "pricing.py",
+      "severity": "blocker",
+      "message": "Total ignores quantity."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "blocker",
+      "message": "Total ignores quantity."
+    },
+    {
+      "file": "README.md",
+      "severity": "minor",
+      "message": "The install line is stale."
+    }
+  ]
+}

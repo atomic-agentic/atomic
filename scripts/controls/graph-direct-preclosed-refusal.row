@@ -1,0 +1,1 @@
+graph-direct-preclosed-refusal|crates/atomic-graph/src/sqlite.rs|if draft.status == Status::Closed {|if false {|-p atomic-agentic-graph --test conformance sqlite_preclosed_draft_refuses_without_item_or_request_write_but_historical_import_works

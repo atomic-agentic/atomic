@@ -11,9 +11,9 @@ upstream = "https://github.com/SamuelXing/durare"
 # The upstream commit the fork's `atomic` branch starts from.
 upstream_base = "0994da0d6425c575ad4192353399c0eb8085b68a"
 branch = "atomic"
-rev = "9f4ce3a7c8870ef24974cc766be97170c40b46f2"
+rev = "51e19b5068f1ececcc9599d8bfc2a04157ff7f10"
 licence = "MIT OR Apache-2.0"
-why = "ported to sqlx 0.9 so it links with Codex's SQLite stack; on SQLite a transaction step that may write begins IMMEDIATE, so its body runs once"
+why = "ported to sqlx 0.9 so it links with Codex's SQLite stack; SQLite write steps begin IMMEDIATE; recovery survives transient storage outages, PostgreSQL-only builds work and receive deadlines persist; shutdown aborts and joins tasks left after the drain deadline"
 crates = ["durare", "durare-macros"]
 
 [[fork]]
@@ -36,3 +36,12 @@ rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6"
 licence = "Apache-2.0"
 why = "makes the parent-death signal best effort where prctl is refused or unsupported, so commands start in AWS Lambda (and on iSH)"
 crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-utils-pty"]
+
+[[fork]]
+name = "astro-oxc"
+repository = "https://github.com/withastro/oxc"
+upstream = "https://github.com/oxc-project/oxc"
+rev = "e5e100abf1afb9a79ae22f97de32befe4b925d5d"
+licence = "MIT"
+why = "the Astro grammar pinned by compiler-rs v0.5.3"
+crates = ["oxc_allocator", "oxc_ast", "oxc_ast_macros", "oxc_ast_visit", "oxc_data_structures", "oxc_diagnostics", "oxc_ecmascript", "oxc_estree", "oxc_parser", "oxc_regular_expression", "oxc_span", "oxc_str", "oxc_syntax"]

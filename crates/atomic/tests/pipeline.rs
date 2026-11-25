@@ -35,15 +35,21 @@ use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
+use atomic_core::workflow::Criterion;
 use atomic_core::{AtomConfig, atom, workflow};
 use atomic_durable::gate::{self, DecisionCommand, Deployment, GateFilter, Principal, Verdict};
 use atomic_durable::usage::Caps;
-use atomic_durable::{DurableRuntime, Durare, RunStatus};
+use atomic_durable::{DurableRuntime, Durare, RunStatus, WorkflowContext};
 use atomic_schema::registry::Registry;
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+mod support;
 
 /// Helper calls run in a child process: the atomic binary under test.
 fn helper_host() {
@@ -502,6 +508,23 @@ async fn engine_built_with(
     store: LocalStore,
     artifacts: Option<Artifacts>,
 ) -> Durare {
+    engine_built_with_trial(
+        dir, base_url, budgets, model, backend, store, artifacts, None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn engine_built_with_trial(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    backend: Option<atomic_exec::Backend>,
+    store: LocalStore,
+    artifacts: Option<Artifacts>,
+    trial_cargo: Option<atomic_app::pipeline::TrialCargo>,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -514,9 +537,18 @@ async fn engine_built_with(
     // scratch directory sitting inside some unrelated repository would have
     // worktrees and refs made there.
     let project = dir.join("project");
-    let owns_a_repository = project.join(".git").exists();
+    // A few host-binding tests keep atom definitions in project but commit
+    // coding attempts to a separate repository, as fixture-bound runs do.
+    // The repository choice belongs to the host, not the atom.
+    let bound_repo = dir.join("bound-repo");
+    let repository = if bound_repo.join(".git").exists() {
+        &bound_repo
+    } else {
+        &project
+    };
+    let owns_a_repository = repository.join(".git").exists();
     let worktrees = if owns_a_repository {
-        ProjectWorktrees::at(&project, dir.join("state/worktrees"))
+        ProjectWorktrees::at(repository, dir.join("state/worktrees"))
     } else {
         ProjectWorktrees::FixtureOnly
     };
@@ -551,10 +583,13 @@ async fn engine_built_with(
         &mut rt,
         Services {
             runtimes,
+            model_endpoint_configured: true,
             store,
             deployment: local(),
             worktrees,
             caches: None,
+            trial_cargo,
+            trial_denied: vec![dir.join("shared-scratch")],
             budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
@@ -1077,7 +1112,13 @@ fn pipeline_child() {
     };
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
-        let rt = Arc::new(engine(&dir, &url).await);
+        let rt = Arc::new(
+            if std::env::var(ENV_RUN).ok().as_deref() == Some("admission-recovery") {
+                engine_with_controls_cargo(&dir, &url).await
+            } else {
+                engine(&dir, &url).await
+            },
+        );
         if role == "replay" {
             // A replay of the recorded run `recorded`, noting a panic where
             // the parent looks.
@@ -1092,6 +1133,26 @@ fn pipeline_child() {
                     pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-legacy-context" => {
+                    let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+                    // This is the exact old on-disk atom projection. The
+                    // durable runtime serializes the complete PipelineRun
+                    // after it has been applied to the portable fixture.
+                    let legacy: Value = serde_json::from_str(include_str!(
+                        "fixtures/legacy-context-projection.json"
+                    ))
+                    .expect("checked-in old atom projection");
+                    for atom in pipeline.atoms.values_mut() {
+                        assert!(atom.context.is_none(), "fixture has no public context");
+                        assert!(legacy["context"].is_null(), "old atom declared no context");
+                        atom.program.contracts["Context"] =
+                            legacy["program"]["contracts"]["Context"].clone();
+                    }
+                    PipelineRun {
+                        pipeline,
+                        input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                    }
+                }
                 "start-sent" => PipelineRun {
                     pipeline: load(&project, "sent.workflow.yaml", &sent()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
@@ -1099,6 +1160,10 @@ fn pipeline_child() {
                 "start-context" => PipelineRun {
                     pipeline: load(&project, "context.workflow.yaml", CONTEXT),
                     input: json!({"text": "When does support open?"}),
+                },
+                "start-context-exec" => PipelineRun {
+                    pipeline: load(&project, "exec-reply.workflow.yaml", EXEC_REPLY),
+                    input: json!({"text": "the door lock is stuck"}),
                 },
                 "start-marked" => PipelineRun {
                     pipeline: load(&project, "marked.workflow.yaml", MARKED),
@@ -1123,6 +1188,26 @@ fn pipeline_child() {
                 "start-reviewed-stopping" => PipelineRun {
                     pipeline: reviewed(&project, 1),
                     input: json!({ "text": NOTE }),
+                },
+                "start-coding-panel" => PipelineRun {
+                    pipeline: load(
+                        &project,
+                        "panel.workflow.yaml",
+                        &std::fs::read_to_string(project.join("workflows/panel.workflow.yaml"))
+                            .expect("panel workflow"),
+                    ),
+                    input: json!({"text": "a code change", "base": plain_git(&project, &["rev-parse", "HEAD"])}),
+                },
+                "start-two-step-admission" => PipelineRun {
+                    pipeline: load(
+                        &project,
+                        "admission-recovery.workflow.yaml",
+                        &std::fs::read_to_string(
+                            project.join("workflows/admission-recovery.workflow.yaml"),
+                        )
+                        .expect("admission recovery workflow"),
+                    ),
+                    input: json!({"text": "a code change", "base": plain_git(&project, &["rev-parse", "HEAD"])}),
                 },
                 _ => PipelineRun {
                     pipeline: load(&project, "fix.workflow.yaml", FIX),
@@ -1256,6 +1341,96 @@ fn a_killed_process_does_not_rerun_a_finished_step() {
         )
         .expect("decode");
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+    });
+}
+
+#[test]
+fn serialized_legacy_context_run_recovers_without_replaying_finished_steps() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("legacy-context-recovery");
+        project(&dir);
+        let url = model.base_url();
+        let run_id = "legacy-context-recovery";
+
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child(
+                &d,
+                &u,
+                "start-legacy-context",
+                run_id,
+                Some("pipeline:after:rank"),
+            )
+        })
+        .await
+        .expect("start child");
+        assert!(!status.success(), "process stopped after rank: {status}");
+        assert_eq!(model.calls(), 2, "both completed turns ran once");
+
+        let inspect = engine(&dir, &url).await;
+        let recorded = inspect
+            .run_input(run_id)
+            .await
+            .expect("read stored input")
+            .expect("stored run input");
+        let atoms = recorded["pipeline"]["atoms"].as_object().expect("atoms");
+        for atom in atoms.values() {
+            assert!(atom["context"].is_null());
+            assert_eq!(
+                atom["program"]["contracts"]["Context"],
+                json!({"type":"object","additionalProperties":false}),
+                "stored legacy input stays unmodified"
+            );
+        }
+        let finished: Vec<_> = inspect
+            .steps(run_id)
+            .await
+            .expect("recorded steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            finished.iter().any(|step| step == "rank.publish"),
+            "{finished:?}"
+        );
+        inspect
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("inspection shutdown");
+
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || child(&d, &u, "recover", run_id, None))
+            .await
+            .expect("recover child");
+        assert!(status.success(), "recovery finished: {status}");
+        assert_eq!(model.calls(), 3, "finished turns did not replay");
+        let output: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+        )
+        .expect("result JSON");
+        assert_eq!(output, json!({"line":"P1: Export crashes on accents"}));
+
+        let inspect = engine(&dir, &url).await;
+        assert_eq!(
+            inspect
+                .run_input(run_id)
+                .await
+                .expect("stored input after recovery")
+                .expect("stored run"),
+            recorded,
+            "recovery changed only its in-memory copy"
+        );
+        inspect
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("inspection shutdown");
     });
 }
 
@@ -2341,6 +2516,42 @@ fn find_worktree(root: &Path) -> Option<PathBuf> {
     let mut queue = vec![(root.to_owned(), 0)];
     while let Some((dir, depth)) = queue.pop() {
         if dir.join(".git").exists() {
+            return Some(dir);
+        }
+        if depth < 4 {
+            for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+                if entry.path().is_dir() {
+                    queue.push((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn all_worktrees(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut queue = vec![(root.to_owned(), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        if dir.join(".git").exists() {
+            found.push(dir);
+        } else if depth < 4
+            && let Ok(entries) = std::fs::read_dir(&dir)
+        {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    queue.push((entry.path(), depth + 1));
+                }
+            }
+        }
+    }
+    found
+}
+
+fn find_other_worktree(root: &Path, first: &Path) -> Option<PathBuf> {
+    let mut queue = vec![(root.to_owned(), 0)];
+    while let Some((dir, depth)) = queue.pop() {
+        if dir != first && dir.join(".git").exists() {
             return Some(dir);
         }
         if depth < 4 {
@@ -4573,6 +4784,406 @@ fn a_contextual_step_without_settings_is_refused() {
     });
 }
 
+/// An atom written with the `Config` its own declarations generate, whose only
+/// read of the public context is a validator's: nothing in its template names
+/// `context`. With `context` it declares one; without, it declares none.
+fn per_atom_atom(project: &Path, context: bool) {
+    let atoms = project.join("atoms");
+    let (declared, validator) = if context {
+        (
+            "context:{type:'object',required:['profile','config'],properties:{profile:{type:'string'},config:{type:'object',required:['maxReplyCharacters'],properties:{maxReplyCharacters:{type:'integer'}}}}},",
+            "validate:[({output, context}) => output.reply.length <= context.config.maxReplyCharacters],",
+        )
+    } else {
+        ("", "validate:[({output}) => output.reply.length > 0],")
+    };
+    std::fs::write(
+        atoms.join("per-atom.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Config }} from '../.atomic/types/per-atom';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: Config = {{{declared}{validator}description: 'Draft a reply.'}};\n\
+             ---\nDraft a brief reply for: {{input.text}}\n"
+        ),
+    )
+    .expect("atom");
+    std::fs::write(
+        atoms.join("per-atom.input.schema.json"),
+        object(json!({"text": {"type": "string"}})).to_string(),
+    )
+    .expect("input schema");
+    std::fs::write(
+        atoms.join("per-atom.output.schema.json"),
+        object(json!({"reply": {"type": "string"}})).to_string(),
+    )
+    .expect("output schema");
+}
+
+const PER_ATOM_CONTEXT: &str = "\
+atomic: 1
+name: per-atom context
+input: { $ref: ../atoms/per-atom.input.schema.json }
+output: { $ref: ../atoms/per-atom.output.schema.json }
+steps:
+  reply:
+    atom: per-atom
+    with: { text: input.text }
+returns: steps.reply.output
+";
+
+// A step whose atom declares a public context it only reads in a validator,
+// written with the per-atom `Config`, is a contextual step just the same: the
+// run is refused before its model is called when it has no context settings.
+#[test]
+fn a_per_atom_config_step_without_settings_is_refused() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("per-atom-no-context");
+        let project = project(&dir);
+        per_atom_atom(&project, true);
+        let pipeline = load(&project, "per-atom.workflow.yaml", PER_ATOM_CONTEXT);
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "per-atom-1",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "the door lock is stuck"}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("per-atom-1")
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("reads a public context") && error.contains("no context settings"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0, "refused before any model turn: {error}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+// The same atom with its context declaration removed needs no settings and runs
+// on one model call: presence, not the spelling, is what asks for a snapshot.
+#[test]
+fn a_per_atom_config_step_declaring_no_context_runs_without_settings() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"reply": "Try the spare key by the mail."}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let dir = scratch("per-atom-plain");
+        let project = project(&dir);
+        per_atom_atom(&project, false);
+        let pipeline = load(&project, "per-atom.workflow.yaml", PER_ATOM_CONTEXT);
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "per-atom-2",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "the door lock is stuck"}),
+            },
+        )
+        .await
+        .expect("start");
+        let out: Value = rt.result("per-atom-2").await.expect("finishes");
+        assert_eq!(out, json!({"reply": "Try the spare key by the mail."}));
+        assert_eq!(model.calls(), 1);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// What `per_atom_exec_atom`'s validator reads, if it has one.
+enum ExecReads {
+    /// No `validate` at all.
+    Nothing,
+    /// A rule that reads only the atom's own output.
+    Output,
+    /// A rule that reads the run's public context beside its output — the only
+    /// place an atom like this one reads its context, since its command gets its
+    /// input on stdin and writes its output on stdout.
+    Context,
+}
+
+/// An exec atom written with the `Config` its own declarations generate, whose
+/// command writes `RAN_LOG` before it reports, so a test can say whether the
+/// command ran at all. `context` declares a public context; `reads` chooses what
+/// its one validator reads.
+fn per_atom_exec_atom(project: &Path, ran_log: &Path, context: bool, reads: ExecReads) {
+    std::fs::create_dir_all(project.join("tools")).expect("tools");
+    std::fs::write(
+        project.join("tools/reply.py"),
+        "import json, os, sys\nnote = json.load(sys.stdin)\nwith open(os.environ['RAN_LOG'], 'w') as ran:\n    ran.write('ran ' + note['text'][:20] + '\\n')\njson.dump({'reply': 'Try the spare key by the mail.'}, sys.stdout)\n",
+    )
+    .expect("script");
+    let atoms = project.join("atoms");
+    let declared = if context {
+        "context:{type:'object',required:['profile','config'],properties:{profile:{type:'string'},config:{type:'object',required:['maxReplyCharacters'],properties:{maxReplyCharacters:{type:'integer'}}}}},"
+    } else {
+        ""
+    };
+    let validator = match (context, reads) {
+        (_, ExecReads::Nothing) => "",
+        (_, ExecReads::Output) => "validate:[({output}) => output.reply.length > 0],",
+        (true, ExecReads::Context) => {
+            "validate:[({output, context}) => output.reply.length <= context.config.maxReplyCharacters],"
+        }
+        (false, ExecReads::Context) => {
+            unreachable!("an atom that declares no context has no context for a rule to read")
+        }
+    };
+    std::fs::write(
+        atoms.join("exec-reply.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Config }} from '../.atomic/types/exec-reply';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: Config = {{ {declared}{validator}description: 'Write a reply.', \
+             kind: 'exec', exec: {{ command: ['python3', 'tools/reply.py'] }}, \
+             env: {{ RAN_LOG: '{}' }} }};\n---\n",
+            ran_log.display()
+        ),
+    )
+    .expect("atom");
+    std::fs::write(
+        atoms.join("exec-reply.input.schema.json"),
+        object(json!({"text": {"type": "string"}})).to_string(),
+    )
+    .expect("input schema");
+    std::fs::write(
+        atoms.join("exec-reply.output.schema.json"),
+        object(json!({"reply": {"type": "string"}})).to_string(),
+    )
+    .expect("output schema");
+}
+
+const EXEC_REPLY: &str = "\
+atomic: 1
+name: exec context
+input: { $ref: ../atoms/exec-reply.input.schema.json }
+output: { $ref: ../atoms/exec-reply.output.schema.json }
+steps:
+  reply:
+    atom: exec-reply
+    with: { text: input.text }
+returns: steps.reply.output
+";
+
+/// Run `EXEC_REPLY` in a child process that was given context settings, and
+/// report what it wrote. The settings are the child's own: `engine` reads them
+/// from the environment, so only a child process can hold them while other
+/// tests assert that a contextual step without them is refused.
+async fn exec_child(
+    dir: &Path,
+    settings: &Path,
+    url: &str,
+    run: &'static str,
+) -> (String, Option<Value>) {
+    let (d, u, s) = (
+        dir.to_owned(),
+        url.to_owned(),
+        settings.display().to_string(),
+    );
+    let status = tokio::task::spawn_blocking(move || {
+        child_in(
+            &d,
+            &u,
+            "start-context-exec",
+            run,
+            None,
+            "UTC",
+            &[
+                ("ATOMIC_TEST_CONTEXT_SETTINGS", &s),
+                ("SUPPORT_REGION", "eu-west"),
+            ],
+        )
+    })
+    .await
+    .expect("child");
+    assert!(status.success(), "the child ended: {status}");
+    let error = std::fs::read_to_string(dir.join("error.txt")).ok();
+    let result = std::fs::read_to_string(dir.join("result.json"))
+        .ok()
+        .map(|text| serde_json::from_str(&text).expect("result JSON"));
+    (error.unwrap_or_default(), result)
+}
+
+// A contextual exec step's validators are given the context its step recorded.
+// The reply is far shorter than the limit the settings record, so the rule that
+// reads `context` decides on the run's own values and the step finishes. This is
+// what the exec path refused before, for every contextual atom that had a
+// validator at all: the read is not a missing value once the step's snapshot
+// reaches the validation, and an exec atom has no repair round to spend one on.
+#[test]
+fn a_contextual_exec_step_validates_with_the_snapshot_its_step_recorded() {
+    on_codex_runtime(async {
+        // No model endpoint from this machine: this step calls none, and with
+        // any control off it must still reach no provider.
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("context-exec-checks");
+        let project = project(&dir);
+        let ran = dir.join("command-ran.txt");
+        per_atom_exec_atom(&project, &ran, true, ExecReads::Context);
+        let settings = settings_file(&dir, "Example Support");
+        load(&project, "exec-reply.workflow.yaml", EXEC_REPLY);
+        let (error, result) =
+            exec_child(&dir, &settings, &model.base_url(), "context-exec-1").await;
+        assert!(error.is_empty(), "the run failed: {error}");
+        assert_eq!(
+            result,
+            Some(json!({"reply": "Try the spare key by the mail."})),
+            "{error}"
+        );
+        assert!(ran.exists(), "its command ran: {error}");
+        assert_eq!(model.calls(), 0, "an exec step calls no model");
+    });
+}
+
+// The case `docs/reference/atom-files.md` promises and this path used to break:
+// a contextual exec atom whose one rule reads only its own output. It runs on
+// the same step, with the same recorded snapshot beside it.
+#[test]
+fn a_contextual_exec_step_validates_a_rule_that_reads_only_its_output() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("context-exec-output-only");
+        let project = project(&dir);
+        let ran = dir.join("command-ran.txt");
+        per_atom_exec_atom(&project, &ran, true, ExecReads::Output);
+        let settings = settings_file(&dir, "Example Support");
+        load(&project, "exec-reply.workflow.yaml", EXEC_REPLY);
+        let (error, result) =
+            exec_child(&dir, &settings, &model.base_url(), "context-exec-2").await;
+        assert!(error.is_empty(), "the run failed: {error}");
+        assert_eq!(
+            result,
+            Some(json!({"reply": "Try the spare key by the mail."})),
+            "{error}"
+        );
+        assert!(ran.exists(), "its command ran: {error}");
+        assert_eq!(model.calls(), 0, "an exec step calls no model");
+    });
+}
+
+// The same exec atom with no validator at all still runs: its atom declares a
+// context, and what a step is refused for is a context it cannot account for,
+// not the declaration on its own.
+#[test]
+fn a_contextual_exec_step_that_never_reads_its_context_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("context-exec-runs");
+        let project = project(&dir);
+        let ran = dir.join("command-ran.txt");
+        per_atom_exec_atom(&project, &ran, true, ExecReads::Nothing);
+        let settings = settings_file(&dir, "Example Support");
+        load(&project, "exec-reply.workflow.yaml", EXEC_REPLY);
+        let (error, result) =
+            exec_child(&dir, &settings, &model.base_url(), "context-exec-3").await;
+        assert!(error.is_empty(), "the run failed: {error}");
+        assert_eq!(
+            result,
+            Some(json!({"reply": "Try the spare key by the mail."})),
+            "{error}"
+        );
+        assert!(ran.exists(), "its command ran: {error}");
+        assert_eq!(model.calls(), 0, "an exec step calls no model");
+    });
+}
+
+// A contextual exec step whose run has nothing to record its context from is
+// refused before its command, and its command's own marker says so: what cannot
+// be accounted for leaves no effect behind. The refusal names the missing
+// settings; no validator of that atom is reported, because none ran.
+#[test]
+fn a_contextual_exec_step_with_nothing_to_record_runs_no_command() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("exec-no-settings");
+        let project = project(&dir);
+        let ran = dir.join("command-ran.txt");
+        per_atom_exec_atom(&project, &ran, true, ExecReads::Context);
+        let pipeline = load(&project, "exec-reply.workflow.yaml", EXEC_REPLY);
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "exec-no-settings",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "the door lock is stuck"}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("exec-no-settings")
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("reads a public context") && error.contains("no context settings"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("validate.0"),
+            "a validator that never ran must not be reported: {error}"
+        );
+        assert!(
+            !ran.exists(),
+            "its command never started: {}",
+            std::fs::read_to_string(&ran).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 0, "refused before any model turn: {error}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+// An exec atom whose validators read only its own output is refused by nothing:
+// its validation is given every value its rules ask for, and it brings no
+// snapshot because its atom declares no context. This is the test that says the
+// refusals above ask about a public context, and not about validators an exec
+// atom has.
+#[test]
+fn an_exec_step_with_its_own_validators_and_no_context_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("exec-own-checks");
+        let project = project(&dir);
+        let ran = dir.join("command-ran.txt");
+        per_atom_exec_atom(&project, &ran, false, ExecReads::Output);
+        let pipeline = load(&project, "exec-reply.workflow.yaml", EXEC_REPLY);
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "exec-own-1",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "the door lock is stuck"}),
+            },
+        )
+        .await
+        .expect("start");
+        let out: Value = rt.result("exec-own-1").await.expect("finishes");
+        assert_eq!(out, json!({"reply": "Try the spare key by the mail."}));
+        assert!(ran.exists(), "its command ran");
+        assert_eq!(model.calls(), 0, "an exec step calls no model");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// The policy atom, accepting at most `trust` input.
 fn trusting_atom(project: &Path, trust: &str) {
     policy_atom(project);
@@ -5353,6 +5964,5910 @@ returns: steps.read.output
     )
 }
 
+#[test]
+fn failed_cel_criteria_repair_before_review_and_never_publish() {
+    on_codex_runtime(async {
+        let dir = scratch("criteria-before-review");
+        let project = project(&dir);
+        let mut pipeline = reviewed(&project, 1);
+        atom_step(&mut pipeline, "read").criteria = vec![Criterion::Cel {
+            expr: "candidate.output.words > 100".into(),
+        }];
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(READ.into()),
+            Reply::Text(json!({"verdict":"approve","findings":[]}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "criteria-before-review",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a title"}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("criteria-before-review")
+            .await
+            .expect_err("both candidates fail the criterion")
+            .to_string();
+        assert!(error.contains("criteria still fail"), "{error}");
+        assert_eq!(model.calls(), 2, "reviewer was never called");
+        let names: Vec<_> = rt
+            .steps("criteria-before-review")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(names.contains(&"read.criteria.0.0".to_owned()), "{names:?}");
+        assert!(names.contains(&"read.criteria.1.0".to_owned()), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("read.review.") || name == "read.publish")
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn unreviewed_workflow_criteria_fail_before_publication() {
+    on_codex_runtime(async {
+        let dir = scratch("criteria-unreviewed");
+        let project = project(&dir);
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        atom_step(&mut pipeline, "read").criteria = vec![Criterion::Cel {
+            expr: "candidate.output.words > 100".into(),
+        }];
+        let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "criteria-unreviewed",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a title"}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("criteria-unreviewed")
+            .await
+            .expect_err("both candidates fail")
+            .to_string();
+        assert!(error.contains("criteria still fail"), "{error}");
+        assert_eq!(model.calls(), 2);
+        let names: Vec<_> = rt
+            .steps("criteria-unreviewed")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(!names.contains(&"read.publish".to_owned()), "{names:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn non_worktree_test_criterion_runs_in_a_worktree_workflow() {
+    on_codex_runtime(async {
+        let dir = scratch("criteria-mixed-worktree");
+        let project = project(&dir);
+        let (_, base) = self_reviewed(&project);
+        let source = SELF_REVIEW_WORKFLOW.replace(
+            "steps:\n  code:\n",
+            "steps:\n  read:\n    atom: read-note\n    with: {text: input.text}\n    criteria:\n      - {kind: test, argv: [/usr/bin/false], timeout_ms: 1000}\n  code:\n    after: [read]\n",
+        );
+        assert_ne!(source, SELF_REVIEW_WORKFLOW);
+        use std::os::unix::fs::PermissionsExt;
+        let marker = format!("sk-proj-{}", "B".repeat(48));
+        let program = dir.join("failing-check");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho 'check failed: {marker}' >&2\nexit 1\n"),
+        )
+        .expect("write criterion");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make criterion executable");
+        let source = source.replace("/usr/bin/false", program.to_str().expect("fixture path"));
+        let pipeline = load(&project, "mixed-criteria.workflow.yaml", &source);
+        let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "mixed-criteria",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a title","base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("mixed-criteria")
+            .await
+            .expect_err("test criterion fails twice before code")
+            .to_string();
+        assert!(error.contains("criteria still fail"), "{error}");
+        assert!(!error.contains("host-recorded candidate commit"), "{error}");
+        assert_eq!(model.calls(), 2, "coding atom was not called");
+        let steps = rt
+            .steps("mixed-criteria")
+            .await
+            .expect("criterion checkpoints");
+        let checkpoint = steps
+            .iter()
+            .find(|step| step.name == "read.criteria.0.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("first criterion output")
+            .to_string();
+        let repair = model.requests()[1].to_string();
+        for diagnostic in [&checkpoint, &repair, &error] {
+            assert!(
+                diagnostic.contains("check failed: [REDACTED]"),
+                "missing redacted diagnostic"
+            );
+            assert!(
+                !diagnostic.contains(&marker),
+                "raw credential in diagnostic"
+            );
+        }
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn unknown_test_criterion_release_terminalizes_without_running_the_effect_again() {
+    struct LostCriterion {
+        local: atomic_exec::LocalBackend,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl atomic_exec::ExecutionBackend for LostCriterion {
+        fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+            self.local.connect()
+        }
+        fn open(
+            &self,
+            request: &atomic_exec::Open,
+        ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+            self.local.open(request)
+        }
+        fn run(
+            &self,
+            command: &atomic_exec::Command,
+        ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(atomic_exec::ExecError::Lost {
+                program: command.program.clone(),
+                code: None,
+                message: "lost after dispatch".into(),
+                stderr: format!("runner log: sk-proj-{}", "K".repeat(48)),
+            })
+        }
+        fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+            self.local.close(workspace)
+        }
+    }
+    on_codex_runtime(async {
+        let dir = scratch("criterion-unknown");
+        let project = project(&dir);
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        atom_step(&mut pipeline, "read").criteria = vec![Criterion::Test {
+            argv: vec!["/usr/bin/true".into()],
+            timeout_ms: 1000,
+        }];
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = atomic_exec::Backend::connect(LostCriterion {
+            local: atomic_exec::LocalBackend::in_dir(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join(format!("pipeline-criterion-lost-{}", std::process::id())),
+            ),
+            calls: calls.clone(),
+        })
+        .expect("backend");
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine_built_with(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            LocalStore::open(dir.join("artifacts")).expect("artifact store"),
+            None,
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "criterion-unknown",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a title"}),
+            },
+        )
+        .await
+        .expect("start");
+        let first = nth_park(&rt, "criterion-unknown", 1).await;
+        assert!(
+            first.reason.contains("unknown external outcome"),
+            "{}",
+            first.reason
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        release_raising(&rt, &first, None).await.expect("release");
+        let error = rt
+            .result::<Value>("criterion-unknown")
+            .await
+            .expect_err("release terminalizes unknown outcome")
+            .to_string();
+        assert!(error.contains("outcome unknown"), "{error}");
+        let steps = rt
+            .steps("criterion-unknown")
+            .await
+            .expect("steps after release");
+        let record = steps
+            .iter()
+            .find(|s| s.name == "read.criteria.0.0")
+            .and_then(|s| s.output.as_ref())
+            .expect("unknown criterion record")
+            .to_string();
+        let marker = format!("sk-proj-{}", "K".repeat(48));
+        for diagnostic in [&record, &error] {
+            assert!(
+                diagnostic.contains("runner log: [REDACTED]"),
+                "missing runner diagnostic"
+            );
+            assert!(!diagnostic.contains(&marker), "raw runner credential");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(model.calls(), 1, "no repair or reviewer runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+fn self_review_schema() -> Value {
+    let item_properties: serde_json::Map<String, Value> = (1..=10)
+        .map(|n| (n.to_string(), json!({"type": "string"})))
+        .collect();
+    let decision = object(json!({
+        "point": {"type": "string"},
+        "allow_refuse": {"type": "string"},
+        "not_found": {"type": "string"},
+        "permission_denied": {"type": "string"},
+        "link_loop": {"type": "string"},
+        "not_directory": {"type": "string"},
+        "other_io": {"type": "string"},
+        "parse_error": {"type": "string"},
+        "timeout": {"type": "string"},
+        "empty_result": {"type": "string"},
+    }));
+    object(json!({
+        "items": {"type": "object", "additionalProperties": false, "properties": item_properties},
+        "decisions": {"type": "array", "items": decision},
+        "controls": {"type": "array", "items": object(json!({
+            "row": {"type": "string"}, "result": {"type": "string"}
+        }))},
+    }))
+}
+
+const SELF_REVIEW_WORKFLOW: &str = r#"atomic: 1
+name: self-reviewed-code
+input: {type: object, additionalProperties: false, required: [text, base], properties: {text: {type: string}, base: {type: string}}}
+output: { $ref: ../atoms/code-author.output.schema.json }
+steps:
+  code:
+    atom: code-author
+    with: {text: input.text, base: input.base}
+    worktree: true
+    coding: true
+    review:
+      reviewer: code-reviewer
+      trial_merge:
+        main: refs/heads/main
+        checks: [['true']]
+      with: {diff: candidate.metadata.diff}
+      self_review:
+        atom: self-check
+        with: {diff: candidate.metadata.diff}
+        decision_points: [candidate publication]
+      rounds: 0
+returns: steps.code.output
+"#;
+
+#[test]
+fn coding_review_refuses_missing_trial_merge_before_any_turn() {
+    let dir = scratch("coding-missing-trial");
+    let project = project(&dir);
+    let _ = self_reviewed(&project);
+    let missing = SELF_REVIEW_WORKFLOW.replace(
+        "      trial_merge:\n        main: refs/heads/main\n        checks: [['true']]\n",
+        "",
+    );
+    assert_ne!(
+        missing, SELF_REVIEW_WORKFLOW,
+        "fixture removed the trial merge"
+    );
+    let error = try_load(&project, "missing-trial.workflow.yaml", &missing)
+        .expect_err("coding review without a trial merge cannot be admitted");
+    assert!(error.contains("trial merge"), "wrong refusal: {error}");
+}
+
+#[test]
+fn coding_review_refuses_runtime_snapshot_without_trial_merge() {
+    let dir = scratch("coding-runtime-missing-trial");
+    let project = project(&dir);
+    let (mut pipeline, base) = self_reviewed(&project);
+    let Step::Atom(step) = &mut pipeline.steps[0] else {
+        panic!("coding step")
+    };
+    step.review.as_mut().expect("coding review").trial_merge = None;
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "coding-runtime-missing-trial",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("coding-runtime-missing-trial")
+            .await
+            .expect_err("runtime snapshot cannot bypass trial merge")
+            .to_string();
+        assert!(error.contains("trial merge"), "wrong refusal: {error}");
+        assert_eq!(model.calls(), 0, "no author or reviewer turn ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+fn controls_self_review_workflow() -> String {
+    let workflow = SELF_REVIEW_WORKFLOW.replace(
+        "        decision_points: [candidate publication]\n",
+        "        decision_points: [candidate publication]\n        selected_controls: [row-test]\n        controls_atom: prove-controls\n",
+    );
+    assert_ne!(workflow, SELF_REVIEW_WORKFLOW);
+    workflow
+}
+
+fn self_review_fixture(project: &Path, with_controls: bool, blind: bool) -> (Pipeline, String) {
+    let evidence = self_review_schema();
+    write_atom(
+        project,
+        "code-author",
+        "Return the change for {input.text}",
+        object(json!({"text": {"type": "string"}, "base": {"type": "string"}})),
+        object(json!({"done": {"type": "boolean"}})),
+    );
+    let file = project.join("atoms/code-author.atom.astro");
+    let text = std::fs::read_to_string(&file).expect("author atom");
+    std::fs::write(
+        &file,
+        text.replace(
+            "description: 'code-author'",
+            "description: 'code-author', kind: 'codex', sandbox: 'workspace-write'",
+        ),
+    )
+    .expect("coding author");
+    let self_prompt = if with_controls {
+        "Give checklist evidence for this diff: {input.diff}. Control results: {input.control_results}"
+    } else {
+        "Give checklist evidence for this diff: {input.diff}"
+    };
+    let self_input = if with_controls {
+        object(json!({
+            "diff": {"type": "string"},
+            "control_results": {"type": "array", "items": object(json!({
+                "row": {"type": "string"}, "result": {"type": "string"}
+            }))}
+        }))
+    } else {
+        object(json!({"diff": {"type": "string"}}))
+    };
+    write_atom(
+        project,
+        "self-check",
+        self_prompt,
+        self_input,
+        evidence.clone(),
+    );
+    if with_controls {
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::create_dir_all(project.join("scripts/controls")).expect("control rows");
+        std::fs::write(
+            project.join("scripts/controls/row-test.row"),
+            "row-test|code.txt|before|after|--lib -- guard_row\n",
+        )
+        .expect("selected control row");
+        std::fs::write(
+        project.join("tools/prove-controls.py"),
+        format!(
+            "import json, os, subprocess, sys\n\
+             request = json.load(sys.stdin)\n\
+             assert request['rows'] == ['row-test'], request\n\
+             git = lambda *args: subprocess.check_output(['git', '-C', request['source'], *args], text=True).strip()\n\
+             assert request['commit'] == git('rev-parse', request['bound']['reference']), request\n\
+             assert request['bound']['base'] == git('rev-parse', request['commit'] + '^'), request\n\
+             json.dump({{'ok': {}, 'source': request['source'], 'commit': request['commit'], \
+             'bound': request['bound'], \
+             'rows': [{{'name': 'row-test', 'verdict': '{}', \
+             'detail': 'ok row-test: guard removal failed the assertion'}}]}}, sys.stdout)\n",
+            if blind { "False" } else { "True" },
+            if blind { "blind" } else { "passed" },
+        ),
+    )
+    .expect("proof driver");
+        std::fs::write(
+            project.join("atoms/prove-controls.atom.astro"),
+            "---\nimport type { Props, Config } from '../.atomic/types/prove-controls';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: Config = { description: 'Prove a declared control.', kind: 'exec', \
+         exec: { command: ['python3', 'tools/prove-controls.py'] }, \
+         effects: { external: 'idempotent' } };\n---\n",
+        )
+        .expect("proof atom");
+        std::fs::write(
+            project.join("atoms/prove-controls.input.schema.json"),
+            json!({
+                "type": "object", "additionalProperties": false,
+                "required": ["source", "commit", "bound", "rows"],
+                "properties": {
+                    "source": {"type": "string"}, "commit": {"type": "string"},
+                    "bound": object(json!({
+                        "reference": {"type": "string"}, "base": {"type": "string"},
+                        "admitted": {"type": "string"}
+                    })),
+                    "rows": {"type": "array", "items": {"type": "string"}},
+                    "row_seconds": {"type": "integer"}
+                }
+            })
+            .to_string(),
+        )
+        .expect("proof input schema");
+        std::fs::write(
+            project.join("atoms/prove-controls.output.schema.json"),
+            object(json!({
+                "ok": {"type": "boolean"}, "source": {"type": "string"},
+                "commit": {"type": "string"},
+                "bound": object(json!({
+                    "reference": {"type": "string"}, "base": {"type": "string"},
+                    "admitted": {"type": "string"}
+                })),
+                "rows": {"type": "array", "items": object(json!({
+                    "name": {"type": "string"}, "verdict": {"type": "string"},
+                    "detail": {"type": "string"}
+                }))}
+            }))
+            .to_string(),
+        )
+        .expect("proof output schema");
+    }
+    std::fs::write(project.join("code.txt"), "before\n").expect("seed code");
+    std::fs::create_dir_all(project.join(".atomic")).expect("reviewed inventory directory");
+    std::fs::write(
+        project.join(".atomic/coding-decision-inventory.json"),
+        r#"{"version":1,"decision_points":["candidate publication"]}"#,
+    )
+    .expect("reviewed decision inventory");
+    write_atom(
+        project,
+        "code-reviewer",
+        "Review this diff: {input.diff}. Checklist: {input.self_review}. Host inventory and verified results: {input.host_review}",
+        json!({
+            "type": "object", "additionalProperties": false, "required": ["diff", "host_review"],
+            "properties": {"diff": {"type": "string"}, "self_review": evidence,
+                "host_review": object(json!({
+                    "decision_points": {"type": "array", "items": {"type": "string"}},
+                    "selected_controls": {"type": "array", "items": {"type": "string"}},
+                    "control_results": {"type": "array", "items": object(json!({
+                        "row": {"type": "string"}, "result": {"type": "string"}
+                    }))}
+                }))}
+        }),
+        object(json!({"verdict": {"type": "string", "enum": ["approve", "request_changes"]}})),
+    );
+    let workflow = if with_controls {
+        controls_self_review_workflow()
+    } else {
+        SELF_REVIEW_WORKFLOW.to_owned()
+    };
+    let pipeline = load(project, "self-reviewed.workflow.yaml", &workflow);
+    plain_git(project, &["init", "-q"]);
+    plain_git(project, &["add", "."]);
+    plain_git(project, &["commit", "-q", "-m", "base"]);
+    let base = plain_git(project, &["rev-parse", "HEAD"]);
+    plain_git(project, &["update-ref", "refs/heads/main", &base]);
+    (pipeline, base)
+}
+
+fn self_reviewed(project: &Path) -> (Pipeline, String) {
+    self_review_fixture(project, false, false)
+}
+
+#[test]
+fn coding_review_requires_host_inventory_input_contract() {
+    let dir = scratch("review-host-contract");
+    let project = project(&dir);
+    let _ = self_reviewed(&project);
+    let schema = project.join("atoms/code-reviewer.input.schema.json");
+    let mut input: Value = serde_json::from_slice(&std::fs::read(&schema).expect("reviewer input"))
+        .expect("reviewer schema");
+    assert!(
+        input["required"]
+            .as_array()
+            .expect("required")
+            .contains(&json!("host_review")),
+        "fixture exercises a required host field"
+    );
+    input["properties"]
+        .as_object_mut()
+        .expect("properties")
+        .remove("host_review");
+    std::fs::write(&schema, input.to_string()).expect("remove host field");
+    let reviewer = project.join("atoms/code-reviewer.atom.astro");
+    let source = std::fs::read_to_string(&reviewer).expect("reviewer atom");
+    std::fs::write(
+        &reviewer,
+        source.replace("{input.host_review}", "inventory unavailable"),
+    )
+    .expect("remove missing template field");
+    let error = try_load(
+        &project,
+        "review-host-contract.workflow.yaml",
+        SELF_REVIEW_WORKFLOW,
+    )
+    .expect_err("coding review needs host inventory contract");
+    assert!(
+        error.contains("needs an input field `host_review`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn coding_panel_refuses_incompatible_required_host_inventory_schema_before_model() {
+    let dir = scratch("panel-host-contract");
+    let project = project(&dir);
+    let _ = panel_reviewed(&project);
+    let workflow = SELF_REVIEW_WORKFLOW.replace(
+        "      reviewer: code-reviewer\n",
+        "      reviewers: [code-reviewer, code-reviewer-two]\n      require: all\n",
+    );
+    for reviewer in ["code-reviewer", "code-reviewer-two"] {
+        let schema = project.join(format!("atoms/{reviewer}.input.schema.json"));
+        let original = std::fs::read(&schema).expect("input schema");
+        let mut input: Value = serde_json::from_slice(&original).expect("schema JSON");
+        input["properties"]["host_review"] = json!({"type":"string"});
+        std::fs::write(&schema, input.to_string()).expect("incompatible host field");
+        let error = try_load(&project, "panel-host-contract.workflow.yaml", &workflow)
+            .expect_err("incompatible host inventory must refuse at load");
+        assert!(
+            error.contains("host inventory cannot fit"),
+            "{reviewer}: {error}"
+        );
+        std::fs::write(&schema, original).expect("restore reviewer schema");
+    }
+}
+
+#[test]
+fn coding_panel_preflights_nested_host_inventory_for_every_member_before_reviewers() {
+    on_codex_runtime(async {
+        let dir = scratch("panel-host-nested-contract");
+        let project = project(&dir);
+        let (mut pipeline, base) = panel_reviewed(&project);
+        pipeline
+            .atoms
+            .get_mut("code-reviewer-two")
+            .expect("second reviewer")
+            .program
+            .contracts["Input"]["properties"]["host_review"]["properties"]["decision_points"] =
+            json!({"type":"string"});
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "panel-host-nested-contract",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root).expect("worktree").join("code.txt"),
+            "after\n",
+        )
+        .expect("author edit");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("panel-host-nested-contract")
+            .await
+            .expect_err("nested reviewer schema must refuse before reviewer turns")
+            .to_string();
+        assert!(
+            error.contains("reviewer `code-reviewer-two` cannot accept host review input"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "neither reviewer model turn may run");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+fn panel_reviewed(project: &Path) -> (Pipeline, String) {
+    let (_, _) = self_reviewed(project);
+    for extension in ["atom.astro", "input.schema.json", "output.schema.json"] {
+        let source = project
+            .join("atoms")
+            .join(format!("code-reviewer.{extension}"));
+        let target = project
+            .join("atoms")
+            .join(format!("code-reviewer-two.{extension}"));
+        let text = std::fs::read_to_string(source).expect("first reviewer");
+        std::fs::write(target, text.replace("code-reviewer", "code-reviewer-two"))
+            .expect("second reviewer");
+    }
+    std::fs::write(
+        project.join("atoms/code-reviewer-two.output.schema.json"),
+        json!({
+            "type": "object", "additionalProperties": false, "required": ["verdict"],
+            "properties": {
+                "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+                "findings": {"type": "array", "items": {
+                    "type": "object", "additionalProperties": false, "required": ["message"],
+                    "properties": {"message": {"type": "string", "minLength": 1}}
+                }}
+            }
+        })
+        .to_string(),
+    )
+    .expect("typed second reviewer findings");
+    plain_git(project, &["add", "."]);
+    plain_git(project, &["commit", "-q", "-m", "second reviewer"]);
+    let base = plain_git(project, &["rev-parse", "HEAD"]);
+    let workflow = SELF_REVIEW_WORKFLOW.replace(
+        "      reviewer: code-reviewer\n",
+        "      reviewers: [code-reviewer, code-reviewer-two]\n      require: all\n",
+    );
+    assert_ne!(workflow, SELF_REVIEW_WORKFLOW);
+    (load(project, "panel.workflow.yaml", &workflow), base)
+}
+
+#[cfg(target_os = "linux")]
+fn trial_reviewed(project: &Path, check: &str) -> (Pipeline, String) {
+    trial_reviewed_command(project, &format!("[python3, -c, {check}]"))
+}
+
+#[cfg(target_os = "linux")]
+fn trial_reviewed_command(project: &Path, command: &str) -> (Pipeline, String) {
+    let (_, base) = self_reviewed(project);
+    plain_git(project, &["branch", "-M", "main"]);
+    let workflow = SELF_REVIEW_WORKFLOW.replace(
+        "        checks: [['true']]\n",
+        &format!("        checks: [{command}]\n"),
+    );
+    (
+        load(project, "self-reviewed.workflow.yaml", &workflow),
+        base,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn bind_trial_snapshot(dir: &Path, project: &Path, pipeline: &mut Pipeline, base: &str) {
+    let git = Git::find().expect("git");
+    let source = git.discover(project).expect("source repository");
+    let snapshot = dir.join("trial-fixture-snapshot.git");
+    let owned = git.init_bare(&snapshot).expect("bare snapshot");
+    source
+        .copy_reachable(base, &owned)
+        .expect("copy fixture history");
+    assert!(owned.has_everything(base).expect("complete fixture"));
+    owned
+        .create_ref(&format!("refs/atomic/fixture/{base}"), base)
+        .expect("keep bound commit");
+    pipeline.fixture = Some(atomic_core::fixture::FixtureBinding {
+        source: std::fs::canonicalize(project).expect("fixture source"),
+        rev: "refs/heads/main".into(),
+        commit: base.into(),
+        tree: source.tree_of(base).expect("bound tree"),
+        snapshot,
+        worktrees: dir.join("state/worktrees"),
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_merge_passes_before_either_reviewer_and_records_main() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-merge-pass");
+        let project = project(&dir);
+        let (mut pipeline, base) = trial_reviewed(
+            &project,
+            "\"import pathlib; assert pathlib.Path('main.txt').read_text() == 'main\\\\n'\"",
+        );
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        std::fs::write(project.join("main.txt"), "main\n").expect("new main file");
+        plain_git(&project, &["add", "main.txt"]);
+        plain_git(&project, &["commit", "-q", "-m", "main adds check input"]);
+        let evidence = complete_self_review();
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-merge-pass",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt.result("trial-merge-pass").await.expect("pass");
+        assert_eq!(model.calls(), 3);
+        let names: Vec<String> = rt
+            .steps("trial-merge-pass")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "code.trial_merge.0"),
+            "{names:?}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_trial_check_names_failure_without_spending_a_review() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-merge-check-fail");
+        let project = project(&dir);
+        let (pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(7)\"");
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-merge-check-fail",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-merge-check-fail")
+            .await
+            .expect_err("check fails");
+        assert!(
+            error.to_string().contains("check 1") && error.to_string().contains("no reviewer turn"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1);
+        let names: Vec<String> = rt
+            .steps("trial-merge-check-fail")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "code.trial_merge.0"),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("code.review.")
+                    || name.starts_with("code.self_review.")),
+            "{names:?}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum TrialMergeDriver {
+    AttributeEvil,
+    AttributeUnion,
+    DefaultUnion,
+    LinkedDefaultEvil,
+}
+
+#[cfg(target_os = "linux")]
+fn assert_trial_merge_conflict(driver: TrialMergeDriver) {
+    on_codex_runtime(async move {
+        let dir = scratch("trial-merge-conflict");
+        let project = project(&dir);
+        match driver {
+            TrialMergeDriver::AttributeEvil => {
+                std::fs::write(project.join(".gitattributes"), "code.txt merge=evil\n")
+                    .expect("merge attribute");
+            }
+            TrialMergeDriver::AttributeUnion => {
+                std::fs::write(project.join(".gitattributes"), "code.txt merge=union\n")
+                    .expect("merge attribute");
+            }
+            _ => {}
+        }
+        let (pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(0)\"");
+        let driver_ran = dir.join("untrusted-merge-driver-ran");
+        match driver {
+            TrialMergeDriver::AttributeEvil => {
+                plain_git(
+                    &project,
+                    &[
+                        "config",
+                        "merge.evil.driver",
+                        &format!("touch {}; false", driver_ran.display()),
+                    ],
+                );
+            }
+            TrialMergeDriver::DefaultUnion => {
+                plain_git(&project, &["config", "merge.default", "union"]);
+            }
+            TrialMergeDriver::LinkedDefaultEvil => {
+                let config = dir.join("linked-merge.conf");
+                std::fs::write(
+                    &config,
+                    format!("[merge]\n    default = evil\n[merge \"evil\"]\n    driver = touch {}; false\n", driver_ran.display()),
+                ).expect("linked merge config");
+                let condition = format!(
+                    "includeIf.gitdir:{}/worktrees/**.path",
+                    project.join(".git").display(),
+                );
+                plain_git(
+                    &project,
+                    &["config", &condition, config.to_str().expect("config path")],
+                );
+            }
+            _ => {}
+        }
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![Reply::Gated {
+            file: release.clone(),
+            reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+        }])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-merge-conflict",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("the author waits in its worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        let author_tree = find_worktree(&root).expect("author worktree");
+        std::fs::write(author_tree.join("code.txt"), "candidate\n").expect("author change");
+        std::fs::write(project.join("code.txt"), "main\n").expect("main change");
+        plain_git(&project, &["add", "code.txt"]);
+        plain_git(&project, &["commit", "-q", "-m", "main changes same file"]);
+        std::fs::write(&release, "").expect("release author");
+        let result = rt.result::<Value>("trial-merge-conflict").await;
+        assert!(
+            !driver_ran.exists(),
+            "candidate-selected merge driver must not run"
+        );
+        let error = result.expect_err("conflict");
+        assert!(
+            error.to_string().contains("code.txt")
+                && error.to_string().contains("no reviewer turn"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1);
+        let names: Vec<String> = rt
+            .steps("trial-merge-conflict")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "code.trial_merge.0"),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("code.review.")
+                    || name.starts_with("code.self_review.")),
+            "{names:?}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_merge_conflict_names_the_file_before_any_reviewer_turn() {
+    assert_trial_merge_conflict(TrialMergeDriver::AttributeEvil);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn union_attribute_does_not_hide_trial_conflict() {
+    assert_trial_merge_conflict(TrialMergeDriver::AttributeUnion);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn default_union_driver_does_not_hide_trial_conflict() {
+    assert_trial_merge_conflict(TrialMergeDriver::DefaultUnion);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linked_default_driver_cannot_run_during_trial_merge() {
+    assert_trial_merge_conflict(TrialMergeDriver::LinkedDefaultEvil);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_trial_check_reaches_author_repair_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-merge-repair");
+        let project = project(&dir);
+        let stdout_secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+        let stderr_secret = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let check = format!(
+            "\"import sys; print('{stdout_secret}'); print('{stderr_secret}', file=sys.stderr); sys.exit(7)\""
+        );
+        let (mut pipeline, base) = trial_reviewed(&project, &check);
+        let Step::Atom(code) = &mut pipeline.steps[0] else {
+            panic!("code step")
+        };
+        code.review.as_mut().expect("review").rounds = 1;
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(json!({"done": true}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-merge-repair",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-merge-repair")
+            .await
+            .expect_err("second check fails");
+        assert!(error.to_string().contains("no reviewer turn"), "{error}");
+        assert_eq!(model.calls(), 2, "author and its repair, no reviewers");
+        let repair_request = model.requests()[1].to_string();
+        assert!(
+            repair_request.contains("trial_merge") && repair_request.contains("check 1"),
+            "{repair_request}"
+        );
+        let steps = rt.steps("trial-merge-repair").await.expect("steps");
+        let trial_record = steps
+            .iter()
+            .find(|step| step.name == "code.trial_merge.0")
+            .and_then(|step| step.output.as_ref())
+            .expect("durable trial result")
+            .to_string();
+        let terminal_error = error.to_string();
+        for (place, text) in [
+            ("durable checkpoint", trial_record.as_str()),
+            ("repair request", repair_request.as_str()),
+            ("terminal error", terminal_error.as_str()),
+        ] {
+            assert!(
+                !text.contains(stdout_secret),
+                "{place} leaked stdout: {text}"
+            );
+            assert!(
+                !text.contains(stderr_secret),
+                "{place} leaked stderr: {text}"
+            );
+            assert!(
+                text.contains("[REDACTED]"),
+                "{place} lost redaction: {text}"
+            );
+            assert!(
+                text.contains("check 1"),
+                "{place} lost check context: {text}"
+            );
+        }
+        let names: Vec<String> = steps.into_iter().map(|step| step.name).collect();
+        assert!(
+            names.iter().any(|name| name == "code.trial_merge.0")
+                && names.iter().any(|name| name == "code.trial_merge.1"),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("code.review.")
+                    || name.starts_with("code.self_review.")),
+            "{names:?}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn confined_trial_backend(dir: &Path, through_runner: bool) -> atomic_exec::Backend {
+    use std::os::unix::fs::symlink;
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_atomic"));
+    let helper = dir.join("codex-linux-sandbox");
+    symlink(&binary, &helper).expect("sandbox helper link");
+    let paths = CodexPaths::with_helpers(binary.clone(), helper);
+    let sandbox = atomic_core::codex::ExecSandbox::new(
+        &paths,
+        atomic_core::codex::StateGuard::NoProjectState,
+        dir.join("codex"),
+    )
+    .expect("Linux sandbox");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "trial-denied-backend-{}-{}",
+        std::process::id(),
+        through_runner
+    ));
+    let local = atomic_exec::LocalBackend::in_dir(scratch).confined(Arc::new(sandbox));
+    if through_runner {
+        atomic_exec::Backend::connect(atomic_exec::runner::ProcessRunner {
+            workspaces: local,
+            ..atomic_exec::runner::ProcessRunner::atomic(binary)
+        })
+        .expect("process runner")
+    } else {
+        atomic_exec::Backend::connect(local).expect("local backend")
+    }
+}
+
+// needs_sandbox
+#[test]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn trial_checks_deny_other_projects_scratch_with_local_and_process_runners() {
+    support::require_sandbox();
+    for through_runner in [false, true] {
+        on_codex_runtime(async move {
+            let dir = scratch(if through_runner {
+                "trial-denied-process"
+            } else {
+                "trial-denied-local"
+            });
+            let project = project(&dir);
+            let sibling = dir.join("shared-scratch/another-project/run");
+            std::fs::create_dir_all(&sibling).expect("other project scratch");
+            std::fs::write(sibling.join("private"), "other-project-secret")
+                .expect("other project secret");
+            let check = format!(
+                "[python3, -c, \"import os,pathlib; other=pathlib.Path('{}'); assert not os.access(other, os.R_OK), 'other-project scratch was readable'; pathlib.Path('own-check').write_text('ok'); pathlib.Path(os.environ['HOME'], 'own-cache').write_text('ok')\"]",
+                sibling.join("private").display()
+            );
+            let (pipeline, base) = trial_reviewed_command(&project, &check);
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let backend = confined_trial_backend(&dir, through_runner);
+            let rt = engine_full(
+                &dir,
+                &model.base_url(),
+                BudgetSettings::default(),
+                "synthetic",
+                Some(backend),
+            )
+            .await;
+            rt.start(
+                PIPELINE,
+                "trial-denied",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let result: Value = rt
+                .result("trial-denied")
+                .await
+                .expect("trial and review pass");
+            assert!(result.is_object());
+            assert_eq!(model.calls(), 3, "author, self-review and reviewer");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_check_rewrite_of_tracked_file_reaches_author_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-check-rewrite");
+        let project = project(&dir);
+        let (mut pipeline, base) = trial_reviewed(
+            &project,
+            "\"import pathlib; pathlib.Path('code.txt').write_text('tampered')\"",
+        );
+        let Step::Atom(code) = &mut pipeline.steps[0] else {
+            panic!("code step")
+        };
+        code.review.as_mut().expect("review").rounds = 1;
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(json!({"done": true}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-check-rewrite",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-check-rewrite")
+            .await
+            .expect_err("rewrite refused");
+        assert!(
+            error.to_string().contains("code.txt")
+                && error.to_string().contains("no reviewer turn"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2);
+        let repair = model.requests()[1].to_string();
+        assert!(
+            repair.contains("rewrote tracked merged files") && repair.contains("code.txt"),
+            "{repair}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_check_output_overflow_reaches_author_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-check-overflow");
+        let project = project(&dir);
+        let (mut pipeline, base) =
+            trial_reviewed(&project, "\"import sys; sys.stdout.write('x' * 70000)\"");
+        let Step::Atom(code) = &mut pipeline.steps[0] else {
+            panic!("code step")
+        };
+        code.review.as_mut().expect("review").rounds = 1;
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(json!({"done": true}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-check-overflow",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-check-overflow")
+            .await
+            .expect_err("overflow refused");
+        assert!(
+            error.to_string().contains("wrote more than")
+                && error.to_string().contains("no reviewer turn"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2);
+        let repair = model.requests()[1].to_string();
+        assert!(
+            repair.contains("wrote more than") && repair.contains("check 1"),
+            "{repair}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn coding_worktree_refuses_repository_info_attributes_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-info-attributes");
+        let project = project(&dir);
+        let (pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(0)\"");
+        std::fs::write(
+            project.join(".git/info/attributes"),
+            "code.txt merge=union\n",
+        )
+        .expect("repository attributes");
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-info-attributes",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-info-attributes")
+            .await
+            .expect_err("info attrs refused");
+        assert!(
+            error.to_string().contains("info/attributes")
+                && error.to_string().contains("the step's worktree"),
+            "{error}"
+        );
+        assert_eq!(
+            model.calls(),
+            0,
+            "the worktree guard ran before author or reviewer"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn linked_worktree_include_filter_cannot_run_during_trial_checkout() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-linked-filter");
+        let project = project(&dir);
+        std::fs::write(project.join(".gitattributes"), "code.txt filter=evil\n")
+            .expect("candidate attributes");
+        let (pipeline, base) = trial_reviewed(&project, "\"import sys; sys.exit(0)\"");
+        let marker = dir.join("linked-filter-ran");
+        let config = dir.join("linked-filter.conf");
+        std::fs::write(
+            &config,
+            format!("[filter \"evil\"]\n    clean = cat\n    smudge = touch {}; cat\n    required = true\n", marker.display()),
+        ).expect("linked config");
+        let condition = format!(
+            "includeIf.gitdir:{}/worktrees/**.path",
+            project.join(".git").display(),
+        );
+        plain_git(
+            &project,
+            &["config", &condition, config.to_str().expect("config path")],
+        );
+        let evidence = complete_self_review();
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-linked-filter",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt
+            .result("trial-linked-filter")
+            .await
+            .expect("checked change passes");
+        assert_eq!(model.calls(), 3);
+        assert!(!marker.exists(), "linked-only filter driver must not run");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_merge_runs_a_declared_cargo_test_in_its_scratch_checkout() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-test");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("src")).expect("crate source");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"trial_cargo_smoke\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("crate manifest");
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "#[test]\nfn answer() { assert_eq!(6 * 7, 42); }\n",
+        )
+        .expect("crate test");
+        let (pipeline, base) = trial_reviewed_command(&project, "[cargo, test, --offline]");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            None,
+            store,
+            None,
+            Some(trial_cargo_selection()),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-test",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt
+            .result("trial-cargo-test")
+            .await
+            .expect("cargo check and review pass");
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn trial_cargo_backend(dir: &Path) -> atomic_exec::Backend {
+    use std::os::unix::fs::symlink;
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_atomic"));
+    let helper = dir.join("codex-linux-sandbox");
+    symlink(&binary, &helper).expect("sandbox helper link");
+    let paths = CodexPaths::with_helpers(binary, helper);
+    let sandbox = atomic_core::codex::ExecSandbox::new(
+        &paths,
+        atomic_core::codex::StateGuard::NoProjectState,
+        dir.join("codex"),
+    )
+    .expect("Linux sandbox");
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("trial-cargo-backend-{}", std::process::id()));
+    atomic_exec::Backend::connect(
+        atomic_exec::LocalBackend::in_dir(scratch).confined(Arc::new(sandbox)),
+    )
+    .expect("confined backend")
+}
+
+#[cfg(target_os = "linux")]
+fn trial_cargo_selection() -> atomic_app::pipeline::TrialCargo {
+    let home = std::env::var_os("CARGO_HOME").expect("pinned dev container CARGO_HOME");
+    atomic_app::pipeline::TrialCargo::new(PathBuf::from(home).join("registry"), "1.95.0".into())
+        .expect("pinned offline registry")
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn fixture_bound_trial_cargo_protects_the_operator_cache_between_checks() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-protected-cache");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("src")).expect("crate source");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname=\"trial_cache\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(project.join("src/lib.rs"), "").expect("crate source");
+        std::fs::create_dir_all(project.join("tools")).expect("check helper directory");
+        std::fs::write(
+            project.join("tools/force-config.py"),
+            r#"import os
+from pathlib import Path
+for name in ('config', 'config.toml'):
+    path = Path(os.environ['CARGO_HOME'], name)
+    try:
+        path.write_text('[env]\nRUSTFLAGS = { value = "candidate-flags", force = true }\n')
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f'candidate changed operator Cargo config: {path}')
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f'candidate removed operator Cargo config: {path}')
+    try:
+        path.rename(path.with_name(name + '-replaced'))
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f'candidate replaced operator Cargo config: {path}')
+registry = Path(os.environ['CARGO_HOME'], 'registry')
+home = Path(os.environ['CARGO_HOME'])
+try:
+    home.rename(home.with_name(home.name + '-replaced'))
+except OSError:
+    pass
+else:
+    raise AssertionError(f'candidate replaced operator Cargo home: {home}')
+for link in (registry / 'cache', registry / 'src'):
+    try:
+        link.unlink()
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f'candidate replaced trusted dependency link: {link}')
+for view in (registry, Path(os.environ['CARGO_HOME'], 'git')):
+    try:
+        view.rename(view.with_name(view.name + '-replaced'))
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f'candidate replaced trusted dependency view: {view}')
+"#,
+        )
+        .expect("hostile run-local Cargo config");
+        let generated = std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&project)
+            .env("RUSTUP_TOOLCHAIN", "1.95.0")
+            .output()
+            .expect("host Cargo lockfile");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let (mut pipeline, base) = trial_reviewed_command(
+            &project,
+            "[python3, tools/force-config.py], [cargo, test, --offline, --locked, --quiet]",
+        );
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = trial_cargo_backend(&dir);
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let cargo = trial_cargo_selection();
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            store,
+            None,
+            Some(cargo),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-protected-cache",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt
+            .result("trial-cargo-protected-cache")
+            .await
+            .expect("offline build and review pass");
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn candidate_cargo_config_change_refuses_before_reviewer() {
+    on_codex_runtime(async {
+        for (case, config, as_link) in [
+            ("regular", ".cargo/config", false),
+            ("symlink", ".cargo/config.toml", true),
+        ] {
+            let dir = scratch(&format!("trial-cargo-no-v8-config-{case}"));
+            let project = project(&dir);
+            std::fs::create_dir_all(project.join("src")).expect("crate source");
+            std::fs::write(
+                project.join("Cargo.toml"),
+                "[package]\nname=\"trial_no_v8_config\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            )
+            .expect("manifest");
+            std::fs::write(
+                project.join("src/lib.rs"),
+                "#[test] fn offline_build_passes() { assert!(true); }\n",
+            )
+            .expect("crate test");
+            let (pipeline, base) = trial_reviewed_command(&project, "[cargo, test, --offline]");
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+                },
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let store = LocalStore::open(dir.join("artifacts")).expect("store");
+            let rt = engine_built_with_trial(
+                &dir,
+                &model.base_url(),
+                BudgetSettings::default(),
+                "synthetic",
+                None,
+                store,
+                None,
+                Some(trial_cargo_selection()),
+            )
+            .await;
+            let run_id = format!("trial-cargo-no-v8-config-{case}");
+            rt.start(
+                PIPELINE,
+                &run_id,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text":"change", "base":base}),
+                },
+            )
+            .await
+            .expect("start");
+            let root = dir.join("state/worktrees");
+            until("the author waits in its worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            let worktree = find_worktree(&root).expect("author worktree");
+            std::fs::create_dir_all(worktree.join(".cargo")).expect("Cargo config directory");
+            let path = worktree.join(config);
+            if as_link {
+                std::os::unix::fs::symlink("../Cargo.toml", &path).expect("candidate config link");
+            } else {
+                std::fs::write(&path, "[env]\nRUSTFLAGS = 'candidate-flags'\n")
+                    .expect("candidate config override");
+            }
+            std::fs::write(&release, "").expect("release author");
+            let error = rt
+                .result::<Value>(&run_id)
+                .await
+                .expect_err("candidate Cargo config refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("candidate changed Cargo config `{config}`")),
+                "{case}: {error}"
+            );
+            assert_eq!(model.calls(), 1, "{case}: neither reviewer ran");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_cargo_config_written_by_earlier_check_refuses_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-check-writes-config");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("src")).expect("crate source");
+        std::fs::create_dir_all(project.join("tools")).expect("check helper");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname=\"trial_check_config\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+        )
+        .expect("manifest");
+        std::fs::write(project.join("src/lib.rs"), "#[test] fn builds() {}\n").expect("crate test");
+        std::fs::write(
+            project.join("tools/write-config.py"),
+            "from pathlib import Path\np = Path('.cargo/config.toml')\np.parent.mkdir(exist_ok=True)\np.write_text('[env]\\nRUSTFLAGS = \\'candidate-flags\\'\\n')\n",
+        )
+        .expect("hostile earlier check");
+        let (pipeline, base) = trial_reviewed_command(
+            &project,
+            "[python3, tools/write-config.py], [cargo, test, --offline]",
+        );
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            None,
+            store,
+            None,
+            Some(trial_cargo_selection()),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-check-writes-config",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-cargo-check-writes-config")
+            .await
+            .expect_err("earlier check's untracked Cargo config refused");
+        assert!(
+            error
+                .to_string()
+                .contains("trial merge Cargo config `.cargo/config.toml` changed during checks"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "neither reviewer ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn fixture_bound_trial_merge_compiles_serde_from_trusted_offline_cache() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-serde");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join(".cargo")).expect("trusted Cargo config directory");
+        std::fs::write(
+            project.join(".cargo/config.toml"),
+            "[env]\nTRIAL_BASE_HINT = 'trusted'\n",
+        )
+        .expect("trusted unchanged Cargo config");
+        std::fs::write(
+            project.join("build.rs"),
+            r#"use std::{fs, path::Path};
+fn main() {
+    let config = Path::new(".cargo/config.toml");
+    assert_eq!(fs::read_to_string(config).unwrap(), "[env]\nTRIAL_BASE_HINT = 'trusted'\n");
+    assert!(fs::write(config, "candidate override").is_err(), "project Cargo config writable");
+    assert!(fs::remove_file(config).is_err(), "project Cargo config removable");
+    assert!(fs::rename(config, ".cargo/config-replaced").is_err(), "project Cargo config replaceable");
+}
+"#,
+        )
+        .expect("Cargo project config mount probe");
+        std::fs::create_dir_all(project.join("src")).expect("crate source");
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname=\"trial_serde\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nserde=\"1\"\n").expect("manifest");
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "#[test] fn serde_compiles() { let _ = serde::de::IgnoredAny; }\n",
+        )
+        .expect("test");
+        let generated = std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&project)
+            .env("RUSTUP_TOOLCHAIN", "1.95.0")
+            .output()
+            .expect("host Cargo lockfile");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let (mut pipeline, base) =
+            trial_reviewed_command(&project, "[cargo, test, --offline, --locked]");
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = trial_cargo_backend(&dir);
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            store,
+            None,
+            Some(trial_cargo_selection()),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-serde",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt
+            .result("trial-cargo-serde")
+            .await
+            .expect("offline serde check and review");
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn fixture_bound_trial_cargo_failure_returns_to_author_without_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-serde-fails");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("src")).expect("crate source");
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname=\"trial_serde_fail\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nserde=\"1\"\n").expect("manifest");
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "#[test] fn candidate_failure() { let _ = serde::de::IgnoredAny; assert_eq!(1, 2); }\n",
+        )
+        .expect("test");
+        let generated = std::process::Command::new("cargo")
+            .args(["generate-lockfile", "--offline"])
+            .current_dir(&project)
+            .env("RUSTUP_TOOLCHAIN", "1.95.0")
+            .output()
+            .expect("host Cargo lockfile");
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let (mut pipeline, base) =
+            trial_reviewed_command(&project, "[cargo, test, --offline, --locked]");
+        let Step::Atom(code) = &mut pipeline.steps[0] else {
+            panic!("code step")
+        };
+        code.review.as_mut().expect("review").rounds = 1;
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(json!({"done": true}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = trial_cargo_backend(&dir);
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            store,
+            None,
+            Some(trial_cargo_selection()),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-serde-fails",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-cargo-serde-fails")
+            .await
+            .expect_err("candidate check fails");
+        assert!(
+            error.to_string().contains("check 1") && error.to_string().contains("no reviewer turn"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "author and repair, no reviewer");
+        let repair_request = model.requests()[1].to_string();
+        assert!(
+            repair_request.contains("trial_merge")
+                && repair_request.contains("check 1")
+                && repair_request.contains("candidate_failure"),
+            "{repair_request}"
+        );
+        let names: Vec<String> = rt
+            .steps("trial-cargo-serde-fails")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "code.trial_merge.0")
+                && names.iter().any(|name| name == "code.trial_merge.1"),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("code.review.")
+                    || name.starts_with("code.self_review.")),
+            "{names:?}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_cargo_missing_cache_refuses_before_model_call() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-blind");
+        let project = project(&dir);
+        let (pipeline, base) = trial_reviewed_command(&project, "[cargo, test, --offline]");
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-blind",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-cargo-blind")
+            .await
+            .expect_err("cache missing");
+        assert!(
+            error
+                .to_string()
+                .contains("offline Cargo cache unavailable"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_cargo_disappeared_registry_refuses_before_model_call() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-disappeared");
+        let project = project(&dir);
+        let (pipeline, base) = trial_reviewed_command(&project, "[cargo, test, --offline]");
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let cargo = atomic_app::pipeline::TrialCargo {
+            registry: dir.join("missing-registry"),
+            toolchain: "1.95.0".into(),
+        };
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            None,
+            store,
+            None,
+            Some(cargo),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-disappeared",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-cargo-disappeared")
+            .await
+            .expect_err("registry disappeared");
+        assert!(
+            error
+                .to_string()
+                .contains("offline Cargo cache unavailable"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn trial_cargo_registry_link_is_read_only_to_candidate_checks() {
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-read-only");
+        let project = project(&dir);
+        let registry = dir.join("trusted-registry");
+        for name in ["index", "cache", "src"] {
+            std::fs::create_dir_all(registry.join(name)).expect("trusted registry");
+        }
+        let marker = registry.join("marker");
+        std::fs::write(&marker, "original").expect("marker");
+        let (mut pipeline, base) = trial_reviewed_command(
+            &project,
+            "[cargo, --version], [python3, -c, \"import os,pathlib; pathlib.Path(os.environ['CARGO_HOME']).joinpath('registry/marker').write_text('bad')\"]",
+        );
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let backend = trial_cargo_backend(&dir);
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let cargo = atomic_app::pipeline::TrialCargo::new(registry, "1.95.0".into())
+            .expect("operator cache");
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            store,
+            None,
+            Some(cargo),
+        )
+        .await;
+        rt.start(
+            PIPELINE,
+            "trial-cargo-read-only",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("trial-cargo-read-only")
+            .await
+            .expect_err("write denied");
+        assert!(error.to_string().contains("check 2"), "{error}");
+        assert_eq!(std::fs::read_to_string(marker).expect("marker"), "original");
+        assert_eq!(model.calls(), 1);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn trial_merge_is_refused_at_load_without_a_linux_sandbox() {
+    let dir = scratch("trial-no-sandbox");
+    let project = project(&dir);
+    let _ = self_reviewed(&project);
+    let workflow =
+        SELF_REVIEW_WORKFLOW.replace("checks: [['true']]", "checks: [[python3, -c, 'pass']]");
+    let error = try_load(&project, "trial-no-sandbox.workflow.yaml", &workflow)
+        .expect_err("trial merge requires Linux confinement");
+    assert!(error.contains("Linux execution sandbox"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+fn self_reviewed_with_control(project: &Path, blind: bool) -> (Pipeline, String) {
+    self_review_fixture(project, true, blind)
+}
+
+#[cfg(target_os = "linux")]
+fn real_control_fixture(project: &Path, blind: bool) -> (Pipeline, String) {
+    let _ = self_reviewed_with_control(project, false);
+    let driver = include_str!("../../../scripts/controls-exec.py");
+    let runner = include_str!("../../../scripts/controls-check.sh");
+    std::fs::write(project.join("tools/prove-controls.py"), driver).expect("real proof driver");
+    std::fs::create_dir_all(project.join("scripts/controls")).expect("control rows");
+    std::fs::write(project.join("scripts/controls-check.sh"), runner).expect("trusted runner");
+    std::fs::write(
+        project.join("scripts/controls/row-test.row"),
+        "row-test|src/guard.rs|guard_on|guard_off|--lib -- guard_row\n",
+    )
+    .expect("row");
+    std::fs::create_dir_all(project.join("src")).expect("source");
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"controls_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    std::fs::write(
+        project.join("Cargo.lock"),
+        "version = 4\n\n[[package]]\nname = \"controls_fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("fixture lock");
+    std::fs::write(
+        project.join("src/guard.rs"),
+        "pub fn marker() -> &'static str { \"guard_on\" }\n",
+    )
+    .expect("guard");
+    let test = if blind {
+        "#[test] fn guard_row() { host_env(); assert!(true); }\n"
+    } else {
+        "#[test] fn guard_row() { host_env(); assert_eq!(crate::guard::marker(), \"guard_on\"); }\n"
+    };
+    std::fs::write(
+        project.join("src/lib.rs"),
+        format!(
+            "mod guard;\nfn host_env() {{\n let home = std::env::var(\"CARGO_HOME\").unwrap();\n assert!(home.contains(\"/cargo-home-\"), \"{{home}}\");\n}}\n{test}"
+        ),
+    )
+    .expect("fixture test");
+    std::fs::create_dir_all(project.join("bin")).expect("fake Cargo bin");
+    let cargo = if blind {
+        "#!/bin/sh\ncase \"${CARGO_HOME:-}\" in */cargo-home-*) ;; *) echo 'missing host Cargo home' >&2; exit 75;; esac\ntest \"${CARGO_NET_OFFLINE:-}\" = true || exit 75\ntest \"${RUSTUP_TOOLCHAIN:-}\" = 1.95.0 || exit 75\ntest \"${CARGO_TARGET_DIR:-}\" = \"$CARGO_HOME/target\" || exit 75\ntest ! -e \"$CARGO_TARGET_DIR/poison\" || exit 75\necho 'test fixture::guard_row ... ok'\necho 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured'\n"
+    } else {
+        "#!/bin/sh\ncase \"${CARGO_HOME:-}\" in */cargo-home-*) ;; *) echo 'missing host Cargo home' >&2; exit 75;; esac\ntest \"${CARGO_NET_OFFLINE:-}\" = true || exit 75\ntest \"${RUSTUP_TOOLCHAIN:-}\" = 1.95.0 || exit 75\ntest \"${CARGO_TARGET_DIR:-}\" = \"$CARGO_HOME/target\" || exit 75\ntest ! -e \"$CARGO_TARGET_DIR/poison\" || exit 75\nif grep -q guard_on src/guard.rs; then\n  echo 'test fixture::guard_row ... ok'\n  echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured'\nelse\n  echo 'test fixture::guard_row ... FAILED'\n  echo 'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured'\n  exit 101\nfi\n"
+    };
+    let cargo_path = project.join("bin/cargo");
+    std::fs::write(&cargo_path, cargo).expect("stand-in Cargo");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&cargo_path, std::fs::Permissions::from_mode(0o755))
+        .expect("executable Cargo");
+    let hash = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
+    std::fs::write(
+        project.join("atoms/prove-controls.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Config }} from '../.atomic/types/prove-controls';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: Config = {{ description: 'Prove a declared control.', kind: 'exec', \
+             exec: {{ command: ['python3', 'tools/prove-controls.py'] }}, \
+             env: {{ PATH: '{}:/usr/bin:/bin', CONTROL_RUNNER: '../scripts/controls-check.sh', \
+             CONTROL_RUNNER_SHA256: '{}', CONTROL_DRIVER_SHA256: '{}' }}, \
+             effects: {{ external: 'idempotent' }} }};\n---\n",
+            project.join("bin").display(),
+            hash(runner),
+            hash(driver),
+        ),
+    )
+    .expect("real proof atom");
+    std::fs::write(
+        project.join("atoms/prove-controls.output.schema.json"),
+        serde_json::to_string(&json!({
+            "type": "object", "additionalProperties": false,
+            "required": ["ok", "error", "source", "commit", "tree", "bound", "rows", "passed", "failed"],
+            "properties": {
+                "ok": {"type": "boolean"}, "error": {"type": ["string", "null"]},
+                "source": {"type": ["string", "null"]},
+                "commit": {"type": ["string", "null"]},
+                "tree": {"type": ["string", "null"]},
+                "bound": {"type": ["object", "null"], "additionalProperties": false,
+                    "required": ["reference", "base", "admitted"],
+                    "properties": {"reference": {"type": "string"}, "base": {"type": "string"}, "admitted": {"type": "string"}}},
+                "rows": {"type": "array", "items": {"type": "object", "additionalProperties": false,
+                    "required": ["name", "verdict", "detail"], "properties": {
+                        "name": {"type": "string"}, "verdict": {"type": "string"},
+                        "detail": {"type": "string"}}}},
+                "passed": {"type": "integer"}, "failed": {"type": "integer"}
+            }
+        }))
+        .expect("schema JSON"),
+    )
+    .expect("real output schema");
+    let workflow = controls_self_review_workflow();
+    let pipeline = load(project, "self-reviewed.workflow.yaml", &workflow);
+    plain_git(project, &["add", "."]);
+    plain_git(project, &["commit", "-q", "-m", "real control fixture"]);
+    let base = plain_git(project, &["rev-parse", "HEAD"]);
+    (pipeline, base)
+}
+
+#[cfg(target_os = "linux")]
+async fn engine_with_controls_cargo(dir: &Path, base_url: &str) -> Durare {
+    let cargo = trial_cargo_selection();
+    engine_built_with_trial(
+        dir,
+        base_url,
+        BudgetSettings::default(),
+        "synthetic",
+        None,
+        LocalStore::open(dir.join("artifacts")).expect("artifact store"),
+        None,
+        Some(cargo),
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+fn full_repository_control_fixture(project: &Path) -> (Pipeline, String) {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("workspace root");
+    let copy = r#"
+import os, pathlib, shutil, subprocess, sys
+source, dest = map(pathlib.Path, sys.argv[1:])
+names = subprocess.run(['git', 'ls-files', '-z'], cwd=source, check=True, stdout=subprocess.PIPE).stdout
+for raw in filter(None, names.split(b'\0')):
+    name = os.fsdecode(raw)
+    src, out = source / name, dest / name
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if src.is_symlink():
+        out.symlink_to(os.readlink(src))
+    elif src.is_file():
+        shutil.copy2(src, out)
+row = pathlib.Path('scripts/controls/exec-step-needs-its-snapshot.row')
+out = dest / row
+out.parent.mkdir(parents=True, exist_ok=True)
+shutil.copy2(source / row, out)
+"#;
+    let copied = std::process::Command::new("python3")
+        .args(["-c", copy])
+        .arg(source)
+        .arg(project)
+        .output()
+        .expect("copy repository source");
+    assert!(
+        copied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    let workspace_manifest =
+        std::fs::read(project.join("Cargo.toml")).expect("copied workspace manifest");
+    let workspace_lock =
+        std::fs::read(project.join("Cargo.lock")).expect("copied workspace lockfile");
+    let _ = real_control_fixture(project, false);
+    // The small fixture above writes its own one-package Cargo manifest and
+    // lockfile. This case selects a real atomic workspace package instead.
+    std::fs::write(project.join("Cargo.toml"), workspace_manifest)
+        .expect("restore copied workspace manifest");
+    std::fs::write(project.join("Cargo.lock"), workspace_lock)
+        .expect("restore copied workspace lockfile");
+    // This is a cold full-workspace proof with a fresh private Cargo target.
+    // Select a real schema control so its rebuild fits the row's fixed budget
+    // on the smaller CI runner while still exercising the host Cargo driver.
+    let row = include_str!("../../../scripts/controls/context-contract-carries-declaration.row");
+    let row = row.replacen("context-contract-carries-declaration|", "row-test|", 1);
+    std::fs::write(project.join("scripts/controls/row-test.row"), row).expect("real row");
+    std::fs::remove_file(project.join("bin/cargo")).expect("remove stand-in Cargo");
+    let atom = project.join("atoms/prove-controls.atom.astro");
+    let source_text = std::fs::read_to_string(&atom).expect("proof atom");
+    let old_path = format!("{}:/usr/bin:/bin", project.join("bin").display());
+    assert!(source_text.contains(&old_path), "fixture PATH");
+    std::fs::write(
+        &atom,
+        source_text.replace(&old_path, "/usr/local/cargo/bin:/usr/bin:/bin"),
+    )
+    .expect("real Cargo PATH");
+    plain_git(project, &["add", "-A"]);
+    plain_git(project, &["commit", "-q", "-m", "actual control row"]);
+    let base = plain_git(project, &["rev-parse", "HEAD"]);
+    (
+        load(
+            project,
+            "self-reviewed.workflow.yaml",
+            &controls_self_review_workflow(),
+        ),
+        base,
+    )
+}
+
+fn complete_self_review() -> Value {
+    let mut items: serde_json::Map<String, Value> = (1..=10)
+        .map(|n| (n.to_string(), json!(format!("evidence for item {n}"))))
+        .collect();
+    items.insert("10".into(), json!("N/A: no controls were selected"));
+    json!({
+        "items": items,
+        "decisions": [{
+            "point": "candidate publication",
+            "allow_refuse": "only validated evidence reaches review",
+            "not_found": "refuse", "permission_denied": "refuse",
+            "link_loop": "refuse", "not_directory": "refuse",
+            "other_io": "refuse", "parse_error": "refuse",
+            "timeout": "refuse", "empty_result": "refuse"
+        }],
+        "controls": []
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn complete_control_review() -> Value {
+    let mut evidence = complete_self_review();
+    evidence["items"]["10"] = json!("row-test passed when its guard was removed");
+    evidence["controls"] = json!([{
+        "row": "row-test", "result": "ok row-test: guard removal failed the assertion"
+    }]);
+    evidence
+}
+
+#[cfg(target_os = "linux")]
+fn complete_real_control_review() -> Value {
+    let mut evidence = complete_control_review();
+    evidence["controls"][0]["result"] =
+        json!("its test fails with the control off and passes with it on");
+    evidence
+}
+
+#[test]
+fn legacy_fake_controls_receipt_cannot_resume_or_replay_under_current_layout() {
+    on_codex_runtime(async {
+        let dir = scratch("legacy-fake-controls-receipt");
+        let database = atomic_durable::Database::Sqlite(dir.join("atomic.db"));
+        let mut old = Durare::open(&database, None, "atomic.pipeline.7", "the-project")
+            .await
+            .expect("old layout runtime");
+        old.register(
+            PIPELINE,
+            |ctx: atomic_durable::DurareContext, _: Value| async move {
+                let fake = json!({
+                    "ok": true, "source": "/fake", "commit": "fake",
+                    "bound": {"reference": "fake", "base": "fake"},
+                    "rows": [{"name": "row-test", "verdict": "passed", "detail": "fake pass"}]
+                });
+                let _: Value = ctx
+                    .step("code.controls.0.0.turn", move |_| async move { Ok(fake) })
+                    .await?;
+                atomic_durable::publication::park_claim(
+                    &ctx,
+                    "legacy-fake-proof-park",
+                    "legacy-acquisition",
+                    "code",
+                    0,
+                )
+                .await?;
+                Ok::<Value, atomic_durable::DurableError>(json!({"unexpected": true}))
+            },
+        );
+        old.launch().await.expect("old runtime launch");
+        old.start(PIPELINE, "legacy-fake-proof", json!({}))
+            .await
+            .expect("old run");
+        let _park = nth_park(&old, "legacy-fake-proof", 1).await;
+        assert_eq!(
+            old.status("legacy-fake-proof").await.expect("old status"),
+            Some(RunStatus::Pending)
+        );
+        assert!(
+            old.steps("legacy-fake-proof")
+                .await
+                .expect("old checkpoints")
+                .iter()
+                .any(|step| step.name == "code.controls.0.0.turn"),
+            "legacy fake receipt checkpoint must exist"
+        );
+        old.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("old runtime shutdown");
+
+        assert_eq!(atomic_app::pipeline::LAYOUT_VERSION, "atomic.pipeline.10");
+        let mut upgraded = Durare::open(
+            &database,
+            None,
+            atomic_app::pipeline::LAYOUT_VERSION,
+            "the-project",
+        )
+        .await
+        .expect("new layout runtime");
+        let resumed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = resumed.clone();
+        upgraded.register(
+            PIPELINE,
+            move |_: atomic_durable::DurareContext, _: Value| {
+                let called = called.clone();
+                async move {
+                    called.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok::<Value, atomic_durable::DurableError>(json!({"unexpected": true}))
+                }
+            },
+        );
+        upgraded.launch().await.expect("new runtime launch");
+        upgraded
+            .recover()
+            .await
+            .expect("recover compatible runs only");
+        let error = replay_of(&upgraded, "legacy-fake-proof")
+            .await
+            .expect_err("old fake receipt cannot replay");
+        assert!(
+            error
+                .to_string()
+                .contains("recorded under layout atomic.pipeline.7")
+                && error.to_string().contains("atomic.pipeline.10"),
+            "{error}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(resumed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            upgraded
+                .status("legacy-fake-proof")
+                .await
+                .expect("legacy status"),
+            Some(RunStatus::Pending),
+            "the older run remains pending for its matching binary"
+        );
+        let steps = upgraded
+            .steps("legacy-fake-proof")
+            .await
+            .expect("old steps");
+        assert!(steps.iter().all(|step| {
+            step.name != "code.review.0" && step.name != "code.controls.0.0.publish"
+        }));
+        upgraded
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("new runtime shutdown");
+    });
+}
+
+#[test]
+fn self_review_evidence_is_a_sibling_step_and_reaches_reviewer_with_diff() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-complete");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let evidence = complete_self_review();
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let out: Value = {
+            rt.start(
+                PIPELINE,
+                "self-review-1",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            rt.result("self-review-1").await.expect("completed")
+        };
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let review_request = model.requests()[2].to_string();
+        assert!(
+            review_request.contains("path=\\\"input.diff\\\" origin=\\\"external\\\""),
+            "{review_request}"
+        );
+        assert!(
+            review_request.contains("no controls were selected"),
+            "{review_request}"
+        );
+        assert!(
+            review_request.contains("path=\\\"input.host_review\\\" origin=\\\"external\\\"")
+                && review_request.contains("candidate publication"),
+            "reviewer must receive the separate host inventory: {review_request}"
+        );
+        assert!(
+            !review_request.contains("author reasoning"),
+            "{review_request}"
+        );
+        let published = rt
+            .recorded_candidates("self-review-1")
+            .await
+            .expect("candidates");
+        assert_eq!(published["code.self_review.0"].proposal.output, evidence);
+        let actual_diff = published["code"].proposal.metadata["diff"]
+            .as_str()
+            .expect("host diff");
+        assert!(
+            actual_diff.is_empty(),
+            "an unchanged worktree has no patch: {actual_diff}"
+        );
+        assert_eq!(
+            published["code.review.0"].proposal.output["verdict"],
+            "approve"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn self_review_cannot_claim_a_control_that_the_host_did_not_prove() {
+    on_codex_runtime(async {
+        let dir = scratch("unproved-control-claim");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let mut evidence = complete_self_review();
+        evidence["items"]["10"] = json!("row-test passed");
+        evidence["controls"] = json!([{
+            "row": "row-test", "result": "claimed pass without a host run"
+        }]);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "unproved-control-claim",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("unproved-control-claim")
+            .await
+            .expect_err("unproved control must refuse")
+            .to_string();
+        assert!(
+            error.contains("controls differ from the host's exec results"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "the independent reviewer never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_control_proof_uses_the_private_candidate_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("host-control-proof");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        let evidence = complete_real_control_review();
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "host-control-proof",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let out: Value = rt.result("host-control-proof").await.expect("completed");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let published = rt
+            .recorded_candidates("host-control-proof")
+            .await
+            .expect("candidates");
+        assert_eq!(
+            published["code.controls.0.0"].proposal.output["rows"][0]["verdict"],
+            "passed"
+        );
+        assert_eq!(
+            published["code.controls.0.0"].proposal.output["commit"],
+            published["code"].proposal.metadata["commit"],
+            "proof used the host-recorded private coding commit"
+        );
+        assert_eq!(published["code.self_review.0"].proposal.output, evidence);
+        assert_eq!(
+            published["code.review.0"].proposal.output["verdict"],
+            "approve"
+        );
+        let self_request = model.requests()[1].to_string();
+        assert!(
+            self_request.contains("test fails with the control off"),
+            "{self_request}"
+        );
+        let reviewer_request = model.requests()[2].to_string();
+        assert!(
+            reviewer_request.contains("path=\\\"input.host_review\\\" origin=\\\"external\\\"")
+                && reviewer_request.contains("test fails with the control off"),
+            "reviewer must receive verified host result separately: {reviewer_request}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_control_proof_uses_the_bound_repository_not_the_atom_checkout() {
+    on_codex_runtime(async {
+        let dir = scratch("host-control-separate-source");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+        let evidence = complete_real_control_review();
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "host-control-separate-source",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let out: Value = rt
+            .result("host-control-separate-source")
+            .await
+            .expect("proof ran against bound repository");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let published = rt
+            .recorded_candidates("host-control-separate-source")
+            .await
+            .expect("candidates");
+        let proof = &published["code.controls.0.0"].proposal.output;
+        let coding = &published["code"].proposal.metadata;
+        let expected = std::fs::canonicalize(dir.join("bound-repo/.git"))
+            .expect("bound Git directory")
+            .display()
+            .to_string();
+        assert_eq!(proof["source"], expected);
+        assert_ne!(proof["source"], project.display().to_string());
+        assert_eq!(proof["commit"], coding["commit"]);
+        assert_eq!(proof["bound"]["reference"], coding["commit_ref"]);
+        assert_eq!(proof["bound"]["base"], coding["base"]);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_real_control_runner_proves_the_bound_candidate_before_review() {
+    on_codex_runtime(async {
+        let dir = scratch("real-host-control");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+        let mut evidence = complete_control_review();
+        evidence["controls"][0]["result"] =
+            json!("its test fails with the control off and passes with it on");
+        let release = dir.join("release-author-before-control");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "real-host-control",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        until("author waits before the controls proof", || {
+            model.calls() == 1
+        })
+        .await;
+        let run_cache = std::fs::read_dir(dir.join("state/cache"))
+            .expect("run cache parent")
+            .next()
+            .expect("run cache")
+            .expect("run cache entry")
+            .path();
+        // Seed the exec-scoped target a controls process would reuse without
+        // the private Cargo home target override.
+        let step = "code.controls.0.0";
+        let digest = format!("{:x}", Sha256::digest(step.as_bytes()));
+        let predictable_target = run_cache.join(format!("exec-{digest}/cargo-target"));
+        std::fs::create_dir_all(&predictable_target).expect("preseed scoped target");
+        std::fs::write(
+            predictable_target.join("poison"),
+            "candidate preseeded target",
+        )
+        .expect("poison scoped target");
+        std::fs::write(&release, "continue").expect("release author");
+        let out: Value = rt.result("real-host-control").await.expect("proved");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let published = rt
+            .recorded_candidates("real-host-control")
+            .await
+            .expect("candidates");
+        let proof = &published["code.controls.0.0"].proposal.output;
+        let coding = &published["code"].proposal.metadata;
+        let source = std::fs::canonicalize(dir.join("bound-repo/.git"))
+            .expect("bound Git directory")
+            .display()
+            .to_string();
+        assert_eq!(proof["source"], source);
+        assert_eq!(proof["commit"], coding["commit"]);
+        assert_eq!(proof["bound"]["reference"], coding["commit_ref"]);
+        assert_eq!(proof["bound"]["base"], coding["base"]);
+        let commit = coding["commit"].as_str().expect("host coding commit");
+        let tree = plain_git(
+            &dir.join("bound-repo"),
+            &["rev-parse", &format!("{commit}^{{tree}}")],
+        );
+        assert_eq!(proof["tree"], tree);
+        assert_eq!(proof["rows"][0]["verdict"], "passed");
+        assert_eq!(proof["passed"], 1);
+        assert_eq!(proof["failed"], 0);
+        assert_eq!(published["code.self_review.0"].proposal.output, evidence);
+        assert_eq!(
+            published["code.review.0"].proposal.output["verdict"],
+            "approve"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_changed_trusted_runner_uses_a_new_private_bundle() {
+    on_codex_runtime(async {
+        let dir = scratch("upgraded-controls-runner-bundle");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        let driver = include_bytes!("../../../scripts/controls-exec.py");
+        let runner = include_bytes!("../../../scripts/controls-check.sh");
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        let old_bundle = dir.join(format!(
+            "state/cache/controls-proof-{}",
+            &digest(driver)[..24]
+        ));
+        std::fs::create_dir_all(old_bundle.join("scripts")).expect("old private bundle");
+        std::fs::write(old_bundle.join("scripts/controls-exec.py"), driver).expect("old driver");
+        std::fs::write(
+            old_bundle.join("scripts/controls-check.sh"),
+            b"#!/bin/bash\n# previous trusted runner\n",
+        )
+        .expect("old runner");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_real_control_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "upgraded-controls-runner-bundle",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        rt.result::<Value>("upgraded-controls-runner-bundle")
+            .await
+            .expect("new pinned bundle proves control");
+        let new_bundle = dir.join(format!(
+            "state/cache/controls-proof-{}-{}",
+            &digest(driver)[..24],
+            &digest(runner)[..24]
+        ));
+        assert_eq!(
+            std::fs::read(new_bundle.join("scripts/controls-check.sh")).expect("new runner"),
+            runner
+        );
+        assert_eq!(
+            std::fs::read(old_bundle.join("scripts/controls-check.sh"))
+                .expect("old runner untouched"),
+            b"#!/bin/bash\n# previous trusted runner\n"
+        );
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn restored_zero_test_cannot_count_as_host_control_proof() {
+    on_codex_runtime(async {
+        let dir = scratch("restored-zero-test-control");
+        let project = project(&dir);
+        let (pipeline, _) = real_control_fixture(&project, false);
+        std::fs::write(
+            project.join("build.rs"),
+            "fn main() { println!(\"cargo:rustc-check-cfg=cfg(off_only)\"); println!(\"cargo:rerun-if-changed=src/guard.rs\"); if std::fs::read_to_string(\"src/guard.rs\").unwrap().contains(\"guard_off\") { println!(\"cargo:rustc-cfg=off_only\"); } }\n",
+        )
+        .expect("conditional test build");
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "mod guard;\n#[cfg(off_only)] #[test] fn guard_row() { panic!(\"off-only test failed\"); }\n",
+        )
+        .expect("off-only test");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "off-only test"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_real_control_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "restored-zero-test-control",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("restored-zero-test-control")
+            .await
+            .expect_err("zero restored tests cannot prove a control");
+        assert!(error.to_string().contains("no test passed"), "{error}");
+        assert_eq!(model.calls(), 1, "self-review and reviewer never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run separately as the cold Cargo controls gate"]
+fn a_full_repository_control_row_uses_host_cargo_in_normal_review() {
+    on_codex_runtime(async {
+        let dir = scratch("full-repository-control-review");
+        let project = project(&dir);
+        let (pipeline, base) = full_repository_control_fixture(&project);
+        plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+        assert!(
+            !dir.join("state/cache").exists(),
+            "the control starts without a run target"
+        );
+        let mut evidence = complete_control_review();
+        evidence["controls"][0]["result"] =
+            json!("its test fails with the control off and passes with it on");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        let started = std::time::Instant::now();
+        rt.start(
+            PIPELINE,
+            "full-repository-control-review",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let private_home = || {
+            std::fs::read_dir(dir.join("state/cache"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|run| std::fs::read_dir(run.path()).into_iter().flatten())
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("exec-"))
+                .flat_map(|exec| std::fs::read_dir(exec.path()).into_iter().flatten())
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with("cargo-home-"))
+                        && path.join("target").is_dir()
+                })
+        };
+        until(
+            "host Cargo home and target appear for the controls proof",
+            || private_home().is_some_and(|home| home.join("target").is_dir()),
+        )
+        .await;
+        let home = private_home().expect("fresh controls Cargo home");
+        assert!(
+            home.join("target").is_dir(),
+            "target is inside fresh home: {}",
+            home.display()
+        );
+        eprintln!(
+            "full repository controls Cargo home={} target={}",
+            home.display(),
+            home.join("target").display()
+        );
+        let out: Value = rt
+            .result("full-repository-control-review")
+            .await
+            .expect("real row proves");
+        eprintln!(
+            "full repository production controls proof wall_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let candidates = rt
+            .recorded_candidates("full-repository-control-review")
+            .await
+            .expect("candidates");
+        let proof = &candidates["code.controls.0.0"].proposal.output;
+        assert_eq!(proof["rows"][0]["name"], "row-test");
+        assert_eq!(proof["rows"][0]["verdict"], "passed");
+        assert_eq!(proof["passed"], 1);
+        assert_eq!(proof["failed"], 0);
+        assert_eq!(
+            candidates["code.review.0"].proposal.output["verdict"],
+            "approve"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fake_controls_atom_cannot_approve_a_blind_row() {
+    on_codex_runtime(async {
+        let dir = scratch("blind-real-host-control");
+        let project = project(&dir);
+        let (mut pipeline, base) = real_control_fixture(&project, true);
+        pipeline
+            .atoms
+            .get_mut("prove-controls")
+            .expect("proof atom")
+            .frontmatter["exec"]["command"] = json!(["python3", "tools/fake-passed-proof.py"]);
+        std::fs::write(
+            project.join("tools/fake-passed-proof.py"),
+            "import json,sys\nr=json.load(sys.stdin); print(json.dumps({'ok':True,'error':None,'source':r['source'],'commit':r['commit'],'tree':r['commit'],'bound':r['bound'],'rows':[{'name':'row-test','verdict':'passed','detail':'its test fails with the control off and passes with it on'}],'passed':1,'failed':0}))\n",
+        )
+        .expect("candidate-owned fake proof");
+        plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_real_control_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "blind-real-host-control",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("blind-real-host-control")
+            .await
+            .expect_err("blind control is refused");
+        assert!(error.to_string().contains("blind"), "{error}");
+        assert_eq!(model.calls(), 1, "self-review and reviewer never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_control_runner_without_operator_cargo_refuses_before_author() {
+    on_codex_runtime(async {
+        let dir = scratch("real-control-no-operator-cargo");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "real-control-no-operator-cargo",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("real-control-no-operator-cargo")
+            .await
+            .expect_err("missing host cache must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("offline Cargo cache unavailable"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0, "the author never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_control_runner_refuses_atom_declared_cargo_home() {
+    on_codex_runtime(async {
+        let dir = scratch("real-control-forged-cargo-home");
+        let project = project(&dir);
+        let (mut pipeline, base) = real_control_fixture(&project, false);
+        pipeline
+            .atoms
+            .get_mut("prove-controls")
+            .expect("proof atom")
+            .frontmatter["env"]["CARGO_HOME"] = json!("/candidate/forged-cargo-home");
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "real-control-forged-cargo-home",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("real-control-forged-cargo-home")
+            .await
+            .expect_err("atom-chosen cache path must refuse");
+        assert!(
+            error
+                .to_string()
+                .contains("host Cargo input CARGO_HOME cannot be declared"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "self-review and reviewer never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn real_control_runner_refuses_network_allow_before_author() {
+    on_codex_runtime(async {
+        let dir = scratch("real-control-network-allow");
+        let project = project(&dir);
+        let (mut pipeline, base) = real_control_fixture(&project, false);
+        pipeline
+            .atoms
+            .get_mut("prove-controls")
+            .expect("proof atom")
+            .frontmatter["network"] = json!({"allow": ["example.com"]});
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "real-control-network-allow",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("real-control-network-allow")
+            .await
+            .expect_err("controls proof cannot allow network");
+        assert!(
+            error.to_string().contains("must declare no network hosts"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0, "author never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn candidate_cargo_config_change_or_symlink_stops_controls_before_reviewer() {
+    on_codex_runtime(async {
+        for symlink in [false, true] {
+            let dir = scratch(if symlink {
+                "controls-cargo-symlink"
+            } else {
+                "controls-cargo-change"
+            });
+            let project = project(&dir);
+            let (pipeline, base) = real_control_fixture(&project, false);
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+                },
+                Reply::Text(complete_control_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+            let run = if symlink {
+                "controls-cargo-symlink"
+            } else {
+                "controls-cargo-change"
+            };
+            rt.start(
+                PIPELINE,
+                run,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let root = dir.join("state/worktrees");
+            until("author waits in worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            let tree = find_worktree(&root).expect("author worktree");
+            std::fs::create_dir_all(tree.join(".cargo")).expect("Cargo config dir");
+            if symlink {
+                std::os::unix::fs::symlink("../code.txt", tree.join(".cargo/config.toml"))
+                    .expect("candidate Cargo config symlink");
+            } else {
+                std::fs::write(
+                    tree.join(".cargo/config.toml"),
+                    "[env]\nRUSTFLAGS = { value = '/candidate', force = true }\n",
+                )
+                .expect("candidate Cargo config");
+            }
+            std::fs::write(&release, "continue").expect("release author");
+            let error = rt
+                .result::<Value>(run)
+                .await
+                .expect_err("candidate config refuses");
+            assert!(
+                error.to_string().contains("candidate changed Cargo config"),
+                "{error}"
+            );
+            assert_eq!(model.calls(), 1, "self-review and reviewer never ran");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn baseline_cargo_env_stops_controls_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("controls-baseline-env");
+        let project = project(&dir);
+        let _ = real_control_fixture(&project, false);
+        std::fs::create_dir_all(project.join(".cargo")).expect("Cargo config dir");
+        std::fs::write(
+            project.join(".cargo/config.toml"),
+            "[env]\nRUSTFLAGS = { value = '/candidate', force = true }\n",
+        )
+        .expect("bound build environment");
+        plain_git(&project, &["add", "-A"]);
+        plain_git(&project, &["commit", "-q", "-m", "forced base config"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let pipeline = load(
+            &project,
+            "self-reviewed.workflow.yaml",
+            &controls_self_review_workflow(),
+        );
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "controls-baseline-env",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("controls-baseline-env")
+            .await
+            .expect_err("bound environment refuses");
+        assert!(
+            error.to_string().contains("can change host build inputs"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "self-review and reviewer never ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_coding_candidate_cannot_redefine_a_selected_control_row() {
+    on_codex_runtime(async {
+        let dir = scratch("changed-control-row");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_control_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "changed-control-row",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("the author waits in its worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        let worktree = find_worktree(&root).expect("author worktree");
+        std::fs::write(
+            worktree.join("scripts/controls/row-test.row"),
+            "row-test|src/guard.rs|guard_on|guard_off|-- trivial_test\n",
+        )
+        .expect("replace selected row");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("changed-control-row")
+            .await
+            .expect_err("candidate-owned row substitution is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("candidate changes a control definition"),
+            "{error}"
+        );
+        assert_eq!(
+            model.calls(),
+            1,
+            "proof, self-review and reviewer never ran"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn changing_the_selected_libtest_harness_or_path_stops_both_reviews() {
+    on_codex_runtime(async {
+        for (case, declaration, refusal) in [
+            (
+                "custom-control-harness",
+                "harness = false",
+                "nonstandard or disabled libtest harness",
+            ),
+            (
+                "redirected-control-target",
+                "path = \"src/alternate.rs\"",
+                "changes selected Cargo target",
+            ),
+        ] {
+            let dir = scratch(case);
+            let project = project(&dir);
+            let (pipeline, base) = real_control_fixture(&project, false);
+            plain_git(&dir, &["clone", "--no-local", "project", "bound-repo"]);
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+                },
+                Reply::Text(complete_control_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("scripted author and reviewers");
+            let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                case,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start coding run");
+            let root = dir.join("state/worktrees");
+            until("author waits in its candidate worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            let tree = find_worktree(&root).expect("candidate worktree");
+            let manifest = tree.join("Cargo.toml");
+            let original = std::fs::read_to_string(&manifest).expect("candidate Cargo manifest");
+            std::fs::write(manifest, format!("{original}\n[lib]\n{declaration}\n"))
+                .expect("modify candidate's selected target");
+            if case == "redirected-control-target" {
+                std::fs::copy(tree.join("src/lib.rs"), tree.join("src/alternate.rs"))
+                    .expect("alternative source exists and has the same tests");
+            }
+            std::fs::write(&release, "").expect("release author");
+            let error = rt
+                .result::<Value>(case)
+                .await
+                .expect_err("changed control target must fail")
+                .to_string();
+            assert!(
+                error.contains("row-test") && error.contains(refusal),
+                "{case}: {error}"
+            );
+            assert_eq!(model.calls(), 1, "{case}: only the author ran");
+            let checkpoints = rt.steps(case).await.expect("workflow history");
+            assert!(
+                !checkpoints
+                    .iter()
+                    .any(|step| step.name.starts_with("code.self_review.")
+                        || step.name.starts_with("code.review.")),
+                "{case}: a review began"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn candidate_controls_atom_cannot_forge_bound_or_base() {
+    on_codex_runtime(async {
+        for field in ["reference", "base"] {
+            let dir = scratch(field);
+            let project = project(&dir);
+            let (mut pipeline, base) = real_control_fixture(&project, false);
+            pipeline
+                .atoms
+                .get_mut("prove-controls")
+                .expect("proof atom")
+                .frontmatter["exec"]["command"] = json!(["python3", "tools/fake-passed-proof.py"]);
+            std::fs::write(
+                project.join("tools/fake-passed-proof.py"),
+                format!("import json,sys\nr=json.load(sys.stdin); r['bound']['{field}']='forged'; print(json.dumps({{'ok':True,'source':r['source'],'commit':r['commit'],'bound':r['bound'],'rows':[{{'name':'row-test','verdict':'passed','detail':'forged'}}]}}))\n"),
+            ).expect("fake proof command");
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(complete_real_control_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                field,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            rt.result::<Value>(field)
+                .await
+                .expect("host proof ignores candidate command");
+            let published = rt.recorded_candidates(field).await.expect("candidates");
+            let proof = &published["code.controls.0.0"].proposal.output;
+            let coding = &published["code"].proposal.metadata;
+            assert_eq!(proof["bound"]["reference"], coding["commit_ref"]);
+            assert_eq!(proof["bound"]["base"], coding["base"]);
+            assert_eq!(model.calls(), 3);
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_blind_host_control_refuses_before_self_review_or_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("blind-host-control");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, true);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_control_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "blind-host-control",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("blind-host-control")
+            .await
+            .expect_err("blind row must refuse")
+            .to_string();
+        assert!(
+            error.contains("row-test") && error.contains("blind"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "only the coding author ran");
+        let published = rt
+            .recorded_candidates("blind-host-control")
+            .await
+            .expect("candidates");
+        assert!(
+            !published.contains_key("code.self_review.0"),
+            "{published:?}"
+        );
+        assert!(!published.contains_key("code.review.0"), "{published:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn self_review_cannot_substitute_a_claim_for_the_host_control_result() {
+    on_codex_runtime(async {
+        let dir = scratch("borrowed-control-result");
+        let project = project(&dir);
+        let (pipeline, base) = real_control_fixture(&project, false);
+        let mut evidence = complete_real_control_review();
+        evidence["controls"][0]["result"] = json!("a model's claimed pass");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "borrowed-control-result",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("borrowed-control-result")
+            .await
+            .expect_err("the host result must win")
+            .to_string();
+        assert!(
+            error.contains("result for `row-test` differs from the host"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "the independent reviewer never ran");
+        let published = rt
+            .recorded_candidates("borrowed-control-result")
+            .await
+            .expect("candidates");
+        assert_eq!(
+            published["code.controls.0.0"].proposal.output["rows"][0]["verdict"],
+            "passed"
+        );
+        assert!(!published.contains_key("code.review.0"), "{published:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn coding_controls_refuse_without_a_proof_atom_before_a_model_turn() {
+    let dir = scratch("missing-host-controls-atom");
+    let project = project(&dir);
+    let (mut pipeline, base) = self_reviewed_with_control(&project, false);
+    let original = controls_self_review_workflow();
+    let omitted = original.replace("        controls_atom: prove-controls\n", "");
+    assert_ne!(omitted, original);
+    let error = try_load(&project, "missing-host-controls.workflow.yaml", &omitted)
+        .expect_err("source loader refuses unproved controls");
+    assert!(error.contains("controls_atom"), "{error}");
+    let Step::Atom(step) = &mut pipeline.steps[0] else {
+        panic!("coding step")
+    };
+    step.review
+        .as_mut()
+        .and_then(|review| review.self_review.as_mut())
+        .expect("self-review")
+        .controls_atom = None;
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "missing-host-controls-atom",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("missing-host-controls-atom")
+            .await
+            .expect_err("run admission refuses")
+            .to_string();
+        assert!(error.contains("controls_atom"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn controls_proof_requires_repeatable_effects_before_any_model_turn() {
+    let dir = scratch("controls-proof-replay-contract");
+    let project = project(&dir);
+    let _ = self_reviewed_with_control(&project, false);
+    let file = project.join("atoms/prove-controls.atom.astro");
+    let original = std::fs::read_to_string(&file).expect("proof atom");
+    let changed = original.replace(", effects: { external: 'idempotent' }", "");
+    assert_ne!(changed, original);
+    std::fs::write(&file, changed).expect("remove replay promise");
+    let error = try_load(
+        &project,
+        "controls-proof-replay-contract.workflow.yaml",
+        &controls_self_review_workflow(),
+    )
+    .expect_err("source loader refuses unknown exec outcome on replay");
+    assert!(error.contains("idempotent or read-only"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn controls_proof_refuses_declared_network_before_any_model_turn() {
+    let dir = scratch("controls-proof-no-network");
+    let project = project(&dir);
+    let (mut pipeline, base) = self_reviewed_with_control(&project, false);
+    let file = project.join("atoms/prove-controls.atom.astro");
+    let original = std::fs::read_to_string(&file).expect("proof atom");
+    let changed = original.replace(
+        "effects: { external: 'idempotent' }",
+        "effects: { external: 'idempotent' }, network: { allow: ['example.com'] }",
+    );
+    assert_ne!(changed, original);
+    std::fs::write(&file, changed).expect("declare network");
+    let error = try_load(
+        &project,
+        "controls-proof-network.workflow.yaml",
+        &controls_self_review_workflow(),
+    )
+    .expect_err("source loader refuses a network-capable proof");
+    assert!(error.contains("no network hosts"), "{error}");
+    std::fs::write(&file, original).expect("restore pinned proof atom");
+    pipeline
+        .atoms
+        .get_mut("prove-controls")
+        .expect("proof atom")
+        .frontmatter["network"] = json!({"allow": ["example.com"]});
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "controls-proof-network",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("controls-proof-network")
+            .await
+            .expect_err("run admission refuses network")
+            .to_string();
+        assert!(error.contains("no network hosts"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn controls_proof_requires_the_linux_exec_sandbox() {
+    let dir = scratch("controls-proof-linux-only");
+    let project = project(&dir);
+    let (mut pipeline, base) = self_reviewed(&project);
+    let error = try_load(
+        &project,
+        "controls-proof-linux-only.workflow.yaml",
+        &controls_self_review_workflow(),
+    )
+    .expect_err("source loader refuses controls without Linux sandbox");
+    assert!(error.contains("Linux exec sandbox"), "{error}");
+    let Step::Atom(step) = &mut pipeline.steps[0] else {
+        panic!("coding step")
+    };
+    let self_review = step
+        .review
+        .as_mut()
+        .and_then(|review| review.self_review.as_mut())
+        .expect("self-review");
+    self_review.selected_controls.push("row-test".into());
+    self_review.controls_atom = Some("self-check".into());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "controls-proof-linux-only",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("controls-proof-linux-only")
+            .await
+            .expect_err("run admission refuses controls without sandbox")
+            .to_string();
+        assert!(error.contains("Linux exec sandbox"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn reviewer_gets_the_exact_nonempty_host_patch_with_self_review_evidence() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-real-diff");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let evidence = complete_self_review();
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-real-diff",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("the author waits in its worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        let worktree = find_worktree(&root).expect("author worktree");
+        std::fs::write(worktree.join("code.txt"), "after\n").expect("simulate author edit");
+        std::fs::write(&release, "").expect("release author");
+        let out: Value = rt.result("self-review-real-diff").await.expect("completed");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        let published = rt
+            .recorded_candidates("self-review-real-diff")
+            .await
+            .expect("candidates");
+        let diff = published["code"].proposal.metadata["diff"]
+            .as_str()
+            .expect("host patch");
+        assert!(
+            diff.contains("-before\n") && diff.contains("+after\n"),
+            "{diff}"
+        );
+        let encoded = serde_json::to_string(diff).expect("encoded patch");
+        let review_request = model.requests()[2].to_string();
+        assert!(
+            review_request.contains(encoded.trim_matches('"')),
+            "{review_request}"
+        );
+        assert!(
+            review_request.contains("no controls were selected"),
+            "{review_request}"
+        );
+        assert!(
+            review_request.contains("path=\\\"input.diff\\\" origin=\\\"external\\\""),
+            "{review_request}"
+        );
+        assert_eq!(published["code.self_review.0"].proposal.output, evidence);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn coding_panel_requires_both_fresh_reviewers_before_publication() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-review-panel-approve");
+        let project = project(&dir);
+        let (pipeline, base) = panel_reviewed(&project);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "coding-review-panel-approve",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root).expect("worktree").join("code.txt"),
+            "after\n",
+        )
+        .expect("author edit");
+        std::fs::write(&release, "").expect("release author");
+        let out: Value = rt
+            .result("coding-review-panel-approve")
+            .await
+            .expect("approved");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 4);
+        let published = rt
+            .recorded_candidates("coding-review-panel-approve")
+            .await
+            .expect("candidates");
+        assert_eq!(
+            published["code.review.0.0"].proposal.output["verdict"],
+            "approve"
+        );
+        assert_eq!(
+            published["code.review.0.1"].proposal.output["verdict"],
+            "approve"
+        );
+        assert!(published.contains_key("code"), "{published:?}");
+        for request in &model.requests()[2..] {
+            let text = request.to_string();
+            assert!(
+                text.contains("path=\\\"input.diff\\\" origin=\\\"external\\\""),
+                "{text}"
+            );
+            assert!(
+                text.contains("path=\\\"input.host_review\\\" origin=\\\"external\\\"")
+                    && text.contains("candidate publication"),
+                "each panel member receives the reviewed host inventory: {text}"
+            );
+            assert!(
+                !text.contains("Return the change for"),
+                "author task leaked: {text}"
+            );
+        }
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn coding_panel_either_rejection_blocks_publication() {
+    for rejected in 0..2 {
+        on_codex_runtime(async move {
+            let name = format!("coding-review-panel-reject-{rejected}");
+            let dir = scratch(&name);
+            let project = project(&dir);
+            let (pipeline, base) = panel_reviewed(&project);
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+                },
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(
+                    json!({"verdict": if rejected == 0 { "request_changes" } else { "approve" }})
+                        .to_string(),
+                ),
+                Reply::Text(
+                    json!({"verdict": if rejected == 1 { "request_changes" } else { "approve" }})
+                        .to_string(),
+                ),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                &name,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let root = dir.join("state/worktrees");
+            until("author worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            std::fs::write(
+                find_worktree(&root).expect("worktree").join("code.txt"),
+                "after\n",
+            )
+            .expect("author edit");
+            std::fs::write(&release, "").expect("release author");
+            let g = open_gate(&rt, &name).await;
+            let published = rt.recorded_candidates(&name).await.expect("candidates");
+            assert_eq!(model.calls(), 4);
+            assert!(!published.contains_key("code"), "{published:?}");
+            assert!(published.contains_key("code.review.0.0"));
+            assert!(published.contains_key("code.review.0.1"));
+            decide(&rt, &g, Verdict::Reject, "a reviewer found a problem").await;
+            rt.result::<Value>(&name).await.expect_err("rejected");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+    }
+}
+
+#[test]
+fn coding_panel_repairs_then_requires_both_reviewers_again() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-review-panel-repair");
+        let project = project(&dir);
+        let (mut pipeline, base) = panel_reviewed(&project);
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding step")
+        };
+        step.review.as_mut().expect("review").rounds = 1;
+        let release_first = dir.join("release-author-first");
+        let release_repair = dir.join("release-author-repair");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release_first.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+            Reply::Text(json!({"verdict": "request_changes", "findings": [{"message": "The first attempt misses the required edge case."}]}).to_string()),
+            Reply::Gated {
+                file: release_repair.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "coding-panel-repair",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("first author worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        let first = find_worktree(&root).expect("first author worktree");
+        std::fs::write(first.join("code.txt"), "first attempt\n").expect("first edit");
+        std::fs::write(&release_first, "").expect("release first author");
+        until("repair author worktree", || {
+            model.calls() == 5 && find_other_worktree(&root, &first).is_some()
+        })
+        .await;
+        let published = rt
+            .recorded_candidates("coding-panel-repair")
+            .await
+            .expect("candidates");
+        assert!(
+            !published.contains_key("code"),
+            "first rejected candidate published: {published:?}"
+        );
+        let second = find_other_worktree(&root, &first).expect("repair worktree");
+        std::fs::write(second.join("code.txt"), "repaired attempt\n").expect("repair edit");
+        std::fs::write(&release_repair, "").expect("release repair author");
+        let out: Value = rt
+            .result("coding-panel-repair")
+            .await
+            .expect("both approve repair");
+        assert_eq!(out["done"], true);
+        assert_eq!(
+            model.calls(),
+            8,
+            "one author repair and two reviewer turns per candidate"
+        );
+        let published = rt
+            .recorded_candidates("coding-panel-repair")
+            .await
+            .expect("candidates");
+        for round in 0..2 {
+            for index in 0..2 {
+                assert!(
+                    published.contains_key(&format!("code.review.{round}.{index}")),
+                    "{published:?}"
+                );
+            }
+        }
+        assert_eq!(
+            published["code.review.0.1"].proposal.output["verdict"],
+            "request_changes"
+        );
+        assert_eq!(
+            published["code.review.1.0"].proposal.output["verdict"],
+            "approve"
+        );
+        assert_eq!(
+            published["code.review.1.1"].proposal.output["verdict"],
+            "approve"
+        );
+        assert!(
+            published.contains_key("code"),
+            "repaired candidate not published: {published:?}"
+        );
+        let repair_request = model.requests()[4].to_string();
+        assert!(
+            repair_request.contains("code-reviewer-two"),
+            "{repair_request}"
+        );
+        assert!(
+            repair_request.contains("request_changes"),
+            "{repair_request}"
+        );
+        assert!(
+            repair_request.contains("The first attempt misses the required edge case."),
+            "exact reviewer finding missing from repair: {repair_request}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn coding_panel_recovery_does_not_repeat_first_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-review-panel-crash");
+        let project = project(&dir);
+        let (_, _) = panel_reviewed(&project);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let (child_dir, child_url) = (dir.clone(), url.clone());
+        let first = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "start-coding-panel",
+                "coding-panel-crash",
+                Some("checkpoint:after:code.review.0.0.publish"),
+            )
+        });
+        let root = dir.join("state/worktrees");
+        until("author worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root).expect("worktree").join("code.txt"),
+            "after\n",
+        )
+        .expect("author edit");
+        std::fs::write(&release, "").expect("release author");
+        let status = first.await.expect("child");
+        assert!(!status.success(), "first process was killed: {status}");
+        assert_eq!(model.calls(), 3, "first reviewer finished once");
+        let (child_dir, child_url) = (dir.clone(), url);
+        let status = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "recover",
+                "coding-panel-crash",
+                None,
+            )
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "recovery finished: {status}");
+        assert_eq!(model.calls(), 4, "finished reviewer did not repeat");
+        let output: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+        )
+        .expect("output");
+        assert_eq!(output["done"], true);
+    });
+}
+
+#[test]
+fn recovered_panel_refuses_stale_main_before_unfinished_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-panel-main-advanced");
+        let project = project(&dir);
+        let (_, _) = panel_reviewed(&project);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let (child_dir, child_url) = (dir.clone(), url.clone());
+        let first = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "start-coding-panel",
+                "coding-panel-main-advanced",
+                Some("checkpoint:after:code.review.0.0.publish"),
+            )
+        });
+        let root = dir.join("state/worktrees");
+        until("author worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root).expect("worktree").join("code.txt"),
+            "after\n",
+        )
+        .expect("author edit");
+        std::fs::write(&release, "").expect("release author");
+        let status = first.await.expect("child");
+        assert!(!status.success(), "first process was killed: {status}");
+        assert_eq!(model.calls(), 3, "first reviewer completed once");
+        std::fs::write(project.join("code.txt"), "main advanced\n")
+            .expect("advance protected main");
+        plain_git(&project, &["add", "code.txt"]);
+        plain_git(&project, &["commit", "-q", "-m", "advance main"]);
+        let advanced = plain_git(&project, &["rev-parse", "HEAD"]);
+        plain_git(&project, &["update-ref", "refs/heads/main", &advanced]);
+        let (child_dir, child_url) = (dir.clone(), url);
+        let status = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "recover",
+                "coding-panel-main-advanced",
+                None,
+            )
+        })
+        .await
+        .expect("recover child");
+        assert!(status.success(), "recovery process: {status}");
+        let error = std::fs::read_to_string(dir.join("error.txt")).expect("freshness refusal");
+        assert!(
+            error.contains("protected main advanced after the recorded trial merge")
+                && error.contains("start a new run"),
+            "{error}"
+        );
+        assert_eq!(
+            model.calls(),
+            3,
+            "completed review did not repeat; new reviewer did not run"
+        );
+    });
+}
+
+#[test]
+fn coding_panel_selection_is_fixed_by_workflow_source() {
+    let dir = scratch("coding-review-panel-policy");
+    let project = project(&dir);
+    let _ = panel_reviewed(&project);
+    let source = std::fs::read_to_string(project.join("workflows/panel.workflow.yaml"))
+        .expect("panel workflow");
+    for (replacement, expected) in [
+        (
+            "candidate.output.reviewers",
+            "names exactly two reviewer atoms",
+        ),
+        ("[code-reviewer, code-reviewer]", "appears twice"),
+    ] {
+        let changed = source.replace("[code-reviewer, code-reviewer-two]", replacement);
+        let error = try_load(&project, "invalid-panel.workflow.yaml", &changed)
+            .expect_err("reviewer selection is fixed");
+        assert!(error.contains(expected), "{error}");
+    }
+    let changed = source.replace("require: all", "require: majority");
+    let error = try_load(&project, "invalid-panel.workflow.yaml", &changed)
+        .expect_err("only all reviewers supported");
+    assert!(error.contains("requires `require: all`"), "{error}");
+}
+
+#[test]
+fn incomplete_self_review_evidence_refuses_before_reviewer_turn() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-missing");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let mut evidence = complete_self_review();
+        evidence["items"]
+            .as_object_mut()
+            .expect("items")
+            .remove("4");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-2",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("self-review-2")
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("self-review evidence is incomplete"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "the reviewer was never dispatched");
+        let published = rt
+            .recorded_candidates("self-review-2")
+            .await
+            .expect("candidates");
+        assert!(!published.contains_key("code.review.0"), "{published:?}");
+        assert!(!published.contains_key("code"), "{published:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn host_decision_inventory_refuses_workflow_and_model_omission_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("host-decisions-omitted");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed(&project);
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        step.review
+            .as_mut()
+            .expect("review")
+            .self_review
+            .as_mut()
+            .expect("self-review")
+            .decision_points
+            .clear();
+        let mut evidence = complete_self_review();
+        evidence["decisions"] = json!([]);
+        evidence["items"]["9"] = json!("N/A: the workflow declares no decision points");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "host-decisions-omitted",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("host-decisions-omitted")
+            .await
+            .expect_err("host decision inventory refuses omission")
+            .to_string();
+        assert!(
+            error
+                .contains("workflow omits host-inventoried decision point `candidate publication`"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "neither self-reviewer nor reviewer runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_touched_control_refuses_workflow_and_model_omission_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("host-control-omitted");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed_with_control(&project, false);
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        let self_review = step
+            .review
+            .as_mut()
+            .expect("review")
+            .self_review
+            .as_mut()
+            .expect("self-review");
+        self_review.selected_controls.clear();
+        self_review.controls_atom = None;
+        let mut evidence = complete_control_review();
+        evidence["controls"] = json!([]);
+        evidence["items"]["10"] = json!("N/A: the workflow declares no selected controls");
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(evidence.to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "host-control-omitted",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in its coding worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("author worktree")
+                .join("code.txt"),
+            "after\n",
+        )
+        .expect("touch control's switched file");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("host-control-omitted")
+            .await
+            .expect_err("host touched control refuses omission")
+            .to_string();
+        assert!(
+            error.contains("workflow omits touched control row `row-test`"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "no self-review or reviewer turn runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn host_selects_qualified_guard_and_every_test_target_before_reviewer() {
+    on_codex_runtime(async {
+        for (case, args, changed_path, before, after) in [
+            (
+                "qualified",
+                "-- module::guard_row",
+                "checks/guard.rs",
+                "guard_row\n",
+                "guard_row changed\n",
+            ),
+            (
+                "first-target",
+                "--test first --test second -- unrelated_filter",
+                "crates/atomic/tests/first.rs",
+                "before\n",
+                "after\n",
+            ),
+        ] {
+            let dir = scratch(&format!("host-select-{case}"));
+            let project = project(&dir);
+            let (mut pipeline, _) = self_reviewed_with_control(&project, false);
+            std::fs::write(
+                project.join("scripts/controls/row-test.row"),
+                format!("row-test|code.txt|before|after|{args}\n"),
+            )
+            .expect("row");
+            let path = project.join(changed_path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            std::fs::write(&path, before).expect("guarding source");
+            plain_git(&project, &["add", "."]);
+            plain_git(&project, &["commit", "-q", "-m", "guard selector"]);
+            let base = plain_git(&project, &["rev-parse", "HEAD"]);
+            let Step::Atom(step) = &mut pipeline.steps[0] else {
+                panic!("coding atom")
+            };
+            let self_review = step
+                .review
+                .as_mut()
+                .expect("review")
+                .self_review
+                .as_mut()
+                .expect("self-review");
+            self_review.selected_controls.clear();
+            self_review.controls_atom = None;
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+                },
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict":"approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            let id = format!("host-select-{case}");
+            rt.start(
+                PIPELINE,
+                &id,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text":"a code change","base":base}),
+                },
+            )
+            .await
+            .expect("start");
+            let root = dir.join("state/worktrees");
+            until("author waits in worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            std::fs::write(
+                find_worktree(&root).expect("worktree").join(changed_path),
+                after,
+            )
+            .expect("change guard");
+            std::fs::write(&release, "").expect("release author");
+            let error = rt
+                .result::<Value>(&id)
+                .await
+                .expect_err("omitted touched row refuses")
+                .to_string();
+            assert!(
+                error.contains("workflow omits touched control row `row-test`"),
+                "{case}: {error}"
+            );
+            assert_eq!(model.calls(), 1, "{case}: no self-review or reviewer turn");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn normalized_shared_reader_change_refuses_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("normalized-shared-reader");
+        let project = project(&dir);
+        let (pipeline, _) = self_reviewed_with_control(&project, false);
+        std::fs::create_dir_all(project.join("checks")).expect("checks");
+        std::fs::write(project.join("checks/helper.rs"), "before\n").expect("helper");
+        std::fs::write(
+            project.join("scripts/controls-shared.txt"),
+            " ./checks/helper.rs : --test\n",
+        )
+        .expect("shared readers");
+        std::fs::write(
+            project.join("scripts/controls/row-test.row"),
+            "row-test|code.txt|before|after|--test guard -- guard_row\n",
+        )
+        .expect("row");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "shared reader"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "normalized-shared-reader",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("worktree")
+                .join("checks/helper.rs"),
+            "after\n",
+        )
+        .expect("change shared reader");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("normalized-shared-reader")
+            .await
+            .expect_err("shared reader must refuse")
+            .to_string();
+        assert!(
+            error.contains("candidate changes shared control reader `checks/helper.rs`"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "reviewer never runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn included_fixture_and_shared_test_code_cannot_omit_control_row() {
+    on_codex_runtime(async {
+        for (case, changed_path, source, alias, expected) in [
+            (
+                "included",
+                "fixtures/data.txt",
+                Some("include_str!(\"../../../fixtures/data.txt\");\n"),
+                false,
+                "workflow omits touched control row `row-test`",
+            ),
+            (
+                "shared",
+                "crates/atomic/tests/support/helper.rs",
+                None,
+                false,
+                "workflow omits touched control row `row-test`",
+            ),
+            (
+                "escaped",
+                "fixtures/data.txt",
+                Some("include_str!(\"../../../fixtures/\\u{64}ata.txt\");\n"),
+                false,
+                "cannot select controls through an escaped Rust source reference",
+            ),
+            (
+                "aliased",
+                "fixtures/data.txt",
+                Some("include_str!(\"../../../alias.txt\");\n"),
+                true,
+                "cannot select controls through a tracked path alias",
+            ),
+        ] {
+            let dir = scratch(&format!("host-expansion-{case}"));
+            let project = project(&dir);
+            let (mut pipeline, _) = self_reviewed_with_control(&project, false);
+            std::fs::write(
+                project.join("scripts/controls/row-test.row"),
+                "row-test|code.txt|before|after|--test guard -- unrelated_filter\n",
+            )
+            .expect("row");
+            if let Some(source) = source {
+                let target = project.join("crates/atomic/tests/guard.rs");
+                std::fs::create_dir_all(target.parent().expect("parent"))
+                    .expect("target directory");
+                std::fs::write(target, source).expect("include source");
+            }
+            let path = project.join(changed_path);
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+            std::fs::write(&path, "before\n").expect("fixture or helper");
+            if alias {
+                std::os::unix::fs::symlink("fixtures/data.txt", project.join("alias.txt"))
+                    .expect("tracked included alias");
+            }
+            plain_git(&project, &["add", "."]);
+            plain_git(&project, &["commit", "-q", "-m", "test source"]);
+            let base = plain_git(&project, &["rev-parse", "HEAD"]);
+            let Step::Atom(step) = &mut pipeline.steps[0] else {
+                panic!("coding atom")
+            };
+            let self_review = step
+                .review
+                .as_mut()
+                .expect("review")
+                .self_review
+                .as_mut()
+                .expect("self-review");
+            self_review.selected_controls.clear();
+            self_review.controls_atom = None;
+            let release = dir.join("release-author");
+            let model = FakeModel::start(vec![
+                Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+                },
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict":"approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            let id = format!("host-expansion-{case}");
+            rt.start(
+                PIPELINE,
+                &id,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text":"a code change", "base":base}),
+                },
+            )
+            .await
+            .expect("start");
+            let root = dir.join("state/worktrees");
+            until("author waits in worktree", || {
+                model.calls() == 1 && find_worktree(&root).is_some()
+            })
+            .await;
+            std::fs::write(
+                find_worktree(&root).expect("worktree").join(changed_path),
+                "after\n",
+            )
+            .expect("change source");
+            std::fs::write(&release, "").expect("release author");
+            let error = rt
+                .result::<Value>(&id)
+                .await
+                .expect_err("CI-touched row omission refuses")
+                .to_string();
+            assert!(error.contains(expected), "{case}: {error}");
+            assert_eq!(model.calls(), 1, "{case}: reviewer never runs");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_rust_path_string_with_backslash_does_not_block_coding_review() {
+    on_codex_runtime(async {
+        let dir = scratch("ordinary-rust-path-string");
+        let project = project(&dir);
+        let (pipeline, _) = self_reviewed(&project);
+        std::fs::create_dir_all(project.join("src")).expect("source directory");
+        std::fs::write(
+            project.join("src/ordinary.rs"),
+            "fn path() -> &'static str { \"C:\\\\temp\" }\n",
+        )
+        .expect("ordinary source");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "ordinary source"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "ordinary-rust-path-string",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("worktree")
+                .join("src/ordinary.rs"),
+            "fn path() -> &'static str { \"D:\\\\temp\" }\n",
+        )
+        .expect("ordinary edit");
+        std::fs::write(&release, "").expect("release author");
+        let out: Value = rt
+            .result("ordinary-rust-path-string")
+            .await
+            .expect("ordinary source must not trigger reference refusal");
+        assert_eq!(out["done"], true);
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn plain_tests_literal_and_lib_row_cannot_be_omitted_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("plain-tests-literal-lib-row");
+        let project = project(&dir);
+        let (mut pipeline, _) = self_reviewed_with_control(&project, false);
+        std::fs::write(
+            project.join("scripts/controls/row-test.row"),
+            "row-test|code.txt|before|after|-p atomic-agentic --lib -- guard_row\n",
+        )
+        .expect("lib row");
+        std::fs::create_dir_all(project.join("crates/atomic/tests")).expect("test directory");
+        std::fs::write(
+            project.join("crates/atomic/tests/guard.rs"),
+            "const DATA: &str = \"tests/other.rs\";\n",
+        )
+        .expect("plain test reader");
+        std::fs::write(project.join("crates/atomic/tests/other.rs"), "before\n")
+            .expect("test data");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "plain test data"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        let self_review = step
+            .review
+            .as_mut()
+            .expect("review")
+            .self_review
+            .as_mut()
+            .expect("self-review");
+        self_review.selected_controls.clear();
+        self_review.controls_atom = None;
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "plain-tests-literal-lib-row",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("worktree")
+                .join("crates/atomic/tests/other.rs"),
+            "after\n",
+        )
+        .expect("change plain test data");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("plain-tests-literal-lib-row")
+            .await
+            .expect_err("CI touched lib row must not be omitted")
+            .to_string();
+        assert!(
+            error.contains("workflow omits touched control row `row-test`"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "no reviewer runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reviewed_decision_inventory_refuses_missing_malformed_and_link_loop_base() {
+    on_codex_runtime(async {
+        for (kind, expected) in [
+            ("missing", "is absent from the bound base"),
+            ("malformed", "reviewed decision inventory is invalid"),
+            (
+                "link-loop",
+                "is not a fixed regular blob from the bound base",
+            ),
+        ] {
+            let dir = scratch(&format!("inventory-{kind}"));
+            let project = project(&dir);
+            let (pipeline, _) = self_reviewed(&project);
+            let inventory = project.join(".atomic/coding-decision-inventory.json");
+            match kind {
+                "missing" => std::fs::remove_file(&inventory).expect("remove inventory"),
+                "malformed" => {
+                    std::fs::write(&inventory, "{invalid-json\n").expect("malformed inventory")
+                }
+                "link-loop" => {
+                    std::fs::remove_file(&inventory).expect("remove regular inventory");
+                    std::os::unix::fs::symlink("coding-decision-inventory.json", &inventory)
+                        .expect("link inventory to itself");
+                }
+                _ => unreachable!(),
+            }
+            plain_git(&project, &["add", "-A"]);
+            plain_git(&project, &["commit", "-q", "-m", kind]);
+            let base = plain_git(&project, &["rev-parse", "HEAD"]);
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(complete_self_review().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                kind,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let error = rt
+                .result::<Value>(kind)
+                .await
+                .expect_err("bad reviewed inventory is refused")
+                .to_string();
+            assert!(error.contains(expected), "{kind}: {error}");
+            assert_eq!(model.calls(), 1, "{kind}: no reviewer reached");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[test]
+fn candidate_cannot_rewrite_reviewed_decision_inventory_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("candidate-inventory-change");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "candidate-inventory-change",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in its coding worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("author worktree")
+                .join(".atomic/coding-decision-inventory.json"),
+            r#"{"version":1,"decision_points":[]}"#,
+        )
+        .expect("candidate attempts to erase reviewed point");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("candidate-inventory-change")
+            .await
+            .expect_err("candidate inventory change is refused")
+            .to_string();
+        assert!(
+            error.contains("is not a fixed regular blob from the bound base"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "reviewer never runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn earlier_unreviewed_worktree_cannot_replace_admitted_decision_inventory() {
+    on_codex_runtime(async {
+        let dir = scratch("earlier-unreviewed-inventory");
+        let project = project(&dir);
+        let (_, base) = self_reviewed(&project);
+        let workflow = SELF_REVIEW_WORKFLOW.replace(
+            "steps:\n  code:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n",
+            "steps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  code:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n",
+        );
+        assert_ne!(workflow, SELF_REVIEW_WORKFLOW);
+        let pipeline = load(&project, "earlier-unreviewed.workflow.yaml", &workflow);
+        let release = dir.join("release-seed");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "earlier-unreviewed-inventory",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("unreviewed seed waits in its worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("seed worktree")
+                .join(".atomic/coding-decision-inventory.json"),
+            r#"{"version":1,"decision_points":[]}"#,
+        )
+        .expect("seed erases inventory point");
+        std::fs::write(&release, "").expect("release seed");
+        let error = rt
+            .result::<Value>("earlier-unreviewed-inventory")
+            .await
+            .expect_err("coding review rejects inventory rewritten by earlier step")
+            .to_string();
+        assert!(
+            error.contains("is not a fixed regular blob from the bound base"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "no self-review or reviewer ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn earlier_unreviewed_worktree_cannot_replace_admitted_control_row() {
+    on_codex_runtime(async {
+        let dir = scratch("earlier-unreviewed-row");
+        let project = project(&dir);
+        let (_, base) = self_reviewed_with_control(&project, false);
+        let source = controls_self_review_workflow();
+        let workflow = source.replace(
+            "steps:\n  code:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n",
+            "steps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  code:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n",
+        );
+        assert_ne!(workflow, source);
+        let pipeline = load(&project, "earlier-unreviewed-row.workflow.yaml", &workflow);
+        let release = dir.join("release-seed");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(json!({"done":true}).to_string()),
+            Reply::Text(complete_control_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "earlier-unreviewed-row",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("unreviewed seed waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("seed worktree")
+                .join("scripts/controls/row-test.row"),
+            "row-test|code.txt|before|after|-- other_guard\n",
+        )
+        .expect("seed rewrites row");
+        std::fs::write(&release, "").expect("release seed");
+        let error = rt
+            .result::<Value>("earlier-unreviewed-row")
+            .await
+            .expect_err("coding review rejects earlier row rewrite")
+            .to_string();
+        assert!(
+            error.contains("candidate changes a control definition"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "no self-review or reviewer ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn admitted_control_base_survives_old_layout_stop_and_recovery() {
+    on_codex_runtime(async {
+        let dir = scratch("admitted-base-old-layout-recovery");
+        let project = project(&dir);
+        let (_, _) = self_reviewed_with_control(&project, false);
+        let source = controls_self_review_workflow();
+        let workflow = source.replace(
+            "steps:\n  code:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n",
+            "steps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  code:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n",
+        );
+        assert_ne!(workflow, source);
+        std::fs::write(
+            project.join("workflows/admission-recovery.workflow.yaml"),
+            workflow,
+        )
+        .expect("recovery workflow");
+        let release = dir.join("release-seed");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(json!({"done":true}).to_string()),
+            Reply::Text(complete_control_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let (child_dir, child_url) = (dir.clone(), url.clone());
+        let first = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "start-two-step-admission",
+                "admission-recovery",
+                Some("checkpoint:after:seed.publish"),
+            )
+        });
+        let root = dir.join("state/worktrees");
+        until("seed waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("seed worktree")
+                .join("scripts/controls/row-test.row"),
+            "row-test|code.txt|before|after|-- other_guard\n",
+        )
+        .expect("seed rewrites row");
+        std::fs::write(&release, "").expect("release seed");
+        let status = first.await.expect("child");
+        assert!(
+            !status.success(),
+            "first process stopped at old layout checkpoint: {status}"
+        );
+        assert_eq!(model.calls(), 1);
+        let inspect = engine(&dir, &url).await;
+        let names: Vec<String> = inspect
+            .steps("admission-recovery")
+            .await
+            .expect("old layout steps")
+            .into_iter()
+            .map(|step| step.name)
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "pin.reviewed_base"),
+            "admission pin added a checkpoint: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "seed.publish"),
+            "seed publication missing: {names:?}"
+        );
+        inspect
+            .shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("inspection shutdown");
+        let (child_dir, child_url) = (dir.clone(), url);
+        let status = tokio::task::spawn_blocking(move || {
+            child(
+                &child_dir,
+                &child_url,
+                "recover",
+                "admission-recovery",
+                None,
+            )
+        })
+        .await
+        .expect("recover child");
+        assert!(status.success(), "recovery process: {status}");
+        let error = std::fs::read_to_string(dir.join("error.txt")).expect("recovery refusal");
+        assert!(
+            error.contains("candidate changes a control definition"),
+            "{error}"
+        );
+        assert_eq!(
+            model.calls(),
+            2,
+            "coding turn ran once; reviewers never ran"
+        );
+    });
+}
+
+/// Run explicitly with `ATOMIC_TEST_PRECHANGE_BINARY=/path/to/atomic`, a
+/// writable `ATOMIC_TEST_CROSS_HOME_ROOT` outside `/tmp` and the project, and
+/// `cargo test ... -- --ignored --exact old_binary_worktree_history_resumes_with_current_binary`.
+/// The historical binary is intentionally not a CI dependency.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicitly supplied pre-change atomic binary"]
+fn old_binary_worktree_history_resumes_with_current_binary() {
+    on_codex_runtime(async {
+        let old_binary = std::env::var("ATOMIC_TEST_PRECHANGE_BINARY")
+            .expect("set ATOMIC_TEST_PRECHANGE_BINARY to a pre-change atomic binary");
+        let dir = scratch("cross-binary-worktree-recovery");
+        let home_root = std::env::var("ATOMIC_TEST_CROSS_HOME_ROOT")
+            .expect("set ATOMIC_TEST_CROSS_HOME_ROOT outside /tmp and the project");
+        let atomic_home = std::path::PathBuf::from(home_root)
+            .join(format!("m58-cross-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&atomic_home).expect("persistent atomic state");
+        let project = project(&dir);
+        let (_, _) = self_reviewed(&project);
+        let workflow = "atomic: 1\nname: cross-binary-worktrees\ninput: {type: object, additionalProperties: false, required: [text, base], properties: {text: {type: string}, base: {type: string}}}\noutput: { $ref: ../atoms/code-author.output.schema.json }\nsteps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  next:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n    worktree: true\nreturns: steps.next.output\n";
+        let workflow_path = project.join("workflows/cross-binary.workflow.yaml");
+        std::fs::write(&workflow_path, workflow).expect("workflow");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "cross binary workflow"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        let release = dir.join("release-second-model");
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done":true}).to_string()),
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(json!({"done":true}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let run_id = "cross-binary-worktree-recovery";
+        let input = json!({"text":"a code change","base":base}).to_string();
+        let old_stdout = std::fs::File::create(dir.join("old.stdout")).expect("old stdout");
+        let old_stderr = std::fs::File::create(dir.join("old.stderr")).expect("old stderr");
+        let mut old = std::process::Command::new(&old_binary)
+            .arg("run")
+            .arg(&workflow_path)
+            .args(["--project", project.to_str().expect("project path")])
+            .args(["--fixture", project.to_str().expect("fixture path")])
+            .args(["--fixture-rev", &base])
+            .args([
+                "--data",
+                &input,
+                "--run-id",
+                run_id,
+                "--model-base-url",
+                &url,
+                "--model",
+                "synthetic",
+                "--json",
+            ])
+            .stdout(old_stdout)
+            .stderr(old_stderr)
+            .env("ATOMIC_HOME", &atomic_home)
+            .spawn()
+            .expect("start pre-change binary");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        while model.calls() < 2 {
+            if let Some(status) = old.try_wait().expect("poll old binary") {
+                panic!(
+                    "pre-change binary exited before second turn ({status}): {}",
+                    std::fs::read_to_string(dir.join("old.stderr")).unwrap_or_default()
+                );
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre-change binary did not reach its second model turn: {}",
+                std::fs::read_to_string(dir.join("old.stderr")).unwrap_or_default()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        old.kill().expect("kill old process after seed publication");
+        let status = old.wait().expect("reap old process");
+        assert!(!status.success(), "old process was killed");
+        let old_history = std::process::Command::new(&old_binary)
+            .args([
+                "runs",
+                "show",
+                run_id,
+                "--project",
+                project.to_str().expect("project"),
+                "--json",
+            ])
+            .env("ATOMIC_HOME", &atomic_home)
+            .output()
+            .expect("inspect old history");
+        assert!(
+            old_history.status.success(),
+            "old history unavailable: {} {}",
+            String::from_utf8_lossy(&old_history.stdout),
+            String::from_utf8_lossy(&old_history.stderr)
+        );
+        std::fs::write(dir.join("old-history.json"), &old_history.stdout)
+            .expect("save old history evidence");
+        std::fs::write(&release, "").expect("release abandoned model call");
+        let (project_for_resume, url_for_resume, home_for_resume) =
+            (project.clone(), url.clone(), atomic_home.clone());
+        let resumed = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+                .args([
+                    "runs",
+                    "resume",
+                    run_id,
+                    "--project",
+                    project_for_resume.to_str().expect("project"),
+                    "--model-base-url",
+                    &url_for_resume,
+                    "--model",
+                    "synthetic",
+                    "--json",
+                ])
+                .env("ATOMIC_HOME", home_for_resume)
+                .output()
+                .expect("resume with current binary")
+        })
+        .await
+        .expect("resume task");
+        assert!(
+            resumed.status.success(),
+            "cross-binary resume failed: stderr={} stdout={}",
+            String::from_utf8_lossy(&resumed.stderr),
+            String::from_utf8_lossy(&resumed.stdout)
+        );
+        let output: Value =
+            serde_json::from_slice(&resumed.stdout).expect("current binary JSON result");
+        assert_eq!(output["output"]["done"], true, "{output}");
+        assert_eq!(
+            model.calls(),
+            3,
+            "seed turn stayed finished; only interrupted second turn retried"
+        );
+        let (project_for_show, home_for_show) = (project.clone(), atomic_home.clone());
+        let shown = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+                .args([
+                    "runs",
+                    "show",
+                    run_id,
+                    "--project",
+                    project_for_show.to_str().expect("project"),
+                    "--json",
+                ])
+                .env("ATOMIC_HOME", home_for_show)
+                .output()
+                .expect("show recovered run")
+        })
+        .await
+        .expect("show task");
+        assert!(
+            shown.status.success(),
+            "show failed: {}",
+            String::from_utf8_lossy(&shown.stderr)
+        );
+        let history = String::from_utf8(shown.stdout).expect("history UTF-8");
+        assert!(
+            history.contains("seed.publish") && history.contains("next.publish"),
+            "finished steps missing: {history}"
+        );
+        assert!(
+            !history.contains("pin.reviewed_base"),
+            "checkpoint position shifted: {history}"
+        );
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn coding_revert_still_selects_row_from_current_step_diff() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-revert-current-diff");
+        let project = project(&dir);
+        let (_, base) = self_reviewed_with_control(&project, false);
+        let source = controls_self_review_workflow();
+        let workflow = source.replace(
+            "steps:\n  code:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n",
+            "steps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  code:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n",
+        );
+        assert_ne!(workflow, source);
+        let mut pipeline = load(&project, "coding-revert.workflow.yaml", &workflow);
+        let Step::Atom(code) = &mut pipeline.steps[1] else {
+            panic!("coding step")
+        };
+        let self_review = code
+            .review
+            .as_mut()
+            .expect("review")
+            .self_review
+            .as_mut()
+            .expect("self-review");
+        self_review.selected_controls.clear();
+        self_review.controls_atom = None;
+        let release_seed = dir.join("release-seed");
+        let release_code = dir.join("release-code");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release_seed.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Gated {
+                file: release_code.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "coding-revert-current-diff",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("seed waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("seed worktree")
+                .join("code.txt"),
+            "after\n",
+        )
+        .expect("seed touches guard");
+        std::fs::write(&release_seed, "").expect("release seed");
+        until("coding author waits in worktree", || {
+            model.calls() == 2 && !all_worktrees(&root).is_empty()
+        })
+        .await;
+        for tree in all_worktrees(&root) {
+            std::fs::write(tree.join("code.txt"), "before\n").expect("restore original guard");
+        }
+        std::fs::write(&release_code, "").expect("release coding author");
+        let error = rt
+            .result::<Value>("coding-revert-current-diff")
+            .await
+            .expect_err("current coding diff still touches row")
+            .to_string();
+        assert!(
+            error.contains("workflow omits touched control row `row-test`"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "self-review and reviewer never run");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn coding_revert_of_control_row_refuses_untrusted_definition_change() {
+    on_codex_runtime(async {
+        let dir = scratch("coding-revert-control-row");
+        let project = project(&dir);
+        let (_, base) = self_reviewed_with_control(&project, false);
+        let source = controls_self_review_workflow();
+        let workflow = source.replace(
+            "steps:\n  code:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n",
+            "steps:\n  seed:\n    atom: code-author\n    with: {text: input.text, base: input.base}\n    worktree: true\n  code:\n    after: [seed]\n    atom: code-author\n    with: {text: input.text, base: steps.seed.metadata.commit}\n",
+        );
+        assert_ne!(workflow, source);
+        let mut pipeline = load(&project, "coding-revert-row.workflow.yaml", &workflow);
+        let Step::Atom(code) = &mut pipeline.steps[1] else {
+            panic!("coding step")
+        };
+        let self_review = code
+            .review
+            .as_mut()
+            .expect("review")
+            .self_review
+            .as_mut()
+            .expect("self-review");
+        self_review.selected_controls.clear();
+        self_review.controls_atom = None;
+        let release_seed = dir.join("release-seed");
+        let release_code = dir.join("release-code");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release_seed.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Gated {
+                file: release_code.clone(),
+                reply: Box::new(Reply::Text(json!({"done":true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict":"approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "coding-revert-control-row",
+            PipelineRun {
+                pipeline,
+                input: json!({"text":"a code change", "base":base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("seed waits in worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        let row = "scripts/controls/row-test.row";
+        std::fs::write(
+            find_worktree(&root).expect("seed worktree").join(row),
+            "row-test|code.txt|before|after|-- other_guard\n",
+        )
+        .expect("seed rewrites row");
+        std::fs::write(&release_seed, "").expect("release seed");
+        until("coding author waits in worktree", || {
+            model.calls() == 2 && !all_worktrees(&root).is_empty()
+        })
+        .await;
+        for tree in all_worktrees(&root) {
+            std::fs::write(
+                tree.join(row),
+                "row-test|code.txt|before|after|-- guard_row\n",
+            )
+            .expect("restore reviewed row");
+        }
+        std::fs::write(&release_code, "").expect("release coding author");
+        let error = rt
+            .result::<Value>("coding-revert-control-row")
+            .await
+            .expect_err("unreviewed control definition change is refused")
+            .to_string();
+        assert!(
+            error.contains("candidate changes a control definition or shared control driver"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "self-review and reviewer never run");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn unreadable_touched_control_source_refuses_before_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("unreadable-control-source");
+        let project = project(&dir);
+        let (pipeline, base) = self_reviewed(&project);
+        let release = dir.join("release-author");
+        let model = FakeModel::start(vec![
+            Reply::Gated {
+                file: release.clone(),
+                reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+            },
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "unreadable-control-source",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let root = dir.join("state/worktrees");
+        until("author waits in its coding worktree", || {
+            model.calls() == 1 && find_worktree(&root).is_some()
+        })
+        .await;
+        std::fs::write(
+            find_worktree(&root)
+                .expect("author worktree")
+                .join("code.txt"),
+            [0, 0xff, 0xfe],
+        )
+        .expect("unreadable changed source");
+        std::fs::write(&release, "").expect("release author");
+        let error = rt
+            .result::<Value>("unreadable-control-source")
+            .await
+            .expect_err("unreadable selector input refuses")
+            .to_string();
+        assert!(
+            error.contains("is not UTF-8 for control selection"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "no reviewer turn runs");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn self_review_refuses_empty_na_and_omitted_selected_row() {
+    on_codex_runtime(async {
+        for (tag, mut evidence, expected) in [
+            {
+                let mut value = complete_real_control_review();
+                value["controls"] = json!([]);
+                value["items"]["10"] = json!("N/A:");
+                ("empty-na", value, "specific N/A reason")
+            },
+            {
+                let mut value = complete_real_control_review();
+                value["controls"] = json!([]);
+                value["items"]["10"] = json!("N/A: no rows were selected");
+                (
+                    "omitted-row",
+                    value,
+                    "selected controls row `row-test` has no result",
+                )
+            },
+        ] {
+            let dir = scratch(tag);
+            let project = project(&dir);
+            let (pipeline, base) = real_control_fixture(&project, false);
+            let model = FakeModel::start(vec![
+                Reply::Text(json!({"done": true}).to_string()),
+                Reply::Text(evidence.take().to_string()),
+                Reply::Text(json!({"verdict": "approve"}).to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let rt = engine_with_controls_cargo(&dir, &model.base_url()).await;
+            rt.start(
+                PIPELINE,
+                tag,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a code change", "base": base}),
+                },
+            )
+            .await
+            .expect("start");
+            let error = rt
+                .result::<Value>(tag)
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains(expected), "{tag}: {error}");
+            assert_eq!(model.calls(), 2, "{tag}: independent reviewer never saw it");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+    });
+}
+
+#[test]
+fn coding_step_refuses_removed_self_review_before_any_model_turn() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-removed");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed(&project);
+        let removed = SELF_REVIEW_WORKFLOW.replace(
+            "      self_review:\n        atom: self-check\n        with: {diff: candidate.metadata.diff}\n        decision_points: [candidate publication]\n",
+            "",
+        );
+        assert_ne!(removed, SELF_REVIEW_WORKFLOW);
+        let error = try_load(&project, "self-review-removed.workflow.yaml", &removed)
+            .expect_err("source loader refuses missing self-review");
+        assert!(
+            error.contains("coding step needs a worktree and self-review"),
+            "{error}"
+        );
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        step.review.as_mut().expect("review").self_review = None;
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-removed",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("self-review-removed")
+            .await
+            .expect_err("run admission refuses")
+            .to_string();
+        assert!(
+            error.contains("coding step needs a worktree and self-review"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn coding_step_refuses_reviewer_without_host_diff_before_any_model_turn() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-no-diff");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed(&project);
+        let removed = SELF_REVIEW_WORKFLOW.replace(
+            "with: {diff: candidate.metadata.diff}",
+            "with: {diff: candidate.output.done}",
+        );
+        assert_ne!(removed, SELF_REVIEW_WORKFLOW);
+        let error = try_load(&project, "self-review-no-diff.workflow.yaml", &removed)
+            .expect_err("source loader refuses author-produced diff");
+        assert!(error.contains("coding review must bind `diff`"), "{error}");
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        step.review
+            .as_mut()
+            .expect("review")
+            .with
+            .insert("diff".into(), "candidate.output.done".into());
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-no-diff",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("self-review-no-diff")
+            .await
+            .expect_err("run admission refuses")
+            .to_string();
+        assert!(error.contains("coding review must bind `diff`"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn coding_step_does_not_send_author_reasoning_to_reviewer() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-reasoning");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed(&project);
+        let leaked = SELF_REVIEW_WORKFLOW.replace(
+            "with: {diff: candidate.metadata.diff}\n      self_review:",
+            "with: {diff: candidate.metadata.diff, reasoning: candidate.output.reasoning}\n      self_review:",
+        );
+        assert_ne!(leaked, SELF_REVIEW_WORKFLOW);
+        let error = try_load(&project, "self-review-reasoning.workflow.yaml", &leaked)
+            .expect_err("source loader refuses author reasoning");
+        assert!(error.contains("without author reasoning"), "{error}");
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        step.review
+            .as_mut()
+            .expect("review")
+            .with
+            .insert("reasoning".into(), "candidate.output.reasoning".into());
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-reasoning",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("self-review-reasoning")
+            .await
+            .expect_err("run admission refuses")
+            .to_string();
+        assert!(error.contains("without author reasoning"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn noncoding_worktree_cannot_claim_a_host_diff_that_is_not_produced() {
+    let dir = scratch("noncoding-no-diff");
+    let project = project(&dir);
+    let _ = self_reviewed(&project);
+    let plain = SELF_REVIEW_WORKFLOW
+        .replace("    coding: true\n", "")
+        .replace("      trial_merge:\n        main: refs/heads/main\n        checks: [['true']]\n", "")
+        .replace(
+            "      self_review:\n        atom: self-check\n        with: {diff: candidate.metadata.diff}\n        decision_points: [candidate publication]\n",
+            "",
+        );
+    assert_ne!(plain, SELF_REVIEW_WORKFLOW);
+    let error = try_load(&project, "noncoding-no-diff.workflow.yaml", &plain)
+        .expect_err("a plain worktree does not produce a review patch");
+    assert!(error.contains("review/with/diff"), "{error}");
+}
+
+#[test]
+fn coding_author_cannot_be_its_own_reviewer_in_a_direct_pipeline() {
+    on_codex_runtime(async {
+        let dir = scratch("self-review-same-reviewer");
+        let project = project(&dir);
+        let (mut pipeline, base) = self_reviewed(&project);
+        let Step::Atom(step) = &mut pipeline.steps[0] else {
+            panic!("coding atom")
+        };
+        step.review.as_mut().expect("review").reviewer = step.atom.clone();
+        let model = FakeModel::start(vec![Reply::Text(json!({"done": true}).to_string())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "self-review-same-reviewer",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "a code change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("self-review-same-reviewer")
+            .await
+            .expect_err("run admission refuses")
+            .to_string();
+        assert!(
+            error.contains("cannot be its own independent reviewer"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// The title a seeded bug gives the note: it says the opposite of the note.
 const WRONG: &str = r#"{"title": "Export works with accents", "words": 7}"#;
 const REJECT: &str = r#"{"verdict": "request_changes", "findings": [{"file": "title", "severity": "major", "message": "The note says the export crashes; the title says it works."}]}"#;
@@ -5482,6 +11997,30 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         let out: Value = rt.result("review-2").await.expect("finishes");
         assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
         assert_eq!(model.calls(), 4);
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "author, reviewer, repair, fresh reviewer"
+        );
+        let first_review = requests[1].to_string();
+        assert!(
+            first_review.contains("Export works with accents")
+                && first_review.contains("café.txt crashes"),
+            "the reviewer must see the seeded contradiction: {first_review}"
+        );
+        let repair = requests[2].to_string();
+        assert!(
+            repair.contains("A reviewer rejected your previous output")
+                && repair.contains("the title says it works"),
+            "the author must receive the defect finding: {repair}"
+        );
+        let second_review = requests[3].to_string();
+        assert!(
+            second_review.contains("Export crashes on accents")
+                && !second_review.contains("Export works with accents"),
+            "the fresh reviewer must see the repaired candidate: {second_review}"
+        );
         let open = gate::gates(&rt, GateFilter::default())
             .await
             .expect("gates");
@@ -5498,6 +12037,14 @@ fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
         assert_eq!(
             published["read.review.1"].proposal.output["verdict"],
             "approve"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["verdict"],
+            "request_changes"
+        );
+        assert_eq!(
+            published["read.review.0"].proposal.output["findings"][0]["message"],
+            "The note says the export crashes; the title says it works."
         );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await

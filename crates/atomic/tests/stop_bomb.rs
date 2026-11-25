@@ -111,6 +111,8 @@ fn stopping_ends_a_fork_bomb_and_its_namespace() {
                 time: Duration::from_secs(600),
                 stdout: 1024,
                 stderr: 1024,
+                cpu_seconds: None,
+                data_bytes: None,
             },
         )
     });

@@ -13,10 +13,14 @@ use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+mod delivery;
+mod delivery_remote;
 mod engine;
 mod evals;
 mod failure;
 mod gates;
+mod goals;
+mod graph;
 mod init;
 mod parks;
 mod prompt;
@@ -53,6 +57,10 @@ enum Command {
     Check {
         /// An atom file or project directory; defaults to the current project.
         path: Option<PathBuf>,
+        /// Select `atomic.<profile>.yaml` for this project (`ATOMIC_PROFILE`
+        /// when omitted).
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
@@ -89,6 +97,15 @@ enum Command {
     /// Enroll your operator credential, list gates and decide them.
     #[command(subcommand)]
     Gates(gates::GatesCommand),
+    /// Import or export work items in beads JSONL format.
+    #[command(subcommand)]
+    Graph(graph::GraphCommand),
+    /// Deliver a reviewed graph coding item through a human gate.
+    #[command(subcommand)]
+    Delivery(delivery::DeliveryCommand),
+    /// Manage pinned goals and their feedback.
+    #[command(subcommand)]
+    Goals(goals::GoalsCommand),
     /// List the runs parked on a budget cap, and release one, raising its
     /// cap, with your operator credential.
     #[command(subcommand)]
@@ -143,6 +160,12 @@ struct RenderArgs {
     /// Explicit configuration profile.
     #[arg(long)]
     profile: Option<String>,
+    /// Override the model endpoint as `atomic run --model-base-url` would.
+    #[arg(long)]
+    model_base_url: Option<String>,
+    /// Inspect helper output with a fresh clock; this is not an exact live prompt.
+    #[arg(long)]
+    preview_helpers: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -233,19 +256,7 @@ fn real_main() -> anyhow::Result<()> {
     #[cfg(unix)]
     atomic_exec::inherited::keep_from_children(&[])
         .context("keep the descriptors atomic was started with from the programs it starts")?;
-    // A helper child serves one call and exits, before anything else starts:
-    // no state directory, no Codex dispatch.
-    if std::env::args_os().nth(1).as_deref()
-        == Some(atomic_core::helper_runtime::CHILD_ARG.as_ref())
-    {
-        std::process::exit(atomic_core::helper_runtime::serve());
-    }
-    // So does the Astro compiler's child, which runs the bundled compiler on
-    // the embedded V8.
-    if std::env::args_os().nth(1).as_deref() == Some(atomic_core::compiler_host::CHILD_ARG.as_ref())
-    {
-        std::process::exit(atomic_core::compiler_host::serve());
-    }
+    atomic_core::compiler_host::dispatch_embedded_child();
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
     if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {
@@ -423,6 +434,25 @@ fn runner() -> i32 {
 }
 
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
+    // Graph commands must resolve their configured store before the generic
+    // SQLite workflow store is opened. A PostgreSQL project is refused by the
+    // graph CLI rather than creating a different local graph database.
+    let Cli {
+        json,
+        project,
+        command,
+    } = cli;
+    let command = match command {
+        Some(Command::Graph(command)) => return graph::run(command, &state, json).await,
+        Some(Command::Delivery(command)) => return delivery::command(command, &state, json).await,
+        Some(Command::Goals(command)) => return goals::run(command, &state, json).await,
+        other => other,
+    };
+    let cli = Cli {
+        json,
+        project,
+        command,
+    };
     // Before anything else: a store written by a newer atomic is refused.
     atomic_durable::store::open_sqlite(&state.database()).await?;
     // Turn directories a killed atomic left behind.
@@ -433,10 +463,17 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     let turns = turn_backend(cli.command.as_ref(), &state);
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
+        Some(Command::Graph(_)) => unreachable!("graph commands dispatch before store open"),
+        Some(Command::Delivery(_)) => unreachable!("delivery commands dispatch before store open"),
+        Some(Command::Goals(_)) => unreachable!("goal commands dispatch before store open"),
         Some(Command::Parks(command)) => parks::run(command, &state).await,
         Some(Command::Model(_)) => unreachable!("`atomic model` runs without a state directory"),
-        Some(Command::Check { path }) => {
-            tokio::task::spawn_blocking(move || check(path, json)).await?
+        Some(Command::Check { path, profile }) => {
+            // `--project` selects the project even when CHECK's optional
+            // positional path is omitted. The state root was already
+            // resolved from that flag, including its manifest-file form.
+            let path = path.or_else(|| project.map(|_| state.root().to_path_buf()));
+            tokio::task::spawn_blocking(move || check_with_profile(path, profile, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
         Some(Command::Eval(args)) => evals::run(args, project, &paths, json).await,
@@ -522,6 +559,110 @@ fn write_declarations(atom: &atomic_core::atom::Atom) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove shared-schema editor modules that no checked atom still imports.
+/// These are disposable output of `atomic check`, never a source of truth for
+/// compilation. Inspect the complete tree before deleting anything, and never
+/// follow a link inside the generated directory.
+fn prune_schema_declarations(
+    root: &std::path::Path,
+    live: &std::collections::BTreeSet<PathBuf>,
+) -> anyhow::Result<()> {
+    fn owned_schema_module(root: &std::path::Path, file: &std::path::Path) -> anyhow::Result<bool> {
+        let metadata = match std::fs::symlink_metadata(file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        anyhow::ensure!(
+            metadata.is_file(),
+            "generated schema module changed during cleanup: {}",
+            file.display()
+        );
+        // A compiler response is at most 32 MiB, so a larger file cannot be
+        // one module this command generated. Refuse to inspect an unbounded
+        // file rather than read it into memory to decide whether to delete it.
+        if metadata.len() > 32 * 1024 * 1024 {
+            return Ok(false);
+        }
+        let Ok(text) = std::fs::read_to_string(file) else {
+            return Ok(false);
+        };
+        if text.lines().next() != Some("// Generated by atomic. Do not edit.") {
+            return Ok(false);
+        }
+        let Some(origin) = atomic_schema::typescript::generated_origin(&text) else {
+            return Ok(false);
+        };
+        if !origin.pointer.is_empty() {
+            return Ok(false);
+        }
+        Ok(
+            atomic_schema::typescript::declaration_path(root, &root.join(origin.file)).as_deref()
+                == Some(file),
+        )
+    }
+
+    let mut dir = root.to_path_buf();
+    for part in [".atomic", "types"] {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => anyhow::ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                "generated schema directory is not a plain directory: {}",
+                dir.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    fn inspect(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        root: &std::path::Path,
+        live: &std::collections::BTreeSet<PathBuf>,
+        stale: &mut Vec<PathBuf>,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                !metadata.file_type().is_symlink(),
+                "generated schema tree contains a symlink: {}",
+                path.display()
+            );
+            if metadata.is_dir() {
+                inspect(&path, base, root, live, stale)?;
+            } else if metadata.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".d.ts"))
+                && !live.contains(path.strip_prefix(base)?)
+                && owned_schema_module(root, &path)?
+            {
+                stale.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut stale = Vec::new();
+    inspect(&dir, &dir, root, live, &mut stale)?;
+    for file in stale {
+        if !owned_schema_module(root, &file)? {
+            continue;
+        }
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn load_project_schemas(
     path: &std::path::Path,
     registry: &mut atomic_schema::registry::Registry,
@@ -540,17 +681,39 @@ fn load_project_schemas(
     }
 }
 
+// Existing in-process fixture checks use the unselected path.
+#[cfg(test)]
 fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
+    check_with_profile(path, None, json)
+}
+
+fn check_with_profile(
+    path: Option<PathBuf>,
+    profile: Option<String>,
+    json: bool,
+) -> anyhow::Result<()> {
     use atomic_core::{atom, collections, compile, workflow};
     let path = path.unwrap_or(std::env::current_dir()?);
     let mut registry = atomic_schema::registry::Registry::new();
+    let check_settings = |dir: &std::path::Path| {
+        settings::check(dir, profile.as_deref()).map_err(|e| {
+            failure::Failure::new(
+                "config.invalid",
+                format!("the configuration cannot be read: {e}"),
+                "fix the setting it names; `atomic config --explain` lists every setting and \
+                 where it comes from",
+            )
+        })
+    };
     if path.is_file() {
         load_project_schemas(
             path.parent().unwrap_or(std::path::Path::new(".")),
             &mut registry,
         )?;
         let atom = atom::load(&path, &mut registry)?;
-        compile::compile(&atom, &registry)?;
+        check_settings(&settings::config_dir(&atom.program.root))?;
+        let compiled = compile::compile(&atom, &registry)?;
+        check_prompt_snapshots(&atom, &compiled, profile.as_deref())?;
         write_declarations(&atom)?;
         if json {
             println!(
@@ -574,22 +737,42 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         manifests.extend(project::members(&project)?);
     }
     for manifest in &manifests {
-        settings::check(&manifest.dir).map_err(|e| {
-            failure::Failure::new(
-                "config.invalid",
-                format!("the configuration cannot be read: {e}"),
-                "fix the setting it names; `atomic config --explain` lists every setting and \
-                 where it comes from",
-            )
-        })?;
+        check_settings(&manifest.dir)?;
     }
     let files = collections::collect(&project)?;
     collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();
+    let mut live_schema_modules: std::collections::BTreeMap<
+        PathBuf,
+        std::collections::BTreeSet<PathBuf>,
+    > = manifests
+        .iter()
+        .map(|manifest| {
+            Ok((
+                std::fs::canonicalize(&manifest.dir)?,
+                std::collections::BTreeSet::new(),
+            ))
+        })
+        .collect::<anyhow::Result<_>>()?;
     for source in &files["atoms"] {
         let atom = atom::load(&source.path, &mut registry)?;
-        compile::compile(&atom, &registry)?;
+        let compiled = compile::compile(&atom, &registry)?;
+        check_prompt_snapshots(&atom, &compiled, profile.as_deref())?;
         write_declarations(&atom)?;
+        let generated_types = atom.program.root.join(".atomic/types");
+        let root = std::fs::canonicalize(&atom.program.root)?;
+        let live = live_schema_modules.entry(root).or_default();
+        for name in atom
+            .declarations
+            .as_object()
+            .context("compiler declarations")?
+            .keys()
+        {
+            let file = std::path::Path::new(name);
+            if let Ok(relative) = file.strip_prefix(&generated_types) {
+                live.insert(relative.to_path_buf());
+            }
+        }
         let name = atom.name.clone();
         anyhow::ensure!(
             atoms.insert(name.clone(), atom).is_none(),
@@ -655,6 +838,9 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         }
         operations += tools.len();
     }
+    for (root, live) in &live_schema_modules {
+        prune_schema_declarations(root, live)?;
+    }
     if json {
         println!(
             "{}",
@@ -677,6 +863,169 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             files["workflows"].len(),
             operations
         );
+    }
+    Ok(())
+}
+
+/// Compare a project's opted-in prompt snapshots against the same preview
+/// path as `atomic render`. The first snapshot opts the whole atom in: every
+/// fixture then needs a snapshot, and an unused snapshot is an error.
+fn check_prompt_snapshots(
+    atom: &atomic_core::atom::Atom,
+    compiled: &atomic_core::compile::Compiled,
+    profile: Option<&str>,
+) -> anyhow::Result<()> {
+    use atomic_core::render;
+    use std::collections::BTreeMap;
+
+    let root = &atom.program.root;
+    let snapshots_dir = root.join("snapshots");
+    match std::fs::symlink_metadata(&snapshots_dir) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_dir(),
+            "{}: prompt snapshots must be in a regular directory",
+            snapshots_dir.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).with_context(|| snapshots_dir.display().to_string()),
+    }
+    let snapshots = match std::fs::read_dir(&snapshots_dir) {
+        Ok(entries) => entries,
+        Err(error) => return Err(error).with_context(|| snapshots_dir.display().to_string()),
+    };
+    let prefix = format!("{}__", atom.name);
+    let mut saved = BTreeMap::new();
+    for entry in snapshots {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            anyhow::anyhow!(
+                "{}: prompt snapshot name is not UTF-8",
+                entry.path().display()
+            )
+        })?;
+        if let Some(case) = name
+            .strip_prefix(&prefix)
+            .and_then(|name| name.strip_suffix(".prompt.json"))
+        {
+            anyhow::ensure!(
+                !case.is_empty(),
+                "{}: empty snapshot case",
+                entry.path().display()
+            );
+            anyhow::ensure!(
+                entry.file_type()?.is_file(),
+                "{}: prompt snapshot must be a regular file",
+                entry.path().display()
+            );
+            saved.insert(case.to_owned(), entry.path());
+        }
+    }
+    if saved.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        atom.context.is_none(),
+        "{}: prompt snapshots for contextual atoms require a frozen context manifest",
+        atom.file.display()
+    );
+    anyhow::ensure!(
+        atom.kind == "lite" || atom.kind == "codex",
+        "{}: only model atoms have prompt snapshots",
+        atom.file.display()
+    );
+    anyhow::ensure!(
+        compiled.program.helpers.is_empty(),
+        "{}: prompt snapshots with TypeScript helpers need a recorded step clock",
+        atom.file.display()
+    );
+    let fixtures_dir = root.join("fixtures").join(&atom.name);
+    anyhow::ensure!(
+        std::fs::symlink_metadata(&fixtures_dir)?
+            .file_type()
+            .is_dir(),
+        "{}: prompt fixtures must be in a regular directory",
+        fixtures_dir.display()
+    );
+    let fixtures = std::fs::read_dir(&fixtures_dir).with_context(|| {
+        format!(
+            "{}: prompt snapshot fixtures are required",
+            fixtures_dir.display()
+        )
+    })?;
+    let mut fixtures = fixtures.collect::<std::io::Result<Vec<_>>>()?;
+    fixtures.sort_by_key(|entry| entry.file_name());
+    let resolved = settings::check(&settings::config_dir(root), profile)?;
+    let endpoint = resolved.endpoint();
+    let mut found = 0;
+    for entry in fixtures {
+        let name = entry.file_name().into_string().map_err(|_| {
+            anyhow::anyhow!(
+                "{}: prompt fixture name is not UTF-8",
+                entry.path().display()
+            )
+        })?;
+        let Some(case) = name.strip_suffix(".input.json") else {
+            continue;
+        };
+        anyhow::ensure!(
+            !case.is_empty(),
+            "{}: empty fixture case",
+            entry.path().display()
+        );
+        anyhow::ensure!(
+            entry.file_type()?.is_file(),
+            "{}: prompt fixture must be a regular file",
+            entry.path().display()
+        );
+        found += 1;
+        let expected_file = snapshots_dir.join(format!("{}__{}.prompt.json", atom.name, case));
+        let saved_file = saved.remove(case).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: missing prompt snapshot for {}",
+                expected_file.display(),
+                entry.path().display()
+            )
+        })?;
+        let input: serde_json::Value = serde_json::from_slice(&std::fs::read(entry.path())?)
+            .with_context(|| entry.path().display().to_string())?;
+        let mut prompt = render::render_with_context(
+            compiled,
+            &render::RunInput {
+                run_id: "preview",
+                input: &input,
+                frontmatter: &atom.frontmatter,
+                origin: "external",
+                origins: None,
+                step: None,
+            },
+            None,
+            Some("preview"),
+        )?;
+        prompt.developer = atomic_core::runtime::preview_developer_instructions(
+            atom,
+            compiled,
+            endpoint.as_ref().map(|endpoint| endpoint.base_url.as_str()),
+            prompt.developer,
+        )?;
+        let actual = serde_json::to_string_pretty(
+            &serde_json::json!({"developer":prompt.developer,"user":prompt.user}),
+        )? + "\n";
+        let expected = std::fs::read(&saved_file)?;
+        anyhow::ensure!(
+            actual.as_bytes() == expected,
+            "{}: prompt snapshot changed; review `atomic render {} --input {}` and update this file",
+            saved_file.display(),
+            atom.file.display(),
+            entry.path().display()
+        );
+    }
+    anyhow::ensure!(
+        found > 0,
+        "{}: prompt snapshots need input fixtures",
+        fixtures_dir.display()
+    );
+    if let Some(path) = saved.into_values().next() {
+        anyhow::bail!("{}: prompt snapshot has no input fixture", path.display());
     }
     Ok(())
 }
@@ -779,6 +1128,29 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
     )?;
     let atom = atom::load(&args.atom, &mut registry)?;
     let compiled = compile::compile(&atom, &registry)?;
+    anyhow::ensure!(
+        args.preview_helpers || compiled.program.helpers.keys().next().is_none(),
+        "{}: an exact prompt preview with TypeScript helpers needs a recorded step clock",
+        atom.file.display()
+    );
+    if args.preview_helpers && !compiled.program.helpers.is_empty() {
+        atomic_core::log_line!(
+            "warning: helper preview uses a fresh clock and may differ from a live prompt"
+        );
+    }
+    // A preview contacts no model or local discovery endpoint, but it must
+    // know the configured endpoint to include the same schema guidance as a
+    // live Codex turn. Without one, exact Codex instructions are unknown.
+    let resolved = settings::resolve(
+        &settings::config_dir(&atom.program.root),
+        &engine::EngineArgs {
+            profile: args.profile.clone(),
+            model_base_url: args.model_base_url.clone(),
+            ..engine::EngineArgs::default()
+        },
+        &settings::Surroundings::without_probe(),
+    )?;
+    let endpoint = resolved.endpoint();
     let state = ProjectState::resolve(&atom.program.root)?;
     state.create()?;
     let project_name = project::discover(&atom.program.root)
@@ -830,7 +1202,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
     } else {
         None
     };
-    let prompt = render::render_with_context(
+    let mut prompt = render::render_with_context(
         &compiled,
         &render::RunInput {
             run_id,
@@ -842,6 +1214,12 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         },
         snapshot.as_ref(),
         Some(&args.step_id),
+    )?;
+    prompt.developer = atomic_core::runtime::preview_developer_instructions(
+        &atom,
+        &compiled,
+        endpoint.as_ref().map(|endpoint| endpoint.base_url.as_str()),
+        prompt.developer,
     )?;
     println!(
         "{}",

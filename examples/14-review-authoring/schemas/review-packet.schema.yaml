@@ -1,0 +1,21 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+title: ReviewPacket
+type: object
+additionalProperties: false
+required: [change_id, candidate, checks]
+properties:
+  change_id:
+    type: string
+    minLength: 1
+    maxLength: 80
+  candidate:
+    type: string
+    minLength: 1
+    maxLength: 4000
+  checks:
+    type: array
+    maxItems: 12
+    items:
+      type: string
+      minLength: 1
+      maxLength: 200

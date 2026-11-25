@@ -123,9 +123,8 @@ async fn sandboxed(f: &Fixture, cwd: &Path, command: &str, extra: TurnSpec) -> S
     .await
 }
 
-/// Where the turns' backend keeps its scratch directories: not under /tmp,
-/// where some fixtures keep their project and state, since a scratch root
-/// there is refused.
+/// Where the turns' backend keeps its scratch directories. This can itself
+/// be under /tmp when the checkout and Cargo target directory are there.
 fn scratch_root() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("atomic-sandboxed-scratch-{}", std::process::id()))
@@ -338,7 +337,7 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
         assert!(!common.join("forged").exists());
         assert!(!state.join("private/forged").exists());
         assert_eq!(f.worktrees.repo().refs("refs/heads/").unwrap().len(), 1);
-        // Its temporary files go to a private directory, not /tmp.
+        // Its temporary files go to the turn's private directory.
         assert!(output.contains("mktemp-exit=0"), "{output}");
         // The output is the JSON text of what the command printed.
         let temp = output
@@ -347,16 +346,14 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
             .and_then(|rest| rest.split("\\n").next())
             .expect("mktemp printed its file")
             .to_owned();
-        // The turn's own temporary directory, inside its scratch directory
-        // under the backend's root, outside /tmp; not the directory every
-        // turn of the backend shares, where Codex's sandbox keeps a registry.
+        // The turn's own temporary directory is inside its scratch directory
+        // under the backend's root, not in the shared registry directory.
         assert!(
             Path::new(&temp).starts_with(scratch_root())
                 && !Path::new(&temp).starts_with(scratch_root().join(".tmp"))
                 && temp.contains("/tmp/tmp."),
             "{temp} is not in the turn's own temporary directory"
         );
-        assert!(!temp.starts_with("/tmp/"), "{temp}");
     });
 }
 

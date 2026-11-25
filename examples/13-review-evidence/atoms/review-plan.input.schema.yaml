@@ -1,0 +1,129 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [plan, required_outcomes, proposed_tasks, host_records, author_claims, assumptions, display]
+properties:
+  plan:
+    type: object
+    additionalProperties: false
+    required: [record_id, revision, repository, change]
+    properties:
+      record_id:
+        type: string
+        minLength: 4
+        maxLength: 120
+        description: The plan record's own source ID.
+      revision:
+        type: string
+        pattern: '^[0-9a-f]{40}$'
+        description: The candidate the plan is proposed for. Coverage is read against this revision.
+      repository:
+        type: string
+        minLength: 1
+        maxLength: 120
+        description: Where the candidate came from.
+      change:
+        type: string
+        minLength: 1
+        maxLength: 120
+        description: The change the plan is for.
+  required_outcomes:
+    type: array
+    minItems: 1
+    maxItems: 8
+    description: The outcomes the plan must deliver, in order. One row of the answer per entry, covered or not.
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, statement, acceptance_criterion, depends_on, record, expected_criterion, required]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: The requirement's ID, which proposed tasks name in `covers`.
+        statement:
+          type: string
+          minLength: 1
+          maxLength: 300
+          description: The outcome, in the words it was accepted in.
+        acceptance_criterion:
+          type: string
+          minLength: 1
+          maxLength: 300
+          description: How the outcome would be shown, in the words the plan was accepted with.
+        depends_on:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The requirement this one waits on, or `none`.
+        record:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The record ID this requirement names, or `none`. A task's own record answers its row first.
+        expected_criterion:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The required check whose execution answers this outcome, written by the host, or `none` when no check does. A covered row may only answer a record whose `criterion` is this.
+        required:
+          type: boolean
+          description: Whether the plan requires this outcome.
+  proposed_tasks:
+    type: array
+    maxItems: 8
+    description: The tasks the plan proposes. A task that covers nothing leaves its requirement uncovered.
+    items:
+      type: object
+      additionalProperties: false
+      required: [id, title, covers, depends_on, record]
+      properties:
+        id:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The task's ID.
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: What the task does.
+        covers:
+          type: array
+          maxItems: 8
+          description: The requirement IDs this task delivers.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 60
+        depends_on:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: The task this one waits on, or `none`.
+        record:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The record the task says ran, or `none` when nothing ran for it.
+  host_records:
+    type: array
+    maxItems: 12
+    description: Executions the host recorded, in their own binding. This list may be empty, which is not the same as every outcome being delivered.
+    items:
+      $ref: https://atomic.example/schemas/execution-record-v1
+  author_claims:
+    type: array
+    maxItems: 8
+    description: What the author says about the checks these tasks name. Nothing here is coverage.
+    items:
+      $ref: https://atomic.example/schemas/author-claim-v1
+  assumptions:
+    type: array
+    maxItems: 8
+    description: Assumptions the plan's author recorded, shown under their own heading.
+    items:
+      $ref: https://atomic.example/schemas/assumption-v1
+  display:
+    $ref: https://atomic.example/schemas/display-dialect-v1

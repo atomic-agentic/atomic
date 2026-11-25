@@ -1,0 +1,1 @@
+self-review-host-touched-row|crates/atomic/src/pipeline.rs|                if !self_review.selected_controls.contains(row) {|                if false {|-p atomic-agentic --test pipeline host_touched_control_refuses_workflow_and_model_omission_before_reviewer

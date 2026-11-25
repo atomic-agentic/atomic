@@ -109,6 +109,32 @@ pinned `bd` release.
 | Handoff on release | When a step gives an item back or fails it, it writes down what it attempted, where it went wrong and what it found out; whoever claims the item next gets that note, with each file flagged as changed or untouched since |
 | Memories | A context contributor adds a short brief to every turn: the item that was claimed, its criteria, the latest handoff and the approved memories. The brief has a fixed size, and each stored field is placed on its own labelled line so that stored text cannot pretend to be structure |
 
+The M6 graph work loop starts with `atomic graph create --kind epic --pinned`
+and runs a one-worktree-step workflow with
+`atomic run <workflow> --graph-epic <id> --fixture <repo> --fixture-rev <rev>`.
+The workflow's input contract
+declares an optional `item` object, but the operator omits it: atomic selects a
+ready direct child, including an imported Beads `acceptance_criteria` string
+when present, validates the host-supplied item and mapped atom input,
+then claims it in the same short transaction. Each child gets separately named
+turn, review, publication and close checkpoints. Publication and close fence
+the full lease token. The close transaction links the host-generated worktree
+commit and refreshes blocked edges, so a newly unblocked child is selectable
+immediately. A pinned child or a goal/message child is outside this work loop;
+an ordinary blocked or deferred child keeps it pending. When all work children
+are closed, the exclusive epic-to-run binding is marked done. The epic stays
+pinned as its durable container, and a different run ID cannot silently work it
+again. Pending work records a releasable park. After changing a blocker or due
+date, the operator releases that park; the resumed run uses a fresh claim step
+to select from the graph again.
+Each graph reviewer and repair model turn renews and checks its own bounded
+claim. Before a human review gate waits, a durable sibling step records an
+agent-trust handoff, releases the claim and bumps its epoch. An approval is
+followed by a durable re-claim step; if another worker took the item while the
+gate waited, the reviewed candidate stays private and the original run parks.
+The new lease fences publication and close. The three-item M6 pilot also runs
+without review.
+
 Atoms use the graph through typed tools: `graph_ready`, `graph_show`,
 `graph_create`, `graph_close`, `graph_dep_add` and `graph_remember`. The read
 tools show what has been committed. The write tools do not commit; they add to

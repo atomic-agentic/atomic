@@ -1,0 +1,51 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://atomic.example/schemas/execution-record-v1
+title: ExecutionRecord
+description: >-
+  One host execution record for one criterion. Both review Atoms take this same
+  shape, so a record cannot have wider access or more fields in one view than
+  in the other. The fields say what was run; whether it answers the candidate is
+  decided from `revision`, `outcome` and `access`, never by a pre-judged state.
+type: object
+additionalProperties: false
+required: [id, origin, criterion, revision, outcome, access, findings, detail]
+properties:
+  id:
+    type: string
+    minLength: 4
+    maxLength: 120
+    description: The record's own source ID, kept verbatim so a finding can cite it.
+  origin:
+    type: string
+    const: host
+    description: Who produced this record. A host record is always `host`.
+  criterion:
+    type: string
+    minLength: 1
+    maxLength: 60
+    description: The check or requirement this run answers.
+  revision:
+    type: string
+    pattern: '^[0-9a-f]{40}$'
+    description: The candidate revision the run actually ran against.
+  outcome:
+    type: string
+    enum: [pass, fail, unavailable]
+    description: "`unavailable` means the run never reported a state, not that it was clean."
+  access:
+    type: string
+    enum: [grant, none]
+    description: "`none` means the record exists but its contents cannot be opened, so it credits nothing."
+  findings:
+    type: array
+    maxItems: 8
+    description: Finding lines this run reported. An unavailable run has none, which is not a clean result.
+    items:
+      type: string
+      minLength: 1
+      maxLength: 300
+  detail:
+    type: string
+    minLength: 1
+    maxLength: 300
+    description: One sentence of host context, kept out of the table cells.

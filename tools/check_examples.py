@@ -406,7 +406,8 @@ def check_project(top):
 
         atoms = {}
         templates = {}
-        variants = {}
+        variants = {}  # base atom name -> variant name -> its file
+        rendered = {}  # atom name -> the (input, golden output) pairs it was rendered against
         prepared_schemas = {}  # atom name -> the shape its prepare() returns, from a committed sample
         for path in sorted(p for suffix in ATOM_SUFFIXES for p in project.rglob("*" + suffix)):
             if not belongs(path):
@@ -422,8 +423,8 @@ def check_project(top):
                 require(fm.get("atomic") == 1, f"{path}: wrong format")
                 _, inp, out, inputs, outputs = atoms[base]
                 astro_atoms.check(path, schemas[inputs], schemas[outputs], registry, inputs.as_uri(), outputs.as_uri())
-                require(variant not in variants.setdefault(base, set()), f"{path}: duplicate variant {variant}")
-                variants[base].add(variant)
+                require(variant not in variants.setdefault(base, {}), f"{path}: duplicate variant {variant}")
+                variants[base][variant] = path
                 continue
             name = fm.get("name", stem)
             require(name not in atoms, f"{path}: duplicate atom name")
@@ -457,6 +458,7 @@ def check_project(top):
                 inp.validate(example["input"])
                 out.validate(example["output"])
                 astro_atoms.fixture(path, example["input"], example["output"])
+                rendered.setdefault(name, []).append((example["input"], example["output"]))
             evals = project / "evals" / name
             cases = sorted(evals.glob("*.yaml"))
             case_files = sorted(evals.glob("*.jsonl"))
@@ -488,6 +490,7 @@ def check_project(top):
                     inp.validate(row["input"])
                     out.validate(expected)
                     astro_atoms.fixture(path, row["input"], expected)
+                    rendered.setdefault(name, []).append((row["input"], expected))
                     fixture_count += 1
             for eval_path in cases:
                 ev = read_yaml(eval_path.read_text())
@@ -508,6 +511,7 @@ def check_project(top):
                 inp.validate(fixture_input)
                 out.validate(fixture_output)
                 astro_atoms.fixture(path, fixture_input, fixture_output)
+                rendered.setdefault(name, []).append((fixture_input, fixture_output))
                 fixture_count += 1
                 if fm.get("kind") == "exec" and "command" in fm["exec"]:
                     result = subprocess.run(fm["exec"]["command"], cwd=project, input=json.dumps(fixture_input), text=True, capture_output=True, timeout=5)
@@ -516,6 +520,20 @@ def check_project(top):
                     out.validate(actual)
                     require(actual == fixture_output, f"{eval_path}: exec result differs from golden")
                     exec_count += 1
+
+        # A variant is its base atom with other instructions, so every case the base
+        # renders, the variant has to render too. Checking a variant only proves its
+        # template and its imported helpers *type*-check: rendering it is what shows
+        # its components and its captured helpers produce a prompt for the inputs the
+        # catalog ships, and validating there is what shows its own validators accept
+        # the base's golden outputs. An atom whose code writes to an outside system is
+        # the one exception: the checker never renders that base, so it renders none
+        # of its variants here either.
+        for base, entries in sorted(variants.items()):
+            for variant, variant_path in sorted(entries.items()):
+                for case_input, case_output in rendered.get(base, []):
+                    astro_atoms.fixture(variant_path, case_input, case_output)
+                    fixture_count += 1
 
         if "decisions" in config:
             # Every catalog atom has eval cases, so any atom can be named as evidence.

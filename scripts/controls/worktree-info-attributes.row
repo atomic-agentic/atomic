@@ -1,0 +1,1 @@
+worktree-info-attributes|crates/atomic-core/src/git.rs|if self.has_info_attributes()? {|if false && self.has_info_attributes()? {|-p atomic-agentic-core --test git_safety linked_only_attribute_filter_never_runs_during_prepare_or_commit

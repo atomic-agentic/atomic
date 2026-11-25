@@ -1,0 +1,13 @@
+{
+  "summary": "Made decide() refuse a finding whose verification record is absent, so an absent record no longer reads as an unverified finding that passes.",
+  "files_changed": [
+    "tools/lane_guard.py",
+    "tests/test_lane_guard.py"
+  ],
+  "tests_run": [
+    {
+      "command": "python3 tests/test_lane_guard.py",
+      "passed": true
+    }
+  ]
+}

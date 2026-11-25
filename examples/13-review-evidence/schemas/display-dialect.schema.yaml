@@ -1,0 +1,24 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://atomic.example/schemas/display-dialect-v1
+title: DisplayDialect
+description: >-
+  How the prompt draws its headings, record references and emphasized words.
+  This changes presentation only: the record IDs, their access, the candidate
+  revision and the decision rules are identical in every dialect, so a matched
+  plain/Markdown pair differs by nothing else and must score the same.
+type: object
+additionalProperties: false
+required: [section, link, emphasis]
+properties:
+  section:
+    type: string
+    enum: [plain, markdown]
+    description: A section is a line of words, or a Markdown `## ` heading.
+  link:
+    type: string
+    enum: [plain, markdown]
+    description: A record is a bare ID after its label, or that same ID inside a Markdown link.
+  emphasis:
+    type: string
+    enum: [plain, italic, bold]
+    description: The emphasized phrase carries no delimiters, `*…*`, or `**…**`.

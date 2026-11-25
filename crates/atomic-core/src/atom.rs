@@ -58,6 +58,9 @@ pub const LATER: &[&str] = &[
 /// The typed `AtomConfig` declaration the compiler checks configuration
 /// against, generated into each project as `.atomic/types/authoring.d.ts`.
 pub const AUTHORING_DECLARATIONS: &str = include_str!("../../../authoring/authoring.d.ts");
+/// The ambient declaration for captured local Markdown literals. The authoring
+/// module references it so stock Astro tooling sees the same type as atomic.
+pub const RAW_IMPORT_DECLARATIONS: &str = include_str!("../../../authoring/raw-imports.d.ts");
 
 /// A loaded, schema-checked Astro atom and its immutable source graph. It
 /// serializes whole, sources and contracts included, so a run can carry the
@@ -117,18 +120,31 @@ impl Atom {
 }
 
 /// A file-local loading diagnostic.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("{}:{line}: {path}: {message}", file.display())]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AtomError {
     /// Source file.
     pub file: PathBuf,
     /// One-based source line.
     pub line: usize,
+    /// One-based UTF-16 source column when the compiler supplies one.
+    pub column: Option<usize>,
     /// Configuration or body path.
     pub path: String,
     /// Diagnostic message.
     pub message: String,
 }
+
+impl std::fmt::Display for AtomError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.file.display(), self.line)?;
+        if let Some(column) = self.column {
+            write!(f, ":{column}")?;
+        }
+        write!(f, ": {}: {}", self.path, self.message)
+    }
+}
+
+impl std::error::Error for AtomError {}
 
 /// Check an exec atom's command and environment, and that no other atom
 /// declares them. `exec.command` is a literal argument array, run with no
@@ -365,6 +381,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     let fail = |line, path: &str, message: String| AtomError {
         file: file.to_owned(),
         line,
+        column: None,
         path: path.to_owned(),
         message,
     };
@@ -380,6 +397,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     let fail = |line, path: &str, message: String| AtomError {
         file: file.clone(),
         line,
+        column: None,
         path: path.to_owned(),
         message,
     };
@@ -393,6 +411,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         AtomError {
             file: error.file.map_or_else(|| file.clone(), PathBuf::from),
             line: error.line.unwrap_or(1),
+            column: error.column,
             path: path.to_owned(),
             message,
         }
@@ -662,6 +681,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
                 } else {
                     1
                 },
+                column: None,
                 path: if in_atom {
                     format!("/output{}", e.path.trim_end_matches('/'))
                 } else {
@@ -675,9 +695,14 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         )?;
     }
 
-    let context = match fm.get("context").cloned() {
-        Some(schema) => Some(schema),
-        None => registry::sidecar(&file, "context")
+    // The atom's public context contract, from the `context` field it writes or
+    // from the sidecar beside it. `context: null` is how the authoring contract
+    // spells "none" so that the *presence* of the key still means the sidecar:
+    // a schema that declares no properties is a declared context, and asks for
+    // a snapshot; no schema at all does not.
+    let context = match fm.get("context") {
+        Some(schema) if !schema.is_null() => Some(schema.clone()),
+        _ => registry::sidecar(&file, "context")
             .map_err(|e| fail(1, "/context", e.to_string()))?
             .map(|path| {
                 registry
@@ -705,12 +730,15 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             "context binding requires a declared context schema".into(),
         ));
     }
-    schemas.insert(
-        "Context".into(),
-        context
-            .clone()
-            .unwrap_or(json!({"type":"object","additionalProperties":false})),
-    );
+    // The contract is projected with a `Context` type only when the atom
+    // declares one: with none, `Props` and `Config` carry `input` alone, so a
+    // read of `context` — in the template or in a validator or scorer — is a
+    // type error here rather than a callback that sees nothing. A declared
+    // schema with no required field still declares one, and still asks for a
+    // snapshot.
+    if let Some((role, schema)) = context_contract(context.clone()) {
+        schemas.insert(role, schema);
+    }
     let mut schema_number = 0;
     let mut resolve_schema = |schema: &Value| -> Result<Value, AtomError> {
         schema_number += 1;
@@ -792,7 +820,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     let required: Vec<_> = judge_properties.keys().cloned().collect();
     schemas.insert("Judges".into(), json!({"type":"object","additionalProperties":false,"required":required,"properties":judge_properties}));
     program.contracts = Value::Object(schemas.clone());
-    let generated = declarations_for(
+    let (generated, dead) = declarations_for(
         &program.root,
         &file,
         &parsed["typeImports"],
@@ -800,9 +828,20 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         registry,
     )
     .map_err(|e| fail(1, "types", e))?;
-    let declarations = program
-        .invoke_located("check", json!({ "declarations": generated }))
-        .map_err(|e| located("types", e))?;
+    let declarations = match program.invoke_located("check", json!({ "declarations": generated })) {
+        Ok(declarations) => declarations,
+        Err(e) => {
+            // A shared type whose schema file is gone is the cause, and the
+            // type checker's "cannot find module" is its symptom: name the
+            // schema files the import needed, because that is what a rename
+            // moved or a removal took away.
+            let mut error = located("types", e);
+            if let Some(cause) = dead_import(&dead) {
+                error.message = format!("{cause} {}", error.message);
+            }
+            return Err(error);
+        }
+    };
     if let Some(files) = declarations.as_object() {
         for (name, source) in files {
             program.sources.insert(
@@ -837,15 +876,18 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
 /// sources import types from, with the schema files those reference. Sources
 /// import `schemas/change.schema.json`'s types from
 /// `.atomic/types/schemas/change`. Only imported schemas are included, so
-/// editing an unrelated schema leaves the compiled atom unchanged. An import
-/// with no schema file behind it is left for the type checker to report.
+/// editing an unrelated schema leaves the compiled atom unchanged.
+///
+/// Alongside them come the shared-schema imports with no schema file behind
+/// them — an import of a module generated here is never one — which
+/// [`dead_import`] turns into the error a schema rename leaves in its place.
 fn declarations_for(
     root: &Path,
     file: &Path,
     type_imports: &Value,
     schemas: &serde_json::Map<String, Value>,
     registry: &mut Registry,
-) -> Result<serde_json::Map<String, Value>, String> {
+) -> Result<(serde_json::Map<String, Value>, Vec<String>), String> {
     let types = root.join(".atomic/types");
     let stem = file
         .file_name()
@@ -861,7 +903,12 @@ fn declarations_for(
         astro::path_text(&types.join("authoring.d.ts"))?.to_owned(),
         json!(AUTHORING_DECLARATIONS),
     );
+    out.insert(
+        astro::path_text(&types.join("raw-imports.d.ts"))?.to_owned(),
+        json!(RAW_IMPORT_DECLARATIONS),
+    );
     let mut wanted = Vec::new();
+    let mut dead = Vec::new();
     for import in type_imports
         .as_array()
         .into_iter()
@@ -875,6 +922,13 @@ fn declarations_for(
         let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        // The atom's own contract types and the authoring types are generated
+        // here from the atom's contracts, so no schema file is behind them and
+        // their import is never a rename. A schema file of one of those names
+        // is still looked up below, because it would replace those declarations.
+        let own_path = types.join(relative).with_file_name(format!("{name}.d.ts"));
+        let own = out.contains_key(astro::path_text(&own_path)?);
+        let mut loaded = false;
         for extension in ["json", "yaml"] {
             let schema = root
                 .join(relative)
@@ -882,12 +936,23 @@ fn declarations_for(
             if schema.is_file() {
                 registry.load_file(&schema).map_err(|e| e.to_string())?;
                 wanted.push(std::fs::canonicalize(&schema).map_err(|e| e.to_string())?);
+                loaded = true;
                 break;
             }
         }
+        if !loaded && !own {
+            // The module id and the schema file are the same path but for
+            // `.schema.<extension>`, which is what a rename moves.
+            let module = module_text(relative);
+            dead.push(format!(
+                "`.atomic/types/{module}` names no schema file of the project: neither \
+                 `{module}.schema.json` nor `{module}.schema.yaml` exists, so nothing was \
+                 generated for it to import"
+            ));
+        }
     }
     if wanted.is_empty() {
-        return Ok(out);
+        return Ok((out, dead));
     }
     for (path, text) in
         typescript::declarations(registry, root, &wanted, true).map_err(|e| e.to_string())?
@@ -904,7 +969,43 @@ fn declarations_for(
         }
         out.insert(key, json!(text));
     }
-    Ok(out)
+    Ok((out, dead))
+}
+
+/// A path below the project root with `/` separators, as a generated
+/// declaration import names it in a source file.
+fn module_text(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The one thing to say first when a generated-declaration import has no
+/// schema file behind it, or `None` when every import resolved. The type
+/// checker's own "cannot find module" follows this, so the message names the
+/// schema file to write back or the new name to point the import at.
+fn dead_import(dead: &[String]) -> Option<String> {
+    let first = dead.first()?;
+    Some(match dead.len() {
+        1 => first.clone(),
+        more => format!(
+            "{first} And {} more such {}.",
+            more - 1,
+            if more == 2 { "import" } else { "imports" }
+        ),
+    })
+}
+
+/// The public context's entry in the projected contracts: what the atom
+/// declares, or nothing. A synthetic stand-in for an atom that declares no
+/// context would make every atom look contextual — a `context` in its `Props`
+/// that no run can supply, a callback reading a context that is never there,
+/// and no way to tell the atoms that need a snapshot from the ones that must
+/// not be given one.
+fn context_contract(context: Option<Value>) -> Option<(String, Value)> {
+    Some(("Context".to_owned(), context?))
 }
 
 /// Register an explicitly declared schema and return its id. Errors carry a

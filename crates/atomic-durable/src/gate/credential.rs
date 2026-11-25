@@ -12,6 +12,7 @@
 use super::Principal;
 use crate::runtime::{DurableError, DurableRuntime, Param, Result, Tx};
 use sha2::{Digest, Sha256};
+use sqlx::{Row as _, SqliteConnection};
 
 /// A person's proof of who they are: their principal and the secret they
 /// enrolled. Only its holder can make one that verifies.
@@ -99,6 +100,24 @@ fn same(a: &str, b: &str) -> bool {
             .zip(b.bytes())
             .fold(0u8, |acc, (x, y)| acc | (x ^ y))
             == 0
+}
+
+/// Verify an operator against the SQLite enrollment on the caller's connection.
+///
+/// A privileged caller must first begin its write transaction, then call this
+/// before checking a replay key or changing rows. Sharing the connection makes
+/// credential rotation serialize with the privileged write.
+pub async fn verify_sqlite_in_write_transaction(
+    conn: &mut SqliteConnection,
+    credential: &HumanCredential,
+) -> std::result::Result<bool, sqlx::Error> {
+    let row = sqlx::query("SELECT verifier FROM atomic_operators WHERE principal = ?")
+        .bind(credential.principal.as_str())
+        .fetch_optional(conn)
+        .await?;
+    let Some(row) = row else { return Ok(false) };
+    let verifier: String = row.try_get("verifier")?;
+    Ok(same(&verifier, &credential.verifier()))
 }
 
 /// The verifier's database key. A length prefix keeps project/principal

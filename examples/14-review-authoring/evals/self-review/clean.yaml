@@ -1,0 +1,8 @@
+input:
+  packet:
+    change_id: C-1
+    candidate: Parser accepts at most 100 characters and rejects longer input.
+    checks: [Candidate explicitly states the 100-character limit and rejection]
+expect:
+  - "output.decision == 'ready'"
+  - "output.findings.size() == 0"

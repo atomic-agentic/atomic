@@ -1,0 +1,1 @@
+controls-exec-tree-equality|scripts/controls-exec.py|    status = git_run(git, where, env, ["status", "--porcelain"], room()).strip()|    status = ""  # CONTROL_OFF: accept a copy that differs from the candidate tree|-p atomic-agentic --test controls_exec_driver_guard -- copy_tree_equality_refuses_mismatch_before_any_row

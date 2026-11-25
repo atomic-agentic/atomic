@@ -1,0 +1,48 @@
+input:
+  diff: |
+    diff --git a/tools/lane_guard.py b/tools/lane_guard.py
+    --- a/tools/lane_guard.py
+    +++ b/tools/lane_guard.py
+    @@ -52,2 +52,3 @@
+         # The control row switches this line.
+    +    # A finding with no host record must never reach the confirmed return.
+         if findings and not verified(verification):
+  self_review:
+    items:
+      '1': The patch adds a comment explaining the existing unverified-finding refusal.
+      '2': No import or dependency changes.
+      '3': Only tools/lane_guard.py changes.
+      '4': No credential appears in the patch.
+      '5': The existing branch returns confirmed false without a verified host record.
+      '6': No repeat or retry is added.
+      '7': The change reads only finding and verification.
+      '8': No lock or temporary resource is created.
+      '9': 'Unverified finding refusal: allow confirmation with a verified host record,
+        refuse without it.'
+      '10': 'lane-guard-bites: the host reports it passes and fails when the guard is
+        removed.'
+    decisions:
+    - point: unverified finding refusal
+      allow_refuse: 'Allow: a host record verifies the claim. Refuse: no host verification
+        exists.'
+      not_found: Refuse when the host record is missing.
+      permission_denied: Refuse when the host cannot read evidence.
+      link_loop: Refuse when a path is a link loop.
+      not_directory: Refuse when an expected evidence directory is not a directory.
+      other_io: Refuse on any other evidence I/O error.
+      parse_error: Refuse when the host record cannot be parsed.
+      timeout: Refuse when evidence collection times out.
+      empty_result: Refuse when the host record has no verification result.
+    controls:
+    - row: lane-guard-bites
+      result: 'passed: guard present passes; removal fails lane_guard_refuses_unverified'
+  host_review:
+    decision_points:
+    - unverified finding refusal
+    selected_controls:
+    - lane-guard-bites
+    control_results:
+    - row: lane-guard-bites
+      result: 'passed: guard present passes; removal fails lane_guard_refuses_unverified'
+expect:
+- output.verdict == 'approve'

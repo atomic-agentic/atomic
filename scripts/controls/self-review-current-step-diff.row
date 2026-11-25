@@ -1,0 +1,1 @@
+self-review-current-step-diff|crates/atomic/src/pipeline.rs|repo.changed_paths(step_base, commit)|repo.changed_paths(trusted, commit)|-p atomic-agentic --test pipeline coding_revert_still_selects_row_from_current_step_diff

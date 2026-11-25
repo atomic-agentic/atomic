@@ -1,0 +1,1 @@
+graph-commit-recovery|crates/atomic-graph/src/sqlite.rs|let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await; // CONTROL_OFF: graph-commit-recovery|let _ = Ok::<(), StoreError>(()); // CONTROL_OFF: graph-commit-recovery|-p atomic-agentic-graph --lib sqlite::tests::sqlite_commit_failure_rolls_back_and_next_operation_runs

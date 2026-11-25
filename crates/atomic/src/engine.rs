@@ -14,7 +14,10 @@
 use crate::failure::Failure;
 use crate::settings;
 use anyhow::Context;
-use atomic_app::pipeline::{LAYOUT_VERSION, ProjectWorktrees, Services, register_pipeline};
+use atomic_app::model_policy::LanePolicySource;
+use atomic_app::pipeline::{
+    LAYOUT_VERSION, ProjectWorktrees, Services, TrialCargo, register_pipeline,
+};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
@@ -46,6 +49,10 @@ pub enum RunnerKind {
 /// [`crate::settings`]); a flag wins over both.
 #[derive(Clone, Debug, Default, Args)]
 pub struct EngineArgs {
+    /// Project configuration profile: `atomic.<profile>.yaml` beside the
+    /// resolved project's manifest. `ATOMIC_PROFILE` is used without a flag.
+    #[arg(long)]
+    pub profile: Option<String>,
     /// Base URL of the OpenAI-compatible API that model atoms use
     /// (`model.base_url`, `ATOMIC_MODEL_BASE_URL`).
     #[arg(long)]
@@ -428,6 +435,10 @@ pub struct Engine {
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// Whether a project-wide model endpoint was resolved for ordinary runs.
+    pub model_endpoint_configured: bool,
+    /// Operator-owned route source admitted for new graph lanes, when set.
+    pub lane_policy: Option<LanePolicySource>,
     /// The project's artifact store, which its runs read and write.
     pub artifacts: LocalStore,
 }
@@ -468,6 +479,20 @@ pub async fn open(
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
     let resolved = settings(state, args, needs_model)?;
+    let lane_policy = resolved
+        .settings
+        .model
+        .lanes
+        .as_ref()
+        .map(|policy| {
+            Ok::<_, anyhow::Error>(LanePolicySource {
+                path: resolved.user.clone().ok_or_else(|| {
+                    anyhow::anyhow!("model.lanes has no operator configuration file")
+                })?,
+                endpoints: policy.endpoints.clone(),
+            })
+        })
+        .transpose()?;
     atomic_core::runtime::limit_backend_wait(
         resolved
             .settings
@@ -501,7 +526,15 @@ pub async fn open(
     } else {
         None
     };
-    let endpoint = endpoint(&resolved, needs_model, personal_refused)?;
+    // Routed graph runs take their endpoint from a checkpointed item choice.
+    // Resume and serve open before they know each stored run's workflow type;
+    // the workflow refuses an ordinary model run without this endpoint.
+    let default_required = needs_model
+        && lane_policy.is_none()
+        && (matches!(&takes, Takes::Own) || (personal_refused.is_some() && resolved.on_sign_in()));
+    let endpoint = endpoint(&resolved, default_required, personal_refused)?;
+    let model_endpoint_configured =
+        endpoint.base_url != "http://127.0.0.1:9/unconfigured" || endpoint.model != "unconfigured";
     let signed_in = endpoint.sign_in.is_some();
     // Where model calls go, when the person running this did not say.
     if let Some(line) = resolved.announcement() {
@@ -546,6 +579,40 @@ pub async fn open(
     // tell a directory git refused from one git could not be asked about (see
     // `runs::bind_fixture`).
     let worktrees = ProjectWorktrees::FixtureOnly;
+    // An explicit operator choice, separate from the candidate's Cargo home.
+    // The runner later exposes only its registry, read-only, to a trial check.
+    let operator_value =
+        |trial: &str, controls: &str| -> anyhow::Result<Option<std::ffi::OsString>> {
+            let (trial, controls) = (std::env::var_os(trial), std::env::var_os(controls));
+            anyhow::ensure!(
+                trial.is_none() || controls.is_none() || trial == controls,
+                "trial and controls offline Cargo settings disagree"
+            );
+            Ok(trial.or(controls))
+        };
+    let trial_cargo = match operator_value(
+        "ATOMIC_TRIAL_CARGO_REGISTRY",
+        "ATOMIC_CONTROLS_CARGO_REGISTRY",
+    )? {
+        Some(registry) => Some(
+            TrialCargo::new(
+                registry.into(),
+                operator_value(
+                    "ATOMIC_TRIAL_RUSTUP_TOOLCHAIN",
+                    "ATOMIC_CONTROLS_RUSTUP_TOOLCHAIN",
+                )?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "operator offline Cargo toolchain is required with its registry"
+                    )
+                })?
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("operator offline Cargo toolchain is not UTF-8"))?,
+            )
+            .map_err(anyhow::Error::msg)?,
+        ),
+        None => None,
+    };
     let mut rt = Durare::open(
         &database,
         executor.as_deref(),
@@ -558,11 +625,14 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
+            model_endpoint_configured,
             store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
             caches: Some(state.dir().join("cache")),
+            trial_cargo,
+            trial_denied: state.denied_scratch(),
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public
@@ -570,6 +640,7 @@ pub async fn open(
             context: None,
         },
     );
+    crate::delivery::register_delivery(&mut rt, state.clone());
     let only = match &takes {
         Takes::Own => None,
         Takes::Run(run) => Some(Some(run.as_str())),
@@ -585,6 +656,8 @@ pub async fn open(
         store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        model_endpoint_configured,
+        lane_policy,
         artifacts: store,
     })
 }

@@ -49,6 +49,47 @@ fn declared_paths_pass() {
 }
 
 #[test]
+fn boolean_condition_rejects_known_non_boolean_results() {
+    let schema = json!({"type":"object","properties":{
+        "tests_run":{"type":"array","items":{"type":"string"}},
+        "passed":{"type":"boolean"},
+        "count":{"type":"integer"}
+    }});
+    let scope = Scope::new().with("candidate", &schema);
+    for bad in [
+        "candidate.tests_run.size()",
+        "candidate.count",
+        "42",
+        "'ready'",
+        "[true]",
+    ] {
+        let error = parse(bad)
+            .expect("valid CEL")
+            .check_boolean(&scope)
+            .expect_err("known non-boolean condition");
+        assert!(
+            (1..=bad.chars().count()).contains(&error.column),
+            "{bad}: {error}"
+        );
+        assert!(
+            error.message.contains("expected a boolean result"),
+            "{bad}: {error}"
+        );
+    }
+    for good in [
+        "candidate.passed",
+        "candidate.tests_run.size() > 0",
+        "candidate.count == 1 && true",
+        "candidate.tests_run.exists(x, x == 'ok')",
+    ] {
+        parse(good)
+            .expect("valid CEL")
+            .check_boolean(&scope)
+            .unwrap_or_else(|error| panic!("{good}: {error}"));
+    }
+}
+
+#[test]
 fn loop_variables_are_typed_from_their_list() {
     let e = check("input.files.exists(f, f.pth == \"x\")").expect_err("misspelt in a loop");
     assert!(

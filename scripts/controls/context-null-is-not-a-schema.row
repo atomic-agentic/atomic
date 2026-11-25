@@ -1,0 +1,1 @@
+context-null-is-not-a-schema|crates/atomic-core/src/atom.rs|        Some(schema) if !schema.is_null() => Some(schema.clone()),|        Some(schema) => Some(schema.clone()), /*CONTROL_OFF*/|-p atomic-agentic-core --lib -- atom::tests::a_context_sidecar_declares_a_context_and_null_does_not

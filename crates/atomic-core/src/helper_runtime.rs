@@ -1,76 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The runtime captured TypeScript helpers run in: one fresh V8 isolate per
-//! call, embedded through `deno_core` with none of Deno's extensions.
-//!
-//! An isolate has no filesystem, network, environment, process, timer or FFI
-//! operations, because nothing adds them, so there is nothing to grant or
-//! deny: a helper sees ECMAScript built-ins and the JSON arguments it is
-//! given, and returns JSON. The prelude removes what `deno_core` installs
-//! (`Deno.core`, `__bootstrap` and a printing `console`) and the built-ins
-//! whose memory V8 allocates outside both limits below (`WebAssembly`,
-//! `SharedArrayBuffer` and resizable `ArrayBuffer`s).
-//!
-//! Resource limits are enforced from Rust, so a helper cannot lift them: a
-//! watchdog thread terminates a call at its deadline, a near-heap-limit
-//! callback terminates it before V8's heap is exhausted, a budgeted allocator
-//! bounds ArrayBuffer memory, and the result and the text of an error a call
-//! throws are measured before they are copied out of the isolate. An error a
-//! module throws while it loads is copied by `deno_core` and then truncated,
-//! within the memory limit of the call's process. A failed isolate is
-//! discarded.
-//!
-//! [`invoke`] runs each call in a child process (see `process`), which bounds
-//! the memory V8 allocates outside its heap and contains the failures V8
-//! cannot recover from, such as an invalid string size, by aborting.
-
-mod allocator;
+//! Captured helper modules execute once in a bounded Boa child.
 mod process;
 #[cfg(test)]
 mod tests;
-mod zone;
-
-pub use process::{CHILD_ARG, HostCommand, serve, set_host_command};
-
-use deno_core::{
-    JsRuntime, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
-    ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, PollEventLoopOptions,
-    ResolutionKind, RuntimeOptions, error::ModuleLoaderError, v8,
+use crate::js_modules::Modules;
+use boa_engine::{
+    Context, JsNativeError, JsResult, JsString, JsValue, Module, Source, context::HostHooks,
+    realm::Realm,
 };
+pub use process::{CHILD_ARG, HostCommand, serve, set_host_command};
 use serde_json::Value;
-use std::collections::BTreeMap;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{collections::BTreeMap, rc::Rc, time::Duration};
 
 /// The URL scheme captured modules are keyed by.
 pub const SCHEME: &str = "atomic-helper";
 
-/// The version of the helper-call semantics: the wrapper, JSON marshalling
-/// and failure kinds. Changing what a helper observes changes this.
-const SEMANTICS: &str = "atomic-helper-call-2";
-
-/// What a helper's behaviour depends on besides its own code: the engine
-/// (deno_core and V8), the prelude (host functions, stripped globals, the
-/// virtual clock) and the call semantics. A run that recorded another
-/// identity cannot resume its helper steps on this runtime.
+/// Fingerprint of the engine, dependency versions, helper host and call protocol.
+/// Durable runs verify this identity before resuming helper steps.
 pub fn identity() -> String {
-    use sha2::{Digest, Sha256};
-    let mut digest = Sha256::new();
-    for part in [
-        SEMANTICS,
-        "deno_core 0.413.0",
-        deno_core::v8::VERSION_STRING,
-        HOST,
-        STRIP,
-        CLOCK,
-        zone::ZONE,
-        zone::LOCALE,
-    ] {
-        digest.update(part.as_bytes());
-        digest.update([0]);
-    }
-    format!("{:x}", digest.finalize())
+    env!("ATOMIC_HELPER_HASH").to_owned()
 }
 
 /// A captured helper module graph, already transpiled to JavaScript.
@@ -106,7 +54,7 @@ impl Captured {
 pub struct Limits {
     /// Wall-clock time for the call, including module evaluation.
     pub deadline: Duration,
-    /// V8 heap, in bytes.
+    /// engine heap, in bytes.
     pub heap_bytes: usize,
     /// ArrayBuffer and typed-array contents held at once, in bytes.
     pub array_buffer_bytes: usize,
@@ -151,12 +99,11 @@ pub enum Failure {
     /// The call ran past its deadline.
     #[error("helper deadline exceeded")]
     Deadline,
-    /// The call exhausted its memory: the V8 heap, or the helper
+    /// The call exhausted its memory: the engine heap, or the helper
     /// process's limit on what it may allocate outside the heap.
     #[error("helper memory limit exceeded")]
     Heap,
-    /// The call asked for more ArrayBuffer memory than its budget, and V8
-    /// could not recover the space.
+    /// The call asked for more ArrayBuffer memory than its budget, across live backing stores.
     #[error("helper ArrayBuffer limit exceeded")]
     ArrayBufferLimit,
     /// The result was larger than the output limit.
@@ -184,7 +131,7 @@ pub(crate) struct Controls {
     /// Remove `Deno`, `__bootstrap`, `console`, `WebAssembly`,
     /// `SharedArrayBuffer` and resizable ArrayBuffers.
     pub strip_globals: bool,
-    /// Terminate the call from the near-heap-limit callback.
+    /// Enforce the child’s live allocation ceiling.
     pub heap_callback: bool,
     /// Bound ArrayBuffer memory with the budgeted allocator.
     pub bounded_array_buffers: bool,
@@ -210,59 +157,6 @@ impl Default for Controls {
     }
 }
 
-struct Loader(BTreeMap<String, String>);
-
-fn invoke_url(url: &ModuleSpecifier) -> bool {
-    url.scheme() == SCHEME && url.path().starts_with("/__invoke")
-}
-
-impl ModuleLoader for Loader {
-    fn resolve(
-        &self,
-        specifier: &str,
-        referrer: &str,
-        kind: ResolutionKind,
-    ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        if matches!(kind, ResolutionKind::DynamicImport) {
-            return Err(ModuleLoaderError::generic("dynamic imports are disabled"));
-        }
-        let url =
-            deno_core::resolve_import(specifier, referrer).map_err(ModuleLoaderError::from_err)?;
-        if !(self.0.contains_key(url.as_str()) || invoke_url(&url)) {
-            return Err(ModuleLoaderError::generic(format!(
-                "uncaptured module: {url}"
-            )));
-        }
-        Ok(url)
-    }
-
-    fn load(
-        &self,
-        url: &ModuleSpecifier,
-        _: Option<&ModuleLoadReferrer>,
-        options: ModuleLoadOptions,
-    ) -> ModuleLoadResponse {
-        if options.is_dynamic_import {
-            return ModuleLoadResponse::Sync(Err(ModuleLoaderError::generic(
-                "dynamic imports are disabled",
-            )));
-        }
-        ModuleLoadResponse::Sync(
-            self.0
-                .get(url.as_str())
-                .map(|source| {
-                    ModuleSource::new(
-                        ModuleType::JavaScript,
-                        ModuleSourceCode::String(source.clone().into()),
-                        url,
-                        None,
-                    )
-                })
-                .ok_or_else(|| ModuleLoaderError::generic(format!("uncaptured module: {url}"))),
-        )
-    }
-}
-
 // Runs before any author module. The per-call wrapper uses only the functions
 // captured here, which author code cannot replace.
 const HOST: &str = r#"(() => {
@@ -283,23 +177,18 @@ const HOST: &str = r#"(() => {
   }
   Object.defineProperty(globalThis, '__atomicHost', { configurable: false, writable: false, enumerable: false,
     value: freeze({ input: text => deepFreeze(parse(text)), output: value => stringify(value, jsonOnly),
-      text: value => (value !== null && typeof value === 'object' && typeof value.stack === 'string') ? value.stack : toText(value) }) });
+      text: value => { const message = toText(value); const stack = value !== null && typeof value === 'object' ? value.stack : undefined; return typeof stack === 'string' ? message + '\n' + stack : message; } }) });
 })();
 "#;
 
-// deno_core installs Deno.core and __bootstrap, which reach its built-in
-// operations, and a console that prints to the process's stdout; author code
-// gets none of them, and console calls are accepted and discarded.
-// WebAssembly memories, SharedArrayBuffers and resizable ArrayBuffers are
-// reserved by V8's page allocator, outside both the heap limit and the
-// budgeted ArrayBuffer allocator, so they are removed: ArrayBuffer accepts a
-// length and nothing else, and the original constructor is unreachable from
-// its prototype.
+// Helpers get a quiet console and fixed-size ArrayBuffers. The original
+// constructor must also be removed from the prototype chain.
 const STRIP: &str = r#"(() => {
   delete globalThis.Deno;
   delete globalThis.__bootstrap;
   delete globalThis.WebAssembly;
   delete globalThis.SharedArrayBuffer;
+  delete globalThis.TypedArray;
   const freeze = Object.freeze, construct = Reflect.construct, HostRangeError = RangeError;
   const quiet = () => {};
   Object.defineProperty(globalThis, 'console', { configurable: false, writable: false, enumerable: false,
@@ -320,16 +209,13 @@ const STRIP: &str = r#"(() => {
 
 // What a helper could otherwise read from the host: the clock (Date,
 // Temporal.Now), randomness (Math.random), and the host's timezone and
-// locale, which ICU reads per process and V8 cannot set per isolate. Each is
-// replaced: time is the call's logical time, Math.random a seeded generator,
-// local time is UTC, and an unspecified locale is en-US. ICU's own defaults
-// are also set to UTC and en-US (see `zone`), for the built-ins this cannot
-// reach. Called with the call's time and the four words of its seed.
+// locale. Each call supplies its logical time and four-word random seed.
 const CLOCK: &str = r#"((now, a, b, c, d) => {
   const defineProperty = Object.defineProperty, construct = Reflect.construct, freeze = Object.freeze;
   const define = (target, name, value) => defineProperty(target, name, { value, writable: true, configurable: true, enumerable: false });
   const LOCALE = 'en-US';
-  const locales = (value) => (value === undefined ? LOCALE : value);
+  const supported = Intl.DateTimeFormat.supportedLocalesOf.bind(Intl.DateTimeFormat);
+  const locales = value => value === undefined || supported(value).length === 0 ? LOCALE : value;
   const utc = (options) => (options !== undefined && options !== null && typeof options === 'object' && options.timeZone !== undefined)
     ? options : Object.assign({}, options, { timeZone: 'UTC' });
 
@@ -391,7 +277,7 @@ const CLOCK: &str = r#"((now, a, b, c, d) => {
     define(Original.prototype, 'constructor', Wrapped);
     define(Intl, name, Wrapped);
   }
-  // A DateTimeFormat given no date formats the current time, which V8 reads
+  // A DateTimeFormat given no date formats the current time, which engines read
   // from the host clock: the logical time is passed instead.
   const DateTimeProto = Intl.DateTimeFormat.prototype;
   const formatGetter = Object.getOwnPropertyDescriptor(DateTimeProto, 'format').get, bound = new WeakMap();
@@ -405,7 +291,7 @@ const CLOCK: &str = r#"((now, a, b, c, d) => {
     return format;
   } });
   const formatToParts = DateTimeProto.formatToParts;
-  define(DateTimeProto, 'formatToParts', function formatToParts_(date) { return formatToParts.call(this, date === undefined ? now : date); });
+  if (formatToParts) define(DateTimeProto, 'formatToParts', function formatToParts_(date) { return formatToParts.call(this, date === undefined ? now : date); });
   for (const [target, name, args] of [[Number.prototype, 'toLocaleString', 0], [BigInt.prototype, 'toLocaleString', 0],
     [String.prototype, 'localeCompare', 1], [String.prototype, 'toLocaleLowerCase', 0], [String.prototype, 'toLocaleUpperCase', 0]]) {
     const original = target[name];
@@ -437,289 +323,181 @@ const CLOCK: &str = r#"((now, a, b, c, d) => {
     }
   }
 })"#;
-
-/// Flags the watchdog and heap callback raise before they terminate a call,
-/// so the failure is reported as the limit it hit.
-#[derive(Default)]
-struct Tripped {
-    deadline: AtomicBool,
-    heap: AtomicBool,
+struct Hooks {
+    restricted: bool,
+}
+impl HostHooks for Hooks {
+    fn ensure_can_compile_strings(
+        &self,
+        _: Realm,
+        _: &[JsString],
+        _: &JsString,
+        _: bool,
+        _: &mut Context,
+    ) -> JsResult<()> {
+        if self.restricted {
+            Err(JsNativeError::eval()
+                .with_message("string compilation is disabled")
+                .into())
+        } else {
+            Ok(())
+        }
+    }
+    fn local_timezone_offset_seconds(&self, _: i64) -> i32 {
+        0
+    }
 }
 
-/// One V8 isolate holding a captured module graph. Module state persists
-/// between calls on one isolate, so [`invoke`] uses a fresh one for every
-/// call; reusing one is only for measurement and negative controls.
+struct LogicalTime(i64);
+impl boa_engine::context::time::Clock for LogicalTime {
+    fn now(&self) -> boa_engine::context::time::JsInstant {
+        boa_engine::context::time::JsInstant::new(0, 0)
+    }
+    fn system_time_millis(&self) -> i64 {
+        self.0
+    }
+}
+
 pub(crate) struct Isolate {
-    // Declared first, so it drops before the Tokio runtime it was created in.
-    runtime: JsRuntime,
-    tokio: tokio::runtime::Runtime,
+    context: Context,
+    modules: Rc<Modules>,
     entry: String,
     limits: Limits,
     controls: Controls,
-    tripped: Arc<Tripped>,
-    budget: Option<Arc<allocator::Budget>>,
-    calls: u64,
 }
-
 impl Isolate {
-    /// Creates an isolate for `captured` with the prelude applied.
     pub(crate) fn new(
         captured: &Captured,
         limits: Limits,
         clock: Clock,
         controls: Controls,
     ) -> Result<Self, Failure> {
-        let host = |error: &dyn std::fmt::Display| Failure::Host(error.to_string());
-        // V8 posts delayed tasks to the Tokio runtime current when the
-        // isolate is created; creating one outside a runtime aborts.
-        let tokio = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|error| host(&error))?;
-        let mut params = v8::CreateParams::default().heap_limits(0, limits.heap_bytes);
-        let mut budget = None;
-        if controls.bounded_array_buffers {
-            let (allocator, shared) = allocator::bounded(limits.array_buffer_bytes);
-            params = params.array_buffer_allocator(allocator);
-            budget = Some(shared);
-        }
-        if controls.virtual_clock {
-            // ICU's defaults are set once V8 has loaded ICU's data and before
-            // any isolate exists, so no isolate caches the host's.
-            JsRuntime::init_platform(None);
-            zone::set_defaults().map_err(Failure::Host)?;
-        }
-        let mut runtime = {
-            let _entered = tokio.enter();
-            JsRuntime::new(RuntimeOptions {
-                module_loader: Some(Rc::new(Loader(captured.modules.clone()))),
-                create_params: Some(params),
-                ..Default::default()
-            })
-        };
-        if controls.strip_globals {
-            // `eval` and `new Function` compile strings; a helper is its
-            // captured modules and nothing else.
-            let context = runtime.main_context();
-            deno_core::scope!(scope, &mut runtime);
-            v8::Local::new(scope, context).set_allow_generation_from_strings(false);
-        }
-        let tripped = Arc::new(Tripped::default());
-        if controls.heap_callback {
-            let handle = runtime.v8_isolate().thread_safe_handle();
-            let flag = tripped.clone();
-            // Terminating unwinds the call; the raised limit gives V8 room to
-            // do that instead of aborting. V8 also calls this from the
-            // last-resort collection after the allocator refuses an
-            // ArrayBuffer, which `call` reports as that limit. Each call
-            // raises the limit by a quarter of the original, to twice it at
-            // most; past that V8 aborts, which the call's process contains.
-            runtime.add_near_heap_limit_callback(move |current, initial| {
-                flag.heap.store(true, Ordering::Release);
-                handle.terminate_execution();
-                current
-                    .saturating_add(initial / 4)
-                    .min(initial.saturating_mul(2))
-                    .max(current)
-            });
-        }
-        runtime
-            .execute_script("atomic:host", HOST)
-            .map_err(|error| host(&error))?;
-        if controls.strip_globals {
-            runtime
-                .execute_script("atomic:strip", STRIP)
-                .map_err(|error| host(&error))?;
-        }
+        let modules = Rc::new(Modules::default());
+        let mut builder = Context::builder()
+            .module_loader(modules.clone())
+            .host_hooks(Rc::new(Hooks {
+                restricted: controls.strip_globals,
+            }));
         if controls.virtual_clock {
             if !clock.now_ms.is_finite() {
                 return Err(Failure::Host("helper clock is not a finite time".into()));
             }
+            builder = builder.clock(Rc::new(LogicalTime(clock.now_ms as i64)));
+        }
+        let mut context = builder.build().map_err(|e| Failure::Host(e.to_string()))?;
+        let mut init = |src: &str| {
+            context
+                .eval(Source::from_bytes(src))
+                .map_err(|e| Failure::Host(e.to_string()))
+        };
+        init(HOST)?;
+        if controls.strip_globals {
+            init(STRIP)?;
+        }
+        if controls.virtual_clock {
             let [a, b, c, d] = clock.seed;
-            runtime
-                .execute_script(
-                    "atomic:clock",
-                    format!("{CLOCK}({:?}, {a}, {b}, {c}, {d});", clock.now_ms),
-                )
-                .map_err(|error| host(&error))?;
+            init(&format!("{CLOCK}({}, {a}, {b}, {c}, {d})", clock.now_ms))?;
+        }
+        for (name, source) in &captured.modules {
+            if !name.starts_with("atomic-helper:///") {
+                return Err(Failure::Refused("invalid helper module URL".into()));
+            }
+            let module = Module::parse(
+                Source::from_bytes(source).with_path(std::path::Path::new(name)),
+                None,
+                &mut context,
+            )
+            .map_err(|e| Failure::Threw(e.to_string()))?;
+            modules.insert(name.clone(), module);
         }
         Ok(Self {
-            runtime,
-            tokio,
+            context,
+            modules,
             entry: captured.entry.clone(),
             limits,
             controls,
-            tripped,
-            budget,
-            calls: 0,
         })
     }
 
-    /// Calls one export with `args` (a JSON array) spread as its parameters.
     pub(crate) fn call(&mut self, export: &str, args: &Value) -> Result<Value, Failure> {
-        let _entered = self.tokio.enter();
-        let handle = self.runtime.v8_isolate().thread_safe_handle();
-        let (done, finished) = std::sync::mpsc::channel::<()>();
-        let deadline = self.limits.deadline;
-        let watchdog = self.controls.watchdog.then(|| {
-            let flag = self.tripped.clone();
-            std::thread::spawn(move || {
-                if finished.recv_timeout(deadline).is_err() {
-                    flag.deadline.store(true, Ordering::Release);
-                    handle.terminate_execution();
-                }
-            })
-        });
-        self.calls += 1;
-        let (runtime, entry, sequence) = (&mut self.runtime, self.entry.as_str(), self.calls);
-        let (limits, controls) = (self.limits, self.controls);
-        let result = self.tokio.block_on(async {
-            match tokio::time::timeout(
-                deadline + Duration::from_millis(250),
-                call(runtime, entry, sequence, export, args, limits, controls),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(Failure::Deadline),
-            }
-        });
-        let _ = done.send(());
-        if let Some(watchdog) = watchdog {
-            watchdog
-                .join()
-                .map_err(|_| Failure::Host("watchdog panicked".into()))?;
+        if !args.is_array() {
+            return Err(Failure::Host("helper arguments must be an array".into()));
         }
-        if self.tripped.heap.load(Ordering::Acquire) {
-            let refused = self.budget.as_ref().is_some_and(|budget| budget.refused());
-            return Err(if refused {
-                Failure::ArrayBufferLimit
+        let quote = |s: &str| serde_json::Value::from(s).to_string();
+        let wrapper = format!(
+            r#"import * as helpers from {};
+            export const missing = typeof helpers[{}] !== 'function';
+            export let result, error;
+            if (!missing) {{
+                try {{ result = __atomicHost.output(await helpers[{}](...__atomicHost.input({}))); }}
+                catch (e) {{ error = __atomicHost.text(e); }}
+            }}"#,
+            quote(&self.entry),
+            quote(export),
+            quote(export),
+            quote(&args.to_string())
+        );
+        let ctx = &mut self.context;
+        let module = Module::parse(Source::from_bytes(&wrapper), None, ctx)
+            .map_err(|e| Failure::Host(e.to_string()))?;
+        if let Err(e) = self.modules.evaluate(&module, ctx) {
+            let reason = e
+                .into_opaque(ctx)
+                .and_then(|v| v.to_string(ctx))
+                .map_err(|_| Failure::Threw("module evaluation failed".into()))?;
+            let mut message = String::new();
+            for c in reason.as_str().code_points_lossy() {
+                if message.len() + c.len_utf8() > self.limits.error_bytes {
+                    message.push('…');
+                    break;
+                }
+                message.push(c);
+            }
+            return Err(if message.contains("uncaptured module") {
+                Failure::Refused(message)
             } else {
-                Failure::Heap
+                Failure::Threw(message)
             });
         }
-        if self.tripped.deadline.load(Ordering::Acquire) {
-            return Err(Failure::Deadline);
+        let mut get = |key: &str| {
+            module
+                .get_value(JsString::from(key), ctx)
+                .map_err(|e| Failure::Host(e.to_string()))
+        };
+        if get("missing")?.as_boolean() == Some(true) {
+            return Err(Failure::Refused(format!(
+                "{export} is not an exported function"
+            )));
         }
-        result
-    }
-}
-
-fn bounded(text: String, limit: usize) -> String {
-    if text.len() <= limit {
-        return text;
-    }
-    let mut end = limit;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &text[..end])
-}
-
-// Reads a global the wrapper set, measuring it before copying it out.
-fn read_text(
-    runtime: &mut JsRuntime,
-    name: &'static str,
-    limit: usize,
-    measured: bool,
-) -> Result<Option<String>, Failure> {
-    let value = runtime
-        .execute_script("atomic:result", name)
-        .map_err(|error| Failure::Host(error.to_string()))?;
-    deno_core::scope!(scope, runtime);
-    let value = v8::Local::new(scope, value);
-    if value.is_undefined() {
-        return Ok(None);
-    }
-    let text = v8::Local::<v8::String>::try_from(value)
-        .map_err(|_| Failure::Host(format!("{name} is not text")))?;
-    if measured && text.utf8_length(scope) > limit {
-        return Err(Failure::OutputLimit);
-    }
-    Ok(Some(text.to_rust_string_lossy(scope)))
-}
-
-async fn call(
-    runtime: &mut JsRuntime,
-    entry: &str,
-    sequence: u64,
-    export: &str,
-    args: &Value,
-    limits: Limits,
-    controls: Controls,
-) -> Result<Value, Failure> {
-    if !args.is_array() {
-        return Err(Failure::Host("helper arguments must be an array".into()));
-    }
-    let quote = |text: &str| serde_json::to_string(text).unwrap_or_default();
-    let code = format!(
-        r#"
-        import * as authored from {entry};
-        const host = globalThis.__atomicHost;
-        globalThis.__atomicResult = undefined;
-        globalThis.__atomicError = undefined;
-        globalThis.__atomicMissing = typeof authored[{export}] !== 'function';
-        if (!globalThis.__atomicMissing) {{
-          try {{
-            globalThis.__atomicResult = host.output(await authored[{export}](...host.input({args})));
-          }} catch (error) {{ globalThis.__atomicError = host.text(error); }}
-        }}
-    "#,
-        entry = quote(entry),
-        export = quote(export),
-        args = quote(&args.to_string()),
-    );
-    let specifier = ModuleSpecifier::parse(&format!("{SCHEME}:///__invoke_{sequence}.mjs"))
-        .map_err(|error| Failure::Host(error.to_string()))?;
-    let threw = |error: deno_core::error::CoreError| {
-        let text = error.to_string();
-        if text.contains("uncaptured module") || text.contains("dynamic imports are disabled") {
-            Failure::Refused(bounded(text, limits.error_bytes))
-        } else {
-            Failure::Threw(bounded(text, limits.error_bytes))
+        let checked = |val: JsValue, limit, failure| -> Result<Option<String>, Failure> {
+            let Some(s) = val.as_string() else {
+                return Ok(None);
+            };
+            if self.controls.text_limits
+                && s.as_str()
+                    .code_points_lossy()
+                    .map(char::len_utf8)
+                    .sum::<usize>()
+                    > limit
+            {
+                return Err(failure);
+            }
+            Ok(Some(s.to_std_string_lossy()))
+        };
+        if let Some(error) = checked(get("error")?, self.limits.error_bytes, Failure::ErrorLimit)? {
+            return Err(Failure::Threw(error));
         }
-    };
-    let id = runtime
-        .load_side_es_module_from_code(&specifier, code)
-        .await
-        .map_err(threw)?;
-    let evaluated = runtime.mod_evaluate(id);
-    runtime
-        .run_event_loop(PollEventLoopOptions::default())
-        .await
-        .map_err(threw)?;
-    evaluated.await.map_err(threw)?;
-    if read_text(runtime, "String(globalThis.__atomicMissing)", 8, false)?.as_deref()
-        == Some("true")
-    {
-        return Err(Failure::Refused(format!(
-            "{export} is not an exported function"
-        )));
+        let output = checked(
+            get("result")?,
+            self.limits.output_bytes,
+            Failure::OutputLimit,
+        )?
+        .ok_or_else(|| Failure::NotJson("the helper returned undefined".into()))?;
+        serde_json::from_str(&output).map_err(|e| Failure::NotJson(e.to_string()))
     }
-    match read_text(
-        runtime,
-        "globalThis.__atomicError",
-        limits.error_bytes,
-        controls.text_limits,
-    ) {
-        Ok(Some(error)) => return Err(Failure::Threw(error)),
-        Ok(None) => {}
-        Err(Failure::OutputLimit) => return Err(Failure::ErrorLimit),
-        Err(other) => return Err(other),
-    }
-    let output = read_text(
-        runtime,
-        "globalThis.__atomicResult",
-        limits.output_bytes,
-        controls.text_limits,
-    )?
-    .ok_or_else(|| Failure::NotJson("the helper returned undefined".into()))?;
-    serde_json::from_str(&output).map_err(|error| Failure::NotJson(error.to_string()))
 }
 
-/// Calls one export of `captured` in a fresh isolate on its own thread, so no
-/// module state survives between calls and the caller's thread may be inside
-/// an async runtime. `args` is the JSON array of arguments.
+/// Invoke a captured export in a fresh supervised child.
 pub fn invoke(
     captured: &Captured,
     export: &str,
@@ -738,10 +516,5 @@ pub(crate) fn invoke_with(
     clock: Clock,
     controls: Controls,
 ) -> Result<Value, Failure> {
-    std::thread::scope(|scope| {
-        scope
-            .spawn(|| Isolate::new(captured, limits, clock, controls)?.call(export, args))
-            .join()
-            .unwrap_or_else(|_| Err(Failure::Host("helper thread panicked".into())))
-    })
+    Isolate::new(captured, limits, clock, controls)?.call(export, args)
 }

@@ -1,0 +1,1 @@
+graph-claim-turn-horizon|crates/atomic/src/graph_claim.rs|self.turn_timeout >= self.lease_for|false|-p atomic-agentic --test graph_claim claimed_turn_rejects_a_deadline_at_or_beyond_its_lease_before_claiming

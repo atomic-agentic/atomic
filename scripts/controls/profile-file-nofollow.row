@@ -1,0 +1,1 @@
+profile-file-nofollow|crates/atomic-core/src/config.rs|libc::O_NOFOLLOW|0 /* CONTROL_OFF: follow selected-profile links */|-p atomic-agentic-core --lib -- config::tests::selected_profile_opens_inside_its_project_and_refuses_links_and_unreadable_files

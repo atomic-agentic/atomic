@@ -1,0 +1,1 @@
+criterion-redacts-stderr|crates/atomic/src/criteria.rs|atomic_core::redact::excerpt(&String::from_utf8_lossy(bytes), 4096)|String::from_utf8_lossy(bytes).into_owned()|-p atomic-agentic --test pipeline -- non_worktree_test_criterion_runs_in_a_worktree_workflow

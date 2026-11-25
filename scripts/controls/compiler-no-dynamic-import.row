@@ -1,1 +1,1 @@
-compiler-no-dynamic-import|crates/atomic-core/src/compiler_host.rs|if matches!(kind, ResolutionKind::DynamicImport) {|if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib -- compiler_host::tests::no_other_module_can_be_imported
+compiler-no-dynamic-import|crates/atomic-core/src/js_modules.rs|if !self.linking.get() {|if false {|-p atomic-agentic-core --lib -- compiler_host::tests::no_other_module_can_be_imported

@@ -1,0 +1,1 @@
+graph-cli-close-policy-atomic|crates/atomic/src/graph.rs|store.set_status(actor, id.clone(), Status::Closed).await?;|store.claim(actor, String::new(), id.clone(), Duration::from_secs(900)).await?;|-p atomic-agentic --test graph_cli refused_human_close_leaves_no_claim_and_evidenced_close_succeeds

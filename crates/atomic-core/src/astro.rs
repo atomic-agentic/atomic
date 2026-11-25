@@ -8,27 +8,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
-// What a compile's result depends on: the worker, its WASM, the host it runs
-// on (its JavaScript and its Rust) and the deno_core and V8 that run it.
-static COMPILER_HASH: LazyLock<String> = LazyLock::new(|| {
-    use crate::compiler_host::{HOST, WASM, WORKER};
-    let mut digest = Sha256::new();
-    for part in [
-        WORKER.as_bytes(),
-        WASM,
-        HOST.as_bytes(),
-        include_str!("compiler_host.rs").as_bytes(),
-        include_str!("compiler_host/limits.rs").as_bytes(),
-        crate::compiler_host::DENO_CORE.as_bytes(),
-        deno_core::v8::VERSION_STRING.as_bytes(),
-    ] {
-        digest.update(part);
-        digest.update([0]);
-    }
-    format!("{:x}", digest.finalize())
-});
+// Identify the native frontend, its locked dependencies, and the interpreter host.
+const COMPILER_HASH: &str = env!("ATOMIC_COMPILER_HASH");
 
 /// An immutable atom and its transitive local component sources.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +41,8 @@ pub struct Diagnostic {
     pub file: Option<String>,
     /// The one-based authored line, when known.
     pub line: Option<usize>,
+    /// The one-based UTF-16 authored column, when known.
+    pub column: Option<usize>,
     /// Further located diagnostics, one per line, such as type errors.
     pub details: Vec<String>,
 }
@@ -69,6 +53,7 @@ impl Diagnostic {
             message: message.into(),
             file: None,
             line: None,
+            column: None,
             details: Vec::new(),
         }
     }
@@ -96,17 +81,28 @@ impl Diagnostic {
                     .collect()
             })
             .unwrap_or_default();
+        let first = object
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first());
+        let positive = |value: Option<&Value>| {
+            value
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| *value > 0)
+        };
         Self {
             message: object
                 .get("message")
                 .and_then(text)
                 .unwrap_or_else(|| "compiler error".into()),
             file: object.get("file").and_then(text),
-            line: object
-                .get("line")
-                .and_then(Value::as_u64)
-                .and_then(|line| usize::try_from(line).ok())
-                .filter(|line| *line > 0),
+            line: positive(object.get("line")),
+            column: positive(
+                object
+                    .get("column")
+                    .or_else(|| first.and_then(|item| item.get("column"))),
+            ),
             details,
         }
     }
@@ -117,9 +113,12 @@ impl std::fmt::Display for Diagnostic {
         if !self.details.is_empty() {
             return f.write_str(&self.details.join("\n"));
         }
-        match (&self.file, self.line) {
-            (Some(file), Some(line)) => write!(f, "{file}:{line}: {}", self.message),
-            (Some(file), None) => write!(f, "{file}: {}", self.message),
+        match (&self.file, self.line, self.column) {
+            (Some(file), Some(line), Some(column)) => {
+                write!(f, "{file}:{line}:{column}: {}", self.message)
+            }
+            (Some(file), Some(line), None) => write!(f, "{file}:{line}: {}", self.message),
+            (Some(file), None, _) => write!(f, "{file}: {}", self.message),
             _ => f.write_str(&self.message),
         }
     }
@@ -183,9 +182,8 @@ fn safe_json(value: &Value, depth: usize, remaining: &mut usize) -> Result<(), S
     Ok(())
 }
 
-/// Invoke the shipped compiler, which atomic runs in a child of its own on
-/// its embedded V8, without network, environment, filesystem or subprocess
-/// access (see [`crate::compiler_host`]).
+/// Invoke the shipped compiler in its isolated child process without network,
+/// environment, filesystem or subprocess access (see [`crate::compiler_host`]).
 pub fn worker(request: Value) -> Result<Value, String> {
     worker_located(request).map_err(|error| error.to_string())
 }
@@ -372,12 +370,14 @@ pub(crate) fn worker_with(
                     }
                     Err(e) => return Err(format!("read component {target}: {e}").into()),
                 };
-                let helper = canonical.extension().is_some_and(|e| e == "ts")
-                    && !canonical.to_string_lossy().ends_with(".d.ts");
-                if !canonical.starts_with(&root)
-                    || !(helper || canonical.extension().is_some_and(|e| e == "astro"))
-                {
-                    return Err("an imported source must be an Astro component or a .ts helper inside the project root".into());
+                let extension = canonical.extension().unwrap_or_default();
+                let helper = extension == "ts" && !canonical.to_string_lossy().ends_with(".d.ts");
+                // A literal Markdown import's file: inert authored prompt text,
+                // captured under the same root and size limits as a component
+                // or a helper. It is never parsed, and nothing runs it.
+                let literal = extension == "md";
+                if !canonical.starts_with(&root) || !(helper || literal || extension == "astro") {
+                    return Err("an imported source must be an Astro component, a .ts helper or a literal Markdown file inside the project root".into());
                 }
                 let canonical_name = canonical
                     .to_str()
@@ -496,6 +496,15 @@ impl Program {
         args["root"] = json!(path_text(&self.root)?);
         args["sources"] = json!(self.sources);
         args["sourcePaths"] = json!(self.source_paths);
+        // Whether this atom's compiled contract declares a public context, which
+        // only the host can say. The worker's own look at the source sees a
+        // context in the fifth `AtomConfig` type argument or a `context` prop
+        // bound in a template; it cannot see one declared through the per-atom
+        // `Config` alias, nor one the sidecar beside the atom declares. Every
+        // action this program invokes is told, so its render, validation and
+        // judge calls can refuse a missing snapshot as an operation error rather
+        // than let a callback read a missing value and return a repairable rejection.
+        args["contextDeclared"] = json!(self.contracts.get("Context").is_some());
         worker_with(args, &self.helpers, clock)
     }
 
@@ -659,6 +668,7 @@ mod tests {
             &json!({"message": "unknown value x", "file": "/p/a.atom.astro", "line": 7}),
         );
         assert_eq!(error.to_string(), "/p/a.atom.astro:7: unknown value x");
+        assert_eq!(error.column, None);
         let types = Diagnostic::from_response(&json!({
             "message": "TS2339: no",
             "file": "/p/a.atom.astro",
@@ -672,5 +682,6 @@ mod tests {
             types.to_string(),
             "/p/a.atom.astro:3:5: TS2339: no\n/p/b.astro:1:2: TS2322: also"
         );
+        assert_eq!(types.column, Some(5));
     }
 }

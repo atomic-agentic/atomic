@@ -1,0 +1,14 @@
+{
+  "origin": "host",
+  "records": [
+    {
+      "id": "fixture:execution:docs-links",
+      "criterion": "docs-links",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Checked 41 links in the built documentation for this revision."
+    }
+  ]
+}

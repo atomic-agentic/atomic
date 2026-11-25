@@ -1,0 +1,1 @@
+schema-origin-nested-pointer|crates/atomic-schema/src/typescript.rs|self.path.extend_from_slice(tokens);|self.path.extend_from_slice(&[]);|-p atomic-agentic-schema --lib -- typescript::tests::nested_fields_name_array_and_combinator_pointer_segments

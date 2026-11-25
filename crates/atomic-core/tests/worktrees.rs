@@ -95,6 +95,28 @@ fn a_step_commits_on_its_base() {
 }
 
 #[test]
+fn trial_merge_refuses_info_attributes_that_select_union() {
+    let f = fixture("trial-info-attributes");
+    let before = status(&f);
+    let wt = f.worktrees.prepare("run", "candidate", &f.first).unwrap();
+    write(&wt.path.join("a.txt"), "one\nCANDIDATE\n");
+    let candidate = f
+        .worktrees
+        .commit(&wt, "candidate", &Signature::default())
+        .unwrap();
+    write(
+        &f.project.join(".git/info/attributes"),
+        "a.txt merge=union\n",
+    );
+    let error = f
+        .worktrees
+        .trial_merge("run", "trial", &candidate, "main", None)
+        .expect_err("info/attributes must not hide an overlapping conflict");
+    assert!(error.to_string().contains("info/attributes"), "{error}");
+    assert_eq!(status(&f), before, "source checkout remains unchanged");
+}
+
+#[test]
 fn every_attempt_starts_from_the_base() {
     let f = fixture("reset");
     let wt = f.worktrees.prepare("run", "step", &f.first).unwrap();

@@ -2,16 +2,9 @@
 
 //! Each helper call runs in a child process of its own.
 //!
-//! Some failures inside V8 cannot be caught: an "invalid size" error or an
-//! allocation V8 cannot satisfy aborts the process it runs in, whatever the
-//! isolate's limits. Memory V8 allocates outside its heap (flattened
-//! strings, compiled regular expressions, parser buffers) is also outside
-//! the heap limit. A process boundary contains both: the child runs one
-//! call under a limit on its memory, the host kills it at the call's
-//! deadline, and a child that dies takes nothing with it. The child sets
-//! that limit on itself where the operating system has one to set; on
-//! macOS, which has none, the host holds it (see `child_memory`).
-//!
+//! A child runs under memory, CPU and wall-time limits. The host reports
+//! allocation failures and termination without sharing guest state. On macOS
+//! the host holds the process memory limit (see `child_memory`).
 //! The child is the atomic binary itself, started with [`CHILD_ARG`] and a
 //! cleared environment, so the host's timezone and locale never reach it.
 //! It reads one request on stdin and writes one result line on stdout.
@@ -33,8 +26,8 @@ pub const CHILD_ARG: &str = "__atomic-helper";
 /// harness's) is ignored.
 const RESULT: &str = "atomic-helper-result ";
 
-/// Writable memory the child needs besides the call's own limits: V8's
-/// code, its platform threads and the binary's own data.
+/// Writable memory the child needs besides the call's own limits: the engine,
+/// its runtime threads and the binary's own data.
 const BASE_MEMORY: u64 = 384 * 1024 * 1024;
 
 /// Time the child may take to start before its deadline begins.
@@ -246,6 +239,12 @@ fn run(
             return Err(Failure::Deadline);
         }
     }
+    match status.code() {
+        Some(crate::js_budget::HEAP_EXIT) => return Err(Failure::Heap),
+        Some(crate::js_budget::BUFFER_EXIT) => return Err(Failure::ArrayBufferLimit),
+        Some(crate::js_budget::DEADLINE_EXIT) => return Err(Failure::Deadline),
+        _ => {}
+    }
     let text = String::from_utf8_lossy(&out);
     if let Some(line) = text.lines().find_map(|line| line.strip_prefix(RESULT)) {
         return match serde_json::from_str(line) {
@@ -255,7 +254,7 @@ fn run(
         };
     }
     let stderr = String::from_utf8_lossy(&err);
-    // V8 reports what it could not allocate and aborts; the operating
+    // Rust reports unsatisfied allocations on stderr; the operating
     // system's limit on the child's memory makes allocations fail the same
     // way. Either is the call exhausting its memory.
     let exhausted = [
@@ -315,7 +314,7 @@ pub fn serve() -> i32 {
     let response = match serde_json::from_slice::<Request>(&request) {
         Ok(request) => {
             let result = limit_self(&request.limits).and_then(|()| {
-                super::invoke_with(
+                supervised(
                     &request.captured,
                     &request.export,
                     &request.args,
@@ -344,10 +343,44 @@ pub fn serve() -> i32 {
     0
 }
 
-/// Limits this process: its CPU time, no core file when V8 aborts and,
-/// except on macOS, its writable memory. macOS refuses a data limit below
-/// the size of the whole address map, so there the host holds the memory
-/// limit (see `child_memory`).
+// This function runs exclusively in the disposable helper child.
+pub(super) fn supervised(
+    captured: &Captured,
+    export: &str,
+    args: &Value,
+    limits: Limits,
+    clock: Clock,
+    controls: Controls,
+) -> Result<Value, Failure> {
+    let (done, finished) = std::sync::mpsc::channel();
+    let deadline = limits.deadline;
+    let _watchdog = controls.watchdog.then(|| {
+        std::thread::spawn(move || {
+            if finished.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                std::process::exit(crate::js_budget::DEADLINE_EXIT);
+            }
+        })
+    });
+    crate::js_budget::enter(
+        if controls.heap_callback {
+            limits.heap_bytes
+        } else {
+            usize::MAX
+        },
+        if controls.bounded_array_buffers {
+            limits.array_buffer_bytes
+        } else {
+            usize::MAX
+        },
+    );
+    let result = super::invoke_with(captured, export, args, limits, clock, controls);
+    let _ = done.send(());
+    result
+}
+
+/// Limits this process: its CPU time and core files, and its writable memory
+/// except on macOS. macOS refuses a data limit below its address map, so the
+/// host holds the memory limit there (see `child_memory`).
 fn limit_self(limits: &Limits) -> Result<(), Failure> {
     let memory = byte_limits(limits)?.0;
     #[cfg(target_os = "macos")]

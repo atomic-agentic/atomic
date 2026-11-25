@@ -139,14 +139,6 @@ jobs:
         with:
           target-cache: test
           backends: "true"
-      # rusty_v8's build script lays its prebuilt archive and bindings outside
-      # its own output, in target/debug/gn_out/ and its crate's source, and the
-      # build cache keeps neither, so a row built with other features than
-      # the cached build, which compiles v8 again, finds no archive to link.
-      # Forgetting v8's units makes its build script run again, from the
-      # verified mirror rust-setup laid out, before any row builds.
-      - name: V8's build output for every feature set
-        run: rm -rf target/debug/build/v8-* target/debug/.fingerprint/v8-*
       - name: Run the rows
         # Under the job's limit, so the summary below still runs.
         timeout-minutes: 290

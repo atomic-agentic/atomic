@@ -1,0 +1,1 @@
+schema-origin-dead-import|crates/atomic-core/src/atom.rs|if let Some(cause) = dead_import(&dead) {|if let Some(cause) = std::hint::black_box(None::<String>) {|-p atomic-agentic-core --lib -- atom::tests::a_renamed_shared_schema_is_diagnosed_where_its_type_is_imported

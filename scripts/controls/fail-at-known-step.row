@@ -1,0 +1,1 @@
+fail-at-known-step|crates/atomic/src/runs.rs|if !valid|if false && !valid|--features atomic-agentic/dev-failpoints -p atomic-agentic --test run_cli fail_at_unknown_step_refuses_before_any_model_call

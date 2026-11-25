@@ -34,7 +34,7 @@
 //! Everything here blocks on git; async callers use
 //! [`Worktrees::run_step`], which moves the git work off the async workers.
 
-use crate::git::{Git, GitError, Repo, Signature, is_sha};
+use crate::git::{Git, GitError, Repo, Signature, TrialMerge, is_sha};
 use crate::state::ProjectState;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -160,6 +160,21 @@ pub struct StepCommit {
     pub reference: String,
     /// Which attempt at the step made it, from 1.
     pub attempt: u32,
+}
+
+/// Git facts atomic checked before it may use a worktree commit as graph
+/// close evidence. The branch head and pinned base are retained so a stored
+/// attestation says exactly what was checked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCommitProof {
+    /// The verified worktree commit.
+    pub commit: String,
+    /// The authorized full branch ref.
+    pub branch: String,
+    /// The branch head when atomic checked reachability.
+    pub head: String,
+    /// The base recorded for this run, independent of later branch movement.
+    pub pinned_base: String,
 }
 
 impl StepCommit {
@@ -298,6 +313,89 @@ impl Worktrees {
         Ok(self.repo.ref_target(&name)?)
     }
 
+    /// Check a runtime-recorded attempt against this run's pinned base and
+    /// the current authorized branch. A caller's `StepCommit` fields are
+    /// treated as claims until Git independently confirms every one of them.
+    /// A missing ref or a mismatch returns `None`; Git failures propagate.
+    pub fn verify_step_commit_on_branch(
+        &self,
+        run: &str,
+        step_commit: &StepCommit,
+        branch: &str,
+    ) -> Result<Option<BranchCommitProof>> {
+        let prefix = format!("refs/atomic/{}/steps/", component(run));
+        let Some(rest) = step_commit.reference.strip_prefix(&prefix) else {
+            return Ok(None);
+        };
+        let Some((step, attempt)) = rest.rsplit_once('/') else {
+            return Ok(None);
+        };
+        if step.is_empty()
+            || step.contains('/')
+            || attempt.parse::<u32>().ok() != Some(step_commit.attempt)
+            || step_commit.attempt == 0
+        {
+            return Ok(None);
+        }
+        let Some(pinned_base) = self.base(run)? else {
+            return Ok(None);
+        };
+        if self.repo.resolve_commit(&step_commit.commit)? != step_commit.commit
+            || self.repo.resolve_commit(&step_commit.base)? != step_commit.base
+            || self.repo.ref_target(&step_commit.reference)?.as_deref()
+                != Some(step_commit.commit.as_str())
+            || self.repo.parents(&step_commit.commit)? != [step_commit.base.clone()]
+            || !self.repo.is_ancestor(&pinned_base, &step_commit.commit)?
+            || !self.repo.has_everything(&step_commit.commit)?
+        {
+            return Ok(None);
+        }
+        let Some(head) = self.repo.ref_target(branch)? else {
+            return Ok(None);
+        };
+        if !self.repo.is_ancestor(&step_commit.commit, &head)? {
+            return Ok(None);
+        }
+        Ok(Some(BranchCommitProof {
+            commit: step_commit.commit.clone(),
+            branch: branch.to_owned(),
+            head,
+            pinned_base,
+        }))
+    }
+
+    /// Reconstruct an attempt recorded by atomic from its Git ref. This is
+    /// for a host admin action after the turn: the command names the run,
+    /// step and attempt, while Git supplies the SHA and sole parent.
+    pub fn recorded_step_commit(
+        &self,
+        run: &str,
+        step: &str,
+        attempt: u32,
+    ) -> Result<Option<StepCommit>> {
+        if attempt == 0 {
+            return Ok(None);
+        }
+        let reference = format!(
+            "refs/atomic/{}/steps/{}/{attempt}",
+            component(run),
+            component(step)
+        );
+        let Some(commit) = self.repo.ref_target(&reference)? else {
+            return Ok(None);
+        };
+        let parents = self.repo.parents(&commit)?;
+        let [base] = parents.as_slice() else {
+            return Ok(None);
+        };
+        Ok(Some(StepCommit {
+            base: base.clone(),
+            commit,
+            reference,
+            attempt,
+        }))
+    }
+
     /// The worktree of step `step` in run `run`: its path, whether or not it
     /// exists.
     pub fn path(&self, run: &str, step: &str) -> PathBuf {
@@ -320,6 +418,9 @@ impl Worktrees {
         if let Some(e) = fail_for_tests(&self.dir) {
             return Err(e);
         }
+        // Reject local attributes before removing a previous attempt: they
+        // can select a filter during checkout even with an empty attr source.
+        let safe = self.repo.clone().with_empty_attributes()?;
         std::fs::create_dir_all(&self.dir).map_err(io("create", &self.dir))?;
         let dir = std::fs::canonicalize(&self.dir).map_err(io("resolve", &self.dir))?;
         let name = worktree_name(run, step);
@@ -328,7 +429,7 @@ impl Worktrees {
         let target = path
             .to_str()
             .ok_or_else(|| WorktreeError::Invalid(format!("{} is not UTF-8", path.display())))?;
-        self.repo.run(
+        safe.run(
             &["worktree", "add", "--detach", "--force", target, base],
             None,
         )?;
@@ -343,6 +444,109 @@ impl Worktrees {
         })
     }
 
+    /// Prepare a disposable checkout of a host-recorded candidate, then
+    /// merge the branch's current head into it. This runs in the control
+    /// plane, outside an atom sandbox. The source checkout and its refs are
+    /// read only. A retry resets the scratch checkout before merging again.
+    pub fn trial_merge(
+        &self,
+        run: &str,
+        step: &str,
+        candidate: &StepCommit,
+        main: &str,
+        fixture_source: Option<&Path>,
+    ) -> Result<(PathBuf, String, TrialMerge, Option<String>)> {
+        if self.repo.has_info_attributes()? {
+            return Err(WorktreeError::Invalid(
+                "trial merge refuses repository info/attributes; it could select a merge or filter driver".into(),
+            ));
+        }
+        if self.repo.ref_target(&candidate.reference)?.as_deref() != Some(&candidate.commit)
+            || self.repo.parents(&candidate.commit)? != [candidate.base.as_str()]
+        {
+            return Err(WorktreeError::Invalid(
+                "the candidate no longer matches its host commit ref and base".into(),
+            ));
+        }
+        let head = match fixture_source {
+            Some(source) => {
+                // A fixture snapshot was cut at admission and has no live
+                // branch refs. Resolve main in the original trusted source
+                // now, then bring its objects across without a transport.
+                let source = Git::find()?.discover(source)?;
+                if source.object_format()? != self.repo.object_format()? {
+                    return Err(WorktreeError::Invalid(
+                        "the fixture source and snapshot use different object formats".into(),
+                    ));
+                }
+                if source.is_shallow()? {
+                    return Err(WorktreeError::Invalid(
+                        "the current fixture source has shallow history".into(),
+                    ));
+                }
+                let grafts = source.git_dir().join("info/grafts");
+                match std::fs::symlink_metadata(&grafts) {
+                    Ok(_) => {
+                        return Err(WorktreeError::Invalid(
+                            "the current fixture source has grafted history".into(),
+                        ));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(io("inspect", &grafts)(e)),
+                }
+                let head = source.resolve_commit(main)?;
+                if !self.repo.has_everything(&head)? {
+                    source.copy_reachable(&head, &self.repo)?;
+                }
+                if !self.repo.has_everything(&head)? {
+                    return Err(WorktreeError::Invalid(format!(
+                        "the fixture snapshot is missing objects for current main {head}"
+                    )));
+                }
+                let pin = format!(
+                    "refs/atomic/{}/steps/{}/trial-main-{head}",
+                    component(run),
+                    component(step)
+                );
+                if let Err(e) = self.repo.create_ref(&pin, &head)
+                    && self.repo.ref_target(&pin)?.as_deref() != Some(head.as_str())
+                {
+                    return Err(WorktreeError::Git(e));
+                }
+                head
+            }
+            None => self.repo.resolve_commit(main)?,
+        };
+        let worktree = self.prepare(run, step, &candidate.commit)?;
+        self.check_admin(&worktree.git_dir, &worktree.path)?;
+        let scratch = self
+            .repo
+            .clone()
+            .with_empty_attributes()?
+            .linked(&worktree.git_dir, &worktree.path);
+        let result = scratch.trial_merge(&head)?;
+        let tree = if result == TrialMerge::Clean {
+            Some(scratch.index_tree()?)
+        } else {
+            None
+        };
+        Ok((worktree.path, head, result, tree))
+    }
+
+    /// Check that a trial check did not rewrite tracked merged content.
+    pub fn trial_changed_tracked(&self, run: &str, step: &str, tree: &str) -> Result<Vec<String>> {
+        let name = worktree_name(run, step);
+        let path = self.dir.join(&name);
+        let git_dir = self.admin_dir(&name);
+        self.check_admin(&git_dir, &path)?;
+        let repo = self
+            .repo
+            .clone()
+            .with_empty_attributes()?
+            .linked(git_dir, path);
+        Ok(repo.changed_tracked(tree)?)
+    }
+
     /// Commit everything in `worktree` on top of its base, after the atom's
     /// turn has ended, and keep the commit with a new attempt ref.
     pub fn commit(
@@ -354,7 +558,11 @@ impl Worktrees {
         // The git directory is the one atomic created, outside the worktree,
         // and still belongs to it; nothing in the worktree is consulted.
         self.check_admin(&worktree.git_dir, &worktree.path)?;
-        let tree = self.repo.linked(&worktree.git_dir, &worktree.path);
+        let tree = self
+            .repo
+            .clone()
+            .with_empty_attributes()?
+            .linked(&worktree.git_dir, &worktree.path);
         let commit = tree.commit_all(&worktree.base, message, signature)?;
         if crate::failpoint::armed() {
             crate::failpoint::failpoint(&format!("commit:before-ref:{}", worktree.step));
@@ -594,6 +802,107 @@ impl Caches {
             scope: format!("{kind}-{:x}", Sha256::digest(name)),
             ..self.clone()
         }
+    }
+
+    /// A trial check's writable caches live inside its disposable scratch
+    /// worktree. Resetting that worktree on a retried durable step clears
+    /// every write the earlier check could have made. A candidate that
+    /// already contains this path is refused instead of trusted as a cache.
+    pub fn for_trial(&self, tree: &Path) -> Result<Self> {
+        let dir = tree.join(".atomic-trial-cache");
+        match std::fs::symlink_metadata(&dir) {
+            Ok(_) => {
+                return Err(WorktreeError::Invalid(format!(
+                    "the candidate already contains {}; trial checks need a fresh cache",
+                    dir.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io("inspect", &dir)(e)),
+        }
+        Ok(Self {
+            dir,
+            legacy: None,
+            rustup: self.rustup.clone(),
+            scope: "trial".into(),
+        })
+    }
+
+    /// Give an offline trial check the operator's registry, read-only under
+    /// the sandbox. Cargo's home, locks and target stay in this disposable
+    /// attempt cache. Registry sources stay read-only.
+    pub fn prepare_trial_cargo(&self, registry: &Path) -> Result<PathBuf> {
+        self.prepare_offline_cargo(self.writable_roots()[1].join("cargo-home"), registry)
+    }
+
+    /// A production exec proof gets a new Cargo home for each attempt. An
+    /// interrupted attempt may have left a cache view behind; it must never
+    /// become the trusted view of a later attempt.
+    pub fn prepare_exec_cargo(&self, registry: &Path) -> Result<PathBuf> {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).map_err(|e| {
+            WorktreeError::Invalid(format!("cannot name a fresh exec Cargo home: {e}"))
+        })?;
+        let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.prepare_offline_cargo(
+            self.writable_roots()[1].join(format!("cargo-home-{suffix}")),
+            registry,
+        )
+    }
+
+    fn prepare_offline_cargo(&self, home: PathBuf, registry: &Path) -> Result<PathBuf> {
+        let source = std::fs::canonicalize(registry).map_err(io("inspect", registry))?;
+        let scratch = self
+            .dir
+            .parent()
+            .ok_or_else(|| WorktreeError::Invalid("trial cache has no scratch worktree".into()))?;
+        if source != registry
+            || source.starts_with(scratch)
+            || scratch.starts_with(&source)
+            || !["index", "cache", "src"]
+                .iter()
+                .all(|name| source.join(name).is_dir())
+        {
+            return Err(WorktreeError::Invalid(format!(
+                "trial merge offline Cargo cache unavailable at {}",
+                registry.display()
+            )));
+        }
+        std::fs::create_dir(&home).map_err(io("create", &home))?;
+        // Cargo reads both spellings. Mount empty files read-only for every
+        // check so an earlier check cannot install forced env overrides for a
+        // later Cargo invocation.
+        for name in ["config", "config.toml"] {
+            let path = home.join(name);
+            std::fs::write(&path, "").map_err(io("create", &path))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let registry_view = home.join("registry");
+            std::fs::create_dir(&registry_view).map_err(io("create", &registry_view))?;
+            for name in ["index", "cache", "src"] {
+                symlink(source.join(name), registry_view.join(name))
+                    .map_err(io("link", &registry_view))?;
+            }
+            if let Some(home_source) = source.parent() {
+                let git_cache = home_source.join("git");
+                if git_cache.is_dir() {
+                    let git_view = home.join("git");
+                    std::fs::create_dir(&git_view).map_err(io("create", &git_view))?;
+                    for entry in std::fs::read_dir(&git_cache).map_err(io("read", &git_cache))? {
+                        let entry = entry.map_err(io("read", &git_cache))?;
+                        symlink(entry.path(), git_view.join(entry.file_name()))
+                            .map_err(io("link", &git_view))?;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        return Err(WorktreeError::Invalid(
+            "trial merge offline Cargo cache needs a Linux sandbox".into(),
+        ));
+        Ok(home)
     }
 
     /// Writable cache roots for a command. Their common parent belongs
@@ -1240,5 +1549,86 @@ mod tests {
         std::os::unix::fs::symlink(dir.join("elsewhere"), caches.dir()).expect("link");
         assert!(caches.create().is_err(), "a link was taken for the caches");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trial_cargo_links_the_trusted_registry_and_git_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "atomic-trial-registry-cache-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = dir.join("trusted/registry");
+        let index = registry.join("src/index.test");
+        std::fs::create_dir_all(registry.join("index")).expect("registry index");
+        std::fs::create_dir_all(registry.join("cache")).expect("registry archive cache");
+        std::fs::create_dir_all(index.join("serde-1.0.0/src")).expect("serde source");
+        std::fs::create_dir_all(dir.join("trusted/git")).expect("Git dependency cache");
+        std::fs::write(dir.join("trusted/git/db"), "trusted Git cache")
+            .expect("Git dependency marker");
+        std::fs::write(index.join("serde-1.0.0/src/lib.rs"), "trusted serde")
+            .expect("serde source");
+        let scratch = dir.join("trial");
+        std::fs::create_dir(&scratch).expect("trial scratch");
+        let cache = Caches::new(dir.join("unused"))
+            .for_trial(&scratch)
+            .expect("trial cache");
+        cache.create().expect("fresh cache");
+        let home = cache
+            .prepare_trial_cargo(&registry)
+            .expect("trial Cargo view");
+        assert!(home.starts_with(cache.writable_roots()[1].as_path()));
+        for path in ["registry/index", "registry/cache", "git/db", "registry/src"] {
+            assert!(
+                std::fs::symlink_metadata(home.join(path))
+                    .expect("trusted cache link")
+                    .file_type()
+                    .is_symlink(),
+                "{path} must still come from the trusted cache"
+            );
+        }
+        assert!(home.join("git").is_dir());
+        assert!(
+            !std::fs::symlink_metadata(home.join("git"))
+                .expect("private Git view")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("registry/src/index.test/serde-1.0.0/src/lib.rs"))
+                .expect("read trusted serde source"),
+            "trusted serde"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exec_cargo_preparation_never_reuses_a_previous_attempt_home() {
+        let dir =
+            std::env::temp_dir().join(format!("atomic-exec-cargo-attempts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let registry = dir.join("trusted/registry");
+        for part in ["index", "cache", "src/index.test/serde-1.0.0"] {
+            std::fs::create_dir_all(registry.join(part)).expect("trusted registry");
+        }
+        let cache = Caches::new(dir.join("private/run-cache"));
+        cache.create().expect("private run cache");
+        let first = cache.prepare_exec_cargo(&registry).expect("first attempt");
+        assert!(first.starts_with(cache.writable_roots()[1].as_path()));
+        std::fs::write(
+            first.join("config.toml"),
+            "[env]\nCARGO_NET_OFFLINE='false'\n",
+        )
+        .expect("earlier attempt write");
+        let next = cache.prepare_exec_cargo(&registry).expect("next attempt");
+        assert_ne!(first, next);
+        assert_eq!(
+            std::fs::read_to_string(next.join("config.toml")).expect("fresh config"),
+            ""
+        );
+        assert!(next.join("registry/src/index.test/serde-1.0.0").is_dir());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

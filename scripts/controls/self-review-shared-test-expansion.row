@@ -1,0 +1,1 @@
+self-review-shared-test-expansion|crates/atomic/src/pipeline.rs|parts.len() >= 4 && parts[0] == "crates" && parts[2] == "tests"|false|-p atomic-agentic --test pipeline included_fixture_and_shared_test_code_cannot_omit_control_row

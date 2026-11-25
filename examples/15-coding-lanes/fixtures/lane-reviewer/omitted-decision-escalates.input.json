@@ -1,0 +1,26 @@
+{
+  "diff": "diff --git a/tools/lane_guard.py b/tools/lane_guard.py\n--- a/tools/lane_guard.py\n+++ b/tools/lane_guard.py\n@@ -40,6 +40,8 @@ def decide(finding):\n     findings = [claim]\n+    # The control row switches this line.\n+    if findings and not verified(verification):\n         return {\"confirmed\": False, \"claim\": claim, \"reason\": \"unverified finding\"}",
+  "self_review": {
+    "items": {
+      "1": "The patch adds one branch in decide() and touches no other function.",
+      "2": "No new import, no new file, no command.",
+      "3": "Nothing outside tools/lane_guard.py is written.",
+      "4": "No credential appears in the patch.",
+      "5": "The branch returns before any confirmation is built.",
+      "6": "Nothing in the patch is retried or repeated.",
+      "7": "The change reads only the finding it was handed.",
+      "8": "No lock, hold or temporary directory is taken.",
+      "9": "N/A: the diff names no decision point, so the host inventory is the only list.",
+      "10": "N/A: no control row is proved by this self-review alone."
+    },
+    "decisions": [],
+    "controls": []
+  },
+  "host_review": {
+    "decision_points": [
+      "candidate publication"
+    ],
+    "selected_controls": [],
+    "control_results": []
+  }
+}

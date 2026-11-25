@@ -1,0 +1,1 @@
+prompt-render-helper-clock|crates/atomic/src/main.rs|compiled.program.helpers.keys().next().is_none()|true /* CONTROL_OFF: accept a helper render without a recorded clock */|-p atomic-agentic --test render_cli helper_prompt_snapshot_and_render_refuse_without_recorded_clock

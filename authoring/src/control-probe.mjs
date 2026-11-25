@@ -24,7 +24,7 @@ try {
     },
     {
       name: 'frontmatter statement allowlist',
-      before: "else error(unit, null, `unsupported script statement: ${ts.SyntaxKind[statement.kind]}; script code is never executed`);",
+      before: "else error(unit, statement, `unsupported script statement: ${ts.SyntaxKind[statement.kind]}; script code is never executed`);",
       after: 'else { /* control: silently allow unsupported statements */ }',
       expected: 'rejects script statements without executing it',
     },

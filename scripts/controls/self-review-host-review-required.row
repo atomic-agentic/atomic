@@ -1,0 +1,1 @@
+self-review-host-review-required|crates/atomic-core/src/workflow.rs|required == "host_review" && reviewed.coding && self_output.is_some()|false|-p atomic-agentic --test pipeline self_review_evidence_is_a_sibling_step_and_reaches_reviewer_with_diff

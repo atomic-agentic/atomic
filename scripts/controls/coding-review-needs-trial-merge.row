@@ -1,0 +1,1 @@
+coding-review-needs-trial-merge|crates/atomic/src/pipeline.rs|if step.coding && review.trial_merge.is_none() {|if false {| -p atomic-agentic --test pipeline coding_review_refuses_runtime_snapshot_without_trial_merge

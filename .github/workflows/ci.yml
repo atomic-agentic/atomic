@@ -40,9 +40,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # Codex's patch block pulls rusty_v8 and its Chromium submodules; cargo's
-  # built-in git client has failed on those fetches on macOS runners, and the
-  # git command line is sturdier.
+  # Use command-line git for pinned source fetches on macOS and Linux.
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
 
@@ -74,6 +72,10 @@ jobs:
       # controls-touched.py, which picks the rows the Controls workflow runs,
       # in throwaway repositories.
       - run: scripts/controls-touched-test.sh
+      # controls-exec.py, the controls as an exec step: it copies the candidate
+      # commit out of git and switches each declared row off in that copy, which
+      # is tested in throwaway repositories with the same stand-in for cargo.
+      - run: scripts/controls-exec-test.sh
       - run: scripts/backends-check-audit-test.sh
       # acceptance.py fails on a listed test that failed or did not run.
       - run: scripts/acceptance-test.sh
@@ -124,18 +126,62 @@ jobs:
           target-cache: test
       - name: Build atomic
         run: cargo build --workspace --locked
+      - name: Astro source mirror boundaries
+        env:
+          ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
+        run: python3 tools/astro_atoms_test.py
       - name: Checker dependencies
         run: |
           python3 -m venv "${RUNNER_TEMP}/examples-venv"
           "${RUNNER_TEMP}/examples-venv/bin/pip" install --no-deps --require-hashes -r tools/requirements.txt
       # No Deno is installed: a check that needed one would fail here.
-      - name: Check the examples
+      - name: Check the examples and helper fixtures
         working-directory: tools
         env:
           ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
         run: |
           if command -v deno; then echo "::error::a Deno is on PATH; these checks must pass without one"; exit 1; fi
+          "${RUNNER_TEMP}/examples-venv/bin/python" helper_call_mirror_test.py
+          "${RUNNER_TEMP}/examples-venv/bin/python" review_authoring_catalog_declarations_test.py
           "${RUNNER_TEMP}/examples-venv/bin/python" check_examples.py
+      - name: Check two review authoring projects and exact renders
+        env:
+          ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
+        run: python3 tools/review_authoring_pilot_test.py
+      - name: Stock Astro language-server smoke for both review project forms
+        env:
+          ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -w "${GITHUB_WORKSPACE}/authoring" \
+            node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 \
+            npm ci --ignore-scripts --no-audit --no-fund
+          cat > "${RUNNER_TEMP}/atomic-node-lsp" <<'SH'
+          #!/bin/sh
+          exec docker run --rm -i --network none \
+            -v "${GITHUB_WORKSPACE}:${GITHUB_WORKSPACE}" -v /tmp:/tmp \
+            -w "${GITHUB_WORKSPACE}" \
+            node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 \
+            node "$@"
+          SH
+          chmod +x "${RUNNER_TEMP}/atomic-node-lsp"
+          NODE_BIN="${RUNNER_TEMP}/atomic-node-lsp" \
+            ASTRO_NODE_MODULES="${GITHUB_WORKSPACE}/authoring/node_modules" \
+            python3 tools/review_authoring_lsp_test.py
+      - name: Check prompt layout snapshots
+        env:
+          ATOMIC_BIN: ${{ github.workspace }}/target/debug/atomic
+        run: python3 examples/08-templating/prompt_layouts_test.py
+      - name: Score review-evidence fixtures offline
+        run: |
+          docker run --rm --network none -u "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e ATOMIC_BIN=/work/target/debug/atomic \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 \
+            node --test \
+              examples/13-review-evidence/cli.test.mjs \
+              examples/13-review-evidence/fixture-check.test.mjs \
+              examples/13-review-evidence/score.test.mjs
 
   # deny.toml: a dependency with a disallowed licence, a banned crate or an
   # unlisted source fails CI.
@@ -233,12 +279,29 @@ jobs:
         with:
           target-cache: test
           backends: "true"
+      - name: Pin SQLite-capable bd for the M5 differential test
+        if: ${{ matrix.shard == 3 }}
+        run: |
+          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
+          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
       - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
         # The runner's /tmp belongs to this job alone, so a test may create
         # and remove entries there (turn_workspace.rs).
         env:
           ATOMIC_TEST_PRIVATE_TMP: "1"
         run: scripts/test-shards.py run ${{ matrix.shard }}
+      # This cold full-repository Cargo proof is run alone so the pipeline
+      # target's other tests cannot consume its bounded 240-second row slot.
+      # It is ignored in the shard and required here on shard 1.
+      - name: Cold full-repository controls proof
+        if: ${{ matrix.shard == 1 }}
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p atomic-agentic --test pipeline --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests a_full_repository_control_row_uses_host_cargo_in_normal_review -- --ignored --exact 2>&1 | tee "${RUNNER_TEMP}/cold-controls.log"
+          grep -Fq 'test a_full_repository_control_row_uses_host_cargo_in_normal_review ... ok' "${RUNNER_TEMP}/cold-controls.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/cold-controls.log"
 
   # The crash suite: every failpoint, triggered in turn, against real
   # workflows and the scripted fake model; each run killed there must finish
@@ -333,7 +396,6 @@ jobs:
         uses: ./.github/actions/rust-setup
         with:
           target-cache: test
-      - run: scripts/v8-archive-test.sh
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
@@ -347,7 +409,7 @@ jobs:
       # without its feature, which the test shards' features turn on; it runs
       # only here, without them. The whole workspace is selected, as the
       # shards select it, so dependencies resolve the same features and the
-      # cached builds serve (selecting one package rebuilds V8 differently).
+      # cached builds can be reused.
       # With the feature on, as it would be if a dependency enabled it, the
       # doctest's twin runs in its place and passes; the step requires the
       # compile-fail test itself to have run and passed.
@@ -364,9 +426,9 @@ jobs:
       - name: Lockfile resolves from scratch
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: scripts/lock-resolves.sh
-      # Each V8 version deps/v8.toml lists as locked but unbuilt stays out of
+      # Verify V8 runtime crates stay out of
       # the build graph.
-      - name: Unbuilt V8 versions stay unbuilt
+      - name: Reject V8 in the binary dependency graph
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: scripts/lock-check.sh v8-built
       # The release SBOM must list every fork at its pinned revision.
@@ -428,5 +490,9 @@ jobs:
           key: cargo-home-Linux-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - uses: ./.github/actions/rust-setup-macos
       - run: cargo build --workspace --locked
+      - name: Pin SQLite-capable bd for the M5 differential test
+        run: |
+          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
+          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
       - name: Test (macOS)
         run: cargo test --workspace --locked --no-fail-fast

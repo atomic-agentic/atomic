@@ -22,6 +22,19 @@ const CPU_ENV: &str = "ATOMIC_COMPILER_TEST_CPU";
 /// enforcement with a smaller budget in this test binary's probe child.
 #[allow(unsafe_code)]
 pub(super) fn shorten_cpu_probe() -> Result<(), String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut memory = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: the kernel writes one rlimit into a valid mutable slot.
+        if unsafe { libc::getrlimit(libc::RLIMIT_DATA, &mut memory) } != 0
+            || memory.rlim_cur == libc::RLIM_INFINITY
+        {
+            return Err("compiler writable memory must be limited".into());
+        }
+    }
     if std::env::var_os(CPU_ENV).is_none() {
         return Ok(());
     }
@@ -140,11 +153,9 @@ fn the_worker_runs_in_the_child_and_answers_a_request() {
 }
 
 #[test]
-fn the_worker_reads_its_own_wasm_and_no_other_file() {
-    assert_eq!(
-        probe("return (await Deno.readFile(new URL('./astro.wasm', import.meta.url))).length;"),
-        Ok(json!(WASM.len()))
-    );
+fn the_compiler_host_reads_no_files() {
+    let former_asset = refusal("await Deno.readFile(new URL('./astro.wasm', import.meta.url))");
+    assert!(former_asset.contains("compiler file reads are disabled"));
     let dir = scratch("read");
     let file = dir.join("secret.txt");
     std::fs::write(&file, "do-not-read").expect("file");
@@ -153,13 +164,16 @@ fn the_worker_reads_its_own_wasm_and_no_other_file() {
         "new TextDecoder().decode(await Deno.readFile({path:?}))"
     ));
     assert!(
-        refused.contains("it reads only its own WASM") && refused.contains(path),
+        refused.contains("compiler file reads are disabled") && refused.contains(path),
         "{refused}"
     );
     let refused = refusal(&format!(
         "new TextDecoder().decode(await Deno.readFile('file://{path}'))"
     ));
-    assert!(refused.contains("it reads only its own WASM"), "{refused}");
+    assert!(
+        refused.contains("compiler file reads are disabled"),
+        "{refused}"
+    );
     // The refusal is the host's, never the filesystem's: a file no one may
     // read and a link to itself are refused the same way, with no error of
     // their own (which root, reading the first, would not get).
@@ -175,7 +189,7 @@ fn the_worker_reads_its_own_wasm_and_no_other_file() {
             let target = target.to_str().expect("utf-8");
             let refused = refusal(&format!("await Deno.readFile({target:?})"));
             assert!(
-                refused.contains("it reads only its own WASM")
+                refused.contains("compiler file reads are disabled")
                     && !refused.contains("denied")
                     && !refused.contains("symbolic links"),
                 "{refused}"
@@ -279,18 +293,18 @@ fn the_host_offers_no_environment_process_or_deno_internals() {
            bootstrap: typeof globalThis.__bootstrap, \
            infra: typeof globalThis.__infra, \
            process: typeof globalThis.process, \
-           require: typeof globalThis.require, \
+           hostOps: Object.getOwnPropertyNames(globalThis).filter(k => k.startsWith('op_compiler_')), require: typeof globalThis.require, \
          };",
     )
     .expect("probe");
     assert_eq!(
         output,
         json!({
-            "deno": ["exit", "readFile", "stdin", "stdout", "version"],
+            "deno": ["exit", "readFile", "stdin", "stdout"],
             "bootstrap": "undefined",
             "infra": "undefined",
             "process": "undefined",
-            "require": "undefined",
+            "hostOps": [], "require": "undefined",
         })
     );
 }
@@ -298,9 +312,15 @@ fn the_host_offers_no_environment_process_or_deno_internals() {
 #[test]
 fn no_other_module_can_be_imported() {
     let refused = refusal("import('node:child_process')");
-    assert!(refused.contains("imports nothing dynamically"), "{refused}");
+    assert!(
+        refused.contains("dynamic imports are disabled"),
+        "{refused}"
+    );
     let refused = refusal("import('node:path')");
-    assert!(refused.contains("imports nothing dynamically"), "{refused}");
+    assert!(
+        refused.contains("dynamic imports are disabled"),
+        "{refused}"
+    );
     // A static import of a module the host lacks fails the compile.
     let mut command = command().expect("command");
     command.env.push((
@@ -317,33 +337,25 @@ fn no_other_module_can_be_imported() {
     )
     .expect_err("refused");
     assert!(
-        error.contains("imports only its Node modules, not node:child_process"),
+        error.contains("uncaptured module: node:child_process"),
         "{error}"
     );
 }
 
 #[test]
 fn a_heap_blow_up_is_refused_at_the_limit() {
-    let heap = 64 * 1024 * 1024;
-    // Within the limit, a compile allocates as it needs.
+    let heap = 64 << 20;
     assert_eq!(
         probe_with(
-            "const kept = []; for (let i = 0; i < 32; i++) kept.push(new Array(1 << 16).fill(i)); return kept.length;",
+            "return 'x'.repeat(1024).length;",
             &[(HEAP_ENV, heap.to_string())],
-            TIME_LIMIT,
+            TIME_LIMIT
         ),
-        Ok(json!(32))
+        Ok(json!(1024))
     );
     let started = Instant::now();
-    // Three times the limit, past what the limit grows to while a compile
-    // unwinds; a host without the limit would answer.
     let error = probe_with(
-        &format!(
-            "const kept = []; let size = 0; \
-             while (size < {}) {{ kept.push(new Array(1 << 16).fill(size)); size += 8 << 16; }} \
-             return kept.length;",
-            3 * heap
-        ),
+        "return 'x'.repeat(80 << 20).length;",
         &[(HEAP_ENV, heap.to_string())],
         TIME_LIMIT,
     )
@@ -381,7 +393,7 @@ fn a_runaway_compile_is_killed_at_the_time_limit() {
 }
 
 #[test]
-fn the_wasm_runtime_has_its_clock_randomness_and_timers() {
+fn the_worker_has_its_clock_randomness_and_timers() {
     let output = probe(
         "const bytes = crypto.getRandomValues(new Uint8Array(32)); \
          const waited = await new Promise((resolve) => setTimeout(resolve, 5, 'fired')); \
@@ -449,40 +461,19 @@ fn console_output_stays_off_the_protocol() {
     );
 }
 
-// WebAssembly memories and ArrayBuffer contents are outside the V8 heap
-// limit; the child's memory limit bounds them. Neither is touched, so a host
-// without that limit would grant both without using the memory. macOS has
-// no such limit for the child to set: there its parent holds the limit on
-// the memory it uses (see the next test).
+// The child bounds ArrayBuffer contents even when a call does not touch them.
+// On macOS its parent holds the process memory limit (see the next test).
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn memory_outside_the_heap_is_refused_past_the_limit() {
-    let limit = limits::memory_limit(HEAP_LIMIT);
-    assert_eq!(limit, limits::OUTSIDE_HEAP + 2 * HEAP_LIMIT as u64);
-    let env = [];
-    let grow = |pages: u64| {
-        probe_with(
-            &format!(
-                "return new WebAssembly.Memory({{ initial: 1, maximum: 65536 }}).grow({pages});"
-            ),
-            &env,
-            TIME_LIMIT,
-        )
-    };
-    assert_eq!(grow(16), Ok(json!(1)));
-    // A memory grown past the limit: V8 fails the compile.
-    let error = grow(limit / 65536 + 1).expect_err("refused");
-    assert!(
-        error.contains("the Astro compiler exceeded its memory limit"),
-        "{error}"
-    );
-    // An ArrayBuffer past the limit: V8 fails the compile.
+fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
+    assert_eq!(probe("return typeof WebAssembly;"), Ok(json!("undefined")));
+    let heap = 8 << 20;
     let error = probe_with(
-        &format!("return new Uint8Array({limit} + 1).length;"),
-        &env,
+        "return new Uint8Array(9 << 20).length;",
+        &[(HEAP_ENV, heap.to_string())],
         TIME_LIMIT,
     )
-    .expect_err("refused");
+    .expect_err("buffer budget");
     assert!(
         error.contains("the Astro compiler exceeded its memory limit"),
         "{error}"
@@ -493,19 +484,21 @@ fn memory_outside_the_heap_is_refused_past_the_limit() {
 // on the memory it uses (see `child_memory`). The parent is given a limit
 // far below production's here, on every platform, so that a parent that
 // does not hold it grants memory the machine has. The memory is ArrayBuffer
-// contents, outside the V8 heap limit, and is filled: memory not written to
-// is not in use.
+// contents, and one byte per page is written so the footprint counts it.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn memory_a_compile_uses_past_its_limit_is_refused_by_its_parent() {
     const LIMIT: u64 = 256 * 1024 * 1024;
-    // Fills `megabytes` and holds them for `held` milliseconds.
+    // Commits `megabytes` one page at a time and holds them for `held` milliseconds.
     let fill = |megabytes: u64, held: u64| {
         crate::child_memory::with_limit(LIMIT, || {
             probe(&format!(
                 "const kept = []; \
-                 for (let size = 0; size < {megabytes}; size += 16) \
-                   kept.push(new Uint8Array(16 << 20).fill(1)); \
+                 for (let size = 0; size < {megabytes}; size += 16) {{ \
+                   const bytes = new Uint8Array(16 << 20); \
+                   for (let page = 0; page < bytes.length; page += 4096) bytes[page] = 1; \
+                   kept.push(bytes); \
+                 }} \
                  await new Promise((resolve) => setTimeout(resolve, {held})); \
                  return kept.length;"
             ))
@@ -545,4 +538,43 @@ fn a_compile_is_stopped_at_its_cpu_time_limit() {
         "{:?}",
         started.elapsed()
     );
+}
+
+#[test]
+fn checker_resolves_imports_only_in_the_frozen_graph() {
+    let cmd = command().expect("compiler command");
+    let file = "/p/example.atom.astro";
+    for (statement, code, line) in [
+        ("import type { T } from './absent';", "TS2307", 2),
+        ("type T = import('./absent').T;", "TS2307", 2),
+        ("import type { T } from 'target';", "TS2307", 2),
+        (
+            "import type { T } from './alias';\nconst x: T = 'wrong';",
+            "TS2322",
+            3,
+        ),
+    ] {
+        let request = json!({"action":"check", "root":"/p", "file":file, "sources":{
+            (file): format!("---\n{statement}\n---\n<p/>"),
+            "/p/pkg/target.ts":"export type { T } from './nested';",
+            "/p/pkg/nested.ts":"export type T = number;",
+        }, "sourcePaths":{"/p/alias":"/p/pkg/target.ts"}});
+        let output = run_interactive(
+            &cmd.program,
+            &cmd.args,
+            &cmd.env,
+            request.to_string().as_bytes(),
+            TIME_LIMIT,
+            &mut |_| panic!("no helper calls"),
+        )
+        .expect("compiler response");
+        let response: Value = serde_json::from_slice(&output).expect("JSON");
+        let d = &response["error"]["diagnostics"][0];
+        assert_eq!(d["file"], file, "{response}");
+        assert_eq!(d["line"], line, "{response}");
+        assert!(
+            d["message"].as_str().is_some_and(|s| s.starts_with(code)),
+            "{response}"
+        );
+    }
 }

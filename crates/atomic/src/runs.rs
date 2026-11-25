@@ -13,10 +13,11 @@
 //! process may recover and keeps running, so gates decided from another
 //! terminal let their runs go on, until it is stopped.
 
+use crate::delivery;
 use crate::engine::{self, EngineArgs};
 use crate::failure::{Failure, Said};
 use crate::target;
-use atomic_app::pipeline::{PIPELINE, ProjectWorktrees};
+use atomic_app::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, PIPELINE, ProjectWorktrees, Step};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
 use atomic_durable::{DurableError, DurableRuntime, RunStatus};
@@ -27,6 +28,80 @@ use std::time::Duration;
 
 /// How often `atomic serve` wakes runs whose gates were decided.
 const REDELIVERY: Duration = Duration::from_secs(5);
+const QUEUE_POLL_TICK: Duration = Duration::from_secs(1);
+
+fn queue_poll_now() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
+/// A separate runtime reads one due row at a time. In particular, the
+/// protected provider read never holds the serve loop or a store transaction.
+async fn poll_queue_outcomes(state: ProjectState) {
+    let rt = match delivery::open_local_observation_runtime(&state).await {
+        Ok(rt) => rt,
+        Err(_) => {
+            atomic_core::log_line!("atomic serve: queue outcome poller unavailable");
+            return;
+        }
+    };
+    let Some(project) = rt.project().map(str::to_owned) else {
+        return;
+    };
+    loop {
+        let now = queue_poll_now();
+        if let Some(now) = now {
+            let scoped_project = project.clone();
+            let due = rt
+                .control_transaction(move |mut tx| {
+                    let project = scoped_project.clone();
+                    Box::pin(async move {
+                        atomic_durable::delivery_effect::due_queue_observation_in(
+                            &mut tx, &project, now,
+                        )
+                        .await
+                    })
+                })
+                .await;
+            match due {
+                Ok(Some(run)) => {
+                    if delivery::observe_one(&rt, &state, &run).await.is_err() {
+                        atomic_core::log_line!("atomic serve: queue outcome refresh failed");
+                        let deferred_at = queue_poll_now().unwrap_or(now);
+                        let scoped_project = project.clone();
+                        let deferred = rt
+                            .control_transaction(move |mut tx| {
+                                let project = scoped_project.clone();
+                                let run = run.clone();
+                                Box::pin(async move {
+                                    atomic_durable::delivery_effect::defer_queue_observation_in(
+                                        &mut tx,
+                                        &project,
+                                        &run,
+                                        deferred_at,
+                                    )
+                                    .await
+                                })
+                            })
+                            .await;
+                        if deferred.is_err() {
+                            atomic_core::log_line!("atomic serve: queue outcome deferral failed");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    atomic_core::log_line!("atomic serve: queue outcome lookup failed");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+            }
+        }
+        tokio::time::sleep(QUEUE_POLL_TICK).await;
+    }
+}
 
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
@@ -53,6 +128,14 @@ pub struct RunArgs {
     /// The id to give the run; by default a new one.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// Work every ready child of this pinned graph epic with the named workflow template.
+    #[arg(long, value_name = "EPIC_ID")]
+    pub graph_epic: Option<String>,
+    /// Kill this development build after the named workflow step commits,
+    /// so `atomic runs resume` can exercise recovery through the real CLI.
+    #[cfg(feature = "dev-failpoints")]
+    #[arg(long, value_name = "STEP")]
+    pub fail_at: Option<String>,
     /// For a workflow that changes code: the repository, already on disk,
     /// its worktrees are made from. The run never writes to it.
     #[arg(long, value_name = "REPO", requires = "fixture_rev")]
@@ -63,6 +146,18 @@ pub struct RunArgs {
     pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+#[cfg(feature = "dev-failpoints")]
+fn graph_fail_at_step(step: &str, template: &str) -> bool {
+    step.strip_prefix("graph.").is_some_and(|rest| {
+        rest.split_once('.').is_some_and(|(ordinal, name)| {
+            ordinal.len() == 5
+                && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+                && ordinal.parse::<usize>().is_ok_and(|number| number < 10_000)
+                && name == template
+        })
+    })
 }
 
 /// Bind `run` to its fixture, as `args` name one, before anything runs:
@@ -328,7 +423,13 @@ async fn finish(
             let hint = Said::new().text(HINT).name(run_id).text(HINT_END);
             Err(Failure::named("run.panicked", cause, hint).into())
         }
-        Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
+        Err(DurableError::Failed(why))
+            if why.starts_with(&format!(
+                "{} run {run_id} stopped {} times ",
+                atomic_app::pipeline::DEAD_LETTERED,
+                atomic_app::pipeline::RECOVERY_LIMIT
+            )) =>
+        {
             Err(Failure::named(
                 "run.dead_lettered",
                 Said::new()
@@ -399,7 +500,45 @@ pub async fn run(
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
+    if args.graph_epic.is_some() && input.get("item").is_some() {
+        return Err(Failure::new(
+            "graph.item_reserved",
+            "graph item input is supplied by the host after a claim; omit the `item` key",
+            "remove `item` from --data or the input file; declare it optional in the workflow input schema",
+        ).into());
+    }
     let mut run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
+    if args.graph_epic.is_some()
+        && (run.pipeline.steps.len() != 1
+            || !matches!(run.pipeline.steps.first(), Some(Step::Atom(step)) if step.worktree))
+    {
+        return Err(Failure::new(
+            "graph.template",
+            "--graph-epic requires a workflow with exactly one worktree atom step",
+            "use a one-step coding workflow template and put optional `item` fields in its input schema",
+        ).into());
+    }
+    #[cfg(feature = "dev-failpoints")]
+    if let Some(step) = args.fail_at.as_deref() {
+        let valid = if args.graph_epic.is_some() {
+            graph_fail_at_step(step, run.pipeline.steps[0].id())
+        } else {
+            run.pipeline
+                .steps
+                .iter()
+                .any(|candidate| candidate.id() == step)
+        };
+        if !valid {
+            return Err(Failure::new(
+                "run.fail_at",
+                "no workflow step matches --fail-at",
+                "name a step in this workflow (for a graph run: graph.00000.<template step>), then resume the run after the crash",
+            )
+            .into());
+        }
+        atomic_durable::failpoints::arm_cli(&format!("pipeline:after:{step}"))
+            .map_err(|reason| Failure::new("run.fail_at", reason, "start a new atomic command"))?;
+    }
     // Before any model is called, and before the run is recorded.
     state.create()?;
     bind_fixture(&mut run, &args, &state, &cwd)?;
@@ -415,9 +554,21 @@ pub async fn run(
         engine::Takes::Own,
     )
     .await?;
+    if args.graph_epic.is_none() && target::needs_model(&run) && !engine.model_endpoint_configured {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "config.model",
+            "this workflow needs a project-wide model endpoint; model.lanes applies only to graph runs",
+            "configure model.base_url and model.name, or run a coding workflow with --graph-epic",
+        )
+        .into());
+    }
     // Refused before it starts, not at its first lite step.
     let lite = target::lite_atoms(&run);
-    if engine.signed_in && !lite.is_empty() {
+    if engine.signed_in
+        && !lite.is_empty()
+        && !(args.graph_epic.is_some() && engine.lane_policy.is_some())
+    {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         return Err(Failure::new(
             "config.model",
@@ -477,6 +628,22 @@ pub async fn run(
         )
         .into());
     }
+    if let Some(epic) = &args.graph_epic {
+        if engine.shared {
+            return Err(Failure::new(
+                "graph.sqlite_required",
+                "graph epic runs currently require a SQLite project store",
+                "use a SQLite project store for this graph run",
+            )
+            .into());
+        }
+        let graph = atomic_graph::sqlite::SqliteStore::open_authorized(
+            &state.database(),
+            std::time::SystemTime::now,
+            crate::gates::operator_credential(&state)?,
+        )?;
+        graph.authorize_graph_run(epic, &run_id).await?;
+    }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
     // Names only, not redacted, since a run id such as `rotate-secret` is
@@ -510,7 +677,19 @@ pub async fn run(
     let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
     let told = halt.clone();
     let (artifacts, rt) = (&engine.artifacts, &engine.rt);
-    let admission = admit(artifacts, rt, PIPELINE, &run_id, run, typed, told);
+    let (workflow_name, durable_input) = match args.graph_epic {
+        Some(epic) => (
+            GRAPH_PIPELINE,
+            serde_json::to_value(GraphPipelineRun {
+                run,
+                epic,
+                model_source: engine.lane_policy.clone(),
+            })?,
+        ),
+        None => (PIPELINE, serde_json::to_value(run)?),
+    };
+    #[rustfmt::skip]
+    let admission = admit(artifacts, rt, workflow_name, &run_id, durable_input, typed, told);
     tokio::pin!(admission);
     let mut signalled = None;
     let admitted = tokio::select! {
@@ -976,6 +1155,11 @@ pub async fn serve(
     atomic_core::log_line!(
         "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"
     );
+    let queue_poller = if !engine.shared {
+        Some(tokio::spawn(poll_queue_outcomes(state.clone())))
+    } else {
+        None
+    };
     // A decider that stopped before waking its run is caught up within a
     // few seconds, not only at the next start.
     let signal = loop {
@@ -991,6 +1175,10 @@ pub async fn serve(
             }
         }
     };
+    if let Some(queue_poller) = queue_poller {
+        queue_poller.abort();
+        let _ = queue_poller.await;
+    }
     atomic_core::log_line!("atomic serve: {signal}");
     stop(&mut signals, "atomic serve", Exit::Served).await
 }
@@ -998,6 +1186,29 @@ pub async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dev-failpoints")]
+    #[test]
+    fn graph_fail_at_names_the_actual_after_close_site() {
+        assert!(graph_fail_at_step("graph.00000.implement", "implement"));
+        assert!(graph_fail_at_step("graph.00042.implement", "implement"));
+        for invalid in [
+            "implement",
+            "graph.0.implement",
+            "graph.00000.other",
+            "graph.00000.implement.turn",
+            "graph.abcde.implement",
+            "graph.10000.implement",
+            "graph.99999.implement",
+        ] {
+            assert!(!graph_fail_at_step(invalid, "implement"), "{invalid}");
+        }
+        assert_eq!(
+            atomic_durable::failpoints::site_of("pipeline:after:graph.00000.implement")
+                .map(|site| site.name),
+            Some("pipeline:after:{step}")
+        );
+    }
 
     /// What every refusal says: the rule, and not the id.
     const REFUSED: &str = "the run id given with --run-id is refused: a run id is 1 to 128 \

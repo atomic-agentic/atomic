@@ -1,0 +1,1 @@
+trial-cargo-config-between-checks|crates/atomic/src/pipeline.rs|if verify_cargo_config {|if false {|--test pipeline trial_cargo_config_written_by_earlier_check_refuses_before_reviewer

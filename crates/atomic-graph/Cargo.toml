@@ -18,3 +18,20 @@ name = "atomic_graph"
 workspace = true
 
 [dependencies]
+atomic-core = { package = "atomic-agentic-core", path = "../atomic-core" }
+atomic-durable = { package = "atomic-agentic-durable", path = "../atomic-durable" }
+chrono = "0.4"
+jsonschema = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "sync"] }
+
+# The conformance suite in tests/ is std alone, so there is nothing here yet.
+# `Cargo.lock` records this package with no dependencies and CI runs cargo with
+# `--locked`, so a dev-dependency arrives with the lockfile change it needs —
+# which is step 3 of the store gate in tests/conformance.rs (tokio, for a store
+# built on a connection pool). Until then the suite drives its checks with a
+# std-only executor of its own; see tests/harness/mod.rs.
+[dev-dependencies]

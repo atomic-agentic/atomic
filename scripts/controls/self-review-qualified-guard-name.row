@@ -1,0 +1,1 @@
+self-review-qualified-guard-name|crates/atomic/src/pipeline.rs|word.rsplit("::").next().unwrap_or(word)|word|-p atomic-agentic --test pipeline host_selects_qualified_guard_and_every_test_target_before_reviewer

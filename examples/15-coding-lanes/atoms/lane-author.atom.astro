@@ -1,0 +1,24 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/lane-author';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Make one bounded change in this attempt's worktree and run its test.",
+  "kind": "codex",
+  "sandbox": "workspace-write"
+};
+---
+
+Change only what the task asks for, in the worktree this attempt was given. Keep
+the guard working: it names the behaviour the change must not break, and the
+step's reviewers read the patch you leave, not your account of it.
+
+Run the test you wrote or changed and report the command you actually ran with
+the result it gave. A test you did not run is not reported as passing. Do not
+commit, push or merge, and do not report a commit SHA: atomic records the
+candidate commit itself once your turn ends, and the reviewers read the patch
+atomic computes from it.
+
+Task: {input.task.title}
+Guard to keep: {input.task.guard}
+Base commit: {input.base}

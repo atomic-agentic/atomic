@@ -1,0 +1,50 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [diff, host_review]
+properties:
+  diff:
+    type: string
+    minLength: 1
+    maxLength: 400000
+    description: The patch atomic read from the candidate's recorded base and commit.
+  self_review:
+    $ref: lane-self-check.output.schema.yaml
+  host_review:
+    type: object
+    additionalProperties: false
+    required: [decision_points, selected_controls, control_results]
+    properties:
+      decision_points:
+        type: array
+        maxItems: 16
+        items:
+          type: string
+          minLength: 1
+          maxLength: 200
+      selected_controls:
+        type: array
+        maxItems: 16
+        items:
+          type: string
+          minLength: 1
+          maxLength: 100
+      control_results:
+        type: array
+        maxItems: 16
+        items:
+          type: object
+          additionalProperties: false
+          required: [row, result]
+          properties:
+            row:
+              type: string
+              minLength: 1
+              maxLength: 100
+            result:
+              type: string
+              minLength: 1
+              maxLength: 2000
+    description: >-
+      The reviewed decision inventory and the verified control results, read by
+      the host from the admitted revision. Supplied by the host, never mapped.

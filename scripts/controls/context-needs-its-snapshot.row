@@ -1,0 +1,1 @@
+context-needs-its-snapshot|crates/atomic-core/assets/worker.mjs|if(qt(e)&&!o)throw new Error("context snapshot required")|if(false&&qt(e)&&!o)throw new Error("context snapshot required")|-p atomic-agentic-core --lib -- render::tests::a_worker_render_requires_its_declared_context_snapshot

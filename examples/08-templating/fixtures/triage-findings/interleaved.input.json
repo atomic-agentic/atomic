@@ -1,0 +1,37 @@
+{
+  "item": {
+    "id": "nt-10",
+    "title": "Quantity is missing in three places",
+    "criteria": [
+      "Every money calculation multiplies by quantity.",
+      "A regression test covers a quantity greater than one."
+    ]
+  },
+  "findings": [
+    {
+      "file": "pricing.py",
+      "severity": "blocker",
+      "message": "Total ignores quantity."
+    },
+    {
+      "file": "README.md",
+      "severity": "minor",
+      "message": "The example shows one unit."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "major",
+      "message": "Refunds ignore quantity."
+    },
+    {
+      "file": "README.md",
+      "severity": "minor",
+      "message": "The install line is stale."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "blocker",
+      "message": "Tax ignores the region."
+    }
+  ]
+}

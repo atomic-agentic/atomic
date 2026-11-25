@@ -1,0 +1,1 @@
+criterion-fresh-confinement-check|crates/atomic-exec/src/lib.rs|self.checked = Arc::default();|let _ = &self.checked;|-p atomic-agentic --features sandbox-tests --test exec_scratch -- executable_criteria_isolate_other_projects_scratch_on_both_runners

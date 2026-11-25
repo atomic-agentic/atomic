@@ -844,7 +844,6 @@ fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
         gate::enroll(&rt, &HumanCredential::new(Principal::local("dev"), secret))
             .await
             .unwrap();
-
         let release = [
             "parks",
             "release",
@@ -907,6 +906,174 @@ fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
         );
         assert_eq!(cap().await, 1_000_000);
         let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// A shell inside an atom cannot use the operator's file credential to make a
+/// committed graph write, even when the whole atomic home is otherwise a
+/// writable sandbox root. The same command succeeds for the person outside.
+#[test]
+fn an_atom_shell_cannot_create_a_human_graph_item() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-graph-shell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["project", "home", "bin"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let (project, home) = (dir.join("project"), dir.join("home"));
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: graph-shell\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("beads.jsonl"),
+            "{\"id\":\"bd-shell\",\"title\":\"From shell\",\"status\":\"open\",\"issue_type\":\"task\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("criteria.json"),
+            "[{\"kind\":\"text\",\"text\":\"Operator approved criterion\"}]",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let atomic = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_atomic"))
+                .args(args)
+                .current_dir(&project)
+                .env("ATOMIC_HOME", &home)
+                .env("ATOMIC_CREDENTIAL_STORE", "file")
+                .env("USER", "dev")
+                .output()
+                .unwrap()
+        };
+        let out = atomic(&["debug", "state-dir"]);
+        assert!(out.status.success(), "{out:?}");
+        let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let id = state.file_name().unwrap().to_string_lossy().into_owned();
+        let private_root = home.join("private");
+        let private = private_root.join(&id);
+        std::fs::create_dir_all(&private).unwrap();
+        let rt = Durare::sqlite(&private.join("atomic.db")).await.unwrap();
+        let secret = "the graph operator's secret";
+        let store = credential::FileSecrets::open(&home.join("credentials"), &project).unwrap();
+        credential::SecretStore::save(&store, &format!("operator:dev@{id}"), secret).unwrap();
+        gate::enroll(&rt, &HumanCredential::new(Principal::local("dev"), secret))
+            .await
+            .unwrap();
+        let seeded = atomic(&["graph", "create", "Policy", "--id", "at-policy"]);
+        assert!(seeded.status.success(), "{seeded:?}");
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: private_root,
+            also: vec![home.join("credentials")],
+        });
+        let command = format!(
+            "ATOMIC_HOME={home} ATOMIC_CREDENTIAL_STORE=file USER=dev {atomic} graph create Shell --id at-shell; echo graph-exit=$?; ATOMIC_HOME={home} ATOMIC_CREDENTIAL_STORE=file USER=dev {atomic} graph import beads.jsonl; echo import-exit=$?; ATOMIC_HOME={home} ATOMIC_CREDENTIAL_STORE=file USER=dev {atomic} graph policy set at-policy --require commit; echo policy-exit=$?; ATOMIC_HOME={home} ATOMIC_CREDENTIAL_STORE=file USER=dev {atomic} graph criteria set at-policy --file criteria.json; echo criteria-exit=$?",
+            home = home.display(),
+            atomic = env!("CARGO_BIN_EXE_atomic"),
+        );
+        let output = sandboxed(&dir, &home, &guard, &project, &command).await;
+        assert!(output.contains("graph-exit="), "{output}");
+        assert!(
+            !output.contains("graph-exit=0"),
+            "atom shell wrote the graph: {output}"
+        );
+        assert!(output.contains("import-exit="), "{output}");
+        assert!(
+            !output.contains("import-exit=0"),
+            "atom shell imported the graph: {output}"
+        );
+        assert!(output.contains("policy-exit="), "{output}");
+        assert!(
+            !output.contains("policy-exit=0"),
+            "atom shell wrote a policy: {output}"
+        );
+        assert!(output.contains("criteria-exit="), "{output}");
+        assert!(
+            !output.contains("criteria-exit=0"),
+            "atom shell wrote item criteria: {output}"
+        );
+        // Isolate the file-store denial as well: make the graph DB accessible
+        // in this second test policy, while still denying credentials.
+        let other_private = home.join("unrelated-private");
+        std::fs::create_dir_all(&other_private).unwrap();
+        let credential_only = StateGuard::Deny(PrivateState {
+            state_dir: state,
+            private: other_private,
+            also: vec![home.join("credentials")],
+        });
+        let credential_output = sandboxed(&dir, &home, &credential_only, &project, &command).await;
+        assert!(
+            credential_output.contains("graph-exit="),
+            "{credential_output}"
+        );
+        assert!(
+            !credential_output.contains("graph-exit=0"),
+            "atom shell read the file credential: {credential_output}"
+        );
+        assert!(
+            credential_output.contains("import-exit="),
+            "{credential_output}"
+        );
+        assert!(
+            !credential_output.contains("import-exit=0"),
+            "atom shell used the file credential for import: {credential_output}"
+        );
+        assert!(
+            credential_output.contains("policy-exit="),
+            "{credential_output}"
+        );
+        assert!(
+            !credential_output.contains("policy-exit=0"),
+            "atom shell used the file credential for policy: {credential_output}"
+        );
+        assert!(
+            credential_output.contains("criteria-exit="),
+            "{credential_output}"
+        );
+        assert!(
+            !credential_output.contains("criteria-exit=0"),
+            "atom shell used the file credential for criteria: {credential_output}"
+        );
+        assert!(
+            !credential_output.contains("cannot create the state directory"),
+            "the file-store probe failed before credential lookup: {credential_output}"
+        );
+        let exported = atomic(&["graph", "export"]);
+        assert!(exported.status.success(), "{exported:?}");
+        let graph = String::from_utf8_lossy(&exported.stdout);
+        assert!(graph.contains("at-policy"), "seeded item missing: {graph}");
+        assert!(
+            !graph.contains("at-shell") && !graph.contains("bd-shell"),
+            "the refused write left a graph row: {graph}"
+        );
+        let shown = atomic(&["--json", "graph", "policy", "show", "at-policy"]);
+        assert!(shown.status.success(), "{shown:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&shown.stdout).unwrap()["policy"],
+            serde_json::Value::Null,
+            "atom shell wrote a policy row"
+        );
+        let criteria = atomic(&["--json", "graph", "criteria", "show", "at-policy"]);
+        assert!(criteria.status.success(), "{criteria:?}");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&criteria.stdout).unwrap()["criteria"],
+            serde_json::json!([]),
+            "atom shell wrote structured criteria"
+        );
+        let outside = atomic(&["graph", "create", "Human", "--id", "at-human"]);
+        assert!(outside.status.success(), "{outside:?}");
+        let imported = atomic(&["graph", "import", "beads.jsonl"]);
+        assert!(imported.status.success(), "{imported:?}");
+        let _ = std::fs::remove_dir_all(dir);
     });
 }
 

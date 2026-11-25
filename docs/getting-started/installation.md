@@ -16,7 +16,7 @@ supported installation command. The check under
 published release will face; there is nothing to check against yet.
 
 Atomic itself is in this repository and builds from source. With a container
-engine, git and curl on the host, from a checkout:
+engine and git on the host, from a checkout:
 
 ```sh
 scripts/dev.sh cargo build --release --locked -p atomic-agentic
@@ -26,7 +26,7 @@ That writes `target/release/atomic`, a Linux executable (the container is a
 Linux image): the package is `atomic-agentic`, the program it builds is
 `atomic`, and `atomic --help` lists its commands.
 [Developing atomic](../development.md) covers the development container, the
-pinned toolchain and the prebuilt V8 the build links.
+pinned Rust toolchain and the build cache.
 
 Which commands are built and which are a later stage's plan is listed in
 [availability](../reference/availability.md); read it before trying a feature.
@@ -43,13 +43,10 @@ Which commands are built and which are a later stage's plan is listed in
   On macOS, install a current Git with Homebrew if the bundled Git lacks that
   option. Atomic looks for Homebrew Git at its standard installation paths.
 - Git and a container engine (Docker, or Podman) to build Atomic from source; the
-  executable itself runs with no container. `scripts/dev.sh` also wants `curl`,
-  which fetches the pinned V8 archive the first time its cache needs it; the
-  Rust toolchain and the other build tools are in the
+  executable itself runs with no container. The Rust toolchain and other build tools are in the
   [development container](../development.md#the-development-container).
 
-Atomic's Astro compiler is built into the binary and runs on the V8 engine it
-embeds, so `atomic check` and `atomic render` need no Deno, Node or npm. From
+Atomic embeds the native Astro compiler and the Boa helper runtime, so `atomic check` and `atomic render` need no Deno, Node or npm. From
 v0.7, atom code and scripts run on a [Deno](../guides/atom-code-runtime.md)
 that Atomic downloads and verifies itself the first time a project needs it.
 

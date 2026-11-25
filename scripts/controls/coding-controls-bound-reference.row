@@ -1,0 +1,1 @@
+coding-controls-bound-reference|crates/atomic/src/pipeline.rs|let reference_matches = output["bound"]["reference"].as_str() == Some(reference);|let reference_matches = true;|-p atomic-agentic --lib -- pipeline::tests::a_host_control_proof_refuses_a_wrong_reference_receipt

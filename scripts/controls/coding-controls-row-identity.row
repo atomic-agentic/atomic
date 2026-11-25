@@ -1,0 +1,1 @@
+coding-controls-row-identity|crates/atomic/src/pipeline.rs|        path.starts_with("scripts/controls/")|        false|-p atomic-agentic --test pipeline a_coding_candidate_cannot_redefine_a_selected_control_row

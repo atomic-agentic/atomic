@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # What every Linux Rust job in CI needs before cargo runs: system packages,
-# the pinned toolchain, the build caches and the
-# verified V8 archive, and for the test jobs the test Postgres and the user
+# the pinned toolchain, the build caches, and for the test jobs the test Postgres and the user
 # namespaces Codex's sandbox needs. Actions are pinned by commit SHA.
 #
 # Two caches are restored. cargo's downloads (the registry and the git
-# sources, rusty_v8's Chromium submodules among them) are keyed on the
+# sources) are keyed on the
 # toolchain and Cargo.lock. target/ is keyed on those and the manifests, one
 # cache per kind of build ("test" for the test features' build, "check" for
 # clippy's), and holds only the dependencies' artifacts (scripts/cache-trim.py),
@@ -130,9 +129,3 @@ runs:
         path: target
         key: target-${{ inputs.target-cache }}-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', '.cargo/config.toml') }}
         restore-keys: ${{ !(inputs.warm == 'true' && github.ref == 'refs/heads/main') && format('target-{0}-{1}-', inputs.target-cache, runner.os) || '' }}
-
-    # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
-    # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
-    - name: V8 archive
-      shell: bash
-      run: scripts/v8-archive.sh

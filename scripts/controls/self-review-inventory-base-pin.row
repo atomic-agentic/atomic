@@ -1,0 +1,1 @@
+self-review-inventory-base-pin|crates/atomic/src/pipeline.rs|candidate != Some(entry)|false|-p atomic-agentic --test pipeline candidate_cannot_rewrite_reviewed_decision_inventory_before_reviewer

@@ -36,6 +36,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Where a value came from.
@@ -73,6 +75,19 @@ pub struct Layers<'a> {
     pub env_names: Vec<String>,
     /// Flag overrides: a dotted setting path and its value.
     pub flags: Vec<(String, Value)>,
+}
+
+/// Profile names are single, unambiguous file-name components. `local` is
+/// already the always-read personal layer, not a selectable profile.
+pub fn valid_profile_name(name: &str) -> bool {
+    name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name != "local"
+        && name.split(['-', '_']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        })
 }
 
 /// The resolved configuration and where each setting came from.
@@ -158,10 +173,22 @@ where
         (layers.dir.join("atomic.local.yaml"), false),
     ]);
     if let Some(profile) = layers.profile {
+        if !valid_profile_name(profile) {
+            return Err(ConfigError::Value {
+                name: "profile".into(),
+                message: "use a lowercase ASCII name beginning with a letter, with single '-' \
+                          or '_' separators; 'local' is reserved for atomic.local.yaml"
+                    .into(),
+            });
+        }
         files.push((layers.dir.join(format!("atomic.{profile}.yaml")), true));
     }
     for (path, required) in files {
-        let text = match std::fs::read_to_string(&path) {
+        let text = match if required {
+            read_selected_profile(layers.dir, &path)
+        } else {
+            std::fs::read_to_string(&path)
+        } {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required => continue,
             Err(source) => return Err(ConfigError::Read { path, source }),
@@ -227,6 +254,77 @@ where
     let config = serde_json::from_value(value)
         .map_err(|e| ConfigError::Invalid(without_values(&e.to_string())))?;
     Ok(Resolved { config, sources })
+}
+
+/// Read the selected profile through the directory this resolution opened,
+/// never through a profile symlink. The name was checked as a single file
+/// component above. A nonblocking open lets us reject a FIFO rather than
+/// waiting forever for a writer. Linux and macOS both provide `openat` and
+/// `O_NOFOLLOW`.
+#[cfg(unix)]
+fn read_selected_profile(dir: &Path, path: &Path) -> std::io::Result<String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::PermissionsExt;
+    let directory = std::fs::File::open(dir)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "profile directory is not a directory",
+        ));
+    }
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "profile has no file name")
+    })?;
+    let name = CString::new(name.as_encoded_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "profile name contains NUL",
+        )
+    })?;
+    // SAFETY: `directory` owns a live directory descriptor, `name` is a
+    // NUL-terminated single component, and a successful descriptor is taken
+    // into exactly one File below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `openat` returned this owned descriptor, which no other File
+    // has taken; the File closes it on every path.
+    #[allow(unsafe_code)]
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "selected profile must be a regular file, not a symlink or special file",
+        ));
+    }
+    if metadata.permissions().mode() & 0o444 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "selected profile has no read permission",
+        ));
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Without a descriptor-relative no-follow open, no selected profile is read.
+#[cfg(not(unix))]
+fn read_selected_profile(_dir: &Path, _path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure profile loading is not available on this platform",
+    ))
 }
 
 fn normalize(name: &str) -> String {

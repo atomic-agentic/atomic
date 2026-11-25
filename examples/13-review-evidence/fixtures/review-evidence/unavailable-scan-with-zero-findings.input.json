@@ -1,0 +1,42 @@
+{
+  "candidate": {
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example",
+    "base_revision": "11111111a3f6c8d2e5b7a90c4d1e8f36a2b5c7d9"
+  },
+  "required_checks": [
+    {
+      "id": "secret-scan",
+      "title": "No secret is committed",
+      "record": "fixture:execution:secret-scan",
+      "required": true
+    }
+  ],
+  "host_records": [
+    {
+      "id": "fixture:execution:secret-scan",
+      "origin": "host",
+      "criterion": "secret-scan",
+      "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+      "outcome": "unavailable",
+      "access": "grant",
+      "findings": [],
+      "detail": "The scanner reported it could not start, so no state was recorded."
+    }
+  ],
+  "author_claims": [
+    {
+      "id": "fixture:claim:secret-scan",
+      "origin": "author",
+      "criterion": "secret-scan",
+      "claim": "pass",
+      "basis": "This change adds no credential, so the scan cannot have found one."
+    }
+  ],
+  "display": {
+    "section": "markdown",
+    "link": "markdown",
+    "emphasis": "bold"
+  }
+}

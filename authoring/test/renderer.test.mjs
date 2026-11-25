@@ -95,6 +95,22 @@ test('repeated references share one binding', async (t) => {
   assert.equal(result.bindings.length, 1);
   assert.equal(result.developer.match(/see <data-/g).length, 2);
 });
+test('distinct values from one filtered source path keep distinct user bindings', async (t) => {
+  const tiny = await sample(t, '{input.groups.map((group) => <Fragment>{input.items.filter((item) => item.group === group)}</Fragment>)}');
+  const result = render(tiny, {
+    groups: ['first', 'second', 'first'],
+    items: [{ group: 'first', message: 'one' }, { group: 'second', message: 'two' }],
+  });
+  assert.deepEqual(result.bindings.map((binding) => binding.origin), ['external', 'external']);
+  assert.equal(result.bindings[0].path, result.bindings[1].path);
+  assert.match(result.user, /"message":"one"/);
+  assert.match(result.user, /"message":"two"/);
+  assert.equal((result.user.match(/path=/g) ?? []).length, 2, 'the exact repeated value is shared');
+  const references = [...result.developer.matchAll(/see <data-([0-9a-f]+)>/g)].map((match) => match[1]);
+  assert.equal(references.length, 3);
+  assert.notEqual(references[0], references[1], 'different values need different wrapper IDs');
+  assert.equal(references[0], references[2], 'the exact repeated value reuses its binding');
+});
 test('a payload cannot forge the wrapper of another binding', async (t) => {
   const tiny = await sample(t, '{input.a}\n{input.b}');
   const wrapperOf = (result, at) => result.user.match(new RegExp(`^<data-([0-9a-f]+) path="${at.replace('.', '\\.')}"`, 'm'))[1];

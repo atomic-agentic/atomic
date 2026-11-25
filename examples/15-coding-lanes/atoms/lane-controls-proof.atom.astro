@@ -1,0 +1,11 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/lane-controls-proof';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Read one declared control row in the checkout it is given and report whether it is intact.",
+  "kind": "exec",
+  "exec": { "command": ["python3", "tools/lane_controls_proof.py"] },
+  "effects": { "external": "read-only" }
+};
+---

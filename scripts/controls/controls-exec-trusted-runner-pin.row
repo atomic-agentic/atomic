@@ -1,0 +1,1 @@
+controls-exec-trusted-runner-pin|scripts/controls-exec.py|    got = hashed(here, RUNNER_LIMIT_BYTES, "the proof runner")|    got = want  # CONTROL_OFF: trust the claimed runner hash without reading its bytes|-p atomic-agentic --test controls_exec_driver_guard -- trusted_runner_pin_refuses_changed_bytes_before_any_row

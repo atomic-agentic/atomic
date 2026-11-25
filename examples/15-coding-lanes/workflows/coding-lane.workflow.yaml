@@ -1,0 +1,104 @@
+atomic: 1
+input:
+  type: object
+  additionalProperties: false
+  required: [task, base]
+  properties:
+    task:
+      $ref: ../atoms/lane-author.input.schema.yaml#/properties/task
+    base:
+      $ref: ../atoms/lane-author.input.schema.yaml#/properties/base
+output:
+  $ref: ../atoms/lane-author.output.schema.yaml
+steps:
+  # The author. A coding step is a worktree step that hands atomic's own patch,
+  # never its own account of it, to everything that judges it. For one candidate
+  # the runtime runs, in this order: the author's turn, the trial merge and its
+  # checks, these criteria, the controls proof for each selected row, the
+  # self-review, then both reviewers. Anything that asks for changes costs the
+  # author one repair round while `rounds` lasts. Once none is left a reviewer's
+  # request opens `code.review` for a person, and a trial merge or a criterion
+  # that still fails stops the run where it stands.
+  code:
+    atom: lane-author
+    with:
+      task: input.task
+      base: input.base
+    worktree: true
+    coding: true
+    # Each criterion is a durable step of its own (`code.criteria.<round>.<n>`)
+    # recorded before the self-reviewer and the reviewers start. `test`, `cel`
+    # and `http` decide; a `text` criterion is recorded and passes, because it is
+    # prose for the reviewers and the person at the gate, not a machine check. A
+    # failed criterion sends the author one repair round; a second failure stops
+    # the run rather than reaching a reviewer.
+    criteria:
+    - kind: text
+      text: >-
+        The change does only what the task asks, and the guard it names still
+        refuses what it refused before. Read the patch for this; the author's
+        summary is not evidence of it.
+    - kind: test
+      argv:
+      - python3
+      - tests/test_lane_guard.py
+      timeout_ms: 30000
+    - kind: cel
+      expr: candidate.output.files_changed.size() >= 1
+    review:
+      # Two independent reviewers, both named here, and `require: all`: the
+      # candidate needs both verdicts. They read the same host-published patch
+      # and the same host evidence, and each has one question of its own —
+      # `lane-reviewer` the change, `lane-evidence-reviewer` whether the
+      # evidence covers what the host recorded. Each runs in its own durable
+      # step (`code.review.<round>.0` and `code.review.<round>.1`) and never
+      # sees the other's verdict or reasoning.
+      reviewers:
+      - lane-reviewer
+      - lane-evidence-reviewer
+      require: all
+      # Exactly one binding, shared by both members: atomic's patch. The
+      # author's reasoning is not mapped, and `self_review` and `host_review`
+      # are the host's to supply.
+      with:
+        diff: candidate.metadata.diff
+      # One proof step per row (`code.controls.<round>.<n>`), before the
+      # self-reviewer. The host substitutes its pinned offline driver for the
+      # declared exec atom's command and keeps that atom's own schemas, so a
+      # lane meant to run declares the driver's contract; the catalog's
+      # illustration reads a row and reports `intact` or `blind`, and so can
+      # never mint the `passed` result a review requires. The self-reviewer
+      # receives the host's results as `control_results` and cannot map them.
+      self_review:
+        atom: lane-self-check
+        with:
+          diff: candidate.metadata.diff
+        decision_points:
+        - candidate publication
+        selected_controls:
+        - lane-guard-bites
+        controls_atom: lane-controls-proof
+      trial_merge:
+        main: refs/heads/main
+        checks:
+        - - python3
+          - tests/test_lane_guard.py
+      rounds: 1
+  # A person authorizes the merge: the second human decision point of this
+  # lane, the first being `code.review`, the gate the review opens when a
+  # verdict is not `approve` for both members. atomic recorded the candidate
+  # commit and both panel verdicts; nothing here merges, pushes or advances a
+  # ref, and a gate decision authorizes an effect rather than performing one.
+  # A rejected, expired or unanswered gate stops the run, so no step after it
+  # runs. Approvers are not named here: locally that is the enrolled operator,
+  # and a shared deployment needs a group its policy allows. Neither a model
+  # tool call nor an atom's shell can stand in for this decision.
+  authorize-merge:
+    after:
+    - code
+    gate:
+      title: '''Authorize merging the candidate both reviewers approved'''
+      show: '{''commit'': steps.code.metadata.commit, ''candidate'': steps.code.output}'
+      timeout: 24h
+      on_timeout: reject
+returns: steps.code.output

@@ -1,0 +1,1 @@
+compiler-no-file-reads|crates/atomic-core/src/compiler_host/host.js|return Promise.reject(refused(`file ${String(file)}: compiler file reads are disabled`));|return Promise.resolve(new Uint8Array());|-p atomic-agentic-core --lib -- compiler_host::tests::the_compiler_host_reads_no_files

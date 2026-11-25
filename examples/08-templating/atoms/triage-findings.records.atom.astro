@@ -1,0 +1,28 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/triage-findings.records';
+import type { AtomConfig } from '../.atomic/types/authoring';
+import TriageFrame from './TriageFrame.astro';
+import NoFindings from './NoFindings.astro';
+import FindingRecord from './FindingRecord.astro';
+import { findingRuns } from './layout';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Layout B of the same triage: the findings in groups by file, each field on its own labeled line, every group where its first finding was reported.",
+  "input": { "$ref": "./triage-findings.input.schema.yaml" },
+  "output": { "$ref": "./triage-findings.output.schema.yaml" },
+  "validate": [({input, output}) => output.decision !== 'accept' || output.must_fix.length === 0]
+};
+---
+<TriageFrame id={input.item.id} title={input.item.title} criteria={input.item.criteria}>
+{input.findings.length === 0 ? <Fragment>
+<NoFindings />
+</Fragment> : <Fragment>
+Findings, in groups by file, each field on its own labeled line, every group where its first finding was reported:
+{findingRuns(input.findings).map((run) => <Fragment>
+
+{run.file}
+{run.findings.map((f) => <Fragment>
+<FindingRecord finding={f} /></Fragment>)}
+</Fragment>)}
+</Fragment>}
+</TriageFrame>

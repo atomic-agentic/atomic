@@ -49,7 +49,7 @@ The same pipeline runs for every model-backed atom:
 2. **Render,** once per run. Evaluate the template against the input. Every
    inserted value goes into the user turn, wrapped in a delimited element that
    names its path and origin. Each wrapper ends in a suffix generated for that
-   run and field, and atomic verifies the suffix is absent from the value, so no
+   run and distinct binding, and atomic verifies the suffix is absent from the value, so no
    value can terminate its own wrapper; the value goes in byte for byte, without
    escaping. Values never enter the developer instructions.
 3. **Start** a thread, or a single call for a lite atom, with the atom's model,

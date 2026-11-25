@@ -1,0 +1,1 @@
+graph-export-read-only|crates/atomic-graph/src/sqlite.rs|self.transaction(false, f).await|self.transaction(true, f).await|-p atomic-agentic-graph --test admin_auth opening_and_exporting_do_not_rebuild_the_graph_projection

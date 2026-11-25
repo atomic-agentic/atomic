@@ -211,6 +211,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
         &mut rt,
         Services {
             runtimes,
+            model_endpoint_configured: true,
             store: LocalStore::open(dir.join("state/artifacts")).expect("artifact store"),
             deployment: local(),
             worktrees: ProjectWorktrees::Found(Arc::new(Worktrees::new(
@@ -218,6 +219,8 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
                 dir.join("state/worktrees"),
             ))),
             caches: None,
+            trial_cargo: None,
+            trial_denied: Vec::new(),
             budgets: Arc::default(),
             context: None,
         },

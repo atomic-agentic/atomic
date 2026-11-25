@@ -1,0 +1,1 @@
+criterion-scratch-exclusions|crates/atomic/src/criteria.rs|denied: backend.criterion_exclusions(cwd)?,|denied: Vec::new(),|-p atomic-agentic --features sandbox-tests --test exec_scratch -- executable_criteria_isolate_other_projects_scratch_on_both_runners

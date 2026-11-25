@@ -1,0 +1,1 @@
+criterion-cel-boolean-at-load|crates/atomic-core/src/workflow.rs|parsed.check_boolean(&criterion_scope)|parsed.check(&criterion_scope)|-p atomic-agentic-core --lib executable_criteria_are_bounded_and_type_checked_before_run

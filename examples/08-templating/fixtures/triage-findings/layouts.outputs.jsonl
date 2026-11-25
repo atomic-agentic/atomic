@@ -1,0 +1,5 @@
+{"decision": "accept", "must_fix": [], "summary": "No finding was reported and every criterion holds."}
+{"decision": "fix_now", "must_fix": ["pricing.py"], "summary": "Two blockers on pricing.py must be fixed before this ships."}
+{"decision": "fix_now", "must_fix": ["pricing.py", "notes/pricing.md"], "summary": "A blocker and a guard that never fires must be fixed; the rest can follow up."}
+{"decision": "fix_now", "must_fix": ["pricing.py"], "summary": "The refund path is reported twice against pricing.py and must be fixed before this ships."}
+{"decision": "fix_now", "must_fix": ["pricing.py"], "summary": "One blocker on pricing.py is reported twice and must be fixed before this ships."}

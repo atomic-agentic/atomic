@@ -644,6 +644,7 @@ fn command_as(
         "ATOMIC_MODEL_BASE_URL",
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
+        "ATOMIC_PROFILE",
         "ATOMIC_RUNNER",
         "ATOMIC_BACKEND_WAIT",
         "OPENAI_API_KEY",
@@ -1788,6 +1789,226 @@ fn check_reads_the_settings_of_every_manifest() {
     .expect("manifest");
     let out = check();
     assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn profile_selection_is_visible_in_config_and_checked_in_each_workspace_member() {
+    let dir = scratch("profile-selection");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nmodel:\n  name: base\nworkspace:\n  members: [member]\n",
+    )
+    .expect("root manifest");
+    std::fs::write(
+        project.join("atomic.local.yaml"),
+        "model:\n  name: local-choice\n",
+    )
+    .expect("local settings");
+    std::fs::write(
+        project.join("atomic.nightly.yaml"),
+        "model:\n  name: nightly-choice\n",
+    )
+    .expect("profile settings");
+    std::fs::write(
+        project.join("atomic.review_2.yaml"),
+        "model:\n  name: review-choice\n",
+    )
+    .expect("other profile");
+    let member = project.join("member");
+    std::fs::create_dir_all(&member).expect("member");
+    std::fs::write(member.join("atomic.yaml"), "atomic: 1\nname: member\n")
+        .expect("member manifest");
+
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "config", "--explain", "--profile", "nightly"],
+        &[("ATOMIC_MODEL_NAME", "environment-choice")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout_json(&out);
+    let setting = shown["settings"]
+        .as_array()
+        .expect("settings")
+        .iter()
+        .find(|row| row["setting"] == "model.name")
+        .expect("model.name");
+    assert_eq!(setting["value"], "environment-choice", "{shown}");
+    assert_eq!(
+        setting["source"], "environment variable ATOMIC_MODEL_NAME",
+        "{shown}"
+    );
+    assert!(
+        shown["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|n| n == "profile nightly selected by --profile"),
+        "{shown}"
+    );
+
+    // The flag wins over an ambient selection, even one with a bad name.
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "config", "--explain", "--profile", "review_2"],
+        &[("ATOMIC_PROFILE", "../outside")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout_json(&out);
+    let setting = shown["settings"]
+        .as_array()
+        .expect("settings")
+        .iter()
+        .find(|row| row["setting"] == "model.name")
+        .expect("model.name");
+    assert_eq!(setting["value"], "review-choice", "{shown}");
+    assert!(
+        setting["source"]
+            .as_str()
+            .is_some_and(|s| s.contains("atomic.review_2.yaml")),
+        "{shown}"
+    );
+
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "config",
+            "--explain",
+            "--profile",
+            "nightly",
+            "--model",
+            "flag-choice",
+        ],
+        &[("ATOMIC_MODEL_NAME", "environment-choice")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout_json(&out);
+    let setting = shown["settings"]
+        .as_array()
+        .expect("settings")
+        .iter()
+        .find(|row| row["setting"] == "model.name")
+        .expect("model.name");
+    assert_eq!(setting["value"], "flag-choice", "{shown}");
+    assert_eq!(setting["source"], "flag --model", "{shown}");
+
+    // `check` examines the selected profile in every member, rather than
+    // silently accepting an absent member file.
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "check", "--profile", "nightly"],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.invalid", "{error}");
+    assert!(
+        error["description"].as_str().is_some_and(
+            |s| s.contains("member/atomic.nightly.yaml") && s.contains("create that file")
+        ),
+        "{error}"
+    );
+    std::fs::write(
+        member.join("atomic.nightly.yaml"),
+        "model:\n  name: member-nightly\n",
+    )
+    .expect("member profile");
+    let out = atomic(&dir, &project, &["check", "--profile", "nightly"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &member,
+        &["--json", "config", "--profile", "nightly"],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout_json(&out);
+    let setting = shown["settings"]
+        .as_array()
+        .expect("settings")
+        .iter()
+        .find(|row| row["setting"] == "model.name")
+        .expect("model.name");
+    assert_eq!(setting["value"], "member-nightly", "{shown}");
+    assert!(
+        setting["source"]
+            .as_str()
+            .is_some_and(|s| s.contains("member/atomic.nightly.yaml")),
+        "{shown}"
+    );
+}
+
+#[test]
+fn run_resume_and_serve_use_the_selected_project_profile_before_work() {
+    let dir = scratch("profile-entry-points");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("atomic.nightly.yaml"),
+        "runner: unrecognized\n",
+    )
+    .expect("profile");
+    for args in [
+        vec!["--json", "run", "count-only", "--data", NOTE],
+        vec!["--json", "runs", "resume", "missing-run"],
+        vec!["--json", "serve"],
+    ] {
+        let out = atomic(&dir, &project, &args, &[("ATOMIC_PROFILE", "nightly")], "");
+        assert!(!out.status.success(), "{args:?}: {}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "config.invalid", "{args:?}: {error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|s| s.contains("atomic.nightly.yaml")
+                    && s.contains("runner")
+                    && s.contains("must be local or process")),
+            "{args:?}: {error}"
+        );
+    }
+    // An explicit empty flag clears an ambient selection for the same run.
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "config", "--explain", "--profile", ""],
+        &[("ATOMIC_PROFILE", "nightly")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        !stdout_json(&out)["notes"]
+            .as_array()
+            .expect("notes")
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.starts_with("profile "))),
+        "{}",
+        text(&out)
+    );
+
+    let out = atomic(
+        &dir,
+        &dir.join("elsewhere"),
+        &["--json", "config", "--profile", "nightly"],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        stdout_json(&out)["error"]["description"]
+            .as_str()
+            .is_some_and(|s| s.contains("profile needs a project")),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -3288,6 +3509,145 @@ fn killed_after_rank(dir: &Path, project: &Path, env: &[(&'static str, String)],
     assert!(
         !out.status.success(),
         "killed at the failpoint: {}",
+        text(&out)
+    );
+}
+
+// needs_sandbox
+#[cfg(all(
+    feature = "dev-failpoints",
+    any(not(target_os = "linux"), feature = "sandbox-tests")
+))]
+#[test]
+fn fail_at_cli_resumes_after_the_named_step_without_repeating_its_model_call() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("fail-at-cli");
+        let project = project(&dir);
+        let env = model_env(&model.base_url());
+
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let killed = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "--json",
+                    "run",
+                    "triage",
+                    "--run-id",
+                    "fail-at-cli-1",
+                    "--data",
+                    NOTE,
+                    "--fail-at",
+                    "rank",
+                ],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!killed.status.success(), "{}", text(&killed));
+        assert!(
+            text(&killed).contains("failpoint pipeline:after:rank: killing the process"),
+            "{}",
+            text(&killed)
+        );
+        assert_eq!(model.calls(), 1, "rank called its model once");
+        assert_eq!(
+            count_log(&dir),
+            1,
+            "count command ran once before the crash"
+        );
+
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let resumed = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "runs", "resume", "fail-at-cli-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(resumed.status.success(), "{}", text(&resumed));
+        assert_eq!(
+            stdout_json(&resumed)["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        assert_eq!(
+            model.calls(),
+            2,
+            "rank ran once and summarize ran after resume"
+        );
+        assert_eq!(count_log(&dir), 1, "resume repeated the completed command");
+    });
+}
+
+#[cfg(feature = "dev-failpoints")]
+#[test]
+fn fail_at_unknown_step_refuses_before_any_model_call() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let dir = scratch("fail-at-unknown");
+        let project = project(&dir);
+        let env = model_env(&model.base_url());
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "rank-note",
+                "--data",
+                r#"{"title":"Short note","words":2}"#,
+                "--fail-at",
+                "missing",
+            ],
+            &with(&env, &[]),
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        assert_eq!(stdout_json(&out)["error"]["kind"], "run.fail_at");
+        assert!(
+            text(&out).contains("no workflow step matches --fail-at"),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(model.calls(), 0, "the invalid selector called a model");
+    });
+}
+
+#[cfg(not(feature = "dev-failpoints"))]
+#[test]
+fn release_cli_does_not_offer_a_crash_flag() {
+    let dir = scratch("fail-at-release");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "rank-note",
+            "--data",
+            r#"{"title":"Short note","words":2}"#,
+            "--fail-at",
+            "run",
+        ],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("unexpected argument '--fail-at'"),
+        "{}",
         text(&out)
     );
 }
@@ -7308,8 +7668,10 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     // A request it can read runs, and the answer says how the command ended.
     let request = json!({
-        "protocol": 3, "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
-        "cwd": "/", "env": [], "stdin": "6869", "time_limit_ms": 10000, "output_limit": 1024
+        "protocol": atomic_exec::runner::PROTOCOL,
+        "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
+        "cwd": "/", "env": [], "stdin": "6869", "time_limit_ms": 10000,
+        "output_limit": 1024, "cpu_seconds": null, "data_bytes": null
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &request.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
@@ -7322,16 +7684,22 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(stdout_json(&out)["code"], 3);
     // A request of an earlier protocol, from an older atomic, is refused
-    // with a reason, since its command's secret variables would not reach
-    // the runner as this one reads them.
+    // with a reason, since its command's fields would not reach the runner
+    // as this one reads them.
     let old = json!({
-        "protocol": 2, "program": "/bin/sh", "args": ["-c", "exit 0"],
-        "cwd": "/", "env": [], "stdin": "", "time_limit_ms": 10000, "output_limit": 1024
+        "protocol": atomic_exec::runner::PROTOCOL - 1,
+        "program": "/bin/sh", "args": ["-c", "exit 0"],
+        "cwd": "/", "env": [], "stdin": "", "time_limit_ms": 10000,
+        "output_limit": 1024, "cpu_seconds": null, "data_bytes": null
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &old.to_string());
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     assert!(
-        text(&out).contains("request protocol 2 is not 3"),
+        text(&out).contains(&format!(
+            "request protocol {} is not {}",
+            atomic_exec::runner::PROTOCOL - 1,
+            atomic_exec::runner::PROTOCOL
+        )),
         "{}",
         text(&out)
     );

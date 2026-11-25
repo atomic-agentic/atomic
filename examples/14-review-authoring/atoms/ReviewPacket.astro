@@ -1,0 +1,10 @@
+---
+import type { ReviewPacket } from '../.atomic/types/schemas/review-packet';
+interface Props { packet: ReviewPacket }
+const { packet }: Props = Astro.props;
+---
+<candidate>{packet.candidate}</candidate>
+<checks>
+{packet.checks.length === 0 ? <Fragment>No checks supplied.</Fragment> : packet.checks.map(check => <Fragment>- {check}
+</Fragment>)}
+</checks>

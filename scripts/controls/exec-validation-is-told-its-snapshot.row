@@ -1,0 +1,1 @@
+exec-validation-is-told-its-snapshot|crates/atomic-core/src/runtime.rs|    serde_json::json!({"contextSnapshot":snapshot,"stepId":step_id})|    serde_json::json!({})|-p atomic-agentic-core --lib -- runtime::tests::a_contextual_exec_atom_validates_with_the_snapshot_its_step_recorded

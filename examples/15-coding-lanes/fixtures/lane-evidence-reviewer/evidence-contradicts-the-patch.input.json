@@ -1,0 +1,47 @@
+{
+  "diff": "diff --git a/tools/lane_guard.py b/tools/lane_guard.py\n--- a/tools/lane_guard.py\n+++ b/tools/lane_guard.py\n@@ -40,6 +40,9 @@ def decide(finding):\n+def _read_record(path):\n+    with open(path, encoding=\"utf-8\") as handle:\n+        return json.load(handle)\n+\n     claim = _text(finding.get(\"claim\"), \"claim\")\n-    verification = finding[\"verification\"]\n+    verification = _read_record(finding[\"verification_path\"])",
+  "self_review": {
+    "items": {
+      "1": "The patch adds one helper above decide() and changes one line inside it.",
+      "2": "No import and no command are added; the helper uses what the module already holds.",
+      "3": "Only tools/lane_guard.py is touched; nothing outside it is written.",
+      "4": "No credential or token appears anywhere in the patch.",
+      "5": "The confirmation still depends on `verified(verification)`, as before.",
+      "6": "Nothing is repeated or retried.",
+      "7": "decide() reads only the finding it is handed, which the caller already supplied.",
+      "8": "No lock, reservation or temporary directory is taken.",
+      "9": "candidate publication is covered by the decisions entry below.",
+      "10": "lane-guard-bites carries the host's own result in the controls entry below."
+    },
+    "decisions": [
+      {
+        "point": "candidate publication",
+        "allow_refuse": "The confirmation still turns on `verified(verification)`, which the patch leaves in place.",
+        "not_found": "No path is opened here, so a missing file cannot be reached and nothing has to answer for it.",
+        "permission_denied": "decide() opens no file, so no read can be denied.",
+        "link_loop": "No path is opened here, so a loop cannot be reached.",
+        "not_directory": "Not reachable in this function; it takes no path.",
+        "other_io": "Not reachable in this function; it performs no I/O.",
+        "parse_error": "The caller refuses a body that is not one JSON document before decide() runs.",
+        "timeout": "This function cannot block: no I/O, no wait, no loop.",
+        "empty_result": "An empty claim is refused by _text(), so an empty finding never reaches the branch."
+      }
+    ],
+    "controls": [
+      {
+        "row": "lane-guard-bites",
+        "result": "its test fails with the control off and passes with it on"
+      }
+    ]
+  },
+  "host_review": {
+    "decision_points": ["candidate publication"],
+    "selected_controls": ["lane-guard-bites"],
+    "control_results": [
+      {
+        "row": "lane-guard-bites",
+        "result": "its test fails with the control off and passes with it on"
+      }
+    ]
+  }
+}

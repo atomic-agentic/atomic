@@ -1,0 +1,1 @@
+snapshot-needs-a-declared-context|crates/atomic-core/src/render.rs|    if declared.is_none() && snapshot.is_some() {|    if /*CONTROL_OFF*/ false && declared.is_none() && snapshot.is_some() {|-p atomic-agentic-core --lib -- render::tests::a_snapshot_for_an_atom_that_declares_no_context_is_refused

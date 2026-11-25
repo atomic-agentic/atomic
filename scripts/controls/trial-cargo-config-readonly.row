@@ -1,0 +1,1 @@
+trial-cargo-config-readonly|crates/atomic/src/pipeline.rs|.chain(config_mount)|.chain(None::<std::path::PathBuf>)|--test pipeline fixture_bound_trial_merge_compiles_serde_from_trusted_offline_cache

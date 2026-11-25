@@ -1,0 +1,1 @@
+controls-exec-scratch-copy-bound|scripts/controls-exec.py|        bind_copy(git, copy, env, store, commit, tree, room)|        pass  # CONTROL_OFF: the copy keeps no HEAD and no index, so nothing is bound to the candidate|-p atomic-agentic --features atomic-agentic/sandbox-tests --test controls_exec -- a_control_row_proves_itself_in_the_sandbox_and_a_blind_row_fails_the_step

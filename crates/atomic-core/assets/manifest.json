@@ -1,31 +1,34 @@
 {
   "version": 1,
   "sources": {
-    "authoring/src/build-worker.mjs": "c97b0f74ff930143f34d017efde55f869935ef95f076cd10536a6631524fa4bb",
-    "authoring/src/worker.mjs": "fb1b5f029389c4ea07d7eb482e85c14ab38b60703a3b52d1f2d0544e141c5635",
-    "authoring/src/renderer.mjs": "df7fd95ca5f7d20310032158e97d8face2136d60118322fc79a656387e29626a",
-    "authoring/src/typecheck.mjs": "9f034a740c63c5e4faf04a7b07d915eeb0005511f622e2e0a45b39d91c34ec8e",
+    "authoring/src/build-worker.mjs": "c470f69ba1cffc755f4d77d40f48d3c05f2a303af1111949ef26ed2d9e1e488f",
+    "authoring/src/native-typescript.mjs": "398c21aa23b5a54b9ac0f5b2ce05f675353e7693a3216fbc16cc3e961ab3e115",
+    "authoring/src/native-typecheck.mjs": "4734be77af1cc8ad3a0b6fbc5e33f49a2e7e3df121432cdc7eedeb3a333d288b",
+    "authoring/src/native-compiler.mjs": "f72a117d32eff6efed58e7c2e6abd9cc38cfc1feef375b5fa904238fdb0beec2",
+    "authoring/src/worker.mjs": "69853703f2b9196f474b53eb1bfaaf967a2303649574f16578432a27e09240b2",
+    "authoring/src/renderer.mjs": "784fa4610155f3ba7736bdf0c96b853b8b01b58945ed2c19f6a81abcaaa55587",
+    "authoring/src/typecheck.mjs": "2cf4b6c4decad98a4c82e5bfe761033fba834cae3d3fcc63de8ee7f225dd916c",
     "authoring/src/platform.mjs": "fb8e01afb7067a1a3c5a552f83f394d7b6c0403cfc3cd6796bf671259fb13de0",
     "authoring/src/context.mjs": "f778318f9b86c07e7fd799306d2bcc8de51ac4e13065cedcb92986c93d9b0eec",
-    "authoring/src/generate.mjs": "acccd4e317b0e1edf1fcc6683a5e170233df73c4b488f3cb46026d8705608618",
+    "authoring/src/generate.mjs": "3cdf6021bd074378673e3f2f12aecc79d035ed716b2a85ee72883e1611043f79",
     "authoring/src/intrinsics.mjs": "1998f7bcfb276501618e48635e9f26731197a29fab362727eb0682e60f3b6995",
-    "authoring/src/capture.mjs": "d667165af6d3803738aa71a3e1d344727c95f96468d57376e187280c2c0d1cd7",
+    "authoring/src/capture.mjs": "7e423c51ed494221d0251f81d05de82b9466fb3c23748f1fe35b47883d9a5fa3",
     "authoring/src/fences.mjs": "90fa798848e0db3b538466bf88d26eaa2bda9dad8991727b6e518785b9f627c0",
     "authoring/src/balance.mjs": "6d3b86bdca989b51f21fb1088d93dfe36b2bbaf2d8431c83e3bd3cd92286c1c8",
-    "authoring/authoring.d.ts": "0fc50932695142a995e3ab3f02cf3690c44d7e9b0b9df021dfcb64c920cf394a",
-    "authoring/package.json": "6e093c23679caafc5c476e18c2b903a64eaecbf0437d4fe01d38ed74989b6036",
+    "authoring/authoring.d.ts": "ede992b4e79d65d2c4e0165e24daca1c66b23da042f586a7ece81c25df83e6da",
+    "authoring/raw-imports.d.ts": "3524906713e0894182e56cb109492de2728c13a46c98c8da9d579d3ae2d68126",
+    "authoring/package.json": "529de7c420faf73873c2fccd77d998f84bf6ebbd7efb1d84ee754438fd617438",
     "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
   },
   "assets": {
-    "worker.mjs": "3d96ed8cfc5e0286ecbd6c92dd428d82f11731112f4e337a1ac8860b6b827e87",
+    "typescript-es2022.json": "67cc96f621fdaf5cb2c2df0d808afa8e4880ad4e1471ab11634a5de44850d7f3",
+    "worker.mjs": "3feba8c470c7ce9b3ee0cca556739b07c5c8b081e73060fdb9fd03cc077872e1",
     "worker.mjs.LEGAL.txt": "ab1fbb4a8cd93f8da2ecaf67e418c748cd6c2ef00609e7d60923fc46aa5745da",
-    "astro.wasm": "a4ed5ef260d401dba6f172d52a3c27dbd933bfcd9b1698e91b430214c9701313",
     "TYPESCRIPT-LICENSE.txt": "a7d00bfd54525bc694b6e32f64c7ebcf5e6b7ae3657be5cc12767bce74654a47",
-    "ASTRO-LICENSE": "41bf89dd8dffe96c4d833b7dabef397194a24f3c15c2ef4b050f875c6e9b7d29",
-    "SOURCE-MAP-LICENSE": "6cb0631f71c7749763fd3dd1d5bee52dd1070ec17f2edc1710079ad070bd2fbd"
+    "SOURCE-MAP-LICENSE": "6cb0631f71c7749763fd3dd1d5bee52dd1070ec17f2edc1710079ad070bd2fbd",
+    "ASTRO-RUST-LICENSE.txt": "0bc4288c57ea88749cbd9da485cafb7ed2a27d664ea7b35437120caca4b4ccb4"
   },
   "dependencies": {
-    "@astrojs/compiler": "4.0.0",
     "typescript": "5.9.3",
     "source-map-js": "1.2.2"
   }

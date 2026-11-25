@@ -1,0 +1,1 @@
+criterion-runner-revalidates|crates/atomic/src/criteria.rs|parse_criteria(&serde_json::json!([value])).map_err(CriterionError::Declaration)?;|let _ = value;|-p atomic-agentic --lib criteria::tests::a_hand_built_shell_criterion_is_rejected_before_runner_call

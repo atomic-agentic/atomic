@@ -480,6 +480,13 @@ impl atomic_exec::ExecutionBackend for DenyingNothing {
         self.0.shared().run(command)
     }
 
+    fn criterion_exclusions(
+        &self,
+        _: &std::path::Path,
+    ) -> Result<Vec<std::path::PathBuf>, atomic_exec::ExecError> {
+        Ok(Vec::new())
+    }
+
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
         self.0.shared().close(workspace)
     }

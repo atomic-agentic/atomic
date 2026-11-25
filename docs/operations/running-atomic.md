@@ -57,6 +57,13 @@ shared approvals. Configure `ATOMIC_DATABASE_URL` from the deployment's secret
 source, then run `atomic serve`. Keep Atomic's state in its own database/schema
 and role, separate from application data sources.
 
+To upgrade a PostgreSQL store from the older scalar version marker, the store
+role needs `TEMPORARY` on the database to compare the legacy schema with a
+temporary reference, `USAGE` and `CREATE` on the existing Atomic schema, and
+permission to update its version marker. It needs database `CREATE` only when
+Atomic must create the schema. If `TEMPORARY` is unavailable, the legacy
+upgrade stops before changing the store.
+
 Give each `atomic serve` process an executor identity with `ATOMIC_EXECUTOR_ID`:
 a name unique to that process that stays the same when it restarts, such as a
 host or StatefulSet member name, never a random container or pod name. On

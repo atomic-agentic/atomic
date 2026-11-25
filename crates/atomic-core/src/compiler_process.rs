@@ -236,6 +236,9 @@ pub(crate) fn run_interactive(
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
         let mut message = match status.code() {
+            Some(crate::js_budget::HEAP_EXIT | crate::js_budget::BUFFER_EXIT) => {
+                "the Astro compiler exceeded its memory limit".to_string()
+            }
             Some(code) => format!("the Astro compiler crashed (exit status: {code})"),
             None if cpu_limit(&status) => {
                 "the Astro compiler exceeded its CPU time limit".to_owned()

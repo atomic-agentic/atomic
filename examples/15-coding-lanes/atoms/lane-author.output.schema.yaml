@@ -1,0 +1,30 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [summary, files_changed, tests_run]
+properties:
+  summary:
+    type: string
+    minLength: 1
+    maxLength: 500
+  files_changed:
+    type: array
+    maxItems: 50
+    items:
+      type: string
+      minLength: 1
+      maxLength: 200
+  tests_run:
+    type: array
+    maxItems: 20
+    items:
+      type: object
+      additionalProperties: false
+      required: [command, passed]
+      properties:
+        command:
+          type: string
+          minLength: 1
+          maxLength: 300
+        passed:
+          type: boolean

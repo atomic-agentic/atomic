@@ -143,14 +143,6 @@ pub struct ThreadRecord {
     pub thread_id: String,
 }
 
-/// atomic's index of threads by run and step, written with each publication.
-pub(crate) const THREADS_TABLE: &str = "CREATE TABLE IF NOT EXISTS atomic_threads (
-    candidate TEXT PRIMARY KEY,
-    run TEXT NOT NULL,
-    step TEXT NOT NULL,
-    thread_id TEXT NOT NULL
-)";
-
 /// Where a workflow is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunStatus {
@@ -1689,26 +1681,6 @@ impl Durare {
         engine
             .listen_queues(Vec::<String>::new())
             .map_err(from_durare)?;
-        let index =
-            "CREATE INDEX IF NOT EXISTS atomic_threads_by_thread ON atomic_threads (thread_id)";
-        match &reads {
-            Reads::Sqlite(pool) => {
-                for sql in [THREADS_TABLE, index] {
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                        .execute(pool)
-                        .await
-                        .map_err(db)?;
-                }
-            }
-            Reads::Postgres(pool) => {
-                for sql in [THREADS_TABLE, index] {
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
-                        .execute(pool)
-                        .await
-                        .map_err(db)?;
-                }
-            }
-        }
         Ok(Self {
             engine,
             reads,

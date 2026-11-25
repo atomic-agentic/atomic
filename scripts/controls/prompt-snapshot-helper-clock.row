@@ -1,0 +1,1 @@
+prompt-snapshot-helper-clock|crates/atomic/src/main.rs|compiled.program.helpers.is_empty(),|true, /* CONTROL_OFF: accept helper snapshots without a recorded step clock */|-p atomic-agentic --test render_cli helper_prompt_snapshot_and_render_refuse_without_recorded_clock

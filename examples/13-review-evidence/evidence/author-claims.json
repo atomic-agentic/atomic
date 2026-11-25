@@ -1,0 +1,33 @@
+{
+  "origin": "author",
+  "claims": [
+    {
+      "id": "fixture:claim:docs-links",
+      "criterion": "docs-links",
+      "claim": "pass",
+      "basis": "I opened every link in the pricing example in my editor."
+    },
+    {
+      "id": "fixture:claim:secret-scan",
+      "criterion": "secret-scan",
+      "claim": "pass",
+      "basis": "This change adds no credential, so the scan cannot have found one."
+    },
+    {
+      "id": "fixture:claim:pricing-scan",
+      "criterion": "pricing-scan",
+      "claim": "pass",
+      "basis": "The scan was green on this branch the day before."
+    }
+  ],
+  "assumptions": [
+    {
+      "id": "fixture:assumption:a1",
+      "text": "docs-build covers the rendered numbers, so the pricing example needs no new test."
+    },
+    {
+      "id": "fixture:assumption:a2",
+      "text": "The changelog entry can land in a later change."
+    }
+  ]
+}

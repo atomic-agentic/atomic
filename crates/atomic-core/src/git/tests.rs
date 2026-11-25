@@ -192,6 +192,33 @@ pub(crate) fn history(dir: &Path) -> (PathBuf, String, String) {
 }
 
 #[test]
+fn review_diff_is_the_host_patch_between_recorded_commits() {
+    let dir = scratch("review-diff");
+    let (source, first, second) = history(&dir);
+    let repo = Git::find().expect("git").discover(&source).expect("repo");
+    let patch = repo.review_diff(&first, &second).expect("patch");
+    assert!(patch.contains("-one\n"), "{patch}");
+    assert!(patch.contains("+two\n"), "{patch}");
+    assert!(
+        patch.contains("a/a.txt") && patch.contains("b/a.txt"),
+        "{patch}"
+    );
+    assert_eq!(repo.review_diff(&first, &first).expect("same commit"), "");
+    assert!(matches!(
+        repo.review_diff("--output=/tmp/forbidden", &second),
+        Err(GitError::Invalid(_))
+    ));
+    std::fs::write(source.join("oversized.txt"), "x".repeat(600_000)).expect("large file");
+    plain(&source, &["add", "oversized.txt"]);
+    plain(&source, &["commit", "-q", "-m", "large"]);
+    let third = plain(&source, &["rev-parse", "HEAD"]);
+    assert!(matches!(
+        repo.review_diff(&second, &third),
+        Err(GitError::TooLarge(_))
+    ));
+}
+
+#[test]
 fn a_bare_repository_starts_from_no_template() {
     let dir = scratch("bare");
     let repo = Git::find()

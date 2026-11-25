@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Trusted, bundled compiler. Atom modules are never imported or executed.
-import { initialize } from '@astrojs/compiler';
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -13,11 +12,7 @@ import { fileURLToPath } from 'node:url';
 // to run a captured helper: it writes a `call` line and reads the host's
 // one-line reply from stdin.
 //
-// The compiler's Go runtime calls what it believes a process's stdout to be
-// its own, and the wasm shim hands every line of it to console.log. This
-// process's stdout is the protocol: a fault inside the compiler would land
-// between the host and its reply. So console.log goes to stderr, where the
-// host reports it, and replies are written to stdout here.
+// Stdout carries protocol messages. Diagnostics go to stderr.
 console.log = (...args) => console.error(...args);
 function respond(body) {
   const bytes = new TextEncoder().encode(`${JSON.stringify(body)}\n`);
@@ -35,13 +30,9 @@ function failure(error) {
   const body = { message: String(error?.message ?? error) };
   if (typeof error?.file === 'string') body.file = error.file;
   if (Number.isSafeInteger(error?.line) && error.line > 0) body.line = error.line;
+  if (Number.isSafeInteger(error?.column) && error.column > 0) body.column = error.column;
   if (Array.isArray(error?.diagnostics)) body.diagnostics = error.diagnostics;
   return { error: body };
-}
-const PINNED_DENO = '2.9.8';
-if (Deno.version.deno !== PINNED_DENO) {
-  respond(failure(`the Astro compiler requires Deno ${PINNED_DENO}, but found Deno ${Deno.version.deno}; set ATOMIC_DENO to a Deno ${PINNED_DENO} executable`));
-  Deno.exit(0);
 }
 // One line from stdin, read synchronously (the interpreter is synchronous and
 // waits for each helper result). Bytes after the newline are kept for the next.
@@ -95,19 +86,24 @@ globalThis.__atomicPlatform = { ...fs, path, createHash, fileURLToPath,
   },
   async realpath(file) {
     if (Object.hasOwn(sourcePaths, file)) return sourcePaths[file];
+    // A source the host captured under its own name is already canonical: its
+    // alias was never recorded because nothing asked for it under another name.
     if (sources.has(file) || file === request.root) return file;
     missing(file);
   },
 };
-const wasm = await Deno.readFile(new URL('./astro.wasm', import.meta.url));
-const fetchOriginal = globalThis.fetch;
-globalThis.fetch = (url, options) => String(url) === 'atomic:compiler-wasm'
-  ? Promise.resolve(new Response(wasm, { headers: { 'Content-Type': 'application/wasm' } })) : fetchOriginal(url, options);
-await initialize({ wasmURL: 'atomic:compiler-wasm' });
 try {
-  const { compile, render, validateOutput, judgeInput, judgeScore, aggregateScores } = await import('./renderer.mjs');
+  const { compile, render, validateOutput, judgeInput, judgeScore, aggregateScores, needsContext } = await import('./renderer.mjs');
   if (!frozen) throw new Error('the compiler reads atom sources only from the request');
   const unit = await compile(request.file, { root: request.root, authoringFile: `${request.root}/.atomic/types/authoring.d.ts`, production: true });
+  // The host's compiled contract says whether this atom has a public context.
+  // The compiler's own look at the source sees a fifth `AtomConfig` type
+  // argument, a `context` schema in the config, or a `context` prop bound in a
+  // template; it cannot see a context that the sidecar beside the atom declares,
+  // nor read the per-atom `Config` alias back to its fifth argument. A host that
+  // says "declared" is believed; a host that says otherwise clears nothing, so
+  // two disagreeing readings stay a refusal rather than a silent pass.
+  if (request.contextDeclared === true) unit.requiresContext = true;
   // Helper calls go to the host, which runs each in a fresh isolate from the
   // capture it recorded when the atom loaded.
   const { locateThrow } = await import('./capture.mjs');
@@ -144,7 +140,7 @@ try {
     const visit = (item) => { if (seen.has(item)) return; seen.add(item); item.typeImports.forEach((file) => typeImports.add(file)); item.imports.forEach(visit); };
     visit(unit);
     const helpers = Object.fromEntries([...unit.captures].sort(([a], [b]) => (a < b ? -1 : 1)).map(([digest, captured]) => [digest, captured.artifact]));
-    result = { config: unit.config, needsContext: unit.requiresContext || unit.bindings.some(binding => binding.prop === 'context'), sources: Object.fromEntries(sources), sourcePaths, typeImports: [...typeImports].sort(), helpers };
+    result = { config: unit.config, needsContext: needsContext(unit), sources: Object.fromEntries(sources), sourcePaths, typeImports: [...typeImports].sort(), helpers };
   } else if (request.action === 'check') {
     // The host generates every declaration from the full schemas; the worker only checks.
     const { typecheck } = await import('./typecheck.mjs');

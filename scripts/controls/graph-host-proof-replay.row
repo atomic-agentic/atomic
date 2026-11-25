@@ -1,0 +1,1 @@
+graph-host-proof-replay|crates/atomic-graph/src/sqlite.rs|ON CONFLICT(item_id,sha) DO NOTHING|ON CONFLICT(item_id,sha) DO UPDATE SET indexed=0,on_branch=0,verified_branch=NULL,verified_head=NULL,pinned_base=NULL|-p atomic-agentic-graph --test admin_auth only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate_it

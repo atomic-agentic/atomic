@@ -24,16 +24,17 @@ feature-depth = 1
 # they leave with a Codex bump; re-check this list at each one.
 ignore = [
     { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained, no known vulnerability; via starlark in codex-execpolicy; remove when Codex drops it" },
-    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, no known vulnerability; via starlark and v8; remove when Codex drops it" },
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, no known vulnerability; via starlark; remove when Codex drops it" },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability; via serde_yaml in Codex's skills and plugins; atomic reads YAML with its own restricted loader; remove when Codex drops serde_yaml" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash: unmaintained, no known vulnerability; via starlark and bm25 in Codex; remove when Codex drops it" },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 2: unmaintained, no known vulnerability or safe upgrade; via tsz-core in the native TypeScript checker; remove when tsz-core replaces it" },
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
     { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
     { id = "RUSTSEC-2026-0374", reason = "basic-toml: unmaintained, no known vulnerability; via i18n-config under age in codex-secrets; remove when Codex drops it" },
-    { id = "RUSTSEC-2026-0386", reason = "tokio: the safe AsyncFd constructors accept a descriptor the caller does not own; atomic never calls them. The callers in the graph are Codex's PTY (codex-utils-pty) and exec-server's missing-path watcher, which wrap a File they own, and deno_core's uv_compat pipe and TTY handles (uv_pipe_open, uv_pipe_connect, uv_tty_init and the pipe read, write and poll paths), which exist only when an embedder calls those functions; atomic's helper runtime never does, and inotify's caller sits behind its stream feature, which is not built; remove when Codex's lockfile has tokio >=1.53.3, which atomic follows" },
+    { id = "RUSTSEC-2026-0386", reason = "tokio: the safe AsyncFd constructors accept a descriptor the caller does not own; atomic never calls them. The callers in the graph are Codex's PTY (codex-utils-pty) and exec-server's missing-path watcher, which wrap a File they own. inotify's caller sits behind its stream feature, which is not built; remove when Codex's lockfile has tokio >=1.53.3, which atomic follows" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint: timing variation in P-256 arithmetic, reached through p256 in age's tag recipients, aws-config (codex-aws-auth) and codex-user-verification (the app server); codex-secrets encrypts with age's scrypt recipient only, atomic authenticates to its endpoint with an API key and never runs the app server; remove when those paths use crypto-bigint >=0.7.6" },
     { id = "RUSTSEC-2026-0391", reason = "zstd: Codex's rollout, thread store and HTTP client, tonic and zip do not reuse a borrowed context across streams; remove when the lockfile has zstd >=0.14.3 (it follows Codex's)" },
     { id = "RUSTSEC-2026-0398", reason = "zstd-safe: Seekable::decompress is behind zstd's seekable feature, which nothing enables; remove when the lockfile has zstd-safe >=8.2.0" },
@@ -111,6 +112,10 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # deny.toml), and the durare fork (deps/forks.toml). A source the graph stops
 # using is removed here.
 allow-git = [
+    "https://github.com/withastro/oxc",
+    "https://github.com/tsz-org/tsz",
+    "https://github.com/withastro/compiler-rs",
+    "https://github.com/biomejs/biome",
     "https://github.com/atomic-agentic/codex",
     "https://github.com/atomic-agentic/durare",
     "https://github.com/helix-editor/nucleo.git",

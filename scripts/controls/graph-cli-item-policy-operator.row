@@ -1,0 +1,1 @@
+graph-cli-item-policy-operator|crates/atomic/src/graph.rs|policy_write(action)|false|-p atomic-agentic --test graph_cli operator_sets_shows_and_clears_one_item_policy_with_json

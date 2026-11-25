@@ -1,0 +1,1 @@
+graph-request-operation-conflict|crates/atomic-graph/src/sqlite.rs|old_kind != kind|false|-p atomic-agentic-graph --test conformance sqlite_request_ids_bind_operation_and_target

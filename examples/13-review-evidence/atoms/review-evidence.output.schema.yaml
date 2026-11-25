@@ -1,0 +1,122 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [decision, rows, summary]
+properties:
+  decision:
+    type: string
+    enum: [approve, escalate, reject]
+    description: >-
+      The recommendation for this review, never an approval. `approve` only when
+      every required check is satisfied by an opened host record for this
+      candidate and no required claim is uncredited; `reject` when a required
+      check failed; `escalate` for anything else.
+  rows:
+    type: array
+    minItems: 1
+    maxItems: 8
+    description: One row per required check, in the order they were given, whatever the records hold.
+    items:
+      type: object
+      additionalProperties: false
+      required: [criterion, required, state, record, citations, finding_count, claimed, claim_ids, credit, outcome, detail]
+      properties:
+        criterion:
+          type: string
+          minLength: 1
+          maxLength: 60
+          description: The check this row answers.
+        required:
+          type: boolean
+          description: Whether the plan requires this check.
+        state:
+          type: string
+          enum: [record_current_pass, record_current_fail, record_unavailable, record_stale, record_inaccessible, record_missing]
+          description: >-
+            What the host holds for this check: a pass or a fail for this
+            candidate, a run that never reported a state, a run for another
+            revision, a record that cannot be opened, or nothing recorded.
+        record:
+          type: string
+          minLength: 4
+          maxLength: 120
+          description: The record ID the check names, kept verbatim, or `none`. Preserved whether or not it is cited.
+        citations:
+          type: array
+          maxItems: 4
+          description: The record IDs that are evidence for this candidate. Empty unless a record is for this revision and can be opened.
+          items:
+            type: string
+            minLength: 4
+            maxLength: 120
+        finding_count:
+          type: integer
+          minimum: 0
+          maximum: 50
+          description: How many findings the joined record reported. Zero from a run that could not start is not a clean result.
+        claimed:
+          type: boolean
+          description: Whether the author claims a pass for this check.
+        claim_ids:
+          type: array
+          maxItems: 8
+          description: The claim IDs that say so, kept verbatim.
+          items:
+            type: string
+            minLength: 4
+            maxLength: 120
+        credit:
+          type: string
+          enum: [host_record, not_credited]
+          description: >-
+            `host_record` when a passing host record for this candidate supports
+            the check. An author claim never earns credit on its own.
+        outcome:
+          type: string
+          enum: [satisfied, failed, missing_evidence, unassessable, not_required]
+          description: >-
+            `unassessable` is for a required run that never reported a state;
+            `missing_evidence` for a required check whose only record is for
+            another revision or cannot be opened; `not_required` for an
+            unrequired check with no current pass.
+        detail:
+          type: string
+          minLength: 1
+          maxLength: 400
+          description: One sentence saying what the row means for the author.
+  summary:
+    type: object
+    additionalProperties: false
+    required: [required, satisfied, failed, missing_evidence, unassessable, uncredited_claims]
+    description: Counts over the required rows only.
+    properties:
+      required:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: How many checks the plan requires.
+      satisfied:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required checks satisfied by an opened host record for this candidate.
+      failed:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required checks whose host record failed for this candidate.
+      missing_evidence:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required checks with no record, a stale record, or a record that cannot be opened.
+      unassessable:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required checks whose run never reported a state, however few findings it listed.
+      uncredited_claims:
+        type: integer
+        minimum: 0
+        maximum: 8
+        description: Required checks the author claims a pass for, with no supporting host record for this candidate.

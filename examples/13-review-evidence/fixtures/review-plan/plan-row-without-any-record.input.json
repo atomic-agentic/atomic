@@ -1,0 +1,39 @@
+{
+  "plan": {
+    "record_id": "fixture:plan:plan-9",
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example"
+  },
+  "required_outcomes": [
+    {
+      "id": "REQ-TEST",
+      "statement": "A regression test covers the multi-unit case.",
+      "acceptance_criterion": "A test asserts quantity 2 prices at 250 cents",
+      "depends_on": "REQ-PRICING",
+      "record": "none",
+      "expected_criterion": "none",
+      "required": true
+    }
+  ],
+  "proposed_tasks": [],
+  "host_records": [],
+  "author_claims": [],
+  "assumptions": [
+    {
+      "id": "fixture:assumption:a1",
+      "origin": "author",
+      "text": "docs-build covers the rendered numbers, so the pricing example needs no new test."
+    },
+    {
+      "id": "fixture:assumption:a2",
+      "origin": "author",
+      "text": "The changelog entry can land in a later change."
+    }
+  ],
+  "display": {
+    "section": "plain",
+    "link": "plain",
+    "emphasis": "plain"
+  }
+}

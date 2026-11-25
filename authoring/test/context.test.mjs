@@ -8,7 +8,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { resolveContext, sealSnapshot, verifySnapshot, checkpointContext, contextForStep, validateContext } from '../src/context.mjs';
-import { compile, render, validateOutput, judgeInput, judgeScore } from '../src/renderer.mjs';
+import { compile, render, validateOutput, judgeInput, judgeScore, needsContext } from '../src/renderer.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const document = JSON.parse(await readFile(path.join(root, 'schemas/contracts.schema.json'), 'utf8'));
 const settings = JSON.parse(await readFile(path.join(root, 'fixtures/context/settings.json'), 'utf8'));
@@ -183,4 +183,29 @@ test('SIGKILL after CONTEXT_COMMITTED preserves the original context on restart'
   assert.equal(restored.context.profile, 'test');
   assert.equal(restored.context.env.SUPPORT_REGION, 'before-kill');
   assert.deepEqual(restored.environmentReads, []);
+});
+// The per-atom `Config` spelling, read through the generated declarations the
+// checker and the stock editor use. Nothing in this atom's template binds
+// `context`, so a missing snapshot must not reach a callback as a missing value:
+// that would be a repairable rejection of an output whose rule could not run.
+test('a config that declares its own context needs a snapshot to validate or judge', async () => {
+  const declared = await compile(path.join(root, 'fixtures/context/callback-context.atom.astro'), { root, production: true });
+  assert(!declared.bindings.some((binding) => binding.prop === 'context'), JSON.stringify(declared.bindings.map((binding) => binding.prop)));
+  assert.equal(declared.requiresContext, true);
+  assert.equal(needsContext(declared), true);
+  const answer = { input, output: { subject: 'reply', body: 'short' } };
+  for (const [label, call] of [
+    ['render', () => render(declared, input)],
+    ['validate, no options', () => validateOutput(declared, answer)],
+    ['validate, empty options', () => validateOutput(declared, answer, {})],
+  ]) assert.throws(call, /context snapshot required/, label);
+  const options = { contextSnapshot: snapshot({ profile: 'test' }) };
+  assert.equal(validateOutput(declared, answer, options).valid, true);
+  assert.equal(validateOutput(declared, { ...answer, output: { subject: 'reply', body: 'x'.repeat(201) } }, options).valid, false);
+  assert.equal(validateOutput(declared, { ...answer, output: { subject: 'reply', body: 'x'.repeat(201) } }, options).results[0].id, 'validate.0');
+});
+test('an atom that declares no context validates with no snapshot in hand', async () => {
+  const plain = await compile(path.join(root, 'fixtures/triage-email.atom.astro'), { root, production: true });
+  assert.equal(needsContext(plain), false);
+  assert.doesNotThrow(() => validateOutput(plain, { input: {}, output: {} }));
 });

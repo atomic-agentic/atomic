@@ -1,0 +1,1 @@
+graph-edge-parent-identity|crates/atomic-graph/src/sqlite.rs|sqlx::query("UPDATE atomic_graph_items SET parent=? WHERE id=?")|sqlx::query("UPDATE atomic_graph_items SET parent=parent WHERE id=? AND ? IS NOT NULL")|-p atomic-agentic-graph --test conformance sqlite_edge_endpoints_and_parent_identity_are_atomic

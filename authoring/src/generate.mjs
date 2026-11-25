@@ -71,7 +71,14 @@ export async function generate({ root = fileURLToPath(new URL('../', import.meta
       return `${JSON.stringify(key)}: { input: ${reference(judge.input)}; output: ${reference(judge.output)} };`;
     }).join(' ');
     const runtimeContext = atom.context ? `type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\nexport type Context = Immutable<${reference(atom.context)}>;\n` : '';
-    files.set(`${name}.d.ts`, `${header}import type * as S from './schemas';\nexport type Input = ${input};\nexport type Reply = ${output};\nexport type EvalCase = ${evalCase};\n${runtimeContext}export interface Props { input: Input${atom.context ? '; readonly context: Context' : ''} }\nexport interface Judges { ${judges} }\n`);
+    // The per-atom `Config` alias, spelled as the Rust declaration path spells
+    // it: the fifth argument, and with it any read of `context` in a validator,
+    // scorer or template, is present only when the registry declares a context
+    // for this atom. An atom with none gets `Props { input: Input }` and a
+    // four-argument `Config`, so a callback that reads `context` is a type error
+    // in the editor and in `atomic check`, not a callback that sees nothing.
+    const configType = `export type Config = AtomConfig<Input, Reply, EvalCase, Judges${atom.context ? ', Context' : ''}>;\n`;
+    files.set(`${name}.d.ts`, `${header}import type * as S from './schemas';\nimport type { AtomConfig } from '../../authoring';\nexport type Input = ${input};\nexport type Reply = ${output};\nexport type EvalCase = ${evalCase};\n${runtimeContext}export interface Props { input: Input${atom.context ? '; readonly context: Context' : ''} }\nexport interface Judges { ${judges} }\n${configType}`);
     metadata[name] = { atomic: 1, name, kind: 'lite', input: atom.input, output: atom.output, case: atom.case, judges: atom.judges ?? {}, ...(atom.context ? { context: atom.context } : {}) };
   }
   const manifest = { version: 1, schemaDigest: digest(document), registryDigest: digest(registry), atoms: metadata };

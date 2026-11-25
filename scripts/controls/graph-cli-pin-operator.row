@@ -1,0 +1,1 @@
+graph-cli-pin-operator|crates/atomic/src/graph.rs|store.set_status(actor, id.clone(), Status::Pinned).await?;|store.set_status(Actor::agent("cli"), id.clone(), Status::Pinned).await?;|-p atomic-agentic --test graph_cli operator_pins_an_imported_open_epic_only

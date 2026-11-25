@@ -1,0 +1,42 @@
+{
+  "candidate": {
+    "revision": "22222222d4b0c1a9e7f35b6a8c04d1e9f2a7b3c6",
+    "repository": "atomic-agentic/atomic",
+    "change": "docs-pricing-example",
+    "base_revision": "11111111a3f6c8d2e5b7a90c4d1e8f36a2b5c7d9"
+  },
+  "required_checks": [
+    {
+      "id": "pricing-scan",
+      "title": "The pricing example is scanned",
+      "record": "fixture:execution:pricing-scan",
+      "required": true
+    }
+  ],
+  "host_records": [
+    {
+      "id": "fixture:execution:pricing-scan",
+      "origin": "host",
+      "criterion": "pricing-scan",
+      "revision": "99999999b7e2f4a1c8d3056e9b7a4f2c1d8e6a35",
+      "outcome": "pass",
+      "access": "grant",
+      "findings": [],
+      "detail": "Last ran on the revision before the candidate was cut."
+    }
+  ],
+  "author_claims": [
+    {
+      "id": "fixture:claim:pricing-scan",
+      "origin": "author",
+      "criterion": "pricing-scan",
+      "claim": "pass",
+      "basis": "The scan was green on this branch the day before."
+    }
+  ],
+  "display": {
+    "section": "markdown",
+    "link": "markdown",
+    "emphasis": "bold"
+  }
+}

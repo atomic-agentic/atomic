@@ -1,1 +1,1 @@
-git-filters|crates/atomic-core/src/git.rs|        let mut overrides = (*self.overrides).clone();|        let mut overrides = (*self.overrides).clone(); let names: Vec<String> = { let _ = names; Vec::new() };|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs
+git-filters|crates/atomic-core/src/git.rs|            self.attr_source = Some(empty.to_owned());|            self.attr_source = None; /*CONTROL_OFF*/|-p atomic-agentic-core --test git_safety linked_only_attribute_filter_never_runs_during_prepare_or_commit

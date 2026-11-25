@@ -1,0 +1,1 @@
+graph-stage-proof-branch|crates/atomic-graph/src/transactional_claim.rs|row.text_opt("verified_branch")?.as_deref() == Some(branch.as_str()) // CONTROL_OFF: graph-stage-proof-branch|true // CONTROL_OFF: graph-stage-proof-branch|-p atomic-agentic-graph --test epic_run staged_graph_commit_needs_exact_host_branch_proof_and_never_downgrades_it

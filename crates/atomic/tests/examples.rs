@@ -235,6 +235,31 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
     }
 }
 
+#[test]
+fn coding_lanes_example_passes_the_production_loader() {
+    let dir = copy("15-coding-lanes");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .arg("--json")
+        .arg("check")
+        .current_dir(&dir)
+        .env("ATOMIC_HOME", dir.join(".state"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
+        .env("XDG_CONFIG_HOME", dir.join(".state/config"))
+        .output()
+        .expect("atomic check");
+    assert!(
+        output.status.success(),
+        "15-coding-lanes: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let checked: Value = serde_json::from_slice(&output.stdout).expect("check JSON");
+    assert_eq!(checked["checked"]["atoms"], 5);
+    assert_eq!(checked["checked"]["workflows"], 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 // The workspace example (`examples/06-workspace`): a member checked from an
 // unrelated directory resolves the shared schema its output references,
 // offline; two members sharing a schema ID fail.

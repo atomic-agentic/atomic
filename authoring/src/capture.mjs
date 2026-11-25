@@ -96,7 +96,7 @@ export async function captureHelper(root, entry, from, state) {
       }
       return ts.visitEachChild(node, visit, context);
     });
-    const output = ts.transpileModule(text, {
+    const output = globalThis.__atomicTypeScript ? globalThis.__atomicTypeScript('transpile', file, text, Object.fromEntries([...edges.get(file)].map(([spec, target]) => [spec, urlOf(root, target)]))) : ts.transpileModule(text, {
       fileName: file,
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, sourceMap: true, inlineSources: false },
       transformers: { before: [rewrite] },

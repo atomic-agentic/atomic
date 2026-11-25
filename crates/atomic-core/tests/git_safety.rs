@@ -290,6 +290,131 @@ fn nothing_in_the_worktree_or_the_repository_runs() {
 }
 
 #[test]
+fn linked_only_attribute_filter_never_runs_during_prepare_or_commit() {
+    let scratch = Scratch::new("linked-only-filter");
+    let root = scratch.path();
+    let (project, _, _) = support::project(root);
+    write(&project.join(".gitattributes"), "a.txt filter=linked\n");
+    git(&project, &["add", ".gitattributes"]);
+    git(&project, &["commit", "-q", "-m", "select linked filter"]);
+    let base = git(&project, &["rev-parse", "HEAD"]).trim().to_owned();
+    let markers = root.join("linked-markers");
+    std::fs::create_dir(&markers).unwrap();
+    let trap = root.join("linked-filter.sh");
+    executable(
+        &trap,
+        &format!("#!/bin/sh\n/usr/bin/touch {}/$1\ncat\n", markers.display()),
+    );
+    let attributes = root.join("linked.attributes");
+    write(&attributes, "a.txt filter=linked\n");
+    let included = root.join("linked.config");
+    write(
+        &included,
+        &format!(
+            "[filter \"linked\"]\n\tclean = {} clean\n\tsmudge = {} smudge\n\trequired = true\n[core]\n\tattributesFile = {}\n",
+            trap.display(),
+            trap.display(),
+            attributes.display()
+        ),
+    );
+    let config = project.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[includeIf \"gitdir:{}/worktrees/\"]\n\tpath = {}\n",
+        project.join(".git").display(),
+        included.display()
+    ));
+    write(&config, &text);
+    let repo = Git::find().unwrap().discover(&project).unwrap();
+    let worktrees = Worktrees::new(repo, root.join("state/worktrees"));
+    let source_before = git(&project, &["status", "--porcelain"]);
+    let info = project.join(".git/info/attributes");
+    write(&info, "a.txt filter=linked\n");
+    let refusal = worktrees
+        .prepare("run", "step", &base)
+        .expect_err("info attributes can activate a linked-only filter during checkout");
+    assert!(refusal.to_string().contains("info/attributes"), "{refusal}");
+    assert!(
+        std::fs::read_dir(&markers).unwrap().next().is_none(),
+        "refusal started linked filter"
+    );
+    std::fs::remove_file(&info).unwrap();
+    let wt = worktrees.prepare("run", "step", &base).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+        "one\nTWO\n"
+    );
+    assert!(
+        std::fs::read_dir(&markers).unwrap().next().is_none(),
+        "checkout started linked filter"
+    );
+    write(&wt.path.join("a.txt"), "changed\n");
+    write(&info, "a.txt filter=linked\n");
+    let retry = worktrees
+        .prepare("run", "step", &base)
+        .expect_err("an unsafe retry must refuse before removing the attempt");
+    assert!(retry.to_string().contains("info/attributes"), "{retry}");
+    assert_eq!(
+        std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+        "changed\n"
+    );
+    let refusal = worktrees
+        .commit(&wt, "candidate", &Signature::default())
+        .expect_err("info attributes can activate a linked-only filter during add");
+    assert!(refusal.to_string().contains("info/attributes"), "{refusal}");
+    assert!(
+        std::fs::read_dir(&markers).unwrap().next().is_none(),
+        "refusal started linked filter"
+    );
+    std::fs::remove_file(&info).unwrap();
+    let committed = worktrees
+        .commit(&wt, "candidate", &Signature::default())
+        .unwrap();
+    assert_eq!(
+        support::show(&project, &committed.commit, "a.txt"),
+        "changed\n"
+    );
+    assert!(
+        std::fs::read_dir(&markers).unwrap().next().is_none(),
+        "commit started linked filter"
+    );
+    assert_eq!(git(&project, &["status", "--porcelain"]), source_before);
+    assert_eq!(git(&project, &["rev-parse", "HEAD"]).trim(), base);
+}
+
+#[test]
+fn a_linked_source_sees_common_info_attributes_before_checkout() {
+    let scratch = Scratch::new("linked-source-info-attributes");
+    let root = scratch.path();
+    let (project, _, _) = support::project(root);
+    let base = git(&project, &["rev-parse", "HEAD"]).trim().to_owned();
+    let linked = root.join("operator-linked");
+    git(
+        &project,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            &base,
+        ],
+    );
+    let git_tool = Git::find().unwrap();
+    let checkout = git_tool.checkout_at(&linked).unwrap();
+    assert_ne!(checkout.git_dir, checkout.common_dir);
+    let info = checkout.common_dir.join("info/attributes");
+    write(&info, "a.txt merge=union\n");
+    let source = git_tool.worktree(checkout.git_dir, &linked);
+    assert!(source.has_info_attributes().unwrap());
+    let worktrees = Worktrees::new(source, root.join("state/linked-worktrees"));
+    let refusal = worktrees
+        .prepare("run", "step", &base)
+        .expect_err("common info/attributes must be seen from a linked source");
+    assert!(refusal.to_string().contains("info/attributes"), "{refusal}");
+    assert_eq!(git(&project, &["rev-parse", "HEAD"]).trim(), base);
+}
+
+#[test]
 fn hostile_arguments_never_reach_git() {
     let f = hostile("arguments");
     let repo = f.worktrees.repo();

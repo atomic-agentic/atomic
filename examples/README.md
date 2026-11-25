@@ -1,9 +1,11 @@
 # Atomic example catalog
 
-These are examples of the **proposed atomic format**, reviewed against the scaffold
-plan. This repository has no atomic implementation or published format schema yet.
-The local checks below validate the files and execute the Python transforms; they
-do not establish that an atomic runtime accepts or executes the projects.
+These examples cover the implemented authoring contract and later-phase designs.
+The local catalog checker validates schemas, fixtures, rendered Astro prompts and
+Python transforms offline. Example 14 also runs through `atomic check` and
+`atomic render` as a fresh configured and inferred project; example 15 runs
+through the production `atomic check` loader. Later-phase examples
+can describe staged contracts that the current runtime refuses.
 
 | Example | First phase | Demonstrates |
 | --- | --- | --- |
@@ -19,6 +21,9 @@ do not establish that an atomic runtime accepts or executes the projects.
 | [10 · A decision recorded with its evidence](10-recorded-decision/README.md) | v0.7 | A `decisions` block in the manifest: a choice, the eval condition it rests on, an age limit for that evidence and a review date for `atomic stale` |
 | [11 · Read from and write to S3 with the AWS SDK](11-aws-s3/README.md) | v0.7 | Separate fetch and write script atoms around an Astro summarizer and a human gate; `npm:` imports on Deno with a lockfile; hosts, environment and a named short-lived credential declared in the atom; a gate that shows the hash of what the model read; local tests with a stand-in for S3 |
 | [12 · Public execution context](12-execution-context/README.md) | Implemented compiler/direct invocation | Typed readonly profiles, public env, project/run/step metadata and external checkpoint reuse |
+| [13 · Review evidence and coverage](13-review-evidence/README.md) | v0.5 | Revision-scoped host execution records, separate author claims, required-outcome coverage, and offline evidence scoring |
+| [14 · Review authoring pilot](14-review-authoring/README.md) | v0.2 | Two distinct review atoms sharing a schema-derived component and helper; configured and inferred checks, exact prompt snapshots and stock Astro editor smoke |
+| [15 · Coding lanes](15-coding-lanes/README.md) | v0.2 | Author, self-review, controls proof and two independent reviewers; executable criteria, trial merge and a human merge gate |
 
 Workspace discovery/shared-schema resolution belong to M11b/M39b in v0.5.
 Later-phase examples are not v0.1 quickstarts. [Further recipes](recipes.md) explain OpenAPI, database, retrieval,
@@ -81,8 +86,11 @@ Example 12 exercises schema-typed public context using synthetic host values.
 It also exercises failure cases for invalid quantities and mismatched orders,
 and verifies reproducible coding-fixture preparation from unrelated directories
 without source modifications or unsafe destination reuse.
-The compiler is shared with the production loader. This checker does not execute
-workflow CEL, model evals or workflow crash recovery.
+The compiler is shared with the production loader. For imported shared schema
+types, the checker asks `atomic check` in a disposable project copy for fresh
+declarations, then supplies those to the catalog compiler. It leaves no runtime
+state in the source project and needs no project npm dependencies. The checker
+does not execute workflow CEL, model evals or workflow crash recovery.
 
 `evals/<atom>/<case>.yaml` is the proposed atomic eval case. The matching
 `fixtures/<atom>/<case>.input.json` and `.output.json` are an illustrative golden

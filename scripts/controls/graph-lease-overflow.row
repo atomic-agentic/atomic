@@ -1,0 +1,1 @@
+graph-lease-overflow|crates/atomic-graph/src/sqlite.rs|i64::try_from(duration.as_millis())|Ok::<i64, StoreError>(duration.as_millis() as i64)|-p atomic-agentic-graph --test conformance sqlite_rejects_zero_and_overflowing_lease_durations_without_changing_holder

@@ -1,0 +1,1 @@
+graph-conditional-requires-failure|crates/atomic-graph/src/sqlite.rs|COALESCE(b.terminal_outcome,'unknown')!='failure'|COALESCE(b.terminal_outcome,'unknown')!='success'|-p atomic-agentic-graph --test conformance sqlite_conditional_compensation_requires_persisted_terminal_failure

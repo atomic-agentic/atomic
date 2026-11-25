@@ -12,6 +12,8 @@ fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {
         stdin: stdin.to_vec(),
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
+        cpu_seconds: None,
+        data_bytes: None,
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),

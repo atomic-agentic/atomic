@@ -356,14 +356,16 @@ pub fn fields_reference(defs: &Definitions<'_>) -> Result<String, String> {
          The frontmatter of an `.atom.astro` file exports one literal object:\n\n\
          ```astro\n\
          ---\n\
-         import type { Props, Input, Output } from '../.atomic/types/<atom-name>';\n\
-         import type { AtomConfig } from '../.atomic/types/authoring';\n\
+         import type { Props, Config } from '../.atomic/types/<atom-name>';\n\
          const { input }: Props = Astro.props;\n\
-         export const config: AtomConfig<Input, Output> = {\n  description: '…',\n};\n\
+         export const config: Config = {\n  description: '…',\n};\n\
          ---\n\
          ```\n\n\
          The import paths are relative from the atom file to `.atomic/types/` in the \
-         project root; `atomic check` writes those declarations. Values are literals: no \
+         project root; `atomic check` writes those declarations. `Config` is the \
+         per-atom alias for `AtomConfig` with generated input, output, case, \
+         judges and optional context contracts. The explicit `AtomConfig` import \
+         remains valid. Values are literals: no \
          variables, calls or spreads. Only `validate` holds functions.\n\n",
     );
     out.push_str("## Project layout\n\n");
@@ -426,6 +428,17 @@ pub fn fields_reference(defs: &Definitions<'_>) -> Result<String, String> {
             .join(", "),
     );
     out.push_str(". Any other field name fails as unknown.\n");
+    out.push_str(
+        "\n## Generated type navigation\n\n\
+         Run `atomic check` to generate `.atomic/types/`. Import `Props`, `Config`, \
+         `Input` and `Output` directly from the atom's generated module; do not use \
+         a virtual `atomic:atoms/…` import. The generated `schemas/` modules expose \
+         reusable schema types. Their `@atomic-schema <path>#<JSON-pointer>` comments \
+         point back to the source schema, including a referenced definition. Follow \
+         that path and pointer to edit the contract; never edit the generated type. \
+         Stock Astro tooling can inspect `.atom.astro` files without a custom \
+         language server.\n",
+    );
     Ok(out)
 }
 
@@ -504,6 +517,19 @@ pub const CONSTRUCTS: &[Construct] = &[
         "Prose that needs `<` or `{` uses entities; a bare `{` starts an expression.",
         "Write placeholders as &lt;name> or &#123;value&#125;.",
     ),
+    Construct {
+        title: "Import literal JSON and TypeScript examples",
+        note: "A local `.md?raw` default import captures authored text without parsing its \
+               braces, tags or code fences. Keep the file under the project root and use \
+               a `./` path; its text stays in developer instructions.",
+        frontmatter: "import literalExamples from './literal-examples.md?raw';",
+        config: "{}",
+        body: "Follow the literal examples:\n{literalExamples}\nSummarize: {input.text}",
+        component: Some((
+            "literal-examples.md",
+            "```json\n{\"summary\": \"short\", \"labels\": []}\n```\n\n```ts\nexport const identity = <T,>(value: T): T => value;\n```\n",
+        )),
+    },
     Construct {
         title: "Reuse prompt text with a component",
         note: "Import a local `.astro` file by relative path; it declares `Props` and \
@@ -616,7 +642,7 @@ pub const MISTAKES: &[Mistake] = &[
     Mistake {
         title: "A runtime global",
         wrong: Construct::body("", "", "{JSON.stringify(input)}"),
-        says: "unsupported expression: CallExpression",
+        says: "Cannot find name 'JSON'.",
         fix: "Interpolate the fields you need, `{input.text}`.",
     },
     Mistake {
@@ -649,9 +675,9 @@ pub const MISTAKES: &[Mistake] = &[
             body: "Note: {input.text}",
             component: None,
         },
-        says: "named imports of local .ts helpers are supported",
-        fix: "Import local `.astro` components and `.ts` helpers only; packages are not \
-              available yet.",
+        says: "only default imports of local .astro components",
+        fix: "Import local `.astro` components, `.ts` helpers or `.md?raw` literals only; \
+              packages are not available yet.",
     },
     Mistake {
         title: "A validator written as a CEL string",
@@ -710,10 +736,31 @@ pub fn prompt_reference() -> String {
         }
         let _ = writeln!(out, "{}\n```\n", c.body);
         if let Some((file, source)) = c.component {
-            let fence = if file.ends_with(".ts") { "ts" } else { "astro" };
-            let _ = writeln!(out, "`{file}`:\n\n```{fence}\n{}```\n", source);
+            let fence = if file.ends_with(".ts") {
+                "ts"
+            } else if file.ends_with(".md") {
+                "markdown"
+            } else {
+                "astro"
+            };
+            let ticks = if file.ends_with(".md") { "````" } else { "```" };
+            let _ = writeln!(out, "`{file}`:\n\n{ticks}{fence}\n{}{ticks}\n", source);
         }
     }
+    out.push_str(
+        "## Markdown layout and provenance\n\n\
+         Keep the decision criteria and output contract near the top. Use bullets for \
+         short findings; use a table when named columns make a comparison or lookup \
+         clearer. Preview both `developer` instructions and tagged `user` bindings \
+         with `atomic render` on ordinary, empty, escaped and mixed-origin input. \
+         Static text and imported `.md?raw` text are authored instructions; values \
+         from `input`, `context` or component props retain their source path and \
+         origin as data. Preserve record IDs and distinguish author-supplied records \
+         from host-supplied records. A helper result inherits the least trusted \
+         argument's provenance. Only a `mermaid` fence is parsed literally in an \
+         atom body; put literal JSON and TypeScript fences in a `.md?raw` file. \
+         Validate cited IDs against host records before a gate.\n\n",
+    );
     out.push_str("## Mistakes `atomic check` refuses\n\n");
     for m in MISTAKES {
         let shown = if m.wrong.frontmatter.is_empty() && m.wrong.config == "{}" {

@@ -1,0 +1,1 @@
+controls-exec-relative-runner-declared|scripts/controls-exec.py|        named = os.path.join(os.path.dirname(driver), named)|        pass  # CONTROL_OFF: a relative CONTROL_RUNNER is never resolved against the driver|-p atomic-agentic --features atomic-agentic/sandbox-tests --test controls_exec -- a_control_row_proves_itself_in_the_sandbox_and_a_blind_row_fails_the_step

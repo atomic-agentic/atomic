@@ -1,0 +1,12 @@
+[package]
+name = "lane-guard-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# This illustrative candidate is its own Cargo project, separate from atomic.
+[workspace]
+
+[[test]]
+name = "lane_guard"
+path = "tests/lane_guard.rs"

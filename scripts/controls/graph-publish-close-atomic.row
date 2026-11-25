@@ -1,0 +1,1 @@
+graph-publish-close-atomic|crates/atomic/src/pipeline.rs|close(&mut tx, &token, &sha).await?;|let _ = (&mut tx, &token, &sha);|-p atomic-agentic --test graph_work_loop crash_after_graph_publish_has_already_closed_the_item_atomically

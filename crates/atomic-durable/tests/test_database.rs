@@ -20,6 +20,7 @@ const USERS: &[&str] = &[
     "atomic-durable/",
     "atomic/tests/run_cli.rs",
     "atomic/tests/failpoints.rs",
+    "atomic/tests/graph_claim.rs",
 ];
 
 /// Why `text`, a source outside [`USERS`], reaches the test database's

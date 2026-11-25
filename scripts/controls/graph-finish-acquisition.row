@@ -1,0 +1,1 @@
+graph-finish-acquisition|crates/atomic-graph/src/sqlite.rs|finished_acquisition.as_deref() == Some(lease.acquisition.as_str())|true|-p atomic-agentic-graph --test conformance sqlite_finished_close_replay_fences_full_lease_identity

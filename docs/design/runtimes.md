@@ -217,10 +217,10 @@ Naming a credential the manifest lacks fails the load. See
 
 ## The managed Deno
 
-There are two Deno pieces in atomic, and they differ in status.
+Declarative atoms and planned code atoms use different runtimes.
 
 **Today.** The bundled Astro compiler, which every declarative atom passes
-through, runs on the `deno_core` and V8 linked into the atomic binary, in a child
+through, runs on the Boa engine linked into the atomic binary, in a child
 process of atomic itself with no network, environment, filesystem or subprocess
 access; no Deno executable is needed. The same engine runs helper isolates.
 
