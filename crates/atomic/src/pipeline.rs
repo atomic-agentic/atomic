@@ -4668,7 +4668,9 @@ fn route_review_findings(
     controls_clean: bool,
     changed_paths: &BTreeSet<String>,
 ) -> (String, Vec<ReviewFollowup>) {
-    if !enabled || !matches!(said, "approve" | "request_changes" | "revise") {
+    // Finding labels are model-supplied metadata. They cannot override an
+    // explicit request for repair from the reviewer.
+    if !enabled || said != "approve" {
         return (said.to_owned(), Vec::new());
     }
     let Some(findings) = verdict.get("findings").and_then(Value::as_array) else {
@@ -4741,7 +4743,7 @@ mod severity_routing_tests {
 
     #[test]
     fn low_documentation_findings_become_followups_only_without_touched_controls() {
-        let verdict = json!({"verdict":"request_changes","findings":[
+        let verdict = json!({"verdict":"approve","findings":[
             {"file":"docs/guide.md","line":12,"severity":"low","category":"grammar","message":"Clarify the example"},
             {"file":"examples/demo/README.md","severity":"nit","category":"formatting","message":"Tighten the label"}
         ]});
@@ -4749,52 +4751,30 @@ mod severity_routing_tests {
             "docs/guide.md".to_owned(),
             "examples/demo/README.md".to_owned(),
         ]);
-        let (routed, followups) = route_review_findings(
-            "reviewer",
-            &verdict,
-            "request_changes",
-            true,
-            true,
-            &changed,
-        );
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
         assert_eq!(routed, "approve");
         assert_eq!(followups.len(), 2);
         assert_eq!(followups[0].line, Some(12));
         assert_eq!(followups[0].category, "grammar");
+        for said in ["request_changes", "revise"] {
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, said, true, true, &changed);
+            assert_eq!(routed, said);
+            assert!(followups.is_empty());
+        }
         let (routed, followups) =
-            route_review_findings("reviewer", &verdict, "revise", true, true, &changed);
-        assert_eq!(
-            routed, "approve",
-            "revise follows the same low-finding policy"
-        );
-        assert_eq!(followups.len(), 2);
-        let (routed, followups) = route_review_findings(
-            "reviewer",
-            &verdict,
-            "request_changes",
-            true,
-            false,
-            &changed,
-        );
+            route_review_findings("reviewer", &verdict, "approve", true, false, &changed);
         assert_eq!(routed, "request_changes");
         assert!(followups.is_empty());
-        let (routed, followups) = route_review_findings(
-            "reviewer",
-            &verdict,
-            "request_changes",
-            false,
-            true,
-            &changed,
-        );
-        assert_eq!(
-            routed, "request_changes",
-            "an older run keeps its admitted policy"
-        );
+        let (routed, followups) =
+            route_review_findings("reviewer", &verdict, "approve", false, true, &changed);
+        assert_eq!(routed, "approve", "an older run keeps its admitted policy");
         assert!(followups.is_empty());
         let (routed, followups) = route_review_findings(
             "reviewer",
             &verdict,
-            "request_changes",
+            "approve",
             true,
             true,
             &BTreeSet::new(),
@@ -4804,6 +4784,23 @@ mod severity_routing_tests {
             "invented source paths cannot be filed"
         );
         assert!(followups.is_empty());
+    }
+
+    #[test]
+    fn explicit_changes_stay_blocking_with_low_editorial_metadata() {
+        let changed = BTreeSet::from(["docs/getting-started/installation.md".to_owned()]);
+        for said in ["request_changes", "revise"] {
+            let verdict = json!({"verdict":said,"findings":[{
+                "file":"docs/getting-started/installation.md",
+                "severity":"low",
+                "category":"formatting",
+                "message":"Remove the curl pipe into sh from the install snippet"
+            }]});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, said, true, true, &changed);
+            assert_eq!(routed, said);
+            assert!(followups.is_empty());
+        }
     }
 
     #[test]
@@ -4892,11 +4889,11 @@ mod severity_routing_tests {
         ];
         let eligible = eligible_review_paths(&changed, &entries);
         assert_eq!(eligible, BTreeSet::from(["docs/guide.md".to_owned()]));
-        let verdict = json!({"verdict":"revise","findings":[
+        let verdict = json!({"verdict":"approve","findings":[
             {"file":"docs/link.md","severity":"nit","category":"spelling","message":"Typo"}
         ]});
         let (routed, followups) =
-            route_review_findings("reviewer", &verdict, "revise", true, true, &eligible);
+            route_review_findings("reviewer", &verdict, "approve", true, true, &eligible);
         assert_eq!(routed, "request_changes");
         assert!(followups.is_empty());
     }

@@ -110,12 +110,14 @@ with `approve` among them:
 For graph-driven `coding: true` steps, a reviewer may return typed findings
 with `file`, optional `line`, `severity` (`blocker`, `major`, `minor`/`low`, or
 `nit`), `message`, and an editorial `category` (`spelling`, `grammar`,
-`formatting`, or `broken_link`). A `request_changes` or `revise` verdict with
-only low editorial findings becomes an approval with follow-up work if the host
+`formatting`, or `broken_link`). An `approve` verdict with
+only low editorial findings records follow-up work if the host
 can prove the cited paths are changed regular Markdown blobs outside selected
 control rows. That proof is limited to `docs/` and `examples/`; a symlink,
 missing or ambiguous category, security-relevant path or finding text, or an
 item labeled `security` requires repair even if the reviewer called it low.
+A reviewer’s explicit `request_changes` or `revise` still requires repair,
+regardless of finding labels.
 A high-severity finding requires repair even when the reviewer wrote `approve`.
 Accepted low findings are filed with `discovered-from` links under a separate
 pinned goal, so they do not hold the active epic open. If the final panel
