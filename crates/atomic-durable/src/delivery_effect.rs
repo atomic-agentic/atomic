@@ -610,6 +610,66 @@ fn observation_from_row(row: &crate::Row) -> Result<QueueObservation> {
     })
 }
 
+/// Return one due observation owned by this project. The provider read must
+/// happen after this short transaction has closed.
+pub async fn due_queue_observation_in(
+    tx: &mut Tx<'_, '_>,
+    project: &str,
+    now: i64,
+) -> Result<Option<String>> {
+    let row = tx.query_opt(
+        "SELECT o.delivery_run FROM atomic_delivery_queue_observations o JOIN atomic_run_projects p ON p.run_id=o.delivery_run WHERE p.project=? AND o.status IN ('pending','failed') AND o.next_poll_at<=? ORDER BY o.next_poll_at,o.delivery_run LIMIT 1",
+        &[text(project), Param::Int(now)],
+    ).await?;
+    row.map(|row| row.text("delivery_run")).transpose()
+}
+
+/// Defer a due row whose local record cannot be observed at this layout.
+/// Keep its last provider outcome visible and move only its retry schedule,
+/// so one bad row cannot starve later rows across serve restarts.
+pub async fn defer_queue_observation_in(
+    tx: &mut Tx<'_, '_>,
+    project: &str,
+    run: &str,
+    now: i64,
+) -> Result<()> {
+    let row = tx.query_opt(
+        "SELECT o.poll_attempts FROM atomic_delivery_queue_observations o JOIN atomic_run_projects p ON p.run_id=o.delivery_run WHERE p.project=? AND o.delivery_run=? AND o.status IN ('pending','failed') AND o.next_poll_at<=?",
+        &[text(project), text(run), Param::Int(now)],
+    ).await?;
+    if let Some(row) = row {
+        let (attempts, next) = next_poll("failed", row.int("poll_attempts")?, now);
+        tx.execute(
+            "UPDATE atomic_delivery_queue_observations SET poll_attempts=?,next_poll_at=? WHERE delivery_run=? AND status IN ('pending','failed') AND next_poll_at<=?",
+            &[Param::Int(attempts), Param::Int(next), text(run), Param::Int(now)],
+        ).await?;
+    }
+    Ok(())
+}
+
+fn next_poll(status: &str, prior_attempts: i64, observed_at: i64) -> (i64, i64) {
+    if status == "merged" || status == "dropped" {
+        return (prior_attempts, i64::MAX);
+    }
+    let attempts = if status == "failed" {
+        prior_attempts.saturating_add(1)
+    } else {
+        0
+    };
+    let delay = if status == "failed" {
+        5_000_i64
+            .saturating_mul(
+                1_i64
+                    .checked_shl(u32::try_from(attempts.min(6)).unwrap_or(6))
+                    .unwrap_or(64),
+            )
+            .min(300_000)
+    } else {
+        30_000
+    };
+    (attempts, observed_at.saturating_add(delay))
+}
+
 /// A terminal provider event is immutable. Pending and failed reads occupy one
 /// row that a later observation may replace, so restart cannot double-count.
 pub async fn record_queue_observation_in(
@@ -643,7 +703,7 @@ pub async fn record_queue_observation_in(
         )
     );
     let existing = tx.query_opt(
-        "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+        "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail,poll_attempts FROM atomic_delivery_queue_observations WHERE delivery_run=?",
         &[text(run)],
     ).await?;
     if let Some(row) = &existing
@@ -699,16 +759,22 @@ pub async fn record_queue_observation_in(
         Param::Int(observed_at),
         text(detail),
     ];
+    let prior_attempts = existing
+        .as_ref()
+        .map(|row| row.int("poll_attempts"))
+        .transpose()?
+        .unwrap_or(0);
+    let (poll_attempts, next_poll_at) = next_poll(status, prior_attempts, observed_at);
     if existing.is_some() {
         tx.execute(
             // CONTROL_OFF: delivery-queue-outcome-stable
-            "UPDATE atomic_delivery_queue_observations SET status=?,provider_event_id=?,merge_sha=?,happened_at=?,observed_at=?,detail=? WHERE delivery_run=? AND status IN ('pending','failed')",
-            &[params[5].clone(), params[6].clone(), params[7].clone(), params[8].clone(), params[9].clone(), params[10].clone(), params[0].clone()],
+            "UPDATE atomic_delivery_queue_observations SET status=?,provider_event_id=?,merge_sha=?,happened_at=?,observed_at=?,detail=?,poll_attempts=?,next_poll_at=? WHERE delivery_run=? AND status IN ('pending','failed')",
+            &[params[5].clone(), params[6].clone(), params[7].clone(), params[8].clone(), params[9].clone(), params[10].clone(), Param::Int(poll_attempts), Param::Int(next_poll_at), params[0].clone()],
         ).await?;
     } else {
         tx.execute(
-            "INSERT INTO atomic_delivery_queue_observations (delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(delivery_run) DO NOTHING",
-            &params,
+            "INSERT INTO atomic_delivery_queue_observations (delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail,poll_attempts,next_poll_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(delivery_run) DO NOTHING",
+            &[params[0].clone(),params[1].clone(),params[2].clone(),params[3].clone(),params[4].clone(),params[5].clone(),params[6].clone(),params[7].clone(),params[8].clone(),params[9].clone(),params[10].clone(),Param::Int(poll_attempts),Param::Int(next_poll_at)],
         ).await?;
     }
     let row = tx.query_one(
@@ -788,6 +854,16 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn queue_poll_schedule_is_bounded_and_terminal_is_never_due() {
+        assert_eq!(next_poll("pending", 5, 1_000), (0, 31_000));
+        assert_eq!(next_poll("failed", 0, 1_000), (1, 11_000));
+        assert_eq!(next_poll("failed", 1, 1_000), (2, 21_000));
+        assert_eq!(next_poll("failed", 100, 1_000), (101, 301_000));
+        assert_eq!(next_poll("merged", 5, 1_000), (5, i64::MAX));
+        assert_eq!(next_poll("dropped", 5, 1_000), (5, i64::MAX));
+    }
 
     fn plan() -> DeliveryPlan {
         DeliveryPlan {
