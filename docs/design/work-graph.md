@@ -89,10 +89,27 @@ and git sync is only needed for offline replicas.
 
 ## Import and export
 
-`atomic graph import` and `export` speak beads' JSONL format, so a beads project
-can come into atomic or leave it. Importing one export twice leaves the graph
-unchanged, and differential tests compare the `ready` results with those of a
-pinned `bd` release.
+`atomic graph import` and `export` speak beads' JSONL issue format, so a
+beads project can come into atomic or leave it. Importing one export twice
+leaves the graph unchanged. Differential tests compare issue fields and
+`ready` results with the pinned SQLite `bd` v0.50.3 release.
+
+An atomic-native pinned item uses a versioned JSONL extension so it remains a
+valid beads issue: `status` is `open`, `pinned` is `true`, and
+`metadata.atomic_graph` contains `{"schema_version":1,"native_status":"pinned"}`.
+atomic restores `pinned` only when all three fields agree. A generic beads
+`pinned: true` flag or an unsupported marker paired with that flag is refused
+rather than silently converted to an ordinary item. Imported items and
+`_type: "memory"` records have external trust even if their JSON claims a
+higher trust level. Export includes memories, including when the graph has no
+items.
+
+Memory records use beads' `_type: "memory"` JSONL form. atomic tests that
+memory values survive its own export and reimport and remain external trust.
+The pinned SQLite `bd` v0.50.3 used for the readiness differential rejects
+those records and has no memory-inclusive export option. Interoperability of
+memory records with current `bd` v1.3.2 was checked separately; it is not
+covered by the v0.50.3 differential.
 
 ## How workflows use the graph
 
