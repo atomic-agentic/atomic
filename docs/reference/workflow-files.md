@@ -107,24 +107,42 @@ with `approve` among them:
 | `request_changes`, `revise` | The author gets a repair round, while any are left; then a person decides. |
 | `reject`, `escalate`, `insufficient_context` | A person decides. |
 
-For graph-driven `coding: true` steps, a reviewer may return typed findings
-with `file`, optional `line`, `severity` (`blocker`, `major`, `minor`/`low`, or
-`nit`), `message`, and an editorial `category` (`spelling`, `grammar`,
-`formatting`, or `broken_link`). A `request_changes` or `revise` verdict with
-only low editorial findings becomes an approval with follow-up work if the host
-can prove the cited paths are changed regular Markdown blobs outside selected
-control rows. That proof is limited to `docs/` and `examples/`; a symlink,
-missing or ambiguous category, security-relevant path or finding text, or an
-item labeled `security` requires repair even if the reviewer called it low.
-A high-severity finding requires repair even when the reviewer wrote `approve`.
-Accepted low findings are filed with `discovered-from` links under a separate
-pinned goal, so they do not hold the active epic open. If the final panel
-goes to a human gate, approval files that candidate’s eligible follow-ups
-when the item closes. Delivery still requires two explicit independent
-approvals, including when the graph closes an item with follow-ups. Older
-reviewers with plain-text findings keep their verdicts unchanged.
-The graph run records this routing policy at admission. A run recorded before
-the policy was introduced keeps its original review behavior when recovered.
+For graph-driven `coding: true` steps, `request_changes` and `revise` always
+require repair or a human decision. Reviewers can include plain-text findings
+as evidence for their verdict. With structured findings, even an `approve`
+requires repair unless each finding matches a formatting issue the host verified.
+
+The host recognizes one formatting edit. The candidate adds a single ASCII
+space immediately before the final LF of an existing, one-line Markdown file
+under `docs/` or `examples/`. The original line starts with an ASCII letter,
+contains only ASCII letters, digits, spaces, periods and commas, and ends
+without a space. The base and candidate trees must otherwise match, including
+file modes. Both entries must be non-executable regular files. The host considers
+only review diffs of at most 2,048 bytes, excludes security-sensitive filenames,
+and requires an item without the `security` label and no touched control rows.
+
+To cite that issue, a reviewer with a structured output contract can return
+
+```json
+{"verdict":"approve","findings":[{"file":"docs/guide.md","line":1,"severity":"nit","category":"formatting","message":"Remove the trailing space."}]}
+```
+
+The approved verdict must contain only `verdict` and `findings`. The file
+must match the host's proof. The finding must contain exactly these
+five fields, with the displayed category, line and message. Supported low
+severities are `minor`, `low` and `nit`. Other structured findings, including
+spelling, grammar, broken links and high-severity objections, require repair.
+An approver can omit findings when there are none.
+
+When the graph item closes, verified findings are filed with `discovered-from`
+links under a separate pinned goal. If the final panel opens a human gate,
+approval files eligible findings from reviewers who approved that candidate.
+Delivery requires two explicit independent approvals. The host records its
+formatting evidence with the candidate. Each repair gets its own candidate
+and proof. Graph runs admitted before finding routing retain their original
+review behavior on recovery. If an interrupted draft run had already recorded
+acceptance after an explicit change request, recovery refuses the conflicting
+checkpoint before the item can publish.
 
 The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
 own. Its `with` maps its input from what the step can see and from

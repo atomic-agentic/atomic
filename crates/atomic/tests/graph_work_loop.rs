@@ -356,10 +356,10 @@ fn panel_graph_project(project: &Path) -> String {
         } else {
             json!({"type":"object","additionalProperties":false,"required":["verdict"],
             "properties":{
-                "verdict":{"type":"string","enum":["approve","request_changes"]},
+                "verdict":{"type":"string","enum":["approve","request_changes","revise"]},
                 "findings":{"type":"array","items":{"type":"object","additionalProperties":false,
                     "required":["file","severity","category","message"],
-                    "properties":{"file":{"type":"string"},"severity":{"type":"string"},
+                    "properties":{"file":{"type":"string"},"line":{"type":"integer"},"severity":{"type":"string"},
                         "category":{"type":"string"},"message":{"type":"string"}}}}
             }})
         };
@@ -846,13 +846,66 @@ fn three_dependent_items_make_three_model_calls_and_close_with_host_commits() {
     });
 }
 
-/// Run the real coding panel on an author's Markdown change. The first reviewer
-/// reports a spelling nit. The second may send the final candidate to a gate.
+fn formatting_finding() -> Value {
+    json!({"severity":"nit","category":"formatting","file":"docs/guide.md","line":1,
+        "message":"Remove the trailing space."})
+}
+
+#[derive(Clone, Copy)]
+enum PanelCrash {
+    AfterFinalize,
+    DraftAccepted,
+}
+
+fn checkpoint_encoding(value: &Value) -> String {
+    let mut encoded =
+        atomic_core::testing::b64url(&serde_json::to_vec(value).expect("checkpoint JSON"))
+            .replace('-', "+")
+            .replace('_', "/");
+    while !encoded.len().is_multiple_of(4) {
+        encoded.push('=');
+    }
+    encoded
+}
+
+/// Restore the old draft's next checkpoint, written when both published
+/// verdicts were treated as approval. The referenced candidate and digest
+/// come from this execution's genuine author turn.
+async fn record_draft_acceptance(rt: &Durare) {
+    let steps = rt.steps(RUN).await.expect("reviewed graph steps");
+    let author = steps
+        .iter()
+        .find(|s| s.name == "graph.00000.fix.turn")
+        .and_then(|s| s.output.as_ref())
+        .and_then(|o| o.get("Candidate"))
+        .expect("checkpointed author");
+    let accepted = json!({"candidate":author["id"], "digest":author["digest"], "accepted":true,
+        "reason":"accepted low findings from reviewer(s) review-one, review-two as follow-up work in review round 0"});
+    let encoded = checkpoint_encoding(&accepted);
+    rt.control_transaction(move |mut tx| {
+        let encoded = encoded.clone();
+        Box::pin(async move {
+            let n = tx.execute(
+                "INSERT INTO operation_outputs(workflow_uuid,function_id,function_name,output,serialization)
+                 SELECT workflow_uuid,function_id+1,'graph.00000.fix.accepted',?,serialization
+                 FROM operation_outputs WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.1.publish'",
+                &[Param::Text(encoded),Param::Text(RUN.into())]
+            ).await?;
+            assert_eq!(n, 1, "old acceptance follows the published panel");
+            Ok(())
+        })
+    }).await.expect("record draft acceptance");
+}
+
+/// Run the real graph panel against the supplied candidate and verdicts.
 async fn editorial_panel(
     root: &Path,
     first: &str,
     second: &str,
+    finding: Value,
+    candidate_text: &str,
     human: Option<Verdict>,
+    crash: Option<PanelCrash>,
 ) -> (FakeModel, Durare) {
     let signal = root.join("finish-author");
     let model = FakeModel::start(vec![
@@ -872,35 +925,74 @@ async fn editorial_panel(
             }],
             "controls": []
         }).to_string()),
-        Reply::Text(json!({"verdict":first,"findings":[{
-            "severity":"nit","category":"spelling","file":"docs/guide.md","message":"Correct the typo."
-        }]}).to_string()),
+        Reply::Text(json!({"verdict":first,"findings":[finding]}).to_string()),
         Reply::Text(json!({"verdict":second}).to_string()),
     ]).await.expect("scripted coding panel");
     seed(root).await;
     leave_one_work_child(root).await;
     let project = root.join("project");
+    std::fs::create_dir_all(project.join("docs")).expect("fixture guide directory");
+    std::fs::write(project.join("docs/guide.md"), "Example text.\n").expect("base guide");
     let base = panel_graph_project(&project);
     let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
         .expect("graph worktrees")
         .path(RUN, "graph.00000.fix");
-    let mut child = child_command(root, &model.base_url(), &base, "start-panel", None)
-        .spawn()
-        .expect("start panel");
+    let mut worker = child_command(
+        root,
+        &model.base_url(),
+        &base,
+        "start-panel",
+        crash.map(|crash| match crash {
+            PanelCrash::AfterFinalize => "graph:after-finalize-applied",
+            PanelCrash::DraftAccepted => "checkpoint:after:graph.00000.fix.review.0.1.publish",
+        }),
+    )
+    .env("HOME", root.join("home"))
+    .spawn()
+    .expect("start panel");
     wait_for("author model call", || model.calls() == 1).await;
     std::fs::create_dir_all(tree.join("docs")).expect("author docs directory");
-    std::fs::write(tree.join("docs/guide.md"), "Example text.").expect("author edit");
+    std::fs::write(tree.join("docs/guide.md"), candidate_text).expect("author edit");
     std::fs::write(signal, "ready").expect("release author");
     let rt = durable(root).await;
     if let Some(verdict) = human {
-        let gate = wait_for_review_gate(&rt).await;
+        let gate = tokio::select! {
+            gate = wait_for_review_gate(&rt) => gate,
+            result = rt.result::<Value>(RUN) => panic!("expected the human review gate, graph finished with {result:?}"),
+        };
+        let shown = &gate.show["verdict"]["reviewers"][0]["verdict"];
+        let original = shown.get("review").unwrap_or(shown);
+        assert_eq!(original, &json!({"verdict":first,"findings":[finding]}));
         decide_review_gate(&rt, &gate, "decide-editorial-panel", verdict).await;
     }
-    let status = tokio::task::spawn_blocking(move || child.wait())
+    let status = tokio::task::spawn_blocking(move || worker.wait())
         .await
         .expect("panel worker")
         .expect("wait for panel");
-    assert!(status.success(), "graph panel child: {status}");
+    if let Some(crash) = crash {
+        assert!(
+            !status.success(),
+            "review checkpoint failpoint should kill the worker"
+        );
+        match crash {
+            PanelCrash::AfterFinalize => {
+                assert_eq!(editorial_followup_count(&rt).await, 1);
+                let (_, steps) = inspect(root).await;
+                assert!(steps.contains(&"graph.00000.fix.finalize.0".to_owned()));
+                assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
+            }
+            PanelCrash::DraftAccepted => record_draft_acceptance(&rt).await,
+        }
+        let mut recover = child_command(root, &model.base_url(), &base, "recover", None);
+        recover.env("HOME", root.join("home"));
+        let resumed = tokio::task::spawn_blocking(move || recover.status())
+            .await
+            .expect("recovery worker")
+            .expect("recovery status");
+        assert!(resumed.success(), "recovered graph panel: {resumed}");
+    } else {
+        assert!(status.success(), "graph panel child: {status}");
+    }
     assert_eq!(model.calls(), 4, "author, self-review and two reviewers");
     (model, rt)
 }
@@ -918,8 +1010,16 @@ fn final_panel_files_editorial_followups_only_for_human_approval() {
         for verdict in [Verdict::Approve, Verdict::Reject] {
             let root = std::fs::canonicalize(scratch("editorial-gate"))
                 .expect("physical fixture path for Git trial worktree");
-            let (_model, rt) =
-                editorial_panel(&root, "approve", "request_changes", Some(verdict)).await;
+            let (_model, rt) = editorial_panel(
+                &root,
+                "approve",
+                "request_changes",
+                formatting_finding(),
+                "Example text. \n",
+                Some(verdict),
+                None,
+            )
+            .await;
             let result = rt.result::<Value>(RUN).await;
             if verdict == Verdict::Approve {
                 result.expect("graph item closed after approval");
@@ -942,19 +1042,99 @@ fn final_panel_files_editorial_followups_only_for_human_approval() {
 }
 
 #[test]
-fn delivery_requires_explicit_approval_from_both_reviewers_even_with_followups() {
+fn explicit_reviewer_changes_block_even_on_verified_formatting() {
     on_codex_runtime(async {
-        let root = std::fs::canonicalize(scratch("editorial-routed"))
-            .expect("physical fixture path for Git trial worktree");
-        let (_model, rt) = editorial_panel(&root, "request_changes", "approve", None).await;
-        rt.result::<Value>(RUN)
+        let privacy = json!({"file":"docs/guide.md","line":1,"severity":"low","category":"grammar",
+            "message":"Omit the customer address."});
+        for (first, finding) in [
+            ("request_changes", formatting_finding()),
+            ("revise", formatting_finding()),
+            ("request_changes", privacy.clone()),
+            ("revise", privacy),
+        ] {
+            let root = std::fs::canonicalize(scratch("formatting-changes"))
+                .expect("physical fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                first,
+                "approve",
+                finding,
+                "Example text. \n",
+                Some(Verdict::Reject),
+                None,
+            )
+            .await;
+            let err = rt
+                .result::<Value>(RUN)
+                .await
+                .expect_err("explicit objection opened the gate");
+            assert!(err.to_string().contains("was rejected"), "{err}");
+            assert_eq!(editorial_followup_count(&rt).await, 0);
+        }
+    });
+}
+
+#[test]
+fn unproved_formatting_and_mislabeled_privacy_findings_require_repair() {
+    on_codex_runtime(async {
+        let privacy = json!({"severity":"low","category":"grammar","file":"docs/guide.md","line":1,
+            "message":"Omit the customer's home address from the public guide."});
+        for (finding, candidate) in [
+            (privacy, "Example text. \n"),
+            (formatting_finding(), "Publish customer addresses. \n"),
+        ] {
+            let root = std::fs::canonicalize(scratch("unproved-formatting"))
+                .expect("physical fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                "approve",
+                "approve",
+                finding,
+                candidate,
+                Some(Verdict::Reject),
+                None,
+            )
+            .await;
+            let err = rt
+                .result::<Value>(RUN)
+                .await
+                .expect_err("unproved finding opened the gate");
+            assert!(err.to_string().contains("was rejected"), "{err}");
+            assert_eq!(editorial_followup_count(&rt).await, 0);
+        }
+    });
+}
+
+#[test]
+fn recovery_refuses_a_draft_acceptance_after_an_explicit_change_request() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("draft-accepted")).expect("physical fixture path");
+        let finding = json!({"file":"docs/guide.md","line":1,"severity":"low","category":"grammar",
+            "message":"Omit the customer address."});
+        let (_, rt) = editorial_panel(
+            &root,
+            "request_changes",
+            "approve",
+            finding,
+            "Publish customer addresses.\n",
+            None,
+            Some(PanelCrash::DraftAccepted),
+        )
+        .await;
+        let err = rt
+            .result::<Value>(RUN)
             .await
-            .expect("graph accepted editorial findings");
-        assert_eq!(editorial_followup_count(&rt).await, 1);
-        let err = atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
-            .await
-            .expect_err("host routing cannot supply an independent approval");
-        assert_eq!(err.to_string(), "independent reviewer did not approve");
+            .expect_err("old draft acceptance cannot authorize publication");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("graph.00000.fix.review.claim.release")
+                && detail.contains("graph.00000.fix.accepted"),
+            "{detail}"
+        );
+        assert_eq!(editorial_followup_count(&rt).await, 0);
+        let (_, steps) = inspect(&root).await;
+        assert!(!steps.contains(&"graph.00000.fix.publish".into()));
+        assert!(!steps.contains(&"graph.00000.fix.close".into()));
     });
 }
 
@@ -963,7 +1143,16 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     on_codex_runtime(async {
         let root = std::fs::canonicalize(scratch("delivery-panel-source"))
             .expect("physical fixture path for Git trial worktree");
-        let (model, rt) = editorial_panel(&root, "approve", "approve", None).await;
+        let (model, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            formatting_finding(),
+            "Example text. \n",
+            None,
+            Some(PanelCrash::AfterFinalize),
+        )
+        .await;
         let url = model.base_url();
         assert_eq!(editorial_followup_count(&rt).await, 1);
         let source =
@@ -1186,6 +1375,25 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             reclosed.to_string().contains("no longer closed"),
             "{reclosed}"
         );
+        // A terminal draft run could hold an explicit negative published verdict
+        // alongside a panel acceptance. Delivery must still refuse that record.
+        let old = checkpoint_encoding(
+            &json!({"verdict":"request_changes","findings":[formatting_finding()]}),
+        );
+        rt.control_transaction(move |mut tx| {
+            let old = old.clone();
+            Box::pin(async move {
+                let rows = tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'",
+                    &[Param::Text(old),Param::Text(RUN.into())]).await?;
+                assert_eq!(rows, 1);
+                Ok(())
+            })
+        }).await.expect("terminal draft reviewer verdict");
+        let negative =
+            atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+                .await
+                .expect_err("terminal acceptance cannot replace independent approval");
+        assert_eq!(negative.to_string(), "independent reviewer did not approve");
         rt.control_transaction(|mut tx| Box::pin(async move {
             tx.execute("UPDATE workflow_status SET application_version='atomic.pipeline.8' WHERE workflow_uuid=?",
                 &[Param::Text(RUN.into())]).await?;
