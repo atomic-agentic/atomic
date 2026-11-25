@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 const EXPORT: &str = concat!(
-    r#"{"id":"bd-epic","title":"One epic","description":"Parent","status":"open","priority":1,"issue_type":"epic","created_at":"2026-01-01T00:00:00Z","labels":["v0.2"]}"#,
+    r#"{"_type":"issue","id":"bd-epic","title":"One epic","description":"Parent","status":"open","priority":1,"issue_type":"epic","created_at":"2026-01-01T00:00:00Z","labels":["v0.2"]}"#,
     "\n",
     r#"{"id":"bd-child","title":"One child","description":"Work","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-02T00:00:00Z","parent_issue":"bd-epic","dependencies":[{"issue_id":"bd-child","depends_on_id":"bd-epic","type":"related"}]}"#,
     "\n"

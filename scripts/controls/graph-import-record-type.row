@@ -1,0 +1,1 @@
+graph-import-record-type|crates/atomic-graph/src/sqlite.rs|                    if record_type != "memory" && record_type != "issue" {|                    if false { /* CONTROL_OFF: unsupported record types enter the issue import path */|-p atomic-agentic-graph --test conformance -- sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file
