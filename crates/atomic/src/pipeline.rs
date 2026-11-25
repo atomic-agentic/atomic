@@ -1018,6 +1018,16 @@ pub struct GraphPipelineRun {
     pub review_routing: bool,
 }
 
+/// The host records a formatting citation here only after checking the
+/// candidate, item labels, touched controls and every finding in the panel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GraphAcceptance {
+    #[serde(flatten)]
+    pub(crate) acceptance: Acceptance,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verified_formatting_path: Option<String>,
+}
+
 /// One durable graph finalization attempt. A missing proof or revoked lease is
 /// checkpointed before its wait, so replay cannot skip an unreleased park when
 /// branch evidence changes while atomic is offline.
@@ -2268,12 +2278,16 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .await?;
                 (candidate, acceptance, Vec::new())
             };
-            let kept = acceptance.clone();
-            let acceptance: Acceptance = ctx
+            let kept = GraphAcceptance {
+                acceptance,
+                verified_formatting_path: followups.first().map(|finding| finding.file.clone()),
+            };
+            let receipt: GraphAcceptance = ctx
                 .step(&format!("{step_name}.accepted"), move |_| async move {
                     Ok(kept)
                 })
                 .await?;
+            let acceptance = receipt.acceptance;
             let commit = candidate
                 .proposal
                 .metadata
@@ -4673,7 +4687,7 @@ fn verified_formatting_path(repo: &Repo, base: &str, commit: &str, diff: &str) -
     Some(a.path.clone())
 }
 
-fn route_review_findings(
+pub(crate) fn route_review_findings(
     reviewer: &str,
     verdict: &Value,
     said: &str,
@@ -4881,13 +4895,13 @@ mod severity_routing_tests {
     }
 }
 
+pub(crate) const FOLLOWUP_REASON_PREFIX: &str = "accepted low findings from reviewer(s) ";
+
 /// The two acceptance reasons written by an independently reviewed panel.
 /// Delivery also verifies the published verdict of each individual reviewer.
 pub(crate) fn panel_acceptance_reason(members: &str, round: u64, followups: bool) -> String {
     if followups {
-        format!(
-            "accepted low findings from reviewer(s) {members} as follow-up work in review round {round}"
-        )
+        format!("{FOLLOWUP_REASON_PREFIX}{members} as follow-up work in review round {round}")
     } else {
         format!("approved by reviewer(s) {members} in review round {round}")
     }

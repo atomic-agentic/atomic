@@ -1,0 +1,1 @@
+delivery-formatting-finding|crates/atomic/src/delivery_evidence.rs|verified_reviewer_findings(&verdict, true, Some(path))?|true|-p atomic-agentic --test graph_work_loop -- delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item

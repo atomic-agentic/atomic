@@ -144,7 +144,11 @@ formatting evidence with the candidate. Each repair gets its own candidate
 and proof. Graph runs admitted before finding routing retain their original
 review behavior on recovery. If an interrupted draft run had already recorded
 acceptance after an explicit change request, recovery refuses the conflicting
-checkpoint before the item can publish.
+checkpoint before the item can publish. Delivery checks the host formatting
+receipt, accepted candidate and reviewer findings at admission and again before
+each new remote effect. A
+draft acceptance that deferred a finding without this receipt requires a fresh
+review before delivery.
 
 A reviewer can include its reasoning when it requests changes or sends a
 candidate to a person. Its `with` maps its input from what the step can see and from

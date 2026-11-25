@@ -666,8 +666,11 @@ fn graph_loop_child() {
             return;
         }
         let rt = engine(&root, &url, true).await;
-        if role == "start" || role == "start-panel" || role == "start-routed" {
-            let mut prepared = if role == "start-panel" {
+        if matches!(
+            role.as_str(),
+            "start" | "start-panel" | "start-legacy-panel" | "start-routed"
+        ) {
+            let mut prepared = if matches!(role.as_str(), "start-panel" | "start-legacy-panel") {
                 panel_pipeline(&root.join("project"))
             } else {
                 pipeline(&root.join("project"))
@@ -696,7 +699,7 @@ fn graph_loop_child() {
                 },
                 epic: EPIC.into(),
                 model_source,
-                review_routing: true,
+                review_routing: role != "start-legacy-panel",
             };
             rt.start(GRAPH_PIPELINE, RUN, run)
                 .await
@@ -852,7 +855,8 @@ fn formatting_finding() -> Value {
 }
 
 #[derive(Clone, Copy)]
-enum PanelCrash {
+enum PanelHistory {
+    BeforeRouting,
     AfterFinalize,
     DraftAccepted,
 }
@@ -905,7 +909,7 @@ async fn editorial_panel(
     finding: Value,
     candidate_text: &str,
     human: Option<Verdict>,
-    crash: Option<PanelCrash>,
+    history: Option<PanelHistory>,
 ) -> (FakeModel, Durare) {
     let signal = root.join("finish-author");
     let model = FakeModel::start(vec![
@@ -941,11 +945,18 @@ async fn editorial_panel(
         root,
         &model.base_url(),
         &base,
-        "start-panel",
-        crash.map(|crash| match crash {
-            PanelCrash::AfterFinalize => "graph:after-finalize-applied",
-            PanelCrash::DraftAccepted => "checkpoint:after:graph.00000.fix.review.0.1.publish",
-        }),
+        if matches!(history, Some(PanelHistory::BeforeRouting)) {
+            "start-legacy-panel"
+        } else {
+            "start-panel"
+        },
+        match history {
+            Some(PanelHistory::AfterFinalize) => Some("graph:after-finalize-applied"),
+            Some(PanelHistory::DraftAccepted) => {
+                Some("checkpoint:after:graph.00000.fix.review.0.1.publish")
+            }
+            _ => None,
+        },
     )
     .env("HOME", root.join("home"))
     .spawn()
@@ -969,19 +980,20 @@ async fn editorial_panel(
         .await
         .expect("panel worker")
         .expect("wait for panel");
-    if let Some(crash) = crash {
+    if let Some(crash @ (PanelHistory::AfterFinalize | PanelHistory::DraftAccepted)) = history {
         assert!(
             !status.success(),
             "review checkpoint failpoint should kill the worker"
         );
         match crash {
-            PanelCrash::AfterFinalize => {
+            PanelHistory::AfterFinalize => {
                 assert_eq!(editorial_followup_count(&rt).await, 1);
                 let (_, steps) = inspect(root).await;
                 assert!(steps.contains(&"graph.00000.fix.finalize.0".to_owned()));
                 assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
             }
-            PanelCrash::DraftAccepted => record_draft_acceptance(&rt).await,
+            PanelHistory::DraftAccepted => record_draft_acceptance(&rt).await,
+            PanelHistory::BeforeRouting => unreachable!(),
         }
         let mut recover = child_command(root, &model.base_url(), &base, "recover", None);
         recover.env("HOME", root.join("home"));
@@ -1118,7 +1130,7 @@ fn recovery_refuses_a_draft_acceptance_after_an_explicit_change_request() {
             finding,
             "Publish customer addresses.\n",
             None,
-            Some(PanelCrash::DraftAccepted),
+            Some(PanelHistory::DraftAccepted),
         )
         .await;
         let err = rt
@@ -1138,6 +1150,228 @@ fn recovery_refuses_a_draft_acceptance_after_an_explicit_change_request() {
     });
 }
 
+async fn open_cli_delivery(
+    root: &Path,
+    url: &str,
+    delivery_run: &str,
+) -> (Durare, PathBuf, Value, Value) {
+    // Move a consistent snapshot of this real graph run into the normal
+    // CLI project state. Delivery admission must read the recorded source
+    // through that project's runtime and open an actual human gate.
+    cli_success(&cli(root, &root.join("project"), url, &["graph", "export"]).await);
+    let cli_db = cli_database(root, &root.join("project"));
+    // Read-only export leaves an absent CLI database absent. A previous
+    // fixture or a writable command may have created it, in which case
+    // replace it with the source run's consistent snapshot.
+    match std::fs::remove_file(&cli_db) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("replace CLI database: {error}"),
+    }
+    let mut source_db = sqlx::SqliteConnection::connect(&format!(
+        "sqlite://{}?mode=rw",
+        root.join("atomic.db").display()
+    ))
+    .await
+    .expect("source database connection");
+    sqlx::query("VACUUM main INTO ?")
+        .bind(cli_db.to_string_lossy().as_ref())
+        .execute(&mut source_db)
+        .await
+        .expect("consistent CLI source snapshot");
+    let state_id = cli_state_id(root, &root.join("project"));
+    let cli_project = format!("graph-loop/{state_id}");
+    let cli_rt = Durare::sqlite(&cli_db).await.expect("copied project store");
+    cli_rt
+        .control_transaction(move |mut tx| {
+            let cli_project = cli_project.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_run_projects SET project=? WHERE run_id=?",
+                    &[Param::Text(cli_project), Param::Text(RUN.into())],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("adopt source into CLI project state");
+    let delivery_dir = cli_db.parent().expect("private state").join("delivery");
+    std::fs::create_dir(&delivery_dir).expect("protected delivery directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&delivery_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("delivery directory mode");
+    }
+    std::fs::write(
+        delivery_dir.join("adapter"),
+        include_bytes!("support/delivery_remote.py"),
+    )
+    .expect("fake remote adapter");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            delivery_dir.join("adapter"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("adapter mode");
+    }
+    let target = json!({"repository":"test/repo","branch_ref":"refs/heads/reviewed",
+    "base_ref":"refs/heads/main","expected_old":null,"pull_request_number":null,
+    "title":"Reviewed graph item","body":"Green trial and panel"});
+    std::fs::write(delivery_dir.join("target.json"), target.to_string()).expect("delivery target");
+    let started = cli_success(
+        &cli(
+            root,
+            &root.join("project"),
+            url,
+            &[
+                "--json",
+                "delivery",
+                "start",
+                RUN,
+                "--step",
+                "graph.00000.fix",
+                "--run-id",
+                delivery_run,
+            ],
+        )
+        .await,
+    );
+    let opened: Value = serde_json::from_str(&started).expect("delivery gate JSON");
+    (cli_rt, delivery_dir, target, opened)
+}
+
+#[test]
+fn terminal_draft_privacy_finding_refuses_delivery_and_recovered_dispatch() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("draft-delivery")).expect("physical fixture path");
+        let privacy = json!({"severity":"low","category":"grammar","file":"docs/guide.md",
+            "line":1,"message":"Omit the customer address."});
+        let (model, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            privacy,
+            "Publish customer addresses.\n",
+            None,
+            Some(PanelHistory::BeforeRouting),
+        )
+        .await;
+        let url = model.base_url();
+        let (cli_rt, dir, _, opened) = open_cli_delivery(&root, &url, "draft-delivery").await;
+        let steps = cli_rt
+            .steps("draft-delivery")
+            .await
+            .expect("delivery checkpoints");
+        assert!(steps.iter().any(|step| step.name == "delivery.source"));
+        let gate = opened["gate"].as_str().expect("delivery gate");
+        enroll_cli(&root, &root.join("project"), &url).await;
+        cli_success(
+            &cli(
+                &root,
+                &root.join("project"),
+                &url,
+                &[
+                    "gates",
+                    "approve",
+                    gate,
+                    "--command-id",
+                    "approve-draft-delivery",
+                ],
+            )
+            .await,
+        );
+
+        // The old draft accepted these exact published reviewer outputs. Restore
+        // its admission flag and acceptance reason on the copied database. All
+        // candidate digests, publications, graph closure and gate are genuine.
+        let mut input = rt
+            .own_run_record(RUN)
+            .await
+            .expect("load graph run")
+            .expect("graph run")
+            .input;
+        input["review_routing"] = json!(true);
+        let graph_steps = rt.steps(RUN).await.expect("graph checkpoints");
+        let mut receipt = graph_steps
+            .iter()
+            .find(|step| step.name == "graph.00000.fix.accepted")
+            .and_then(|step| step.output.clone())
+            .expect("accepted");
+        assert!(receipt.get("verified_formatting_path").is_none());
+        receipt["reason"] = json!(
+            "accepted low findings from reviewer(s) review-one, review-two as follow-up work in review round 0"
+        );
+        let input = checkpoint_encoding(&input);
+        let receipt = checkpoint_encoding(&receipt);
+        cli_rt.control_transaction(move |mut tx| {
+            let input=input.clone(); let receipt=receipt.clone();
+            Box::pin(async move {
+                assert_eq!(tx.execute("UPDATE workflow_status SET inputs=? WHERE workflow_uuid=?", &[Param::Text(input),Param::Text(RUN.into())]).await?,1);
+                assert_eq!(tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.accepted'", &[Param::Text(receipt),Param::Text(RUN.into())]).await?,1);
+                Ok(())
+            })
+        }).await.expect("restore old draft source");
+        let project = root.join("project");
+        let fresh = cli(
+            &root,
+            &project,
+            &url,
+            &[
+                "--json",
+                "delivery",
+                "start",
+                RUN,
+                "--step",
+                "graph.00000.fix",
+                "--run-id",
+                "fresh-draft",
+            ],
+        )
+        .await;
+        assert!(!fresh.status.success(), "draft source admitted: {fresh:?}");
+        assert!(
+            String::from_utf8_lossy(&fresh.stdout)
+                .contains("source review finding lacks host-verified formatting evidence"),
+            "{fresh:?}"
+        );
+        let resumed = cli(
+            &root,
+            &project,
+            &url,
+            &["--json", "delivery", "resume", "draft-delivery"],
+        )
+        .await;
+        assert!(
+            !resumed.status.success(),
+            "draft source dispatched: {resumed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&resumed.stdout)
+                .contains("delivery follow-ups lack a host-verified formatting receipt"),
+            "{resumed:?}"
+        );
+        assert!(
+            !dir.join("remote-state.json").exists(),
+            "remote adapter ran"
+        );
+        let intents = cli_rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one("SELECT COUNT(*) AS n FROM atomic_delivery_effects", &[])
+                        .await?
+                        .int("n")
+                })
+            })
+            .await
+            .expect("outbound intent count");
+        assert_eq!(intents, 0);
+    });
+}
+
 #[test]
 fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     on_codex_runtime(async {
@@ -1150,7 +1384,7 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             formatting_finding(),
             "Example text. \n",
             None,
-            Some(PanelCrash::AfterFinalize),
+            Some(PanelHistory::AfterFinalize),
         )
         .await;
         let url = model.base_url();
@@ -1175,93 +1409,8 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
         })
         .await
         .expect("source remains valid at outbound slot");
-        // Move a consistent snapshot of this real graph run into the normal
-        // CLI project state. Delivery admission must read the recorded source
-        // through that project's runtime and open an actual human gate.
-        cli_success(&cli(&root, &root.join("project"), &url, &["graph", "export"]).await);
-        let cli_db = cli_database(&root, &root.join("project"));
-        // Read-only export leaves an absent CLI database absent. A previous
-        // fixture or a writable command may have created it, in which case
-        // replace it with the source run's consistent snapshot.
-        match std::fs::remove_file(&cli_db) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("replace CLI database: {error}"),
-        }
-        let mut source_db = sqlx::SqliteConnection::connect(&format!(
-            "sqlite://{}?mode=rw",
-            root.join("atomic.db").display()
-        ))
-        .await
-        .expect("source database connection");
-        sqlx::query("VACUUM main INTO ?")
-            .bind(cli_db.to_string_lossy().as_ref())
-            .execute(&mut source_db)
-            .await
-            .expect("consistent CLI source snapshot");
-        let state_id = cli_state_id(&root, &root.join("project"));
-        let cli_project = format!("graph-loop/{state_id}");
-        let cli_rt = Durare::sqlite(&cli_db).await.expect("copied project store");
-        cli_rt
-            .control_transaction(move |mut tx| {
-                let cli_project = cli_project.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE atomic_run_projects SET project=? WHERE run_id=?",
-                        &[Param::Text(cli_project), Param::Text(RUN.into())],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .expect("adopt source into CLI project state");
-        let delivery_dir = cli_db.parent().expect("private state").join("delivery");
-        std::fs::create_dir(&delivery_dir).expect("protected delivery directory");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&delivery_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("delivery directory mode");
-        }
-        std::fs::write(
-            delivery_dir.join("adapter"),
-            include_bytes!("support/delivery_remote.py"),
-        )
-        .expect("fake remote adapter");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                delivery_dir.join("adapter"),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .expect("adapter mode");
-        }
-        let target = json!({"repository":"test/repo","branch_ref":"refs/heads/reviewed",
-            "base_ref":"refs/heads/main","expected_old":null,"pull_request_number":null,
-            "title":"Reviewed graph item","body":"Green trial and panel"});
-        std::fs::write(delivery_dir.join("target.json"), target.to_string())
-            .expect("delivery target");
-        let started = cli_success(
-            &cli(
-                &root,
-                &root.join("project"),
-                &url,
-                &[
-                    "--json",
-                    "delivery",
-                    "start",
-                    RUN,
-                    "--step",
-                    "graph.00000.fix",
-                    "--run-id",
-                    "delivery-panel-source",
-                ],
-            )
-            .await,
-        );
-        let opened: Value = serde_json::from_str(&started).expect("delivery gate JSON");
+        let (cli_rt, delivery_dir, target, opened) =
+            open_cli_delivery(&root, &url, "delivery-panel-source").await;
         assert_eq!(opened["run"], "delivery-panel-source");
         assert!(opened["gate"].as_str().is_some(), "{opened}");
         assert_eq!(opened["plan"]["push"]["head"], source.head);
@@ -1321,6 +1470,47 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             .await
             .expect("delivery gate count after duplicate");
         assert_eq!(after, before, "duplicate start opened another gate");
+        // A valid formatting receipt cannot authorize a different finding at dispatch.
+        let bad = checkpoint_encoding(&json!({"verdict":"approve","findings":[{"severity":"low",
+            "file":"docs/guide.md","line":1,"category":"grammar","message":"Omit the customer address."}]}));
+        let original = rt.control_transaction(move |mut tx| {
+            let bad = bad.clone();
+            Box::pin(async move {
+                let key = Param::Text(RUN.into());
+                let original = tx.query_one("SELECT output FROM operation_outputs WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", std::slice::from_ref(&key)).await?.text("output")?;
+                tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", &[Param::Text(bad),key]).await?;
+                Ok(original)
+            })
+        }).await.expect("replace published finding on the source fixture");
+        let invalid = rt
+            .control_transaction({
+                let source = source.clone();
+                move |mut tx| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        atomic_app::delivery_evidence::revalidate_delivery_source_in(
+                            &mut tx, &source,
+                        )
+                        .await
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))
+                    })
+                }
+            })
+            .await
+            .expect_err("dispatch checks the cited finding against the formatting receipt");
+        assert!(
+            invalid
+                .to_string()
+                .contains("source review finding lacks host-verified formatting evidence"),
+            "{invalid}"
+        );
+        rt.control_transaction(move |mut tx| {
+            let original = original.clone();
+            Box::pin(async move {
+                tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", &[Param::Text(original),Param::Text(RUN.into())]).await?;
+                Ok(())
+            })
+        }).await.expect("restore published verdict");
         rt.control_transaction(|mut tx| {
             Box::pin(async move {
                 tx.execute(

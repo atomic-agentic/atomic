@@ -4,7 +4,8 @@
 //! attest its own review or to recreate evidence from a source run.
 
 use crate::pipeline::{
-    GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step, panel_acceptance_reason,
+    FOLLOWUP_REASON_PREFIX, GRAPH_PIPELINE, GraphAcceptance, GraphPipelineRun, LAYOUT_VERSION,
+    Step, panel_acceptance_reason, route_review_findings,
 };
 use anyhow::{Context, Result, bail, ensure};
 use atomic_durable::publication::{Acceptance, Candidate};
@@ -72,6 +73,10 @@ fn output<'a>(steps: &'a [StepRecord], name: &str) -> Result<&'a Value> {
 
 fn turn(steps: &[StepRecord], name: &str, source_run: &str) -> Result<Candidate> {
     let value = output(steps, name)?;
+    candidate_from_turn(value, name, source_run)
+}
+
+fn candidate_from_turn(value: &Value, name: &str, source_run: &str) -> Result<Candidate> {
     let candidate: Candidate = serde_json::from_value(
         value
             .get("Candidate")
@@ -253,7 +258,8 @@ pub async fn approved_graph_item(
         "source claim has wrong run or item"
     );
     let accepted_name = format!("{base_step}.accepted");
-    let accepted: Acceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
+    let receipt: GraphAcceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
+    let accepted = &receipt.acceptance;
     ensure!(accepted.accepted, "source candidate was not accepted");
     ensure!(
         !steps
@@ -262,17 +268,18 @@ pub async fn approved_graph_item(
                 || s.name == format!("{base_step}.review")),
         "human-overridden review cannot authorize delivery"
     );
-    let (round, candidate, turn_name) = round_for(base_step, &steps, &accepted, source_run)?;
+    let (round, candidate, turn_name) = round_for(base_step, &steps, accepted, source_run)?;
     ensure!(
         round <= review.rounds,
         "accepted repair exceeds frozen policy"
     );
     let members = review.reviewers.join(", ");
     let reason = accepted.reason.as_deref();
+    let routing_enabled = frozen.review_routing;
+    let followup_reason = reason == Some(panel_acceptance_reason(&members, round, true).as_str());
     ensure!(
         reason == Some(panel_acceptance_reason(&members, round, false).as_str())
-            || (frozen.review_routing
-                && reason == Some(panel_acceptance_reason(&members, round, true).as_str())),
+            || (routing_enabled && followup_reason),
         "source acceptance was human-overridden or mismatched"
     );
     let head = candidate
@@ -355,14 +362,24 @@ pub async fn approved_graph_item(
         step(&steps, &format!("{self_name}.publish"))?,
     )?;
     previous = step(&steps, &format!("{self_name}.publish"))?;
+    let mut has_followups = false;
+    let verified_path = receipt.verified_formatting_path.as_deref().filter(|path| {
+        candidate
+            .proposal
+            .metadata
+            .get("verified_formatting_path")
+            .and_then(Value::as_str)
+            == Some(*path)
+            && !item
+                .labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("security"))
+    });
     for index in 0..2 {
         let name = format!("{base_step}.review.{round}.{index}");
         let reviewer = turn(&steps, &format!("{name}.turn"), source_run)?;
         let verdict = output(&steps, &format!("{name}.publish"))?;
-        ensure!(
-            verdict.get("verdict").and_then(Value::as_str) == Some("approve"),
-            "independent reviewer did not approve"
-        );
+        has_followups |= verified_reviewer_findings(verdict, routing_enabled, verified_path)?;
         ordered(previous, step(&steps, &format!("{name}.turn"))?)?;
         ordered(
             step(&steps, &format!("{name}.turn"))?,
@@ -384,6 +401,10 @@ pub async fn approved_graph_item(
         })
         .await?;
     }
+    ensure!(
+        has_followups == followup_reason,
+        "source panel reason differs from its verified findings"
+    );
     ordered(previous, step(&steps, &accepted_name)?)?;
     // The finalizer may have parked for branch proof before it applied. Freeze
     // the exact successful occurrence for the delivery plan.
@@ -464,6 +485,91 @@ pub async fn approved_graph_item(
     Ok(source)
 }
 
+/// The same exact finding contract as graph review. A verified receipt also
+/// attests that the item and its touched controls allowed a follow-up.
+fn verified_reviewer_findings(
+    verdict: &Value,
+    routing_enabled: bool,
+    verified_path: Option<&str>,
+) -> Result<bool> {
+    let said = verdict.get("verdict").and_then(Value::as_str);
+    ensure!(
+        said == Some("approve"),
+        "independent reviewer did not approve"
+    );
+    let (routed, findings) = route_review_findings(
+        "delivery",
+        verdict,
+        "approve",
+        routing_enabled,
+        true,
+        verified_path,
+    );
+    ensure!(
+        routed == "approve",
+        "source review finding lacks host-verified formatting evidence"
+    );
+    Ok(!findings.is_empty())
+}
+
+async fn checkpoint_in(tx: &mut Tx<'_, '_>, run: &str, name: &str) -> Result<Value> {
+    let row = tx
+        .query_one(
+            "SELECT output,error FROM operation_outputs WHERE workflow_uuid=? AND function_name=?",
+            &[Param::Text(run.to_owned()), Param::Text(name.to_owned())],
+        )
+        .await?;
+    ensure!(
+        row.text_opt("error")?.is_none(),
+        "source checkpoint {name} failed"
+    );
+    Ok(serde_json::from_slice(&decode_base64(
+        &row.text("output")?,
+    )?)?)
+}
+
+async fn recheck_followups_in(
+    tx: &mut Tx<'_, '_>,
+    source: &DeliverySource,
+    receipt: &GraphAcceptance,
+) -> Result<()> {
+    let path = receipt
+        .verified_formatting_path
+        .as_deref()
+        .context("delivery follow-ups lack a host-verified formatting receipt")?;
+    let base = &source.base_step;
+    let round = source.review_round;
+    let author = if round == 0 {
+        format!("{base}.turn")
+    } else {
+        format!("{base}.repair.{round}.turn")
+    };
+    let recorded = checkpoint_in(tx, &source.source_run, &author).await?;
+    let candidate = candidate_from_turn(&recorded, &author, &source.source_run)?;
+    ensure!(
+        candidate.id == source.candidate_id
+            && candidate.digest == source.digest
+            && candidate
+                .proposal
+                .metadata
+                .get("verified_formatting_path")
+                .and_then(Value::as_str)
+                == Some(path),
+        "delivery formatting proof differs from its accepted candidate"
+    );
+    let mut has_followups = false;
+    for index in 0..2 {
+        let name = format!("{base}.review.{round}.{index}.publish");
+        let verdict = checkpoint_in(tx, &source.source_run, &name).await?;
+        has_followups |= verified_reviewer_findings(&verdict, true, Some(path))?;
+    }
+    ensure!(
+        has_followups,
+        "delivery follow-up receipt has no verified finding"
+    );
+    Ok(())
+}
+
 /// Recheck the frozen source immediately before a remote effect is dispatched.
 /// The caller holds a durable transaction and its outbound slot in that same
 /// transaction; stale accepted content or a reopened item refuses the slot.
@@ -501,13 +607,25 @@ pub async fn revalidate_delivery_source_in(
         "source acceptance failed"
     );
     let bytes = decode_base64(&accepted.text("output")?)?;
-    let receipt: Acceptance = serde_json::from_slice(&bytes)?;
+    let stored: GraphAcceptance = serde_json::from_slice(&bytes)?;
+    let receipt = &stored.acceptance;
     ensure!(
         receipt.accepted
             && receipt.candidate == source.candidate_id
             && receipt.digest == source.digest,
         "source acceptance changed"
     );
+    let followup_receipt = receipt
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.starts_with(FOLLOWUP_REASON_PREFIX));
+    ensure!(
+        stored.verified_formatting_path.is_none() || followup_receipt,
+        "source formatting receipt has a different acceptance reason"
+    );
+    if followup_receipt {
+        recheck_followups_in(tx, source, &stored).await?;
+    }
     let publication = tx
         .query_opt(
             "SELECT digest,output FROM atomic_publications WHERE publication_key=?",
