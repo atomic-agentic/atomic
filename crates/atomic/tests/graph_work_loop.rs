@@ -1428,7 +1428,7 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             .await
             .expect("one delivery gate");
         assert_eq!(before, 1);
-        let mut changed = target;
+        let mut changed = target.clone();
         changed["title"] = json!("Changed after first gate");
         std::fs::write(delivery_dir.join("target.json"), changed.to_string())
             .expect("change protected target");
@@ -1470,6 +1470,45 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             .await
             .expect("delivery gate count after duplicate");
         assert_eq!(after, before, "duplicate start opened another gate");
+        std::fs::write(delivery_dir.join("target.json"), target.to_string())
+            .expect("restore approved target");
+        let project = root.join("project");
+        enroll_cli(&root, &project, &url).await;
+        let gate = opened["gate"]
+            .as_str()
+            .expect("verified formatting delivery gate");
+        cli_success(
+            &cli(
+                &root,
+                &project,
+                &url,
+                &[
+                    "gates",
+                    "approve",
+                    gate,
+                    "--command-id",
+                    "approve-verified-formatting",
+                ],
+            )
+            .await,
+        );
+        cli_success(
+            &cli(
+                &root,
+                &project,
+                &url,
+                &["delivery", "resume", "delivery-panel-source"],
+            )
+            .await,
+        );
+        let remote: Value = serde_json::from_slice(
+            &std::fs::read(delivery_dir.join("remote-state.json"))
+                .expect("fake remote state after approved delivery"),
+        )
+        .expect("fake remote JSON");
+        let expected = json!({"push":1, "pull_request":1, "enqueue":1});
+        assert_eq!(remote["apply_calls"], expected);
+        assert_eq!(remote["mutations"], expected);
         // A valid formatting receipt cannot authorize a different finding at dispatch.
         let bad = checkpoint_encoding(&json!({"verdict":"approve","findings":[{"severity":"low",
             "file":"docs/guide.md","line":1,"category":"grammar","message":"Omit the customer address."}]}));
