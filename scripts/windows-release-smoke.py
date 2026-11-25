@@ -24,7 +24,9 @@ def coding_turn(exe, project, repository, state, env):
     expected = hashlib.sha256((repository / "pricing.py").read_bytes()).hexdigest().upper()
     literal = str(canary).replace("'", "''")
     command = (
-        "$ErrorActionPreference='Stop'; Copy-Item pricing.py windows-copy.py; "
+        "$ErrorActionPreference='Stop'; "
+        "Write-Output ('cwd=' + [Environment]::CurrentDirectory + ' PowerShell=' + $PWD.Path); "
+        "Copy-Item pricing.py windows-copy.py; "
         f"try {{ [IO.File]::ReadAllText('{literal}') | Out-Null; throw 'private file was readable' }} "
         "catch [UnauthorizedAccessException] { "
         "Write-Output ('denied ' + (Get-FileHash windows-copy.py).Hash) }"
@@ -39,6 +41,11 @@ def coding_turn(exe, project, repository, state, env):
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if not replies:
+                for part in request.get("input", []):
+                    if isinstance(part, dict) and part.get("role") == "user":
+                        for item in part.get("content", []):
+                            if isinstance(item, dict) and "<cwd>" in str(item.get("text")):
+                                print("Codex cwd", str(item["text"]).split("<cwd>")[1].split("</cwd>")[0], flush=True)
                 item = dict(type="function_call", id="fc_1", call_id="call_1", name="exec_command",
                             arguments=json.dumps({"cmd": command, "yield_time_ms": 10000}), status="completed")
             elif len(replies) == 1 and any(
@@ -105,7 +112,7 @@ returns: steps.implement.output
 
 def main():
     archive, sbom = Path(sys.argv[1]), Path(sys.argv[2])
-    with tempfile.TemporaryDirectory(prefix="atomic Windows smoke ", dir=Path.home()) as directory:
+    with tempfile.TemporaryDirectory(prefix="atomic Windows smoke ", dir=Path.home(), ignore_cleanup_errors=True) as directory:
         scratch = Path(directory)
         with ZipFile(archive) as bundle:
             bundle.extractall(scratch)
