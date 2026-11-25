@@ -162,7 +162,7 @@ impl<'a> Loader<'a> {
                 });
             }
             (Event::DocumentStart(_), _) => {
-                let value = self.node(String::new())?;
+                let value = self.node(String::new(), 0)?;
                 match self.next()? {
                     (Event::DocumentEnd, _) => {}
                     (_, span) => {
@@ -204,9 +204,12 @@ impl<'a> Loader<'a> {
         Ok(())
     }
 
-    fn node(&mut self, pointer: String) -> Result<Value, YamlError> {
+    fn node(&mut self, pointer: String, depth: usize) -> Result<Value, YamlError> {
         let (event, span) = self.next()?;
         let at = position(&span);
+        if depth > 64 {
+            return Err(self.error(at, "YAML nesting exceeds 64 levels"));
+        }
         self.positions.insert(pointer.clone(), at);
         match event {
             Event::Alias(_) => Err(self.error(
@@ -226,7 +229,7 @@ impl<'a> Loader<'a> {
                         break;
                     }
                     let child = format!("{pointer}/{}", items.len());
-                    items.push(self.node(child)?);
+                    items.push(self.node(child, depth + 1)?);
                 }
                 Ok(Value::Array(items))
             }
@@ -248,7 +251,7 @@ impl<'a> Loader<'a> {
                     }
                     seen.insert(key.clone(), key_at);
                     let child = format!("{pointer}/{}", token(&key));
-                    let value = self.node(child)?;
+                    let value = self.node(child, depth + 1)?;
                     map.insert(key, value);
                 }
                 Ok(Value::Object(map))

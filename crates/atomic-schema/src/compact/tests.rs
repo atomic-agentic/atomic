@@ -201,3 +201,18 @@ fn a_root_mixing_compact_fields_and_structural_keywords_is_refused() {
         assert_eq!(to_json_schema(&schema).expect(text), schema, "{text}");
     }
 }
+
+#[test]
+fn annotations_cannot_hide_compact_fields() {
+    let schema = json!({"description":"a message","text":"string"});
+    assert!(
+        to_json_schema(&schema)
+            .expect_err("mixed root")
+            .message
+            .contains("description")
+    );
+    assert!(to_json_schema(&json!({"description":"a message"})).is_ok());
+    let compact =
+        to_json_schema(&json!({"description":"string","text":"string"})).expect("compact fields");
+    assert_eq!(compact["required"], json!(["description", "text"]));
+}

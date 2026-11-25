@@ -1,0 +1,1 @@
+reference-target-unevaluated-properties|crates/atomic-schema/src/registry/resolve.rs|target_object.contains_key("unevaluatedProperties")|false /* target evaluation scope */|-p atomic-agentic-schema --lib -- registry::tests::inlining_preserves_the_scope_of_evaluated_and_pattern_properties

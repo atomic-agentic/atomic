@@ -1,0 +1,1 @@
+durable-error-nul|crates/atomic-durable/src/runtime.rs|durare::Error::app(message.replace('\0', "\\0"))|durare::Error::app(message)|-p atomic-agentic-durable --lib --features postgres-tests -- runtime::tests::sqlite::a_step_error_with_a_nul_is_recorded_once runtime::tests::postgres::a_step_error_with_a_nul_is_recorded_once

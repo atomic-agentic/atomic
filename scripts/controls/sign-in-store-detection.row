@@ -1,0 +1,1 @@
+sign-in-store-detection|crates/atomic-core/src/signin.rs|other.stored()?.is_none(),|true, /* CONTROL_OFF */|-p atomic-agentic-core --lib --features fake-model detection_refuses_a_sign_in_in_the_other_store

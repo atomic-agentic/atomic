@@ -606,10 +606,10 @@ async fn call(
             .get(reqwest::header::LOCATION)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let text = response
-            .text()
+        let bytes = crate::http_tools::read_bounded(response)
             .await
-            .with_context(|| format!("read the response from {url}"))?;
+            .map_err(|reason| anyhow!("read the response from {url}: {reason}"))?;
+        let text = String::from_utf8(bytes).with_context(|| format!("read UTF-8 from {url}"))?;
         anyhow::Ok((status, location, text))
     })
     .await;

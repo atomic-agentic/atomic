@@ -121,24 +121,27 @@ fn is_field(value: &Value) -> bool {
     })
 }
 
+fn marks_json_schema(key: &str, value: &Value) -> bool {
+    JSON_SCHEMA_KEYWORDS.contains(&key) || (VALUE_KEYWORDS.contains(&key) && !is_field(value))
+}
+
 /// Whether `schema` is written in the compact form: a non-empty mapping
 /// whose root has no structural JSON Schema keyword, and no constraint or
 /// annotation keyword with a value other than a compact field.
 pub fn is_compact(schema: &Value) -> bool {
     schema.as_object().is_some_and(|object| {
         !object.is_empty()
-            && !object.iter().any(|(key, value)| {
-                JSON_SCHEMA_KEYWORDS.contains(&key.as_str())
-                    || (VALUE_KEYWORDS.contains(&key.as_str()) && !is_field(value))
-            })
+            && !object
+                .iter()
+                .any(|(key, value)| marks_json_schema(key, value))
     })
 }
 
 /// `schema` as JSON Schema: compiled when it is compact, unchanged otherwise.
 ///
 /// A root that mixes the two is refused: one with a structural keyword such
-/// as `type` or `const` and a key that only reads as a compact field (`name:
-/// string`, `name?: ...` or `name(array): ...`). Read as JSON Schema, the
+/// as `type`, or an annotation or constraint with a non-field value, and a key
+/// that only reads as a compact field (`name: string`, `name?: ...` or `name(array): ...`). Read as JSON Schema, the
 /// field would be an unknown keyword and silently ignored.
 pub fn to_json_schema(schema: &Value) -> Result<Value, CompactError> {
     if is_compact(schema) {
@@ -146,8 +149,8 @@ pub fn to_json_schema(schema: &Value) -> Result<Value, CompactError> {
     }
     if let Some(object) = schema.as_object()
         && let Some(keyword) = object
-            .keys()
-            .find(|key| JSON_SCHEMA_KEYWORDS.contains(&key.as_str()))
+            .iter()
+            .find_map(|(key, value)| marks_json_schema(key, value).then_some(key))
     {
         for (key, value) in object {
             let known = JSON_SCHEMA_KEYWORDS.contains(&key.as_str())

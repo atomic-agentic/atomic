@@ -540,6 +540,12 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// for none.
     fn project(&self) -> Option<&str>;
 
+    /// Scope of operator credentials. A private, per-project store can use
+    /// the principal alone. A shared store also needs the project.
+    fn operator_scope(&self) -> Option<&str> {
+        self.project()
+    }
+
     /// Register workflow `name`. Registration happens before
     /// [`launch`](Self::launch), in the same way in every process that may
     /// recover the workflow.
@@ -631,8 +637,20 @@ pub trait DurableRuntime: Send + Sync + Sized {
 // ---------------------------------------------------------------------------
 // The durare adapter.
 
-fn db(e: impl std::fmt::Display) -> DurableError {
-    DurableError::Engine(format!("atomic's tables: {e}"))
+fn db(e: sqlx::Error) -> DurableError {
+    let cause = durare::Error::Db(e);
+    let message = format!("atomic's tables: {cause}");
+    if cause.is_retryable() || cause.is_tx_conflict() {
+        DurableError::Interrupted(message)
+    } else {
+        DurableError::Engine(message)
+    }
+}
+
+/// Error text is also written to PostgreSQL text columns. Preserve the
+/// diagnostic while giving a NUL a printable spelling on both backends.
+fn app_error(message: String) -> durare::Error {
+    durare::Error::app(message.replace('\0', "\\0"))
 }
 
 fn engine(e: durare::Error) -> DurableError {
@@ -657,23 +675,21 @@ pub(crate) fn from_durare(e: durare::Error) -> DurableError {
 /// How an atomic error reads to durare, so it records the right outcome.
 pub(crate) fn to_durare(e: DurableError) -> durare::Error {
     match e {
-        DurableError::Interrupted(m) => {
-            durare::Error::RecoveryRequired(Arc::new(durare::Error::app(m)))
-        }
+        DurableError::Interrupted(m) => durare::Error::RecoveryRequired(Arc::new(app_error(m))),
         DurableError::Database { message, origin } => {
-            origin.take().unwrap_or_else(|| durare::Error::app(message))
+            origin.take().unwrap_or_else(|| app_error(message))
         }
         // A lost race reaches the engine through the context's latch (see
         // `Lost`), never through here: a conflict that no step reported was
         // made up, and fails like any other error rather than leave the run
         // waiting for a winner that does not exist.
-        DurableError::Conflict(run) => durare::Error::app(format!(
+        DurableError::Conflict(run) => app_error(format!(
             "workflow code returned a workflow conflict (run {run}) that no step reported"
         )),
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
-        | DurableError::Parked { reason: m, .. } => durare::Error::app(m),
+        | DurableError::Parked { reason: m, .. } => app_error(m),
     }
 }
 
@@ -684,7 +700,7 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
 /// typed conflict that it would record as the step's outcome.
 pub(crate) fn body_to_durare(e: DurableError) -> durare::Error {
     match e {
-        DurableError::Conflict(run) => durare::Error::app(format!(
+        DurableError::Conflict(run) => app_error(format!(
             "a step's body returned a workflow conflict (run {run}), which only workflow code \
              may return"
         )),
@@ -1724,6 +1740,13 @@ impl DurableRuntime for Durare {
 
     fn project(&self) -> Option<&str> {
         self.project.as_deref()
+    }
+
+    fn operator_scope(&self) -> Option<&str> {
+        match self.reads {
+            Reads::Sqlite(_) => None,
+            Reads::Postgres(_) => self.project(),
+        }
     }
 
     fn register<I, O, F, Fut>(&mut self, name: &str, workflow: F)

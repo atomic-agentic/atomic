@@ -1,0 +1,1 @@
+gate-operator-user|crates/atomic/src/engine.rs|let user = atomic_core::credential::operator_user();|let user = String::from("operator");|-p atomic-agentic --test gate_prompt --features sandbox-tests a_service_without_user_can_enroll_and_decide_its_gate
