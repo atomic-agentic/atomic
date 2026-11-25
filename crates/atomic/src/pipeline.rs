@@ -69,7 +69,7 @@ use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings};
 use atomic_core::git::{Git, Repo, Signature, TreeEntry};
 use atomic_core::render::RunInput;
-use atomic_core::runtime::{Runtimes, contained, run_declarative_repairing};
+use atomic_core::runtime::{Runtimes, contained};
 use atomic_core::workflow::{Criterion, Workflow, parse_criteria};
 use atomic_core::worktree::{StepError, StepRequest, Worktrees};
 use atomic_core::{AtomError, compile};
@@ -82,7 +82,7 @@ use atomic_durable::{
     WorkflowContext, execute_candidate_told, failpoint, publish_candidate, review_candidate,
 };
 use atomic_graph::{
-    handoff::{FileAtRelease, Handoff, HandoffFileStatus, snapshot_changed_files},
+    handoff::{FileSnapshot, Handoff, HandoffFileStatus, snapshot_changed_files},
     store::Lease,
     transactional_claim::{self, ClaimNext, ReviewFollowup, WorkItem},
 };
@@ -2143,7 +2143,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     worktrees
                         .base(&id)
                         .map_err(|e| failed(format!("graph handoff pinned base: {e}")))?
-                        .ok_or_else(|| failed("graph handoff has no pinned base".into()))?
+                        .or_else(|| input.get("base").and_then(Value::as_str).map(str::to_owned))
+                        .ok_or_else(|| failed("graph handoff has no admitted base".into()))?
                 };
                 let handoff = handoff.clone();
                 Some(
@@ -2155,6 +2156,11 @@ async fn run_pipeline_in<C: WorkflowContext>(
             } else {
                 None
             };
+            let graph_handoff_brief = item
+                .handoff
+                .as_ref()
+                .zip(resolved_handoff.as_deref())
+                .map(|(handoff, files)| graph_handoff_brief(handoff, files));
             // This durable step is the boundary between policy edits and a
             // lane already under way. A recovered lane reads its choice from
             // the checkpoint; only a new lane reloads the operator's routes.
@@ -2210,6 +2216,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 accepted: &accepted,
                 caches: run_caches.as_ref(),
                 why,
+                graph_handoff_brief: graph_handoff_brief.as_deref(),
+                graph_author_step: Some(&step_name),
             };
             let (candidate, told) = turn(
                 &ctx,
@@ -2567,6 +2575,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
             accepted: &accepted,
             caches: run_caches.as_ref(),
             why,
+            graph_handoff_brief: None,
+            graph_author_step: None,
         };
         used_worktrees |= step.worktree;
         let (candidate, told) = turn(
@@ -2862,6 +2872,25 @@ fn model_graph_item(
     Ok(value)
 }
 
+/// The host supplies structure, while every prior-claimant string remains a
+/// separately quoted data field. Git object IDs never enter this brief.
+fn graph_handoff_brief(handoff: &Handoff, files: &[HandoffFileStatus]) -> String {
+    let mut brief = format!(
+        "attempted: {}\nfailed: {}\nlearned: {}\n",
+        json!(handoff.attempted),
+        json!(handoff.failed),
+        json!(handoff.learned)
+    );
+    for file in files {
+        brief.push_str(&format!(
+            "file: {} status: {}\n",
+            json!(file.path),
+            if file.changed { "changed" } else { "unchanged" }
+        ));
+    }
+    brief
+}
+
 fn lease_precondition(lease: &Lease) -> Result<Precondition> {
     let session = i64::try_from(lease.session).map_err(|_| {
         failed(format!(
@@ -2911,6 +2940,10 @@ struct RunScope<'a> {
     /// What this run's spans say of a step that failed (see
     /// [`atomic_core::usage::Why`]).
     why: &'a atomic_core::usage::Why,
+    /// Host-rendered previous-claimant data for the graph author's prompts.
+    graph_handoff_brief: Option<&'a str>,
+    /// The author step prefix; reviewer turns never inherit the handoff.
+    graph_author_step: Option<&'a str>,
 }
 
 /// One turn of an atom: a step's author, a reviewer, or the author's repair
@@ -3228,6 +3261,13 @@ async fn turn<C: WorkflowContext>(
     let place = format!("run {run_id}, step {}", t.name);
     let serving = replay.clone();
     let repair = t.repair.clone();
+    let host_brief = run
+        .graph_author_step
+        .filter(|author| {
+            t.name.as_str() == *author || t.name.starts_with(&format!("{author}.repair."))
+        })
+        .and(run.graph_handoff_brief)
+        .map(str::to_owned);
     let charge = t.charge;
     let step_caches = run.caches.map(|c| c.for_exec(&t.name));
     let claim_context = ctx.clone();
@@ -3255,6 +3295,7 @@ async fn turn<C: WorkflowContext>(
         let host_cargo = host_cargo.clone();
         let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
         let repair = repair.clone();
+        let host_brief = host_brief.clone();
         let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
         let (snapshot, tree, guard) = (snapshot.clone(), tree.clone(), guard.clone());
         let pinned_helpers = pinned_helpers.clone();
@@ -3420,6 +3461,7 @@ async fn turn<C: WorkflowContext>(
                             snapshot.as_ref(),
                             repair.as_ref(),
                             &runtimes,
+                            host_brief.as_deref(),
                         )
                         .await
                     })
@@ -3434,6 +3476,7 @@ async fn turn<C: WorkflowContext>(
                         snapshot,
                         run_id,
                         repair,
+                        host_brief,
                         coding: t.coding,
                     };
                     in_worktree(worktrees, caches, request, call, runtimes, &place, bound).await
@@ -4558,20 +4601,23 @@ async fn release_failed_criteria_claim<C: WorkflowContext>(
     reason: &str,
 ) -> Result<()> {
     let Some(claim) = claim else { return Ok(()) };
-    let files = candidate_handoff_files(run, candidate).await?;
+    let snapshot = candidate_handoff_files(run, candidate).await?;
     let token = claim.clone();
     let reason = reason.to_owned();
     let released: bool = ctx
         .transaction(&format!("{step}.criteria.failed"), move |mut tx| {
             let token = token.clone();
             let reason = reason.clone();
-            let files = files.clone();
+            let snapshot = snapshot.clone();
             Box::pin(async move {
                 let handoff = Handoff {
                     attempted: "Ran the claimed item's acceptance criteria".into(),
                     failed: reason.chars().take(1024).collect(),
-                    learned: "Inspect the failed criterion before a new attempt".into(),
-                    files,
+                    learned: format!(
+                        "Inspect the failed criterion before a new attempt.{}",
+                        snapshot.note()
+                    ),
+                    files: snapshot.files,
                 };
                 match transactional_claim::release_after_failure_with_handoff(
                     &mut tx, &token, &reason, &handoff,
@@ -4600,7 +4646,7 @@ async fn release_failed_criteria_claim<C: WorkflowContext>(
 async fn candidate_handoff_files(
     run: &RunScope<'_>,
     candidate: &Candidate,
-) -> Result<Vec<FileAtRelease>> {
+) -> Result<FileSnapshot> {
     let worktrees = run
         .worktrees
         .ok_or_else(|| failed("graph handoff has no bound repository".into()))?;
@@ -4624,7 +4670,7 @@ async fn candidate_handoff_files(
         .map(|(run, _)| run.to_owned())
         .ok_or_else(|| failed("graph handoff candidate ID is invalid".into()))?;
     tokio::task::spawn_blocking(move || {
-        if !reference.starts_with(&format!("refs/atomic/{workflow}/steps/"))
+        if !Worktrees::step_ref_belongs_to_run(&workflow, &reference)
             || repo
                 .ref_target(&reference)
                 .map_err(|e| e.to_string())?
@@ -4634,7 +4680,8 @@ async fn candidate_handoff_files(
         {
             return Err("graph handoff commit does not match its host ref and base".to_owned());
         }
-        snapshot_changed_files(&repo, &base, &commit)
+        Ok(snapshot_changed_files(&repo, &base, &commit)
+            .unwrap_or_else(|_| FileSnapshot::unavailable()))
     })
     .await
     .map_err(|e| failed(format!("graph handoff snapshot task: {e}")))?
@@ -6028,20 +6075,23 @@ async fn reviewed<C: WorkflowContext>(
     // gate. On approval we must acquire a new token; the gate decision by
     // itself never authorizes publication of the old candidate.
     let released_epoch = if let Some(token) = claim.as_deref() {
-        let files = candidate_handoff_files(run, &candidate).await?;
+        let snapshot = candidate_handoff_files(run, &candidate).await?;
         let token = token.clone();
         let gate = id.clone();
         Some(
             ctx.transaction(&format!("{id}.claim.release"), move |mut tx| {
                 let token = token.clone();
                 let gate = gate.clone();
-                let files = files.clone();
+                let snapshot = snapshot.clone();
                 Box::pin(async move {
                     let handoff = Handoff {
                         attempted: format!("Submitted a candidate to review gate {gate}"),
                         failed: "Awaiting a human decision".into(),
-                        learned: "Reclaim the graph item before publishing the candidate".into(),
-                        files,
+                        learned: format!(
+                            "Reclaim the graph item before publishing the candidate.{}",
+                            snapshot.note()
+                        ),
+                        files: snapshot.files,
                     };
                     let release = transactional_claim::release_for_review_gate_with_handoff;
                     release(&mut tx, &token, &gate, &handoff).await
@@ -6376,13 +6426,14 @@ async fn run_in(
     snapshot: Option<&atomic_core::context::ContextSnapshot>,
     repair: Option<&Value>,
     runtimes: &Runtimes,
+    host_brief: Option<&str>,
 ) -> std::result::Result<(Value, atomic_core::runtime::RunMetadata), AtomError> {
     let mut registry = Registry::new();
     let compiled =
         compile::compile(atom, &registry).map_err(|e| AtomError::Runtime(e.to_string()))?;
     // Each mapped field carries the origin its binding allows; anything else
     // is external.
-    run_declarative_repairing(
+    atomic_core::runtime::run_declarative_repairing_with_tools_and_brief(
         atom,
         &compiled,
         &mut registry,
@@ -6400,6 +6451,8 @@ async fn run_in(
         }),
         repair,
         runtimes,
+        None,
+        host_brief,
     )
     .await
 }
@@ -6413,6 +6466,7 @@ struct StepCall {
     snapshot: Option<atomic_core::context::ContextSnapshot>,
     run_id: String,
     repair: Option<Value>,
+    host_brief: Option<String>,
     coding: bool,
 }
 
@@ -6436,6 +6490,7 @@ async fn in_worktree(
         snapshot,
         run_id,
         repair,
+        host_brief,
         coding,
     } = call;
     let step = request.step.clone();
@@ -6467,6 +6522,7 @@ async fn in_worktree(
                     snapshot.as_ref(),
                     repair.as_ref(),
                     &here,
+                    host_brief.as_deref(),
                 )
                 .await
             })
@@ -7113,7 +7169,7 @@ mod tests {
                 attempted: "Edited parser".into(),
                 failed: "Fixture failed".into(),
                 learned: "Check EOF".into(),
-                files: vec![FileAtRelease {
+                files: vec![atomic_graph::handoff::FileAtRelease {
                     path: "src/parser.rs".into(),
                     entry: Some(atomic_graph::handoff::GitFingerprint {
                         mode: "100644".into(),

@@ -50,6 +50,43 @@ pub struct HandoffFileStatus {
     pub changed: bool,
 }
 
+/// A bounded host snapshot. Omitted paths are explicit so a release remains
+/// possible even when the candidate exceeds the brief's file budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSnapshot {
+    /// Safely representable changed paths kept within the brief's budget.
+    pub files: Vec<FileAtRelease>,
+    /// Changed paths omitted due to the file budget or path policy.
+    pub omitted: usize,
+    /// Whether Git tree inspection failed after commit provenance was checked.
+    pub unavailable: bool,
+}
+
+impl FileSnapshot {
+    /// Preserve release liveness when file inspection fails.
+    pub fn unavailable() -> Self {
+        Self {
+            files: Vec::new(),
+            omitted: 0,
+            unavailable: true,
+        }
+    }
+
+    /// Bounded explanation appended to the agent-trust handoff narrative.
+    pub fn note(&self) -> String {
+        if self.unavailable {
+            " Host file comparison was unavailable; inspect the candidate commit.".into()
+        } else if self.omitted > 0 {
+            format!(
+                " Host omitted {} changed path(s) from the bounded file comparison.",
+                self.omitted
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
 impl Handoff {
     /// Reject oversized narratives and unsafe or duplicate file paths before
     /// the record enters a claim-release transaction.
@@ -65,16 +102,7 @@ impl Handoff {
         }
         let mut seen = BTreeSet::new();
         for file in &self.files {
-            let path = Path::new(&file.path);
-            if file.path.is_empty()
-                || file.path.len() > 256
-                || file.path.chars().any(|c| matches!(c, '\\' | ':' | '\0'))
-                || path.is_absolute()
-                || !path
-                    .components()
-                    .all(|part| matches!(part, Component::Normal(_)))
-                || !seen.insert(&file.path)
-            {
+            if !valid_path(&file.path) || !seen.insert(&file.path) {
                 return Err("handoff file path is unsafe or repeated".into());
             }
             if file.entry.as_ref().is_some_and(|entry| !valid_entry(entry)) {
@@ -130,6 +158,17 @@ impl Handoff {
     }
 }
 
+fn valid_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && value.len() <= 256
+        && !value.chars().any(|c| matches!(c, '\\' | ':' | '\0'))
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+}
+
 fn valid_entry(entry: &GitFingerprint) -> bool {
     matches!(
         entry.mode.as_str(),
@@ -159,21 +198,23 @@ pub fn snapshot_changed_files(
     repo: &Repo,
     base: &str,
     commit: &str,
-) -> Result<Vec<FileAtRelease>, String> {
+) -> Result<FileSnapshot, String> {
     let changed = repo
         .changed_paths(base, commit)
         .map_err(|error| error.to_string())?;
-    if changed.len() > MAX_FILES {
-        return Err("too many changed files for a graph handoff".into());
-    }
     let tree = entries_by_path(repo.entries(commit).map_err(|error| error.to_string())?);
-    let files = changed
-        .into_iter()
-        .map(|path| FileAtRelease {
+    let mut files = Vec::new();
+    let mut omitted = 0;
+    for path in changed {
+        if !valid_path(&path) || files.len() >= MAX_FILES {
+            omitted += 1;
+            continue;
+        }
+        files.push(FileAtRelease {
             entry: tree.get(&path).cloned(),
             path,
-        })
-        .collect::<Vec<_>>();
+        });
+    }
     let record = Handoff {
         attempted: String::new(),
         failed: String::new(),
@@ -181,7 +222,11 @@ pub fn snapshot_changed_files(
         files: files.clone(),
     };
     record.validate()?;
-    Ok(files)
+    Ok(FileSnapshot {
+        files,
+        omitted,
+        unavailable: false,
+    })
 }
 
 #[cfg(test)]
@@ -220,7 +265,7 @@ mod tests {
             ("src/fixture.rs".into(), Some(fp('c'))),
         ]);
         assert_eq!(
-            handoff.compare_files(&current).unwrap(),
+            handoff.compare_files(&current).expect("observed files"),
             vec![
                 HandoffFileStatus {
                     path: "src/parser.rs".into(),
@@ -305,7 +350,9 @@ mod tests {
             attempted: "edited two files".into(),
             failed: "criterion failed".into(),
             learned: "change one file".into(),
-            files: snapshot_changed_files(&repo, &base, &release).expect("snapshot"),
+            files: snapshot_changed_files(&repo, &base, &release)
+                .expect("snapshot")
+                .files,
         };
         assert_eq!(handoff.files.len(), 2);
         assert_eq!(
@@ -338,6 +385,19 @@ mod tests {
                 },
             ]
         );
+        for index in 0..130 {
+            std::fs::write(root.join(format!("bulk-{index:03}.txt")), "bulk").expect("bulk edit");
+        }
+        std::fs::write(root.join("colon:name.txt"), "valid Git path").expect("punctuated edit");
+        command(&["add", "."]);
+        command(&["commit", "-q", "-m", "large release"]);
+        let large = command(&["rev-parse", "HEAD"]);
+        let bounded = snapshot_changed_files(&repo, &next, &large).expect("bounded snapshot");
+        assert_eq!(bounded.files.len(), MAX_FILES);
+        assert_eq!(bounded.omitted, 3);
+        assert!(!bounded.unavailable);
+        assert!(bounded.note().contains("omitted 3 changed path"));
+        assert!(bounded.files.iter().all(|file| !file.path.contains(':')));
         std::fs::remove_dir_all(root).expect("scratch cleanup");
     }
 }

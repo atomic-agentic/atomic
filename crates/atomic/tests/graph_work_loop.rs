@@ -24,6 +24,7 @@ use atomic_durable::gate::{
 };
 use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{Database, DurableRuntime, Durare, Param};
+use atomic_graph::handoff::{FileAtRelease, GitFingerprint, Handoff};
 use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{Actor, Draft, EdgeKind, GraphStore, Status};
 use atomic_schema::registry::Registry;
@@ -2255,6 +2256,86 @@ fn failed_graph_item_criterion_repairs_without_calling_an_independent_reviewer()
                 .as_str()
                 .unwrap_or_default()
                 .contains("criterion")
+        );
+    });
+}
+
+#[test]
+fn next_claimant_receives_fenced_handoff_with_file_statuses() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into())])
+            .await
+            .expect("scripted author");
+        let root = scratch("graph-next-handoff");
+        let base = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        let repo = Git::find()
+            .expect("Git")
+            .discover(&project)
+            .expect("repository");
+        let unchanged = repo
+            .entries(&base)
+            .expect("base entries")
+            .into_iter()
+            .find(|entry| entry.path == "atoms/fix-item.atom.astro")
+            .expect("fixture atom");
+        let handoff = Handoff {
+            attempted: "Tried the parser fixture".into(),
+            failed: "EOF case failed".into(),
+            learned: "Keep the checked file".into(),
+            files: vec![
+                FileAtRelease {
+                    path: "atoms/fix-item.atom.astro".into(),
+                    entry: Some(GitFingerprint {
+                        mode: unchanged.mode,
+                        id: unchanged.id.clone(),
+                    }),
+                },
+                FileAtRelease {
+                    path: "workflows/fix.workflow.yaml".into(),
+                    entry: Some(GitFingerprint {
+                        mode: "100644".into(),
+                        id: "a".repeat(40),
+                    }),
+                },
+            ],
+        };
+        let rt = durable(&root).await;
+        let record = serde_json::to_string(&handoff).expect("record handoff");
+        rt.control_transaction(move |mut tx| {
+            let record = record.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES (?,?,?)",
+                    &[Param::Text(CHILDREN[0].into()), Param::Int(1), Param::Text(record)],
+                ).await?;
+                Ok(())
+            })
+        }).await.expect("committed previous handoff");
+        let (r, u, b) = (root.clone(), model.base_url(), base);
+        let status = tokio::task::spawn_blocking(move || child(&r, &u, &b, "start", None))
+            .await
+            .expect("graph child");
+        assert!(status.success(), "next claimant: {status}");
+        assert_eq!(model.calls(), 1);
+        let request = model.requests()[0].to_string();
+        for text in [
+            "Tried the parser fixture",
+            "EOF case failed",
+            "Keep the checked file",
+            "status: unchanged",
+            "status: changed",
+        ] {
+            assert!(request.contains(text), "missing {text}: {request}");
+        }
+        assert!(
+            !request.contains(&unchanged.id),
+            "Git object ID reached the model"
+        );
+        assert!(
+            !request.contains(&"a".repeat(40)),
+            "synthetic Git object ID reached the model"
         );
     });
 }

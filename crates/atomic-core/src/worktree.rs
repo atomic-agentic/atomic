@@ -236,6 +236,18 @@ pub struct Cleanup {
 }
 
 impl Worktrees {
+    /// Whether an attempt ref belongs to this run, using the same encoded
+    /// component that commit and recovery use for non-plain run IDs.
+    pub fn step_ref_belongs_to_run(run: &str, reference: &str) -> bool {
+        let prefix = format!("refs/atomic/{}/steps/", component(run));
+        reference
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.rsplit_once('/'))
+            .is_some_and(|(step, attempt)| {
+                !step.is_empty() && attempt.parse::<u32>().is_ok_and(|n| n > 0)
+            })
+    }
+
     /// The worktrees of the repository the project at `state` is in, kept
     /// under `state`'s directory.
     pub fn open(state: &ProjectState) -> Result<Self> {
@@ -1163,6 +1175,18 @@ mod tests {
         assert_ne!(component("a/b"), component("a_b"));
         assert_ne!(component("a.b"), component("a/b"));
         assert_eq!(worktree_name("r", "s"), "r.s");
+    }
+
+    #[test]
+    fn attempt_ref_ownership_uses_encoded_run_name() {
+        let dotted = "demo.one";
+        let reference = format!("refs/atomic/{}/steps/author/1", component(dotted));
+        assert!(Worktrees::step_ref_belongs_to_run(dotted, &reference));
+        assert!(!Worktrees::step_ref_belongs_to_run("demo_two", &reference));
+        assert!(!Worktrees::step_ref_belongs_to_run(
+            dotted,
+            &format!("refs/atomic/{}/steps/author/0", component(dotted))
+        ));
     }
 
     #[test]
