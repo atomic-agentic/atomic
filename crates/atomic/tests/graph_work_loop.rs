@@ -2359,19 +2359,38 @@ fn takeover_after_turn_refuses_publication_and_close() {
 }
 
 async fn wait_for_park(rt: &Durare, previous: Option<&str>) -> atomic_durable::Park {
-    for _ in 0..500 {
-        let parks = atomic_durable::release::waiting(rt)
-            .await
-            .expect("waiting parks");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let Ok(parks) =
+            tokio::time::timeout_at(deadline, atomic_durable::release::waiting(rt)).await
+        else {
+            break;
+        };
+        let parks = parks.expect("waiting parks");
         if let Some(park) = parks
             .into_iter()
             .find(|park| park.run == RUN && previous.is_none_or(|old| park.id != old))
         {
             return park;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(std::cmp::min(now + Duration::from_millis(10), deadline)).await;
     }
-    panic!("graph run did not park");
+    let status = rt.status(RUN).await;
+    let recent_steps = rt.steps(RUN).await.map(|steps| {
+        steps
+            .iter()
+            .rev()
+            .take(12)
+            .map(|step| step.name.clone())
+            .collect::<Vec<_>>()
+    });
+    panic!(
+        "graph run did not park within 30 seconds (previous={previous:?}); status={status:?}; recent steps={recent_steps:?}"
+    );
 }
 
 async fn release(rt: &Durare, park: &atomic_durable::Park, id: &str) {
