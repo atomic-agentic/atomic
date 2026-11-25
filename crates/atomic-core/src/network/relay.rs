@@ -34,7 +34,7 @@
 //! proxy's `200` answer, which the upstream sends once the proxy's dial
 //! reached it; for a plain request, the first bytes of its response.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -50,6 +50,11 @@ pub const DEFAULT_CONNECTIONS_PER_COMMAND: u32 = 64;
 /// The most a command may be allowed: the sandbox helper's bridge opens no
 /// more than this many connections at once for a command anyway.
 pub const MAX_CONNECTIONS_PER_COMMAND: u32 = 128;
+
+/// Maximum new connections per command during one kernel connect lifetime,
+/// relative to its simultaneous connection limit. A proxy connection that
+/// finishes may still leave two secondary address dials running in rama.
+pub(super) const CONNECTIONS_PER_LINGER: u32 = 8;
 
 /// How long the relay waits for the proxy to accept a connection, and how
 /// long a connection's first request may go unanswered before it is closed.
@@ -125,6 +130,9 @@ struct Admitted {
     codex_token: String,
     /// One for each connection the command may hold.
     permits: Arc<Semaphore>,
+    /// Bounds secondary address dials that may outlive answered connections.
+    opened: Mutex<VecDeque<Instant>>,
+    rate_limit: usize,
     /// Changes, as its sender drops, when the command ends.
     ended: watch::Receiver<()>,
     /// What the command keeps until its last connection has let go: its
@@ -260,6 +268,8 @@ impl Relay {
         let admitted = Arc::new(Admitted {
             codex_token,
             permits: Arc::new(Semaphore::new(limit as usize)),
+            opened: Mutex::new(VecDeque::new()),
+            rate_limit: (limit * CONNECTIONS_PER_LINGER) as usize,
             ended: receiver,
             _keep: keep,
         });
@@ -308,6 +318,26 @@ async fn serve(shared: Arc<Shared>, mut front: TcpStream) {
     let Ok(permit) = admitted.permits.clone().try_acquire_owned() else {
         return;
     };
+    // An answered proxy connection can release its permit while rama still
+    // dials two other DNS addresses. Count every forwarded connection for a
+    // whole kernel connect lifetime, including ones whose proxy dial fails.
+    {
+        let now = Instant::now();
+        let mut opened = admitted
+            .opened
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while opened
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= shared.timeouts.linger)
+        {
+            opened.pop_front();
+        }
+        if opened.len() >= admitted.rate_limit {
+            return;
+        }
+        opened.push_back(now);
+    }
     let connect = shared.timeouts.connect;
     let Ok(Ok(mut codex)) = tokio::time::timeout(connect, TcpStream::connect(shared.codex)).await
     else {

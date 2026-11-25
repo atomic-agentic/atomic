@@ -5095,6 +5095,9 @@ async fn new_config_reading(
             model_provider.name = "atomic endpoint".to_string();
             model_provider.base_url = Some(endpoint.base_url.clone());
             model_provider.env_key = endpoint.api_key_env.clone();
+            // The configured key must not follow an endpoint redirect,
+            // including a same-host HTTPS-to-HTTP downgrade.
+            model_provider.reject_redirects = endpoint.api_key_env.is_some();
             model_provider.requires_openai_auth = false;
             model_provider.supports_websockets = false;
             env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
@@ -8946,6 +8949,7 @@ mod tests {
                 .expect("config");
             assert_eq!(config.model_provider_id, OPENAI_PROVIDER_ID);
             assert_eq!(config.model_provider.env_http_headers, None);
+            assert!(!config.model_provider.reject_redirects);
             // OpenAI's API with a key keeps them: the provider has them.
             let api = ModelEndpoint {
                 base_url: "https://api.openai.com/v1".into(),
@@ -8957,6 +8961,7 @@ mod tests {
                 .await
                 .expect("config");
             assert!(config.model_provider.env_http_headers.is_some());
+            assert!(config.model_provider.reject_redirects);
         });
     }
 

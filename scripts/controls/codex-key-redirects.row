@@ -1,0 +1,1 @@
+codex-key-redirects|crates/atomic-core/src/codex.rs|model_provider.reject_redirects = endpoint.api_key_env.is_some();|model_provider.reject_redirects = false;|-p atomic-agentic --test run_cli --features sandbox-tests a_codex_atoms_key_is_never_sent_on_a_redirect

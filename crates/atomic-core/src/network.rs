@@ -71,8 +71,9 @@
 //! Each command that declares hosts is admitted against a budget of file
 //! descriptors ([`Budget`]): it reserves [`descriptors_per_command`] for its
 //! limit, [`DESCRIPTORS_PER_COMMAND`] for the default one, and together the
-//! commands may reserve no more than half of atomic's limit on open files,
-//! which atomic first raises toward its hard limit. A command that would
+//! commands may reserve no more than half of atomic's limit on open files
+//! minus 256 for the pinned proxy's direct dial cap; atomic first raises
+//! its limit toward its hard limit. A command that would
 //! pass it does not start. The relay counts a connection until the proxy
 //! has let go of it, since Codex's proxy answers `CONNECT` before it dials,
 //! with no dial timeout of its own, and keeps the connection until that dial
@@ -82,10 +83,12 @@
 //! the relay closed itself, at its timeout or at the command's end, while
 //! the proxy held it. A command that keeps opening and abandoning connections to a
 //! host that never answers holds its limit and is refused more until those
-//! dials end. Two things stay outside the count: a name that resolves to
-//! several addresses may leave the proxy's dials to the others running
-//! after one connected and the connection was answered, until the kernel
-//! gives them up; and a tunnel is kept open until its upstream closes it,
+//! dials end. A second limit admits at most eight times the command's
+//! connection limit during one kernel connect lifetime. The pinned Codex
+//! proxy also limits actual direct dials to 256 across this process and
+//! times each out after ten seconds, including secondary DNS addresses
+//! after a successful connection. A tunnel is kept open
+//! until its upstream closes it,
 //! though the relay closes its own side when the command ends. A command's
 //! room is given back once its last connection has let go.
 
@@ -397,18 +400,22 @@ const BRIDGE_CONNECTIONS: u64 = MAX_CONNECTIONS_PER_COMMAND as u64;
 /// may have open, which the relay closes at once past the limit; and for
 /// each connection the relay lets through, its own to the proxy, the
 /// proxy's end of that, and up to three dials the proxy makes at once for
-/// it; and some to spare. See the module documentation for what the count
-/// leaves out.
+/// it; a margin for secondary dials; and some to spare. The pinned Codex
+/// proxy separately limits all actual direct dials to [`DIRECT_DIALS_RESERVE`].
 pub const fn descriptors_per_command(limit: u32) -> u64 {
-    BRIDGE_CONNECTIONS + 5 * limit as u64 + 16
+    BRIDGE_CONNECTIONS + (5 + 2 * relay::CONNECTIONS_PER_LINGER as u64) * limit as u64 + 16
 }
 
 /// [`descriptors_per_command`] for [`DEFAULT_CONNECTIONS_PER_COMMAND`].
 pub const DESCRIPTORS_PER_COMMAND: u64 = descriptors_per_command(DEFAULT_CONNECTIONS_PER_COMMAND);
 
+/// The pinned Codex proxy's process-wide cap on simultaneous direct dials.
+/// Reserve this once beyond the admitted commands' connection counts.
+const DIRECT_DIALS_RESERVE: u64 = 256;
+
 /// Room in this process's file descriptors for commands' proxy
-/// connections: half of its limit on open files, the rest left to atomic's
-/// own database, model and file work.
+/// connections: half of its limit on open files minus the direct dial cap,
+/// the rest left to atomic's own database, model and file work.
 struct Budget(Mutex<u64>);
 
 /// The process's budget, shared by every proxy, since the limit is the
@@ -433,9 +440,9 @@ impl Drop for Reservation {
 
 impl Budget {
     /// Room for one more command's connections, `each` descriptors, within
-    /// half of `limit`, or why there is none.
+    /// half of `limit` after the direct dial reserve, or why there is none.
     fn reserve(&'static self, limit: u64, each: u64) -> anyhow::Result<Reservation> {
-        let share = limit / 2;
+        let share = (limit / 2).saturating_sub(DIRECT_DIALS_RESERVE);
         let mut reserved = self
             .0
             .lock()
@@ -443,8 +450,9 @@ impl Budget {
         if *reserved + each > share {
             anyhow::bail!(
                 "{} commands that declare hosts are running, and atomic's limit of {limit} open \
-                 files leaves room for {} at once: their proxy connections may take half of it, \
-                 {each} for each. atomic raises its own limit only as far as its hard limit and \
+                 files leaves room for {} at once: their proxy connections may take half of it \
+                 minus {DIRECT_DIALS_RESERVE} reserved for direct dials, {each} for each. atomic \
+                 raises its own limit only as far as its hard limit and \
                  at most to {RAISED_LIMIT}; to run more at once, raise its hard limit, start it \
                  with a higher soft limit, or lower exec.connections_per_command",
                 *reserved / each,
@@ -1350,7 +1358,7 @@ mod tests {
     fn commands_share_half_the_descriptor_limit() {
         static OURS: Budget = Budget(Mutex::new(0));
         let each = DESCRIPTORS_PER_COMMAND;
-        let limit = 4 * each + 1;
+        let limit = 4 * each + 2 * DIRECT_DIALS_RESERVE + 1;
         let first = OURS.reserve(limit, each).expect("room for one");
         let second = OURS.reserve(limit, each).expect("room for two");
         let Err(why) = OURS.reserve(limit, each) else {
@@ -1371,8 +1379,23 @@ mod tests {
         let small = descriptors_per_command(1);
         assert!(small < each);
         let room = OURS
-            .reserve(2 * small, small)
+            .reserve(2 * (small + DIRECT_DIALS_RESERVE), small)
             .expect("room for the small one");
+        drop(room);
+    }
+
+    #[test]
+    fn proxy_direct_dial_reserve_is_subtracted_once() {
+        static OURS: Budget = Budget(Mutex::new(0));
+        let each = descriptors_per_command(1);
+        assert!(
+            OURS.reserve(2 * (each + DIRECT_DIALS_RESERVE) - 1, each)
+                .is_err(),
+            "the direct dial reserve must not be admitted to a command"
+        );
+        let room = OURS
+            .reserve(2 * (each + DIRECT_DIALS_RESERVE), each)
+            .expect("the exact budget admits one command");
         drop(room);
     }
 

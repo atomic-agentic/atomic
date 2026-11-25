@@ -243,20 +243,22 @@ for each connection it may hold, atomic reserves five open files (the relay's
 to the proxy, the proxy's own and up to three dials the proxy makes at once
 for it),
 one for each of the 128 connections its sandbox may open to the relay, and a
-few to spare, 464 for the default 64; and the commands that declare hosts may
-reserve no more than half of atomic's limit on open files between them. A
+few to spare, 1488 for the default 64; and the commands that declare hosts may
+reserve no more than half of atomic's limit on open files minus 256 descriptors
+for the pinned proxy's process-wide direct dial cap. A
 command's room is given back when its last connection has stopped counting.
 When they need more room, atomic first raises its own limit as far as the
 hard limit allows, up to 65536, and the commands it starts afterwards inherit
 that; a command that would still pass it does not start, and says so, and its
 step fails rather than waits. To run more of them at once, raise atomic's hard
 limit on open files, start it with a higher soft limit, or lower
-`exec.connections_per_command`. Two things are outside the count. A host
-whose name resolves to several addresses may leave the proxy's dials to the
-others running, for up to the kernel's connect timeout, after one of them
-connected and answered. And the proxy keeps a tunnel open until the host
-closes it, even after the command has ended, though the relay closes its own
-side then.
+`exec.connections_per_command`. Each command may open at most eight times its
+connection limit during one kernel connect lifetime. The pinned Codex proxy
+also limits actual direct dials to 256 across the process and times each out
+after ten seconds. This bounds dials to other addresses that the proxy may
+leave running after one address connected, including on a reused connection.
+The proxy may keep a tunnel open until the host closes it, even after the
+command has ended, though the relay closes its own side then.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling

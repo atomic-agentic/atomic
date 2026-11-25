@@ -2,7 +2,7 @@
 
 //! A confined command that holds many tunnels through its proxy to a server
 //! that answers stays within its share of atomic's file descriptors. With
-//! atomic's limit on open files held at 1024, soft and hard, a command
+//! atomic's limit on open files held at 4096, soft and hard, a command
 //! opens 300 tunnels through the proxy to a server on this machine that
 //! greets every connection and keeps it open until its client closes it, as
 //! a host does. The relay in front of the
@@ -87,7 +87,10 @@ fn limit_open_files(soft: u64) {
 #[test]
 fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
     support::require_sandbox();
-    const LIMIT: u64 = 1024;
+    // The budget reserves 1,488 descriptors per command plus 256 for
+    // process-wide direct dials. At 4,096, one command fits in half the
+    // limit and a second does not.
+    const LIMIT: u64 = 4096;
     limit_open_files(LIMIT);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("atomic-exec-network-fds-{}", std::process::id()));
@@ -169,8 +172,12 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         let first = s.spawn(|| local.run(&command(&done)));
         let started = Instant::now();
         while !ready.exists() {
+            if first.is_finished() {
+                let outcome = first.join().expect("first command thread");
+                panic!("the command exited before opening its connections: {outcome:?}");
+            }
             assert!(
-                started.elapsed() < Duration::from_secs(90) && !first.is_finished(),
+                started.elapsed() < Duration::from_secs(90),
                 "the command did not open its connections"
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -208,7 +215,7 @@ fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
         assert!(
             error
                 .to_string()
-                .contains("commands that declare hosts are running, and atomic's limit of 1024"),
+                .contains("commands that declare hosts are running, and atomic's limit of 4096"),
             "{error}"
         );
 

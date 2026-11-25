@@ -129,6 +129,41 @@ fn timeouts(connect: Duration, linger: Duration) -> Timeouts {
     Timeouts { connect, linger }
 }
 
+/// Answered connections can release their live permit while rama keeps
+/// secondary address dials. A command cannot accumulate them indefinitely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answered_connections_are_rate_limited_for_a_connect_lifetime() {
+    let stand = Stand::closing(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+        Duration::ZERO,
+    )
+    .await;
+    let relay = Relay::start(
+        stand.addr,
+        timeouts(Duration::from_secs(1), Duration::from_secs(5)),
+    )
+    .await
+    .expect("starts");
+    let _command = relay
+        .admit("relay-one".into(), "proxy-one".into(), 1, Box::new(()))
+        .expect("admitted");
+    for count in 1..=CONNECTIONS_PER_LINGER as usize {
+        let mut connection = open(relay.addr(), Some("relay-one")).await;
+        connection
+            .write_all(b"GET http://allowed.invalid/ HTTP/1.1\r\n\r\n")
+            .await
+            .expect("request");
+        let mut answer = [0u8; 64];
+        assert!(connection.read(&mut answer).await.expect("answer") > 0);
+        drop(connection);
+        assert_eq!(stand.until(count).await, count);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    let mut over = open(relay.addr(), Some("relay-one")).await;
+    assert!(closed(&mut over, Duration::from_secs(2)).await);
+    assert_eq!(stand.tokens().len(), CONNECTIONS_PER_LINGER as usize);
+}
+
 /// A command holds no more connections than its limit: one more is closed
 /// at once and never reaches the proxy, while another command keeps its
 /// own. Each connection reaches the proxy with the proxy's token for its

@@ -334,8 +334,8 @@ name that resolves to this machine, such as one that `/etc/hosts` maps to
 `127.0.1.1`, counts as elsewhere and uses the proxies the environment names, so
 put it in `NO_PROXY`.
 
-A Codex atom calls through Codex's own client, which atomic cannot tell to skip
-a proxy or to refuse a redirect. When a key would go to an endpoint on this
+A Codex atom calls through Codex's own client. Atomic tells that client to
+refuse a redirect for a configured-key endpoint. When a key would go to an endpoint on this
 machine over plain `http` and the client would send it through a proxy that
 `HTTP_PROXY`, `http_proxy`, `ALL_PROXY` or `all_proxy` names, the atom's turn is
 refused before anything is sent, naming the variable. Whether `NO_PROXY` exempts
@@ -362,9 +362,9 @@ This machine is recognised as for a lite atom: a host name that only resolves
 here is not refused and goes through the proxy, so put it in `NO_PROXY`
 yourself.
 
-Redirects stay open: Codex's client follows one, so an `https` endpoint that
-redirects to `http` on the same host and port receives the key again in
-cleartext. Point a Codex atom only at an endpoint you trust not to redirect.
+For a Codex atom with `api_key_env`, a redirect fails the model request. The
+client does not resend the key to the redirect target, including a same-host
+`https` to `http` downgrade.
 
 For a lite or a Codex atom alike, a key sent over plain `http` to an endpoint
 elsewhere than this machine is not refused: it travels in cleartext across the
