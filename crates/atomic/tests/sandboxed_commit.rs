@@ -250,23 +250,26 @@ fn a_fresh_worktree_reuses_the_shared_cache() {
     on_codex_runtime(async {
         let f = fixture("cache");
         let caches = Caches::new(f.dir.join("state/cache"));
-        caches.create().unwrap();
-        let spec = TurnSpec {
-            env: caches.env(),
-            writable_roots: vec![caches.dir().to_owned()],
-            ..TurnSpec::default()
+        let spec = |tree: &Path| {
+            let caches = caches.in_worktree(tree);
+            caches.create().expect("step caches");
+            TurnSpec {
+                env: caches.env(),
+                writable_roots: caches.writable_roots().to_vec(),
+                ..TurnSpec::default()
+            }
         };
         // A build that is cold without its output in the cache and warm with
         // it, keyed on the sources.
-        let build = "key=$(sha256sum a.txt | cut -c1-16); out=\"$CARGO_TARGET_DIR/$key\"; \
+        let build = "key=$(sha256sum a.txt | cut -c1-16); out=\"$ATOMIC_CACHE_DIR/$key\"; \
                      if [ -f \"$out\" ]; then echo build=warm; \
-                     else mkdir -p \"$CARGO_TARGET_DIR\" && echo built > \"$out\" && echo build=cold; fi; \
-                     echo target=$CARGO_TARGET_DIR";
+                     else mkdir -p \"$ATOMIC_CACHE_DIR\" && echo built > \"$out\" && echo build=cold; fi; \
+                     echo target=$ATOMIC_CACHE_DIR";
 
         let first = f.worktrees.prepare("sandboxed", "first", &f.base).unwrap();
-        let output = sandboxed(&f, &first.path, build, spec.clone()).await;
+        let output = sandboxed(&f, &first.path, build, spec(&first.path)).await;
         assert!(output.contains("build=cold"), "{output}");
-        let target = caches.dir().join("cargo-target");
+        let target = caches.dir().join("shared");
         assert!(
             output.contains(&format!("target={}", target.display())),
             "{output}"
@@ -281,7 +284,7 @@ fn a_fresh_worktree_reuses_the_shared_cache() {
         f.worktrees.prepare("sandboxed", "first", &f.base).unwrap();
         assert_ne!(first.path, second.path);
         assert!(!target.starts_with(&first.path) && !target.starts_with(&second.path));
-        let output = sandboxed(&f, &second.path, build, spec).await;
+        let output = sandboxed(&f, &second.path, build, spec(&second.path)).await;
         assert!(output.contains("build=warm"), "{output}");
         assert!(!second.path.join("target").exists());
     });

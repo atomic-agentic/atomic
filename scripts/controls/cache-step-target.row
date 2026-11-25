@@ -1,0 +1,1 @@
+cache-step-target|crates/atomic-core/src/runtime.rs|                writable_roots.extend(caches.writable_roots());|                writable_roots.push(caches.dir().to_owned());|-p atomic-agentic --features atomic-agentic/sandbox-tests --test shell_env -- each_worktree_builds_in_a_target_directory_of_its_own

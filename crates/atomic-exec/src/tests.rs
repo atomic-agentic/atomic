@@ -3,6 +3,21 @@
 use super::*;
 use std::path::{Path, PathBuf};
 
+fn test_target() -> PathBuf {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("target"))
+        .join("atomic-exec-tests")
+}
+
 fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecError> {
     LocalBackend::default().run(&Command {
         program: "/bin/sh".into(),
@@ -118,9 +133,7 @@ fn source(tag: &str) -> PathBuf {
 /// build's target directory: a scratch root under the system's temporary
 /// directory is refused at connect.
 fn backend(tag: &str) -> LocalBackend {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atomic-exec-tests")
-        .join(format!("scratch-{tag}-{}", std::process::id()));
+    let root = test_target().join(format!("scratch-{tag}-{}", std::process::id()));
     let _ = workspace::remove_tree(&root);
     LocalBackend::in_dir(root)
 }
@@ -926,9 +939,7 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
 #[cfg(unix)]
 #[test]
 fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/atomic-exec-tests")
-        .join(format!("outermost-{}", std::process::id()));
+    let base = test_target().join(format!("outermost-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let (home, elsewhere) = (base.join("scratch"), base.join("elsewhere"));
     std::fs::create_dir_all(home.join("p")).expect("home");
@@ -956,9 +967,7 @@ fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
 #[test]
 fn an_old_scratch_root_goes_only_once_nothing_live_is_in_it() {
     let make = |tag: &str| {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/atomic-exec-tests")
-            .join(format!("retire-{tag}-{}", std::process::id()));
+        let root = test_target().join(format!("retire-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let dead = root.join("fix-0123/999999999.1-a0");
         std::fs::create_dir_all(&dead).expect("dead attempt");

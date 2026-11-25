@@ -1,0 +1,1 @@
+lite-response-size|crates/atomic-core/src/http_tools.rs|if chunk.len() > RESPONSE_LIMIT - bytes.len() {|if false { /* CONTROL_OFF */|-p atomic-agentic-core --lib --features fake-model oversized_provider_responses_are_refused_before_parsing

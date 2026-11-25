@@ -223,7 +223,9 @@ be opened. A replay spends nothing.
 them run, and a case no atom has is an error. `--sample N --seed S` runs a seeded
 sample, `--junit <file>` writes JUnit XML (a suite per atom, with failures, errors
 and skipped scorers counted), `--report <file>` writes the reports as JSON, and
-`--revision <rev>` records the revision being evaluated in each report. An atom
+`--revision <rev>` records the revision being evaluated in each report. Assertions and
+scorers read the original model output. Atomic applies log redaction to the
+output and failure messages it writes to reports. An atom
 with no cases is named in the output. Scorers need a judge, and `atomic eval` has
 none to call yet: an atom that declares scorers fails unless `--allow-unscored` is
 given, and then they are reported as skipped. `--baseline` is refused for the same

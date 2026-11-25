@@ -1,0 +1,1 @@
+openapi-content-count|crates/atomic-schema/src/openapi.rs|entries.len() == 1|!entries.is_empty()|-p atomic-agentic-schema --lib -- openapi::tests::content_parameters_require_one_declared_representation
