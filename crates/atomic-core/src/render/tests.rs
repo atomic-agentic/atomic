@@ -262,3 +262,46 @@ fn curated_examples_are_rendered_as_schema_checked_team_data() {
     assert!(result.user.contains("curated sample") && result.user.contains("ABC-1"));
     assert!(result.user.contains("origin=\"team\""));
 }
+
+#[test]
+fn examples_and_live_inputs_resolve_the_builtin_artifact_schema() {
+    let reference = format!("artifact://sha256/{}", "0".repeat(64));
+    let config = format!(
+        "{{examples:[{{name:'sample',input:{{text:'{reference}'}},output:{{ticket:'ABC-1'}}}}]}}"
+    );
+    let dir = crate::atom::tests::project("{input.text}", &config, None);
+    std::fs::write(
+        dir.join("test.input.schema.json"),
+        json!({
+            "type":"object","properties":{"text":{"$ref":"atomic:artifact"}},"required":["text"]
+        })
+        .to_string(),
+    )
+    .expect("write artifact schema");
+    let mut registry = atomic_schema::registry::Registry::new();
+    let atom = crate::atom::load(&dir.join("test.atom.astro"), &mut registry).expect("load atom");
+    let compiled = crate::compile::compile(&atom, &registry).expect("compile example");
+    let input = json!({"text":reference});
+    let mut run = RunInput {
+        run_id: "artifact-run",
+        input: &input,
+        frontmatter: &atom.frontmatter,
+        origin: "external",
+        origins: None,
+        step: None,
+    };
+    assert!(
+        render(&compiled, &run)
+            .expect("render artifact reference")
+            .user
+            .contains(&reference)
+    );
+    let invalid = json!({"text":"not an artifact"});
+    run.input = &invalid;
+    assert!(
+        render(&compiled, &run)
+            .expect_err("reject invalid artifact")
+            .0
+            .contains("input")
+    );
+}

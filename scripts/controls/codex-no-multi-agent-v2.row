@@ -1,0 +1,1 @@
+codex-no-multi-agent-v2|crates/atomic-core/src/codex.rs|    Feature::MultiAgentV2,|    /* CONTROL_OFF v2 multi-agent */|-p atomic-agentic-core --lib --features fake-model a_scripted_model_drives_a_real_codex_thread_with_an_exact_call_count

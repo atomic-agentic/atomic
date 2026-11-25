@@ -910,6 +910,7 @@ pub async fn decide<R: DurableRuntime>(
     credential: &HumanCredential,
     cmd: DecisionCommand,
 ) -> std::result::Result<Decision, DecideError> {
+    let key = credential::enrollment_key(rt, credential.principal());
     let by = credential.principal().clone();
     let request = request_digest(&by, &cmd);
     let gate_id = cmd.gate.clone();
@@ -917,6 +918,7 @@ pub async fn decide<R: DurableRuntime>(
     let project = project_param(rt.project());
     let (recorded, run) = rt
         .control_transaction(move |mut tx| {
+            let key = key.clone();
             let (cmd, by, request, credential, project) = (
                 cmd.clone(),
                 by.clone(),
@@ -925,7 +927,7 @@ pub async fn decide<R: DurableRuntime>(
                 project.clone(),
             );
             Box::pin(async move {
-                match credential::verify(&mut tx, &credential).await? {
+                match credential::verify(&mut tx, &key, &credential).await? {
                     credential::Verified::Yes => {}
                     credential::Verified::NotEnrolled => {
                         return Ok((Err(DecideError::NotEnrolled(by)), None));

@@ -6,6 +6,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::borrow::Cow;
 
+fn sandbox_test_root(name: &str) -> std::path::PathBuf {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                workspace.join(path)
+            }
+        })
+        .unwrap_or_else(|| workspace.join("target"));
+    target
+        .join("atomic-core-tests")
+        .join(format!("{name}-{}", std::process::id()))
+}
+
 #[test]
 fn held_store_stop_is_consumed_only_by_its_store_and_run() {
     let root = std::env::temp_dir().join(format!("atomic-held-stop-{}", std::process::id()));
@@ -1249,6 +1266,10 @@ fn exec_output_that_breaks_its_schema_fails_the_step() {
         for (script, expected) in [
             ("print('{\"total\": -5}')\n", "minimum"),
             ("print('not json')\n", "not one JSON value"),
+            (
+                r#"import sys; sys.stdout.buffer.write(b'{"total": 1, "unused": "\xff"}')"#,
+                "not valid UTF-8",
+            ),
         ] {
             let (_, a, compiled) = exec_project("exec-bad", script, "");
             let r = run_declarative(
@@ -1344,7 +1365,8 @@ fn an_exec_atoms_declared_environment_wins_over_its_runs_caches() {
             assert_eq!(env[&name], value, "{name}");
         }
     }
-    assert_eq!(writable, [std::path::Path::new("/state/cache/run-1-ab")]);
+    assert_eq!(writable, caches.writable_roots());
+    assert!(!writable.iter().any(|root| caches.dir().starts_with(root)));
     // With no caches, as in an eval, only what the atom declares.
     let (env, writable) = exec_environment(&a, None);
     assert_eq!(
@@ -2193,10 +2215,8 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
         let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
             .await
             .expect("fake model");
-        // Not under /tmp, which connect refuses.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/atomic-core-tests")
-            .join(format!("no-sandbox-{}", std::process::id()));
+        // Scratch must not live under /tmp, even when the source worktree does.
+        let root = sandbox_test_root("no-sandbox");
         let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         struct Counting(ExecSandbox, Arc<std::sync::atomic::AtomicUsize>);
         impl atomic_exec::Confine for Counting {
@@ -2360,9 +2380,7 @@ fn a_check_that_may_pass_is_waited_for_and_kept_once_it_passes() {
     }
     on_codex_runtime(async {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/atomic-core-tests")
-            .join(format!("flaky-check-{}", std::process::id()));
+        let root = sandbox_test_root("flaky-check");
         let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let backend = atomic_exec::Backend::connect(
             atomic_exec::LocalBackend::in_dir(root.join("scratch"))
@@ -2847,7 +2865,7 @@ async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them(
         open.env["CARGO_TARGET_DIR"], "/mine",
         "what the atom declares wins"
     );
-    assert_eq!(open.writable_roots, [caches.dir().to_owned()]);
+    assert_eq!(open.writable_roots, caches.writable_roots());
     // A read-only turn finds them, and writes nothing.
     let open = Backend::Codex(&rt, &atomic_exec::Backend::default()).open(&request(ReadOnly, &[]));
     assert!(open.env.contains_key("XDG_CACHE_HOME"));

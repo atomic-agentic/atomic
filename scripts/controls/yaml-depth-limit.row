@@ -1,0 +1,1 @@
+yaml-depth-limit|crates/atomic-schema/src/yaml.rs|if depth > 64 {|if false && depth > 64 {|-p atomic-agentic-schema --lib -- yaml::tests::nested_collections_stop_at_the_loader_limit

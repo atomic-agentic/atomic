@@ -319,7 +319,8 @@ fn validate_context(atom: &Atom, snapshot: &Value) -> Result<(), String> {
         .context
         .as_ref()
         .ok_or("atom has no context contract")?;
-    jsonschema::validator_for(schema)
+    atomic_schema::registry::Registry::new()
+        .validator_for(schema)
         .map_err(|e| e.to_string())?
         .validate(&snapshot["context"])
         .map_err(|e| e.to_string())

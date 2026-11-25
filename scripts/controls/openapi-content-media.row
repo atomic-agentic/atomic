@@ -1,0 +1,1 @@
+openapi-content-media|crates/atomic-schema/src/openapi.rs|if !is_json_media(media) {|if false && !is_json_media(media) {|-p atomic-agentic-schema --lib -- openapi::tests::content_parameters_require_one_declared_representation
