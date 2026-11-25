@@ -5576,7 +5576,7 @@ dependencies = [
 [[package]]
 name = "durare"
 version = "0.6.0"
-source = "git+https://github.com/atomic-agentic/durare?rev=d99966d636ed6e3653537c4ea0153dea4870d682#d99966d636ed6e3653537c4ea0153dea4870d682"
+source = "git+https://github.com/atomic-agentic/durare?rev=34bba48c1f28e7fdf8c657717d7453d724e5b4f3#34bba48c1f28e7fdf8c657717d7453d724e5b4f3"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -5601,7 +5601,7 @@ dependencies = [
 [[package]]
 name = "durare-macros"
 version = "0.2.0"
-source = "git+https://github.com/atomic-agentic/durare?rev=d99966d636ed6e3653537c4ea0153dea4870d682#d99966d636ed6e3653537c4ea0153dea4870d682"
+source = "git+https://github.com/atomic-agentic/durare?rev=34bba48c1f28e7fdf8c657717d7453d724e5b4f3#34bba48c1f28e7fdf8c657717d7453d724e5b4f3"
 dependencies = [
  "heck",
  "proc-macro2",
