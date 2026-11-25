@@ -24,11 +24,15 @@ with open("remote-state.lock", "a") as lock:
     state = json.loads(store.read_text()) if store.exists() else {
         "refs": {}, "prs": {}, "queue": {}, "keys": {}, "next_pr": 1,
         "mutations": {}, "apply_calls": {}, "inspect_calls": {},
+        "observe_calls": {},
     }
     ref = json.dumps([request["repository"], request["branch_ref"]])
     pr = json.dumps([request["repository"], request["branch_ref"], request.get("base_ref")])
     if message["method"] == "inspect":
         counts = state["inspect_calls"]
+        counts[slot] = counts.get(slot, 0) + 1
+    elif message["method"] == "observe":
+        counts = state.setdefault("observe_calls", {})
         counts[slot] = counts.get(slot, 0) + 1
     elif message["method"] == "apply":
         counts = state["apply_calls"]
@@ -72,7 +76,7 @@ with open("remote-state.lock", "a") as lock:
     os.replace(staging, store)
     if message["method"] == "apply" and pathlib.Path("drop-response-" + slot).exists():
         sys.exit(5)
-    if message["method"] == "inspect" and pathlib.Path("unreadable-" + slot).exists():
+    if message["method"] in ("inspect", "observe") and pathlib.Path("unreadable-" + slot).exists():
         sys.exit(6)
     if slot == "push":
         head = state["refs"].get(ref)

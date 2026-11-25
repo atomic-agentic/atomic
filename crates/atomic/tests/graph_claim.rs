@@ -6,6 +6,8 @@ use atomic_app::graph_claim::{
     claimed_turn_with_limits, validate_before_turn,
 };
 use atomic_durable::{DurableError, DurableRuntime, Durare, Param, WorkflowContext};
+#[cfg(feature = "postgres-tests")]
+use atomic_graph::transactional_claim;
 use atomic_graph::{
     sqlite::SqliteStore,
     store::{Actor, Draft, GraphStore},
@@ -1418,4 +1420,163 @@ async fn postgres_contenders_cannot_overwrite_a_live_claim_after_both_read_no_le
         "only the winner dispatches a turn"
     );
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test]
+async fn postgres_contender_cannot_steal_a_lease_renewed_after_its_stale_read() {
+    use sqlx::Connection as _;
+
+    let schema = atomic_durable::testing::schema("ws3j_renew_race").await;
+    let rt = Arc::new(
+        Durare::postgres(schema.url(), schema.name())
+            .await
+            .expect("postgres runtime"),
+    );
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,trust,created_by,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                &[Param::Text("at-work".into()), Param::Text("Work".into()), Param::Text(String::new()), Param::Text("task".into()), Param::Int(2), Param::Text("open".into()), Param::Text("human".into()), Param::Text("owner".into()), Param::Int(0)],
+            ).await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("seed claimable item");
+    let original = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                Ok(transactional_claim::claim(
+                    &mut tx,
+                    "at-work",
+                    "holder",
+                    "holder-acquisition",
+                    Duration::from_secs(60),
+                )
+                .await?
+                .expect("first claim"))
+            })
+        })
+        .await
+        .expect("claim original lease");
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE atomic_graph_leases SET expires_at=0 WHERE item_id=?",
+                &[Param::Text("at-work".into())],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("expire original lease before the race");
+
+    let (renewed_tx, mut renewed_rx) = tokio::sync::watch::channel(None::<i64>);
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let original_for_validation = original.clone();
+    let holder_rt = rt.clone();
+    let holder = tokio::spawn(async move {
+        holder_rt
+            .control_transaction(move |mut tx| {
+                let original = original.clone();
+                let renewed_tx = renewed_tx.clone();
+                let mut release_rx = release_rx.clone();
+                Box::pin(async move {
+                    transactional_claim::renew(&mut tx, &original, Duration::from_secs(60)).await?;
+                    let pid = tx
+                        .query_one("SELECT pg_backend_pid() AS pid", &[])
+                        .await?
+                        .int("pid")?;
+                    renewed_tx.send(Some(pid)).expect("watch renewal backend");
+                    while !*release_rx.borrow_and_update() {
+                        release_rx
+                            .changed()
+                            .await
+                            .expect("release renewal transaction");
+                    }
+                    Ok(())
+                })
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while renewed_rx.borrow().is_none() {
+            renewed_rx
+                .changed()
+                .await
+                .expect("renewal backend became ready");
+        }
+    })
+    .await
+    .expect("renewal reached its open transaction");
+    let holder_pid = renewed_rx.borrow().expect("renewal backend pid");
+
+    let contender_rt = rt.clone();
+    let contender = tokio::spawn(async move {
+        contender_rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    transactional_claim::claim(
+                        &mut tx,
+                        "at-work",
+                        "contender",
+                        "contender-acquisition",
+                        Duration::from_secs(60),
+                    )
+                    .await
+                })
+            })
+            .await
+    });
+    let mut monitor = sqlx::PgConnection::connect(schema.url())
+        .await
+        .expect("monitor Postgres locks");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1::int = ANY(pg_blocking_pids(pid)) AND query LIKE '%INSERT INTO atomic_graph_leases%')",
+            )
+            .bind(i32::try_from(holder_pid).expect("backend pid fits i32"))
+            .fetch_one(&mut monitor)
+            .await
+            .expect("inspect blocked contender");
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("contender waited on the renewing holder's row lock");
+
+    release_tx.send(true).expect("commit the renewal");
+    holder.await.expect("renewal task").expect("commit renewal");
+    let attempted = contender
+        .await
+        .expect("contender task")
+        .expect("claim attempt");
+    assert!(
+        attempted.is_none(),
+        "a stale contender must not replace a lease renewed before its UPSERT"
+    );
+    rt.control_transaction(move |mut tx| {
+        let original = original_for_validation.clone();
+        Box::pin(async move {
+            transactional_claim::validate(&mut tx, &original).await?;
+            let row = tx
+                .query_one(
+                    "SELECT claimant,epoch,expires_at FROM atomic_graph_leases WHERE item_id=?",
+                    &[Param::Text("at-work".into())],
+                )
+                .await?;
+            assert_eq!(row.text("claimant")?, "holder");
+            assert_eq!(row.int("epoch")?, 1);
+            assert!(row.int("expires_at")? > 0);
+            Ok(())
+        })
+    })
+    .await
+    .expect("renewed lease remains intact");
 }

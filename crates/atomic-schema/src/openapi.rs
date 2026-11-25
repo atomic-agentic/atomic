@@ -27,9 +27,10 @@
 //! the one the spec meant for the bodies it covers.
 //!
 //! A request body is read more narrowly, because atomic sends every request
-//! body as `application/json`: only that media type, or a `+json` type of the
-//! `application/` tree, stands as one atomic can send, and it keeps only the
-//! first of those, which changes nothing about it. A `+json` type of another
+//! body as JSON. It prefers `application/json` and otherwise selects a
+//! unique declared application subtype ending in `+json`. Ambiguous
+//! representations leave the operation unsupported. The Content-Type it
+//! sends is the one whose schema it checked. A `+json` type of another
 //! tree (`text/vnd.acme.echo+json`) describes a reply but not a body atomic
 //! may send, so a required body declared only under one leaves the operation
 //! [`Operation::unsupported`]. A wildcard describes no body atomic may send
@@ -69,6 +70,7 @@
 //! of the operation, and declares no response at all.
 
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 /// What one response of a spec declares about its body, as
 /// [`Operation::responses`] keeps it.
@@ -181,6 +183,8 @@ pub struct Operation {
     /// How each parameter is serialized: `{"style": ..., "explode": ...}`,
     /// with OpenAPI's defaults filled in.
     pub styles: Map<String, Value>,
+    /// The Content-Type whose schema is used for the request body.
+    pub request_media: Option<String>,
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
@@ -360,8 +364,8 @@ fn styles_for(place: &str) -> &'static [&'static str] {
 /// `application/json`, with or without parameters, or a structured `+json`
 /// type of any tree (`application/`, `text/`, vendor or standards-prefixed
 /// trees alike), which is what RFC 6839 says a `+json` suffix means. A
-/// request body is read by the narrower `is_json_request_media`, because
-/// atomic sends one as `application/json` and nothing else.
+/// request body must use one of the application media types accepted by
+/// `is_json_request_media`.
 pub fn is_json_media(media: &str) -> bool {
     let essence = media_essence(media);
     essence == "application/json" || (essence.contains('/') && essence.ends_with("+json"))
@@ -369,9 +373,8 @@ pub fn is_json_media(media: &str) -> bool {
 
 /// Whether `media` names a request body atomic can send: `application/json`,
 /// with or without parameters, or a `+json` type of the `application/` tree.
-/// The executor gives every request body `Content-Type: application/json`, so
-/// a `+json` type of another tree — `text/vnd.acme.echo+json` — names a body
-/// atomic would send as something the spec did not declare, and is left to
+/// Request body serialization supports application JSON representations. A
+/// `+json` type of another tree, such as `text/vnd.acme.echo+json`, is left to
 /// [`Operation::unsupported`].
 fn is_json_request_media(media: &str) -> bool {
     let essence = media_essence(media);
@@ -511,19 +514,34 @@ fn media_with_no_kept_schema(content: &Value) -> Vec<String> {
     media
 }
 
-/// The schema under a `content` map's first JSON request media type, if any —
-/// which is what a request body is held to, since atomic sends one JSON body
-/// as `application/json` and nothing else. `None` when the first one names no
-/// `schema`, even where a later one does, which is what leaves such a request
-/// body unsupported.
-fn json_content(content: &Value) -> Option<&Value> {
-    let content = content.as_object()?;
-    let mut keys: Vec<&String> = content
-        .keys()
-        .filter(|k| is_json_request_media(k))
+/// Select one request representation and keep its declared Content-Type.
+/// Prefer plain application/json, then a parameterized application/json,
+/// then an application subtype with the +json suffix. Without a unique
+/// choice at that priority the tool cannot decide which contract to use.
+fn json_content(content: &Value) -> Result<Option<(&str, &Value)>, String> {
+    let Some(entries) = content.as_object() else {
+        return Ok(None);
+    };
+    let mut choices: Vec<_> = entries
+        .iter()
+        .filter(|(media, _)| is_json_request_media(media))
+        .map(|(media, entry)| {
+            let rank = match (media_essence(media).as_str(), media.contains(';')) {
+                ("application/json", false) => 0,
+                ("application/json", true) => 1,
+                _ => 2,
+            };
+            (rank, media, entry)
+        })
         .collect();
-    keys.sort();
-    keys.first().and_then(|k| content[k.as_str()].get("schema"))
+    choices.sort_by_key(|(rank, _, _)| *rank);
+    let Some(&(rank, media, entry)) = choices.first() else {
+        return Ok(None);
+    };
+    if choices.get(1).is_some_and(|next| next.0 == rank) {
+        return Err("request body has several equally preferred JSON media types; select one representation in the spec".into());
+    }
+    Ok(entry.get("schema").map(|schema| (media.as_str(), schema)))
 }
 
 /// Every schema under a `content` map's JSON media types, each keyed by the
@@ -689,6 +707,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             let mut locations = Map::new();
             let mut styles = Map::new();
             let mut unsupported = None;
+            let mut request_media = None;
             // Operation parameters override path-level ones of the same name and place.
             let mut parameters: Vec<Value> = Vec::new();
             for parameter in shared
@@ -734,9 +753,33 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 if properties.contains_key(field) {
                     return Err(fail(&at, format!("two parameters are named `{field}`")));
                 }
-                let mut schema = match parameter.get("schema") {
-                    Some(schema) => convert(schema, &at)?,
-                    None => json!({}),
+                let mut schema = if let Some(content) = parameter.get("content") {
+                    if ["schema", "style", "explode"]
+                        .iter()
+                        .any(|key| parameter.get(*key).is_some())
+                    {
+                        return Err(fail(
+                            &at,
+                            format!(
+                                "parameter `{field}` mixes content with schema or style serialization"
+                            ),
+                        ));
+                    }
+                    let entries = content.as_object().filter(|entries| entries.len() == 1)
+                        .ok_or_else(|| fail(&at, format!("parameter `{field}` must declare exactly one content media type")))?;
+                    let (media, entry) = entries.iter().next().expect("one media type");
+                    if !is_json_media(media) {
+                        unsupported = Some(format!(
+                            "parameter `{field}` uses unsupported content media type `{media}`"
+                        ));
+                    }
+                    styles.insert(field.to_owned(), json!({"content": media}));
+                    convert(entry.get("schema").unwrap_or(&json!({})), &at)?
+                } else {
+                    match parameter.get("schema") {
+                        Some(schema) => convert(schema, &at)?,
+                        None => json!({}),
+                    }
                 };
                 if let (Some(text), Value::Object(map)) =
                     (parameter["description"].as_str(), &mut schema)
@@ -751,8 +794,14 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             }
             if let Some(body) = operation.get("requestBody") {
                 let body = resolve(spec, body, &at)?;
-                let json = body.get("content").and_then(json_content);
-                if json.is_none() && body["required"] == true {
+                let json = match json_content(&body["content"]) {
+                    Ok(selected) => selected,
+                    Err(reason) => {
+                        unsupported = Some(reason);
+                        None
+                    }
+                };
+                if unsupported.is_none() && json.is_none() && body["required"] == true {
                     let mut declared: Vec<&String> = body["content"]
                         .as_object()
                         .map(|c| c.keys().collect())
@@ -768,7 +817,8 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                         }
                     ));
                 }
-                if let Some(schema) = json {
+                if let Some((media, schema)) = json {
+                    request_media = Some(media.to_owned());
                     if properties.contains_key("body") {
                         return Err(fail(
                             &at,
@@ -836,6 +886,12 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             // first: a `200` and a `202` of different shapes both describe the
             // tool's output, as `anyOf`. A key naming no status, such as a
             // bare `2`, is what no status selects, so it describes nothing.
+            project_direction(&mut input, "readOnly").map_err(|message| fail(&at, message))?;
+            for body in kept.values_mut().flatten() {
+                for schema in body.schemas_mut() {
+                    project_direction(schema, "writeOnly").map_err(|message| fail(&at, message))?;
+                }
+            }
             let output = declared_output(&kept);
             let description = operation["summary"]
                 .as_str()
@@ -848,6 +904,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 description,
                 locations,
                 styles,
+                request_media,
                 input,
                 output,
                 responses: kept,
@@ -856,6 +913,132 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
         }
     }
     Ok(out)
+}
+
+/// Project OpenAPI property visibility into an ordinary JSON Schema contract.
+/// A forbidden property is optional and has the false schema, so an open
+/// object cannot accept it as an additional property.
+fn project_direction(schema: &mut Value, forbidden: &str) -> Result<(), String> {
+    let root = schema.clone();
+    directional_schema(schema, &root, forbidden, &BTreeSet::new())
+}
+
+fn directional_schema(
+    schema: &mut Value,
+    root: &Value,
+    forbidden: &str,
+    inherited: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut hidden = inherited.clone();
+    add_hidden_properties(schema, root, forbidden, &mut hidden);
+    // A shared requirement belongs to every caller of the component. Reject
+    // the conflicting use instead of weakening requirements for other callers.
+    if let Some(target) = local_target(schema, root)
+        && !hidden.is_empty()
+    {
+        let mut own = BTreeSet::new();
+        add_hidden_properties(target, root, forbidden, &mut own);
+        for part in conjuncts(target, root) {
+            let required = part.get("required").and_then(Value::as_array);
+            if let Some(name) = required
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|name| hidden.contains(*name) && !own.contains(*name))
+            {
+                return Err(format!(
+                    "a referenced component requires `{name}`, marked {forbidden} outside that component; put its visibility and requirement in the same component"
+                ));
+            }
+        }
+    }
+    let Some(result) = schema.as_object_mut() else {
+        return Ok(());
+    };
+    let separate = BTreeSet::new();
+    for (key, value) in result.iter_mut() {
+        match key.as_str() {
+            "properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions" => {
+                if let Some(fields) = value.as_object_mut() {
+                    for (name, child) in fields {
+                        if key == "properties" && hidden.contains(name) {
+                            *child = Value::Bool(false);
+                        } else {
+                            directional_schema(child, root, forbidden, &separate)?;
+                        }
+                    }
+                }
+            }
+            "allOf" | "oneOf" | "anyOf" | "prefixItems" => {
+                if let Some(children) = value.as_array_mut() {
+                    for child in children {
+                        let same_object = if key == "allOf" { &hidden } else { &separate };
+                        directional_schema(child, root, forbidden, same_object)?;
+                    }
+                }
+            }
+            "items"
+            | "not"
+            | "additionalProperties"
+            | "unevaluatedProperties"
+            | "unevaluatedItems"
+            | "contains"
+            | "if"
+            | "then"
+            | "else"
+            | "propertyNames" => {
+                directional_schema(value, root, forbidden, &separate)?;
+            }
+            _ => {}
+        }
+    }
+    if !hidden.is_empty()
+        && let Some(required) = result.get_mut("required").and_then(Value::as_array_mut)
+    {
+        required.retain(|name| name.as_str().is_none_or(|name| !hidden.contains(name)));
+    }
+    Ok(())
+}
+
+fn local_target<'a>(schema: &Value, root: &'a Value) -> Option<&'a Value> {
+    let pointer = schema.get("$ref")?.as_str()?.strip_prefix('#')?;
+    root.pointer(pointer)
+}
+
+/// Every unconditional conjunct describes the same instance, including a
+/// referenced component. A reference can be recursive, so follow each target once.
+fn conjuncts<'a>(schema: &'a Value, root: &'a Value) -> impl Iterator<Item = &'a Value> {
+    let mut pending = vec![schema];
+    let mut followed = BTreeSet::new();
+    std::iter::from_fn(move || {
+        let schema = pending.pop()?;
+        if let Some(target) = local_target(schema, root)
+            && followed.insert(std::ptr::from_ref(target))
+        {
+            pending.push(target);
+        }
+        if let Some(parts) = schema.get("allOf").and_then(Value::as_array) {
+            pending.extend(parts);
+        }
+        Some(schema)
+    })
+}
+
+fn add_hidden_properties(
+    schema: &Value,
+    root: &Value,
+    forbidden: &str,
+    hidden: &mut BTreeSet<String>,
+) {
+    for part in conjuncts(schema, root) {
+        if let Some(properties) = part.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                if conjuncts(property, root).any(|s| s.get(forbidden) == Some(&Value::Bool(true))) {
+                    hidden.insert(name.clone());
+                }
+            }
+        }
+    }
 }
 
 fn escape(path: &str) -> String {

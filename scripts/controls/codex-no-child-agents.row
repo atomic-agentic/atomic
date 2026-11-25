@@ -1,0 +1,1 @@
+codex-no-child-agents|crates/atomic-core/src/codex.rs|agents_enabled: false,|agents_enabled: true,|-p atomic-agentic-core --lib --features fake-model a_scripted_model_drives_a_real_codex_thread_with_an_exact_call_count

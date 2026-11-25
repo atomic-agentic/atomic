@@ -275,6 +275,7 @@ pub async fn release_park<R: DurableRuntime>(
     credential: &HumanCredential,
     cmd: ReleaseCommand,
 ) -> Result<Release, ReleaseError> {
+    let key = credential::enrollment_key(rt, credential.principal());
     let by = credential.principal().clone();
     let request = request_digest(&by, &cmd);
     let credential = credential.clone();
@@ -283,6 +284,7 @@ pub async fn release_park<R: DurableRuntime>(
     let project = project_param(rt.project());
     let recorded = rt
         .control_transaction(move |mut tx| {
+            let key = key.clone();
             let (cmd, by, request, credential, project) = (
                 cmd.clone(),
                 by.clone(),
@@ -291,7 +293,7 @@ pub async fn release_park<R: DurableRuntime>(
                 project.clone(),
             );
             Box::pin(async move {
-                match credential::verify(&mut tx, &credential).await? {
+                match credential::verify(&mut tx, &key, &credential).await? {
                     Verified::Yes => {}
                     Verified::NotEnrolled => return Ok(Err(ReleaseError::NotEnrolled(by))),
                     Verified::Mismatch => return Ok(Err(ReleaseError::BadCredential(by))),

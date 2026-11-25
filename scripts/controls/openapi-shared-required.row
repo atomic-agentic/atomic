@@ -1,0 +1,1 @@
+openapi-shared-required|crates/atomic-schema/src/openapi.rs|hidden.contains(*name) && !own.contains(*name)|hidden.contains(*name) && own.contains(*name)|-p atomic-agentic-schema --lib -- openapi::tests::a_shared_requirement_cannot_be_overridden_by_one_use_site

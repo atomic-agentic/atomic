@@ -108,6 +108,28 @@ requests through an operator-installed adapter in private project state. Each
 request has a durable intent and an exact remote receipt; an ambiguous result
 parks for reconciliation and is never sent again merely because the process
 restarted.
+After enqueue completes, delivery records an initial read-only queue lookup.
+`atomic delivery observe <delivery-run>` refreshes it against the frozen plan
+and applied receipts. One row per delivery run holds pending, merged with provider event
+time and merge SHA, dropped with provider event time, or a failed observation.
+The command can be rerun after a restart; terminal events are immutable. It
+uses the approved source and receipts even if the operator has since replaced
+or removed `delivery/target.json`, the source item has reopened, or the local
+delivery run is marked failed after an applied enqueue. An initial observation
+store failure leaves the checkpointed read in the delivery run output, but may
+leave no observation row; rerun `delivery observe` when the store is available.
+It does not retarget a stacked change or
+resolve a queue conflict. Like delivery itself in v0.2, observation uses the
+local SQLite project store. An operator can refresh later outcomes with
+`atomic delivery observe`; `atomic serve` also refreshes one due observation
+for this project at a time through the protected read-only adapter. A pending
+read is due again after 30 seconds; an unavailable or inconsistent provider
+gets capped retry backoff up to five minutes. The recorded timestamp and next
+due time distinguish a stale pending read from an observed merged or dropped
+event. Terminal events remain immutable across restarts. Polling does not repeat
+push, pull request, enqueue, or model work.
+An incompatible local run record is deferred durably, leaving its last
+observation visible while later due rows proceed.
 
 A `coding: true` worktree step now requires a sibling `review.self_review`
 turn before each independent review. atomic computes the candidate's patch

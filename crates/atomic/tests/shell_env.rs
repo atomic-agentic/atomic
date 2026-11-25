@@ -365,11 +365,11 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
             "{printed}"
         );
         let caches = run_caches(&project, "tidy-up", &value("gomod"));
-        assert_eq!(Path::new(&value("gomod")), caches.join("go-mod"));
-        assert!(
-            Path::new(&value("target")).starts_with(caches.join("cargo-target")),
-            "{printed}"
-        );
+        let target = PathBuf::from(value("target"));
+        let step = target.parent().expect("step's cache");
+        assert_eq!(step.parent(), Some(caches.as_path()), "{printed}");
+        assert_eq!(target, step.join("cargo-target"), "{printed}");
+        assert_eq!(Path::new(&value("gomod")), step.join("go-mod"), "{printed}");
         // Gone, read-only directories and all.
         assert!(!caches.exists(), "the run's caches outlived it");
         assert_eq!(
@@ -413,7 +413,7 @@ fn a_read_only_worktree_step_finds_its_caches_and_writes_nothing_there() {
         let data = json!({"base": base, "text": "the note"}).to_string();
         let command = "echo \"xdg=$XDG_CACHE_HOME\"; \
                        mkdir -p \"$XDG_CACHE_HOME/x\" 2>/dev/null && echo cache-written; \
-                       mkdir -p \"$CARGO_TARGET_DIR\" 2>/dev/null && echo target-written; echo looked";
+                       mkdir -p \"$CARGO_TARGET_DIR\" && touch \"$CARGO_TARGET_DIR/marker\" 2>/dev/null && echo target-written; echo looked";
         let printed = run_once(&home, &project, "peek-in", &data, command, &[]).await;
         run_caches(&project, "peek-in", &printed_value(&printed, "xdg"));
         assert!(printed.contains("looked"), "{printed}");
@@ -475,11 +475,22 @@ fn each_worktree_builds_in_a_target_directory_of_its_own() {
             &project,
             "tidy-twice",
             &data,
-            &[build.to_owned(), build.to_owned()],
+            &[
+                format!("{build}; mkdir \"$CARGO_TARGET_DIR/../../sibling-marker\" && echo sibling-written"),
+                build.to_owned(),
+            ],
             &[],
         )
         .await;
         let (first, second) = (&printed[0], &printed[1]);
+        assert!(
+            first.contains("Read-only file system") || first.contains("Permission denied"),
+            "{first}"
+        );
+        assert!(
+            !first.lines().any(|line| line.trim() == "sibling-written"),
+            "{first}"
+        );
         let output = |p: &str| p.split_once("Output:\n").map_or(p, |(_, o)| o).to_owned();
         let (listing, _) = output(second)
             .split_once("listed\n")

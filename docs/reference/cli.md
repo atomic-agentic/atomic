@@ -187,6 +187,7 @@ authentication](../getting-started/authentication.md).
 | `atomic graph verify-commit <item> --run <run> --step <step> --attempt <n>` | Check a recorded worktree attempt against the item's authorized branch and store verified commit evidence | v0.2, SQLite |
 | `atomic delivery start <source-run> --step <graph-step>` | Open a human gate for a committed coding item with two clean independent reviews, self-review, selected controls and a passing trial merge; the protected project delivery adapter supplies the exact remote target | v0.2, SQLite |
 | `atomic delivery resume <delivery-run>` | Continue approved push, pull request and merge queue effects, reconciling an unknown remote outcome before any further action | v0.2, SQLite |
+| `atomic delivery observe <delivery-run>` | Read the protected provider's queue state after enqueue and durably record pending, merged, dropped or failed observation for the approved PR head; rerun to refresh a nonterminal result, or let `atomic serve` poll due observations with bounded backoff | v0.2, SQLite |
 
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
 | Workflow and graph inspection commands with `--json` | Use the supervision surface from scripts; import/export already support `--json` | v0.5 |
@@ -197,7 +198,16 @@ described in [Delivery adapter](delivery-adapter.md).
 
 A gate decision carries your operator credential, a secret atomic keeps in the
 OS keyring (the Secret Service on Linux) and checks against the gate store.
-Nothing enrolls it for you: run `atomic gates enroll` once per project. On a
+Run `atomic gates enroll` once per project. After upgrading a PostgreSQL
+store with username-only enrollments, rerun that command in each project to
+register its existing secret under the project. Rotation then applies only
+to that project. The local deployment identifies its single operator by
+account name within the project. Separate people using the same account name
+and project share that role. Gate creation and approval both use `USER`, then
+`LOGNAME`. With neither set, Unix services use the effective UID's account
+name, or `uid-<number>` if the UID has no account name. For a gate created
+by an older service under `local:operator`, enroll and decide with
+`USER=operator`. On a
 machine with no OS keyring, such as a headless server or a container, atomic
 refuses with an error rather than store the secret elsewhere; to keep it in a
 directory readable by you only (`$ATOMIC_HOME/credentials`, or

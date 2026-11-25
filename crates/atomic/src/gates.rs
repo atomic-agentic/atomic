@@ -82,10 +82,10 @@ pub struct DecideArgs {
 }
 
 /// The local operator: the account running this command.
-fn operator() -> anyhow::Result<(String, Principal)> {
-    let user = credential::local_user().context("no user name in $USER or $LOGNAME")?;
+fn operator() -> (String, Principal) {
+    let user = credential::operator_user();
     let principal = Principal::local(&user);
-    Ok((user, principal))
+    (user, principal)
 }
 
 pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<()> {
@@ -124,7 +124,7 @@ async fn enroll(rt: &Durare, state: &ProjectState, replace: bool) -> anyhow::Res
     if !std::io::stdin().is_terminal() {
         bail!("atomic gates enroll is a person's command: run it from a terminal");
     }
-    let (user, principal) = operator()?;
+    let (user, principal) = operator();
     let store = credential::configured_store(state.root())?;
     let account = credential::operator_account(state, &user);
     let outcome = if replace {
@@ -219,7 +219,7 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
 /// The local operator's credential for this project, from the configured
 /// store.
 pub(crate) fn operator_credential(state: &ProjectState) -> anyhow::Result<HumanCredential> {
-    let (user, principal) = operator()?;
+    let (user, principal) = operator();
     let store = credential::configured_store(state.root())?;
     let account = credential::operator_account(state, &user);
     let secret = credential::operator_secret(store.as_ref(), &account)?.with_context(|| {

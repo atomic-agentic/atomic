@@ -1179,7 +1179,7 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist. That
+        // keys are another atomic's: denied even if it creates them later. That
         // atomic's credentials and keys sit under
         // [`crate::state::user_config_dir`], the directory denied above and
         // the same function [`crate::state::outside_user_config`] reads, so
@@ -1197,12 +1197,18 @@ impl StateGuard {
         also.extend(crate::state::legacy_secret_dirs(
             crate::state::legacy_config_dir().as_deref(),
         ));
-        if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
+        if crate::state::atomic_home()?.is_some() {
             let defaults = [
-                dirs::data_dir().map(|d| d.join("atomic")),
-                dirs::config_dir().map(|d| d.join("atomic")),
+                crate::state::process_data_dir().map(|dir| dir.join("atomic")),
+                crate::state::legacy_config_dir(),
             ];
-            also.extend(defaults.into_iter().flatten().filter(|d| d.exists()));
+            for dir in defaults.into_iter().flatten() {
+                // dirs may derive a relative place from HOME. Keep the
+                // startup directory even before any component exists.
+                also.push(std::path::absolute(&dir).with_context(|| {
+                    format!("resolve default atomic directory {}", dir.display())
+                })?);
+            }
         }
         Ok(Self::Deny(PrivateState {
             state_dir: state_dir.into(),
@@ -5348,7 +5354,7 @@ async fn new_config_reading(
         project_doc_max_bytes,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
-        agents_enabled: true,
+        agents_enabled: false,
         agent_max_threads: Some(6),
         agent_default_subagent_model: None,
         agent_default_subagent_reasoning_effort: None,
@@ -5493,6 +5499,8 @@ pub(crate) async fn auth_policy(codex_home: &Path) -> anyhow::Result<codex_login
 /// (the codex_apps MCP server), plugins and their suggestions, hosted image
 /// generation, browser and computer use, realtime and in-app surfaces.
 const ATOMIC_OFF: &[Feature] = &[
+    Feature::Collab,
+    Feature::MultiAgentV2,
     Feature::Apps,
     Feature::EnableMcpApps,
     Feature::CodexAppsMcp20260728,
@@ -6001,6 +6009,17 @@ mod tests {
                 Some("data"),
             );
             let denied = also();
+            if atomic_home.is_some() {
+                let default = scratch.join("data/atomic");
+                assert!(
+                    !default.exists(),
+                    "the test must start before the default home exists"
+                );
+                assert!(
+                    denied.contains(&default),
+                    "{default:?} missing from {denied:?}"
+                );
+            }
             for place in &old {
                 assert!(
                     denied.contains(place),
@@ -9180,6 +9199,15 @@ mod tests {
                 api_key_env: None,
                 sign_in: None,
             };
+            let config = new_config(&endpoint, &home, &cwd, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert!(!config.agents_enabled);
+            assert!(!config.features.enabled(Feature::Collab));
+            assert!(!config.features.enabled(Feature::MultiAgentV2));
+            // Its upstream default is currently off. Preserve an explicit
+            // override when a subsequent Codex pin changes that default.
+            assert!(ATOMIC_OFF.contains(&Feature::MultiAgentV2));
             let answer = one_turn(
                 &CodexPaths::without_helpers(),
                 &home,
@@ -9193,7 +9221,31 @@ mod tests {
             assert_eq!(answer, "pong");
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
-            assert!(model.requests()[0].to_string().contains("ping"));
+            let request = &model.requests()[0];
+            assert!(request.to_string().contains("ping"));
+            let tools = request["tools"].as_array().expect("advertised tools");
+            assert!(!tools.is_empty());
+            for tool in tools {
+                let entries =
+                    std::iter::once(tool).chain(tool["tools"].as_array().into_iter().flatten());
+                for entry in entries {
+                    assert!(
+                        !matches!(
+                            entry["name"].as_str(),
+                            Some(
+                                "spawn_agent"
+                                    | "send_input"
+                                    | "wait_agent"
+                                    | "close_agent"
+                                    | "send_message"
+                                    | "followup_task"
+                                    | "list_agents"
+                            )
+                        ),
+                        "{tool}"
+                    );
+                }
+            }
         });
     }
 

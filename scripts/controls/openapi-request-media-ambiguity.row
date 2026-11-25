@@ -1,0 +1,1 @@
+openapi-request-media-ambiguity|crates/atomic-schema/src/openapi.rs|next.0 == rank|false && next.0 == rank|-p atomic-agentic-schema --lib -- openapi::tests::ambiguous_request_media_are_refused_and_parameters_are_preserved

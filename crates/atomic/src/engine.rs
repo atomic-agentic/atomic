@@ -412,14 +412,11 @@ pub fn describe(database: &Database) -> String {
 
 /// One developer on one machine: the local operator decides gates.
 ///
-/// `$USER` only names that operator in gate records. It is not a
+/// The local account name only names that operator in gate records. It is not a
 /// credential: anyone who can set it can set it to anything, so it must never
 /// be what proves a decision came from a person.
 pub fn deployment() -> Deployment {
-    let user = std::env::var("USER")
-        .ok()
-        .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| "operator".into());
+    let user = atomic_core::credential::operator_user();
     Deployment::Local {
         operator: Principal::local(&user),
     }
