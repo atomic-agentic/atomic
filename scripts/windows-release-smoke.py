@@ -6,9 +6,9 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile
@@ -27,7 +27,6 @@ def coding_turn(exe, project, repository, state, env):
         "$ErrorActionPreference='Stop'; "
         "Write-Output ('cwd=' + [Environment]::CurrentDirectory + ' PowerShell=' + $PWD.Path); "
         "Write-Output ('PS version=' + $PSVersionTable.PSVersion + ' location=' + (Get-Location).Path); "
-        "Set-Location -LiteralPath ([Environment]::CurrentDirectory); "
         "Copy-Item pricing.py windows-copy.py; "
         f"try {{ [IO.File]::ReadAllText('{literal}') | Out-Null; throw 'private file was readable' }} "
         "catch [UnauthorizedAccessException] { "
@@ -114,8 +113,11 @@ returns: steps.implement.output
 
 def main():
     archive, sbom = Path(sys.argv[1]), Path(sys.argv[2])
-    with tempfile.TemporaryDirectory(prefix="atomic Windows smoke ", dir=Path.home(), ignore_cleanup_errors=True) as directory:
-        scratch = Path(directory)
+    # A normal project directory inherits its parent's ACL. Python's tempfile
+    # requests a user-only DACL on Windows, including on the worktree's ancestors.
+    scratch = Path.home() / ("atomic Windows smoke " + secrets.token_hex(6))
+    scratch.mkdir()
+    try:
         with ZipFile(archive) as bundle:
             bundle.extractall(scratch)
         exe = scratch / archive.stem / "atomic.exe"
@@ -146,6 +148,9 @@ def main():
         # Reuse the project to cover Codex's already-provisioned helper cache.
         for _ in range(2):
             coding_turn(exe, project, dest / "repository", state, env)
+
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 if __name__ == "__main__":
