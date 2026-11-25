@@ -66,6 +66,7 @@ pub(crate) fn allow_private_profile_cwd_ancestors(cwd: &Path, codex_home: &Path)
         // and is an ordinary directory. The helper checks existing ACEs and
         // preserves deny entries; NO_INHERITANCE confines the grant to this
         // directory, so unrelated private children do not gain read access.
+        #[allow(unsafe_code)]
         unsafe {
             ensure_allow_mask_aces_with_inheritance(
                 ancestor,
