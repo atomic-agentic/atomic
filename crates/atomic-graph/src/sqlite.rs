@@ -753,7 +753,7 @@ async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, S
 // `atomic_graph_blocked` already holds every unresolved direct blocker. Any
 // longer path starts with one of these rows, so source membership needs only
 // this indexed lookup; expanding all reachable pairs adds no information.
-const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
+const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message','gate') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
 const CLAIM_HAS_BLOCKER_SQL: &str =
     "SELECT EXISTS (SELECT 1 FROM atomic_graph_blocked WHERE source=?)";
 async fn ready_items(
@@ -1005,6 +1005,11 @@ impl GraphStore for SqliteStore {
             if draft.status == Status::Closed {
                 return Err(StoreError::CannotCreateClosed { item_id: draft.id });
             }
+            if draft.kind == "gate" || draft.id.starts_with("gate:") {
+                return Err(StoreError::InvalidStatusTransition {
+                    detail: "gate items are read-only copies of the gate store".into(),
+                });
+            }
             let actor = self.actor_for_write(actor, "create a human item")?;
             let fingerprint = create_request_fingerprint(&actor, &draft)?;
             self.run_at(move |c, now|Box::pin(async move {
@@ -1088,7 +1093,13 @@ impl GraphStore for SqliteStore {
                         }
                     }
                     for endpoint in [&from, &to] {
-                        if get_item(c, endpoint).await?.is_none() {
+                        let item = get_item(c, endpoint).await?;
+                        if item.as_ref().is_some_and(|i| i.kind == "gate") {
+                            return Err(StoreError::InvalidEdge {
+                                detail: "gate items are read-only copies of the gate store".into(),
+                            });
+                        }
+                        if item.is_none() {
                             return Err(StoreError::MissingItem {
                                 item_id: endpoint.clone(),
                             });
@@ -1137,6 +1148,11 @@ impl GraphStore for SqliteStore {
                         .ok_or_else(|| StoreError::MissingItem {
                             item_id: id.clone(),
                         })?;
+                    if item.kind == "gate" {
+                        return Err(StoreError::InvalidStatusTransition {
+                            detail: "gate items are read-only copies of the gate store".into(),
+                        });
+                    }
                     // CONTROL_OFF: graph-admin-pin-epic-only
                     // Import leaves Beads epics open; only an operator may pin
                     // an open epic for a graph run. A terminal or non-epic
@@ -1754,6 +1770,7 @@ async fn claim_id(
     }
     if i.kind == "goal"
         || i.kind == "message"
+        || i.kind == "gate"
         || i.due_at.is_some_and(|due| millis(due) > now)
         || sqlx::query_scalar::<_, i64>(CLAIM_HAS_BLOCKER_SQL)
             .bind(id)
@@ -1870,6 +1887,11 @@ async fn import_jsonl(
                 }
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
                     errors.push(format!("line {} needs id and title", n + 1));
+                }
+                if json_str(&v, "id").is_some_and(|id| id.starts_with("gate:"))
+                    || json_str(&v, "issue_type") == Some("gate")
+                {
+                    errors.push(format!("line {} uses the reserved gate projection", n + 1));
                 }
                 let status = json_str(&v, "status").unwrap_or("");
                 if status == "pinned" || Status::parse(status).is_none() {
@@ -2186,7 +2208,7 @@ async fn import_jsonl(
     Ok(report)
 }
 async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
-    let rows = sqlx::query("SELECT * FROM atomic_graph_items ORDER BY id")
+    let rows = sqlx::query("SELECT * FROM atomic_graph_items WHERE NOT (kind='gate' AND created_by='gate-store') ORDER BY id")
         .fetch_all(&mut *c)
         .await
         .map_err(db)?;
@@ -2340,6 +2362,72 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gate_copies_are_visible_but_never_work_or_exported_items() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-gate-copy-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        store
+            .run(|conn| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('gate:run:ship','Ship','open human gate','gate',0,'blocked',NULL,'agent','gate-store',1)")
+                        .execute(conn)
+                        .await
+                        .map_err(db)?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("project gate");
+
+        let actor = Actor::agent("test");
+        let shown = store
+            .show(actor.clone(), "gate:run:ship".into())
+            .await
+            .expect("show")
+            .expect("gate copy");
+        assert_eq!(shown.item.kind, "gate");
+        assert_eq!(shown.item.status, Status::Blocked);
+        assert!(
+            store
+                .ready(actor.clone(), 10)
+                .await
+                .expect("ready")
+                .is_empty()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "test".into(),
+                    "gate:run:ship".into(),
+                    Duration::from_secs(30)
+                )
+                .await
+                .expect("claim")
+                .is_none()
+        );
+        assert_eq!(store.export(actor.clone()).await.expect("export"), "");
+
+        for mut draft in [
+            Draft::new("gate:fake", "fake"),
+            Draft::new("at-fake", "fake"),
+        ] {
+            if draft.id == "at-fake" {
+                draft.kind = "gate".into();
+            }
+            assert!(matches!(
+                store
+                    .create_item(actor.clone(), draft.id.clone(), draft)
+                    .await,
+                Err(StoreError::InvalidStatusTransition { .. })
+            ));
+        }
+    }
 
     #[test]
     fn readiness_and_claim_use_the_blocker_source_index_without_a_recursive_closure() {

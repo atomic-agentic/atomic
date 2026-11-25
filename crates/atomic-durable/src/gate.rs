@@ -400,6 +400,35 @@ pub fn gate_id(run: &str, step: &str) -> String {
     format!("{run}:{step}")
 }
 
+// The gate store owns this namespace. Graph rows are disposable copies: a
+// decision never derives authority from their presence or status.
+fn graph_gate_id(gate: &str) -> String {
+    format!("gate:{gate}")
+}
+
+async fn project_open_gate(
+    tx: &mut Tx<'_, '_>,
+    gate: &str,
+    title: &str,
+    run: &str,
+    at: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,?,'gate',0,'blocked',NULL,'agent','gate-store',?)",
+        &[Param::Text(graph_gate_id(gate)), Param::Text(title.to_owned()), Param::Text(format!("Open human gate for run {run}")), Param::Int(at)],
+    ).await?;
+    Ok(())
+}
+
+async fn remove_gate_projection(tx: &mut Tx<'_, '_>, gate: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM atomic_graph_items WHERE id=? AND kind='gate' AND created_by='gate-store'",
+        &[Param::Text(graph_gate_id(gate))],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The topic a gate's wake-up is sent on.
 fn topic(gate: &str) -> String {
     format!("atomic.gate:{gate}")
@@ -623,6 +652,9 @@ async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
             ],
         )
         .await?;
+    if won == 1 {
+        remove_gate_projection(tx, &gate.id).await?;
+    }
     if won == 1
         && let (Some(answer), Some(q)) = (&default, &gate.question)
     {
@@ -745,7 +777,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS BIGINT), ?, 'open')",
                     &[
                         Param::Text(id.clone()),
-                        Param::Text(run),
+                        Param::Text(run.clone()),
                         Param::Text(spec.workflow.clone()),
                         Param::Text(step),
                         Param::Text(spec.title.clone()),
@@ -767,6 +799,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                     )
                     .await?;
                 }
+                project_open_gate(&mut tx, &id, &spec.title, &run, now).await?;
                 read_gate(&mut tx, &id)
                     .await?
                     .ok_or_else(|| corrupt(format!("gate {id} was not written")))
@@ -1006,6 +1039,9 @@ pub async fn decide<R: DurableRuntime>(
                                 ],
                             )
                             .await?;
+                        if won == 1 {
+                            remove_gate_projection(&mut tx, &gate.id).await?;
+                        }
                         if won == 1
                             && let Some(answer) = &answer
                         {

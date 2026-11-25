@@ -349,6 +349,15 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX atomic_delivery_queue_observations_due ON atomic_delivery_queue_observations (status,next_poll_at,delivery_run)",
         ],
     },
+    Migration {
+        version: 23,
+        name: "open-gate-graph-projection",
+        // Existing gates are backfilled; gate transactions maintain the
+        // read-only copies after this migration commits.
+        sql: &[
+            "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) SELECT 'gate:' || gate_id,title,'Open human gate for run ' || run,'gate',0,'blocked',NULL,'agent','gate-store',opened_at FROM atomic_gates WHERE state='open'",
+        ],
+    },
 ];
 
 const HISTORY_TABLE: &str = "CREATE TABLE atomic_store_history (
@@ -1837,6 +1846,39 @@ mod tests {
         let p = db("new");
         assert_eq!(open_sqlite(&p).await.expect("open"), STORE_VERSION);
         assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn gate_projection_migration_backfills_only_open_gates() {
+        let p = db("gate-projection-backfill");
+        open_sqlite_with(&p, &MIGRATIONS[..22])
+            .await
+            .expect("version 22 store");
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("connect old store");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:open','run','wf','open','Open gate','{}','[]','digest','[]','low',1,NULL,'reject','open'),('run:closed','run','wf','closed','Closed gate','{}','[]','digest','[]','low',2,NULL,'reject','approved')")
+            .execute(&mut conn)
+            .await
+            .expect("old gates");
+        conn.close().await.expect("close old connection");
+
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("connect upgraded store");
+        let projected: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id,kind,status FROM atomic_graph_items WHERE id LIKE 'gate:%' ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("gate copies");
+        assert_eq!(
+            projected,
+            vec![("gate:run:open".into(), "gate".into(), "blocked".into())]
+        );
+        conn.close().await.expect("close upgraded connection");
         let _ = std::fs::remove_file(&p);
     }
 
