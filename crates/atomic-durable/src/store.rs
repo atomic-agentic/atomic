@@ -2503,7 +2503,7 @@ mod tests {
                 .expect("history")
                 .expect("recorded history")
                 .len(),
-            12
+            13
         );
     }
 
