@@ -739,11 +739,13 @@ scripts/dev.sh cargo test -p atomic-agentic --locked --test coding_tasks
 A release starts from a tag `v<version>` whose version equals the
 `atomic-agentic` package's. The Release workflow then:
 
-1. builds `atomic` in release mode for `x86_64-unknown-linux-gnu` and
-   `aarch64-apple-darwin`, with the checkout and cargo paths remapped out of
+1. builds `atomic` in release mode for `x86_64-unknown-linux-gnu`,
+   `aarch64-apple-darwin` and `x86_64-pc-windows-msvc`, with the checkout and cargo paths remapped out of
    the binary;
 2. packages each binary with `LICENSE`, `NOTICE` and
-   `THIRD-PARTY-NOTICES.md` into a deterministic `.tar.gz`;
+   `THIRD-PARTY-NOTICES.md` into a deterministic archive. Windows uses a ZIP
+   containing `atomic.exe` and the three sandbox helpers built from the Codex pin.
+   Linux and macOS use `.tar.gz`;
 3. writes each binary's CycloneDX SBOM, which records the binary's SHA-256 and
    lists every fork at its pinned revision;
 4. signs each archive and each SBOM with Sigstore, keyless, under the

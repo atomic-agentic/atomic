@@ -66,6 +66,14 @@ pub(crate) fn run_interactive(
     #[cfg(target_os = "macos")]
     let mut supervisor = crate::worker_lifetime::Supervisor::prepare(&mut command)
         .map_err(|e| start(e.to_string()))?;
+    #[cfg(windows)]
+    let (mut child, _job) = crate::windows_worker::spawn(
+        &mut command,
+        crate::compiler_host::memory_limit(),
+        crate::compiler_host::limits::CPU_SECONDS,
+    )
+    .map_err(|e| start(e.to_string()))?;
+    #[cfg(not(windows))]
     let mut child = command.spawn().map_err(|e| start(e.to_string()))?;
     #[cfg(target_os = "macos")]
     supervisor.child_spawned();

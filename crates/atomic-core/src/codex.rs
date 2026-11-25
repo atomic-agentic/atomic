@@ -1793,12 +1793,18 @@ fn denied_paths_with(
 /// UTF-8, since then the pattern may not match it and the databases would
 /// go undenied.
 fn sqlite_glob(home: &Path) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let home = dunce::simplified(home);
     let Some(text) = home.to_str() else {
         bail!(
             "{} is not UTF-8, so atomic cannot deny Codex's databases there",
             home.display()
         );
     };
+    // A Windows separator is a literal path boundary in the glob. Keep the
+    // check for pattern syntax in the directory names themselves.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
     let special = text.matches(GLOB_SPECIAL).next();
     if let Some(c) = special {
         bail!(
@@ -2279,6 +2285,79 @@ fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(records))
 }
 
+/// Set up the pinned Codex backend for this turn's final profile and roots.
+#[cfg(windows)]
+async fn prepare_windows_turn(config: &mut Config) -> anyhow::Result<()> {
+    use codex_config::types::WindowsSandboxModeToml;
+    use codex_protocol::sandbox::SandboxType;
+
+    let mode = Some(WindowsSandboxModeToml::Elevated);
+    config
+        .config_layer_stack
+        .requirements()
+        .windows_sandbox_mode
+        .can_set(&mode)?;
+    config.permissions.windows_sandbox_mode = mode;
+    config.permissions.windows_sandbox_type = SandboxType::WindowsRestrictedToken;
+    config.validate_windows_mxc_requirement()?;
+    let profile = config.permissions.effective_permission_profile();
+    let roots = config.workspace_roots.clone();
+    let cwd = config.cwd.to_path_buf();
+    let home = config.codex_home.to_path_buf();
+    // The setup helper is trusted host code. Project-defined environment
+    // variables must not select proxy exceptions or additional setup roots.
+    let host_paths = [
+        "SystemRoot",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramData",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_owned(), value))
+    })
+    .collect();
+    tokio::task::spawn_blocking(move || {
+        codex_core::windows_sandbox::prepare_elevated_sandbox(
+            &profile,
+            &roots,
+            &cwd,
+            &host_paths,
+            &home,
+        )
+    })
+    .await
+    .context("join Windows sandbox setup")?
+    .context("prepare the Windows sandbox for this turn")
+}
+
+/// Require packaged helpers before Codex can fall back to its executable search path.
+#[cfg(windows)]
+fn require_windows_helpers() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("resolve atomic.exe")?;
+    let dir = exe.parent().context("atomic.exe has no parent")?;
+    for name in [
+        "codex-command-runner.exe",
+        "codex-windows-sandbox-setup.exe",
+        "codex-windows-sandbox-service.exe",
+    ] {
+        let path = dir.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("locate bundled Windows sandbox helper {}", path.display()))?;
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "expected a regular Windows sandbox helper at {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
 /// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
 /// denies paths itself. On Linux, Codex's sandbox reads a profile that
@@ -2286,6 +2365,7 @@ fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
 /// denial hold, so without one the thread could not be kept out of other
 /// attempts' scratch directories; atomic refuses it before the thread starts
 /// rather than run it with less denied. On macOS the denial is not verified.
+#[cfg(any(not(windows), test))]
 fn refuse_denied_without_helper(
     paths: &CodexPaths,
     denied: &[PathBuf],
@@ -4665,6 +4745,9 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    #[cfg(windows)]
+    require_windows_helpers()?;
+    #[cfg(not(windows))]
     refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     // A command whose HOME is the one that must not exist, as a read-only
     // turn's is, runs only while it does not: refused before anything
@@ -4757,6 +4840,8 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
+    #[cfg(windows)]
+    prepare_windows_turn(&mut config).await?;
     config.permissions.shell_environment_policy = command_environment(&env);
     // No login shell, and no snapshot taken from one: a command never runs
     // the developer's or the system's shell startup files.
@@ -5418,7 +5503,11 @@ pub const SHELL_EXCLUDES: &[&str] = &[
 /// home directory even when it is not a login shell (bash's `.bashrc` when
 /// its input is a socket, zsh's `.zshenv` always), and those can export
 /// anything.
+#[cfg(unix)]
 pub const SHELL_HOME: &str = "/nonexistent";
+/// An absent home for a Windows read-only shell, checked before each turn.
+#[cfg(windows)]
+pub const SHELL_HOME: &str = r"C:\nonexistent";
 
 /// Refused unless [`SHELL_HOME`] is not there: a shell given it as its home
 /// would read startup files from it, so one put there, by whoever may make

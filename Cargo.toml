@@ -90,6 +90,8 @@ ctor = "=1.0.6"
 # Only atomic-core may depend on these.
 codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-config = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-core = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-login = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }

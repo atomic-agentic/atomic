@@ -473,6 +473,11 @@ The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
 
+The v0.2 Windows AMD64 release job exercises the extracted CLI with a scripted
+Codex provider. Its acceptance test requires a write in the fixture worktree
+and a denied read from private Atomic state. Standalone exec commands on Windows
+return an unsupported-confinement error.
+
 ## Observability stages
 
 The local baseline is saved run inspection and basic spans in v0.1 (M12).

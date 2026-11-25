@@ -602,6 +602,8 @@ dependencies = [
  "atomic-agentic-schema",
  "boa_engine",
  "codex-app-server",
+ "codex-config",
+ "codex-core",
  "codex-core-api",
  "codex-extension-api",
  "codex-keyring-store",
@@ -611,6 +613,7 @@ dependencies = [
  "codex-protocol",
  "ctor 1.0.6",
  "dirs",
+ "dunce",
  "getrandom 0.3.4",
  "globset",
  "hmac 0.12.1",
@@ -643,6 +646,7 @@ dependencies = [
  "tsz-common",
  "tsz-core",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

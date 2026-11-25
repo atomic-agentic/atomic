@@ -79,6 +79,20 @@ cosign verify-blob \
   atomic-<version>-<target>.tar.gz
 ```
 
+For a Windows AMD64 ZIP from a published release, run these commands in PowerShell.
+Replace `<version>` with the version printed in the filename. Extract the entire
+archive so the Codex sandbox helpers sit beside `atomic.exe`.
+
+```powershell
+$version = '<version>'
+$name = "atomic-$version-x86_64-pc-windows-msvc"
+$identity = "https://github.com/atomic-agentic/atomic/.github/workflows/release.yml@refs/tags/v$version"
+cosign verify-blob --bundle "$name.zip.sigstore.json" --certificate-identity $identity --certificate-oidc-issuer https://token.actions.githubusercontent.com "$name.zip"
+if ($LASTEXITCODE -ne 0) { throw 'Archive signature verification failed' }
+Expand-Archive "$name.zip" -DestinationPath .
+& ".\$name\atomic.exe" --version
+```
+
 It prints `Verified OK` and exits 0 only when the archive is the one the
 workflow signed at that tag. On any other result, do not use the file. The SBOM, `atomic-<version>-<target>.cdx.json`, checks
 the same way with its own bundle, and it records the SHA-256 of the `atomic`
