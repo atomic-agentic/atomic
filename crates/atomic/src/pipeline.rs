@@ -4688,6 +4688,12 @@ fn verified_formatting_path(repo: &Repo, base: &str, commit: &str, diff: &str) -
     Some(a.path.clone())
 }
 
+/// A control row may select the changed Markdown path even when it is the
+/// only changed blob, so path proof does not replace this inventory check.
+fn review_followup_controls_clean(touched_controls: &[String], security_item: bool) -> bool {
+    touched_controls.is_empty() && !security_item
+}
+
 pub(crate) fn route_review_findings(
     reviewer: &str,
     verdict: &Value,
@@ -4755,6 +4761,16 @@ pub(crate) fn route_review_findings(
 mod severity_routing_tests {
     use super::{GraphPipelineRun, TRAILING_SPACE, added_prose_space, route_review_findings};
     use serde_json::json;
+
+    #[test]
+    fn touched_control_rows_block_followups() {
+        assert!(super::review_followup_controls_clean(&[], false));
+        assert!(!super::review_followup_controls_clean(
+            &["docs-guide-row".into()],
+            false
+        ));
+        assert!(!super::review_followup_controls_clean(&[], true));
+    }
 
     #[test]
     fn formatting_proof_requires_one_unchanged_path_and_mode() {
@@ -5443,9 +5459,8 @@ async fn reviewed<C: WorkflowContext>(
                 } else {
                     (Vec::new(), Vec::new())
                 };
-            // The one-blob formatting proof excludes changed control rows.
-            // CONTROL_OFF: review-followup-security-label
-            controls_clean = !security_item;
+            // CONTROL_OFF: review-followup-touched-controls, review-followup-security-label
+            controls_clean = review_followup_controls_clean(&touched_controls, security_item);
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {
                     return Err(failed(format!(

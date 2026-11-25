@@ -10326,7 +10326,17 @@ fn host_touched_control_refuses_workflow_and_model_omission_before_reviewer() {
     on_codex_runtime(async {
         let dir = scratch("host-control-omitted");
         let project = project(&dir);
-        let (mut pipeline, base) = self_reviewed_with_control(&project, false);
+        let (mut pipeline, _) = self_reviewed_with_control(&project, false);
+        std::fs::create_dir_all(project.join("docs")).expect("documentation directory");
+        std::fs::write(project.join("docs/guide.md"), "Example text.\n")
+            .expect("baseline Markdown blob");
+        std::fs::write(project.join("scripts/controls/row-test.row"),
+            "row-test|docs/guide.md|Example|Changed|--lib -- guard_row\n")
+            .expect("control selecting Markdown path");
+        plain_git(&project, &["add", "."]);
+        plain_git(&project, &["commit", "-q", "-m", "select Markdown path"]);
+        let base = plain_git(&project, &["rev-parse", "HEAD"]);
+        plain_git(&project, &["update-ref", "refs/heads/main", &base]);
         let Step::Atom(step) = &mut pipeline.steps[0] else {
             panic!("coding atom")
         };
@@ -10372,10 +10382,10 @@ fn host_touched_control_refuses_workflow_and_model_omission_before_reviewer() {
         std::fs::write(
             find_worktree(&root)
                 .expect("author worktree")
-                .join("code.txt"),
-            "after\n",
+                .join("docs/guide.md"),
+            "Example text. \n",
         )
-        .expect("touch control's switched file");
+        .expect("touch control's switched Markdown file");
         std::fs::write(&release, "").expect("release author");
         let error = rt
             .result::<Value>("host-control-omitted")

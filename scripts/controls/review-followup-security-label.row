@@ -1,1 +1,1 @@
-review-followup-security-label|crates/atomic/src/pipeline.rs|controls_clean = !security_item;|controls_clean = true;|-p atomic-agentic --test graph_work_loop -- imported_security_label_excludes_editorial_followups
+review-followup-security-label|crates/atomic/src/pipeline.rs|!security_item|true|-p atomic-agentic --lib severity_routing_tests::touched_control_rows_block_followups
