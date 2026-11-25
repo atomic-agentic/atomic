@@ -197,24 +197,9 @@ jobs:
         run: |
           $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
           $env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$env:GITHUB_WORKSPACE=/atomic", "--remap-path-prefix=$cargoHome=/cargo", '-C', 'link-arg=/STACK:8388608', '-C', 'target-feature=+crt-static') -join [char]31
-          cargo build --release --locked -p atomic-agentic --target ${{ env.WINDOWS_TARGET }}
-
-      - name: Build pinned Windows sandbox helpers
-        shell: pwsh
-        run: |
-          $target = '${{ env.WINDOWS_TARGET }}'
-          $env:LIBSQLITE3_FLAGS = 'SQLITE_DISABLE_INTRINSIC'
-          $revision = python -c "import tomllib; print(tomllib.load(open('deps/codex.toml','rb'))['codex']['rev'])"
-          $metadata = cargo metadata --locked --format-version 1 | ConvertFrom-Json
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          $package = @($metadata.packages | Where-Object name -eq codex-app-server)
-          if ($package.Count -ne 1) { throw 'Expected one pinned Codex checkout' }
-          $workspace = Split-Path (Split-Path $package[0].manifest_path)
-          if ((git -C $workspace rev-parse HEAD) -ne $revision) { throw 'Unexpected Codex revision' }
-          $out = Join-Path $env:GITHUB_WORKSPACE target
-          Push-Location $workspace
-          cargo build --locked --release --target $target --target-dir $out --bin codex-command-runner --bin codex-windows-sandbox-setup --bin codex-windows-sandbox-service
-          exit $LASTEXITCODE
+          cargo build --release --locked --target ${{ env.WINDOWS_TARGET }} `
+            -p atomic-agentic -p codex-windows-sandbox -p codex-windows-sandbox-service `
+            --bin atomic --bin codex-command-runner --bin codex-windows-sandbox-setup --bin codex-windows-sandbox-service
 
       - name: The binary runs
         run: target/${{ env.WINDOWS_TARGET }}/release/atomic.exe --version
@@ -222,22 +207,39 @@ jobs:
       - name: Package
         run: scripts/release-package.sh ${{ env.WINDOWS_TARGET }}
 
-      - name: Test the extracted Windows release
-        run: python scripts/windows-release-smoke.py target/dist/*.zip target/dist/*.cdx.json
-
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: atomic-${{ env.WINDOWS_TARGET }}
           path: target/dist/*
           if-no-files-found: error
 
+  windows-smoke:
+    name: Exercise Windows release on a fresh machine
+    needs: windows
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - name: Preserve fixture bytes
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: atomic-x86_64-pc-windows-msvc
+          path: dist
+
+      - name: Test the extracted Windows release
+        shell: bash
+        run: python scripts/windows-release-smoke.py dist/*.zip dist/*.cdx.json
+
   # Signing runs in a job of its own, so the OIDC token that signs is never
   # available to the build, its build scripts or its dependencies.
   sign:
     name: Sign
-    needs: [build, windows]
+    needs: [build, windows, windows-smoke]
     if: >-
-      ${{ !cancelled() && needs.windows.result == 'success' &&
+      ${{ !cancelled() && needs.windows-smoke.result == 'success' &&
           (needs.build.result == 'success' || (inputs.windows_only && needs.build.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     permissions:

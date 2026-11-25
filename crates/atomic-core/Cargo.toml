@@ -90,6 +90,8 @@ url = { workspace = true }
 seccompiler = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
+# Package the service binary from the same locked Codex graph as atomic.exe.
+codex-windows-sandbox-service = { workspace = true }
 codex-config = { workspace = true }
 codex-core = { workspace = true }
 dunce = "1"
