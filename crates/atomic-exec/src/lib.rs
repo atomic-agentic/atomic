@@ -627,6 +627,11 @@ impl LocalBackend {
     pub fn prepare(&self, command: &Command) -> Result<(Command, Option<Held>), ExecError> {
         match &self.confine {
             Some(confine) => confine.confine_held(command, &self.tmp),
+            #[cfg(windows)]
+            None => Err(ExecError::Unconfinable {
+                message: "the Windows exec backend cannot confine standalone commands".into(),
+            }),
+            #[cfg(not(windows))]
             None => Ok((command.clone(), None)),
         }
     }

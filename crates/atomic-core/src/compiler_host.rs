@@ -12,7 +12,7 @@ use std::{
 };
 
 mod astro_parser;
-mod limits;
+pub(crate) mod limits;
 #[cfg(test)]
 mod tests;
 mod typescript;

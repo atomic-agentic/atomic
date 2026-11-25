@@ -602,6 +602,8 @@ dependencies = [
  "atomic-agentic-schema",
  "boa_engine",
  "codex-app-server",
+ "codex-config",
+ "codex-core",
  "codex-core-api",
  "codex-extension-api",
  "codex-keyring-store",
@@ -609,8 +611,10 @@ dependencies = [
  "codex-network-proxy",
  "codex-process-hardening",
  "codex-protocol",
+ "codex-windows-sandbox-service",
  "ctor 1.0.6",
  "dirs",
+ "dunce",
  "getrandom 0.3.4",
  "globset",
  "hmac 0.12.1",
@@ -643,6 +647,7 @@ dependencies = [
  "tsz-common",
  "tsz-core",
  "url",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5065,6 +5070,23 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing-appender",
+ "windows 0.58.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "codex-windows-sandbox-service"
+version = "0.169.0"
+source = "git+https://github.com/atomic-agentic/codex?rev=f8e52f30a7d56b045b93068c156aae8a4a312ba6#f8e52f30a7d56b045b93068c156aae8a4a312ba6"
+dependencies = [
+ "anyhow",
+ "codex-cloud-config",
+ "codex-config",
+ "codex-core",
+ "codex-windows-sandbox",
+ "serde_json",
+ "tokio",
+ "toml 0.9.11+spec-1.1.0",
  "windows 0.58.0",
  "windows-sys 0.61.2",
 ]

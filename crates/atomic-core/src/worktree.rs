@@ -423,6 +423,8 @@ impl Worktrees {
         let safe = self.repo.clone().with_empty_attributes()?;
         std::fs::create_dir_all(&self.dir).map_err(io("create", &self.dir))?;
         let dir = std::fs::canonicalize(&self.dir).map_err(io("resolve", &self.dir))?;
+        #[cfg(windows)]
+        let dir = dunce::simplified(&dir);
         let name = worktree_name(run, step);
         let path = dir.join(&name);
         self.remove(&path, &name)?;
@@ -672,6 +674,8 @@ impl Worktrees {
             Err(e) => return Err(io("read", &self.dir)(e)),
         };
         let dir = std::fs::canonicalize(&self.dir).map_err(io("resolve", &self.dir))?;
+        #[cfg(windows)]
+        let dir = dunce::simplified(&dir);
         let mut names: Vec<String> = entries
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with(&start))
