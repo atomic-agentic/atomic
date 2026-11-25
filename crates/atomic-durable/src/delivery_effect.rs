@@ -624,6 +624,29 @@ pub async fn due_queue_observation_in(
     row.map(|row| row.text("delivery_run")).transpose()
 }
 
+/// Defer a due row whose local record cannot be observed at this layout.
+/// Keep its last provider outcome visible and move only its retry schedule,
+/// so one bad row cannot starve later rows across serve restarts.
+pub async fn defer_queue_observation_in(
+    tx: &mut Tx<'_, '_>,
+    project: &str,
+    run: &str,
+    now: i64,
+) -> Result<()> {
+    let row = tx.query_opt(
+        "SELECT o.poll_attempts FROM atomic_delivery_queue_observations o JOIN atomic_run_projects p ON p.run_id=o.delivery_run WHERE p.project=? AND o.delivery_run=? AND o.status IN ('pending','failed') AND o.next_poll_at<=?",
+        &[text(project), text(run), Param::Int(now)],
+    ).await?;
+    if let Some(row) = row {
+        let (attempts, next) = next_poll("failed", row.int("poll_attempts")?, now);
+        tx.execute(
+            "UPDATE atomic_delivery_queue_observations SET poll_attempts=?,next_poll_at=? WHERE delivery_run=? AND status IN ('pending','failed') AND next_poll_at<=?",
+            &[Param::Int(attempts), Param::Int(next), text(run), Param::Int(now)],
+        ).await?;
+    }
+    Ok(())
+}
+
 fn next_poll(status: &str, prior_attempts: i64, observed_at: i64) -> (i64, i64) {
     if status == "merged" || status == "dropped" {
         return (prior_attempts, i64::MAX);

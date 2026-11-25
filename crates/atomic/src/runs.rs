@@ -30,6 +30,13 @@ use std::time::Duration;
 const REDELIVERY: Duration = Duration::from_secs(5);
 const QUEUE_POLL_TICK: Duration = Duration::from_secs(1);
 
+fn queue_poll_now() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+}
+
 /// A separate runtime reads one due row at a time. In particular, the
 /// protected provider read never holds the serve loop or a store transaction.
 async fn poll_queue_outcomes(state: ProjectState) {
@@ -44,10 +51,7 @@ async fn poll_queue_outcomes(state: ProjectState) {
         return;
     };
     loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|duration| i64::try_from(duration.as_millis()).ok());
+        let now = queue_poll_now();
         if let Some(now) = now {
             let scoped_project = project.clone();
             let due = rt
@@ -65,7 +69,27 @@ async fn poll_queue_outcomes(state: ProjectState) {
                 Ok(Some(run)) => {
                     if delivery::observe_one(&rt, &state, &run).await.is_err() {
                         atomic_core::log_line!("atomic serve: queue outcome refresh failed");
-                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        let deferred_at = queue_poll_now().unwrap_or(now);
+                        let scoped_project = project.clone();
+                        let deferred = rt
+                            .control_transaction(move |mut tx| {
+                                let project = scoped_project.clone();
+                                let run = run.clone();
+                                Box::pin(async move {
+                                    atomic_durable::delivery_effect::defer_queue_observation_in(
+                                        &mut tx,
+                                        &project,
+                                        &run,
+                                        deferred_at,
+                                    )
+                                    .await
+                                })
+                            })
+                            .await;
+                        if deferred.is_err() {
+                            atomic_core::log_line!("atomic serve: queue outcome deferral failed");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        }
                     }
                 }
                 Ok(None) => {}

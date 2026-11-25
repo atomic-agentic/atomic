@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str = "reviewed-source";
 const RUN: &str = "delivery-crash-run";
+const OLD_LAYOUT_RUN: &str = "a-old-layout-delivery";
 const STEP: &str = "graph.00000.fix";
 const HEAD: &str = "45f80e38d6c836b32d82ef185c152d69fc8dc383";
 const TRIAL_HEAD: &str = "94cf16751ef4fa8f0436bbb3cab9dbac05082867";
@@ -584,6 +585,33 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
     };
     fs::write(dir.join("unreadable-enqueue"), "").expect("fail provider read");
     due().await.expect("make failed read due");
+    let project_key = format!("project/{id}");
+    rt.control_transaction(move |mut tx| {
+        let project = project_key.clone();
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO workflow_status (workflow_uuid,status,name,application_version,inputs,output) SELECT ?,status,name,?,inputs,output FROM workflow_status WHERE workflow_uuid=?",
+                &[text(OLD_LAYOUT_RUN), text("atomic.pipeline.0"), text(RUN)],
+            ).await?;
+            tx.execute(
+                "INSERT INTO atomic_run_projects (run_id,project) VALUES (?,?)",
+                &[text(OLD_LAYOUT_RUN), text(&project)],
+            ).await?;
+            tx.execute(
+                "INSERT INTO atomic_delivery_queue_observations (delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail,poll_attempts,next_poll_at) SELECT ?,plan_digest,repository,pull_request_number,head,'pending',NULL,NULL,NULL,observed_at,'',0,0 FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+                &[text(OLD_LAYOUT_RUN), text(RUN)],
+            ).await?;
+            Ok(())
+        })
+    }).await.expect("seed old-layout due row");
+    assert_eq!(
+        rt.own_run_record(OLD_LAYOUT_RUN)
+            .await
+            .expect("old run")
+            .expect("old run record")
+            .version,
+        "atomic.pipeline.0"
+    );
     let own_project = format!("project/{id}");
     let due_run = rt
         .control_transaction(move |mut tx| {
@@ -599,7 +627,7 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
         })
         .await
         .expect("query current project");
-    assert_eq!(due_run.as_deref(), Some(RUN));
+    assert_eq!(due_run.as_deref(), Some(OLD_LAYOUT_RUN));
     // Count model transport connections while the provider status changes.
     let mut first = command(&root, Path::new(env!("CARGO_BIN_EXE_atomic")))
         .arg("serve")
@@ -637,6 +665,15 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
     let (state, attempts, next) = status().await.expect("failed schedule");
     assert_eq!(state, "failed");
     assert_eq!(attempts, 1);
+    let (old_state, old_attempts, old_next) = rt.control_transaction(|mut tx| Box::pin(async move {
+        let row = tx.query_one("SELECT status,poll_attempts,next_poll_at FROM atomic_delivery_queue_observations WHERE delivery_run=?", &[text(OLD_LAYOUT_RUN)]).await?;
+        Ok((row.text("status")?, row.int("poll_attempts")?, row.int("next_poll_at")?))
+    })).await.expect("old row schedule");
+    assert_eq!(
+        old_state, "pending",
+        "incompatible row retains its last provider observation"
+    );
+    assert_eq!(old_attempts, 1, "incompatible row must be deferred durably");
     let now = i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -645,13 +682,17 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
     )
     .expect("stored time range");
     assert!(next > now + 5_000, "failure must schedule backoff");
+    assert!(
+        old_next > now + 5_000,
+        "old-layout row must not stay first after restart"
+    );
     let wrong_project = rt
-        .control_transaction(|mut tx| {
+        .control_transaction(move |mut tx| {
             Box::pin(async move {
                 atomic_durable::delivery_effect::due_queue_observation_in(
                     &mut tx,
                     "project/other",
-                    i64::MAX,
+                    now,
                 )
                 .await
             })
@@ -708,6 +749,13 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
     let final_state: Value =
         serde_json::from_slice(&fs::read(&state_path).expect("final provider state"))
             .expect("parse final provider");
+    let old_attempts_after_restart = rt.control_transaction(|mut tx| Box::pin(async move {
+        tx.query_one("SELECT poll_attempts FROM atomic_delivery_queue_observations WHERE delivery_run=?", &[text(OLD_LAYOUT_RUN)]).await?.int("poll_attempts")
+    })).await.expect("old row after restart");
+    assert_eq!(
+        old_attempts_after_restart, 1,
+        "restart must honor persisted deferral"
+    );
     assert_eq!(
         final_state["mutations"],
         json!({"push":1,"pull_request":1,"enqueue":1})
@@ -729,12 +777,8 @@ async fn serve_polls_queue_after_restart_without_repeating_delivery() {
         .control_transaction(move |mut tx| {
             let project = project.clone();
             Box::pin(async move {
-                atomic_durable::delivery_effect::due_queue_observation_in(
-                    &mut tx,
-                    &project,
-                    i64::MAX,
-                )
-                .await
+                atomic_durable::delivery_effect::due_queue_observation_in(&mut tx, &project, now)
+                    .await
             })
         })
         .await

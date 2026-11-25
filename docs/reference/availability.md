@@ -128,6 +128,8 @@ gets capped retry backoff up to five minutes. The recorded timestamp and next
 due time distinguish a stale pending read from an observed merged or dropped
 event. Terminal events remain immutable across restarts. Polling does not repeat
 push, pull request, enqueue, or model work.
+An incompatible local run record is deferred durably, leaving its last
+observation visible while later due rows proceed.
 
 A `coding: true` worktree step now requires a sibling `review.self_review`
 turn before each independent review. atomic computes the candidate's patch
