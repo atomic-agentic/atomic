@@ -1341,6 +1341,16 @@ fn unproved_formatting_and_mislabeled_privacy_findings_require_repair() {
                 .expect_err("unproved finding opened the gate");
             assert!(err.to_string().contains("was rejected"), "{err}");
             assert_eq!(editorial_followup_count(&rt).await, 0);
+            let steps = rt.steps(RUN).await.expect("unproved review steps");
+            let gate = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.gate")
+                .and_then(|step| step.output.as_ref())
+                .expect("unproved finding gate");
+            assert!(
+                gate["show"].get("proposed_followups").is_none(),
+                "unproved or semantic finding cannot enter classification"
+            );
         }
     });
 }
