@@ -2230,6 +2230,32 @@ fn failed_graph_item_criterion_repairs_without_calling_an_independent_reviewer()
             leases, 0,
             "terminal criterion failure stranded a live lease"
         );
+        let handoff = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one(
+                        "SELECT record_json FROM atomic_graph_handoffs WHERE item_id=?",
+                        &[Param::Text(CHILDREN[0].into())],
+                    )
+                    .await?
+                    .text("record_json")
+                })
+            })
+            .await
+            .expect("terminal failure handoff");
+        let handoff: serde_json::Value = serde_json::from_str(&handoff).expect("typed handoff");
+        assert!(
+            handoff["attempted"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("acceptance criteria")
+        );
+        assert!(
+            handoff["failed"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("criterion")
+        );
     });
 }
 

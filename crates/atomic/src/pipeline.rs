@@ -82,6 +82,7 @@ use atomic_durable::{
     WorkflowContext, execute_candidate_told, failpoint, publish_candidate, review_candidate,
 };
 use atomic_graph::{
+    handoff::Handoff,
     store::Lease,
     transactional_claim::{self, ClaimNext, ReviewFollowup, WorkItem},
 };
@@ -2807,6 +2808,9 @@ fn model_graph_item(item: &WorkItem) -> Result<Value> {
     if let Some(object) = value.as_object_mut() {
         object.remove("criteria");
         object.remove("labels");
+        // Handoff file hashes are host state until the next claimant's
+        // workspace has been compared; never expose unresolved hashes.
+        object.remove("handoff");
     }
     Ok(value)
 }
@@ -4511,7 +4515,17 @@ async fn release_failed_criteria_claim<C: WorkflowContext>(
             let token = token.clone();
             let reason = reason.clone();
             Box::pin(async move {
-                match transactional_claim::release_after_failure(&mut tx, &token, &reason).await {
+                let handoff = Handoff {
+                    attempted: "Ran the claimed item's acceptance criteria".into(),
+                    failed: reason.chars().take(1024).collect(),
+                    learned: "Inspect the failed criterion before a new attempt".into(),
+                    files: Vec::new(),
+                };
+                match transactional_claim::release_after_failure_with_handoff(
+                    &mut tx, &token, &reason, &handoff,
+                )
+                .await
+                {
                     Ok(_) => Ok(true),
                     Err(DurableError::Parked { .. }) => Ok(false),
                     Err(error) => Err(error),
@@ -5913,7 +5927,14 @@ async fn reviewed<C: WorkflowContext>(
                 let token = token.clone();
                 let gate = gate.clone();
                 Box::pin(async move {
-                    transactional_claim::release_for_review_gate(&mut tx, &token, &gate).await
+                    let handoff = Handoff {
+                        attempted: format!("Submitted a candidate to review gate {gate}"),
+                        failed: "Awaiting a human decision".into(),
+                        learned: "Reclaim the graph item before publishing the candidate".into(),
+                        files: Vec::new(),
+                    };
+                    let release = transactional_claim::release_for_review_gate_with_handoff;
+                    release(&mut tx, &token, &gate, &handoff).await
                 })
             })
             .await?,
@@ -6978,6 +6999,7 @@ mod tests {
             }],
             kind: "task".into(),
             priority: 2,
+            handoff: None,
         };
         let visible = model_graph_item(&item).expect("model item");
         assert!(visible.get("criteria").is_none(), "{visible}");

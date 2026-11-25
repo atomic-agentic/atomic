@@ -1,0 +1,1 @@
+graph-handoff-record-validate|crates/atomic-graph/src/transactional_claim.rs|handoff.validate().map_err(DurableError::Failed)?;|let _ = handoff;|-p atomic-agentic-graph --test epic_run terminal_failure_release_fences_exact_claim_and_leaves_handoff
