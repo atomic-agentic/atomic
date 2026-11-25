@@ -8895,10 +8895,14 @@ fn a_full_repository_control_row_uses_host_cargo_in_normal_review() {
                 .flatten()
                 .flat_map(|run| std::fs::read_dir(run.path()).into_iter().flatten())
                 .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("exec-"))
+                .flat_map(|exec| std::fs::read_dir(exec.path()).into_iter().flatten())
+                .flatten()
                 .map(|entry| entry.path())
                 .find(|path| {
                     path.file_name()
                         .is_some_and(|name| name.to_string_lossy().starts_with("cargo-home-"))
+                        && path.join("target").is_dir()
                 })
         };
         until(
