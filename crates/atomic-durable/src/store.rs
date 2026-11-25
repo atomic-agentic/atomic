@@ -1304,26 +1304,45 @@ async fn migrate(
     path: &str,
     migrations: &[Migration],
 ) -> Result<i64, StoreError> {
+    migrate_with_probe_hook(conn, path, migrations, || {}).await
+}
+
+async fn migrate_with_probe_hook(
+    conn: &mut SqliteConnection,
+    path: &str,
+    migrations: &[Migration],
+    after_marker: impl FnOnce(),
+) -> Result<i64, StoreError> {
     let to = last_version(migrations);
     let db = |source| StoreError::Database {
         path: path.to_owned(),
         source,
     };
-    let (present, current) = sqlite_marker(conn, path).await?;
-    if current > to {
-        return Err(StoreError::Newer {
-            path: path.to_owned(),
-            found: current,
-            supported: to,
-        });
+    // The marker and history must come from one read snapshot. A concurrent
+    // opener may finish a migration between separate reads, making an old
+    // marker and new history look like corruption. This deferred transaction
+    // takes no writer lock for an already-current store.
+    sqlx::query("BEGIN").execute(&mut *conn).await.map_err(db)?;
+    let probe: Result<bool, StoreError> = async {
+        let (present, current) = sqlite_marker(conn, path).await?;
+        after_marker();
+        if current > to {
+            return Err(StoreError::Newer {
+                path: path.to_owned(),
+                found: current,
+                supported: to,
+            });
+        }
+        let history = sqlite_history(conn, path).await?;
+        if let Some(rows) = &history {
+            validate_history(path, current, rows, migrations)?;
+        }
+        Ok(present && current == to && history.is_some())
     }
-    let history = sqlite_history(conn, path).await?;
-    if let Some(rows) = &history {
-        validate_history(path, current, rows, migrations)?;
-    }
-    // A store already at this version is opened without the write lock, so
-    // a reader such as `atomic runs show` never waits on a writer.
-    if present && current == to && history.is_some() {
+    .await;
+    let end = if probe.is_ok() { "COMMIT" } else { "ROLLBACK" };
+    sqlx::query(end).execute(&mut *conn).await.map_err(db)?;
+    if probe? {
         return Ok(to);
     }
     // One writer at a time: BEGIN IMMEDIATE takes the write lock up front, so
@@ -1819,6 +1838,97 @@ mod tests {
         assert_eq!(open_sqlite(&p).await.expect("open"), STORE_VERSION);
         assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_open_reads_marker_and_history_from_one_snapshot() {
+        let path = db("concurrent-open");
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true);
+        let mut setup = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create store file");
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&mut setup)
+            .await
+            .expect("enable concurrent reader and writer");
+        assert_eq!(mode.to_ascii_lowercase(), "wal");
+        setup.close().await.expect("close setup");
+
+        let (marker_read, marker_seen) = std::sync::mpsc::channel();
+        let (resume, resumed) = std::sync::mpsc::channel();
+        let first_path = path.clone();
+        let first = tokio::spawn(async move {
+            let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&first_path);
+            let mut conn = SqliteConnection::connect_with(&options)
+                .await
+                .expect("first opener");
+            let label = first_path.display().to_string();
+            let result = migrate_with_probe_hook(&mut conn, &label, MIGRATIONS, move || {
+                marker_read.send(()).expect("marker checkpoint");
+                resumed
+                    .recv_timeout(std::time::Duration::from_secs(20))
+                    .expect("resume first opener");
+            })
+            .await;
+            conn.close().await.expect("close first opener");
+            result
+        });
+        marker_seen
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("first opener read the empty marker");
+        let second =
+            tokio::time::timeout(std::time::Duration::from_secs(20), open_sqlite(&path)).await;
+        resume.send(()).expect("resume first opener");
+        assert_eq!(
+            second.expect("second opener completed").expect("migrated"),
+            STORE_VERSION
+        );
+        assert_eq!(
+            first.await.expect("first task").expect("first opener"),
+            STORE_VERSION
+        );
+        assert_eq!(open_sqlite(&path).await.expect("reopen"), STORE_VERSION);
+
+        // A persistent mismatch is still corruption, not an open race.
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path);
+        let mut raw = SqliteConnection::connect_with(&options)
+            .await
+            .expect("raw connection");
+        sqlx::query("UPDATE atomic_store_version SET version = 0")
+            .execute(&mut raw)
+            .await
+            .expect("corrupt marker");
+        raw.close().await.expect("close raw connection");
+        match open_sqlite(&path)
+            .await
+            .expect_err("persistent mismatch refuses")
+        {
+            StoreError::History {
+                version: 0, reason, ..
+            } => {
+                assert!(reason.contains("history ends at"), "{reason}");
+            }
+            other => panic!("unexpected refusal: {other:?}"),
+        }
+        let mut raw = SqliteConnection::connect_with(&options)
+            .await
+            .expect("inspect rejected store");
+        assert_eq!(
+            sqlite_marker(&mut raw, "rejected").await.expect("marker"),
+            (true, 0)
+        );
+        assert_eq!(
+            sqlite_history(&mut raw, "rejected")
+                .await
+                .expect("history")
+                .expect("history table")
+                .len(),
+            STORE_VERSION as usize
+        );
+        raw.close().await.expect("close inspection");
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[tokio::test]
