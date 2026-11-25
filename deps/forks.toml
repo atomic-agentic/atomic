@@ -29,13 +29,13 @@ crates = ["sqlx-core", "sqlx-sqlite", "sqlx-postgres"]
 name = "codex"
 repository = "https://github.com/atomic-agentic/codex"
 upstream = "https://github.com/openai/codex"
-# The upstream release commit the fork's `atomic` branch starts from (deps/codex.toml's tag).
+# The upstream release commit the fork's pin branch starts from (deps/codex.toml's tag).
 upstream_base = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
-branch = "atomic"
-rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6"
+branch = "codex/atomic-key-redirect-pin"
+rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726"
 licence = "Apache-2.0"
-why = "makes the parent-death signal best effort where prctl is refused or unsupported, so commands start in AWS Lambda (and on iSH)"
-crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-utils-pty"]
+why = "makes parent-death signalling best effort where prctl is refused, rejects redirects for configured-key model requests, and bounds direct proxy dials"
+crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-model-provider", "codex-model-provider-info", "codex-network-proxy", "codex-utils-pty"]
 
 [[fork]]
 name = "astro-oxc"

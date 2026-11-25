@@ -1,0 +1,1 @@
+proxy-direct-dial-reserve|crates/atomic-core/src/network.rs|let share = (limit / 2).saturating_sub(DIRECT_DIALS_RESERVE);|let share = limit / 2;|-p atomic-agentic-core --lib network::tests::proxy_direct_dial_reserve_is_subtracted_once

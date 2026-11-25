@@ -1210,6 +1210,99 @@ fn a_codex_atoms_key_is_never_sent_to_a_proxy_in_cleartext() {
     });
 }
 
+/// A configured-key Codex endpoint may answer with a redirect to another
+/// path on the same host. The model client must stop at that first response.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_codex_atoms_key_is_never_sent_on_a_redirect() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    use std::io::{Read as _, Write as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("redirect listener");
+    let port = listener.local_addr().expect("address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let stop = Arc::new(AtomicBool::new(false));
+    let paths = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen = paths.clone();
+    let finish = stop.clone();
+    let server = std::thread::spawn(move || {
+        while !finish.load(Ordering::SeqCst) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accept: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && head.len() < 16_384 {
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            let request = String::from_utf8_lossy(&head);
+            let path = request
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("")
+                .to_owned();
+            seen.lock().expect("paths").push(path);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{port}/leak\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).expect("redirect");
+        }
+    });
+
+    let dir = scratch("codex-key-redirect");
+    let project = project(&dir);
+    write_atom(
+        &project,
+        "look-note",
+        "description: 'Look at the note.', kind: 'codex', sandbox: 'read-only'",
+        "Look at this note: {input.text}",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"done": {"type": "boolean"}})),
+    );
+    let url = format!("http://127.0.0.1:{port}/v1");
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "look-note", "--data", r#"{"text": "hi"}"#],
+        &[
+            ("ATOMIC_MODEL_BASE_URL", &url),
+            ("ATOMIC_MODEL", "synthetic"),
+            ("ATOMIC_MODEL_API_KEY_ENV", "LOOK_KEY"),
+            ("LOOK_KEY", "sk-look-secret"),
+            ("NO_PROXY", "127.0.0.1"),
+        ],
+        "",
+    );
+    stop.store(true, Ordering::SeqCst);
+    server.join().expect("redirect server");
+    assert!(!out.status.success(), "redirect must fail: {}", text(&out));
+    assert!(!text(&out).contains("sk-look-secret"), "{}", text(&out));
+    let paths = paths.lock().expect("paths");
+    assert!(
+        paths.iter().any(|path| path == "/v1/responses"),
+        "{paths:?}"
+    );
+    assert!(!paths.iter().any(|path| path == "/leak"), "{paths:?}");
+}
+
 /// The person's own configuration, at `~/.config/atomic/config.yaml`, caps a
 /// run made with `atomic run`: the project's larger cap, and its `null` for
 /// their dollar cap, leave their caps the ones the run's plan records, with
