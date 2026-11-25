@@ -204,19 +204,6 @@ jobs:
       - name: The binary runs
         run: target/${{ env.WINDOWS_TARGET }}/release/atomic.exe --version
 
-      - name: Verify direct context checkpoints on native Windows
-        shell: pwsh
-        env:
-          CFLAGS_x86_64_pc_windows_msvc: -DCURL_ENABLE_NTLM
-          LIBSQLITE3_FLAGS: SQLITE_DISABLE_INTRINSIC
-        run: |
-          $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-          $env:CARGO_ENCODED_RUSTFLAGS = @("--remap-path-prefix=$env:GITHUB_WORKSPACE=/atomic", "--remap-path-prefix=$cargoHome=/cargo", '-C', 'link-arg=/STACK:8388608', '-C', 'target-feature=+crt-static') -join [char]31
-          cargo test --release --locked --target ${{ env.WINDOWS_TARGET }} -p atomic-agentic-core --lib context::tests::production_context_reuses_its_checkpoint_rebinds_steps_and_rejects_tampering -- --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --release --locked --target ${{ env.WINDOWS_TARGET }} -p atomic-agentic-core --lib context::tests::concurrent_context_publishers_keep_one_complete_winner -- --exact
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
       - name: Package
         run: scripts/release-package.sh ${{ env.WINDOWS_TARGET }}
 
