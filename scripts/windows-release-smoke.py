@@ -26,6 +26,8 @@ def coding_turn(exe, project, repository, state, env):
     command = (
         "$ErrorActionPreference='Stop'; "
         "Write-Output ('cwd=' + [Environment]::CurrentDirectory + ' PowerShell=' + $PWD.Path); "
+        "Write-Output ('PS version=' + $PSVersionTable.PSVersion + ' location=' + (Get-Location).Path); "
+        "Set-Location -LiteralPath ([Environment]::CurrentDirectory); "
         "Copy-Item pricing.py windows-copy.py; "
         f"try {{ [IO.File]::ReadAllText('{literal}') | Out-Null; throw 'private file was readable' }} "
         "catch [UnauthorizedAccessException] { "
