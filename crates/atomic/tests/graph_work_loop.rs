@@ -942,19 +942,23 @@ fn final_panel_files_editorial_followups_only_for_human_approval() {
 }
 
 #[test]
-fn delivery_requires_explicit_approval_from_both_reviewers_even_with_followups() {
+fn explicit_reviewer_change_request_opens_gate_without_editorial_followup() {
     on_codex_runtime(async {
         let root = std::fs::canonicalize(scratch("editorial-routed"))
             .expect("physical fixture path for Git trial worktree");
-        let (_model, rt) = editorial_panel(&root, "request_changes", "approve", None).await;
+        let (_model, rt) =
+            editorial_panel(&root, "request_changes", "approve", Some(Verdict::Approve)).await;
         rt.result::<Value>(RUN)
             .await
-            .expect("graph accepted editorial findings");
-        assert_eq!(editorial_followup_count(&rt).await, 1);
+            .expect("human approved the explicit change request");
+        assert_eq!(editorial_followup_count(&rt).await, 0);
         let err = atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
             .await
-            .expect_err("host routing cannot supply an independent approval");
-        assert_eq!(err.to_string(), "independent reviewer did not approve");
+            .expect_err("human override cannot authorize delivery");
+        assert_eq!(
+            err.to_string(),
+            "human-overridden review cannot authorize delivery"
+        );
     });
 }
 
