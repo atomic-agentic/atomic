@@ -116,7 +116,11 @@ def main():
         subprocess.run([sys.executable, ROOT / "examples/02-change-request/tools/prepare_fixture.py", dest], check=True)
         project = dest / "project"
         state = scratch / "state"
-        env = {**os.environ, "ATOMIC_HOME": str(state)}
+        # The preview needs a model identity to select Codex's instructions.
+        # Render must work with this loopback endpoint offline. Live turns
+        # override it with the scripted server's address below.
+        env = {**os.environ, "ATOMIC_HOME": str(state), "ATOMIC_MODEL": "synthetic",
+               "ATOMIC_MODEL_BASE_URL": "http://127.0.0.1:1/v1"}
         # Native PowerShell does not normally set the Unix HOME variable.
         env.pop("HOME", None)
         system = Path(os.environ["SystemRoot"])
