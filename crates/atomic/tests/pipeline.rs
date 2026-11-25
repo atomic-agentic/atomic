@@ -10330,9 +10330,11 @@ fn host_touched_control_refuses_workflow_and_model_omission_before_reviewer() {
         std::fs::create_dir_all(project.join("docs")).expect("documentation directory");
         std::fs::write(project.join("docs/guide.md"), "Example text.\n")
             .expect("baseline Markdown blob");
-        std::fs::write(project.join("scripts/controls/row-test.row"),
-            "row-test|docs/guide.md|Example|Changed|--lib -- guard_row\n")
-            .expect("control selecting Markdown path");
+        std::fs::write(
+            project.join("scripts/controls/row-test.row"),
+            "row-test|docs/guide.md|Example|Changed|--lib -- guard_row\n",
+        )
+        .expect("control selecting Markdown path");
         plain_git(&project, &["add", "."]);
         plain_git(&project, &["commit", "-q", "-m", "select Markdown path"]);
         let base = plain_git(&project, &["rev-parse", "HEAD"]);
