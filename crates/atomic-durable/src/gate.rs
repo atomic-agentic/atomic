@@ -400,6 +400,66 @@ pub fn gate_id(run: &str, step: &str) -> String {
     format!("{run}:{step}")
 }
 
+// The gate store owns this namespace. Graph rows are disposable copies: a
+// decision never derives authority from their presence or status.
+fn graph_gate_id(gate: &str, suffix: u64) -> String {
+    if suffix == 0 {
+        format!("gate:{gate}")
+    } else {
+        format!("gate:{gate}#{suffix}")
+    }
+}
+
+async fn project_open_gate(
+    tx: &mut Tx<'_, '_>,
+    gate: &str,
+    title: &str,
+    run: &str,
+    at: i64,
+) -> Result<()> {
+    let mut suffix = 0_u64;
+    loop {
+        let inserted = tx.execute(
+            "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES (?,?,?,'gate',0,'blocked',NULL,'agent','gate-store',?,?) ON CONFLICT(id) DO NOTHING",
+            &[Param::Text(graph_gate_id(gate, suffix)), Param::Text(title.to_owned()), Param::Text(format!("Open human gate for run {run}")), Param::Int(at), Param::Text(gate.to_owned())],
+        ).await?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        suffix = suffix
+            .checked_add(1)
+            .ok_or_else(|| DurableError::Failed("gate projection name space exhausted".into()))?;
+    }
+}
+
+async fn remove_gate_projection(tx: &mut Tx<'_, '_>, gate: &str) -> Result<()> {
+    let rows = tx
+        .query_all(
+            "SELECT id FROM atomic_graph_items WHERE projected_gate_id=?",
+            &[Param::Text(gate.to_owned())],
+        )
+        .await?;
+    for row in rows {
+        let id = row.text("id")?;
+        tx.execute(
+            "DELETE FROM atomic_graph_edges WHERE source=? OR target=?",
+            &[Param::Text(id.clone()), Param::Text(id.clone())],
+        )
+        .await?;
+        tx.execute(
+            "DELETE FROM atomic_graph_blocked WHERE source=? OR target=?",
+            &[Param::Text(id.clone()), Param::Text(id)],
+        )
+        .await?;
+    }
+    tx.execute(
+        "DELETE FROM atomic_graph_items WHERE projected_gate_id=? AND kind='gate' AND created_by='gate-store'",
+        &[Param::Text(gate.to_owned())],
+    )
+    .await?;
+    Ok(())
+}
+
 /// The topic a gate's wake-up is sent on.
 fn topic(gate: &str) -> String {
     format!("atomic.gate:{gate}")
@@ -623,6 +683,9 @@ async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
             ],
         )
         .await?;
+    if won == 1 {
+        remove_gate_projection(tx, &gate.id).await?;
+    }
     if won == 1
         && let (Some(answer), Some(q)) = (&default, &gate.question)
     {
@@ -745,7 +808,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS BIGINT), ?, 'open')",
                     &[
                         Param::Text(id.clone()),
-                        Param::Text(run),
+                        Param::Text(run.clone()),
                         Param::Text(spec.workflow.clone()),
                         Param::Text(step),
                         Param::Text(spec.title.clone()),
@@ -767,6 +830,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                     )
                     .await?;
                 }
+                project_open_gate(&mut tx, &id, &spec.title, &run, now).await?;
                 read_gate(&mut tx, &id)
                     .await?
                     .ok_or_else(|| corrupt(format!("gate {id} was not written")))
@@ -1006,6 +1070,9 @@ pub async fn decide<R: DurableRuntime>(
                                 ],
                             )
                             .await?;
+                        if won == 1 {
+                            remove_gate_projection(&mut tx, &gate.id).await?;
+                        }
                         if won == 1
                             && let Some(answer) = &answer
                         {
