@@ -331,6 +331,38 @@ fn review_project(project: &Path) {
     ).expect("reviewed workflow");
 }
 
+fn review_graph_project(project: &Path) {
+    review_project(project);
+    let atom = project.join("atoms/check-commit.atom.astro");
+    let source = std::fs::read_to_string(&atom).expect("reviewer atom");
+    std::fs::write(
+        &atom,
+        source.replace(
+            "Review commit {input.commit}.",
+            "Review commit {input.commit} and proposed graph writes {input.graph_proposals}.",
+        ),
+    )
+    .expect("graph reviewer prompt");
+    std::fs::write(
+        project.join("atoms/check-commit.input.schema.json"),
+        json!({"type":"object","additionalProperties":false,
+            "required":["commit","graph_proposals"],
+            "properties":{"commit":{"type":"string"},"graph_proposals":{"type":"string"}}})
+        .to_string(),
+    )
+    .expect("graph reviewer input schema");
+    let workflow = project.join("workflows/fix.workflow.yaml");
+    let source = std::fs::read_to_string(&workflow).expect("review workflow");
+    std::fs::write(
+        workflow,
+        source.replace(
+            "with: { commit: candidate.metadata.commit }",
+            "with: { commit: candidate.metadata.commit, graph_proposals: candidate.metadata.graph_proposals }",
+        ),
+    )
+    .expect("graph review binding");
+}
+
 fn review_repair_project(project: &Path) {
     review_project(project);
     let workflow = std::fs::read_to_string(project.join("workflows/fix.workflow.yaml"))
@@ -544,7 +576,7 @@ async fn engine_at_with_endpoint(
 ) -> Durare {
     helper_host();
     let mut rt = Durare::open(
-        &Database::Sqlite(database),
+        &Database::Sqlite(database.clone()),
         None,
         LAYOUT_VERSION,
         project_id,
@@ -579,6 +611,7 @@ async fn engine_at_with_endpoint(
             &mut rt,
             Services {
                 runtimes,
+                graph_database: Some(database),
                 model_endpoint_configured,
                 store: LocalStore::open(root.join("artifacts")).expect("artifacts"),
                 deployment: Deployment::Local {
@@ -2214,6 +2247,249 @@ fn crash_after_atomic_finalize_replays_publish_and_close_projections_without_a_t
         let (_, steps) = inspect(&root).await;
         assert!(steps.contains(&"graph.00000.fix.publish".into()));
         assert!(steps.contains(&"graph.00000.fix.close".into()));
+    });
+}
+
+#[test]
+fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({
+                    "title":"Tool follow-up", "body":"Agent-authored follow-up",
+                    "kind":"task", "priority":2,
+                }),
+            },
+            Reply::Text(r#"{"done":true}"#.into()),
+            Reply::Text(r#"{"verdict":"approve"}"#.into()),
+        ])
+        .await
+        .expect("scripted graph tool and author output");
+        let root = scratch("graph-tool-candidate-crash");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_graph_project(&project);
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "graph review fixture"]);
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let url = model.base_url();
+        let (r, u, b) = (root.clone(), url.clone(), base.clone());
+        let crashed = tokio::task::spawn_blocking(move || {
+            child_command(&r, &u, &b, "start", Some("graph:before-finalize"))
+                .stderr(Stdio::piped())
+                .output()
+                .expect("crash child")
+        })
+        .await
+        .expect("crash child");
+        assert!(
+            !crashed.status.success(),
+            "pre-finalize failpoint did not kill child"
+        );
+        let rt = durable(&root).await;
+        let after_crash = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    let followups = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Tool follow-up' AND trust='agent'",
+                            &[],
+                        )
+                        .await?
+                        .int("n")?;
+                    let publications = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS n FROM atomic_publications",
+                            &[],
+                        )
+                        .await?
+                        .int("n")?;
+                    Ok((followups, publications))
+                })
+            })
+            .await
+            .expect("inspect atomic graph publication");
+        assert_eq!(
+            after_crash.0,
+            0,
+            "graph batch escaped before candidate publication; child stderr: {}",
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+        let (r, u, b) = (root.clone(), url.clone(), base.clone());
+        let crashed = tokio::task::spawn_blocking(move || {
+            child_command(&r, &u, &b, "recover", Some("graph:after-finalize-applied"))
+                .stderr(Stdio::piped())
+                .output()
+                .expect("post-finalize crash child")
+        })
+        .await
+        .expect("post-finalize crash child");
+        assert!(
+            !crashed.status.success(),
+            "post-finalize failpoint did not kill child"
+        );
+        let after_commit = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    let followups = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Tool follow-up' AND trust='agent'",
+                            &[],
+                        )
+                        .await?
+                        .int("n")?;
+                    let publications = tx
+                        .query_one("SELECT COUNT(*) AS n FROM atomic_publications", &[])
+                        .await?
+                        .int("n")?;
+                    Ok((followups, publications))
+                })
+            })
+            .await
+            .expect("inspect committed graph publication");
+        assert_eq!(
+            after_commit,
+            (1, 2),
+            "graph batch was not atomic with publication"
+        );
+        let (r, u, b) = (root.clone(), url, base);
+        let recovered = tokio::task::spawn_blocking(move || child(&r, &u, &b, "recover", None))
+            .await
+            .expect("recovery child");
+        assert!(recovered.success(), "graph tool recovery: {recovered}");
+        assert_eq!(
+            model.calls(),
+            3,
+            "recovery repeated the author or reviewer call"
+        );
+        assert!(
+            model.requests()[2].to_string().contains("Tool follow-up"),
+            "reviewer did not see the untrusted proposed graph write"
+        );
+        let final_count = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one(
+                        "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Tool follow-up'",
+                        &[],
+                    )
+                    .await?
+                    .int("n")
+                })
+            })
+            .await
+            .expect("inspect replay");
+        assert_eq!(final_count, 1, "replay duplicated the follow-up");
+    });
+}
+
+#[test]
+fn graph_tool_proposal_without_review_binding_refuses_before_reviewer() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({
+                    "title":"Hidden follow-up", "body":"Must be reviewed",
+                    "kind":"task", "priority":2,
+                }),
+            },
+            Reply::Text(r#"{"done":true}"#.into()),
+        ])
+        .await
+        .expect("scripted hidden proposal");
+        let root = scratch("graph-tool-hidden-proposal");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_project(&project);
+        git(&project, &["add", "."]);
+        git(
+            &project,
+            &["commit", "-q", "-m", "review without graph binding"],
+        );
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let (r, u, b) = (root.clone(), model.base_url(), base);
+        let finished = tokio::task::spawn_blocking(move || child(&r, &u, &b, "start", None))
+            .await
+            .expect("graph child");
+        assert!(finished.success(), "graph child status: {finished}");
+        assert_eq!(model.calls(), 2, "hidden proposal reached the reviewer");
+        let result = std::fs::read_to_string(root.join("result.txt")).expect("run result");
+        assert!(
+            result.contains("graph proposals require a reviewer binding"),
+            "{result}"
+        );
+        let rt = durable(&root).await;
+        let state = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    let items = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Hidden follow-up'",
+                            &[],
+                        )
+                        .await?
+                        .int("n")?;
+                    let publications = tx
+                        .query_one("SELECT COUNT(*) AS n FROM atomic_publications", &[])
+                        .await?
+                        .int("n")?;
+                    Ok((items, publications))
+                })
+            })
+            .await
+            .expect("inspect refused proposal");
+        assert_eq!(state, (0, 0));
+    });
+}
+
+#[test]
+fn graph_tool_proposal_without_any_reviewer_never_publishes() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({
+                    "title":"Unreviewed follow-up", "body":"Must be reviewed",
+                    "kind":"task", "priority":2,
+                }),
+            },
+            Reply::Text(r#"{"done":true}"#.into()),
+        ])
+        .await
+        .expect("scripted unreviewed proposal");
+        let root = scratch("graph-tool-unreviewed-proposal");
+        let base = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let (r, u, b) = (root.clone(), model.base_url(), base);
+        let finished = tokio::task::spawn_blocking(move || child(&r, &u, &b, "start", None))
+            .await
+            .expect("graph child");
+        assert!(finished.success(), "graph child status: {finished}");
+        assert_eq!(model.calls(), 2);
+        let result = std::fs::read_to_string(root.join("result.txt")).expect("run result");
+        assert!(
+            result.contains("without an independent reviewer"),
+            "{result}"
+        );
+        let rt = durable(&root).await;
+        let count = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one(
+                        "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Unreviewed follow-up'",
+                        &[],
+                    )
+                    .await?
+                    .int("n")
+                })
+            })
+            .await
+            .expect("inspect unreviewed graph");
+        assert_eq!(count, 0);
     });
 }
 

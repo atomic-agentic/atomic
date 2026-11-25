@@ -254,6 +254,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
             &mut rt,
             Services {
                 runtimes: runtimes(&dir, &model.base_url()),
+                graph_database: None,
                 model_endpoint_configured: true,
                 store,
                 deployment,
