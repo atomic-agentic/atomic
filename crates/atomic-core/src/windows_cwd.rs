@@ -12,6 +12,7 @@ use codex_windows_sandbox::{
     LocalSid, OFFLINE_USERNAME, ONLINE_USERNAME, ensure_allow_mask_aces_with_inheritance,
     resolve_sid, workspace_cap_sid_for_cwd,
 };
+use std::ffi::c_void;
 use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use windows_sys::Win32::Security::NO_INHERITANCE;
@@ -33,13 +34,19 @@ pub(crate) fn allow_private_profile_cwd_ancestors(cwd: &Path, codex_home: &Path)
     // Codex's elevated setup has provisioned these principals and the
     // workspace capability before this function runs. Both account and
     // restricted capability ACL checks must succeed for the shell token.
-    let offline = resolve_sid(OFFLINE_USERNAME).context("resolve offline sandbox account")?;
-    let online = resolve_sid(ONLINE_USERNAME).context("resolve online sandbox account")?;
+    let mut offline = resolve_sid(OFFLINE_USERNAME).context("resolve offline sandbox account")?;
+    let mut online = resolve_sid(ONLINE_USERNAME).context("resolve online sandbox account")?;
     let workspace = LocalSid::from_string(
         &workspace_cap_sid_for_cwd(codex_home, &cwd)
             .context("resolve Windows sandbox workspace capability")?,
     )?;
-    let sids = [offline.as_ptr(), online.as_ptr(), workspace.as_ptr()];
+    // The buffers own valid Windows SIDs through every ACL call below. Codex's
+    // ACL API accepts mutable opaque pointers but only reads these SID bytes.
+    let sids = [
+        offline.as_mut_ptr().cast::<c_void>(),
+        online.as_mut_ptr().cast::<c_void>(),
+        workspace.as_ptr(),
+    ];
 
     for ancestor in cwd
         .ancestors()
