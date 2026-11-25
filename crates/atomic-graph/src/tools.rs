@@ -12,9 +12,10 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::Mutex;
 
 use crate::proposal::{
-    AttemptKey, GraphView, ProposalBuffer, RecordedOp, ViewNote, ViewTrust, operation_schema,
+    AttemptKey, GraphView, ProposalBuffer, RecordedOp, ViewEdge, ViewNote, ViewTrust,
+    operation_schema,
 };
-use crate::sqlite::SqliteStore;
+use crate::sqlite::{SqliteStore, StoredEdge};
 use crate::store::{Actor, GraphStore, Show, Trust};
 
 /// A single attempt's graph capability. Clone shares the same append log.
@@ -81,10 +82,10 @@ impl GraphTurnTools {
                 let id = bounded_id(&arguments, "item_id")?;
                 let committed = self
                     .store
-                    .show(Actor::agent("graph-tool"), id.clone())
+                    .show_with_edges(id.clone())
                     .await
                     .map_err(|e| e.to_string())?
-                    .map(committed_view);
+                    .map(|(show, edges)| committed_view(show, edges));
                 let view = self.buffer.lock().await.show(&self.attempt, &id, committed);
                 serde_json::to_value(view).map_err(|e| e.to_string())
             }
@@ -141,7 +142,7 @@ fn bounded_id(arguments: &Value, key: &str) -> Result<String, String> {
     Ok(id.to_owned())
 }
 
-fn committed_view(show: Show) -> GraphView {
+fn committed_view(show: Show, edges: Vec<StoredEdge>) -> GraphView {
     let item = show.item;
     GraphView {
         id: item.id,
@@ -155,8 +156,13 @@ fn committed_view(show: Show) -> GraphView {
         parent: item.parent,
         due_at: item
             .due_at
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_millis()).ok()),
+            .and_then(|time| match time.duration_since(UNIX_EPOCH) {
+                Ok(duration) => i64::try_from(duration.as_millis()).ok(),
+                Err(error) => {
+                    let millis = i128::try_from(error.duration().as_millis()).ok()?;
+                    i64::try_from(-millis).ok()
+                }
+            }),
         provisional: false,
         close_intent: None,
         notes: show
@@ -169,7 +175,15 @@ fn committed_view(show: Show) -> GraphView {
                 provisional: false,
             })
             .collect(),
-        edges: Vec::new(),
+        edges: edges
+            .into_iter()
+            .map(|edge| ViewEdge {
+                kind: edge.kind,
+                to: edge.to,
+                provisional: false,
+            })
+            .collect(),
+        blocked_by: show.blocked_by,
     }
 }
 

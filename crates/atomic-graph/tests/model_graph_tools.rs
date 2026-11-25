@@ -10,11 +10,11 @@ use atomic_core::typed::AtomConfig;
 use atomic_core::usage::Metering;
 use atomic_graph::proposal::{AttemptKey, GraphOp, ProposalBuffer};
 use atomic_graph::sqlite::SqliteStore;
-use atomic_graph::store::{Actor, GraphStore};
+use atomic_graph::store::{Actor, Draft, EdgeKind, GraphStore};
 use atomic_graph::tools::GraphTurnTools;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
 async fn model_graph_create_is_private_until_candidate_publication() {
@@ -76,6 +76,7 @@ async fn model_graph_create_is_private_until_candidate_publication() {
     assert_eq!(view["provisional"], true);
     assert_eq!(view["status"], "open");
     assert_eq!(view["notes"][0]["text"], "Private note");
+    assert_eq!(view["notes"][0]["trust"], "external");
     assert_eq!(view["edges"][0]["to"], "at-earlier");
     assert_eq!(view["close_intent"]["text"], "Proposed only");
     assert!(
@@ -92,6 +93,49 @@ async fn model_graph_create_is_private_until_candidate_publication() {
     assert_eq!(batch.len(), 4);
     assert!(matches!(&batch[0].op, GraphOp::Create { title, .. } if title == "Draft only"));
 
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn graph_show_includes_committed_edges_and_current_blockers() {
+    let path = std::env::temp_dir().join(format!("atomic-graph-show-{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let store = Arc::new(SqliteStore::open(&path, SystemTime::now).expect("graph store"));
+    for id in ["at-source", "at-blocker"] {
+        let mut draft = Draft::new(id, id);
+        if id == "at-source" {
+            draft.due_at = Some(UNIX_EPOCH - Duration::from_secs(1));
+        }
+        store
+            .create_item(Actor::agent("test"), format!("create-{id}"), draft)
+            .await
+            .expect("create committed item");
+    }
+    store
+        .add_edge(
+            Actor::agent("test"),
+            "at-source".into(),
+            EdgeKind::Blocks,
+            "at-blocker".into(),
+        )
+        .await
+        .expect("create committed edge");
+    let tools = GraphTurnTools::new(
+        Arc::clone(&store),
+        ProposalBuffer::new(AttemptKey::new("run", "step", 1).expect("attempt")),
+    );
+    let view = tools
+        .call("graph_show", json!({"item_id":"at-source"}))
+        .await
+        .expect("show committed item");
+    assert_eq!(
+        view["edges"],
+        json!([{"kind":"blocks","to":"at-blocker","provisional":false}])
+    );
+    assert_eq!(view["blocked_by"], json!(["at-blocker"]));
+    assert_eq!(view["provisional"], false);
+    assert_eq!(view["trust"], "agent");
+    assert_eq!(view["due_at"], -1000);
     let _ = std::fs::remove_file(&path);
 }
 

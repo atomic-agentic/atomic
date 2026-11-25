@@ -304,6 +304,9 @@ pub struct GraphView {
     pub notes: Vec<ViewNote>,
     /// Outgoing edges visible in this view.
     pub edges: Vec<ViewEdge>,
+    /// Committed items currently blocking readiness. A proposed edge is not
+    /// added here until publication refreshes the committed blocker projection.
+    pub blocked_by: Vec<String>,
 }
 
 /// Private proposals belonging to exactly one atom attempt. This type has
@@ -421,6 +424,7 @@ impl ProposalBuffer {
                         close_intent: None,
                         notes: Vec::new(),
                         edges: Vec::new(),
+                        blocked_by: Vec::new(),
                     });
                 }
                 GraphOp::CloseIntent {
@@ -802,6 +806,7 @@ mod tests {
                 provisional: false,
             }],
             edges: vec![],
+            blocked_by: vec![],
         };
         buffer
             .propose(GraphOp::Remember {

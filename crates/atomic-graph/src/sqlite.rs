@@ -137,6 +137,16 @@ pub struct SqliteStore {
     #[cfg(debug_assertions)]
     projection_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// One committed outgoing edge read with a graph item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEdge {
+    /// Edge kind as stored.
+    pub kind: String,
+    /// Target item ID.
+    pub to: String,
+}
+
 impl SqliteStore {
     /// Open a graph database. Existing graph rows survive reopening.
     pub fn open(
@@ -184,6 +194,35 @@ impl SqliteStore {
             #[cfg(debug_assertions)]
             projection_pause: None,
         })
+    }
+
+    /// Read one item, its notes, current blockers and all outgoing edges in
+    /// one read transaction for a consistent model-facing graph view.
+    pub async fn show_with_edges(
+        &self,
+        id: String,
+    ) -> Result<Option<(Show, Vec<StoredEdge>)>, StoreError> {
+        self.read(move |c| Box::pin(async move {
+            let Some(item) = get_item(c, &id).await? else { return Ok(None) };
+            let rows = sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal")
+                .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
+            let notes = rows.iter().map(|row| Ok(Note {
+                text: row.try_get("text").map_err(db)?,
+                author: row.try_get("author").map_err(db)?,
+                trust: parse_trust(&row.try_get::<String,_>("trust").map_err(db)?),
+            })).collect::<Result<Vec<_>,StoreError>>()?;
+            let blocked_by = blocked(c, &id).await?;
+            let holder = lease_row(c, &id).await?.map(|(lease, _)| Holder {
+                claimant: lease.claimant, epoch: lease.epoch,
+            });
+            let rows = sqlx::query("SELECT kind,target FROM atomic_graph_edges WHERE source=? ORDER BY kind,target")
+                .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
+            let edges = rows.iter().map(|row| Ok(StoredEdge {
+                kind: row.try_get("kind").map_err(db)?,
+                to: row.try_get("target").map_err(db)?,
+            })).collect::<Result<Vec<_>,StoreError>>()?;
+            Ok(Some((Show { item, notes, blocked_by, holder }, edges)))
+        })).await
     }
 
     /// Open a graph store for a person whose enrolled credential is checked
@@ -1213,7 +1252,9 @@ impl GraphStore for SqliteStore {
         id: String,
     ) -> impl Future<Output = Result<Option<Show>, StoreError>> + Send {
         async move {
-            self.read(move |c|Box::pin(async move{let Some(i)=get_item(c,&id).await? else{return Ok(None)};let rows=sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal").bind(&id).fetch_all(&mut *c).await.map_err(db)?;let notes=rows.iter().map(|r|Ok(Note{text:r.try_get("text").map_err(db)?,author:r.try_get("author").map_err(db)?,trust:parse_trust(&r.try_get::<String,_>("trust").map_err(db)?)})).collect::<Result<Vec<_>,StoreError>>()?;let blockers=blocked(c,&id).await?;let holder=lease_row(c,&id).await?.map(|(l,_)|Holder{claimant:l.claimant,epoch:l.epoch});Ok(Some(Show{item:i,notes,blocked_by:blockers,holder}))})).await
+            self.show_with_edges(id)
+                .await
+                .map(|view| view.map(|(show, _)| show))
         }
     }
     fn all_items(
