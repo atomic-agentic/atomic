@@ -449,6 +449,50 @@ fn ordinary_text_is_left_alone() {
 }
 
 #[test]
+fn quoted_cookie_fields_and_extension_credentials_are_hidden_in_each_representation() {
+    for (name, credential) in [
+        ("Cookie", "session=ab'private-tail; other=private-second"),
+        ("Set-Cookie", "session=ab'private-tail; Path=/"),
+        ("Cookie", "sess'ion=private-tail"),
+        ("Set-Cookie", r#"session="ab'private-tail"; Path=/"#),
+        ("Authorization", "7custom.scheme private-tail"),
+        ("Proxy-Authorization", "Scheme.v2 key.part=private-tail"),
+        ("Authorization", "X'Scheme private-tail"),
+    ] {
+        let raw = format!("{name}: {credential}");
+        for shown in [
+            text(&raw).into_owned(),
+            bounded(&raw, 4096),
+            tail(&raw, 4096),
+        ] {
+            assert_eq!(shown, format!("{name}: {REDACTED}"), "{name}");
+        }
+        let doc = json!({name: credential, "password": "another-private", "status": 200});
+        let mut held = json!({"payload": doc.to_string(), "headers": [[name, credential]]});
+        value(&mut held);
+        assert_eq!(held["headers"][0][1], REDACTED);
+        let payload: Value = serde_json::from_str(held["payload"].as_str().expect("nested JSON"))
+            .expect("redacted JSON");
+        assert_eq!(payload[name], REDACTED, "{name}");
+        assert_eq!(payload["password"], REDACTED);
+        assert_eq!(payload["status"], 200);
+        for rendered in [
+            text(&doc.to_string()).into_owned(),
+            excerpt(&doc.to_string(), 4096),
+        ] {
+            assert!(
+                !rendered.contains("private-") && !rendered.contains("another-private"),
+                "{name}"
+            );
+            assert!(
+                rendered.contains("status") && rendered.contains("200"),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
 fn redacting_twice_changes_nothing() {
     let inputs = [
         SAMPLE,
@@ -661,11 +705,25 @@ fn the_lines_writer_holds_back_a_private_key_body() {
         " KEY-----\nMIIEbodyLINEone\nMIIEbodyLINEtwo\n-----END RSA PRIVATE",
         " KEY-----\nafter\nx\u{1b}[2Jy\n"
     );
+    let armor = concat!(
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\n",
+        "Comment: -----END PGP PRIVATE KEY BLOCK-----\n",
+        "private-armor-body\n-----END PGP PRIVATE KEY BLOCK-----\n"
+    );
+    assert_eq!(text(armor), format!("{REDACTED}\n"));
+    lines.write_all(armor.as_bytes()).expect("write armor");
     lines.write_all(block.as_bytes()).expect("write");
     drop(lines);
     let written = String::from_utf8(sink.0.lock().expect("lock").clone()).expect("UTF-8");
     assert!(!written.contains("MIIEbody"), "the key's body was written");
-    assert!(written.starts_with("before\n"), "{written:?}");
+    assert!(
+        !written.contains("private-armor-body"),
+        "the PGP key body was written"
+    );
+    assert!(
+        written.starts_with(&format!("{REDACTED}\nbefore\n")),
+        "{written:?}"
+    );
     assert!(written.ends_with("after\nx\\u{001b}[2Jy\n"), "{written:?}");
 }
 

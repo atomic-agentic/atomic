@@ -346,12 +346,15 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie|x-api-key|x-auth-token)(\\*["']?[ \t]*:[ \t]*\\*["']?)([^\n"'\\]+)"#,
     )
 });
-// An assignment followed by a quote inside a credential header opens a quoted
-// parameter. An ordinary quote-delimited header scan would expose its contents.
+// A quote inside a header parameter may be an HTTP token character
+// (apostrophe) or the start of a quoted value, rather than the surrounding
+// log message's delimiter. Consume the ambiguous header through end of line.
+const HTTP_TOKEN_BYTE: &str = r"[a-zA-Z0-9!#$%&'*+.^_`|~-]";
 static QUOTED_HEADER_PARAMETER: LazyLock<Regex> = LazyLock::new(|| {
-    regex(
-        r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\\*["']?[ \t]*:[ \t]*\\*["']?)[^\n"'\\]*=[ \t]*\\*["'][^\n]*"#,
-    )
+    regex(&format!(
+        r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\\*["']?[ \t]*:[ \t]*\\*["']?)(?:[^\n"'\\]*=(?:[^\n"'\\]*\\*'|[ \t]*\\*")|(?:{t}+[ \t]+)?{t}*'{t}*[ \t]*=|{t}*'{t}*[ \t]+[a-z0-9._~+/=-])[^\n]*"#,
+        t = HTTP_TOKEN_BYTE,
+    ))
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
@@ -678,6 +681,23 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
     }
 }
 
+/// Text after the closing delimiter. An ASCII-armored PGP block can have
+/// comment headers containing arbitrary text, including delimiter spellings.
+fn after_private_key<'a>(body: &'a str, label: &str) -> Option<&'a str> {
+    let end = format!("-----END {label}-----");
+    if label != "PGP PRIVATE KEY BLOCK" {
+        return body.split_once(&end).map(|(_, after)| after);
+    }
+    let mut offset = 0;
+    for line in body.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n', ' ', '\t']) == end {
+            return Some(&body[offset + end.len()..]);
+        }
+        offset += line.len();
+    }
+    None
+}
+
 /// Replace each private key block, and each token of a known format, with
 /// [`REDACTED`]. A key block with no end runs to the end of the text. Each
 /// character is looked at a bounded number of times.
@@ -697,8 +717,7 @@ fn shapes(input: &str) -> Option<String> {
             .then(|| PRIVATE_KEY.captures(rest))
             .flatten()
         {
-            let end = format!("-----END {}-----", &found[1]);
-            let len = rest.find(&end).map_or(rest.len(), |i| i + end.len());
+            let len = rest.len() - after_private_key(rest, &found[1]).map_or(0, str::len);
             step(len);
             out.push_str(&input[copied..at]);
             out.push_str(REDACTED);
@@ -888,24 +907,19 @@ fn is_header_secret(header: &str, value: &str) -> bool {
     let scheme = SCHEMES.iter().any(|s| first.eq_ignore_ascii_case(s));
     // An extension scheme can carry token68 or a list of auth parameters.
     let credential = value[first.len()..].trim_start();
-    let extension = first
-        .as_bytes()
-        .first()
-        .is_some_and(u8::is_ascii_alphabetic)
-        && first
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    };
+    let extension = token(first)
         && !credential.is_empty()
         && (credential
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
-            || credential.split_once('=').is_some_and(|(name, _)| {
-                !name.trim().is_empty()
-                    && name
-                        .trim()
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            }));
+            || credential
+                .split_once('=')
+                .is_some_and(|(name, _)| token(name.trim())));
     (scheme && !credential.is_empty()) || extension || looks_like_credential(first)
 }
 
@@ -2189,7 +2203,9 @@ const fn text_passes() -> usize {
 /// and as written too when `written`, the surest taken: a later reading
 /// can hide what made an earlier one name a secret.
 fn read_strength(name: &str, written: bool) -> Strength {
-    let mut surest = if written {
+    // A credential-shaped header may absorb the part of a field name that
+    // identified its value as secret. Keep that reading before replacing it.
+    let mut surest = if written || HEADER.is_match(name) {
         name_strength(name)
     } else {
         Strength::None
@@ -2519,7 +2535,21 @@ fn text_once(input: &str) -> Cow<'_, str> {
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
     apply(&QUOTED_HEADER_PARAMETER, &|c| {
-        format!("{}{}{REDACTED}", &c[1], &c[2])
+        // A JSON field supplies both delimiters and their escape depth. Keep
+        // its closing delimiter and the fields after it for the other rules.
+        let separator = &c[2];
+        let rest = &c[0][c[1].len() + separator.len()..];
+        let suffix = separator
+            .split_once(':')
+            .and_then(|(close, open)| {
+                let open = open.trim_start();
+                (open.ends_with('"') && close.trim_end() == open)
+                    .then_some(open.len())
+                    .and_then(|len| pair_value_len(rest, len - 1, b'"'))
+                    .map(|end| &rest[end..])
+            })
+            .unwrap_or_default();
+        format!("{}{separator}{REDACTED}{suffix}", &c[1])
     });
     apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
@@ -3703,7 +3733,7 @@ impl Line {
 /// private key block that one line opens are not written at all.
 pub struct Lines {
     pending: Vec<u8>,
-    in_key: bool,
+    key_label: Option<String>,
     out: Box<dyn std::io::Write + Send>,
 }
 
@@ -3723,7 +3753,7 @@ pub fn stderr_lines() -> Lines {
 pub fn lines_to(out: Box<dyn std::io::Write + Send>) -> Lines {
     Lines {
         pending: Vec::new(),
-        in_key: false,
+        key_label: None,
         out,
     }
 }
@@ -3733,14 +3763,29 @@ impl Lines {
         let line: Vec<u8> = self.pending.drain(..upto).collect();
         let line = String::from_utf8_lossy(&line);
         let line = line.strip_suffix('\n').unwrap_or(&line);
-        if self.in_key {
-            self.in_key = !line.contains("-----END ");
-            return Ok(());
+        let line = if let Some(label) = &self.key_label {
+            let Some(after) = after_private_key(line, label) else {
+                return Ok(());
+            };
+            self.key_label = None;
+            if after.trim().is_empty() {
+                return Ok(());
+            }
+            after
+        } else {
+            line
+        };
+        let mut rest = line;
+        while let Some((at, found)) = rest
+            .match_indices("-----BEGIN ")
+            .find_map(|(at, _)| PRIVATE_KEY.captures(&rest[at..]).map(|found| (at, found)))
+        {
+            let Some(after) = after_private_key(&rest[at..], &found[1]) else {
+                self.key_label = Some(found[1].to_owned());
+                break;
+            };
+            rest = after;
         }
-        let opens = line
-            .find("-----BEGIN ")
-            .is_some_and(|at| PRIVATE_KEY.is_match(&line[at..]));
-        self.in_key = opens && !line.contains("-----END ");
         writeln!(self.out, "{}", logged(line))
     }
 }

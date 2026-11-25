@@ -528,16 +528,7 @@ pub async fn run(
             }));
         }
         tallies.push(tally);
-        // Assertions and scorers need the original output. Redact the report only
-        // once their decisions are final, before writing it to any destination.
-        for case in &mut report.cases {
-            if let Some(output) = &mut case.output {
-                atomic_core::redact::value(output);
-            }
-            for failure in &mut case.failures {
-                *failure = atomic_core::redact::text(failure).into_owned();
-            }
-        }
+        redact_report(&mut report);
         reports.push(report);
     }
 
@@ -558,9 +549,7 @@ pub async fn run(
             .with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(path) = &args.report {
-        let mut public = serde_json::to_value(&reports)?;
-        atomic_core::redact::value(&mut public);
-        std::fs::write(path, serde_json::to_string_pretty(&public)? + "\n")
+        std::fs::write(path, serde_json::to_string_pretty(&reports)? + "\n")
             .with_context(|| format!("write {}", path.display()))?;
     }
     let skipped: Vec<(&str, Vec<String>)> = reports
@@ -816,6 +805,33 @@ fn lite_runtime(endpoint: &ModelEndpoint, sent: ModelEndpoint) -> LiteRuntime {
     lite.wire = Wire::for_base_url(&endpoint.base_url);
     lite.limit_field = Some(LimitField::for_endpoint(lite.wire, &endpoint.base_url));
     lite
+}
+
+/// Redact model output and diagnostic text after scoring. Keep the typed
+/// report fields intact so exported reports can still be read as baselines.
+fn redact_report(report: &mut Report) {
+    fn clean(field: &mut String) {
+        if let std::borrow::Cow::Owned(redacted) = atomic_core::redact::text(field) {
+            *field = redacted;
+        }
+    }
+    clean(&mut report.atom);
+    report.revision.iter_mut().for_each(clean);
+    report.failures.iter_mut().for_each(clean);
+    report.not_scored.iter_mut().for_each(clean);
+    for case in &mut report.cases {
+        clean(&mut case.id);
+        case.failures.iter_mut().for_each(clean);
+        if let Some(output) = &mut case.output {
+            atomic_core::redact::value(output);
+        }
+    }
+    for scorer in &mut report.scorers {
+        clean(&mut scorer.name);
+        scorer.reason.iter_mut().for_each(clean);
+        scorer.scored.iter_mut().for_each(clean);
+        scorer.skipped.iter_mut().for_each(clean);
+    }
 }
 
 /// A pass rate and its threshold to three places, or in full when three

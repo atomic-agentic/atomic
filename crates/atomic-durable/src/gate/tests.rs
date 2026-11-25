@@ -869,9 +869,6 @@ async fn operator_rotation_only_changes_the_enrolling_project() {
             .await
             .expect("unattributed verifier")
     );
-    enroll(&a, &first)
-        .await
-        .expect("re-enroll existing protected secret");
     let second = HumanCredential::new(operator(), "project b secret");
     enroll(&b, &second).await.expect("independent enrollment");
     let rotated = HumanCredential::new(operator(), "replacement for b");
@@ -882,6 +879,14 @@ async fn operator_rotation_only_changes_the_enrolling_project() {
     register(&mut a);
     a.launch().await.expect("launch");
     let (run, gate) = start_gated(&a, input(None)).await;
+    assert_eq!(
+        decide(&a, &first, command(&gate, "legacy", Verdict::Approve)).await,
+        Err(DecideError::NotEnrolled(operator())),
+        "a username-only verifier cannot authorize a scoped gate"
+    );
+    enroll(&a, &first)
+        .await
+        .expect("re-enroll existing protected secret");
     for other in [&second, &rotated] {
         assert_eq!(
             decide(&a, other, command(&gate, "wrong", Verdict::Approve)).await,
