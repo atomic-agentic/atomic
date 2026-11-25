@@ -157,8 +157,8 @@ pub const SITES: &[Site] = &[
     },
     Site {
         name: "delivery:after-observation",
-        what: "the initial read-only queue observation checkpointed and its row was recorded; \
-               the delivery workflow has not returned",
+        what: "the initial read-only queue observation checkpointed; its durable row has not \
+               been recorded and the delivery workflow has not returned",
     },
     Site {
         name: "delivery:after-decision",
