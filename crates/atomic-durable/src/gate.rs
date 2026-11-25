@@ -1178,6 +1178,12 @@ pub async fn find<R: DurableRuntime>(rt: &R, id: &str) -> Result<Option<Gate>> {
     .await
 }
 
+/// Read one scoped gate within the caller's transaction, for checks that must
+/// commit with an effect's durable dispatch reservation.
+pub async fn find_in(tx: &mut Tx<'_, '_>, id: &str, project: Option<&str>) -> Result<Option<Gate>> {
+    read_own_gate(tx, id, &project_param(project)).await
+}
+
 /// Send the wake-up again for every resolved gate whose run is still
 /// unfinished. Run it when a runtime starts or resumes runs: a decider that
 /// stopped after committing its decision but before waking the run leaves

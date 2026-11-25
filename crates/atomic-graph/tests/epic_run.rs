@@ -9,7 +9,7 @@ use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{
     Actor, Draft, EdgeKind, Evidence, Finish, GraphStore, Status, StoreError,
 };
-use atomic_graph::transactional_claim::{self, ClaimNext, CommitProof};
+use atomic_graph::transactional_claim::{self, ClaimNext, CommitProof, ReviewFollowup};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +74,179 @@ async fn select(rt: &Durare, step: &str) -> ClaimNext {
     })
     .await
     .expect("select and claim")
+}
+
+#[tokio::test]
+async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
+    let (rt, store, path) = setup("review-followup").await;
+    create(&store, "epic", None, true).await;
+    create(&store, "one", Some("epic"), false).await;
+    // A legacy goal may already have been closed and exported to this store.
+    store
+        .import(
+            Actor::human("operator"),
+            json!({
+                "id": "atomic-review-goal-21dfcf220478826051f5b1d3",
+                "title": "Legacy follow-up goal", "status": "closed", "priority": 3,
+                "issue_type": "goal", "created_at": "2026-01-02T00:00:00Z"
+            })
+            .to_string(),
+            false,
+        )
+        .await
+        .expect("import old goal");
+    store
+        .authorize_graph_run("epic", "run-one")
+        .await
+        .expect("authorize");
+    rt.control_transaction(|mut tx| {
+        Box::pin(
+            async move { transactional_claim::bind_epic_run(&mut tx, "epic", "run-one").await },
+        )
+    })
+    .await
+    .expect("bind");
+    let ClaimNext::Claimed { lease, .. } = select(&rt, "claim-followup").await else {
+        panic!("expected claimed item");
+    };
+    let finding = ReviewFollowup {
+        reviewer: "independent-reviewer".into(),
+        file: "docs/guide.md".into(),
+        line: Some(1),
+        severity: "low".into(),
+        category: "formatting".into(),
+        message: "Remove the trailing space.".into(),
+    };
+    let invalid = ReviewFollowup {
+        severity: "blocker".into(),
+        ..finding.clone()
+    };
+    let failed_lease = lease.clone();
+    let failed_finding = finding.clone();
+    rt.control_transaction(move |mut tx| {
+        let failed_lease = failed_lease.clone();
+        let failed_finding = failed_finding.clone();
+        let invalid = invalid.clone();
+        Box::pin(async move {
+            transactional_claim::file_review_followups(
+                &mut tx,
+                &failed_lease,
+                "epic",
+                "run-one",
+                "one.review",
+                &[failed_finding, invalid],
+            )
+            .await
+        })
+    })
+    .await
+    .expect_err("one invalid finding rolls back the entire batch");
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE id LIKE 'atomic-review-%' AND kind='task'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(row.int("n")?, 0, "no partial follow-up");
+            Ok(())
+        })
+    })
+    .await
+    .expect("inspect rolled-back batch");
+    for _ in 0..2 {
+        let lease = lease.clone();
+        let finding = finding.clone();
+        rt.control_transaction(move |mut tx| {
+            let lease = lease.clone();
+            let finding = finding.clone();
+            Box::pin(async move {
+                transactional_claim::file_review_followups(
+                    &mut tx,
+                    &lease,
+                    "epic",
+                    "run-one",
+                    "one.review",
+                    &[finding],
+                )
+                .await
+            })
+        })
+        .await
+        .expect("file or replay finding");
+    }
+    let followup = rt.control_transaction(|mut tx| Box::pin(async move {
+        let rows = tx.query_one(
+            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE kind='task' AND id LIKE 'atomic-review-%'",
+            &[],
+        ).await?;
+        assert_eq!(rows.int("n")?, 1, "replay cannot duplicate follow-up");
+        let row = tx.query_one(
+            "SELECT f.id AS id,f.parent AS parent,e.target AS discovered FROM atomic_graph_items f \
+             JOIN atomic_graph_edges e ON e.source=f.id AND e.kind='discovered-from' \
+             WHERE f.id LIKE 'atomic-review-%' AND f.kind='task'",
+            &[],
+        ).await?;
+        assert_eq!(row.text_opt("parent")?, None);
+        assert_eq!(row.text("discovered")?, "one");
+        row.text("id")
+    })).await.expect("inspect follow-up graph");
+    let lease_for_close = lease.clone();
+    rt.control_transaction(move |mut tx| {
+        let lease_for_close = lease_for_close.clone();
+        Box::pin(async move {
+            transactional_claim::close_with_commit(&mut tx, &lease_for_close, &"a".repeat(40)).await
+        })
+    })
+    .await
+    .expect("close original item");
+    assert!(
+        matches!(
+            select(&rt, "after-review-followup").await,
+            ClaimNext::Complete
+        ),
+        "unassigned follow-up cannot keep the active epic open"
+    );
+    create(&store, "later-epic", None, true).await;
+    store
+        .add_edge(
+            Actor::human("operator"),
+            followup.clone(),
+            EdgeKind::ParentChild,
+            "later-epic".into(),
+        )
+        .await
+        .expect("operator assigns the task using the graph link operation");
+    store
+        .authorize_graph_run("later-epic", "run-later")
+        .await
+        .expect("authorize follow-up run");
+    let next = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                transactional_claim::bind_epic_run(&mut tx, "later-epic", "run-later").await?;
+                transactional_claim::claim_next_for_epic(
+                    &mut tx,
+                    "run-later",
+                    "next",
+                    "later-epic",
+                    "run-later",
+                    Duration::from_secs(900),
+                    |_| Ok(()),
+                )
+                .await
+            })
+        })
+        .await
+        .expect("select follow-up");
+    let ClaimNext::Claimed { item, .. } = next else {
+        panic!("operator assigned follow-up must be claimable");
+    };
+    assert_eq!(item.id, followup);
+    drop(rt);
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

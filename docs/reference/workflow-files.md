@@ -107,6 +107,30 @@ with `approve` among them:
 | `request_changes`, `revise` | The author gets a repair round, while any are left; then a person decides. |
 | `reject`, `escalate`, `insufficient_context` | A person decides. |
 
+For graph-driven `coding: true` steps, the host may offer a follow-up only
+for the exact typed formatting finding `Remove the trailing space.` on line 1
+of a safe Markdown file. The host independently verifies that the candidate
+changed one regular prose blob by adding that one trailing ASCII space. A
+reviewer-supplied severity, category, path, or message cannot establish this
+proof. A security-labeled item, a touched control row, any additional change,
+or an explicit `request_changes` or `revise` verdict keeps the blocking review
+path. Older reviewers with plain-text findings keep their verdicts.
+
+For an eligible finding, the candidate's merge gate shows its commit, candidate
+digest, both raw approvals, and the proposed follow-up. An enrolled operator
+must approve that exact candidate and panel before publication. Rejecting the
+classification leaves the item open and files nothing.
+
+Follow-ups are filed as unassigned tasks with `discovered-from` links when the
+original item closes. They do not keep its epic open. An operator can schedule
+one with `atomic graph link <task> parent-child <epic>` and a pinned epic.
+Delivery requires two explicit independent approvals and, when findings were
+deferred, the matching human classification. Atomic checks the decision
+against the published reviewer findings at delivery admission and before
+each remote effect. Delivery has its own gate for authorizing those effects.
+The graph run records this routing policy at admission. A run recorded before
+the policy was introduced keeps its original review behavior when recovered.
+
 The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
 own. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step

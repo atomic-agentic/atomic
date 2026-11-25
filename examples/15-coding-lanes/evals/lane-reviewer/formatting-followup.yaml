@@ -1,0 +1,25 @@
+input:
+  diff: "diff --git a/docs/guide.md b/docs/guide.md\nindex 51175d0..f86b9e1 100644\n--- a/docs/guide.md\n+++ b/docs/guide.md\n@@ -1 +1 @@\n-Example text.\n+Example text. \n"
+  self_review:
+    items:
+      '1': The patch adds one trailing space to a documentation line.
+      '2': No import or dependency changes.
+      '3': Only docs/guide.md changes.
+      '4': No secret is added by this edit.
+      '5': No branch is added.
+      '6': No retry is added.
+      '7': The edit reads no new input.
+      '8': The edit takes no resource.
+      '9': 'N/A: no decision point is selected.'
+      '10': 'N/A: no control row is selected.'
+    decisions: []
+    controls: []
+  host_review:
+    decision_points: []
+    selected_controls: []
+    control_results: []
+expect:
+- "output.verdict == 'approve'"
+- "output.findings.size() == 1"
+- "output.findings[0].category == 'formatting'"
+- "output.findings[0].message == 'Remove the trailing space.'"

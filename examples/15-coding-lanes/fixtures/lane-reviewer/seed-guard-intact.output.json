@@ -1,7 +1,7 @@
 {
   "verdict": "approve",
-  "reason": "The patch adds only a comment explaining the existing refusal, and the host control result covers the guard.",
   "findings": [
+    "The patch adds only a comment explaining the existing refusal, and the host control result covers the guard.",
     "tools/lane_guard.py: verified host records still reach the confirmed return."
   ]
 }

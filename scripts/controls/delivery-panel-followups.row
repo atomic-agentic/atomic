@@ -1,0 +1,1 @@
+delivery-panel-followups|crates/atomic/src/delivery_evidence.rs|gate.proposal == gate::proposal_digest(&gate.title, &gate.show, &gate.evidence)|!gate.proposal.is_empty()|-p atomic-agentic --test graph_work_loop -- delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item

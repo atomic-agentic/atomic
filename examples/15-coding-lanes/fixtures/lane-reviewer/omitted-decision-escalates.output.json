@@ -1,7 +1,7 @@
 {
   "verdict": "escalate",
-  "reason": "The patch itself is sound, but the self-review declares `decisions: []` while the host inventory lists the decision point `candidate publication`. The evidence this review is meant to rest on does not cover what the host requires, so a person decides rather than this verdict settling it.",
   "findings": [
+    "The patch itself is sound, but the self-review declares `decisions: []` while the host inventory lists the decision point `candidate publication`. The evidence this review is meant to rest on does not cover what the host requires, so a person decides rather than this verdict settling it.",
     "The new branch refuses a finding with no host record and confirms one with a host record; both halves are in the patch.",
     "Item 9 of the self-review gives an N/A reason claiming the diff names no decision point, but the host inventory lists `candidate publication`, so that reason does not hold.",
     "No control row was selected and none was proved, so nothing here shows the guard bites."

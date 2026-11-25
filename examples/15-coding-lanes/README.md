@@ -70,6 +70,18 @@ Both must return `approve` for the same candidate, and acceptance then reads
 `approved by reviewer(s) lane-reviewer, lane-evidence-reviewer in review round
 <n>` — the words `atomic delivery` checks before it asks a person about a push.
 
+`lane-reviewer` version 2 returns only `verdict` and a nonempty `findings` list. Ordinary
+findings are strings, including its reason for a verdict, and keep the
+reviewer's verdict unchanged. For the graph coding loop's narrow formatting
+follow-up, it can instead return exactly one structured finding with `file`,
+`line: 1`, low `severity`, `category: formatting`, and message `Remove the
+trailing space.` An explicit `request_changes` always blocks. Even an
+`approve` with that object blocks unless the host proves the candidate changed
+only one regular plain-prose Markdown blob by adding that final space and no
+control row was touched. `lane-evidence-reviewer` retains its separate string
+evidence contract. The normal graph workflow test uses this shipped reviewer
+schema; the handwritten output fixture is not a host proof.
+
 Before the first verdict is asked for, atomic validates the host inventory it is
 about to send against **each** member's full input schema, so a reviewer that
 cannot accept it stops the run instead of answering a truncated question. How
@@ -192,7 +204,7 @@ approving the same candidate.
 | `tools/lane_guard.py` and `tests/test_lane_guard.py` | `python3 tests/test_lane_guard.py` | The guard refuses an unverified finding, still confirms a host-recorded one, and refuses an absent record. |
 | `scripts/controls/lane-guard-bites.row` and `tests/lane_guard.rs` | `cargo test --locked -p lane-guard-example --test lane_guard lane_guard_refuses_unverified` | The Cargo target calls the same guard, so the host can prove this row by switching the guard off and back on. |
 | `lane-controls-proof` | `tools/check_examples.py` and `atomic eval lane-controls-proof`, both of which run the local command | The local fixture reads a row and reports `intact` or `blind`; it cannot emit a passing proof. In a production coding run the host substitutes its pinned controls driver. |
-| Seeded `lane-reviewer` cases | `atomic eval lane-reviewer --live` and recorded replay; see [reviewer recall](reviewer-recall.md) | A local model identified two synthetic coding defects and approved one benign control in the recorded pilot. |
+| Seeded `lane-reviewer` cases | Offline `atomic eval lane-reviewer` and the historical report; see [reviewer recall](reviewer-recall.md) | The old prompt's local pilot identified two synthetic coding defects and approved one benign control. Version 2 has no matching recordings and makes no claim of a new live pass. |
 | Self-review, the panel, repair rounds, criteria, trial merge, the two gates | nothing here | These need a bound base revision, a worktree, an admitted inventory, a model and a person's decision. The runtime has them; this directory has none. |
 
 Nothing in this file is a declaration the runtime ignores. Criteria, which used

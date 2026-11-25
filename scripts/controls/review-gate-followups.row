@@ -1,0 +1,1 @@
+review-gate-followups|crates/atomic/src/pipeline.rs|Ok((candidate, acceptance, followups))|Ok((candidate, acceptance, Vec::new()))|-p atomic-agentic --test graph_work_loop -- shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes

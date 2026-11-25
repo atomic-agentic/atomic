@@ -684,6 +684,7 @@ pub async fn run(
                 run,
                 epic,
                 model_source: engine.lane_policy.clone(),
+                review_routing: true,
             })?,
         ),
         None => (PIPELINE, serde_json::to_value(run)?),

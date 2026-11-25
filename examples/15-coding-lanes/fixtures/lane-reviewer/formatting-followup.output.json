@@ -1,0 +1,12 @@
+{
+  "verdict": "approve",
+  "findings": [
+    {
+      "file": "docs/guide.md",
+      "line": 1,
+      "severity": "nit",
+      "category": "formatting",
+      "message": "Remove the trailing space."
+    }
+  ]
+}

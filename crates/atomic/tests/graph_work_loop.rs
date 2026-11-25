@@ -355,7 +355,13 @@ fn panel_graph_project(project: &Path) -> String {
             evidence.clone()
         } else {
             json!({"type":"object","additionalProperties":false,"required":["verdict"],
-                "properties":{"verdict":{"type":"string","enum":["approve","request_changes"]}}})
+            "properties":{
+                "verdict":{"type":"string","enum":["approve","request_changes","revise"]},
+                "findings":{"type":"array","items":{"type":"object","additionalProperties":false,
+                    "required":["file","severity","category","message"],
+                    "properties":{"file":{"type":"string"},"line":{"type":"integer"},"severity":{"type":"string"},
+                        "category":{"type":"string"},"message":{"type":"string"}}}}
+            }})
         };
         std::fs::write(
             project.join(format!("atoms/{name}.input.schema.json")),
@@ -381,10 +387,57 @@ fn panel_graph_project(project: &Path) -> String {
     base
 }
 
+/// Use the reference lane's versioned reviewer contract in the normal graph
+/// coding path, rather than a hand-written test schema for its first member.
+fn shipped_panel_graph_project(project: &Path) -> String {
+    panel_graph_project(project);
+    for (name, source) in [
+        (
+            "lane-reviewer.atom.astro",
+            include_str!("../../../examples/15-coding-lanes/atoms/lane-reviewer.atom.astro"),
+        ),
+        (
+            "lane-reviewer.input.schema.yaml",
+            include_str!("../../../examples/15-coding-lanes/atoms/lane-reviewer.input.schema.yaml"),
+        ),
+        (
+            "lane-reviewer.output.schema.yaml",
+            include_str!(
+                "../../../examples/15-coding-lanes/atoms/lane-reviewer.output.schema.yaml"
+            ),
+        ),
+        (
+            "lane-self-check.output.schema.yaml",
+            include_str!(
+                "../../../examples/15-coding-lanes/atoms/lane-self-check.output.schema.yaml"
+            ),
+        ),
+    ] {
+        std::fs::write(project.join("atoms").join(name), source).expect("shipped reviewer asset");
+    }
+    let path = project.join("workflows/fix.workflow.yaml");
+    let workflow = std::fs::read_to_string(&path).expect("panel workflow");
+    let updated = workflow.replace(
+        "reviewers: [review-one, review-two]",
+        "reviewers: [lane-reviewer, review-two]",
+    );
+    assert_ne!(workflow, updated, "shipped panel reviewer binding");
+    std::fs::write(path, updated).expect("shipped reviewer workflow");
+    git(project, &["add", "."]);
+    git(project, &["commit", "-q", "-m", "bind shipped reviewer"]);
+    let base = git(project, &["rev-parse", "HEAD"]);
+    git(project, &["update-ref", "refs/heads/main", &base]);
+    base
+}
+
 fn panel_pipeline(project: &Path) -> Pipeline {
     let mut registry = Registry::new();
     let mut atoms = BTreeMap::new();
-    for name in ["fix-item", "self-check", "review-one", "review-two"] {
+    let mut names = vec!["fix-item", "self-check", "review-one", "review-two"];
+    if project.join("atoms/lane-reviewer.atom.astro").exists() {
+        names.push("lane-reviewer");
+    }
+    for name in names {
         let loaded = atom::load(
             &project.join(format!("atoms/{name}.atom.astro")),
             &mut registry,
@@ -590,20 +643,24 @@ async fn wait_for_review_gate(rt: &Durare) -> gate::Gate {
 }
 
 async fn approve_review_gate(rt: &Durare, gate: &gate::Gate, command: &str) {
+    decide_review_gate(rt, gate, command, Verdict::Approve).await;
+}
+
+async fn decide_review_gate(rt: &Durare, gate: &gate::Gate, command: &str, verdict: Verdict) {
     gate::decide(
         rt,
         &HumanCredential::new(Principal::local("owner"), SECRET),
         DecisionCommand {
             command_id: command.into(),
             gate: gate.id.clone(),
-            verdict: Verdict::Approve,
-            comment: Some("approved after review".into()),
+            verdict,
+            comment: None,
             proposal: gate.proposal.clone(),
             answer: None,
         },
     )
     .await
-    .expect("human approval");
+    .expect("human review decision");
 }
 
 async fn released_review_handoff(rt: &Durare) -> (String, i64, Option<String>) {
@@ -656,8 +713,11 @@ fn graph_loop_child() {
             return;
         }
         let rt = engine(&root, &url, true).await;
-        if role == "start" || role == "start-panel" || role == "start-routed" {
-            let mut prepared = if role == "start-panel" {
+        if matches!(
+            role.as_str(),
+            "start" | "start-panel" | "start-legacy-panel" | "start-routed"
+        ) {
+            let mut prepared = if matches!(role.as_str(), "start-panel" | "start-legacy-panel") {
                 panel_pipeline(&root.join("project"))
             } else {
                 pipeline(&root.join("project"))
@@ -686,6 +746,7 @@ fn graph_loop_child() {
                 },
                 epic: EPIC.into(),
                 model_source,
+                review_routing: role != "start-legacy-panel",
             };
             rt.start(GRAPH_PIPELINE, RUN, run)
                 .await
@@ -835,45 +896,737 @@ fn three_dependent_items_make_three_model_calls_and_close_with_host_commits() {
     });
 }
 
+fn formatting_finding() -> Value {
+    json!({"severity":"nit","category":"formatting","file":"docs/guide.md","line":1,
+        "message":"Remove the trailing space."})
+}
+
+#[derive(Clone, Copy)]
+enum PanelHistory {
+    BeforeRouting,
+    AfterFinalize,
+    DraftAccepted,
+    Shipped,
+    Security,
+}
+
+fn checkpoint_encoding(value: &Value) -> String {
+    let mut encoded =
+        atomic_core::testing::b64url(&serde_json::to_vec(value).expect("checkpoint JSON"))
+            .replace('-', "+")
+            .replace('_', "/");
+    while !encoded.len().is_multiple_of(4) {
+        encoded.push('=');
+    }
+    encoded
+}
+
+/// Restore the old draft's next checkpoint, written when both published
+/// verdicts were treated as approval. The referenced candidate and digest
+/// come from this execution's genuine author turn.
+async fn record_draft_acceptance(rt: &Durare) {
+    let steps = rt.steps(RUN).await.expect("reviewed graph steps");
+    let author = steps
+        .iter()
+        .find(|s| s.name == "graph.00000.fix.turn")
+        .and_then(|s| s.output.as_ref())
+        .and_then(|o| o.get("Candidate"))
+        .expect("checkpointed author");
+    let accepted = json!({"candidate":author["id"], "digest":author["digest"], "accepted":true,
+        "reason":"accepted low findings from reviewer(s) review-one, review-two as follow-up work in review round 0"});
+    let encoded = checkpoint_encoding(&accepted);
+    rt.control_transaction(move |mut tx| {
+        let encoded = encoded.clone();
+        Box::pin(async move {
+            let n = tx.execute(
+                "INSERT INTO operation_outputs(workflow_uuid,function_id,function_name,output,serialization)
+                 SELECT workflow_uuid,function_id+1,'graph.00000.fix.accepted',?,serialization
+                 FROM operation_outputs WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.1.publish'",
+                &[Param::Text(encoded),Param::Text(RUN.into())]
+            ).await?;
+            assert_eq!(n, 1, "old acceptance follows the published panel");
+            Ok(())
+        })
+    }).await.expect("record draft acceptance");
+}
+
+/// Run the real graph panel against the supplied candidate and verdicts.
+async fn editorial_panel(
+    root: &Path,
+    first: &str,
+    second: &str,
+    finding: Value,
+    candidate_text: &str,
+    human: Option<Verdict>,
+    history: Option<PanelHistory>,
+) -> (FakeModel, Durare) {
+    let signal = root.join("finish-author");
+    let model = FakeModel::start(vec![
+        Reply::Gated {
+            file: signal.clone(),
+            reply: Box::new(Reply::Text(r#"{"done":true}"#.into())),
+        },
+        Reply::Text(json!({
+            "items": (1..=10).map(|n| (n.to_string(), json!(if n == 10 {
+                "N/A: no controls were selected".to_owned()
+            } else { format!("evidence for item {n}") }))).collect::<serde_json::Map<String, Value>>(),
+            "decisions": [{
+                "point":"candidate publication", "allow_refuse":"only validated evidence reaches review",
+                "not_found":"refuse", "permission_denied":"refuse", "link_loop":"refuse",
+                "not_directory":"refuse", "other_io":"refuse", "parse_error":"refuse",
+                "timeout":"refuse", "empty_result":"refuse"
+            }],
+            "controls": []
+        }).to_string()),
+        Reply::Text(json!({"verdict":first,"findings":[finding]}).to_string()),
+        Reply::Text(json!({"verdict":second}).to_string()),
+    ]).await.expect("scripted coding panel");
+    seed(root).await;
+    leave_one_work_child(root).await;
+    if matches!(history, Some(PanelHistory::Security)) {
+        let credential = HumanCredential::new(Principal::local("owner"), SECRET);
+        let graph =
+            SqliteStore::open_authorized(&root.join("atomic.db"), SystemTime::now, credential)
+                .expect("graph for security-labeled item");
+        graph
+            .set_status(Actor::human("owner"), CHILDREN[0].into(), Status::Closed)
+            .await
+            .expect("close ordinary item");
+        graph
+            .import(
+                Actor::human("owner"),
+                json!({"id":"security-panel-task", "title":"Imported security work",
+                "labels":["security"], "status":"open", "priority":2,
+                "issue_type":"task", "parent_issue":EPIC,
+                "created_at":"2026-01-02T00:00:00Z"})
+                .to_string(),
+                false,
+            )
+            .await
+            .expect("import security-labeled item");
+    }
+    let project = root.join("project");
+    std::fs::create_dir_all(project.join("docs")).expect("fixture guide directory");
+    std::fs::write(project.join("docs/guide.md"), "Example text.\n").expect("base guide");
+    let base = if matches!(history, Some(PanelHistory::Shipped)) {
+        shipped_panel_graph_project(&project)
+    } else {
+        panel_graph_project(&project)
+    };
+    let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
+        .expect("graph worktrees")
+        .path(RUN, "graph.00000.fix");
+    let mut worker = child_command(
+        root,
+        &model.base_url(),
+        &base,
+        if matches!(history, Some(PanelHistory::BeforeRouting)) {
+            "start-legacy-panel"
+        } else {
+            "start-panel"
+        },
+        match history {
+            Some(PanelHistory::AfterFinalize) => Some("graph:after-finalize-applied"),
+            Some(PanelHistory::DraftAccepted) => {
+                Some("checkpoint:after:graph.00000.fix.review.0.1.publish")
+            }
+            Some(PanelHistory::Shipped) => None,
+            _ => None,
+        },
+    )
+    .env("HOME", root.join("home"))
+    .spawn()
+    .expect("start panel");
+    wait_for("author model call", || model.calls() == 1).await;
+    std::fs::create_dir_all(tree.join("docs")).expect("author docs directory");
+    std::fs::write(tree.join("docs/guide.md"), candidate_text).expect("author edit");
+    std::fs::write(signal, "ready").expect("release author");
+    let rt = durable(root).await;
+    if let Some(verdict) = human {
+        let gate = tokio::select! {
+            gate = wait_for_review_gate(&rt) => gate,
+            result = rt.result::<Value>(RUN) => panic!("expected the human review gate, graph finished with {result:?}"),
+        };
+        let shown = &gate.show["verdict"]["reviewers"][0]["verdict"];
+        let original = shown.get("review").unwrap_or(shown);
+        assert_eq!(original, &json!({"verdict":first,"findings":[finding]}));
+        decide_review_gate(&rt, &gate, "decide-editorial-panel", verdict).await;
+    }
+    let status = tokio::task::spawn_blocking(move || worker.wait())
+        .await
+        .expect("panel worker")
+        .expect("wait for panel");
+    if let Some(crash @ (PanelHistory::AfterFinalize | PanelHistory::DraftAccepted)) = history {
+        assert!(
+            !status.success(),
+            "review checkpoint failpoint should kill the worker"
+        );
+        match crash {
+            PanelHistory::AfterFinalize => {
+                assert_eq!(editorial_followup_count(&rt).await, 1);
+                let (_, steps) = inspect(root).await;
+                assert!(steps.contains(&"graph.00000.fix.finalize.0".to_owned()));
+                assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
+            }
+            PanelHistory::DraftAccepted => record_draft_acceptance(&rt).await,
+            PanelHistory::BeforeRouting | PanelHistory::Shipped | PanelHistory::Security => {
+                unreachable!()
+            }
+        }
+        let mut recover = child_command(root, &model.base_url(), &base, "recover", None);
+        recover.env("HOME", root.join("home"));
+        let resumed = tokio::task::spawn_blocking(move || recover.status())
+            .await
+            .expect("recovery worker")
+            .expect("recovery status");
+        assert!(resumed.success(), "recovered graph panel: {resumed}");
+    } else {
+        assert!(status.success(), "graph panel child: {status}");
+    }
+    assert_eq!(model.calls(), 4, "author, self-review and two reviewers");
+    (model, rt)
+}
+
+async fn editorial_followup_count(rt: &Durare) -> i64 {
+    rt.control_transaction(|mut tx| Box::pin(async move {
+        tx.query_one("SELECT COUNT(*) AS n FROM atomic_graph_edges WHERE kind='discovered-from' AND target=?",
+            &[Param::Text(CHILDREN[0].into())]).await?.int("n")
+    })).await.expect("count follow-ups for the reviewed item")
+}
+
+#[test]
+fn shipped_lane_reviewer_rejects_empty_findings() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/15-coding-lanes/atoms/lane-reviewer.atom.astro");
+    let atom = atom::load(&path, &mut Registry::new()).expect("shipped reviewer loads");
+    let schema = atom
+        .program
+        .contracts
+        .get("Output")
+        .expect("reviewer output contract");
+    let validator = jsonschema::validator_for(schema).expect("valid reviewer schema");
+    let empty = json!({"verdict":"approve","findings":[]});
+    assert!(
+        validator.validate(&empty).is_err(),
+        "an approval without review evidence must fail the shipped contract"
+    );
+    assert!(
+        validator
+            .validate(&json!({"verdict":"approve","findings":["The guard is unchanged."]}))
+            .is_ok(),
+        "legacy string evidence remains valid"
+    );
+    assert!(
+        validator
+            .validate(&json!({"verdict":"approve","findings":[formatting_finding()]}))
+            .is_ok(),
+        "the exact formatting citation remains valid"
+    );
+}
+
+#[test]
+fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
+    on_codex_runtime(async {
+        for (first, candidate, accepted) in [
+            ("approve", "Example text. \n", true),
+            ("approve", "Example text. \n", false),
+            ("approve", "Publish customer addresses. \n", false),
+            ("request_changes", "Example text. \n", false),
+        ] {
+            let root = std::fs::canonicalize(scratch("shipped-formatting-review"))
+                .expect("physical graph fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                first,
+                "approve",
+                formatting_finding(),
+                candidate,
+                Some(if accepted {
+                    Verdict::Approve
+                } else {
+                    Verdict::Reject
+                }),
+                Some(PanelHistory::Shipped),
+            )
+            .await;
+            let result = rt.result::<Value>(RUN).await;
+            let steps = rt.steps(RUN).await.expect("shipped reviewer checkpoints");
+            let reviewer = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.0.0.publish")
+                .and_then(|step| step.output.as_ref())
+                .expect("shipped reviewer published a verdict");
+            assert_eq!(reviewer["verdict"], first);
+            assert_eq!(reviewer["findings"], json!([formatting_finding()]));
+            assert!(
+                reviewer.get("reason").is_none(),
+                "version 2 has no free-form reason"
+            );
+            if accepted {
+                result.expect("host-verified formatting accepted");
+                assert_eq!(editorial_followup_count(&rt).await, 1);
+                let receipt = steps
+                    .iter()
+                    .find(|step| step.name == "graph.00000.fix.accepted")
+                    .and_then(|step| step.output.as_ref())
+                    .expect("accepted graph receipt");
+                assert_eq!(receipt["verified_formatting_path"], "docs/guide.md");
+                let classification = steps
+                    .iter()
+                    .find(|step| step.name == "graph.00000.fix.review.gate")
+                    .and_then(|step| step.output.as_ref())
+                    .expect("candidate-bound classification gate opened");
+                assert_eq!(
+                    classification["show"]["candidate"]["digest"],
+                    receipt["digest"]
+                );
+                assert_eq!(
+                    classification["show"]["proposed_followups"][0]["file"],
+                    "docs/guide.md"
+                );
+            } else {
+                result.expect_err("unproved or explicit negative review cannot close");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
+                assert!(
+                    steps
+                        .iter()
+                        .any(|step| step.name == "graph.00000.fix.review.gate"),
+                    "blocked review opens a human gate"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn imported_security_label_excludes_editorial_followups() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("security-formatting-review"))
+            .expect("physical fixture path");
+        let (_, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            formatting_finding(),
+            "Example text. \n",
+            Some(Verdict::Reject),
+            Some(PanelHistory::Security),
+        )
+        .await;
+        rt.result::<Value>(RUN)
+            .await
+            .expect_err("security item cannot defer a finding");
+        let steps = rt.steps(RUN).await.expect("security review steps");
+        let gate = steps
+            .iter()
+            .find(|step| step.name == "graph.00000.fix.review.gate")
+            .and_then(|step| step.output.as_ref())
+            .expect("security review gate");
+        assert!(
+            gate["show"].get("proposed_followups").is_none(),
+            "security-labeled item may not propose a nonblocking finding"
+        );
+        let rows = rt.control_transaction(|mut tx| Box::pin(async move {
+            tx.query_one("SELECT COUNT(*) AS n FROM atomic_graph_items WHERE created_by='atomic-review'", &[])
+                .await?.int("n")
+        })).await.expect("count review follow-ups");
+        assert_eq!(rows, 0);
+    });
+}
+
+#[test]
+fn explicit_reviewer_change_request_opens_gate_without_followup() {
+    on_codex_runtime(async {
+        for verdict in [Verdict::Approve, Verdict::Reject] {
+            let root = std::fs::canonicalize(scratch("editorial-gate"))
+                .expect("physical fixture path for Git trial worktree");
+            let (_model, rt) = editorial_panel(
+                &root,
+                "approve",
+                "request_changes",
+                formatting_finding(),
+                "Example text. \n",
+                Some(verdict),
+                None,
+            )
+            .await;
+            let result = rt.result::<Value>(RUN).await;
+            if verdict == Verdict::Approve {
+                result.expect("human approved the explicit change request");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
+                let err =
+                    atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+                        .await
+                        .expect_err("delivery refuses human override");
+                assert_eq!(
+                    err.to_string(),
+                    "human-overridden review cannot authorize delivery"
+                );
+            } else {
+                let err = result.expect_err("rejected graph run");
+                assert!(err.to_string().contains("was rejected"), "{err}");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
+            }
+        }
+    });
+}
+
+#[test]
+fn explicit_reviewer_changes_block_even_on_verified_formatting() {
+    on_codex_runtime(async {
+        let privacy = json!({"file":"docs/guide.md","line":1,"severity":"low","category":"grammar",
+            "message":"Omit the customer address."});
+        for (first, finding) in [
+            ("request_changes", formatting_finding()),
+            ("revise", formatting_finding()),
+            ("request_changes", privacy.clone()),
+            ("revise", privacy),
+        ] {
+            let root = std::fs::canonicalize(scratch("formatting-changes"))
+                .expect("physical fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                first,
+                "approve",
+                finding,
+                "Example text. \n",
+                Some(Verdict::Reject),
+                None,
+            )
+            .await;
+            let err = rt
+                .result::<Value>(RUN)
+                .await
+                .expect_err("explicit objection opened the gate");
+            assert!(err.to_string().contains("was rejected"), "{err}");
+            assert_eq!(editorial_followup_count(&rt).await, 0);
+            let steps = rt.steps(RUN).await.expect("explicit review steps");
+            let gate = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.gate")
+                .and_then(|step| step.output.as_ref())
+                .expect("explicit review gate");
+            assert!(
+                gate["show"].get("proposed_followups").is_none(),
+                "an explicit change request cannot enter classification"
+            );
+        }
+    });
+}
+
+#[test]
+fn unproved_formatting_and_mislabeled_privacy_findings_require_repair() {
+    on_codex_runtime(async {
+        let privacy = json!({"severity":"low","category":"grammar","file":"docs/guide.md","line":1,
+            "message":"Omit the customer's home address from the public guide."});
+        for (finding, candidate) in [
+            (privacy, "Example text. \n"),
+            (formatting_finding(), "Publish customer addresses. \n"),
+        ] {
+            let root = std::fs::canonicalize(scratch("unproved-formatting"))
+                .expect("physical fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                "approve",
+                "approve",
+                finding,
+                candidate,
+                Some(Verdict::Reject),
+                None,
+            )
+            .await;
+            let err = rt
+                .result::<Value>(RUN)
+                .await
+                .expect_err("unproved finding opened the gate");
+            assert!(err.to_string().contains("was rejected"), "{err}");
+            assert_eq!(editorial_followup_count(&rt).await, 0);
+            let steps = rt.steps(RUN).await.expect("unproved review steps");
+            let gate = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.gate")
+                .and_then(|step| step.output.as_ref())
+                .expect("unproved finding gate");
+            assert!(
+                gate["show"].get("proposed_followups").is_none(),
+                "unproved or semantic finding cannot enter classification"
+            );
+        }
+    });
+}
+
+#[test]
+fn recovery_refuses_a_draft_acceptance_after_an_explicit_change_request() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("draft-accepted")).expect("physical fixture path");
+        let finding = json!({"file":"docs/guide.md","line":1,"severity":"low","category":"grammar",
+            "message":"Omit the customer address."});
+        let (_, rt) = editorial_panel(
+            &root,
+            "request_changes",
+            "approve",
+            finding,
+            "Publish customer addresses.\n",
+            None,
+            Some(PanelHistory::DraftAccepted),
+        )
+        .await;
+        let err = rt
+            .result::<Value>(RUN)
+            .await
+            .expect_err("old draft acceptance cannot authorize publication");
+        let detail = err.to_string();
+        assert!(
+            detail.contains("graph.00000.fix.review.claim.release")
+                && detail.contains("graph.00000.fix.accepted"),
+            "{detail}"
+        );
+        assert_eq!(editorial_followup_count(&rt).await, 0);
+        let (_, steps) = inspect(&root).await;
+        assert!(!steps.contains(&"graph.00000.fix.publish".into()));
+        assert!(!steps.contains(&"graph.00000.fix.close".into()));
+    });
+}
+
+async fn open_cli_delivery(
+    root: &Path,
+    url: &str,
+    delivery_run: &str,
+) -> (Durare, PathBuf, Value, Value) {
+    // Move a consistent snapshot of this real graph run into the normal
+    // CLI project state. Delivery admission must read the recorded source
+    // through that project's runtime and open an actual human gate.
+    cli_success(&cli(root, &root.join("project"), url, &["graph", "export"]).await);
+    let cli_db = cli_database(root, &root.join("project"));
+    // Read-only export leaves an absent CLI database absent. A previous
+    // fixture or a writable command may have created it, in which case
+    // replace it with the source run's consistent snapshot.
+    match std::fs::remove_file(&cli_db) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("replace CLI database: {error}"),
+    }
+    let mut source_db = sqlx::SqliteConnection::connect(&format!(
+        "sqlite://{}?mode=rw",
+        root.join("atomic.db").display()
+    ))
+    .await
+    .expect("source database connection");
+    sqlx::query("VACUUM main INTO ?")
+        .bind(cli_db.to_string_lossy().as_ref())
+        .execute(&mut source_db)
+        .await
+        .expect("consistent CLI source snapshot");
+    let state_id = cli_state_id(root, &root.join("project"));
+    let cli_project = format!("graph-loop/{state_id}");
+    let cli_rt = Durare::sqlite(&cli_db).await.expect("copied project store");
+    cli_rt
+        .control_transaction(move |mut tx| {
+            let cli_project = cli_project.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_run_projects SET project=? WHERE run_id=?",
+                    &[Param::Text(cli_project), Param::Text(RUN.into())],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("adopt source into CLI project state");
+    let delivery_dir = cli_db.parent().expect("private state").join("delivery");
+    std::fs::create_dir(&delivery_dir).expect("protected delivery directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&delivery_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("delivery directory mode");
+    }
+    std::fs::write(
+        delivery_dir.join("adapter"),
+        include_bytes!("support/delivery_remote.py"),
+    )
+    .expect("fake remote adapter");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            delivery_dir.join("adapter"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("adapter mode");
+    }
+    let target = json!({"repository":"test/repo","branch_ref":"refs/heads/reviewed",
+    "base_ref":"refs/heads/main","expected_old":null,"pull_request_number":null,
+    "title":"Reviewed graph item","body":"Green trial and panel"});
+    std::fs::write(delivery_dir.join("target.json"), target.to_string()).expect("delivery target");
+    let started = cli_success(
+        &cli(
+            root,
+            &root.join("project"),
+            url,
+            &[
+                "--json",
+                "delivery",
+                "start",
+                RUN,
+                "--step",
+                "graph.00000.fix",
+                "--run-id",
+                delivery_run,
+            ],
+        )
+        .await,
+    );
+    let opened: Value = serde_json::from_str(&started).expect("delivery gate JSON");
+    (cli_rt, delivery_dir, target, opened)
+}
+
+#[test]
+fn terminal_draft_privacy_finding_refuses_delivery_and_recovered_dispatch() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("draft-delivery")).expect("physical fixture path");
+        let privacy = json!({"severity":"low","category":"grammar","file":"docs/guide.md",
+            "line":1,"message":"Omit the customer address."});
+        let (model, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            privacy,
+            "Publish customer addresses.\n",
+            None,
+            Some(PanelHistory::BeforeRouting),
+        )
+        .await;
+        let url = model.base_url();
+        let (cli_rt, dir, _, opened) = open_cli_delivery(&root, &url, "draft-delivery").await;
+        let steps = cli_rt
+            .steps("draft-delivery")
+            .await
+            .expect("delivery checkpoints");
+        assert!(steps.iter().any(|step| step.name == "delivery.source"));
+        let gate = opened["gate"].as_str().expect("delivery gate");
+        enroll_cli(&root, &root.join("project"), &url).await;
+        cli_success(
+            &cli(
+                &root,
+                &root.join("project"),
+                &url,
+                &[
+                    "gates",
+                    "approve",
+                    gate,
+                    "--command-id",
+                    "approve-draft-delivery",
+                ],
+            )
+            .await,
+        );
+
+        // The old draft accepted these exact published reviewer outputs. Restore
+        // its admission flag and acceptance reason on the copied database. All
+        // candidate digests, publications, graph closure and gate are genuine.
+        let mut input = rt
+            .own_run_record(RUN)
+            .await
+            .expect("load graph run")
+            .expect("graph run")
+            .input;
+        input["review_routing"] = json!(true);
+        let graph_steps = rt.steps(RUN).await.expect("graph checkpoints");
+        let mut receipt = graph_steps
+            .iter()
+            .find(|step| step.name == "graph.00000.fix.accepted")
+            .and_then(|step| step.output.clone())
+            .expect("accepted");
+        assert!(receipt.get("verified_formatting_path").is_none());
+        receipt["reason"] = json!(
+            "accepted low findings from reviewer(s) review-one, review-two as follow-up work in review round 0"
+        );
+        let input = checkpoint_encoding(&input);
+        let receipt = checkpoint_encoding(&receipt);
+        cli_rt.control_transaction(move |mut tx| {
+            let input=input.clone(); let receipt=receipt.clone();
+            Box::pin(async move {
+                assert_eq!(tx.execute("UPDATE workflow_status SET inputs=? WHERE workflow_uuid=?", &[Param::Text(input),Param::Text(RUN.into())]).await?,1);
+                assert_eq!(tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.accepted'", &[Param::Text(receipt),Param::Text(RUN.into())]).await?,1);
+                Ok(())
+            })
+        }).await.expect("restore old draft source");
+        let project = root.join("project");
+        let fresh = cli(
+            &root,
+            &project,
+            &url,
+            &[
+                "--json",
+                "delivery",
+                "start",
+                RUN,
+                "--step",
+                "graph.00000.fix",
+                "--run-id",
+                "fresh-draft",
+            ],
+        )
+        .await;
+        assert!(!fresh.status.success(), "draft source admitted: {fresh:?}");
+        assert!(
+            String::from_utf8_lossy(&fresh.stdout)
+                .contains("source review finding lacks host-verified formatting evidence"),
+            "{fresh:?}"
+        );
+        let resumed = cli(
+            &root,
+            &project,
+            &url,
+            &["--json", "delivery", "resume", "draft-delivery"],
+        )
+        .await;
+        assert!(
+            !resumed.status.success(),
+            "draft source dispatched: {resumed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&resumed.stdout)
+                .contains("delivery follow-ups lack a human classification gate"),
+            "{resumed:?}"
+        );
+        assert!(
+            !dir.join("remote-state.json").exists(),
+            "remote adapter ran"
+        );
+        let intents = cli_rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one("SELECT COUNT(*) AS n FROM atomic_delivery_effects", &[])
+                        .await?
+                        .int("n")
+                })
+            })
+            .await
+            .expect("outbound intent count");
+        assert_eq!(intents, 0);
+    });
+}
+
 #[test]
 fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![
-            Reply::Text(r#"{"done":true}"#.into()),
-            Reply::Text(json!({
-                "items": (1..=10).map(|n| (n.to_string(), json!(if n == 10 {
-                    "N/A: no controls were selected".to_owned()
-                } else { format!("evidence for item {n}") }))).collect::<serde_json::Map<String, Value>>(),
-                "decisions": [{
-                    "point":"candidate publication", "allow_refuse":"only validated evidence reaches review",
-                    "not_found":"refuse", "permission_denied":"refuse", "link_loop":"refuse",
-                    "not_directory":"refuse", "other_io":"refuse", "parse_error":"refuse",
-                    "timeout":"refuse", "empty_result":"refuse"
-                }],
-                "controls": []
-            }).to_string()),
-            Reply::Text(r#"{"verdict":"approve"}"#.into()),
-            Reply::Text(r#"{"verdict":"approve"}"#.into()),
-        ]).await.expect("scripted coding panel");
         let root = std::fs::canonicalize(scratch("delivery-panel-source"))
             .expect("physical fixture path for Git trial worktree");
-        let _ = seed(&root).await;
-        leave_one_work_child(&root).await;
-        let base = panel_graph_project(&root.join("project"));
+        let (model, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            formatting_finding(),
+            "Example text. \n",
+            Some(Verdict::Approve),
+            Some(PanelHistory::AfterFinalize),
+        )
+        .await;
         let url = model.base_url();
-        let (r, u, b) = (root.clone(), url.clone(), base.clone());
-        let status = tokio::task::spawn_blocking(move || {
-            child_command(&r, &u, &b, "start-panel", None)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("graph child")
-        })
-        .await
-        .expect("graph child");
-        assert!(status.status.success(), "graph panel run: {status:?}");
-        assert_eq!(model.calls(), 4, "author, self-review, and two reviewers");
-        let rt = durable(&root).await;
+        assert_eq!(editorial_followup_count(&rt).await, 1);
         let source =
             atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
                 .await
@@ -894,93 +1647,8 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
         })
         .await
         .expect("source remains valid at outbound slot");
-        // Move a consistent snapshot of this real graph run into the normal
-        // CLI project state. Delivery admission must read the recorded source
-        // through that project's runtime and open an actual human gate.
-        cli_success(&cli(&root, &root.join("project"), &url, &["graph", "export"]).await);
-        let cli_db = cli_database(&root, &root.join("project"));
-        // Read-only export leaves an absent CLI database absent. A previous
-        // fixture or a writable command may have created it, in which case
-        // replace it with the source run's consistent snapshot.
-        match std::fs::remove_file(&cli_db) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => panic!("replace CLI database: {error}"),
-        }
-        let mut source_db = sqlx::SqliteConnection::connect(&format!(
-            "sqlite://{}?mode=rw",
-            root.join("atomic.db").display()
-        ))
-        .await
-        .expect("source database connection");
-        sqlx::query("VACUUM main INTO ?")
-            .bind(cli_db.to_string_lossy().as_ref())
-            .execute(&mut source_db)
-            .await
-            .expect("consistent CLI source snapshot");
-        let state_id = cli_state_id(&root, &root.join("project"));
-        let cli_project = format!("graph-loop/{state_id}");
-        let cli_rt = Durare::sqlite(&cli_db).await.expect("copied project store");
-        cli_rt
-            .control_transaction(move |mut tx| {
-                let cli_project = cli_project.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE atomic_run_projects SET project=? WHERE run_id=?",
-                        &[Param::Text(cli_project), Param::Text(RUN.into())],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-            .expect("adopt source into CLI project state");
-        let delivery_dir = cli_db.parent().expect("private state").join("delivery");
-        std::fs::create_dir(&delivery_dir).expect("protected delivery directory");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&delivery_dir, std::fs::Permissions::from_mode(0o700))
-                .expect("delivery directory mode");
-        }
-        std::fs::write(
-            delivery_dir.join("adapter"),
-            include_bytes!("support/delivery_remote.py"),
-        )
-        .expect("fake remote adapter");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                delivery_dir.join("adapter"),
-                std::fs::Permissions::from_mode(0o700),
-            )
-            .expect("adapter mode");
-        }
-        let target = json!({"repository":"test/repo","branch_ref":"refs/heads/reviewed",
-            "base_ref":"refs/heads/main","expected_old":null,"pull_request_number":null,
-            "title":"Reviewed graph item","body":"Green trial and panel"});
-        std::fs::write(delivery_dir.join("target.json"), target.to_string())
-            .expect("delivery target");
-        let started = cli_success(
-            &cli(
-                &root,
-                &root.join("project"),
-                &url,
-                &[
-                    "--json",
-                    "delivery",
-                    "start",
-                    RUN,
-                    "--step",
-                    "graph.00000.fix",
-                    "--run-id",
-                    "delivery-panel-source",
-                ],
-            )
-            .await,
-        );
-        let opened: Value = serde_json::from_str(&started).expect("delivery gate JSON");
+        let (cli_rt, delivery_dir, target, opened) =
+            open_cli_delivery(&root, &url, "delivery-panel-source").await;
         assert_eq!(opened["run"], "delivery-panel-source");
         assert!(opened["gate"].as_str().is_some(), "{opened}");
         assert_eq!(opened["plan"]["push"]["head"], source.head);
@@ -998,7 +1666,7 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             .await
             .expect("one delivery gate");
         assert_eq!(before, 1);
-        let mut changed = target;
+        let mut changed = target.clone();
         changed["title"] = json!("Changed after first gate");
         std::fs::write(delivery_dir.join("target.json"), changed.to_string())
             .expect("change protected target");
@@ -1040,6 +1708,152 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             .await
             .expect("delivery gate count after duplicate");
         assert_eq!(after, before, "duplicate start opened another gate");
+        std::fs::write(delivery_dir.join("target.json"), target.to_string())
+            .expect("restore approved target");
+        let project = root.join("project");
+        enroll_cli(&root, &project, &url).await;
+        let gate = opened["gate"]
+            .as_str()
+            .expect("verified formatting delivery gate");
+        cli_success(
+            &cli(
+                &root,
+                &project,
+                &url,
+                &[
+                    "gates",
+                    "approve",
+                    gate,
+                    "--command-id",
+                    "approve-verified-formatting",
+                ],
+            )
+            .await,
+        );
+        cli_success(
+            &cli(
+                &root,
+                &project,
+                &url,
+                &["delivery", "resume", "delivery-panel-source"],
+            )
+            .await,
+        );
+        let remote: Value = serde_json::from_slice(
+            &std::fs::read(delivery_dir.join("remote-state.json"))
+                .expect("fake remote state after approved delivery"),
+        )
+        .expect("fake remote JSON");
+        let expected = json!({"push":1, "pull_request":1, "enqueue":1});
+        assert_eq!(remote["apply_calls"], expected);
+        assert_eq!(remote["mutations"], expected);
+        // A valid formatting receipt cannot authorize a different finding at dispatch.
+        let bad = checkpoint_encoding(&json!({"verdict":"approve","findings":[{"severity":"low",
+            "file":"docs/guide.md","line":1,"category":"grammar","message":"Omit the customer address."}]}));
+        let original = rt.control_transaction(move |mut tx| {
+            let bad = bad.clone();
+            Box::pin(async move {
+                let key = Param::Text(RUN.into());
+                let original = tx.query_one("SELECT output FROM operation_outputs WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", std::slice::from_ref(&key)).await?.text("output")?;
+                tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", &[Param::Text(bad),key]).await?;
+                Ok(original)
+            })
+        }).await.expect("replace published finding on the source fixture");
+        let invalid = rt
+            .control_transaction({
+                let source = source.clone();
+                move |mut tx| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        atomic_app::delivery_evidence::revalidate_delivery_source_in(
+                            &mut tx, &source,
+                        )
+                        .await
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))
+                    })
+                }
+            })
+            .await
+            .expect_err("dispatch checks the cited finding against the formatting receipt");
+        assert!(
+            invalid
+                .to_string()
+                .contains("source review finding lacks host-verified formatting evidence"),
+            "{invalid}"
+        );
+        rt.control_transaction(move |mut tx| {
+            let original = original.clone();
+            Box::pin(async move {
+                tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'", &[Param::Text(original),Param::Text(RUN.into())]).await?;
+                Ok(())
+            })
+        }).await.expect("restore published verdict");
+        // The operator's recorded decision must remain bound to the original
+        // gate proposal at every outbound reservation.
+        let review_gate = gate::gate_id(RUN, "graph.00000.fix.review");
+        let original_proposal = rt
+            .control_transaction({
+                let review_gate = review_gate.clone();
+                move |mut tx| {
+                    let review_gate = review_gate.clone();
+                    Box::pin(async move {
+                        let row = tx
+                            .query_one(
+                                "SELECT proposal FROM atomic_gates WHERE gate_id=?",
+                                &[Param::Text(review_gate.clone())],
+                            )
+                            .await?;
+                        let original = row.text("proposal")?;
+                        tx.execute(
+                            "UPDATE atomic_gates SET proposal=? WHERE gate_id=?",
+                            &[
+                                Param::Text("tampered-proposal".into()),
+                                Param::Text(review_gate),
+                            ],
+                        )
+                        .await?;
+                        Ok(original)
+                    })
+                }
+            })
+            .await
+            .expect("tamper classification proposal");
+        let invalid_gate = rt
+            .control_transaction({
+                let source = source.clone();
+                move |mut tx| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        atomic_app::delivery_evidence::revalidate_delivery_source_in(
+                            &mut tx, &source,
+                        )
+                        .await
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))
+                    })
+                }
+            })
+            .await
+            .expect_err("dispatch refuses changed operator proposal");
+        assert!(
+            invalid_gate
+                .to_string()
+                .contains("follow-up classification does not approve"),
+            "{invalid_gate}"
+        );
+        rt.control_transaction(move |mut tx| {
+            let review_gate = review_gate.clone();
+            let original_proposal = original_proposal.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_gates SET proposal=? WHERE gate_id=?",
+                    &[Param::Text(original_proposal), Param::Text(review_gate)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("restore classification proposal");
         rt.control_transaction(|mut tx| {
             Box::pin(async move {
                 tx.execute(
@@ -1094,6 +1908,25 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             reclosed.to_string().contains("no longer closed"),
             "{reclosed}"
         );
+        // A terminal draft run could hold an explicit negative published verdict
+        // alongside a panel acceptance. Delivery must still refuse that record.
+        let old = checkpoint_encoding(
+            &json!({"verdict":"request_changes","findings":[formatting_finding()]}),
+        );
+        rt.control_transaction(move |mut tx| {
+            let old = old.clone();
+            Box::pin(async move {
+                let rows = tx.execute("UPDATE operation_outputs SET output=? WHERE workflow_uuid=? AND function_name='graph.00000.fix.review.0.0.publish'",
+                    &[Param::Text(old),Param::Text(RUN.into())]).await?;
+                assert_eq!(rows, 1);
+                Ok(())
+            })
+        }).await.expect("terminal draft reviewer verdict");
+        let negative =
+            atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+                .await
+                .expect_err("terminal acceptance cannot replace independent approval");
+        assert_eq!(negative.to_string(), "independent reviewer did not approve");
         rt.control_transaction(|mut tx| Box::pin(async move {
             tx.execute("UPDATE workflow_status SET application_version='atomic.pipeline.8' WHERE workflow_uuid=?",
                 &[Param::Text(RUN.into())]).await?;
@@ -1517,6 +2350,7 @@ fn graph_loop_evaluates_the_workflow_returns_expression_for_each_item() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -1567,6 +2401,7 @@ fn empty_epic_cannot_return_null_under_an_object_output_contract() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -1689,19 +2524,38 @@ fn takeover_after_turn_refuses_publication_and_close() {
 }
 
 async fn wait_for_park(rt: &Durare, previous: Option<&str>) -> atomic_durable::Park {
-    for _ in 0..500 {
-        let parks = atomic_durable::release::waiting(rt)
-            .await
-            .expect("waiting parks");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let Ok(parks) =
+            tokio::time::timeout_at(deadline, atomic_durable::release::waiting(rt)).await
+        else {
+            break;
+        };
+        let parks = parks.expect("waiting parks");
         if let Some(park) = parks
             .into_iter()
             .find(|park| park.run == RUN && previous.is_none_or(|old| park.id != old))
         {
             return park;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep_until(std::cmp::min(now + Duration::from_millis(10), deadline)).await;
     }
-    panic!("graph run did not park");
+    let status = rt.status(RUN).await;
+    let recent_steps = rt.steps(RUN).await.map(|steps| {
+        steps
+            .iter()
+            .rev()
+            .take(12)
+            .map(|step| step.name.clone())
+            .collect::<Vec<_>>()
+    });
+    panic!(
+        "graph run did not park within 30 seconds (previous={previous:?}); status={status:?}; recent steps={recent_steps:?}"
+    );
 }
 
 async fn release(rt: &Durare, park: &atomic_durable::Park, id: &str) {
@@ -1943,6 +2797,7 @@ fn a_policy_edit_routes_only_later_graph_lanes_and_records_each_choice() {
                 },
                 epic: EPIC.into(),
                 model_source: Some(source),
+                review_routing: true,
             },
         )
         .await
@@ -2600,6 +3455,7 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -2837,6 +3693,7 @@ fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3009,6 +3866,7 @@ fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim()
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3239,6 +4097,7 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3540,6 +4399,7 @@ fn mismatched_existing_graph_base_ref_refuses_before_the_model_turn() {
                 },
                 epic: EPIC.into(),
                 model_source: None,
+                review_routing: true,
             },
         )
         .await
@@ -3833,8 +4693,8 @@ fn lane_self_review_with_control() -> Value {
 fn lane_patch_reviewer_for_note() -> Value {
     json!({
         "verdict": "escalate",
-        "reason": "The patch only records a claim about the existing guard. The host test and control proof support that claim, but the patch itself contains no guard code to judge; a person decides whether to publish the note.",
         "findings": [
+            "The patch only records a claim about the existing guard. The host test and control proof support that claim, but the patch itself contains no guard code to judge; a person decides whether to publish the note.",
             "Only notes/lane-change.md was added; no executable guard code changed.",
             "The host proved lane-guard-bites, but that result is separate from the note's patch.",
             "The candidate publication decision belongs to the host and its human gate."
@@ -4549,15 +5409,10 @@ async fn lane_repair_model(first_release: PathBuf, repair_release: PathBuf) -> F
         if said.contains("Judge the patch on its own terms") {
             return Reply::Text(json!({
                 "verdict": if repaired { "approve" } else { "request_changes" },
-                "reason": if repaired {
-                    "The note now explains the existing confirmed: false refusal path and changes no guard code."
-                } else {
-                    "The patch adds a read of ~/.ssh/id_rsa that the author checklist denies; remove this hidden file read."
-                },
                 "findings": if repaired {
-                    vec!["The repaired note identifies the confirmed: false path; the host test and control proof passed."]
+                    vec!["The note now explains the existing confirmed: false refusal path and changes no guard code.", "The repaired note identifies the confirmed: false path; the host test and control proof passed."]
                 } else {
-                    vec!["tools/lane_guard.py reads ~/.ssh/id_rsa through Path.home().joinpath; remove the hidden private-file read."]
+                    vec!["The patch adds a read of ~/.ssh/id_rsa that the author checklist denies; remove this hidden file read.", "tools/lane_guard.py reads ~/.ssh/id_rsa through Path.home().joinpath; remove the hidden private-file read."]
                 }
             }).to_string());
         }
