@@ -22,15 +22,14 @@ def coding_turn(exe, project, repository, state, env):
     canary.parent.mkdir(parents=True, exist_ok=True)
     canary.write_text(secrets.token_hex(32))
     expected = hashlib.sha256((repository / "pricing.py").read_bytes()).hexdigest().upper()
-    literal = str(canary).replace("'", "''")
+    # cmd.exe uses the worktree assigned to the Windows process. Built-in
+    # TYPE must report access denied for the existing private file.
     command = (
-        "$ErrorActionPreference='Stop'; "
-        "[IO.File]::Copy('pricing.py', 'windows-copy.py'); "
-        f"try {{ [IO.File]::ReadAllText('{literal}') | Out-Null; throw 'private file was readable' }} "
-        "catch [UnauthorizedAccessException] { "
-        "$hash = [Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('windows-copy.py')); "
-        "Write-Output ('denied ' + [BitConverter]::ToString($hash).Replace('-', '')) }"
+        'copy /b pricing.py windows-copy.py >nul && '
+        'certutil -hashfile windows-copy.py SHA256 && '
+        f'type "{canary}" >nul'
     )
+    shell = str(Path(os.environ["SystemRoot"]) / "System32/cmd.exe")
     output = (project / "fixtures/implement-step/quantity.output.json").read_text()
     replies = []
 
@@ -42,10 +41,12 @@ def coding_turn(exe, project, repository, state, env):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if not replies:
                 item = dict(type="function_call", id="fc_1", call_id="call_1", name="exec_command",
-                            arguments=json.dumps({"cmd": command, "yield_time_ms": 10000}), status="completed")
+                            arguments=json.dumps({"cmd": command, "shell": shell, "yield_time_ms": 10000}), status="completed")
             elif len(replies) == 1 and any(
                 part.get("type") == "function_call_output" and part.get("call_id") == "call_1"
-                and f"denied {expected}" in str(part.get("output"))
+                and expected in str(part.get("output")).upper()
+                and "Access is denied" in str(part.get("output"))
+                and "Process exited with code 1" in str(part.get("output"))
                 for part in request.get("input", []) if isinstance(part, dict)
             ):
                 item = dict(type="message", id="msg_1", role="assistant", status="completed",
