@@ -34,6 +34,7 @@ test astro_cli
 test admin_auth
 test budgets
 test bd_differential
+test bd_memory_interop
 test change_request
 test change_request_example
 test change_review_helpers

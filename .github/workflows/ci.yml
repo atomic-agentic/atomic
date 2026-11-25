@@ -284,6 +284,11 @@ jobs:
         run: |
           bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
           echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
+      - name: Pin modern bd for the M5 memory JSONL test
+        if: ${{ matrix.shard == 3 }}
+        run: |
+          bd_bin="$(scripts/bd-memory-pin.sh "${RUNNER_TEMP}/atomic-bd-memory")"
+          echo "ATOMIC_TEST_BD_MEMORY_BIN=${bd_bin}" >>"${GITHUB_ENV}"
       - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
         # The runner's /tmp belongs to this job alone, so a test may create
         # and remove entries there (turn_workspace.rs).
