@@ -112,6 +112,11 @@ pinned `bd` release.
 The M6 graph work loop starts with `atomic graph create --kind epic --pinned`
 and runs a one-worktree-step workflow with
 `atomic run <workflow> --graph-epic <id> --fixture <repo> --fixture-rev <rev>`.
+With `--lanes N`, up to N ready children run as separate durable child
+workflows. The parent records each claim and child link in ordinal order,
+then joins the children; each child checkpoints its own turn, review and
+publication, so completion order cannot alter replay. Backend commands share
+one build slot in the process, and the log names a lane while it waits.
 The workflow's input contract
 declares an optional `item` object, but the operator omits it: atomic selects a
 ready direct child, including an imported Beads `acceptance_criteria` string

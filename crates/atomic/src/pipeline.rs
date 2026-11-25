@@ -87,6 +87,7 @@ use atomic_graph::{
 };
 use atomic_schema::expr::Shape;
 use atomic_schema::registry::Registry;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -97,6 +98,8 @@ use std::sync::Arc;
 pub const PIPELINE: &str = "atomic.pipeline";
 /// A separate durable layout for a graph-driven run.
 pub const GRAPH_PIPELINE: &str = "atomic.graph.pipeline.v1";
+/// One concurrently running graph item, with its own durable step sequence.
+pub const GRAPH_LANE: &str = "atomic.graph.lane.v1";
 
 /// The layout of the durable steps `run_pipeline` records, stamped on every
 /// run as its version. The engine recovers and dequeues only runs of its own
@@ -111,7 +114,7 @@ pub const GRAPH_PIPELINE: &str = "atomic.graph.pipeline.v1";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.10";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.11";
 
 /// Older runs projected an empty `Context` contract even when the atom had no
 /// public context. Repair only that exact, inert projection in the in-memory
@@ -1016,6 +1019,30 @@ pub struct GraphPipelineRun {
     /// lacks this field and keeps its original reviewer behavior on recovery.
     #[serde(default)]
     pub review_routing: bool,
+    /// Concurrent ready work items. Older runs keep their one-lane layout.
+    #[serde(default = "one_graph_lane")]
+    pub lanes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GraphLaneRun {
+    pub(crate) run: PipelineRun,
+    pub(crate) epic: String,
+    pub(crate) claim: GraphLaneClaim,
+    pub(crate) model_source: Option<LanePolicySource>,
+    pub(crate) review_routing: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GraphLaneClaim {
+    pub(crate) parent: String,
+    pub(crate) ordinal: usize,
+    pub(crate) item: WorkItem,
+    pub(crate) lease: Lease,
+}
+
+fn one_graph_lane() -> usize {
+    1
 }
 
 /// The host records a formatting citation here only after checking the
@@ -1613,6 +1640,8 @@ async fn run_pipeline<C: WorkflowContext>(
     graph_epic: Option<String>,
     model_source: Option<LanePolicySource>,
     review_routing: bool,
+    graph_lanes: usize,
+    preclaimed: Option<GraphLaneClaim>,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
@@ -1627,6 +1656,8 @@ async fn run_pipeline<C: WorkflowContext>(
         graph_epic,
         model_source,
         review_routing,
+        graph_lanes,
+        preclaimed,
     )
     .await;
     if let Some(caches) = caches {
@@ -1684,7 +1715,14 @@ async fn run_pipeline_in<C: WorkflowContext>(
     graph_epic: Option<String>,
     model_source: Option<LanePolicySource>,
     review_routing: bool,
+    graph_lanes: usize,
+    preclaimed: Option<GraphLaneClaim>,
 ) -> Result<Value> {
+    if !(1..=16).contains(&graph_lanes) || (graph_lanes > 1 && graph_epic.is_none()) {
+        return Err(failed(
+            "graph lanes require an epic and a count from 1 to 16".into(),
+        ));
+    }
     let PipelineRun {
         mut pipeline,
         input,
@@ -1948,7 +1986,10 @@ async fn run_pipeline_in<C: WorkflowContext>(
             )
             .log();
     }
-    let budget = RunBudget::pinned(ledger, &plan);
+    let budget = match &preclaimed {
+        Some(claim) => RunBudget::pinned(ledger, &plan).under_parent_run(&claim.parent, &plan),
+        None => RunBudget::pinned(ledger, &plan),
+    };
     let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();
     // What each finished step's output is typed by, for CEL.
@@ -2014,16 +2055,24 @@ async fn run_pipeline_in<C: WorkflowContext>(
             Step::Atom(step) => step.clone(),
             Step::Gate(_) => unreachable!(),
         };
-        let binding = epic.clone();
-        let workflow = id.clone();
-        ctx.transaction("epic.bind", move |mut tx| {
-            let binding = binding.clone();
-            let workflow = workflow.clone();
-            Box::pin(async move {
-                transactional_claim::bind_epic_run(&mut tx, &binding, &workflow).await
+        if let Some(claim) = &preclaimed {
+            if claim.lease.claimant != claim.parent || claim.lease.item_id != claim.item.id {
+                return Err(failed(
+                    "graph child claim differs from its parent or item".into(),
+                ));
+            }
+        } else {
+            let binding = epic.clone();
+            let workflow = id.clone();
+            ctx.transaction("epic.bind", move |mut tx| {
+                let binding = binding.clone();
+                let workflow = workflow.clone();
+                Box::pin(async move {
+                    transactional_claim::bind_epic_run(&mut tx, &binding, &workflow).await
+                })
             })
-        })
-        .await?;
+            .await?;
+        }
         // A graph run may be recovered after its binding checkpoint. Recheck
         // the host-owned base ref on every execution before any claim or turn;
         // a missing ref is recreated from the frozen fixture commit, while a
@@ -2048,400 +2097,580 @@ async fn run_pipeline_in<C: WorkflowContext>(
         let mut last_output = None;
         let mut complete = false;
         let mut closed_count = 0_usize;
-        for ordinal in 0..10_000_usize {
-            keep_working(&mut working, &id).await;
-            reached(&recovery, ordinal + 1)?;
-            let step_name = format!("graph.{ordinal:05}.{}", template.id);
-            let claim_step = format!("graph.{ordinal:05}.claim");
-            let (workflow, epic_id, claimant, step) =
-                (id.clone(), epic.clone(), id.clone(), claim_step.clone());
-            let (claim_pipeline, claim_template, claim_input, claim_base) = (
-                pipeline.clone(),
-                template.clone(),
-                input.clone(),
-                accepted.last().cloned(),
-            );
-            let selection: ClaimNext = ctx
-                .transaction(&claim_step, move |mut tx| {
-                    let (workflow, epic_id, claimant, step) = (
-                        workflow.clone(),
-                        epic_id.clone(),
-                        claimant.clone(),
-                        step.clone(),
-                    );
-                    let (claim_pipeline, claim_template, claim_input, claim_base) = (
-                        claim_pipeline.clone(),
-                        claim_template.clone(),
-                        claim_input.clone(),
-                        claim_base.clone(),
-                    );
-                    Box::pin(async move {
-                        transactional_claim::claim_next_for_epic(
-                            &mut tx,
-                            &workflow,
-                            &step,
-                            &epic_id,
-                            &claimant,
-                            std::time::Duration::from_secs(900),
-                            |item| {
-                                graph_atom_input(
-                                    &claim_pipeline,
-                                    &claim_template,
-                                    &claim_input,
-                                    item,
-                                    claim_base.as_deref(),
+        if graph_lanes > 1 {
+            // Parent operations have a fixed order. Each child owns a separate
+            // checkpoint sequence, so lane completion order cannot change replay.
+            let mut running = FuturesUnordered::new();
+            let mut outcomes = BTreeMap::<usize, Value>::new();
+            let mut failure = None;
+            let mut ordinal = 0_usize;
+            loop {
+                while running.len() < graph_lanes
+                    && !complete
+                    && failure.is_none()
+                    && ordinal < 10_000
+                {
+                    keep_working(&mut working, &id).await;
+                    if let Err(error) = reached(&recovery, ordinal + 1) {
+                        failure = Some(error);
+                        break;
+                    }
+                    let claim_step = format!("graph.{ordinal:05}.claim");
+                    let (workflow, epic_id, claimant, step) =
+                        (id.clone(), epic.clone(), id.clone(), claim_step.clone());
+                    let (claim_pipeline, claim_template, claim_input) =
+                        (pipeline.clone(), template.clone(), input.clone());
+                    let selection: Result<ClaimNext> = ctx
+                        .transaction(&claim_step, move |mut tx| {
+                            let (workflow, epic_id, claimant, step) = (
+                                workflow.clone(),
+                                epic_id.clone(),
+                                claimant.clone(),
+                                step.clone(),
+                            );
+                            let (claim_pipeline, claim_template, claim_input) = (
+                                claim_pipeline.clone(),
+                                claim_template.clone(),
+                                claim_input.clone(),
+                            );
+                            Box::pin(async move {
+                                transactional_claim::claim_next_for_epic(
+                                    &mut tx,
+                                    &workflow,
+                                    &step,
+                                    &epic_id,
+                                    &claimant,
+                                    std::time::Duration::from_secs(900),
+                                    |item| {
+                                        graph_atom_input(
+                                            &claim_pipeline,
+                                            &claim_template,
+                                            &claim_input,
+                                            item,
+                                            None,
+                                        )
+                                        .map(|_| ())
+                                    },
                                 )
-                                .map(|_| ())
-                            },
-                        )
-                        .await
+                                .await
+                            })
+                        })
+                        .await;
+                    let selection = match selection {
+                        Ok(selection) => selection,
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    };
+                    let this_ordinal = ordinal;
+                    ordinal += 1;
+                    match selection {
+                        ClaimNext::Claimed { item, lease } => {
+                            let mut child_pipeline = pipeline.clone();
+                            child_pipeline.budgets = Some(pinned.budgets.clone());
+                            let child = GraphLaneRun {
+                                run: PipelineRun {
+                                    pipeline: child_pipeline,
+                                    input: input.clone(),
+                                },
+                                epic: epic.clone(),
+                                claim: GraphLaneClaim {
+                                    parent: id.clone(),
+                                    ordinal: this_ordinal,
+                                    item: *item,
+                                    lease,
+                                },
+                                model_source: model_source.clone(),
+                                review_routing,
+                            };
+                            let handle = match ctx.start_child::<_, Value>(GRAPH_LANE, child).await
+                            {
+                                Ok(handle) => handle,
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
+                            };
+                            let child_id = handle.id().to_owned();
+                            let child_step = format!("graph.{this_ordinal:05}.child");
+                            if let Err(error) = ctx
+                                .step(&child_step, move |_| async move { Ok(child_id) })
+                                .await
+                            {
+                                failure = Some(error);
+                                break;
+                            }
+                            running.push(async move { (this_ordinal, handle.result().await) });
+                        }
+                        ClaimNext::Pending if running.is_empty() => {
+                            if let Err(error) = atomic_durable::publication::park_graph_pending(
+                                &ctx,
+                                &claim_step,
+                                &epic,
+                                this_ordinal as u64,
+                            )
+                            .await
+                            {
+                                failure = Some(error);
+                            }
+                        }
+                        ClaimNext::Pending => break,
+                        ClaimNext::Complete => complete = true,
+                    }
+                }
+                if running.is_empty() {
+                    break;
+                }
+                // Child result polling is not a parent durable operation.
+                working = None;
+                if let Some((number, result)) = running.next().await {
+                    match result {
+                        Ok(output) => {
+                            outcomes.insert(number, output);
+                        }
+                        Err(error) if failure.is_none() => failure = Some(error),
+                        Err(_) => {}
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            if complete {
+                if outcomes.is_empty() {
+                    fits(
+                        "the workflow's empty graph result",
+                        &pipeline.output,
+                        &Value::Null,
+                    )?;
+                }
+                let (epic_id, workflow) = (epic.clone(), id.clone());
+                ctx.transaction("epic.done", move |mut tx| {
+                    let (epic_id, workflow) = (epic_id.clone(), workflow.clone());
+                    Box::pin(async move {
+                        transactional_claim::finish_epic_run(&mut tx, &epic_id, &workflow).await
                     })
                 })
                 .await?;
-            let (item, mut lease) = match selection {
-                ClaimNext::Claimed { item, lease } => (item, lease),
-                ClaimNext::Pending => {
-                    atomic_durable::publication::park_graph_pending(
-                        &ctx,
-                        &claim_step,
-                        &epic,
-                        ordinal as u64,
-                    )
-                    .await?;
-                    continue;
-                }
-                ClaimNext::Complete => {
-                    if last_output.is_none() {
-                        fits(
-                            "the workflow's empty graph result",
-                            &pipeline.output,
-                            &Value::Null,
-                        )?;
+            }
+            closed_count = outcomes.len();
+            for (_, output) in outcomes {
+                last_output = Some(output);
+            }
+        } else {
+            let first_ordinal = preclaimed.as_ref().map_or(0, |claim| claim.ordinal);
+            let last_ordinal = if preclaimed.is_some() {
+                first_ordinal.saturating_add(1)
+            } else {
+                10_000
+            };
+            for ordinal in first_ordinal..last_ordinal {
+                keep_working(&mut working, &id).await;
+                reached(&recovery, ordinal + 1)?;
+                let step_name = format!("graph.{ordinal:05}.{}", template.id);
+                let claim_step = format!("graph.{ordinal:05}.claim");
+                let (workflow, epic_id, claimant, step) =
+                    (id.clone(), epic.clone(), id.clone(), claim_step.clone());
+                let (claim_pipeline, claim_template, claim_input, claim_base) = (
+                    pipeline.clone(),
+                    template.clone(),
+                    input.clone(),
+                    accepted.last().cloned(),
+                );
+                let selection: ClaimNext = if let Some(claim) = &preclaimed {
+                    ClaimNext::Claimed {
+                        item: Box::new(claim.item.clone()),
+                        lease: claim.lease.clone(),
                     }
-                    let (epic_id, workflow) = (epic.clone(), id.clone());
-                    ctx.transaction("epic.done", move |mut tx| {
-                        let (epic_id, workflow) = (epic_id.clone(), workflow.clone());
+                } else {
+                    ctx.transaction(&claim_step, move |mut tx| {
+                        let (workflow, epic_id, claimant, step) = (
+                            workflow.clone(),
+                            epic_id.clone(),
+                            claimant.clone(),
+                            step.clone(),
+                        );
+                        let (claim_pipeline, claim_template, claim_input, claim_base) = (
+                            claim_pipeline.clone(),
+                            claim_template.clone(),
+                            claim_input.clone(),
+                            claim_base.clone(),
+                        );
                         Box::pin(async move {
-                            transactional_claim::finish_epic_run(&mut tx, &epic_id, &workflow).await
+                            transactional_claim::claim_next_for_epic(
+                                &mut tx,
+                                &workflow,
+                                &step,
+                                &epic_id,
+                                &claimant,
+                                std::time::Duration::from_secs(900),
+                                |item| {
+                                    graph_atom_input(
+                                        &claim_pipeline,
+                                        &claim_template,
+                                        &claim_input,
+                                        item,
+                                        claim_base.as_deref(),
+                                    )
+                                    .map(|_| ())
+                                },
+                            )
+                            .await
                         })
                     })
+                    .await?
+                };
+                let (item, mut lease) = match selection {
+                    ClaimNext::Claimed { item, lease } => (item, lease),
+                    ClaimNext::Pending => {
+                        atomic_durable::publication::park_graph_pending(
+                            &ctx,
+                            &claim_step,
+                            &epic,
+                            ordinal as u64,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    ClaimNext::Complete => {
+                        if last_output.is_none() {
+                            fits(
+                                "the workflow's empty graph result",
+                                &pipeline.output,
+                                &Value::Null,
+                            )?;
+                        }
+                        let (epic_id, workflow) = (epic.clone(), id.clone());
+                        ctx.transaction("epic.done", move |mut tx| {
+                            let (epic_id, workflow) = (epic_id.clone(), workflow.clone());
+                            Box::pin(async move {
+                                transactional_claim::finish_epic_run(&mut tx, &epic_id, &workflow)
+                                    .await
+                            })
+                        })
+                        .await?;
+                        complete = true;
+                        break;
+                    }
+                };
+                // This durable step is the boundary between policy edits and a
+                // lane already under way. A recovered lane reads its choice from
+                // the checkpoint; only a new lane reloads the operator's routes.
+                let lane_choice: Option<LaneChoice> = if let Some(source) = &model_source {
+                    let (source, kind, labels) =
+                        (source.clone(), item.kind.clone(), item.labels.clone());
+                    let choice: LaneChoice = ctx
+                        .step(
+                            &format!("graph.{ordinal:05}.model_choice"),
+                            move |_| async move {
+                                source
+                                    .select(&kind, labels.iter().map(String::as_str))
+                                    .map_err(failed)
+                            },
+                        )
+                        .await?;
+                    if model_source
+                        .as_ref()
+                        .and_then(|source| source.endpoints.get(&choice.endpoint))
+                        != Some(&choice.target)
+                    {
+                        return Err(failed(format!(
+                            "graph item {}: its recorded model choice differs from the admitted endpoint catalog",
+                            item.id
+                        )));
+                    }
+                    Some(choice)
+                } else {
+                    None
+                };
+                let (current_input, atom_input) = graph_atom_input(
+                    &pipeline,
+                    &template,
+                    &input,
+                    &item,
+                    accepted.last().map(String::as_str),
+                )?;
+                let review_input = atom_input.clone();
+                let run = RunScope {
+                    pipeline: &pipeline,
+                    services: &services,
+                    budget: &budget,
+                    caps: &caps,
+                    exec_caps: &exec_caps,
+                    models: &models,
+                    routed_models: &plan.routed_models,
+                    lane_choice: lane_choice.as_ref(),
+                    replay: &replay,
+                    pinned: &pinned,
+                    worktrees: run_worktrees.as_ref(),
+                    admitted_base: admitted_base.as_deref(),
+                    accepted: &accepted,
+                    caches: run_caches.as_ref(),
+                    why,
+                };
+                let (candidate, told) = turn(
+                    &ctx,
+                    &run,
+                    Turn {
+                        name: step_name.clone(),
+                        atom: template.atom.clone(),
+                        input: atom_input,
+                        origins: template.origins.clone(),
+                        worktree: true,
+                        coding: template.coding,
+                        repair: None,
+                        charge: None,
+                        controls_cargo: false,
+                        trial_head: None,
+                        claim: Some(lease.clone()),
+                    },
+                )
+                .await?;
+                let first_base = if admitted_base.is_none() {
+                    Some(
+                        candidate
+                            .proposal
+                            .metadata
+                            .get("base")
+                            .and_then(Value::as_str)
+                            .filter(|base| !base.is_empty())
+                            .ok_or_else(|| {
+                                failed(format!(
+                                    "graph item {} has no host-recorded admission base",
+                                    item.id
+                                ))
+                            })?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                let (candidate, acceptance, followups) = if let Some(review) = &template.review {
+                    let generated = AtomStep {
+                        id: step_name.clone(),
+                        ..template.clone()
+                    };
+                    let empty_steps = json!({});
+                    let input_shape = Shape::Schema(&pipeline.input);
+                    let steps_shape = Shape::Fields(BTreeMap::new());
+                    let values = [
+                        ("input", &current_input, &input_shape),
+                        ("steps", &empty_steps, &steps_shape),
+                    ];
+                    reviewed(
+                        &ctx,
+                        &run,
+                        &mut working,
+                        &generated,
+                        &item.criteria,
+                        review,
+                        &values,
+                        review_input.clone(),
+                        (candidate, told),
+                        Some(&mut lease),
+                        review_routing,
+                        item.labels
+                            .iter()
+                            .any(|label| label.eq_ignore_ascii_case("security")),
+                    )
+                    .await?
+                } else {
+                    let generated = AtomStep {
+                        id: step_name.clone(),
+                        ..template.clone()
+                    };
+                    let empty_steps = json!({});
+                    let input_shape = Shape::Schema(&pipeline.input);
+                    let steps_shape = Shape::Fields(BTreeMap::new());
+                    let values = [
+                        ("input", &current_input, &input_shape),
+                        ("steps", &empty_steps, &steps_shape),
+                    ];
+                    let (candidate, acceptance) = unreviewed_with_criteria(
+                        &ctx,
+                        &run,
+                        &mut working,
+                        &generated,
+                        &item.criteria,
+                        &values,
+                        review_input,
+                        candidate,
+                        told,
+                        Some(&lease),
+                    )
                     .await?;
+                    (candidate, acceptance, Vec::new())
+                };
+                let kept = GraphAcceptance {
+                    acceptance,
+                    verified_formatting_path: followups.first().map(|finding| finding.file.clone()),
+                };
+                let receipt: GraphAcceptance = ctx
+                    .step(&format!("{step_name}.accepted"), move |_| async move {
+                        Ok(kept)
+                    })
+                    .await?;
+                let acceptance = receipt.acceptance;
+                let commit = candidate
+                    .proposal
+                    .metadata
+                    .get("commit")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        failed(format!(
+                            "graph item {} has no host-recorded worktree commit",
+                            item.id
+                        ))
+                    })?
+                    .to_owned();
+                let mapped_result = graph_result(
+                    &pipeline,
+                    &template,
+                    &current_input,
+                    &candidate.proposal.output,
+                    &candidate.proposal.metadata,
+                )?;
+                let precondition = lease_precondition(&lease)?;
+                let publish_step = format!("{}.publish", step_name);
+                // Every proof decision is a durable sibling. If a process dies
+                // while parked and a human supplies proof offline, replay still
+                // sees the checkpointed Missing outcome and resumes that park.
+                let mut occurrence = 0_u64;
+                let published = loop {
+                    let (
+                        candidate,
+                        acceptance,
+                        token,
+                        sha,
+                        precondition,
+                        recorded_step,
+                        followups,
+                        epic,
+                        run_id,
+                    ) = (
+                        Arc::new(candidate.clone()),
+                        Arc::new(acceptance.clone()),
+                        Arc::new(lease.clone()),
+                        Arc::new(commit.clone()),
+                        Arc::new(precondition.clone()),
+                        Arc::new(publish_step.clone()),
+                        // CONTROL_OFF: review-followup-file
+                        Arc::new(followups.clone()),
+                        Arc::new(epic.clone()),
+                        Arc::new(id.clone()),
+                    );
+                    let finalized: GraphFinalize = ctx
+                        .transaction(
+                            &format!("{step_name}.finalize.{occurrence}"),
+                            move |mut tx| {
+                                let (
+                                    candidate,
+                                    acceptance,
+                                    token,
+                                    sha,
+                                    precondition,
+                                    recorded_step,
+                                    followups,
+                                    epic,
+                                    run_id,
+                                ) = (
+                                    candidate.clone(),
+                                    acceptance.clone(),
+                                    token.clone(),
+                                    sha.clone(),
+                                    precondition.clone(),
+                                    recorded_step.clone(),
+                                    followups.clone(),
+                                    epic.clone(),
+                                    run_id.clone(),
+                                );
+                                Box::pin(async move {
+                                    match transactional_claim::stage_commit_for_close(
+                                        &mut tx, &token, &sha,
+                                    )
+                                    .await?
+                                    {
+                                        transactional_claim::CommitProof::Missing { branch } => {
+                                            Ok(GraphFinalize::Missing { branch })
+                                        }
+                                        transactional_claim::CommitProof::Fenced => {
+                                            Ok(GraphFinalize::Fenced)
+                                        }
+                                        transactional_claim::CommitProof::Ready => {
+                                            let output =
+                                                atomic_durable::publication::publish_candidate_in(
+                                                    &mut tx,
+                                                    &recorded_step,
+                                                    &candidate,
+                                                    &acceptance,
+                                                    &[(*precondition).clone()],
+                                                )
+                                                .await?;
+                                            transactional_claim::file_review_followups(
+                                                &mut tx,
+                                                &token,
+                                                &epic,
+                                                &run_id,
+                                                &recorded_step,
+                                                &followups,
+                                            )
+                                            .await?;
+                                            let close = transactional_claim::close_with_commit;
+                                            close(&mut tx, &token, &sha).await?;
+                                            Ok(GraphFinalize::Applied { output })
+                                        }
+                                    }
+                                })
+                            },
+                        )
+                        .await?;
+                    failpoint("graph:after-proof-stage");
+                    match finalized {
+                        GraphFinalize::Applied { output } => break output,
+                        GraphFinalize::Missing { .. } => {
+                            atomic_durable::publication::park_verified_commit(
+                                &ctx,
+                                &format!("{step_name}.proof.{occurrence}"),
+                                &item.id,
+                                &commit,
+                                occurrence,
+                            )
+                            .await?;
+                            failpoint("graph:after-proof-release");
+                        }
+                        GraphFinalize::Fenced => validate_before_turn(&ctx, &lease).await?,
+                    }
+                    occurrence = occurrence.checked_add(1).ok_or_else(|| {
+                        DurableError::Engine(
+                            "verified-commit park occurrence exceeds stored range".into(),
+                        )
+                    })?;
+                };
+                failpoint("graph:after-finalize-applied");
+                ctx.step(&publish_step, move |_| async move { Ok(published) })
+                    .await?;
+                failpoint("graph:after-verified-publish");
+                // The authoritative close and its checkpoint committed with
+                // Applied. This sibling preserves the public step layout without
+                // rechecking mutable graph state on recovery.
+                ctx.step(
+                    &format!("{}.close", step_name),
+                    move |_| async move { Ok(()) },
+                )
+                .await?;
+                if admitted_base.is_none() {
+                    admitted_base = first_base;
+                }
+                accepted.push(commit);
+                closed_count += 1;
+                last_output = Some(mapped_result);
+                failpoint(&format!("pipeline:after:{step_name}"));
+                if preclaimed.is_some() {
                     complete = true;
                     break;
                 }
-            };
-            // This durable step is the boundary between policy edits and a
-            // lane already under way. A recovered lane reads its choice from
-            // the checkpoint; only a new lane reloads the operator's routes.
-            let lane_choice: Option<LaneChoice> = if let Some(source) = &model_source {
-                let (source, kind, labels) =
-                    (source.clone(), item.kind.clone(), item.labels.clone());
-                let choice: LaneChoice = ctx
-                    .step(
-                        &format!("graph.{ordinal:05}.model_choice"),
-                        move |_| async move {
-                            source
-                                .select(&kind, labels.iter().map(String::as_str))
-                                .map_err(failed)
-                        },
-                    )
-                    .await?;
-                if model_source
-                    .as_ref()
-                    .and_then(|source| source.endpoints.get(&choice.endpoint))
-                    != Some(&choice.target)
-                {
-                    return Err(failed(format!(
-                        "graph item {}: its recorded model choice differs from the admitted endpoint catalog",
-                        item.id
-                    )));
-                }
-                Some(choice)
-            } else {
-                None
-            };
-            let (current_input, atom_input) = graph_atom_input(
-                &pipeline,
-                &template,
-                &input,
-                &item,
-                accepted.last().map(String::as_str),
-            )?;
-            let review_input = atom_input.clone();
-            let run = RunScope {
-                pipeline: &pipeline,
-                services: &services,
-                budget: &budget,
-                caps: &caps,
-                exec_caps: &exec_caps,
-                models: &models,
-                routed_models: &plan.routed_models,
-                lane_choice: lane_choice.as_ref(),
-                replay: &replay,
-                pinned: &pinned,
-                worktrees: run_worktrees.as_ref(),
-                admitted_base: admitted_base.as_deref(),
-                accepted: &accepted,
-                caches: run_caches.as_ref(),
-                why,
-            };
-            let (candidate, told) = turn(
-                &ctx,
-                &run,
-                Turn {
-                    name: step_name.clone(),
-                    atom: template.atom.clone(),
-                    input: atom_input,
-                    origins: template.origins.clone(),
-                    worktree: true,
-                    coding: template.coding,
-                    repair: None,
-                    charge: None,
-                    controls_cargo: false,
-                    trial_head: None,
-                    claim: Some(lease.clone()),
-                },
-            )
-            .await?;
-            let first_base = if admitted_base.is_none() {
-                Some(
-                    candidate
-                        .proposal
-                        .metadata
-                        .get("base")
-                        .and_then(Value::as_str)
-                        .filter(|base| !base.is_empty())
-                        .ok_or_else(|| {
-                            failed(format!(
-                                "graph item {} has no host-recorded admission base",
-                                item.id
-                            ))
-                        })?
-                        .to_owned(),
-                )
-            } else {
-                None
-            };
-            let (candidate, acceptance, followups) = if let Some(review) = &template.review {
-                let generated = AtomStep {
-                    id: step_name.clone(),
-                    ..template.clone()
-                };
-                let empty_steps = json!({});
-                let input_shape = Shape::Schema(&pipeline.input);
-                let steps_shape = Shape::Fields(BTreeMap::new());
-                let values = [
-                    ("input", &current_input, &input_shape),
-                    ("steps", &empty_steps, &steps_shape),
-                ];
-                reviewed(
-                    &ctx,
-                    &run,
-                    &mut working,
-                    &generated,
-                    &item.criteria,
-                    review,
-                    &values,
-                    review_input.clone(),
-                    (candidate, told),
-                    Some(&mut lease),
-                    review_routing,
-                    item.labels
-                        .iter()
-                        .any(|label| label.eq_ignore_ascii_case("security")),
-                )
-                .await?
-            } else {
-                let generated = AtomStep {
-                    id: step_name.clone(),
-                    ..template.clone()
-                };
-                let empty_steps = json!({});
-                let input_shape = Shape::Schema(&pipeline.input);
-                let steps_shape = Shape::Fields(BTreeMap::new());
-                let values = [
-                    ("input", &current_input, &input_shape),
-                    ("steps", &empty_steps, &steps_shape),
-                ];
-                let (candidate, acceptance) = unreviewed_with_criteria(
-                    &ctx,
-                    &run,
-                    &mut working,
-                    &generated,
-                    &item.criteria,
-                    &values,
-                    review_input,
-                    candidate,
-                    told,
-                    Some(&lease),
-                )
-                .await?;
-                (candidate, acceptance, Vec::new())
-            };
-            let kept = GraphAcceptance {
-                acceptance,
-                verified_formatting_path: followups.first().map(|finding| finding.file.clone()),
-            };
-            let receipt: GraphAcceptance = ctx
-                .step(&format!("{step_name}.accepted"), move |_| async move {
-                    Ok(kept)
-                })
-                .await?;
-            let acceptance = receipt.acceptance;
-            let commit = candidate
-                .proposal
-                .metadata
-                .get("commit")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    failed(format!(
-                        "graph item {} has no host-recorded worktree commit",
-                        item.id
-                    ))
-                })?
-                .to_owned();
-            let mapped_result = graph_result(
-                &pipeline,
-                &template,
-                &current_input,
-                &candidate.proposal.output,
-                &candidate.proposal.metadata,
-            )?;
-            let precondition = lease_precondition(&lease)?;
-            let publish_step = format!("{}.publish", step_name);
-            // Every proof decision is a durable sibling. If a process dies
-            // while parked and a human supplies proof offline, replay still
-            // sees the checkpointed Missing outcome and resumes that park.
-            let mut occurrence = 0_u64;
-            let published = loop {
-                let (
-                    candidate,
-                    acceptance,
-                    token,
-                    sha,
-                    precondition,
-                    recorded_step,
-                    followups,
-                    epic,
-                    run_id,
-                ) = (
-                    Arc::new(candidate.clone()),
-                    Arc::new(acceptance.clone()),
-                    Arc::new(lease.clone()),
-                    Arc::new(commit.clone()),
-                    Arc::new(precondition.clone()),
-                    Arc::new(publish_step.clone()),
-                    // CONTROL_OFF: review-followup-file
-                    Arc::new(followups.clone()),
-                    Arc::new(epic.clone()),
-                    Arc::new(id.clone()),
-                );
-                let finalized: GraphFinalize = ctx
-                    .transaction(
-                        &format!("{step_name}.finalize.{occurrence}"),
-                        move |mut tx| {
-                            let (
-                                candidate,
-                                acceptance,
-                                token,
-                                sha,
-                                precondition,
-                                recorded_step,
-                                followups,
-                                epic,
-                                run_id,
-                            ) = (
-                                candidate.clone(),
-                                acceptance.clone(),
-                                token.clone(),
-                                sha.clone(),
-                                precondition.clone(),
-                                recorded_step.clone(),
-                                followups.clone(),
-                                epic.clone(),
-                                run_id.clone(),
-                            );
-                            Box::pin(async move {
-                                match transactional_claim::stage_commit_for_close(
-                                    &mut tx, &token, &sha,
-                                )
-                                .await?
-                                {
-                                    transactional_claim::CommitProof::Missing { branch } => {
-                                        Ok(GraphFinalize::Missing { branch })
-                                    }
-                                    transactional_claim::CommitProof::Fenced => {
-                                        Ok(GraphFinalize::Fenced)
-                                    }
-                                    transactional_claim::CommitProof::Ready => {
-                                        let output =
-                                            atomic_durable::publication::publish_candidate_in(
-                                                &mut tx,
-                                                &recorded_step,
-                                                &candidate,
-                                                &acceptance,
-                                                &[(*precondition).clone()],
-                                            )
-                                            .await?;
-                                        transactional_claim::file_review_followups(
-                                            &mut tx,
-                                            &token,
-                                            &epic,
-                                            &run_id,
-                                            &recorded_step,
-                                            &followups,
-                                        )
-                                        .await?;
-                                        let close = transactional_claim::close_with_commit;
-                                        close(&mut tx, &token, &sha).await?;
-                                        Ok(GraphFinalize::Applied { output })
-                                    }
-                                }
-                            })
-                        },
-                    )
-                    .await?;
-                failpoint("graph:after-proof-stage");
-                match finalized {
-                    GraphFinalize::Applied { output } => break output,
-                    GraphFinalize::Missing { .. } => {
-                        atomic_durable::publication::park_verified_commit(
-                            &ctx,
-                            &format!("{step_name}.proof.{occurrence}"),
-                            &item.id,
-                            &commit,
-                            occurrence,
-                        )
-                        .await?;
-                        failpoint("graph:after-proof-release");
-                    }
-                    GraphFinalize::Fenced => validate_before_turn(&ctx, &lease).await?,
-                }
-                occurrence = occurrence.checked_add(1).ok_or_else(|| {
-                    DurableError::Engine(
-                        "verified-commit park occurrence exceeds stored range".into(),
-                    )
-                })?;
-            };
-            failpoint("graph:after-finalize-applied");
-            ctx.step(&publish_step, move |_| async move { Ok(published) })
-                .await?;
-            failpoint("graph:after-verified-publish");
-            // The authoritative close and its checkpoint committed with
-            // Applied. This sibling preserves the public step layout without
-            // rechecking mutable graph state on recovery.
-            ctx.step(
-                &format!("{}.close", step_name),
-                move |_| async move { Ok(()) },
-            )
-            .await?;
-            if admitted_base.is_none() {
-                admitted_base = first_base;
             }
-            accepted.push(commit);
-            closed_count += 1;
-            last_output = Some(mapped_result);
-            failpoint(&format!("pipeline:after:{step_name}"));
         }
         if !complete {
             return Err(failed(format!(
@@ -2830,6 +3059,108 @@ fn review_preconditions(claim: Option<&Lease>) -> Result<Vec<Precondition>> {
         .map(lease_precondition)
         .transpose()
         .map(|condition| condition.into_iter().collect())
+}
+
+/// A run-wide limit for shell commands from concurrent graph lanes. The
+/// permit covers the backend call and releases even when the command fails.
+struct CommandSlots {
+    active: std::sync::Mutex<usize>,
+    available: std::sync::Condvar,
+    limit: usize,
+}
+
+static GRAPH_COMMAND_SLOTS: std::sync::LazyLock<Arc<CommandSlots>> =
+    std::sync::LazyLock::new(|| Arc::new(CommandSlots::new(1)));
+
+impl CommandSlots {
+    fn new(limit: usize) -> Self {
+        Self {
+            active: std::sync::Mutex::new(0),
+            available: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    fn enter(&self, lane: &str) -> CommandSlot<'_> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if *active >= self.limit {
+            atomic_core::log_line!("atomic: graph lane {lane} waiting for a build slot");
+        }
+        while *active >= self.limit {
+            active = self
+                .available
+                .wait(active)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *active += 1;
+        CommandSlot(self)
+    }
+}
+
+struct CommandSlot<'a>(&'a CommandSlots);
+
+impl Drop for CommandSlot<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active -= 1;
+        self.0.available.notify_one();
+    }
+}
+
+struct PooledBackend {
+    backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    slots: Arc<CommandSlots>,
+    lane: String,
+}
+
+impl atomic_exec::ExecutionBackend for PooledBackend {
+    fn connect(&self) -> std::result::Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        self.backend.connect()
+    }
+
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> std::result::Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        self.backend.open(request)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> std::result::Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        let _slot = self.slots.enter(&self.lane);
+        self.backend.run(command)
+    }
+
+    fn criterion_exclusions(
+        &self,
+        cwd: &std::path::Path,
+    ) -> std::result::Result<Vec<PathBuf>, atomic_exec::ExecError> {
+        self.backend.criterion_exclusions(cwd)
+    }
+
+    fn close(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> std::result::Result<(), atomic_exec::ExecError> {
+        self.backend.close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> std::result::Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError>
+    {
+        self.backend.exchange(workspace)
+    }
 }
 
 /// What one atom turn needs of the run it is a step of.
@@ -6510,6 +6841,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let services = Arc::new(services);
     let ledger = rt.ledger();
     let (graph_services, graph_ledger) = (services.clone(), ledger.clone());
+    let (lane_services, lane_ledger) = (services.clone(), ledger.clone());
     let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
@@ -6530,6 +6862,8 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 None,
                 None,
                 false,
+                1,
+                None,
             ),
         );
         crate::panics::caught(id, traced)
@@ -6552,6 +6886,8 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 None,
                 None,
                 false,
+                1,
+                None,
             ),
         );
         crate::panics::caught(id, traced)
@@ -6564,6 +6900,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                 epic,
                 model_source,
                 review_routing,
+                lanes,
             } = graph;
             let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
             let id = ctx.workflow_id().to_owned();
@@ -6581,11 +6918,54 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
                     Some(epic),
                     model_source,
                     review_routing,
+                    lanes,
+                    None,
                 ),
             );
             crate::panics::caught(id, traced)
         },
     );
+    rt.register(GRAPH_LANE, move |ctx: R::Context, lane: GraphLaneRun| {
+        let GraphLaneRun {
+            run,
+            epic,
+            claim,
+            model_source,
+            review_routing,
+        } = lane;
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        let id = ctx.workflow_id().to_owned();
+        let why = atomic_core::usage::Why::default();
+        let mut scoped = (*lane_services).clone();
+        let mut runtimes = (*scoped.runtimes).clone();
+        let lane_name = format!("graph.{:05}", claim.ordinal);
+        let backend = atomic_exec::Backend::connect(PooledBackend {
+            backend: runtimes.backend.shared(),
+            slots: GRAPH_COMMAND_SLOTS.clone(),
+            lane: lane_name,
+        });
+        let child_ledger = lane_ledger.clone();
+        let traced = crate::telemetry::traced(span, why.clone(), async move {
+            runtimes.backend =
+                backend.map_err(|error| failed(format!("connect graph command pool: {error}")))?;
+            scoped.runtimes = Arc::new(runtimes);
+            run_pipeline(
+                ctx,
+                run,
+                Arc::new(scoped),
+                child_ledger,
+                None,
+                why,
+                Some(epic),
+                model_source,
+                review_routing,
+                1,
+                Some(claim),
+            )
+            .await
+        });
+        crate::panics::caught(id, traced)
+    });
 }
 
 /// Hold every atom step's bindings to its atom's trust, and its review's to
@@ -6870,6 +7250,32 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn graph_command_slots_bound_concurrent_commands() {
+        let slots = Arc::new(CommandSlots::new(1));
+        let first = slots.enter("first");
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (ready, started) = std::sync::mpsc::channel();
+        let next = {
+            let slots = slots.clone();
+            let entered = entered.clone();
+            std::thread::spawn(move || {
+                ready.send(()).expect("announce waiting command");
+                let _slot = slots.enter("second");
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        started.recv().expect("waiting command started");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(
+            !entered.load(std::sync::atomic::Ordering::SeqCst),
+            "a second command entered while the first held the only build slot"
+        );
+        drop(first);
+        next.join().expect("waiting command");
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn trial_cargo_finds_default_rustup_shims_without_cargo_home() {

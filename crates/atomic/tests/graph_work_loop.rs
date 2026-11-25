@@ -555,11 +555,14 @@ async fn engine_at_with_endpoint(
             },
         );
     }
+    rt.take_resumed_runs(Some(RUN))
+        .await
+        .expect("take graph run family queues");
     rt.launch().await.expect("launch");
     rt
 }
 
-async fn seed(root: &Path) -> String {
+async fn seed_with_dependencies(root: &Path, dependencies: bool) -> String {
     let (project, base) = project(root);
     assert!(project.join(".git").exists());
     let db = root.join("atomic.db");
@@ -586,22 +589,28 @@ async fn seed(root: &Path) -> String {
             .await
             .expect("child");
     }
-    for ordinal in 1..CHILDREN.len() {
-        graph
-            .add_edge(
-                Actor::agent("seed"),
-                CHILDREN[ordinal].into(),
-                EdgeKind::Blocks,
-                CHILDREN[ordinal - 1].into(),
-            )
-            .await
-            .expect("dependency");
+    if dependencies {
+        for ordinal in 1..CHILDREN.len() {
+            graph
+                .add_edge(
+                    Actor::agent("seed"),
+                    CHILDREN[ordinal].into(),
+                    EdgeKind::Blocks,
+                    CHILDREN[ordinal - 1].into(),
+                )
+                .await
+                .expect("dependency");
+        }
     }
     graph
         .authorize_graph_run(EPIC, RUN)
         .await
         .expect("authorized graph run");
     base
+}
+
+async fn seed(root: &Path) -> String {
+    seed_with_dependencies(root, true).await
 }
 
 async fn leave_one_work_child(root: &Path) {
@@ -624,12 +633,16 @@ async fn leave_one_work_child(root: &Path) {
 }
 
 async fn wait_for_review_gate(rt: &Durare) -> gate::Gate {
+    wait_for_review_gate_for(rt, RUN).await
+}
+
+async fn wait_for_review_gate_for(rt: &Durare, run: &str) -> gate::Gate {
     for _ in 0..600 {
         let open = gate::gates(
             rt,
             GateFilter {
                 open_only: true,
-                run: Some(RUN.into()),
+                run: Some(run.into()),
             },
         )
         .await
@@ -715,9 +728,17 @@ fn graph_loop_child() {
         let rt = engine(&root, &url, true).await;
         if matches!(
             role.as_str(),
-            "start" | "start-panel" | "start-legacy-panel" | "start-routed"
+            "start"
+                | "start-parallel"
+                | "start-panel"
+                | "start-parallel-panel"
+                | "start-legacy-panel"
+                | "start-routed"
         ) {
-            let mut prepared = if matches!(role.as_str(), "start-panel" | "start-legacy-panel") {
+            let mut prepared = if matches!(
+                role.as_str(),
+                "start-panel" | "start-parallel-panel" | "start-legacy-panel"
+            ) {
                 panel_pipeline(&root.join("project"))
             } else {
                 pipeline(&root.join("project"))
@@ -747,12 +768,23 @@ fn graph_loop_child() {
                 epic: EPIC.into(),
                 model_source,
                 review_routing: role != "start-legacy-panel",
+                lanes: if matches!(role.as_str(), "start-parallel" | "start-parallel-panel") {
+                    3
+                } else {
+                    1
+                },
             };
             rt.start(GRAPH_PIPELINE, RUN, run)
                 .await
                 .expect("start graph run");
         } else {
-            rt.recover().await.expect("recover graph run");
+            if role == "resume-family" {
+                rt.resume_family(RUN)
+                    .await
+                    .expect("resume graph run family");
+            } else {
+                rt.recover().await.expect("recover graph run");
+            }
         }
         if role == "recover-park" {
             wait_for_park(&rt, None).await;
@@ -896,6 +928,63 @@ fn three_dependent_items_make_three_model_calls_and_close_with_host_commits() {
     });
 }
 
+#[test]
+fn three_ready_graph_lanes_begin_before_any_model_reply() {
+    on_codex_runtime(async {
+        let root = scratch("parallel-ready-items");
+        let base = seed_with_dependencies(&root, false).await;
+        let release = root.join("release-model-replies");
+        let model = FakeModel::start(
+            (0..3)
+                .map(|_| Reply::Gated {
+                    file: release.clone(),
+                    reply: Box::new(Reply::Text(json!({"done": true}).to_string())),
+                })
+                .collect(),
+        )
+        .await
+        .expect("fake model");
+        let rt = engine(&root, &model.base_url(), true).await;
+        let mut run = serde_json::to_value(GraphPipelineRun {
+            run: PipelineRun {
+                pipeline: pipeline(&root.join("project")),
+                input: json!({"base": base}),
+            },
+            epic: EPIC.into(),
+            model_source: None,
+            review_routing: true,
+            lanes: 1,
+        })
+        .expect("graph run value");
+        run["lanes"] = json!(3);
+        rt.start(GRAPH_PIPELINE, RUN, run)
+            .await
+            .expect("start parallel graph run");
+        wait_for("three ready graph lanes at the model", || {
+            model.calls() == 3
+        })
+        .await;
+        let started = model.calls();
+        std::fs::write(&release, "go").expect("release all model replies");
+        let result: Value = rt.result(RUN).await.expect("graph run result");
+        assert!(result.is_object(), "{result}");
+        assert_eq!(
+            started, 3,
+            "three ready lanes did not overlap at the model boundary"
+        );
+        assert_eq!(model.calls(), 3, "one author turn per ready item");
+        let (rows, _) = inspect(&root).await;
+        assert_eq!(rows.len(), 3);
+        let mut commits = std::collections::BTreeSet::new();
+        for (id, status, sha) in rows {
+            assert_eq!(status, "closed", "{id}");
+            assert_eq!(sha.len(), 40, "{id} needs a host commit");
+            assert!(commits.insert(sha), "each lane needs its own branch commit");
+        }
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
 fn formatting_finding() -> Value {
     json!({"severity":"nit","category":"formatting","file":"docs/guide.md","line":1,
         "message":"Remove the trailing space."})
@@ -908,6 +997,7 @@ enum PanelHistory {
     DraftAccepted,
     Shipped,
     Security,
+    Parallel,
 }
 
 fn checkpoint_encoding(value: &Value) -> String {
@@ -1013,14 +1103,13 @@ async fn editorial_panel(
     } else {
         panel_graph_project(&project)
     };
-    let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
-        .expect("graph worktrees")
-        .path(RUN, "graph.00000.fix");
     let mut worker = child_command(
         root,
         &model.base_url(),
         &base,
-        if matches!(history, Some(PanelHistory::BeforeRouting)) {
+        if matches!(history, Some(PanelHistory::Parallel)) {
+            "start-parallel-panel"
+        } else if matches!(history, Some(PanelHistory::BeforeRouting)) {
             "start-legacy-panel"
         } else {
             "start-panel"
@@ -1038,13 +1127,29 @@ async fn editorial_panel(
     .spawn()
     .expect("start panel");
     wait_for("author model call", || model.calls() == 1).await;
+    let lane_run = if matches!(history, Some(PanelHistory::Parallel)) {
+        let rt = durable(root).await;
+        let steps = rt.steps(RUN).await.expect("parallel parent steps");
+        steps
+            .iter()
+            .find(|step| step.name == "graph.00000.child")
+            .and_then(|step| step.output.as_ref())
+            .and_then(Value::as_str)
+            .expect("parallel child id")
+            .to_owned()
+    } else {
+        RUN.to_owned()
+    };
+    let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
+        .expect("graph worktrees")
+        .path(&lane_run, "graph.00000.fix");
     std::fs::create_dir_all(tree.join("docs")).expect("author docs directory");
     std::fs::write(tree.join("docs/guide.md"), candidate_text).expect("author edit");
     std::fs::write(signal, "ready").expect("release author");
     let rt = durable(root).await;
     if let Some(verdict) = human {
         let gate = tokio::select! {
-            gate = wait_for_review_gate(&rt) => gate,
+            gate = wait_for_review_gate_for(&rt, &lane_run) => gate,
             result = rt.result::<Value>(RUN) => panic!("expected the human review gate, graph finished with {result:?}"),
         };
         let shown = &gate.show["verdict"]["reviewers"][0]["verdict"];
@@ -1069,7 +1174,10 @@ async fn editorial_panel(
                 assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
             }
             PanelHistory::DraftAccepted => record_draft_acceptance(&rt).await,
-            PanelHistory::BeforeRouting | PanelHistory::Shipped | PanelHistory::Security => {
+            PanelHistory::BeforeRouting
+            | PanelHistory::Shipped
+            | PanelHistory::Security
+            | PanelHistory::Parallel => {
                 unreachable!()
             }
         }
@@ -1946,6 +2054,48 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
 }
 
 #[test]
+fn delivery_evidence_follows_parallel_graph_lane_child() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("parallel-delivery-source"))
+            .expect("physical fixture path");
+        let (_model, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            formatting_finding(),
+            "Example text. \n",
+            Some(Verdict::Approve),
+            Some(PanelHistory::Parallel),
+        )
+        .await;
+        let source =
+            atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+                .await
+                .expect("parallel graph item evidence");
+        assert_eq!(source.source_run, RUN);
+        assert!(
+            source
+                .evidence_run
+                .as_deref()
+                .is_some_and(|id| id.starts_with("graph-run-"))
+        );
+        rt.control_transaction({
+            let source = source.clone();
+            move |mut tx| {
+                let source = source.clone();
+                Box::pin(async move {
+                    atomic_app::delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
+                        .await
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))
+                })
+            }
+        })
+        .await
+        .expect("parallel evidence remains valid at outbound slot");
+    });
+}
+
+#[test]
 fn crash_after_graph_publish_has_already_closed_the_item_atomically() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into())])
@@ -2478,6 +2628,7 @@ fn graph_loop_evaluates_the_workflow_returns_expression_for_each_item() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -2529,6 +2680,7 @@ fn empty_epic_cannot_return_null_under_an_object_output_contract() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -2594,6 +2746,127 @@ fn process_crashes_at_each_graph_boundary_recover_without_repeating_completed_tu
 }
 
 #[test]
+fn parallel_graph_crash_replays_completed_lane_without_another_model_call() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 6])
+            .await
+            .expect("scripted model");
+        let root = scratch("parallel-crash-replay");
+        let base = seed_with_dependencies(&root, false).await;
+        let url = model.base_url();
+        let (r, u, b) = (root.clone(), url.clone(), base.clone());
+        let crashed = tokio::task::spawn_blocking(move || {
+            child(
+                &r,
+                &u,
+                &b,
+                "start-parallel",
+                Some("pipeline:after:graph.00000.fix"),
+            )
+        })
+        .await
+        .expect("parallel crash child");
+        assert!(!crashed.success(), "the first finished lane did not crash");
+        let before = model.calls();
+        assert!(before >= 1, "no lane reached the model");
+        let first_before = model
+            .requests()
+            .iter()
+            .filter(|request| request.to_string().contains("Work item 1"))
+            .count();
+        assert_eq!(first_before, 1, "first lane did not finish its one turn");
+        let rt = durable(&root).await;
+        let parent_steps = rt.steps(RUN).await.expect("parent steps after crash");
+        let first_child: String = serde_json::from_value(
+            parent_steps
+                .iter()
+                .find(|step| step.name == "graph.00000.child")
+                .and_then(|step| step.output.clone())
+                .expect("first child link"),
+        )
+        .expect("child id");
+        let child_steps = rt.steps(&first_child).await.expect("first child steps");
+        assert!(
+            child_steps
+                .iter()
+                .any(|step| step.name == "graph.00000.fix.turn")
+        );
+        assert!(
+            child_steps
+                .iter()
+                .any(|step| step.name == "graph.00000.fix.close")
+        );
+        drop(rt);
+
+        let (r, u, b) = (root.clone(), url, base);
+        let resumed = tokio::task::spawn_blocking(move || child(&r, &u, &b, "recover", None))
+            .await
+            .expect("parallel recovery child");
+        assert!(resumed.success(), "parallel recovery: {resumed}");
+        let (rows, _) = inspect(&root).await;
+        assert!(
+            rows.iter()
+                .all(|(_, status, sha)| status == "closed" && sha.len() == 40),
+            "{rows:?}"
+        );
+        let first_after = model
+            .requests()
+            .iter()
+            .filter(|request| request.to_string().contains("Work item 1"))
+            .count();
+        assert_eq!(first_after, 1, "recovery repeated the completed first lane");
+    });
+}
+
+#[test]
+fn resuming_parent_requeues_its_interrupted_parallel_children() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 6])
+            .await
+            .expect("scripted model");
+        let root = scratch("parallel-resume-family");
+        let base = seed_with_dependencies(&root, false).await;
+        let url = model.base_url();
+        let (r, u, b) = (root.clone(), url.clone(), base.clone());
+        let crashed = tokio::task::spawn_blocking(move || {
+            child(
+                &r,
+                &u,
+                &b,
+                "start-parallel",
+                Some("pipeline:after:graph.00000.fix"),
+            )
+        })
+        .await
+        .expect("parallel crash child");
+        assert!(!crashed.success(), "first lane did not hit its crash point");
+
+        let (r, u, b) = (root.clone(), url, base);
+        let resumed = tokio::task::spawn_blocking(move || child(&r, &u, &b, "resume-family", None))
+            .await
+            .expect("family resume child");
+        assert!(resumed.success(), "family resume: {resumed}");
+        let result = std::fs::read_to_string(root.join("result.txt")).expect("family result");
+        assert!(result.starts_with("Ok("), "{result}");
+        let (rows, _) = inspect(&root).await;
+        assert!(
+            rows.iter()
+                .all(|(_, status, sha)| status == "closed" && sha.len() == 40),
+            "{rows:?}"
+        );
+        assert_eq!(
+            model
+                .requests()
+                .iter()
+                .filter(|request| request.to_string().contains("Work item 1"))
+                .count(),
+            1,
+            "resume repeated a completed lane"
+        );
+    });
+}
+
+#[test]
 fn takeover_after_turn_refuses_publication_and_close() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 3])
@@ -2651,6 +2924,10 @@ fn takeover_after_turn_refuses_publication_and_close() {
 }
 
 async fn wait_for_park(rt: &Durare, previous: Option<&str>) -> atomic_durable::Park {
+    wait_for_park_for(rt, RUN, previous).await
+}
+
+async fn wait_for_park_for(rt: &Durare, run: &str, previous: Option<&str>) -> atomic_durable::Park {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let Ok(parks) =
@@ -2661,7 +2938,7 @@ async fn wait_for_park(rt: &Durare, previous: Option<&str>) -> atomic_durable::P
         let parks = parks.expect("waiting parks");
         if let Some(park) = parks
             .into_iter()
-            .find(|park| park.run == RUN && previous.is_none_or(|old| park.id != old))
+            .find(|park| park.run == run && previous.is_none_or(|old| park.id != old))
         {
             return park;
         }
@@ -2671,8 +2948,8 @@ async fn wait_for_park(rt: &Durare, previous: Option<&str>) -> atomic_durable::P
         }
         tokio::time::sleep_until(std::cmp::min(now + Duration::from_millis(10), deadline)).await;
     }
-    let status = rt.status(RUN).await;
-    let recent_steps = rt.steps(RUN).await.map(|steps| {
+    let status = rt.status(run).await;
+    let recent_steps = rt.steps(run).await.map(|steps| {
         steps
             .iter()
             .rev()
@@ -2925,6 +3202,7 @@ fn a_policy_edit_routes_only_later_graph_lanes_and_records_each_choice() {
                 epic: EPIC.into(),
                 model_source: Some(source),
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -3468,7 +3746,7 @@ fn recovery_without_graph_registrar_cannot_dispatch_unfinished_graph_run() {
 }
 
 #[test]
-fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
+fn cli_verifies_only_the_parallel_lane_attempt_on_its_authorized_branch() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into())])
             .await
@@ -3583,11 +3861,21 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 3,
             },
         )
         .await
         .expect("start graph fixture run");
-        let proof_park = wait_for_park(&rt, None).await;
+        wait_for("parallel author model call", || model.calls() == 1).await;
+        let parent_steps = rt.steps(RUN).await.expect("parent graph checkpoints");
+        let lane_run = parent_steps
+            .iter()
+            .find(|step| step.name == "graph.00000.child")
+            .and_then(|step| step.output.as_ref())
+            .and_then(Value::as_str)
+            .expect("linked lane child")
+            .to_owned();
+        let proof_park = wait_for_park_for(&rt, &lane_run, None).await;
         assert!(
             proof_park.reason.contains("host branch proof"),
             "{proof_park:?}"
@@ -3605,7 +3893,7 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
             .fixture
             .expect("frozen fixture")
             .snapshot;
-        let steps = rt.steps(RUN).await.expect("graph checkpoints");
+        let steps = rt.steps(&lane_run).await.expect("lane checkpoints");
         let candidate: Value = steps
             .iter()
             .find(|step| step.name == "graph.00000.fix.turn")
@@ -3626,7 +3914,7 @@ fn cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch() {
             &snapshot,
             &[
                 "update-ref",
-                &format!("refs/atomic/{RUN}/steps/graph.00000.fix/2"),
+                &format!("refs/atomic/{lane_run}/steps/graph.00000.fix/2"),
                 &sha,
             ],
         );
@@ -3821,6 +4109,7 @@ fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -3994,6 +4283,7 @@ fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim()
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -4225,6 +4515,7 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await
@@ -4438,6 +4729,8 @@ fn cli_run_graph_epic_completes_one_work_item_with_a_real_fixture() {
                     "workflows/fix.workflow.yaml",
                     "--graph-epic",
                     EPIC,
+                    "--lanes",
+                    "3",
                     "--run-id",
                     RUN,
                     "--data",
@@ -4527,6 +4820,7 @@ fn mismatched_existing_graph_base_ref_refuses_before_the_model_turn() {
                 epic: EPIC.into(),
                 model_source: None,
                 review_routing: true,
+                lanes: 1,
             },
         )
         .await

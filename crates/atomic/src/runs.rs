@@ -131,6 +131,9 @@ pub struct RunArgs {
     /// Work every ready child of this pinned graph epic with the named workflow template.
     #[arg(long, value_name = "EPIC_ID")]
     pub graph_epic: Option<String>,
+    /// Run this many ready graph items concurrently (1 to 16).
+    #[arg(long, value_name = "N", requires = "graph_epic", value_parser = parse_lanes)]
+    pub lanes: Option<usize>,
     /// Kill this development build after the named workflow step commits,
     /// so `atomic runs resume` can exercise recovery through the real CLI.
     #[cfg(feature = "dev-failpoints")]
@@ -146,6 +149,16 @@ pub struct RunArgs {
     pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+fn parse_lanes(value: &str) -> Result<usize, String> {
+    let lanes = value
+        .parse::<usize>()
+        .map_err(|_| "lanes must be an integer from 1 to 16".to_owned())?;
+    (1..=16)
+        .contains(&lanes)
+        .then_some(lanes)
+        .ok_or_else(|| "lanes must be an integer from 1 to 16".to_owned())
 }
 
 #[cfg(feature = "dev-failpoints")]
@@ -685,6 +698,7 @@ pub async fn run(
                 epic,
                 model_source: engine.lane_policy.clone(),
                 review_routing: true,
+                lanes: args.lanes.unwrap_or(1),
             })?,
         ),
         None => (PIPELINE, serde_json::to_value(run)?),
@@ -890,7 +904,7 @@ pub async fn resume(
                 .shown(&format!("run {}: resuming", crate::shown::line(id)))
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
-            engine.rt.resume(id).await?;
+            engine.rt.resume_family(id).await?;
             // Resumed: what it does now is noted afresh.
             atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");

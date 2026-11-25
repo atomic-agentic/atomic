@@ -562,6 +562,7 @@ dependencies = [
  "atomic-agentic-graph",
  "atomic-agentic-schema",
  "clap",
+ "futures-util",
  "getrandom 0.3.4",
  "jsonschema",
  "libc",

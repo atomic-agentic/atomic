@@ -25,7 +25,7 @@ pub use publication::{
     run_atom, run_atom_at,
 };
 pub use runtime::{
-    DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
+    ChildWorkflow, DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
     ENGINE_IDENTITY_VARIABLE, ENGINE_VERSION_VARIABLE, IdentityError, Param, RESUME_QUEUES, Result,
     Row, RunContents, RunKey, RunRecord, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx,
     TxFuture, WorkflowContext, executor_identity,
