@@ -1563,6 +1563,14 @@ fn denied_paths_with(
     // a link as what it points at.
     let mut own = Vec::new();
     for entry in children(codex_home, "") {
+        #[cfg(windows)]
+        if entry.file_name().is_some_and(|n| n == ".sandbox-bin") {
+            // Codex runs a versioned copy under the sandbox account. Its read
+            // ACL must survive subsequent turns. Check the copy against the
+            // shipped runner and keep all other files in this directory denied.
+            own.extend(windows_helper_denials(&entry)?);
+            continue;
+        }
         if entry.file_name().is_some_and(|n| n == "tmp") {
             // Codex's links, and atomic's own link to itself under the
             // helper's name, which every sandbox runs; they stay readable.
@@ -2346,6 +2354,46 @@ async fn prepare_windows_turn(config: &mut Config) -> anyhow::Result<()> {
     .await
     .context("join Windows sandbox setup")?
     .context("prepare the Windows sandbox for this turn")
+}
+
+#[cfg(windows)]
+fn windows_helper_denials(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let meta = std::fs::symlink_metadata(dir)?;
+    anyhow::ensure!(
+        meta.is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "expected a regular Windows sandbox helper directory at {}",
+        dir.display()
+    );
+    let digest = |path: &Path| -> std::io::Result<_> {
+        let mut hash = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(path)?, &mut hash)?;
+        Ok(hash.finalize())
+    };
+    let shipped = std::env::current_exe()?.with_file_name("codex-command-runner.exe");
+    let mut denied = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "unexpected reparse point in Windows sandbox helper cache at {}",
+            path.display()
+        );
+        let is_runner = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|s| s.starts_with("codex-command-runner-") && s.ends_with(".exe"));
+        if is_runner && meta.is_file() && digest(&path)? == digest(&shipped)? {
+            continue;
+        }
+        denied.push(path);
+    }
+    Ok(denied)
 }
 
 /// Require packaged helpers before Codex can fall back to its executable search path.

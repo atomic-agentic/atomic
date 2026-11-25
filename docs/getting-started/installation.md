@@ -10,10 +10,10 @@ prerequisites for building that app.
 
 ## Release status
 
-No Atomic release has been published here: there is no download location and no
-supported installation command. The check under
-[verifying a download](#verifying-a-download) is what an archive from a
-published release will face; there is nothing to check against yet.
+[Atomic v0.1.0](https://github.com/atomic-agentic/atomic/releases/tag/v0.1.0)
+provides archives for Linux AMD64 and macOS on Apple silicon. Windows AMD64
+is a new release target for v0.2. Use the archive and matching signature
+bundle from the same tagged release. See [verifying a download](#verifying-a-download).
 
 Atomic itself is in this repository and builds from source. With a container
 engine and git on the host, from a checkout:

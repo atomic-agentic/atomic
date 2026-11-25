@@ -117,6 +117,8 @@ def main():
         project = dest / "project"
         state = scratch / "state"
         env = {**os.environ, "ATOMIC_HOME": str(state)}
+        # Native PowerShell does not normally set the Unix HOME variable.
+        env.pop("HOME", None)
         system = Path(os.environ["SystemRoot"])
         env["PATH"] = os.pathsep.join(map(str, [
             system / "System32", system, system / "System32/WindowsPowerShell/v1.0",
@@ -125,7 +127,9 @@ def main():
         for args in [["--version"], ["check"],
                      ["render", "atoms/implement-step.atom.astro", "--input", "fixtures/implement-step/quantity.input.json"]]:
             subprocess.run([exe, *args], cwd=project, env=env, check=True, timeout=120)
-        coding_turn(exe, project, dest / "repository", state, env)
+        # Reuse the project to cover Codex's already-provisioned helper cache.
+        for _ in range(2):
+            coding_turn(exe, project, dest / "repository", state, env)
 
 
 if __name__ == "__main__":
