@@ -63,12 +63,14 @@ pub fn render_clocked(
     step_id: Option<&str>,
     clock: Option<&crate::astro::StepClock>,
 ) -> Result<Rendered, RenderError> {
-    jsonschema::validator_for(&compiled.program.contracts["Input"])
+    atomic_schema::registry::Registry::new()
+        .validator_for(&compiled.program.contracts["Input"])
         .map_err(|e| RenderError(e.to_string()))?
         .validate(run.input)
         .map_err(|e| RenderError(format!("input: {e}")))?;
     if let Some(snapshot) = snapshot {
-        jsonschema::validator_for(&compiled.program.contracts["Context"])
+        atomic_schema::registry::Registry::new()
+            .validator_for(&compiled.program.contracts["Context"])
             .map_err(|e| RenderError(e.to_string()))?
             .validate(&snapshot.as_value()["context"])
             .map_err(|e| RenderError(format!("context: {e}")))?;

@@ -364,3 +364,32 @@ fn an_optional_reference_to_a_nullable_definition_keeps_its_null() {
         }
     }
 }
+
+#[test]
+fn nullable_objects_and_optional_constants_survive_generation() {
+    let contract = json!({"type":"object","required":["error"],"properties":{
+        "error":{"type":["object","null"],"properties":{"message":{"type":"string"}}},
+        "flag":{"const":true}
+    }});
+    let lowered = lower(&contract, &OPENAI_STRICT).expect("lowers");
+    let validator = jsonschema::validator_for(&lowered.schema).unwrap();
+    assert!(validator.is_valid(&json!({"error":null,"flag":null})));
+    assert!(validator.is_valid(&json!({"error":{"message":"failed"},"flag":true})));
+    assert!(!validator.is_valid(&json!({"error":null,"flag":false})));
+    assert_eq!(
+        normalized(&contract, json!({"error":null,"flag":null})),
+        json!({"error":null})
+    );
+}
+
+#[test]
+fn nullable_objects_are_allowed_only_below_the_generation_root() {
+    let contract = json!({"type":["object","null"],"properties":{}});
+    assert!(
+        lower(&contract, &OPENAI_STRICT)
+            .unwrap_err()
+            .message
+            .contains("root")
+    );
+    assert!(!check(&contract, &OPENAI_STRICT).is_empty());
+}

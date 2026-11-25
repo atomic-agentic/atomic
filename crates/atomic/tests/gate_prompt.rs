@@ -528,6 +528,35 @@ fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
 }
 
 #[test]
+fn a_service_without_user_can_enroll_and_decide_its_gate() {
+    support::require_sandbox();
+    let p = Project::new("service-operator");
+    for (login, expected) in [("service", "service"), ("", "operator")] {
+        let env = [("USER", ""), ("LOGNAME", login)];
+        let enrolled = p.at_terminal_with(&["gates", "enroll"], &[], &env);
+        assert!(enrolled.status.success(), "{}", text(&enrolled));
+        let approved = p.at_terminal_with(
+            &[
+                "run",
+                "approval",
+                "--run-id",
+                expected,
+                "--data",
+                r#"{"text":"v1"}"#,
+            ],
+            &["a"],
+            &env,
+        );
+        let transcript = text(&approved);
+        assert!(approved.status.success(), "{transcript}");
+        assert!(
+            transcript.contains(&format!("approved by local:{expected}")),
+            "{transcript}"
+        );
+    }
+}
+
+#[test]
 fn a_reply_is_taken_however_late_the_prompt_reads_on_after_showing() {
     support::require_sandbox();
     let p = Project::new("late");
@@ -813,7 +842,7 @@ fn an_exec_command_cannot_type_into_the_prompt() {
         .into_iter()
         .flatten()
         .flatten()
-        .find_map(|run| std::fs::read_to_string(run.path().join("inject.log")).ok())
+        .find_map(|run| std::fs::read_to_string(run.path().join("shared/inject.log")).ok())
         .unwrap_or_else(|| panic!("the terminal probe did not report its result: {t}"));
     assert!(
         tried.starts_with("no tty"),

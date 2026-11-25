@@ -243,6 +243,19 @@ fn headers_urls_and_flags_are_found() {
             "curl -H 'Authorization: Bearer abcd1234efgh' x",
             "curl -H 'Authorization: [REDACTED]' x",
         ),
+        ("Authorization: DPoP abc.xyz", "Authorization: [REDACTED]"),
+        (
+            "Proxy-Authorization: Custom username=\"private\"",
+            "Proxy-Authorization: [REDACTED]",
+        ),
+        (
+            "Cookie: name=\"private\"; second=value",
+            "Cookie: [REDACTED]",
+        ),
+        (
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\nprivate\n-----END PGP PRIVATE KEY BLOCK-----",
+            "[REDACTED]",
+        ),
         ("Authorization: abcd1234efgh", "Authorization: [REDACTED]"),
         ("Cookie: session=abcd1234; a=b", "Cookie: [REDACTED]"),
         ("x-api-key: abcd1234efgh", "x-api-key: [REDACTED]"),

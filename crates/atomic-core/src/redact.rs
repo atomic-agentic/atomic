@@ -346,6 +346,13 @@ static HEADER: LazyLock<Regex> = LazyLock::new(|| {
         r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie|x-api-key|x-auth-token)(\\*["']?[ \t]*:[ \t]*\\*["']?)([^\n"'\\]+)"#,
     )
 });
+// An assignment followed by a quote inside a credential header opens a quoted
+// parameter. An ordinary quote-delimited header scan would expose its contents.
+static QUOTED_HEADER_PARAMETER: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\\*["']?[ \t]*:[ \t]*\\*["']?)[^\n"'\\]*=[ \t]*\\*["'][^\n]*"#,
+    )
+});
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
 /// A name and value pair written as JSON text, or as Python writes a
@@ -413,7 +420,7 @@ static WEBHOOK: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 static PRIVATE_KEY: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"^-----BEGIN ([A-Z ]*PRIVATE KEY)-----"));
+    LazyLock::new(|| regex(r"^-----BEGIN ([A-Z ]*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----"));
 
 /// The parts of a name, lower-cased: split at punctuation and where lower
 /// case turns to upper, so `AWS_SECRET_KEY`, `AccountKey` and
@@ -879,7 +886,27 @@ fn is_header_secret(header: &str, value: &str) -> bool {
         return is_secret_value(Strength::Strong, first);
     }
     let scheme = SCHEMES.iter().any(|s| first.eq_ignore_ascii_case(s));
-    (scheme && value.len() > first.len()) || looks_like_credential(first)
+    // An extension scheme can carry token68 or a list of auth parameters.
+    let credential = value[first.len()..].trim_start();
+    let extension = first
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && first
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+        && !credential.is_empty()
+        && (credential
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b))
+            || credential.split_once('=').is_some_and(|(name, _)| {
+                !name.trim().is_empty()
+                    && name
+                        .trim()
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            }));
+    (scheme && !credential.is_empty()) || extension || looks_like_credential(first)
 }
 
 /// A bracket in `value` closed but never opened in it, at its end.
@@ -2491,6 +2518,9 @@ fn text_once(input: &str) -> Cow<'_, str> {
     });
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
+    apply(&QUOTED_HEADER_PARAMETER, &|c| {
+        format!("{}{}{REDACTED}", &c[1], &c[2])
+    });
     apply(&HEADER, &|c| header_read(c, HEADERS_WITHIN));
     apply(&SCHEME, &redact_scheme);
     if FLAG.is_match(&output) {

@@ -343,6 +343,12 @@ pub fn local_user() -> Option<String> {
         .find_map(|v| std::env::var(v).ok().filter(|u| !u.is_empty()))
 }
 
+/// The identity used both to name a gate's approver and to enroll or read
+/// its credential, including in service processes without login variables.
+pub fn operator_user() -> String {
+    local_user().unwrap_or_else(|| "operator".into())
+}
+
 /// The keyring account of `user`'s operator credential for the project
 /// whose state is `state`: one credential per user and project.
 pub fn operator_account(state: &crate::state::ProjectState, user: &str) -> String {

@@ -1604,7 +1604,7 @@ pub(crate) fn process_env(name: &str) -> Option<std::ffi::OsString> {
 
 /// The data directory `dirs` names for this process; for the thread a test
 /// runs on, what `as_process` said it is instead.
-fn process_data_dir() -> Option<PathBuf> {
+pub(crate) fn process_data_dir() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(said) = PROCESS.with(|p| p.borrow().as_ref().map(|process| process.data.clone())) {
         return said;

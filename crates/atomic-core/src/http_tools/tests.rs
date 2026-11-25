@@ -1395,3 +1395,78 @@ async fn a_long_content_type_is_echoed_cut_short() {
     assert!(!said.contains(whole), "the whole type was echoed: {said}");
     assert!(!said.contains("anything"), "the body was echoed: {said}");
 }
+
+#[test]
+fn the_selected_request_media_governs_the_body_and_content_parameters_use_json() {
+    let spec = json!({"openapi":"3.1.0","paths":{"/":{"post":{
+        "operationId":"send",
+        "parameters":[{"in":"query","name":"data","content":{"application/json":{
+            "schema":{"type":"object","required":["parts"]}}}}],
+        "requestBody":{"required":true,"content":{
+            "application/a+json":{"schema":{"type":"integer"}},
+            "application/json":{"schema":{"type":"string"}}
+        }}
+    }}}});
+    let mut tools = toolset("api.example.com");
+    tools.operations = atomic_schema::openapi::operations(&spec)
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.name.clone(), op))
+        .collect();
+    let req = tools
+        .request("send", &json!({"data":{"parts":[1,2]},"body":"ok"}))
+        .unwrap();
+    assert!(req.headers.iter().any(|(key, val)| key.eq_ignore_ascii_case("Content-Type") && val == "application/json"));
+    assert_eq!(
+        req.url.query_pairs().find(|(k, _)| k == "data").unwrap().1,
+        r#"{"parts":[1,2]}"#
+    );
+    assert!(
+        tools
+            .request("send", &json!({"data":1,"body":"ok"}))
+            .is_err()
+    );
+    assert!(tools.request("send", &json!({"body":2})).is_err());
+    tools
+        .headers
+        .push(("content-type".into(), "application/a+json".into()));
+    let error = tools.request("send", &json!({"body":"ok"})).unwrap_err();
+    assert!(
+        matches!(error, CallError::Refused(ref message) if message.contains("configured Content-Type"))
+    );
+    tools.headers.pop();
+    let mut spec = spec;
+    spec["paths"]["/"]["post"]["requestBody"]["content"]
+        .as_object_mut()
+        .unwrap()
+        .remove("application/json");
+    tools.operations = atomic_schema::openapi::operations(&spec)
+        .unwrap()
+        .into_iter()
+        .map(|op| (op.name.clone(), op))
+        .collect();
+    let request = tools.request("send", &json!({"body":2})).unwrap();
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(key, val)| key.eq_ignore_ascii_case("Content-Type")
+                && val == "application/a+json")
+    );
+}
+
+#[test]
+fn cookie_arguments_preserve_the_configured_cookie_header() {
+    let mut tools = extra("api.example.com", "http://api.example.com/");
+    tools.headers.push(("cOoKiE".into(), "session=host".into()));
+    assert!(matches!(
+        tools.request("search", &json!({"session":"other"})),
+        Err(CallError::Refused(_))
+    ));
+    let request = tools.request("search", &json!({})).unwrap();
+    assert!(
+        request
+            .headers
+            .contains(&("cOoKiE".into(), "session=host".into()))
+    );
+}

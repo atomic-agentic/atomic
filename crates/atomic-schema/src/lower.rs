@@ -176,7 +176,7 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
     if contract.get("anyOf").is_some() {
         return Err(err("", "the root must be an object, not anyOf".into()));
     }
-    if !is_object_schema(contract) {
+    if !is_object_root(contract) {
         return Err(err("", "the root must be an object schema".into()));
     }
     let mut out = Lowered {
@@ -206,8 +206,20 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
     Ok(out)
 }
 
+fn is_object_root(schema: &Value) -> bool {
+    match schema.get("type") {
+        None => schema.get("properties").is_some(),
+        Some(Value::Array(types)) => types.len() == 1 && types[0] == "object",
+        Some(kind) => kind == "object",
+    }
+}
+
 fn is_object_schema(s: &Value) -> bool {
-    s.get("type").and_then(Value::as_str) == Some("object") || s.get("properties").is_some()
+    s.get("type").and_then(Value::as_str) == Some("object")
+        || s.get("properties").is_some()
+        || s.get("type")
+            .and_then(Value::as_array)
+            .is_some_and(|types| types.iter().any(|kind| kind == "object"))
 }
 
 /// `s` with local references followed to their target, within `root`.
@@ -237,6 +249,15 @@ fn allows_null_in(s: &Value, root: &Value) -> bool {
 }
 
 fn allows_null(s: &Value) -> bool {
+    if let Some(value) = s.get("const") {
+        return value.is_null();
+    }
+    if s.get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|values| !values.contains(&Value::Null))
+    {
+        return false;
+    }
     match s.get("type") {
         Some(Value::String(t)) => t == "null",
         Some(Value::Array(ts)) => ts.iter().any(|t| t == "null"),
@@ -255,15 +276,11 @@ fn allows_null(s: &Value) -> bool {
 fn nullable(s: &Value) -> Value {
     let mut s = s.clone();
     if let Some(obj) = s.as_object_mut() {
-        if obj.contains_key("$ref") || obj.contains_key("anyOf") {
-            let branches = match obj.remove("anyOf") {
-                Some(Value::Array(b)) if obj.is_empty() => b,
-                Some(Value::Array(b)) => vec![json!({"anyOf": b})],
-                _ => vec![Value::Object(std::mem::take(obj))],
-            };
-            let mut branches = branches;
-            branches.push(json!({"type": "null"}));
-            return json!({ "anyOf": branches });
+        if ["$ref", "const", "anyOf"]
+            .iter()
+            .any(|key| obj.contains_key(*key))
+        {
+            return json!({"anyOf": [s, {"type": "null"}]});
         }
         match obj.get_mut("type") {
             Some(Value::String(t)) => {
@@ -434,7 +451,7 @@ fn node(
             }
             lowered.insert(name.clone(), p);
         }
-        kept.insert("type".into(), json!("object"));
+        kept.entry("type").or_insert_with(|| json!("object"));
         kept.insert("properties".into(), Value::Object(lowered));
         let mut names: Vec<&String> = props.keys().collect();
         names.sort();
@@ -659,7 +676,7 @@ fn path_or_root(p: &str) -> String {
 /// an object. Returns every violation with its schema path.
 pub fn check(schema: &Value, profile: &Profile) -> Vec<String> {
     let mut problems = Vec::new();
-    if schema.get("anyOf").is_some() || !is_object_schema(schema) {
+    if schema.get("anyOf").is_some() || !is_object_root(schema) {
         problems.push("/: the root must be an object".into());
     }
     walk_check(schema, "", profile, &mut problems);

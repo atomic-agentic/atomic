@@ -2278,16 +2278,16 @@ async fn in_worktree(
         } else {
             source_subdirectory(runtimes.codex.cwd.clone()).await?
         };
-        // The run's build caches, with a Cargo target directory of this
-        // worktree's own.
+        // This step's build caches and the run's shared cache directory.
         // On a full disk the step waits for room, as for the execution
         // backend's, rather than failing its run.
+        let caches = caches.in_worktree(&worktrees.path(&run_id, &step));
         caches.create_waiting(&atom.name, &run_id, &step).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
-                here.codex.caches = Some(caches.in_worktree(&tree));
+                here.codex.caches = Some(caches);
                 run_in(
                     &atom,
                     &input,

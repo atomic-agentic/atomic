@@ -493,6 +493,27 @@ impl SignIn {
         }))
     }
 
+    /// Check both stores before allowing endpoint detection to fall through to another account.
+    /// The caller has already established that the private sign-in directory exists.
+    pub fn account_for_detection(&self) -> anyhow::Result<Option<Account>> {
+        if let Some(account) = self.account()? {
+            return Ok(Some(account));
+        }
+        let other = Self {
+            store: match self.store {
+                AuthCredentialsStoreMode::File => AuthCredentialsStoreMode::Keyring,
+                _ => AuthCredentialsStoreMode::File,
+            },
+            ..self.clone()
+        };
+        anyhow::ensure!(
+            other.stored()?.is_none(),
+            "a sign-in is held in {}; select that store or run atomic model logout",
+            other.store_name()
+        );
+        Ok(None)
+    }
+
     /// The sign-in its store keeps, if any.
     fn stored(&self) -> std::io::Result<Option<codex_login::AuthDotJson>> {
         #[cfg(test)]
@@ -1116,6 +1137,35 @@ mod tests {
             "id_token": id_token, "access_token": "", "refresh_token": "",
             "account_id": account}})
         .to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detection_refuses_a_sign_in_in_the_other_store() {
+        let dir = auth_dir("switched-store");
+        let file = SignIn::in_files(&dir);
+        keep(&dir, Some(signed_in("example")));
+        assert!(
+            file.account_for_detection()
+                .unwrap_err()
+                .to_string()
+                .contains("OS keyring")
+        );
+        keep(&dir, None);
+        assert!(file.account_for_detection().unwrap().is_none());
+        std::fs::write(dir.join("auth.json"), signed_in("example")).unwrap();
+        let keyring = SignIn {
+            store: AuthCredentialsStoreMode::Keyring,
+            ..file
+        };
+        assert!(
+            keyring
+                .account_for_detection()
+                .unwrap_err()
+                .to_string()
+                .contains("file store")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// With the keyring store, a live sign-in's directory holds only

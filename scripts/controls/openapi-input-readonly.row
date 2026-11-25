@@ -1,0 +1,1 @@
+openapi-input-readonly|crates/atomic-schema/src/openapi.rs|project_direction(&mut input, "readOnly");|/* no request projection */|-p atomic-agentic-schema --lib -- openapi::tests::request_and_response_use_their_own_view_of_shared_properties

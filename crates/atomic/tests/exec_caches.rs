@@ -153,14 +153,14 @@ fn an_exec_steps_caches_are_its_runs_alone_and_go_with_it() {
 
     let first = probe(&dir, "first");
     let caches = PathBuf::from(first["caches"].as_str().unwrap());
-    assert_eq!(caches.parent().and_then(Path::file_name).unwrap(), "cache");
+    let run = caches.parent().unwrap();
+    assert_eq!(run.parent().and_then(Path::file_name).unwrap(), "cache");
     assert!(caches.starts_with(dir.join("data")), "{first}");
     // Its Cargo target is the step's own, inside them.
-    assert_eq!(
-        Path::new(first["target"].as_str().unwrap()),
-        caches.join("cargo-target").join("probe"),
-        "{first}"
-    );
+    let target = Path::new(first["target"].as_str().unwrap());
+    assert_eq!(target.file_name().unwrap(), "cargo-target", "{first}");
+    assert_eq!(target.parent().unwrap().parent().unwrap(), run, "{first}");
+    assert!(!target.starts_with(&caches), "{first}");
     // Its own, empty but for the sandbox's read-only placeholders, and
     // writable; nothing beside them.
     assert_eq!(found(&first), "", "{first}");
@@ -168,7 +168,7 @@ fn an_exec_steps_caches_are_its_runs_alone_and_go_with_it() {
     assert_ne!(first["beside"], "ok", "{first}");
     // Gone with the run.
     assert!(!caches.exists(), "{caches:?} outlived its run");
-    let all = caches.parent().unwrap();
+    let all = run.parent().unwrap();
     assert!(files(all).is_empty(), "left in {all:?}: {:?}", files(all));
 
     // The next run's are its own, and hold nothing the first wrote.

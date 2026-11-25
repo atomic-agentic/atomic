@@ -528,6 +528,16 @@ pub async fn run(
             }));
         }
         tallies.push(tally);
+        // Assertions and scorers need the original output. Redact the report only
+        // once their decisions are final, before writing it to any destination.
+        for case in &mut report.cases {
+            if let Some(output) = &mut case.output {
+                atomic_core::redact::value(output);
+            }
+            for failure in &mut case.failures {
+                *failure = atomic_core::redact::text(failure).into_owned();
+            }
+        }
         reports.push(report);
     }
 
@@ -548,7 +558,9 @@ pub async fn run(
             .with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(path) = &args.report {
-        std::fs::write(path, serde_json::to_string_pretty(&reports)? + "\n")
+        let mut public = serde_json::to_value(&reports)?;
+        atomic_core::redact::value(&mut public);
+        std::fs::write(path, serde_json::to_string_pretty(&public)? + "\n")
             .with_context(|| format!("write {}", path.display()))?;
     }
     let skipped: Vec<(&str, Vec<String>)> = reports

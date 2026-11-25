@@ -298,7 +298,7 @@ impl Backend<'_> {
         {
             env.extend(caches.env());
             if request.sandbox == crate::typed::Sandbox::WorkspaceWrite {
-                writable_roots.push(caches.dir().to_owned());
+                writable_roots.extend(caches.writable_roots());
             }
         }
         env.extend(request.env.clone());
@@ -1708,7 +1708,7 @@ fn exec_environment(
     let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
     if let Some(caches) = caches {
         env.extend(caches.env());
-        writable_roots.push(caches.dir().to_owned());
+        writable_roots.extend(caches.writable_roots());
     }
     env.extend(declared_env(atom));
     (env, writable_roots)
@@ -2150,7 +2150,10 @@ async fn finish_exec(
             }
         )));
     }
-    let text = String::from_utf8_lossy(&done.stdout).into_owned();
+    let text = String::from_utf8(done.stdout).map_err(|_| AtomError::Schema {
+        message: "stdout is not valid UTF-8 JSON".into(),
+        answer: String::new(),
+    })?;
     let schema_error = |message: String| AtomError::Schema {
         message,
         answer: text.chars().take(2000).collect(),

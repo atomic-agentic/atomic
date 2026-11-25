@@ -101,12 +101,26 @@ fn same(a: &str, b: &str) -> bool {
             == 0
 }
 
+/// The verifier's database key. A length prefix keeps project/principal
+/// pairs distinct even when either name contains punctuation. Local and
+/// group principals already have their own, different prefixes.
+pub(crate) fn enrollment_key<R: DurableRuntime>(rt: &R, principal: &Principal) -> String {
+    match rt.operator_scope() {
+        Some(project) => format!("project:{}:{project}{}", project.len(), principal.as_str()),
+        None => principal.as_str().to_owned(),
+    }
+}
+
 /// Check `credential` against the store, in the caller's transaction.
-pub(crate) async fn verify(tx: &mut Tx<'_, '_>, credential: &HumanCredential) -> Result<Verified> {
+pub(crate) async fn verify(
+    tx: &mut Tx<'_, '_>,
+    key: &str,
+    credential: &HumanCredential,
+) -> Result<Verified> {
     let row = tx
         .query_opt(
             "SELECT verifier FROM atomic_operators WHERE principal = ?",
-            &[Param::Text(credential.principal.as_str().to_owned())],
+            &[Param::Text(key.to_owned())],
         )
         .await?;
     Ok(match row {
@@ -124,12 +138,14 @@ pub async fn enroll<R: DurableRuntime>(
     rt: &R,
     credential: &HumanCredential,
 ) -> std::result::Result<Enrollment, EnrollError> {
+    let key = enrollment_key(rt, credential.principal());
     let credential = credential.clone();
     let outcome = rt
         .control_transaction(move |mut tx| {
             let credential = credential.clone();
+            let key = key.clone();
             Box::pin(async move {
-                match verify(&mut tx, &credential).await? {
+                match verify(&mut tx, &key, &credential).await? {
                     Verified::Yes => return Ok(Ok(Enrollment::AlreadyEnrolled)),
                     Verified::Mismatch => return Ok(Err(credential.principal.clone())),
                     Verified::NotEnrolled => {}
@@ -140,7 +156,7 @@ pub async fn enroll<R: DurableRuntime>(
                         "INSERT INTO atomic_operators (principal, verifier, enrolled_at) \
                          VALUES (?, ?, ?) ON CONFLICT (principal) DO NOTHING",
                         &[
-                            Param::Text(credential.principal.as_str().to_owned()),
+                            Param::Text(key.to_owned()),
                             Param::Text(credential.verifier()),
                             Param::Int(now),
                         ],
@@ -150,7 +166,7 @@ pub async fn enroll<R: DurableRuntime>(
                     return Ok(Ok(Enrollment::Enrolled));
                 }
                 // Another enrollment raced in first.
-                Ok(match verify(&mut tx, &credential).await? {
+                Ok(match verify(&mut tx, &key, &credential).await? {
                     Verified::Yes => Ok(Enrollment::AlreadyEnrolled),
                     _ => Err(credential.principal.clone()),
                 })
@@ -167,15 +183,17 @@ pub async fn replace_enrollment<R: DurableRuntime>(
     rt: &R,
     credential: &HumanCredential,
 ) -> Result<Enrollment> {
+    let key = enrollment_key(rt, credential.principal());
     let credential = credential.clone();
     rt.control_transaction(move |mut tx| {
         let credential = credential.clone();
+        let key = key.clone();
         Box::pin(async move {
-            let before = verify(&mut tx, &credential).await?;
+            let before = verify(&mut tx, &key, &credential).await?;
             if before == Verified::Yes {
                 return Ok(Enrollment::AlreadyEnrolled);
             }
-            let principal = credential.principal.as_str().to_owned();
+            let principal = key;
             tx.execute(
                 "DELETE FROM atomic_operators WHERE principal = ?",
                 &[Param::Text(principal.clone())],
@@ -201,7 +219,7 @@ pub async fn replace_enrollment<R: DurableRuntime>(
 
 /// Whether `principal` has a credential enrolled.
 pub async fn enrolled<R: DurableRuntime>(rt: &R, principal: &Principal) -> Result<bool> {
-    let principal = principal.as_str().to_owned();
+    let principal = enrollment_key(rt, principal);
     rt.control_transaction(move |mut tx| {
         let principal = principal.clone();
         Box::pin(async move {

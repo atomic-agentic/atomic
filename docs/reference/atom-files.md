@@ -69,8 +69,8 @@ the hosts it reaches (see [Network access](#network-access)). It also:
 - finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
   `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
   toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
-  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
-  which is the step's own, and removed when the run ends. No other run's
+  package and build caches belong to the step. Only `ATOMIC_CACHE_DIR` is
+  shared by the run's steps. All these caches are removed when the run ends. No other run's
   command may write them, though one can still read them by their path while
   they last, so keep nothing secret there. A variable the atom declares in
   `env` wins. An eval gives the command no caches;
@@ -831,7 +831,8 @@ context while it renders. It may use `type` (one or a list), `properties`,
 `required`, `additionalProperties`, `items`, `enum`, `const` and local
 `$ref`s, plus annotations and constraint keywords such as `minimum`, `pattern`,
 `maxLength` and `format`. Atomic checks the constraints against the complete
-schema before a snapshot is used. Keywords that change the shape of a value,
+schema before a snapshot is used. Draft 2020-12 formats such as `date-time`
+are annotations. Use a `pattern` to enforce a textual shape. Keywords that change the shape of a value,
 such as `anyOf`, `oneOf`, `allOf`, `not` or `patternProperties`, are refused
 with a message that names them; they are never ignored.
 

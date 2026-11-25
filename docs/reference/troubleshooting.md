@@ -88,7 +88,8 @@ meant, then update the snapshot. The update command is not specified yet.
 
 The compact form has no constraints: a field such as `when: date-time` or
 `name: string(minLength 3)` fails with its file and path. Write that schema as
-full JSON Schema, which can say `format: date-time` or `minLength: 3`. A compact
+full JSON Schema, which can enforce a pattern or `minLength: 3`. Under draft
+2020-12, atomic treats `format: date-time` as an annotation. A compact
 schema also cannot name a top-level field after a structural JSON Schema
 keyword, such as `type`, `enum` or `items`: a schema with one is read as full
 JSON Schema, and atomic refuses it if its other fields read as compact ones

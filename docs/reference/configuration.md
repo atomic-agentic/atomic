@@ -147,13 +147,17 @@ The key's value is never read for detection. Looking for Ollama is one
 nothing else is sent anywhere. `ATOMIC_DETECT_OLLAMA_ADDR` names another loopback
 address, as an IP address and a port; any other address is refused and said. No
 key is sent to a detected Ollama, even when `model.api_key_env` is set.
+To use a different key variable, set `model.base_url` to the endpoint that
+issued that key.
 
 A model endpoint set in a file, a variable or a flag turns detection off, and so
 does a ChatGPT sign-in (`atomic model login`): a configured endpoint comes first,
 then the sign-in, for Codex atoms, then detection. A sign-in is personal, so
 atomic declines to use it where the store is shared or under `atomic serve`,
 rather than quietly falling back to something else, and a sign-in works on
-Linux only.
+Linux only. If changing `ATOMIC_CREDENTIAL_STORE` leaves a sign-in in the
+other store, atomic asks you to select that store or log out before detecting
+another account.
 
 When the endpoint was detected, or set by a project's files rather than by
 whoever runs it, `atomic run`, `atomic runs resume` and `atomic serve` say where
@@ -262,6 +266,8 @@ model:
   base_url: http://127.0.0.1:8000/v1
   name: Qwen3-8B
 ```
+
+Lite calls accept response bodies up to 8 MiB, including error responses.
 
 A lite atom's key goes only to the endpoint `model.base_url` names, and the same
 holds for the key `atomic eval --live` forwards while recording. The client

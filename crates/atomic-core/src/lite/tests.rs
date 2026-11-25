@@ -73,6 +73,21 @@ fn note() -> Note {
 }
 
 #[tokio::test]
+async fn oversized_provider_responses_are_refused_before_parsing() {
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 200,
+        body: " ".repeat(crate::http_tools::RESPONSE_LIMIT + 1),
+    }])
+    .await
+    .unwrap();
+    let rt = runtime(&model, Wire::ChatCompletions);
+    let err = run_lite_atom(&Classify, &note(), &rt, &Default::default())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("response is larger"), "{err}");
+}
+
+#[tokio::test]
 async fn a_lite_atom_returns_a_valid_out_with_exactly_one_model_call() {
     let model = FakeModel::start(vec![Reply::Text(GOOD.into())])
         .await

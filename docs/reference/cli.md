@@ -184,7 +184,13 @@ authentication](../getting-started/authentication.md).
 
 A gate decision carries your operator credential, a secret atomic keeps in the
 OS keyring (the Secret Service on Linux) and checks against the gate store.
-Nothing enrolls it for you: run `atomic gates enroll` once per project. On a
+Run `atomic gates enroll` once per project. After upgrading a PostgreSQL
+store with username-only enrollments, rerun that command in each project to
+register its existing secret under the project. Rotation then applies only
+to that project. The local deployment identifies its single operator by
+account name within the project. Separate people using the same account name
+and project share that role. Gate creation and approval both use `USER`, then `LOGNAME`,
+then the name `operator` if both variables are empty or absent. On a
 machine with no OS keyring, such as a headless server or a container, atomic
 refuses with an error rather than store the secret elsewhere; to keep it in a
 directory readable by you only (`$ATOMIC_HOME/credentials`, or

@@ -351,6 +351,13 @@ fn merge_object_siblings(
     let Some(target_object) = target.as_object() else {
         return Ok(None);
     };
+    // These keywords observe which properties are evaluated in their own
+    // schema. Merging the two property maps would change that set.
+    if target_object.contains_key("unevaluatedProperties")
+        || target_object.contains_key("patternProperties")
+    {
+        return Ok(None);
+    }
     let closed = target_object.get("additionalProperties").cloned();
     // `additionalProperties: false` beside the reference closes the merged
     // object to the properties listed beside it. That means the same as the

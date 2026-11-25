@@ -742,6 +742,55 @@ fn a_call_with_no_recording_fails_whatever_the_pass_rate() {
 }
 
 #[test]
+fn live_eval_redacts_output_and_failure_text_in_both_report_formats() {
+    on_codex_runtime(async {
+        let dir = scratch("redacted-reports");
+        let project = project(&dir, None);
+        let marker = "password=placeholdersecret";
+        let cases = json!({"input": {"text": "example"}, "expect": [
+            "output.ticket == 'different' && output.ticket == 'password=placeholdersecret'"
+        ]});
+        std::fs::write(project.join("evals/note/cases.jsonl"), cases.to_string()).unwrap();
+        let model = FakeModel::start(vec![Reply::Text(json!({"ticket": marker}).to_string())])
+            .await
+            .unwrap();
+        let report = dir.join("report.json");
+        let junit = dir.join("report.xml");
+        let result = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &[
+                "note",
+                "--no-cassettes",
+                "--json",
+                "--report",
+                report.to_str().unwrap(),
+                "--junit",
+                junit.to_str().unwrap(),
+            ],
+        )
+        .await;
+        assert!(!result.status.success());
+        assert_eq!(model.calls(), 1);
+        let json: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        assert_eq!(
+            json[0]["cases"][0]["output"]["ticket"],
+            "password=[REDACTED]"
+        );
+        for public in [
+            json.to_string(),
+            std::fs::read_to_string(junit).unwrap(),
+            text(&result),
+        ] {
+            assert!(public.contains("[REDACTED]"), "{public}");
+            assert!(!public.contains("placeholdersecret"), "{public}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    });
+}
+
+#[test]
 fn a_live_eval_is_metered_and_stopped_by_its_budget() {
     on_codex_runtime(async {
         let dir = scratch("metered");

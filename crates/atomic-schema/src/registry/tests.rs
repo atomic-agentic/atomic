@@ -402,3 +402,27 @@ fn a_reference_into_part_of_the_artifact_schema_is_refused() {
         .expect_err("refused");
     assert!(error.to_string().contains("part of it"), "{error}");
 }
+
+#[test]
+fn inlining_preserves_the_scope_of_evaluated_and_pattern_properties() {
+    let root = dir(&[]);
+    for schema in [
+        json!({"$defs":{"base":{"type":"object","unevaluatedProperties":false}},
+               "$ref":"#/$defs/base","properties":{"note":{"type":"string"}}}),
+        json!({"$defs":{"base":{"type":"object","patternProperties":{"^x":{"type":"number"}}}},
+               "$ref":"#/$defs/base","properties":{},"additionalProperties":false}),
+    ] {
+        let inline = Registry::new()
+            .inline_value(&schema, &root.join("scoped.json"))
+            .unwrap();
+        let original = Registry::new().validator_for(&schema).unwrap();
+        let inlined = Registry::new().validator_for(&inline).unwrap();
+        for value in [json!({}), json!({"note":"hi"}), json!({"x":1})] {
+            assert_eq!(
+                original.is_valid(&value),
+                inlined.is_valid(&value),
+                "{value} under {inline}"
+            );
+        }
+    }
+}

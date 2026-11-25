@@ -1673,3 +1673,66 @@ paths:
         "the refusal should name the reference and the member's own base: {said}"
     );
 }
+
+#[test]
+fn request_and_response_use_their_own_view_of_shared_properties() {
+    let schema = json!({
+        "type":"object", "required":["id","credential"],
+        "properties":{"id":{"type":"integer","readOnly":true},
+                      "credential":{"$ref":"#/components/schemas/Secret"}}
+    });
+    let media = json!({"application/json":{"schema":{"$ref":"#/components/schemas/Record"}}});
+    let spec = json!({"openapi":"3.1.0", "components":{"schemas":{
+        "Record":schema, "Secret":{"type":"string","writeOnly":true}
+    }}, "paths":{"/":{"post":{
+        "requestBody":{"required":true,"content":media},
+        "responses":{"201":{"content":media}}
+    }}}});
+    let op = operations(&spec).unwrap().remove(0);
+    let input = Registry::new().validator_for(&op.input).unwrap();
+    let output = Registry::new()
+        .validator_for(op.output.as_ref().unwrap())
+        .unwrap();
+    assert!(input.is_valid(&json!({"body":{"credential":"value"}})));
+    assert!(!input.is_valid(&json!({"body":{"id":1,"credential":"value"}})));
+    assert!(output.is_valid(&json!({"id":1})));
+    assert!(!output.is_valid(&json!({"id":1,"credential":"value"})));
+}
+
+#[test]
+fn content_parameters_require_one_declared_representation() {
+    let build = |parameter: Value| {
+        operations(&json!({"openapi":"3.1.0","paths":{"/":{"get":{"parameters":[parameter]}}}}))
+    };
+    let mut param = json!({"name":"q","in":"query","content":{"text/plain":{}}});
+    let op = build(param.clone()).unwrap().remove(0);
+    assert!(op.unsupported.unwrap().contains("text/plain"));
+    param["content"]["application/json"] = json!({});
+    assert!(
+        build(param.clone())
+            .unwrap_err()
+            .message
+            .contains("exactly one")
+    );
+    param["schema"] = json!({});
+    assert!(build(param).unwrap_err().message.contains("mixes content"));
+}
+
+#[test]
+fn ambiguous_request_media_are_refused_and_parameters_are_preserved() {
+    let spec = |media: Value| json!({"openapi":"3.1.0","paths":{"/":{"post":{"requestBody":{"content":media}}}}});
+    for media in [
+        json!({"application/a+json":{},"application/b+json":{}}),
+        json!({"application/json; profile=a":{},"application/json; profile=b":{}}),
+    ] {
+        let op = operations(&spec(media)).unwrap().remove(0);
+        assert!(op.unsupported.unwrap().contains("equally preferred"));
+        assert!(op.request_media.is_none());
+    }
+    let content_type = "application/json; profile=custom";
+    let op = operations(&spec(json!({(content_type):{"schema":{"const":1}}})))
+        .unwrap()
+        .remove(0);
+    assert_eq!(op.request_media.as_deref(), Some(content_type));
+    assert_eq!(op.input["properties"]["body"]["const"], 1);
+}

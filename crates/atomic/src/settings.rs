@@ -402,7 +402,7 @@ fn found(sign_in: SignIn) -> SignInFound {
         }
         Err(e) => return Err(format!("{}: {e}", sign_in.auth_home().display())),
     }
-    match sign_in.account() {
+    match sign_in.account_for_detection() {
         Ok(Some(_)) => Ok(Some(sign_in)),
         Ok(None) => Ok(None),
         Err(e) => Err(format!("{e:#}")),
@@ -680,10 +680,20 @@ pub fn resolve(
             other_openai_used = other_openai.is_some();
             settings.model.base_url = Some(base_url);
             sources.insert("model.base_url".into(), Source::Detected(why.clone()));
-            if unset(&sources, "model.api_key_env") {
-                settings.model.api_key_env = Some("OPENAI_API_KEY".into());
-                sources.insert("model.api_key_env".into(), Source::Detected(why.clone()));
+            if settings
+                .model
+                .api_key_env
+                .as_deref()
+                .is_some_and(|name| name != "OPENAI_API_KEY")
+            {
+                notes.push(
+                    "model.api_key_env is set and not used: set model.base_url to the endpoint \
+                     the key is for"
+                        .into(),
+                );
             }
+            settings.model.api_key_env = Some("OPENAI_API_KEY".into());
+            sources.insert("model.api_key_env".into(), Source::Detected(why.clone()));
             if unset(&sources, "model.name") {
                 settings.model.name = Some(OPENAI_DEFAULT_MODEL.into());
                 sources.insert(
