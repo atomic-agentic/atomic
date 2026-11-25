@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -14,6 +15,25 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def context_checkpoint(exe, env):
+    """A direct render reuses its authenticated public context checkpoint."""
+    context_project = ROOT / "examples/12-execution-context"
+    render_context = [exe, "render", "atoms/context-reply.atom.astro", "--input",
+                      "fixtures/context-reply/ordinary.input.json", "--context-settings",
+                      "context.settings.json", "--run-id", "windows-context-smoke"]
+    for region in ["eu-west", "us-east"]:
+        result = subprocess.run(render_context, cwd=context_project,
+                                env={**env, "SUPPORT_REGION": region}, check=True,
+                                capture_output=True, text=True, timeout=120)
+        prompt = json.loads(result.stdout)
+        frozen_region = re.findall(
+            r'<(data-[0-9a-f]+) path="context\.env\.SUPPORT_REGION" origin="team">([^<]+)</\1>',
+            prompt["user"],
+        )
+        if [value for _, value in frozen_region] != ["eu-west"]:
+            raise AssertionError("Direct invocation did not reuse its frozen context")
 
 
 def coding_turn(exe, project, repository, state, env):
@@ -139,17 +159,7 @@ def main():
         for args in [["--version"], ["check"],
                      ["render", "atoms/implement-step.atom.astro", "--input", "fixtures/implement-step/quantity.input.json"]]:
             subprocess.run([exe, *args], cwd=project, env=env, check=True, timeout=120)
-        context_project = ROOT / "examples/12-execution-context"
-        render_context = [exe, "render", "atoms/context-reply.atom.astro", "--input",
-                          "fixtures/context-reply/ordinary.input.json", "--context-settings",
-                          "context.settings.json", "--profile", "test", "--run-id",
-                          "windows-context-smoke"]
-        for region in ["eu-west", "us-east"]:
-            result = subprocess.run(render_context, cwd=context_project,
-                                    env={**env, "SUPPORT_REGION": region}, check=True,
-                                    capture_output=True, text=True, timeout=120)
-            if "Region: eu-west" not in result.stdout or "Region: us-east" in result.stdout:
-                raise AssertionError("Direct invocation did not reuse its frozen context")
+        context_checkpoint(exe, env)
         # Reuse the project to cover Codex's already-provisioned helper cache.
         for _ in range(2):
             coding_turn(exe, project, dest / "repository", state, env)
