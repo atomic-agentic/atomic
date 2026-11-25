@@ -25,12 +25,11 @@ def coding_turn(exe, project, repository, state, env):
     literal = str(canary).replace("'", "''")
     command = (
         "$ErrorActionPreference='Stop'; "
-        "Write-Output ('cwd=' + [Environment]::CurrentDirectory + ' PowerShell=' + $PWD.Path); "
-        "Write-Output ('PS version=' + $PSVersionTable.PSVersion + ' location=' + (Get-Location).Path); "
-        "Copy-Item pricing.py windows-copy.py; "
+        "[IO.File]::Copy('pricing.py', 'windows-copy.py'); "
         f"try {{ [IO.File]::ReadAllText('{literal}') | Out-Null; throw 'private file was readable' }} "
         "catch [UnauthorizedAccessException] { "
-        "Write-Output ('denied ' + (Get-FileHash windows-copy.py).Hash) }"
+        "$hash = [Security.Cryptography.SHA256]::Create().ComputeHash([IO.File]::ReadAllBytes('windows-copy.py')); "
+        "Write-Output ('denied ' + [BitConverter]::ToString($hash).Replace('-', '')) }"
     )
     output = (project / "fixtures/implement-step/quantity.output.json").read_text()
     replies = []
@@ -42,11 +41,6 @@ def coding_turn(exe, project, repository, state, env):
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if not replies:
-                for part in request.get("input", []):
-                    if isinstance(part, dict) and part.get("role") == "user":
-                        for item in part.get("content", []):
-                            if isinstance(item, dict) and "<cwd>" in str(item.get("text")):
-                                print("Codex cwd", str(item["text"]).split("<cwd>")[1].split("</cwd>")[0], flush=True)
                 item = dict(type="function_call", id="fc_1", call_id="call_1", name="exec_command",
                             arguments=json.dumps({"cmd": command, "yield_time_ms": 10000}), status="completed")
             elif len(replies) == 1 and any(
