@@ -2333,7 +2333,10 @@ fn next_claimant_receives_fenced_handoff_with_file_statuses() {
             !request.contains(&unchanged.id),
             "Git object ID reached the model"
         );
-        assert!(request.contains("````text"), "stored text closed the handoff fence");
+        assert!(
+            request.contains("````text"),
+            "stored text closed the handoff fence"
+        );
         assert!(
             !request.contains(&"a".repeat(40)),
             "synthetic Git object ID reached the model"
