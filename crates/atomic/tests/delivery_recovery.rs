@@ -483,6 +483,271 @@ async fn each_delivery_effect_boundary_recovers_without_repeating_remote_mutatio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serve_polls_queue_after_restart_without_repeating_delivery() {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let scratch_base = PathBuf::from(std::env::var_os("HOME").expect("test home"));
+    let root = scratch_base.join(format!(
+        "atomic-delivery-poller-{}-{nonce}",
+        std::process::id()
+    ));
+    fs::create_dir_all(project(&root)).expect("create project");
+    fs::write(
+        project(&root).join("atomic.yaml"),
+        "atomic: 1\nname: project\n",
+    )
+    .expect("create project manifest for serve");
+    fs::create_dir(root.join("home")).expect("create home");
+    success(
+        command(&root, &std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "seed_admitted_delivery",
+                "--nocapture",
+            ])
+            .env("DELIVERY_RECOVERY_ROOT", &root)
+            .output()
+            .expect("seed"),
+    );
+    let model_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake model");
+    let model_url = format!(
+        "http://{}/v1",
+        model_listener.local_addr().expect("model address")
+    );
+    model_listener
+        .set_nonblocking(true)
+        .expect("nonblocking fake model");
+    let model_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let calls = model_calls.clone();
+    let stop = model_stop.clone();
+    let model_worker = std::thread::spawn(move || {
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            match model_listener.accept() {
+                Ok((_stream, _)) => {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake model listener failed: {error}"),
+            }
+        }
+    });
+    let id = fs::read_to_string(root.join("state-id")).expect("project ID");
+    let dir = root.join("state/private").join(&id).join("delivery");
+    let gate_output: Value = serde_json::from_slice(&success(resume(&root, None))).expect("gate");
+    let gate = gate_output["gate"].as_str().expect("gate ID");
+    success(cli(
+        &root,
+        &["gates", "approve", gate, "--command-id", "approve-delivery"],
+        None,
+    ));
+    fs::remove_file(dir.join("drop-response-push")).expect("allow push");
+    fs::remove_file(dir.join("unreadable-push")).expect("allow inspection");
+    success(resume(&root, None));
+    let db = root.join("state/private").join(&id).join("atomic.db");
+    let rt = Durare::open(
+        &Database::Sqlite(db),
+        None,
+        LAYOUT_VERSION,
+        &format!("project/{id}"),
+    )
+    .await
+    .expect("open store");
+    // Make a pending row due without waiting for the production cadence.
+    let due = || {
+        rt.control_transaction(|mut tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_delivery_queue_observations SET next_poll_at=0 WHERE delivery_run=?",
+                    &[text(RUN)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+    };
+    let status = || {
+        rt.control_transaction(|mut tx| {
+            Box::pin(async move {
+                let row = tx.query_one(
+                    "SELECT status,poll_attempts,next_poll_at FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+                    &[text(RUN)],
+                ).await?;
+                Ok((row.text("status")?, row.int("poll_attempts")?, row.int("next_poll_at")?))
+            })
+        })
+    };
+    fs::write(dir.join("unreadable-enqueue"), "").expect("fail provider read");
+    due().await.expect("make failed read due");
+    let own_project = format!("project/{id}");
+    let due_run = rt
+        .control_transaction(move |mut tx| {
+            let project = own_project.clone();
+            Box::pin(async move {
+                atomic_durable::delivery_effect::due_queue_observation_in(
+                    &mut tx,
+                    &project,
+                    i64::MAX,
+                )
+                .await
+            })
+        })
+        .await
+        .expect("query current project");
+    assert_eq!(due_run.as_deref(), Some(RUN));
+    // Count model transport connections while the provider status changes.
+    let mut first = command(&root, Path::new(env!("CARGO_BIN_EXE_atomic")))
+        .arg("serve")
+        .env("ATOMIC_MODEL_BASE_URL", &model_url)
+        .env("ATOMIC_MODEL", "unused")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("serve first");
+    let mut failed = false;
+    for _ in 0..100 {
+        if status().await.expect("read status").0 == "failed" {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if failed {
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        let remote: Value = serde_json::from_slice(
+            &fs::read(dir.join("remote-state.json")).expect("read failed provider state"),
+        )
+        .expect("parse failed provider state");
+        assert_eq!(
+            remote["observe_calls"]["enqueue"], 2,
+            "backoff must prevent an immediate retry"
+        );
+    }
+    first.kill().expect("kill first serve");
+    let first_output = first.wait_with_output().expect("reap first serve");
+    assert!(
+        failed,
+        "serve never recorded unavailable provider: {first_output:?}"
+    );
+    let (state, attempts, next) = status().await.expect("failed schedule");
+    assert_eq!(state, "failed");
+    assert_eq!(attempts, 1);
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("stored time range");
+    assert!(next > now + 5_000, "failure must schedule backoff");
+    let wrong_project = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                atomic_durable::delivery_effect::due_queue_observation_in(
+                    &mut tx,
+                    "project/other",
+                    i64::MAX,
+                )
+                .await
+            })
+        })
+        .await
+        .expect("query other project");
+    assert!(
+        wrong_project.is_none(),
+        "poller must stay in the current project"
+    );
+    fs::remove_file(dir.join("unreadable-enqueue")).expect("restore provider");
+    let state_path = dir.join("remote-state.json");
+    let mut remote: Value = serde_json::from_slice(&fs::read(&state_path).expect("provider state"))
+        .expect("parse provider");
+    let key = remote["queue"]
+        .as_object()
+        .expect("queue")
+        .keys()
+        .next()
+        .expect("queued PR")
+        .clone();
+    remote["queue"][&key]["status"] = json!("merged");
+    remote["queue"][&key]["event_id"] = json!("queue:merged:restart");
+    remote["queue"][&key]["merge_sha"] = json!(TRIAL_HEAD);
+    remote["queue"][&key]["happened_at"] = json!(1_800_000_000_000_i64);
+    fs::write(
+        &state_path,
+        serde_json::to_vec(&remote).expect("encode event"),
+    )
+    .expect("transition provider");
+    due().await.expect("make recovery read due");
+    let mut second = command(&root, Path::new(env!("CARGO_BIN_EXE_atomic")))
+        .arg("serve")
+        .env("ATOMIC_MODEL_BASE_URL", &model_url)
+        .env("ATOMIC_MODEL", "unused")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("serve second");
+    let mut merged = false;
+    for _ in 0..100 {
+        if status().await.expect("read status").0 == "merged" {
+            merged = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    second.kill().expect("kill second serve");
+    let second_output = second.wait_with_output().expect("reap second serve");
+    assert!(
+        merged,
+        "serve never recorded terminal provider event: {second_output:?}"
+    );
+    let final_state: Value =
+        serde_json::from_slice(&fs::read(&state_path).expect("final provider state"))
+            .expect("parse final provider");
+    assert_eq!(
+        final_state["mutations"],
+        json!({"push":1,"pull_request":1,"enqueue":1})
+    );
+    assert_eq!(
+        final_state["observe_calls"]["enqueue"], 3,
+        "one initial and one read per serve"
+    );
+    model_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    model_worker.join().expect("reap fake model");
+    assert_eq!(
+        model_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "polling must not call a model"
+    );
+    due().await.expect("try to make terminal row due");
+    let project = format!("project/{id}");
+    let due_terminal = rt
+        .control_transaction(move |mut tx| {
+            let project = project.clone();
+            Box::pin(async move {
+                atomic_durable::delivery_effect::due_queue_observation_in(
+                    &mut tx,
+                    &project,
+                    i64::MAX,
+                )
+                .await
+            })
+        })
+        .await
+        .expect("query terminal");
+    assert!(
+        due_terminal.is_none(),
+        "terminal observation must never be polled"
+    );
+    drop(rt);
+    fs::remove_dir_all(root).expect("remove fixture");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_observation_records_pending_failure_merge_and_drop_once_after_restart() {
     for final_status in ["merged", "removed"] {
         let nonce = SystemTime::now()
