@@ -4096,11 +4096,26 @@ fn sqlite_exports_beads_memory_records_without_promoting_imported_trust() {
             .export(agent)
             .await
             .expect("export restored memories");
-        assert_eq!(restored.lines().count(), 3);
-        assert!(
-            restored.contains("human-key")
-                && restored.contains("external-key")
-                && restored.contains("forged")
+        let restored_values: std::collections::BTreeMap<String, String> = restored
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value =
+                    serde_json::from_str(line).expect("restored memory JSON");
+                assert_eq!(row["_type"], "memory");
+                (
+                    row["key"].as_str().expect("memory key").to_owned(),
+                    row["value"].as_str().expect("memory value").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            restored_values,
+            std::collections::BTreeMap::from([
+                ("human-key".to_owned(), "human value".to_owned()),
+                ("external-key".to_owned(), "external value".to_owned()),
+                ("forged".to_owned(), "outside".to_owned()),
+            ]),
+            "memory values must survive export and reimport exactly"
         );
     });
     drop(first);
