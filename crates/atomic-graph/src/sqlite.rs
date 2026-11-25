@@ -1767,23 +1767,26 @@ async fn import_jsonl(
         match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(mut v) => {
                 if let Some(record_type) = v.get("_type") {
-                    if record_type != "memory" {
+                    if record_type != "memory" && record_type != "issue" {
                         errors.push(format!("line {} has unsupported _type", n + 1));
                         continue;
                     }
-                    let (Some(key), Some(value)) = (json_str(&v, "key"), json_str(&v, "value"))
-                    else {
-                        errors.push(format!("line {} memory needs string key and value", n + 1));
+                    if record_type == "memory" {
+                        let (Some(key), Some(value)) = (json_str(&v, "key"), json_str(&v, "value"))
+                        else {
+                            errors
+                                .push(format!("line {} memory needs string key and value", n + 1));
+                            continue;
+                        };
+                        let key = key.to_owned();
+                        let value = if value.contains("ghp_") {
+                            "[redacted]".to_owned()
+                        } else {
+                            value.to_owned()
+                        };
+                        memories.push((key, value));
                         continue;
-                    };
-                    let key = key.to_owned();
-                    let value = if value.contains("ghp_") {
-                        "[redacted]".to_owned()
-                    } else {
-                        value.to_owned()
-                    };
-                    memories.push((key, value));
-                    continue;
+                    }
                 }
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
                     errors.push(format!("line {} needs id and title", n + 1));

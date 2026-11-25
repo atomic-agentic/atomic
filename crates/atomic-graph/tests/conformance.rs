@@ -2479,9 +2479,11 @@ fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
         sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("test operation");
     let actor = Actor::agent("importer");
     let input = concat!(
-        r#"{"id":"at-one","title":"First","description":"Full body","status":"open","priority":1,"issue_type":"epic","created_at":"2026-01-01T00:00:00Z","labels":["alpha"],"custom":{"nested":true},"notes":"A note"}"#,
+        r#"{"_type":"issue","id":"at-one","title":"First","description":"Full body","status":"open","priority":1,"issue_type":"epic","created_at":"2026-01-01T00:00:00Z","labels":["alpha"],"custom":{"nested":true},"notes":"A note"}"#,
         "\n",
         r#"{"id":"at-two","title":"Second","description":"Child","status":"closed","priority":3,"issue_type":"task","created_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-03T00:00:00Z","parent_issue":"at-one","dependencies":[{"issue_id":"at-two","depends_on_id":"at-one","type":"related"}]}"#,
+        "\n",
+        r#"{"_type":"memory","key":"project-note","value":"Remember this"}"#,
         "\n"
     );
     harness::block_on(async {
@@ -2496,6 +2498,7 @@ fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
             .expect("test operation");
         assert_eq!(second.unchanged, ["at-one", "at-two"]);
         assert!(second.added.is_empty());
+        assert_eq!(second.kept.get("memories"), None);
         let output = store.export(actor.clone()).await.expect("test operation");
         let before: Vec<serde_json::Value> = input
             .lines()
@@ -2506,6 +2509,24 @@ fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
             .map(|l| serde_json::from_str(l).expect("test operation"))
             .collect();
         assert_eq!(after, before);
+        let unknown = format!(
+            "{input}{}\n{}\n",
+            r#"{"_type":"issue","id":"at-never","title":"Never","status":"open"}"#,
+            r#"{"_type":"future","id":"at-unknown","title":"Unknown","status":"open"}"#
+        );
+        assert!(matches!(
+            store.import(actor.clone(), unknown, false).await,
+            Err(StoreError::ImportRefused(problems))
+                if problems.iter().any(|problem| problem.contains("unsupported _type"))
+        ));
+        assert!(
+            store
+                .show(actor.clone(), "at-never".to_owned())
+                .await
+                .expect("test operation")
+                .is_none(),
+            "an unknown record type must refuse the entire import"
+        );
         let bad = format!("{input}{{broken\n");
         assert!(matches!(
             store.import(actor.clone(), bad, false).await,
