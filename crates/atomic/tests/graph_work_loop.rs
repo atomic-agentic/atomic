@@ -387,10 +387,57 @@ fn panel_graph_project(project: &Path) -> String {
     base
 }
 
+/// Use the reference lane's versioned reviewer contract in the normal graph
+/// coding path, rather than a hand-written test schema for its first member.
+fn shipped_panel_graph_project(project: &Path) -> String {
+    panel_graph_project(project);
+    for (name, source) in [
+        (
+            "lane-reviewer.atom.astro",
+            include_str!("../../../examples/15-coding-lanes/atoms/lane-reviewer.atom.astro"),
+        ),
+        (
+            "lane-reviewer.input.schema.yaml",
+            include_str!("../../../examples/15-coding-lanes/atoms/lane-reviewer.input.schema.yaml"),
+        ),
+        (
+            "lane-reviewer.output.schema.yaml",
+            include_str!(
+                "../../../examples/15-coding-lanes/atoms/lane-reviewer.output.schema.yaml"
+            ),
+        ),
+        (
+            "lane-self-check.output.schema.yaml",
+            include_str!(
+                "../../../examples/15-coding-lanes/atoms/lane-self-check.output.schema.yaml"
+            ),
+        ),
+    ] {
+        std::fs::write(project.join("atoms").join(name), source).expect("shipped reviewer asset");
+    }
+    let path = project.join("workflows/fix.workflow.yaml");
+    let workflow = std::fs::read_to_string(&path).expect("panel workflow");
+    let updated = workflow.replace(
+        "reviewers: [review-one, review-two]",
+        "reviewers: [lane-reviewer, review-two]",
+    );
+    assert_ne!(workflow, updated, "shipped panel reviewer binding");
+    std::fs::write(path, updated).expect("shipped reviewer workflow");
+    git(project, &["add", "."]);
+    git(project, &["commit", "-q", "-m", "bind shipped reviewer"]);
+    let base = git(project, &["rev-parse", "HEAD"]);
+    git(project, &["update-ref", "refs/heads/main", &base]);
+    base
+}
+
 fn panel_pipeline(project: &Path) -> Pipeline {
     let mut registry = Registry::new();
     let mut atoms = BTreeMap::new();
-    for name in ["fix-item", "self-check", "review-one", "review-two"] {
+    let mut names = vec!["fix-item", "self-check", "review-one", "review-two"];
+    if project.join("atoms/lane-reviewer.atom.astro").exists() {
+        names.push("lane-reviewer");
+    }
+    for name in names {
         let loaded = atom::load(
             &project.join(format!("atoms/{name}.atom.astro")),
             &mut registry,
@@ -859,6 +906,7 @@ enum PanelHistory {
     BeforeRouting,
     AfterFinalize,
     DraftAccepted,
+    Shipped,
 }
 
 fn checkpoint_encoding(value: &Value) -> String {
@@ -937,7 +985,11 @@ async fn editorial_panel(
     let project = root.join("project");
     std::fs::create_dir_all(project.join("docs")).expect("fixture guide directory");
     std::fs::write(project.join("docs/guide.md"), "Example text.\n").expect("base guide");
-    let base = panel_graph_project(&project);
+    let base = if matches!(history, Some(PanelHistory::Shipped)) {
+        shipped_panel_graph_project(&project)
+    } else {
+        panel_graph_project(&project)
+    };
     let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
         .expect("graph worktrees")
         .path(RUN, "graph.00000.fix");
@@ -955,6 +1007,7 @@ async fn editorial_panel(
             Some(PanelHistory::DraftAccepted) => {
                 Some("checkpoint:after:graph.00000.fix.review.0.1.publish")
             }
+            Some(PanelHistory::Shipped) => None,
             _ => None,
         },
     )
@@ -993,7 +1046,7 @@ async fn editorial_panel(
                 assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
             }
             PanelHistory::DraftAccepted => record_draft_acceptance(&rt).await,
-            PanelHistory::BeforeRouting => unreachable!(),
+            PanelHistory::BeforeRouting | PanelHistory::Shipped => unreachable!(),
         }
         let mut recover = child_command(root, &model.base_url(), &base, "recover", None);
         recover.env("HOME", root.join("home"));
@@ -1014,6 +1067,62 @@ async fn editorial_followup_count(rt: &Durare) -> i64 {
         tx.query_one("SELECT COUNT(*) AS n FROM atomic_graph_edges WHERE kind='discovered-from' AND target=?",
             &[Param::Text(CHILDREN[0].into())]).await?.int("n")
     })).await.expect("count follow-ups for the reviewed item")
+}
+
+#[test]
+fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
+    on_codex_runtime(async {
+        for (first, candidate, accepted) in [
+            ("approve", "Example text. \n", true),
+            ("approve", "Publish customer addresses. \n", false),
+            ("request_changes", "Example text. \n", false),
+        ] {
+            let root = std::fs::canonicalize(scratch("shipped-formatting-review"))
+                .expect("physical graph fixture path");
+            let (_, rt) = editorial_panel(
+                &root,
+                first,
+                "approve",
+                formatting_finding(),
+                candidate,
+                (!accepted).then_some(Verdict::Reject),
+                Some(PanelHistory::Shipped),
+            )
+            .await;
+            let result = rt.result::<Value>(RUN).await;
+            let steps = rt.steps(RUN).await.expect("shipped reviewer checkpoints");
+            let reviewer = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.0.0.publish")
+                .and_then(|step| step.output.as_ref())
+                .expect("shipped reviewer published a verdict");
+            assert_eq!(reviewer["verdict"], first);
+            assert_eq!(reviewer["findings"], json!([formatting_finding()]));
+            assert!(
+                reviewer.get("reason").is_none(),
+                "version 2 has no free-form reason"
+            );
+            if accepted {
+                result.expect("host-verified formatting accepted");
+                assert_eq!(editorial_followup_count(&rt).await, 1);
+                let receipt = steps
+                    .iter()
+                    .find(|step| step.name == "graph.00000.fix.accepted")
+                    .and_then(|step| step.output.as_ref())
+                    .expect("accepted graph receipt");
+                assert_eq!(receipt["verified_formatting_path"], "docs/guide.md");
+            } else {
+                result.expect_err("unproved or explicit negative review cannot close");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
+                assert!(
+                    steps
+                        .iter()
+                        .any(|step| step.name == "graph.00000.fix.review.gate"),
+                    "blocked review opens a human gate"
+                );
+            }
+        }
+    });
 }
 
 #[test]
@@ -4370,8 +4479,8 @@ fn lane_self_review_with_control() -> Value {
 fn lane_patch_reviewer_for_note() -> Value {
     json!({
         "verdict": "escalate",
-        "reason": "The patch only records a claim about the existing guard. The host test and control proof support that claim, but the patch itself contains no guard code to judge; a person decides whether to publish the note.",
         "findings": [
+            "The patch only records a claim about the existing guard. The host test and control proof support that claim, but the patch itself contains no guard code to judge; a person decides whether to publish the note.",
             "Only notes/lane-change.md was added; no executable guard code changed.",
             "The host proved lane-guard-bites, but that result is separate from the note's patch.",
             "The candidate publication decision belongs to the host and its human gate."
@@ -5086,15 +5195,10 @@ async fn lane_repair_model(first_release: PathBuf, repair_release: PathBuf) -> F
         if said.contains("Judge the patch on its own terms") {
             return Reply::Text(json!({
                 "verdict": if repaired { "approve" } else { "request_changes" },
-                "reason": if repaired {
-                    "The note now explains the existing confirmed: false refusal path and changes no guard code."
-                } else {
-                    "The patch adds a read of ~/.ssh/id_rsa that the author checklist denies; remove this hidden file read."
-                },
                 "findings": if repaired {
-                    vec!["The repaired note identifies the confirmed: false path; the host test and control proof passed."]
+                    vec!["The note now explains the existing confirmed: false refusal path and changes no guard code.", "The repaired note identifies the confirmed: false path; the host test and control proof passed."]
                 } else {
-                    vec!["tools/lane_guard.py reads ~/.ssh/id_rsa through Path.home().joinpath; remove the hidden private-file read."]
+                    vec!["The patch adds a read of ~/.ssh/id_rsa that the author checklist denies; remove this hidden file read.", "tools/lane_guard.py reads ~/.ssh/id_rsa through Path.home().joinpath; remove the hidden private-file read."]
                 }
             }).to_string());
         }

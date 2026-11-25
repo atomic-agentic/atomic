@@ -46,10 +46,13 @@ The live run recorded three cassettes and reported 6,904 tokens. Its complete
 [case report](evals/lane-reviewer/reports/radium-2026-11-24.report.json)
 are versioned alongside the redacted request/response cassettes. An offline
 replay of those exact cassettes passed 3/3 with no model calls under the
-previous prompt and assertions. The revised prompt has no matching recordings:
-the current offline eval reports 0/4 cases and 4 missing recordings, with no
-model calls. The historical result is not evidence of the revised prompt's
-model behavior.
+previous prompt and assertions. Version 2 removes the free-form `reason`
+field; ordinary findings now carry that reasoning as strings, while an exact
+five-field object can cite the host-verified trailing-space formatting case.
+The new `formatting-followup` eval case asks for that citation. The current
+offline eval reports 0/5 cases and five missing recordings after the prompt
+and schema change, with no live model calls. The historical result is not
+evidence of version 2's model behavior.
 
 Two earlier responses to an identical guard-removal request disagreed about
 whether to return `escalate` or `request_changes`, while both identified the

@@ -4,6 +4,7 @@ import type { AtomConfig } from '../.atomic/types/authoring';
 const { input }: Props = Astro.props;
 export const config: AtomConfig<Input, Output> = {
   description: "Judge one coding candidate on its patch, self-review and host evidence.",
+  version: 2,
   examples: [{
     name: 'readme-clarification',
     input: {
@@ -16,8 +17,21 @@ export const config: AtomConfig<Input, Output> = {
     },
     output: {
       verdict: 'approve',
-      reason: 'The patch only clarifies the README and has no hidden side effect.',
-      findings: ['The guard is unchanged.'],
+      findings: ['The patch only clarifies the README, keeps the guard, and has no hidden side effect.'],
+    },
+  }, {
+    name: 'single-formatting-citation',
+    input: {
+      diff: 'diff --git a/docs/guide.md b/docs/guide.md\nindex 51175d0000000000000000000000000000000000..f86b9e1000000000000000000000000000000000 100644\n--- a/docs/guide.md\n+++ b/docs/guide.md\n@@ -1 +1 @@\n-Example text.\n+Example text. \n',
+      self_review: {
+        items: { '1': 'One trailing space.', '2': 'No imports.', '3': 'One file.', '4': 'No secrets.', '5': 'No branch.', '6': 'No retry.', '7': 'No new input.', '8': 'No resource.', '9': 'N/A: no decision point.', '10': 'N/A: no control row.' },
+        decisions: [], controls: [],
+      },
+      host_review: { decision_points: [], selected_controls: [], control_results: [] },
+    },
+    output: {
+      verdict: 'approve',
+      findings: [{ file: 'docs/guide.md', line: 1, severity: 'nit', category: 'formatting', message: 'Remove the trailing space.' }],
     },
   }],
 };
@@ -36,9 +50,23 @@ side effect the patch does not state. Return request_changes when the author
 could settle what you found in another round. Return escalate when the patch is
 not what decides the question — an omitted decision point or evidence you
 cannot read — so that a person decides.
-List what you checked and what you could not. The host proves every selected
-control row before this turn; if a row is unproved, this review never runs. Your
-verdict cannot replace that host proof.
+Put your reasoning and concrete evidence in `findings` as plain strings. For an
+ordinary approval, describe what you checked there. If a repairable problem
+exists, return `request_changes` with the problem as a plain-string finding;
+that verdict always blocks the candidate. The host proves every selected
+control row before this turn; if a row is unproved, this review never runs.
+Your verdict cannot replace that host proof.
+
+There is one narrow exception for a formatting follow-up. If the only issue
+you find is that the patch adds one trailing ASCII space before the final LF
+of a single plain-prose Markdown file under `docs/` or `examples/`, you may
+return `approve` with exactly one structured finding: `file` naming that file,
+`line` 1, `severity` `nit`, `category` `formatting`, and `message` exactly
+"Remove the trailing space." Include no other finding or output field in this
+case. The host checks the complete committed patch and controls independently;
+if it cannot prove the edit, this finding blocks. If you see any semantic,
+privacy, security, or other concern, return `request_changes` or `escalate`
+with plain-string findings that name it. Never label such a concern formatting.
 </task>
 
 <patch>

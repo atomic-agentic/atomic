@@ -29,4 +29,4 @@ input:
     control_results: []
 expect:
 - output.verdict == 'escalate'
-- output.reason.size() > 0
+- output.findings.size() > 0
