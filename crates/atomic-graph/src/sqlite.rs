@@ -1853,17 +1853,20 @@ async fn import_jsonl(
                 scrub_import_text(&mut v);
                 atomic_core::redact::value(&mut v);
                 if let Some(record_type) = v.get("_type") {
-                    if record_type != "memory" {
+                    if record_type != "memory" && record_type != "issue" {
                         errors.push(format!("line {} has unsupported _type", n + 1));
                         continue;
                     }
-                    let (Some(key), Some(value)) = (json_str(&v, "key"), json_str(&v, "value"))
-                    else {
-                        errors.push(format!("line {} memory needs string key and value", n + 1));
+                    if record_type == "memory" {
+                        let (Some(key), Some(value)) = (json_str(&v, "key"), json_str(&v, "value"))
+                        else {
+                            errors
+                                .push(format!("line {} memory needs string key and value", n + 1));
+                            continue;
+                        };
+                        memories.push((key.to_owned(), value.to_owned()));
                         continue;
-                    };
-                    memories.push((key.to_owned(), value.to_owned()));
-                    continue;
+                    }
                 }
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
                     errors.push(format!("line {} needs id and title", n + 1));
