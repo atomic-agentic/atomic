@@ -8,6 +8,7 @@ properties:
     enum: [approve, request_changes, escalate]
   findings:
     type: array
+    minItems: 1
     maxItems: 30
     items:
       anyOf:

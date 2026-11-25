@@ -1070,6 +1070,36 @@ async fn editorial_followup_count(rt: &Durare) -> i64 {
 }
 
 #[test]
+fn shipped_lane_reviewer_rejects_empty_findings() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/15-coding-lanes/atoms/lane-reviewer.atom.astro");
+    let atom = atom::load(&path, &mut Registry::new()).expect("shipped reviewer loads");
+    let schema = atom
+        .program
+        .contracts
+        .get("Output")
+        .expect("reviewer output contract");
+    let validator = jsonschema::validator_for(schema).expect("valid reviewer schema");
+    let empty = json!({"verdict":"approve","findings":[]});
+    assert!(
+        validator.validate(&empty).is_err(),
+        "an approval without review evidence must fail the shipped contract"
+    );
+    assert!(
+        validator
+            .validate(&json!({"verdict":"approve","findings":["The guard is unchanged."]}))
+            .is_ok(),
+        "legacy string evidence remains valid"
+    );
+    assert!(
+        validator
+            .validate(&json!({"verdict":"approve","findings":[formatting_finding()]}))
+            .is_ok(),
+        "the exact formatting citation remains valid"
+    );
+}
+
+#[test]
 fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
     on_codex_runtime(async {
         for (first, candidate, accepted) in [

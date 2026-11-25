@@ -70,7 +70,7 @@ Both must return `approve` for the same candidate, and acceptance then reads
 `approved by reviewer(s) lane-reviewer, lane-evidence-reviewer in review round
 <n>` — the words `atomic delivery` checks before it asks a person about a push.
 
-`lane-reviewer` version 2 returns only `verdict` and `findings`. Ordinary
+`lane-reviewer` version 2 returns only `verdict` and a nonempty `findings` list. Ordinary
 findings are strings, including its reason for a verdict, and keep the
 reviewer's verdict unchanged. For the graph coding loop's narrow formatting
 follow-up, it can instead return exactly one structured finding with `file`,
