@@ -1,0 +1,1 @@
+astro-windows-module-components|crates/atomic-core/src/astro/windows_paths.rs|                    Some(Component::Normal(_))|                    Some(_)|-p atomic-agentic-core --lib protocol_paths_round_trip_without_rewriting_source_text

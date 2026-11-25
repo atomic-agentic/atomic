@@ -143,7 +143,7 @@ mod tests {
             .join("atom project");
         let file = root.join("atoms").join("example.atom.astro");
         let file = path_text(&file).expect("UTF-8");
-        let paths = Project(root.clone());
+        let paths = Project::new(root.to_str().expect("UTF-8 project root"));
         let mut req = json!({"file": file, "root": root, "sources": {file: file}, "sourcePaths": {file: file}});
         paths.request(&mut req).expect("encode project");
         let name = "/project/atoms/example.atom.astro";
@@ -157,19 +157,15 @@ mod tests {
         assert_eq!(rsp["ok"]["sourcePaths"][file], file);
         assert_eq!(rsp["ok"]["needsSources"][0], file);
 
-        for bad in [
-            "/other/secret",
-            "/project/../secret",
-            "/project/a\\b",
-            "/project/C:/secret",
+        for (name, error) in [
+            ("/other/secret", "outside the compiler project"),
+            ("/project/../secret", "invalid compiler source path"),
+            ("/project/a\\b", "invalid compiler source path"),
+            ("/project/C:/secret", "invalid compiler source path"),
         ] {
-            let mut response = json!({"ok": {"needsSources": [bad]}});
-            assert!(
-                paths
-                    .response("load", &mut response)
-                    .expect_err("outside project")
-                    .contains("compiler")
-            );
+            let mut response = json!({"ok": {"needsSources": [name]}});
+            let actual = paths.response("load", &mut response).expect_err(name);
+            assert!(actual.contains(error), "{name}: {actual}");
         }
     }
 }
