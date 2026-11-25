@@ -355,7 +355,13 @@ fn panel_graph_project(project: &Path) -> String {
             evidence.clone()
         } else {
             json!({"type":"object","additionalProperties":false,"required":["verdict"],
-                "properties":{"verdict":{"type":"string","enum":["approve","request_changes"]}}})
+            "properties":{
+                "verdict":{"type":"string","enum":["approve","request_changes"]},
+                "findings":{"type":"array","items":{"type":"object","additionalProperties":false,
+                    "required":["file","severity","category","message"],
+                    "properties":{"file":{"type":"string"},"severity":{"type":"string"},
+                        "category":{"type":"string"},"message":{"type":"string"}}}}
+            }})
         };
         std::fs::write(
             project.join(format!("atoms/{name}.input.schema.json")),
@@ -590,20 +596,24 @@ async fn wait_for_review_gate(rt: &Durare) -> gate::Gate {
 }
 
 async fn approve_review_gate(rt: &Durare, gate: &gate::Gate, command: &str) {
+    decide_review_gate(rt, gate, command, Verdict::Approve).await;
+}
+
+async fn decide_review_gate(rt: &Durare, gate: &gate::Gate, command: &str, verdict: Verdict) {
     gate::decide(
         rt,
         &HumanCredential::new(Principal::local("owner"), SECRET),
         DecisionCommand {
             command_id: command.into(),
             gate: gate.id.clone(),
-            verdict: Verdict::Approve,
-            comment: Some("approved after review".into()),
+            verdict,
+            comment: None,
             proposal: gate.proposal.clone(),
             answer: None,
         },
     )
     .await
-    .expect("human approval");
+    .expect("human review decision");
 }
 
 async fn released_review_handoff(rt: &Durare) -> (String, i64, Option<String>) {
@@ -836,45 +846,126 @@ fn three_dependent_items_make_three_model_calls_and_close_with_host_commits() {
     });
 }
 
+/// Run the real coding panel on an author's Markdown change. The first reviewer
+/// reports a spelling nit. The second may send the final candidate to a gate.
+async fn editorial_panel(
+    root: &Path,
+    first: &str,
+    second: &str,
+    human: Option<Verdict>,
+) -> (FakeModel, Durare) {
+    let signal = root.join("finish-author");
+    let model = FakeModel::start(vec![
+        Reply::Gated {
+            file: signal.clone(),
+            reply: Box::new(Reply::Text(r#"{"done":true}"#.into())),
+        },
+        Reply::Text(json!({
+            "items": (1..=10).map(|n| (n.to_string(), json!(if n == 10 {
+                "N/A: no controls were selected".to_owned()
+            } else { format!("evidence for item {n}") }))).collect::<serde_json::Map<String, Value>>(),
+            "decisions": [{
+                "point":"candidate publication", "allow_refuse":"only validated evidence reaches review",
+                "not_found":"refuse", "permission_denied":"refuse", "link_loop":"refuse",
+                "not_directory":"refuse", "other_io":"refuse", "parse_error":"refuse",
+                "timeout":"refuse", "empty_result":"refuse"
+            }],
+            "controls": []
+        }).to_string()),
+        Reply::Text(json!({"verdict":first,"findings":[{
+            "severity":"nit","category":"spelling","file":"docs/guide.md","message":"Correct the typo."
+        }]}).to_string()),
+        Reply::Text(json!({"verdict":second}).to_string()),
+    ]).await.expect("scripted coding panel");
+    seed(root).await;
+    leave_one_work_child(root).await;
+    let project = root.join("project");
+    let base = panel_graph_project(&project);
+    let tree = Worktrees::open_at(&project, root.join("state/worktrees"))
+        .expect("graph worktrees")
+        .path(RUN, "graph.00000.fix");
+    let mut child = child_command(root, &model.base_url(), &base, "start-panel", None)
+        .spawn()
+        .expect("start panel");
+    wait_for("author model call", || model.calls() == 1).await;
+    std::fs::create_dir_all(tree.join("docs")).expect("author docs directory");
+    std::fs::write(tree.join("docs/guide.md"), "Example text.").expect("author edit");
+    std::fs::write(signal, "ready").expect("release author");
+    let rt = durable(root).await;
+    if let Some(verdict) = human {
+        let gate = wait_for_review_gate(&rt).await;
+        decide_review_gate(&rt, &gate, "decide-editorial-panel", verdict).await;
+    }
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("panel worker")
+        .expect("wait for panel");
+    assert!(status.success(), "graph panel child: {status}");
+    assert_eq!(model.calls(), 4, "author, self-review and two reviewers");
+    (model, rt)
+}
+
+async fn editorial_followup_count(rt: &Durare) -> i64 {
+    rt.control_transaction(|mut tx| Box::pin(async move {
+        tx.query_one("SELECT COUNT(*) AS n FROM atomic_graph_edges WHERE kind='discovered-from' AND target=?",
+            &[Param::Text(CHILDREN[0].into())]).await?.int("n")
+    })).await.expect("count follow-ups for the reviewed item")
+}
+
+#[test]
+fn final_panel_files_editorial_followups_only_for_human_approval() {
+    on_codex_runtime(async {
+        for verdict in [Verdict::Approve, Verdict::Reject] {
+            let root = std::fs::canonicalize(scratch("editorial-gate"))
+                .expect("physical fixture path for Git trial worktree");
+            let (_model, rt) =
+                editorial_panel(&root, "approve", "request_changes", Some(verdict)).await;
+            let result = rt.result::<Value>(RUN).await;
+            if verdict == Verdict::Approve {
+                result.expect("graph item closed after approval");
+                assert_eq!(editorial_followup_count(&rt).await, 1);
+                let err =
+                    atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+                        .await
+                        .expect_err("delivery refuses human override");
+                assert_eq!(
+                    err.to_string(),
+                    "human-overridden review cannot authorize delivery"
+                );
+            } else {
+                let err = result.expect_err("rejected graph run");
+                assert!(err.to_string().contains("was rejected"), "{err}");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
+            }
+        }
+    });
+}
+
+#[test]
+fn delivery_requires_explicit_approval_from_both_reviewers_even_with_followups() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("editorial-routed"))
+            .expect("physical fixture path for Git trial worktree");
+        let (_model, rt) = editorial_panel(&root, "request_changes", "approve", None).await;
+        rt.result::<Value>(RUN)
+            .await
+            .expect("graph accepted editorial findings");
+        assert_eq!(editorial_followup_count(&rt).await, 1);
+        let err = atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
+            .await
+            .expect_err("host routing cannot supply an independent approval");
+        assert_eq!(err.to_string(), "independent reviewer did not approve");
+    });
+}
+
 #[test]
 fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![
-            Reply::Text(r#"{"done":true}"#.into()),
-            Reply::Text(json!({
-                "items": (1..=10).map(|n| (n.to_string(), json!(if n == 10 {
-                    "N/A: no controls were selected".to_owned()
-                } else { format!("evidence for item {n}") }))).collect::<serde_json::Map<String, Value>>(),
-                "decisions": [{
-                    "point":"candidate publication", "allow_refuse":"only validated evidence reaches review",
-                    "not_found":"refuse", "permission_denied":"refuse", "link_loop":"refuse",
-                    "not_directory":"refuse", "other_io":"refuse", "parse_error":"refuse",
-                    "timeout":"refuse", "empty_result":"refuse"
-                }],
-                "controls": []
-            }).to_string()),
-            Reply::Text(r#"{"verdict":"approve"}"#.into()),
-            Reply::Text(r#"{"verdict":"approve"}"#.into()),
-        ]).await.expect("scripted coding panel");
         let root = std::fs::canonicalize(scratch("delivery-panel-source"))
             .expect("physical fixture path for Git trial worktree");
-        let _ = seed(&root).await;
-        leave_one_work_child(&root).await;
-        let base = panel_graph_project(&root.join("project"));
+        let (model, rt) = editorial_panel(&root, "approve", "approve", None).await;
         let url = model.base_url();
-        let (r, u, b) = (root.clone(), url.clone(), base.clone());
-        let status = tokio::task::spawn_blocking(move || {
-            child_command(&r, &u, &b, "start-panel", None)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output()
-                .expect("graph child")
-        })
-        .await
-        .expect("graph child");
-        assert!(status.status.success(), "graph panel run: {status:?}");
-        assert_eq!(model.calls(), 4, "author, self-review, and two reviewers");
-        let rt = durable(&root).await;
+        assert_eq!(editorial_followup_count(&rt).await, 1);
         let source =
             atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
                 .await

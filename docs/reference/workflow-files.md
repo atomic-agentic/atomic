@@ -118,8 +118,11 @@ missing or ambiguous category, security-relevant path or finding text, or an
 item labeled `security` requires repair even if the reviewer called it low.
 A high-severity finding requires repair even when the reviewer wrote `approve`.
 Accepted low findings are filed with `discovered-from` links under a separate
-pinned goal, so they do not hold the active epic open. Older reviewers with
-plain-text findings keep their verdicts unchanged.
+pinned goal, so they do not hold the active epic open. If the final panel
+goes to a human gate, approval files that candidate’s eligible follow-ups
+when the item closes. Delivery still requires two explicit independent
+approvals, including when the graph closes an item with follow-ups. Older
+reviewers with plain-text findings keep their verdicts unchanged.
 The graph run records this routing policy at admission. A run recorded before
 the policy was introduced keeps its original review behavior when recovered.
 

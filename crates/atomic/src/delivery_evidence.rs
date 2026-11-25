@@ -3,7 +3,9 @@
 //! Delivery reads checkpoints and committed rows; it never asks a model to
 //! attest its own review or to recreate evidence from a source run.
 
-use crate::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step};
+use crate::pipeline::{
+    GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step, panel_acceptance_reason,
+};
 use anyhow::{Context, Result, bail, ensure};
 use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{DurableRuntime, Durare, Param, StepRecord, Tx};
@@ -265,15 +267,12 @@ pub async fn approved_graph_item(
         round <= review.rounds,
         "accepted repair exceeds frozen policy"
     );
+    let members = review.reviewers.join(", ");
+    let reason = accepted.reason.as_deref();
     ensure!(
-        accepted.reason.as_deref()
-            == Some(
-                format!(
-                    "approved by reviewer(s) {} in review round {round}",
-                    review.reviewers.join(", ")
-                )
-                .as_str()
-            ),
+        reason == Some(panel_acceptance_reason(&members, round, false).as_str())
+            || (frozen.review_routing
+                && reason == Some(panel_acceptance_reason(&members, round, true).as_str())),
         "source acceptance was human-overridden or mismatched"
     );
     let head = candidate

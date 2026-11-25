@@ -4674,22 +4674,20 @@ fn route_review_findings(
     let Some(findings) = verdict.get("findings").and_then(Value::as_array) else {
         return (said.to_owned(), Vec::new());
     };
+    // Legacy reviewers use strings as evidence for their own verdict.
+    if findings.iter().all(Value::is_string) {
+        return (said.to_owned(), Vec::new());
+    }
     if findings.len() > 30 {
         return ("request_changes".into(), Vec::new());
     }
     let mut low = Vec::new();
     let mut blocking = false;
-    let mut typed = false;
-    let mut legacy = false;
     for finding in findings {
         let Some(fields) = finding.as_object() else {
-            // Older reviewer contracts use string evidence. They never get
-            // silently demoted to a non-gating follow-up.
-            legacy |= finding.is_string();
-            blocking |= !finding.is_string();
+            blocking = true;
             continue;
         };
-        typed = true;
         let file = fields.get("file").and_then(Value::as_str).unwrap_or("");
         let message = fields.get("message").and_then(Value::as_str).unwrap_or("");
         let line_field = fields.get("line");
@@ -4726,16 +4724,11 @@ fn route_review_findings(
             blocking = true;
         }
     }
-    if typed && legacy {
-        blocking = true;
-    }
     // CONTROL_OFF: review-severity-route
     if blocking {
         ("request_changes".into(), Vec::new())
-    } else if typed && !low.is_empty() {
-        ("approve".into(), low)
     } else {
-        (said.to_owned(), Vec::new())
+        ("approve".into(), low)
     }
 }
 
@@ -4841,17 +4834,33 @@ mod severity_routing_tests {
 
     #[test]
     fn legacy_string_findings_keep_the_reviewer_decision() {
-        let verdict = json!({"verdict":"request_changes","findings":["missing proof"]});
-        let (routed, followups) = route_review_findings(
-            "reviewer",
-            &verdict,
-            "request_changes",
-            true,
-            true,
-            &BTreeSet::new(),
-        );
-        assert_eq!(routed, "request_changes");
-        assert!(followups.is_empty());
+        for count in [1, 30, 31] {
+            for said in ["approve", "revise", "request_changes"] {
+                let verdict = json!({"verdict":said, "findings":vec!["legacy evidence"; count]});
+                let (routed, followups) =
+                    route_review_findings("reviewer", &verdict, said, true, true, &BTreeSet::new());
+                assert_eq!(routed, said);
+                assert!(followups.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn typed_findings_remain_bounded_and_mixed_arrays_require_changes() {
+        let changed = BTreeSet::from(["docs/guide.md".to_owned()]);
+        let nit =
+            json!({"file":"docs/guide.md","message":"Typo","severity":"nit","category":"spelling"});
+        for (findings, expected, count) in [
+            (vec![nit.clone(); 30], "approve", 30),
+            (vec![nit.clone(); 31], "request_changes", 0),
+            (vec![nit, json!("legacy evidence")], "request_changes", 0),
+        ] {
+            let verdict = json!({"verdict":"approve", "findings":findings});
+            let (routed, followups) =
+                route_review_findings("reviewer", &verdict, "approve", true, true, &changed);
+            assert_eq!(routed, expected);
+            assert_eq!(followups.len(), count);
+        }
     }
 
     #[test]
@@ -4910,6 +4919,18 @@ mod severity_routing_tests {
     }
 }
 
+/// The two acceptance reasons written by an independently reviewed panel.
+/// Delivery also verifies the published verdict of each individual reviewer.
+pub(crate) fn panel_acceptance_reason(members: &str, round: u64, followups: bool) -> String {
+    if followups {
+        format!(
+            "accepted low findings from reviewer(s) {members} as follow-up work in review round {round}"
+        )
+    } else {
+        format!("approved by reviewer(s) {members} in review round {round}")
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reviewed<C: WorkflowContext>(
     ctx: &C,
@@ -4963,7 +4984,7 @@ async fn reviewed<C: WorkflowContext>(
     } else {
         None
     };
-    let (verdict, said) = loop {
+    let (verdict, said, followups) = loop {
         let mut controls_clean = !step.coding;
         let mut changed_paths = BTreeSet::new();
         let mut trial_head = None;
@@ -5790,17 +5811,11 @@ async fn reviewed<C: WorkflowContext>(
                     candidate: candidate.id.clone(),
                     digest: candidate.digest.clone(),
                     accepted: true,
-                    reason: Some(if round_followups.is_empty() {
-                        format!(
-                            "approved by reviewer(s) {} in review round {round}",
-                            members.join(", ")
-                        )
-                    } else {
-                        format!(
-                            "accepted low findings from reviewer(s) {} as follow-up work in review round {round}",
-                            members.join(", ")
-                        )
-                    }),
+                    reason: Some(panel_acceptance_reason(
+                        &members.join(", "),
+                        round,
+                        !round_followups.is_empty(),
+                    )),
                 };
                 return Ok((candidate, acceptance, round_followups));
             }
@@ -5829,7 +5844,7 @@ async fn reviewed<C: WorkflowContext>(
                 )
                 .await?;
             }
-            _ => break (verdict, said),
+            _ => break (verdict, said, round_followups),
         }
     };
     // A person decides. The gate's title is atomic's own words; what the
@@ -5923,7 +5938,7 @@ async fn reviewed<C: WorkflowContext>(
                 accepted: true,
                 reason: Some(format!("approved by {} at gate {id}", d.by)),
             };
-            Ok((candidate, acceptance, Vec::new()))
+            Ok((candidate, acceptance, followups))
         }
         other => Err(failed(format!(
             "step `{}`: its review went to gate `{id}`, which {}; the step's output is not \

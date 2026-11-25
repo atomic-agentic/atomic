@@ -1,0 +1,1 @@
+review-legacy-verdict|crates/atomic/src/pipeline.rs|if findings.iter().all(Value::is_string) {|if false {|-p atomic-agentic --lib -- legacy_string_findings_keep_the_reviewer_decision

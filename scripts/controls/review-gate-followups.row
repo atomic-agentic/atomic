@@ -1,0 +1,1 @@
+review-gate-followups|crates/atomic/src/pipeline.rs|Ok((candidate, acceptance, followups))|Ok((candidate, acceptance, Vec::new()))|-p atomic-agentic --test graph_work_loop -- final_panel_files_editorial_followups_only_for_human_approval
