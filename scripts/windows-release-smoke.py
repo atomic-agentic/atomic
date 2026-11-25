@@ -139,6 +139,17 @@ def main():
         for args in [["--version"], ["check"],
                      ["render", "atoms/implement-step.atom.astro", "--input", "fixtures/implement-step/quantity.input.json"]]:
             subprocess.run([exe, *args], cwd=project, env=env, check=True, timeout=120)
+        context_project = ROOT / "examples/12-execution-context"
+        render_context = [exe, "render", "atoms/context-reply.atom.astro", "--input",
+                          "fixtures/context-reply/ordinary.input.json", "--context-settings",
+                          "context.settings.json", "--profile", "test", "--run-id",
+                          "windows-context-smoke"]
+        for region in ["eu-west", "us-east"]:
+            result = subprocess.run(render_context, cwd=context_project,
+                                    env={**env, "SUPPORT_REGION": region}, check=True,
+                                    capture_output=True, text=True, timeout=120)
+            if "Region: eu-west" not in result.stdout or "Region: us-east" in result.stdout:
+                raise AssertionError("Direct invocation did not reuse its frozen context")
         # Reuse the project to cover Codex's already-provisioned helper cache.
         for _ in range(2):
             coding_turn(exe, project, dest / "repository", state, env)
