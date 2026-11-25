@@ -898,6 +898,7 @@ fn the_production_source_is_the_recorded_set() {
             "sqlite.rs",
             "sqlite/goals.rs",
             "store.rs",
+            "tools.rs",
             "transactional_claim.rs",
         ]
     );
