@@ -893,6 +893,7 @@ fn the_production_source_is_the_recorded_set() {
         names,
         [
             "goal.rs",
+            "handoff.rs",
             "lib.rs",
             "proposal.rs",
             "sqlite.rs",
