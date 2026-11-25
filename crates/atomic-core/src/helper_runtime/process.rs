@@ -305,7 +305,7 @@ fn bounded(mut reader: impl Read, limit: u64) -> Vec<u8> {
 pub fn serve() -> i32 {
     #[cfg(windows)]
     if let Err(error) = crate::windows_worker::wait_for_job() {
-        eprintln!("cannot start helper: {error}");
+        crate::log_line!("cannot start helper: {error}");
         return 2;
     }
     #[cfg(target_os = "macos")]
