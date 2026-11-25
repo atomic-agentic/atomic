@@ -1,1 +1,1 @@
-graph-claim-live-lease|crates/atomic-graph/src/transactional_claim.rs|WHERE atomic_graph_leases.expires_at<=?|WHERE TRUE|-p atomic-agentic --test graph_claim --features postgres-tests postgres_contenders_cannot_overwrite_a_live_claim_after_both_read_no_lease
+graph-claim-live-lease|crates/atomic-graph/src/transactional_claim.rs|WHERE atomic_graph_leases.expires_at<=?|WHERE CAST(? AS BIGINT) IS NOT NULL|-p atomic-agentic --test graph_claim --features postgres-tests postgres_contender_cannot_steal_a_lease_renewed_after_its_stale_read
