@@ -1,0 +1,129 @@
+{
+  "source_sha256": "9752f1a607911bb9039a0ff034b89ffc51ed10a1aac05b4010baeed28fa62a00",
+  "model": "claude-sonnet-5-5",
+  "claude_cli": "2.1.331",
+  "request_origin": "production atomic eval request capture for current lane-reviewer prompt",
+  "route_limit": "Captured production Atomic eval requests were sent through Claude Code; the measured responses were then validated through Atomic eval via a local bridge with no additional model calls.",
+  "settings": {
+    "tools": "none",
+    "restricted": true,
+    "session_persistence": false,
+    "system_prompt": "captured system turn",
+    "user_prompt": "captured user turn",
+    "response_schema": "captured strict JSON Schema; case 6 carried schema in system prompt after Claude Code formatter used Sonnet 5"
+  },
+  "cases": [
+    {
+      "case": "formatting-followup",
+      "ordinal": 1,
+      "verdict": "approve",
+      "finding_count": 1,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.017696,
+      "method": "strict_cli_json_schema",
+      "request_sha256": "4d59e64a5c02c273d49193b21a909faf940f8ffb7899900cf460cb09404b95b8"
+    },
+    {
+      "case": "omitted-decision-escalates",
+      "ordinal": 2,
+      "verdict": "escalate",
+      "finding_count": 5,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.0260681,
+      "method": "strict_cli_json_schema",
+      "request_sha256": "458280c9e2676b5492771c0e3a4f07106fb8406669d97412ccc27694b07faaa0"
+    },
+    {
+      "case": "seed-env-unverified-bypass",
+      "ordinal": 3,
+      "verdict": "request_changes",
+      "finding_count": 5,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.0230361,
+      "method": "strict_cli_json_schema",
+      "request_sha256": "480a6da3c0e800664011f6bc0fe8757caefdd8df743a27b82f9fbe98e0d575d8"
+    },
+    {
+      "case": "seed-guard-intact",
+      "ordinal": 4,
+      "verdict": "approve",
+      "finding_count": 4,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.0290561,
+      "method": "strict_cli_json_schema",
+      "request_sha256": "90c8b1db9f8f1cff6138d26b49d3c134359a770af045e4fd91571e89bdbb6438"
+    },
+    {
+      "case": "seed-guard-removed",
+      "ordinal": 5,
+      "verdict": "request_changes",
+      "finding_count": 4,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.0230521,
+      "method": "strict_cli_json_schema",
+      "request_sha256": "d5c510ca71e2861412191fd60041a6077ac07b5a54d1cb152e6dc552a8e5c58e"
+    },
+    {
+      "case": "seed-hidden-file-read",
+      "ordinal": 6,
+      "verdict": "request_changes",
+      "finding_count": 5,
+      "schema_valid": true,
+      "expected_predicate_passed": true,
+      "model_ids": [
+        "claude-sonnet-5-5"
+      ],
+      "passed": true,
+      "total_cost_usd": 0.027958000000000004,
+      "method": "schema_in_system_prompt",
+      "request_sha256": "1c625dfacd35677bb701ea45364fe1e684fd4f6e5eae76c2bd4de9a4de8b0c7f"
+    }
+  ],
+  "production_eligible_seeded_defect_detection": {
+    "detected": 2,
+    "total": 2
+  },
+  "prompt_only_diagnostic_detection": {
+    "detected": 2,
+    "total": 2
+  },
+  "benign_control_approval": {
+    "correct": 2,
+    "total": 2
+  },
+  "all_case_predicates": {
+    "passed": 6,
+    "total": 6
+  },
+  "matched_six_cost_usd": 0.146866,
+  "raw_responses": [
+    "sonnet-5-5-2026-11-25.claude-cli.jsonl",
+    "../cassettes/"
+  ],
+  "superseded_formatter_attempts": "Two Claude Code structured-output attempts for case 6 used Sonnet 5; excluded from the six scored calls."
+}
