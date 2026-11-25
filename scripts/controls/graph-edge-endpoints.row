@@ -1,1 +1,1 @@
-graph-edge-endpoints|crates/atomic-graph/src/sqlite.rs|if get_item(c, endpoint).await?.is_none() {|if false {|-p atomic-agentic-graph --test conformance sqlite_edge_endpoints_and_parent_identity_are_atomic
+graph-edge-endpoints|crates/atomic-graph/src/sqlite.rs|if item.is_none() {|if false {|-p atomic-agentic-graph --test conformance sqlite_edge_endpoints_and_parent_identity_are_atomic
