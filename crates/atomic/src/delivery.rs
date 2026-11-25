@@ -603,5 +603,65 @@ async fn execute<C: WorkflowContext>(
         }
         completed.push(json!({"slot":name,"receipt":projected}));
     }
-    Ok(json!({"source_run":plan.source_run,"occurrence":plan.occurrence,"effects":completed}))
+    let pr = pull_request
+        .as_ref()
+        .ok_or_else(|| failed("delivery has no applied pull request receipt"))?;
+    let queue = completed
+        .last()
+        .and_then(|effect| effect.get("receipt"))
+        .ok_or_else(|| failed("delivery has no applied enqueue receipt"))?;
+    let outcome = match remote.observe_queue(&plan, pr, queue).await {
+        Ok(outcome) => outcome,
+        Err(_) => QueueOutcome::Failed {
+            detail: "provider observation unavailable or inconsistent".into(),
+        },
+    };
+    let observed_at = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| failed("queue observation time is unavailable"))?
+            .as_millis(),
+    )
+    .map_err(|_| failed("queue observation time exceeds stored range"))?;
+    let (source, plan_for_observation, run, project) = (
+        source.clone(),
+        plan.clone(),
+        ctx.workflow_id().to_owned(),
+        ctx.project().map(str::to_owned),
+    );
+    let observation = ctx
+        .control_transaction(move |mut tx| {
+            let (source, plan, run, project, outcome) = (
+                source.clone(),
+                plan_for_observation.clone(),
+                run.clone(),
+                project.clone(),
+                outcome.clone(),
+            );
+            Box::pin(async move {
+                delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
+                    .await
+                    .map_err(|error| failed(format!("delivery source: {error}")))?;
+                delivery_effect::record_queue_observation_in(
+                    &mut tx,
+                    &plan,
+                    &run,
+                    project.as_deref(),
+                    outcome,
+                    observed_at,
+                )
+                .await
+            })
+        })
+        .await?;
+    let initial = observation.clone();
+    let projected = ctx
+        .step("delivery.queue_observation.initial", move |_| async move {
+            Ok(initial)
+        })
+        .await?;
+    failpoint("delivery:after-observation");
+    Ok(
+        json!({"source_run":plan.source_run,"occurrence":plan.occurrence,"effects":completed,"queue_observation":projected}),
+    )
 }

@@ -108,15 +108,16 @@ requests through an operator-installed adapter in private project state. Each
 request has a durable intent and an exact remote receipt; an ambiguous result
 parks for reconciliation and is never sent again merely because the process
 restarted.
-After enqueue completes, `atomic delivery observe <delivery-run>` performs a
-read-only provider lookup against the frozen plan and applied receipts. It
-records one outcome row per delivery run: pending, merged with provider event
+After enqueue completes, delivery records an initial read-only queue lookup.
+`atomic delivery observe <delivery-run>` refreshes it against the frozen plan
+and applied receipts. One row per delivery run holds pending, merged with provider event
 time and merge SHA, dropped with provider event time, or a failed observation.
 The command can be rerun after a restart; terminal events are immutable. It
 uses the approved source and receipts even if the operator has since replaced
 or removed `delivery/target.json`. It does not retarget a stacked change or
 resolve a queue conflict. Like delivery itself in v0.2, observation uses the
-local SQLite project store.
+local SQLite project store. Later outcomes are refreshed when an operator
+runs `delivery observe`; background polling is not yet built.
 
 A `coding: true` worktree step now requires a sibling `review.self_review`
 turn before each independent review. atomic computes the candidate's patch

@@ -532,9 +532,33 @@ async fn queue_observation_records_pending_failure_merge_and_drop_once_after_res
         ));
         fs::remove_file(dir.join("drop-response-push")).expect("enable push response");
         fs::remove_file(dir.join("unreadable-push")).expect("enable push inspection");
+        if final_status == "removed" {
+            fs::write(dir.join("unreadable-enqueue"), "")
+                .expect("make initial queue observation unreadable");
+        }
+        if final_status == "merged" {
+            let killed = resume(&root, Some("delivery:after-observation"));
+            assert_eq!(
+                killed.status.signal(),
+                Some(9),
+                "initial queue observation did not checkpoint before process kill: {killed:?}"
+            );
+        }
         let completed: Value = serde_json::from_slice(&success(resume(&root, None)))
             .expect("parse completed delivery");
         assert_eq!(completed["effects"].as_array().map(Vec::len), Some(3));
+        assert_eq!(
+            completed["queue_observation"]["outcome"]["status"],
+            if final_status == "removed" {
+                "failed"
+            } else {
+                "pending"
+            }
+        );
+        if final_status == "removed" {
+            fs::remove_file(dir.join("unreadable-enqueue"))
+                .expect("restore queue observation after delivery");
+        }
         let observe = || -> Value {
             serde_json::from_slice(&success(cli(&root, &["delivery", "observe", RUN], None)))
                 .expect("parse queue observation")

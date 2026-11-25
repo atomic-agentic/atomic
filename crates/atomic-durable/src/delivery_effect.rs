@@ -658,16 +658,6 @@ pub async fn record_queue_observation_in(
                 "queue observation conflicts with its frozen delivery",
             ));
         }
-        let prior = observation_from_row(row)?;
-        // CONTROL_OFF: delivery-queue-outcome-stable
-        if prior.outcome.terminal() {
-            if outcome.terminal() && outcome != prior.outcome {
-                return Err(refuse(
-                    "provider queue outcome conflicts with a recorded terminal event",
-                ));
-            }
-            return Ok(prior);
-        }
     }
     let (status, event, merge_sha, happened_at, detail): (
         &str,
@@ -712,6 +702,7 @@ pub async fn record_queue_observation_in(
     ];
     if existing.is_some() {
         tx.execute(
+            // CONTROL_OFF: delivery-queue-outcome-stable
             "UPDATE atomic_delivery_queue_observations SET status=?,provider_event_id=?,merge_sha=?,happened_at=?,observed_at=?,detail=? WHERE delivery_run=? AND status IN ('pending','failed')",
             &[params[5].clone(), params[6].clone(), params[7].clone(), params[8].clone(), params[9].clone(), params[10].clone(), params[0].clone()],
         ).await?;
@@ -725,6 +716,19 @@ pub async fn record_queue_observation_in(
         "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail FROM atomic_delivery_queue_observations WHERE delivery_run=?",
         &[text(run)],
     ).await?;
+    // A concurrent first observer may have won ON CONFLICT after the initial
+    // read. Recheck the binding before accepting its row.
+    if row.text("plan_digest")? != plan_digest
+        || row.text("repository")? != repository
+        || row.int("pull_request_number")?
+            != i64::try_from(number)
+                .map_err(|_| refuse("pull request number exceeds stored range"))?
+        || row.text("head")? != head
+    {
+        return Err(refuse(
+            "queue observation conflicts with its frozen delivery",
+        ));
+    }
     let recorded = observation_from_row(&row)?;
     if recorded.outcome != outcome && (outcome.terminal() || !recorded.outcome.terminal()) {
         return Err(refuse(
