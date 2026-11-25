@@ -376,11 +376,10 @@ the run goes on once the sandbox starts. A sandbox that fails in a way that may 
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's
-execution lock. On macOS and Windows it kills each command's process group and
-does not wait, so a process that left its group may outlive atomic and the
-lock. On macOS and
-Windows this has not been verified: exec atoms' commands run unconfined there,
-so atomic keeps no operator credential and refuses credentialed gate decisions.
+execution lock. On macOS it kills each command's process group and does not wait, so a
+process that left its group may outlive atomic and the lock. Standalone exec
+commands run unconfined on macOS. On Windows, atomic refuses standalone exec
+commands. Both platforms refuse credentialed gate decisions.
 
 An exec atom's command hands large results over by reference: it writes a
 file to its outputs directory and names it in its output, and the next step's
@@ -494,6 +493,15 @@ mended. A gate decision still comes only from a person's enrolled credential.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
+
+The v0.2 Windows AMD64 release job exercises the extracted CLI with a scripted
+Codex provider. Its acceptance test requires a write in the fixture worktree
+and a denied read from private Atomic state. The test selects `cmd.exe` in the
+Codex shell tool. In a worktree beneath a private Windows directory, PowerShell
+can start at the drive root even though Windows assigned the worktree as the
+process directory. Select `cmd.exe` for commands that use relative file paths
+in that layout. Standalone exec commands on Windows return an
+unsupported-confinement error.
 
 ## Observability stages
 

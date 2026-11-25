@@ -36,12 +36,16 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Where git may be, in order. The first that exists is used.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const GIT_PROGRAMS: &[&str] = &[
     "/usr/bin/git",
     "/usr/local/bin/git",
     "/opt/homebrew/bin/git",
 ];
+
+// Git for Windows' machine-wide install. A repository cannot choose the executable.
+#[cfg(windows)]
+const GIT_PROGRAMS: &[&str] = &[r"C:\Program Files\Git\cmd\git.exe"];
 
 // Apple's bundled Git may lack --no-lazy-fetch. Prefer Homebrew Git at the
 // same fixed locations atomic already trusts.
@@ -395,6 +399,8 @@ impl Git {
             .arg("--no-replace-objects")
             .arg("--literal-pathspecs")
             .arg("--no-lazy-fetch");
+        #[cfg(windows)]
+        command.env("PATH", r"C:\Program Files\Git\cmd;C:\Windows\System32");
         for setting in HARDENING {
             command.arg("-c").arg(setting);
         }

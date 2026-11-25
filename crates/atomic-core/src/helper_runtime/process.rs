@@ -168,6 +168,11 @@ fn run(
     #[cfg(target_os = "macos")]
     let mut supervisor = crate::worker_lifetime::Supervisor::prepare(&mut process)
         .map_err(|e| host(format!("cannot supervise the helper process: {e}")))?;
+    #[cfg(windows)]
+    let (mut child, _job) =
+        crate::windows_worker::spawn(&mut process, memory_limit, cpu_seconds(&limits)?)
+            .map_err(|e| host(format!("cannot start the helper in its job: {e}")))?;
+    #[cfg(not(windows))]
     let mut child = process.spawn().map_err(|e| {
         host(format!(
             "cannot start the helper process {}: {e}",
@@ -298,6 +303,11 @@ fn bounded(mut reader: impl Read, limit: u64) -> Vec<u8> {
 /// Serves one helper call: reads the request on stdin, runs it under the
 /// child's limits and writes the result line. Returns the exit status.
 pub fn serve() -> i32 {
+    #[cfg(windows)]
+    if let Err(error) = crate::windows_worker::wait_for_job() {
+        crate::log_line!("cannot start helper: {error}");
+        return 2;
+    }
     #[cfg(target_os = "macos")]
     if let Err(error) = crate::worker_lifetime::watch_supervisor() {
         crate::log_line!("cannot watch the helper's supervisor: {error}");
@@ -381,15 +391,12 @@ pub(super) fn supervised(
 /// Limits this process: its CPU time and core files, and its writable memory
 /// except on macOS. macOS refuses a data limit below its address map, so the
 /// host holds the memory limit there (see `child_memory`).
+#[cfg(unix)]
 fn limit_self(limits: &Limits) -> Result<(), Failure> {
     let memory = byte_limits(limits)?.0;
     #[cfg(target_os = "macos")]
     let _ = memory;
-    let cpu = limits
-        .deadline
-        .as_secs()
-        .checked_add(2)
-        .ok_or_else(|| Failure::Host("helper CPU limit is too large".into()))?;
+    let cpu = cpu_seconds(limits)?;
     for (resource, value) in [
         #[cfg(not(target_os = "macos"))]
         (libc::RLIMIT_DATA, memory),
@@ -410,6 +417,20 @@ fn limit_self(limits: &Limits) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+fn cpu_seconds(limits: &Limits) -> Result<u64, Failure> {
+    limits
+        .deadline
+        .as_secs()
+        .checked_add(2)
+        .ok_or_else(|| Failure::Host("helper CPU limit is too large".into()))
+}
+
+#[cfg(windows)]
+fn limit_self(limits: &Limits) -> Result<(), Failure> {
+    crate::windows_worker::verify(byte_limits(limits)?.0, cpu_seconds(limits)?)
+        .map_err(|error| Failure::Host(format!("cannot verify helper job: {error}")))
 }
 
 #[cfg(test)]

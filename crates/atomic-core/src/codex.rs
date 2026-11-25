@@ -279,6 +279,7 @@ const AZURE_CONFIG: &str = "AZURE_CONFIG_DIR";
 /// there, though on RHEL a container's subscription entitlements are
 /// mounted under `/run/secrets` too, so a command cannot reach the entitled
 /// repositories with them.
+#[cfg(unix)]
 const WORKLOAD_TOKEN_DIRS: &[&str] = &[
     // `scripts/controls/secrets-dir-var-run.row` switches this off.
     "/var/run/secrets",
@@ -1104,6 +1105,7 @@ pub fn home_secrets(
     // name, a relative one resolved against atomic's working directory as
     // an SDK resolves it, and, for one in a projected volume, the volume
     // itself.
+    #[cfg(unix)]
     out.extend(WORKLOAD_TOKEN_DIRS.iter().map(PathBuf::from));
     out.extend(token_files(env, &homes, &std::env::current_dir)?);
     // Those named inside a configuration rather than by a variable: an AWS
@@ -1567,6 +1569,14 @@ fn denied_paths_with(
     // a link as what it points at.
     let mut own = Vec::new();
     for entry in children(codex_home, "") {
+        #[cfg(windows)]
+        if entry.file_name().is_some_and(|n| n == ".sandbox-bin") {
+            // Codex runs a versioned copy under the sandbox account. Its read
+            // ACL must survive subsequent turns. Check the copy against the
+            // shipped runner and keep all other files in this directory denied.
+            own.extend(windows_helper_denials(&entry)?);
+            continue;
+        }
         if entry.file_name().is_some_and(|n| n == "tmp") {
             // Codex's links, and atomic's own link to itself under the
             // helper's name, which every sandbox runs; they stay readable.
@@ -1799,12 +1809,18 @@ fn denied_paths_with(
 /// UTF-8, since then the pattern may not match it and the databases would
 /// go undenied.
 fn sqlite_glob(home: &Path) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    let home = dunce::simplified(home);
     let Some(text) = home.to_str() else {
         bail!(
             "{} is not UTF-8, so atomic cannot deny Codex's databases there",
             home.display()
         );
     };
+    // A Windows separator is a literal path boundary in the glob. Keep the
+    // check for pattern syntax in the directory names themselves.
+    #[cfg(windows)]
+    let text = text.replace('\\', "/");
     let special = text.matches(GLOB_SPECIAL).next();
     if let Some(c) = special {
         bail!(
@@ -1841,10 +1857,17 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
     use std::path::Component;
     let refuse = |why: String| Err(anyhow::Error::new(DenyRefused(why)));
     // What is walked so far, every link in it followed, and what is left.
-    let mut done = PathBuf::from("/");
+    let root_part = |c: &Component<'_>| matches!(c, Component::RootDir | Component::Prefix(_));
+    let mut done: PathBuf = path.components().take_while(root_part).collect();
+    if !done.is_absolute() {
+        return refuse(format!(
+            "cannot resolve a denied path without an absolute root: {}",
+            path.display()
+        ));
+    }
     let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
         .components()
-        .filter(|c| !matches!(c, Component::RootDir))
+        .skip_while(root_part)
         .map(|c| c.as_os_str().to_owned())
         .collect();
     let mut hops = 0;
@@ -1901,6 +1924,9 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
             }
         };
         if !link {
+            #[cfg(windows)]
+            let next = std::fs::canonicalize(&next)
+                .map_err(|e| DenyRefused(format!("cannot resolve {}: {e}", next.display())))?;
             done = next;
             continue;
         }
@@ -1943,14 +1969,16 @@ fn walk_link(path: &Path, writable: &[PathBuf], masked: &[PathBuf]) -> anyhow::R
                 ));
             }
         };
-        if to.is_absolute() {
-            done = PathBuf::from("/");
+        if to.has_root() {
+            let root: PathBuf = to.components().take_while(root_part).collect();
+            done = done.join(root);
+        } else if matches!(to.components().next(), Some(Component::Prefix(_))) {
+            return refuse(format!(
+                "cannot resolve drive-relative link {}",
+                next.display()
+            ));
         }
-        for part in to
-            .components()
-            .filter(|c| !matches!(c, Component::RootDir))
-            .rev()
-        {
+        for part in to.components().rev().filter(|c| !root_part(c)) {
             rest.push_front(part.as_os_str().to_owned());
         }
     }
@@ -2285,6 +2313,119 @@ fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
     Ok(Some(records))
 }
 
+/// Set up the pinned Codex backend for this turn's final profile and roots.
+#[cfg(windows)]
+async fn prepare_windows_turn(config: &mut Config) -> anyhow::Result<()> {
+    use codex_config::types::WindowsSandboxModeToml;
+    use codex_protocol::sandbox::SandboxType;
+
+    let mode = Some(WindowsSandboxModeToml::Elevated);
+    config
+        .config_layer_stack
+        .requirements()
+        .windows_sandbox_mode
+        .can_set(&mode)?;
+    config.permissions.windows_sandbox_mode = mode;
+    config.permissions.windows_sandbox_type = SandboxType::WindowsRestrictedToken;
+    config.validate_windows_mxc_requirement()?;
+    let profile = config.permissions.effective_permission_profile();
+    let roots = config.workspace_roots.clone();
+    let cwd = config.cwd.to_path_buf();
+    let home = config.codex_home.to_path_buf();
+    // The setup helper is trusted host code. Project-defined environment
+    // variables must not select proxy exceptions or additional setup roots.
+    let host_paths = [
+        "SystemRoot",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "ProgramData",
+    ]
+    .into_iter()
+    .filter_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| (name.to_owned(), value))
+    })
+    .collect();
+    tokio::task::spawn_blocking(move || {
+        codex_core::windows_sandbox::prepare_elevated_sandbox(
+            &profile,
+            &roots,
+            &cwd,
+            &host_paths,
+            &home,
+        )
+    })
+    .await
+    .context("join Windows sandbox setup")?
+    .context("prepare the Windows sandbox for this turn")
+}
+
+#[cfg(windows)]
+fn windows_helper_denials(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    use sha2::{Digest, Sha256};
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let meta = std::fs::symlink_metadata(dir)?;
+    anyhow::ensure!(
+        meta.is_dir() && meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+        "expected a regular Windows sandbox helper directory at {}",
+        dir.display()
+    );
+    let digest = |path: &Path| -> std::io::Result<_> {
+        let mut hash = Sha256::new();
+        std::io::copy(&mut std::fs::File::open(path)?, &mut hash)?;
+        Ok(hash.finalize())
+    };
+    let shipped = std::env::current_exe()?.with_file_name("codex-command-runner.exe");
+    let mut denied = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "unexpected reparse point in Windows sandbox helper cache at {}",
+            path.display()
+        );
+        let is_runner = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|s| s.starts_with("codex-command-runner-") && s.ends_with(".exe"));
+        if is_runner && meta.is_file() && digest(&path)? == digest(&shipped)? {
+            continue;
+        }
+        denied.push(path);
+    }
+    Ok(denied)
+}
+
+/// Require packaged helpers before Codex can fall back to its executable search path.
+#[cfg(windows)]
+fn require_windows_helpers() -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("resolve atomic.exe")?;
+    let dir = exe.parent().context("atomic.exe has no parent")?;
+    for name in [
+        "codex-command-runner.exe",
+        "codex-windows-sandbox-setup.exe",
+        "codex-windows-sandbox-service.exe",
+    ] {
+        let path = dir.join(name);
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("locate bundled Windows sandbox helper {}", path.display()))?;
+        use std::os::windows::fs::MetadataExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "expected a regular Windows sandbox helper at {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
 /// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
 /// denies paths itself. On Linux, Codex's sandbox reads a profile that
@@ -2292,6 +2433,7 @@ fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
 /// denial hold, so without one the thread could not be kept out of other
 /// attempts' scratch directories; atomic refuses it before the thread starts
 /// rather than run it with less denied. On macOS the denial is not verified.
+#[cfg(any(not(windows), test))]
 fn refuse_denied_without_helper(
     paths: &CodexPaths,
     denied: &[PathBuf],
@@ -4671,6 +4813,9 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    #[cfg(windows)]
+    require_windows_helpers()?;
+    #[cfg(not(windows))]
     refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     // A command whose HOME is the one that must not exist, as a read-only
     // turn's is, runs only while it does not: refused before anything
@@ -4763,6 +4908,8 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
+    #[cfg(windows)]
+    prepare_windows_turn(&mut config).await?;
     config.permissions.shell_environment_policy = command_environment(&env);
     // No login shell, and no snapshot taken from one: a command never runs
     // the developer's or the system's shell startup files.
@@ -5429,7 +5576,11 @@ pub const SHELL_EXCLUDES: &[&str] = &[
 /// home directory even when it is not a login shell (bash's `.bashrc` when
 /// its input is a socket, zsh's `.zshenv` always), and those can export
 /// anything.
+#[cfg(unix)]
 pub const SHELL_HOME: &str = "/nonexistent";
+/// An absent home for a Windows read-only shell, checked before each turn.
+#[cfg(windows)]
+pub const SHELL_HOME: &str = r"C:\nonexistent";
 
 /// Refused unless [`SHELL_HOME`] is not there: a shell given it as its home
 /// would read startup files from it, so one put there, by whoever may make

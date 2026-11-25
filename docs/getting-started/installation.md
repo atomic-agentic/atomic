@@ -10,10 +10,10 @@ prerequisites for building that app.
 
 ## Release status
 
-No Atomic release has been published here: there is no download location and no
-supported installation command. The check under
-[verifying a download](#verifying-a-download) is what an archive from a
-published release will face; there is nothing to check against yet.
+[Atomic v0.1.0](https://github.com/atomic-agentic/atomic/releases/tag/v0.1.0)
+provides archives for Linux AMD64 and macOS on Apple silicon. Windows AMD64
+is a new release target for v0.2. Use the archive and matching signature
+bundle from the same tagged release. See [verifying a download](#verifying-a-download).
 
 Atomic itself is in this repository and builds from source. With a container
 engine and git on the host, from a checkout:
@@ -33,8 +33,9 @@ Which commands are built and which are a later stage's plan is listed in
 
 ## What you will need
 
-- A supported development machine. Linux and macOS are the initial local targets;
-  Windows support is planned on a best-effort basis.
+- Linux AMD64, macOS on Apple silicon, or Windows AMD64 for the v0.2 release
+  build. Windows coding atoms use the bundled Codex elevated sandbox. Windows
+  may prompt an administrator during initial sandbox setup.
 - Model access through an eligible ChatGPT subscription with Codex access, an
   API key, or a local OpenAI-compatible endpoint. Codex atoms take the
   subscription sign-in from `atomic model login`, which atomic accepts on Linux
@@ -42,6 +43,8 @@ Which commands are built and which are a later stage's plan is listed in
 - Git that supports `--no-lazy-fetch` for worktree and fixture operations.
   On macOS, install a current Git with Homebrew if the bundled Git lacks that
   option. Atomic looks for Homebrew Git at its standard installation paths.
+  On Windows, use the machine-wide Git for Windows installation at
+  `C:\Program Files\Git`.
 - Git and a container engine (Docker, or Podman) to build Atomic from source; the
   executable itself runs with no container. The Rust toolchain and other build tools are in the
   [development container](../development.md#the-development-container).
@@ -77,6 +80,20 @@ cosign verify-blob \
   --certificate-identity https://github.com/atomic-agentic/atomic/.github/workflows/release.yml@refs/tags/v<version> \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   atomic-<version>-<target>.tar.gz
+```
+
+For a Windows AMD64 ZIP from a published release, run these commands in PowerShell.
+Replace `<version>` with the version printed in the filename. Extract the entire
+archive so the Codex sandbox helpers sit beside `atomic.exe`.
+
+```powershell
+$version = '<version>'
+$name = "atomic-$version-x86_64-pc-windows-msvc"
+$identity = "https://github.com/atomic-agentic/atomic/.github/workflows/release.yml@refs/tags/v$version"
+cosign verify-blob --bundle "$name.zip.sigstore.json" --certificate-identity $identity --certificate-oidc-issuer https://token.actions.githubusercontent.com "$name.zip"
+if ($LASTEXITCODE -ne 0) { throw 'Archive signature verification failed' }
+Expand-Archive "$name.zip" -DestinationPath .
+& ".\$name\atomic.exe" --version
 ```
 
 It prints `Verified OK` and exits 0 only when the archive is the one the

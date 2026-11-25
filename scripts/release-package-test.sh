@@ -53,4 +53,54 @@ fi
 if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
+# Exercise the normal ZIP and SBOM paths with four distinguishable fixture
+# binaries. Only cargo's package ID and CycloneDX metadata are supplied.
+set -e
+repo="${WORK}/repo"
+TRIPLE=x86_64-pc-windows-msvc
+release="${repo}/target/${TRIPLE}/release"
+mkdir -p "${release}" "${repo}/crates/atomic" "${repo}/crates/atomic-core/assets" "${repo}/deps"
+cp "${ROOT}/scripts/sbom.sh" "${repo}/scripts/"
+cp "${ROOT}/crates/atomic-core/assets/manifest.json" "${repo}/crates/atomic-core/assets/"
+cp "${ROOT}"/{LICENSE,NOTICE,THIRD-PARTY-NOTICES.md} "${repo}/"
+cp "${ROOT}"/crates/atomic-core/assets/*LICENSE* "${repo}/crates/atomic-core/assets/"
+touch "${repo}/deps/forks.toml"
+for program in atomic codex-command-runner codex-windows-sandbox-setup codex-windows-sandbox-service; do
+    echo "fixture: ${program}" >"${release}/${program}.exe"
+    chmod +x "${release}/${program}.exe"
+done
+cat >"${WORK}/bin/cargo" <<'SH'
+#!/bin/sh
+case "$1" in
+    pkgid) echo 'atomic-agentic@0.1.0';;
+    cyclonedx) echo '{"metadata":{"component":{"bom-ref":"pkg:atomic","components":[{"name":"atomic","type":"application"}]}},"components":[],"dependencies":[]}' >atomic-agentic.cdx.json;;
+    *) exit 1;;
+esac
+SH
+export SOURCE_DATE_EPOCH=1700000000
+export PATH="${WORK}/bin:${PATH}"
+"${repo}/scripts/release-package.sh" "${TRIPLE}"
+dist="${repo}/target/dist"
+prefix="atomic-0.1.0-${TRIPLE}"
+cp "${dist}/${prefix}.zip" "${WORK}/first.zip"
+"${repo}/scripts/release-package.sh" "${TRIPLE}"
+cmp "${WORK}/first.zip" "${dist}/${prefix}.zip"
+(cd "${dist}" && sha256sum -c ./*.sha256)
+python3 -I - "${dist}" "${prefix}" <<'PYZIP'
+import hashlib, json, pathlib, sys, zipfile
+dist, prefix = pathlib.Path(sys.argv[1]), sys.argv[2]
+doc = json.loads((dist / (prefix + ".cdx.json")).read_text())
+app, = doc["metadata"]["component"]["components"]
+files = {c["name"]: c for c in doc["components"] if c["name"].endswith(".exe")}
+assert set(files) == {"codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "codex-windows-sandbox-service.exe"}
+files["atomic.exe"] = app
+with zipfile.ZipFile(dist / (prefix + ".zip")) as archive:
+    for name, component in files.items():
+        payload = archive.read(prefix + "/" + name)
+        assert payload == ("fixture: " + name[:-4] + "\n").encode(), name
+        assert component["hashes"] == [{"alg": "SHA-256", "content": hashlib.sha256(payload).hexdigest()}], name
+    for name in ("LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md"):
+        assert archive.read(prefix + "/" + name)
+    assert any(n.startswith(prefix + "/licenses/") for n in archive.namelist())
+PYZIP
 echo "release-package tests passed" >&2

@@ -2,6 +2,9 @@
 
 //! The bounded Astro parser/interpreter worker and immutable source snapshots.
 
+#[cfg(any(windows, test))]
+mod windows_paths;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -420,6 +423,12 @@ pub(crate) fn worker_with(
         }
         return Err("component graph limit exceeded".into());
     }
+    #[cfg(windows)]
+    let project = windows_paths::Project::new(root);
+    #[cfg(windows)]
+    let action = request["action"].as_str().unwrap_or_default().to_owned();
+    #[cfg(windows)]
+    project.request(&mut request)?;
     request["protocol"] = json!(1);
     let bytes = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     if bytes.len() > crate::compiler_process::MESSAGE_LIMIT {
@@ -455,6 +464,12 @@ pub(crate) fn worker_with(
     )?;
     let response: Value =
         serde_json::from_slice(&output).map_err(|e| format!("invalid compiler response: {e}"))?;
+    #[cfg(windows)]
+    let response = {
+        let mut response = response;
+        project.response(&action, &mut response)?;
+        response
+    };
     if let Some(error) = response.get("error") {
         return Err(Diagnostic::from_response(error));
     }

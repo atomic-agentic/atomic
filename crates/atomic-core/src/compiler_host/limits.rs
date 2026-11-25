@@ -20,6 +20,7 @@ pub(crate) fn memory_limit(heap: usize) -> u64 {
 
 /// Limits this process's CPU time and its core files and, except on macOS,
 /// its writable memory to `memory` bytes.
+#[cfg(unix)]
 pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
     // macOS holds a data limit against the size of the whole address map and
     // refuses one below it, which any limit on memory is before the child
@@ -48,4 +49,11 @@ pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn limit_self(memory: u64) -> Result<(), String> {
+    crate::windows_worker::wait_for_job()
+        .and_then(|()| crate::windows_worker::verify(memory, CPU_SECONDS))
+        .map_err(|error| format!("cannot verify compiler job: {error}"))
 }

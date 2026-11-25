@@ -548,7 +548,7 @@ impl LocalStore {
             Err(e) => return Err(e),
         };
         let blob = self.blob_path(artifact);
-        match std::fs::File::open(&blob) {
+        match metadata_handle(&blob) {
             Ok(f) => {
                 f.set_modified(std::time::SystemTime::now())
                     .map_err(io(&blob))?;
@@ -616,11 +616,12 @@ impl LocalStore {
             .root
             .join("staging")
             .join(format!("{}-{}", self.owner.id, random_name()?));
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io(&path))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Sealing the file reads its current attributes before making it read-only.
+        #[cfg(windows)]
+        options.read(true);
+        let file = options.open(&path).map_err(io(&path))?;
         Ok((path, file))
     }
 
@@ -663,6 +664,23 @@ impl LocalStore {
         }
         result
     }
+}
+
+/// Change timestamps and attributes of a sealed artifact without opening its
+/// content for writing. Windows requires FILE_WRITE_ATTRIBUTES for SetFileTime.
+fn metadata_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    std::fs::File::open(path)
 }
 
 /// Make `f` writable by no one, keeping who may read it.
@@ -1075,7 +1093,7 @@ impl ArtifactStore for LocalStore {
             // time is not synced: after a crash it may be older, and the
             // content is then only as safe as the caller's keep set. A blob
             // an older atomic left writable is made read-only too.
-            std::fs::File::open(&blob)
+            metadata_handle(&blob)
                 .and_then(|f| {
                     f.set_modified(std::time::SystemTime::now())?;
                     read_only(&f)
@@ -1086,7 +1104,7 @@ impl ArtifactStore for LocalStore {
             // just written takes its place, as recent as this commit rather
             // than its staging, which may have been long before, so a sweep
             // that began reading before now keeps it.
-            std::fs::File::open(&staged.path)
+            metadata_handle(&staged.path)
                 .and_then(|f| f.set_modified(std::time::SystemTime::now()))
                 .map_err(io(&staged.path))?;
             std::fs::create_dir_all(&parent).map_err(io(&parent))?;

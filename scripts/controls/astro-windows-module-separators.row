@@ -1,0 +1,1 @@
+astro-windows-module-separators|crates/atomic-core/src/astro/windows_paths.rs|            if part.contains(['\\', ':'])|            if false|-p atomic-agentic-core --lib protocol_paths_round_trip_without_rewriting_source_text
