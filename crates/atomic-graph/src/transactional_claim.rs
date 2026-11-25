@@ -7,6 +7,7 @@ use atomic_core::workflow::{Criterion, parse_criteria};
 use atomic_durable::{DurableError, Param, Result, Tx};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The immutable fields a graph work loop gives one atom invocation.
@@ -369,7 +370,8 @@ fn review_id(parts: &[&str]) -> String {
 }
 
 /// File approved, low-severity review findings atomically with publication and
-/// close. Follow-ups start without a parent and do not extend the active epic.
+/// close. Identical findings share a task and credit each reviewer. Follow-ups
+/// start without a parent and do not extend the active epic.
 /// An operator can assign them to a pinned epic using the ordinary graph link.
 /// Stable IDs make a retried finalization safe if a prior result was lost.
 pub async fn file_review_followups(
@@ -385,7 +387,9 @@ pub async fn file_review_followups(
     }
     validate(tx, lease).await?;
     let now = now_millis()?;
-    for (index, finding) in findings.iter().enumerate() {
+    let mut grouped: BTreeMap<(String, u32, String, String, String), BTreeSet<String>> =
+        BTreeMap::new();
+    for finding in findings {
         if !matches!(finding.severity.as_str(), "minor" | "low" | "nit")
             || finding.file.is_empty()
             || finding.file.len() > 256
@@ -397,22 +401,47 @@ pub async fn file_review_followups(
                 "review follow-up is not a bounded low-severity finding".into(),
             ));
         }
-        let hash = review_id(&[epic, run, step, &lease.item_id, &index.to_string()]);
+        grouped
+            .entry((
+                finding.file.clone(),
+                1,
+                finding.severity.clone(),
+                finding.category.clone(),
+                finding.message.clone(),
+            ))
+            .or_default()
+            .insert(finding.reviewer.clone());
+    }
+    for ((file, line, severity, category, message), reviewers) in grouped {
+        let line_text = line.to_string();
+        let hash = review_id(&[
+            "finding:v2",
+            epic,
+            run,
+            step,
+            &lease.item_id,
+            &file,
+            &line_text,
+            &severity,
+            &category,
+            &message,
+        ]);
         let item_id = format!("atomic-review-{}", &hash[..24]);
         let request = format!("atomic-review-followup:{hash}");
-        let location = finding.line.map_or_else(
-            || finding.file.clone(),
-            |line| format!("{}:{line}", finding.file),
-        );
-        let title = format!("Review {}: {}", finding.severity, location)
+        let location = format!("{file}:{line}");
+        let title = format!("Review {severity}: {location}")
             .chars()
             .take(200)
             .collect::<String>();
+        let reviewers = reviewers
+            .into_iter()
+            .map(|reviewer| format!("- {reviewer}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let body = format!(
-            "Reviewer: {}\nLocation: {}\nSeverity: {}\nCategory: {}\nFinding: {}",
-            finding.reviewer, location, finding.severity, finding.category, finding.message
+            "Reviewers:\n{reviewers}\nLocation: {location}\nSeverity: {severity}\nCategory: {category}\nFinding: {message}"
         );
-        let priority = if finding.severity == "nit" { 4 } else { 3 };
+        let priority = if severity == "nit" { 4 } else { 3 };
         tx.execute(
             "INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) \
              VALUES (?,?,?,'task',?,'open',NULL,'agent','atomic-review',?) \

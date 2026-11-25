@@ -122,8 +122,10 @@ must approve that exact candidate and panel before publication. Rejecting the
 classification leaves the item open and files nothing.
 
 Follow-ups are filed as unassigned tasks with `discovered-from` links when the
-original item closes. They do not keep its epic open. An operator can schedule
-one with `atomic graph link <task> parent-child <epic>` and a pinned epic.
+original item closes. Identical findings from the final panel become one task
+that credits every reviewer; distinct findings remain separate. They do not
+keep its epic open. An operator can schedule one with
+`atomic graph link <task> parent-child <epic>` and a pinned epic.
 Delivery requires two explicit independent approvals and, when findings were
 deferred, the matching human classification. Atomic checks the decision
 against the published reviewer findings at delivery admission and before
