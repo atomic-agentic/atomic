@@ -2234,6 +2234,133 @@ fn failed_graph_item_criterion_repairs_without_calling_an_independent_reviewer()
 }
 
 #[test]
+fn graph_item_test_and_cel_criteria_pass_before_independent_review() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"done":true}"#.into()),
+            Reply::Text(r#"{"verdict":"approve"}"#.into()),
+        ])
+        .await
+        .expect("scripted author and reviewer");
+        let root = scratch("graph-test-cel-before-review");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_project(&project);
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "review fixture"]);
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let store = SqliteStore::open_authorized(
+            &root.join("atomic.db"),
+            SystemTime::now,
+            HumanCredential::new(Principal::local("owner"), SECRET),
+        )
+        .expect("authorized graph store");
+        store
+            .set_item_criteria(
+                Actor::human("owner"),
+                CHILDREN[0].into(),
+                vec![
+                    Criterion::Test {
+                        argv: vec!["/usr/bin/true".into()],
+                        timeout_ms: 1000,
+                    },
+                    Criterion::Cel {
+                        expr: "candidate.output.done == true".into(),
+                    },
+                ],
+            )
+            .await
+            .expect("operator criteria");
+        let (r, u, b) = (root.clone(), model.base_url(), base);
+        let finished = tokio::task::spawn_blocking(move || child(&r, &u, &b, "start", None))
+            .await
+            .expect("graph child");
+        assert!(finished.success(), "graph child returned: {finished}");
+        assert_eq!(model.calls(), 2, "one author and one independent reviewer");
+        let (rows, steps) = inspect(&root).await;
+        assert_eq!(rows[0].1, "closed");
+        assert_eq!(rows[0].2.len(), 40, "close recorded the host commit");
+        for step in [
+            "graph.00000.fix.criteria.0.0",
+            "graph.00000.fix.criteria.0.1",
+            "graph.00000.fix.review.0.turn",
+            "graph.00000.fix.publish",
+        ] {
+            assert!(
+                steps.contains(&step.to_owned()),
+                "missing {step}: {steps:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn failed_graph_item_test_after_cel_repairs_without_spending_review() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 2])
+            .await
+            .expect("scripted author and repair");
+        let root = scratch("graph-test-cel-blocks-review");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_repair_project(&project);
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "review fixture"]);
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let store = SqliteStore::open_authorized(
+            &root.join("atomic.db"),
+            SystemTime::now,
+            HumanCredential::new(Principal::local("owner"), SECRET),
+        )
+        .expect("authorized graph store");
+        store
+            .set_item_criteria(
+                Actor::human("owner"),
+                CHILDREN[0].into(),
+                vec![
+                    Criterion::Cel {
+                        expr: "candidate.output.done == true".into(),
+                    },
+                    Criterion::Test {
+                        argv: vec!["/usr/bin/false".into()],
+                        timeout_ms: 1000,
+                    },
+                ],
+            )
+            .await
+            .expect("operator criteria");
+        let (r, u, b) = (root.clone(), model.base_url(), base);
+        let finished = tokio::task::spawn_blocking(move || child(&r, &u, &b, "start", None))
+            .await
+            .expect("graph child");
+        assert!(finished.success(), "graph child returned: {finished}");
+        assert_eq!(model.calls(), 2, "reviewer was never called");
+        let (rows, steps) = inspect(&root).await;
+        assert_eq!(rows[0].1, "open");
+        assert!(rows[0].2.is_empty(), "failed item gained a commit link");
+        for step in [
+            "graph.00000.fix.criteria.0.0",
+            "graph.00000.fix.criteria.0.1",
+            "graph.00000.fix.criteria.1.0",
+            "graph.00000.fix.criteria.1.1",
+        ] {
+            assert!(
+                steps.contains(&step.to_owned()),
+                "missing {step}: {steps:?}"
+            );
+        }
+        assert!(
+            !steps
+                .iter()
+                .any(|step| step.contains(".review.0.turn") || step == "graph.00000.fix.publish"),
+            "failed criterion reached review or publication: {steps:?}"
+        );
+    });
+}
+
+#[test]
 fn imported_beads_epic_can_be_pinned_and_runs_three_items_with_acceptance_text() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 3])
