@@ -2204,7 +2204,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                             running.push(async move { (this_ordinal, handle.result().await) });
                         }
                         ClaimNext::Pending if running.is_empty() => {
-                            if let Err(error) = atomic_durable::publication::park_graph_pending(
+                            match atomic_durable::publication::park_graph_pending(
                                 &ctx,
                                 &claim_step,
                                 &epic,
@@ -2212,7 +2212,11 @@ async fn run_pipeline_in<C: WorkflowContext>(
                             )
                             .await
                             {
-                                failure = Some(error);
+                                Ok(()) => continue,
+                                Err(error) => {
+                                    failure = Some(error);
+                                    break;
+                                }
                             }
                         }
                         ClaimNext::Pending => break,

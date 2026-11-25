@@ -3071,6 +3071,80 @@ fn pending_epic_creates_distinct_parks_and_resumes_after_human_release() {
 }
 
 #[test]
+fn parallel_pending_release_retries_claim_and_survives_a_parked_process_crash() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done":true}"#.into()); 3])
+            .await
+            .expect("scripted model");
+        let root = scratch("parallel-pending-release");
+        let base = seed(&root).await;
+        let url = model.base_url();
+        let graph = SqliteStore::open_authorized(
+            &root.join("atomic.db"),
+            SystemTime::now,
+            HumanCredential::new(Principal::local("owner"), SECRET),
+        )
+        .expect("authorized graph");
+        graph
+            .set_status(Actor::human("owner"), CHILDREN[1].into(), Status::Deferred)
+            .await
+            .expect("defer second item");
+
+        let mut first_process = child_command(&root, &url, &base, "start-parallel", None)
+            .spawn()
+            .expect("start parallel graph process");
+        let rt = durable(&root).await;
+        let first = wait_for_park(&rt, None).await;
+        assert_eq!(model.calls(), 1, "first lane finished before pending park");
+        assert!(first.id.ends_with(":2"), "first park: {}", first.id);
+        release(&rt, &first, "parallel-release-still-blocked").await;
+        let second = wait_for_park(&rt, Some(&first.id)).await;
+        assert!(second.id.ends_with(":3"), "second park: {}", second.id);
+        assert_eq!(model.calls(), 1, "release repeated the finished lane");
+
+        first_process.kill().expect("kill process while parked");
+        first_process.wait().expect("reap parked process");
+        let mut recovered = child_command(&root, &url, &base, "recover", None)
+            .spawn()
+            .expect("recover parked parallel graph");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            recovered
+                .try_wait()
+                .expect("poll recovered process")
+                .is_none(),
+            "recovered process should still be parked"
+        );
+        graph
+            .set_status(Actor::human("owner"), CHILDREN[1].into(), Status::Open)
+            .await
+            .expect("make second item ready");
+        release(&rt, &second, "parallel-release-after-ready").await;
+        let status = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || recovered.wait()),
+        )
+        .await
+        .expect("parallel recovery completed in time")
+        .expect("recovery wait worker")
+        .expect("recovery process status");
+        assert!(status.success(), "parallel recovery failed: {status}");
+        assert_eq!(model.calls(), 3, "one turn per child, including recovery");
+        let result = std::fs::read_to_string(root.join("result.txt")).expect("graph result");
+        assert!(result.starts_with("Ok("), "{result}");
+        let (rows, steps) = inspect(&root).await;
+        assert!(
+            rows.iter()
+                .all(|(_, status, sha)| status == "closed" && sha.len() == 40),
+            "{rows:?}"
+        );
+        assert!(steps.contains(&"graph.00002.claim.park".to_owned()));
+        assert!(steps.contains(&"graph.00003.claim.park".to_owned()));
+        assert!(steps.contains(&"epic.done".to_owned()));
+    });
+}
+
+#[test]
 fn reviewed_graph_gate_releases_with_handoff_and_reclaims_after_kill_restart() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
