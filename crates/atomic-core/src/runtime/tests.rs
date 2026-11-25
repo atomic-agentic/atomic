@@ -701,6 +701,7 @@ fn compiler_failures_never_spend_a_repair_call() {
                     name: "infrastructure-test",
                     place: Place::of("run-1", "infrastructure-test"),
                     env: Default::default(),
+                    native_tools: None,
                 },
                 &check,
             )
@@ -2828,6 +2829,7 @@ async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them(
             .iter()
             .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
             .collect(),
+        native_tools: None,
     };
     use crate::typed::Sandbox::{ReadOnly, WorkspaceWrite};
     // Outside a worktree step, nothing of the caches.

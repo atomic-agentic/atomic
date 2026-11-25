@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Private, typed graph proposals for one atom attempt. This module does not
-//! touch the committed graph. A future host bridge can expose its operations
-//! as tools, then publish an accepted batch under the claim's lease fence.
+//! touch the committed graph. The host bridge exposes its operations as
+//! tools, then publishes an accepted batch under the claim's lease fence.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -330,6 +330,11 @@ impl ProposalBuffer {
             attempt,
             operations: Vec::new(),
         }
+    }
+
+    /// The owning attempt, for the host's private read overlay.
+    pub fn attempt(&self) -> &AttemptKey {
+        &self.attempt
     }
 
     /// Parse and validate a JSON tool argument before assigning its stable

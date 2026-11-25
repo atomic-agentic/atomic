@@ -6,4 +6,5 @@ pub mod goal;
 pub mod proposal;
 pub mod sqlite;
 pub mod store;
+pub mod tools;
 pub mod transactional_claim;

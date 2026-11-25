@@ -28,10 +28,8 @@ sha2 = { workspace = true }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["rt", "time", "sync"] }
 
-# The conformance suite in tests/ is std alone, so there is nothing here yet.
-# `Cargo.lock` records this package with no dependencies and CI runs cargo with
-# `--locked`, so a dev-dependency arrives with the lockfile change it needs —
-# which is step 3 of the store gate in tests/conformance.rs (tokio, for a store
-# built on a connection pool). Until then the suite drives its checks with a
-# std-only executor of its own; see tests/harness/mod.rs.
+# The model-tool regression uses core's scripted fake model and the local
+# execution backend. The conformance suite remains std-only.
 [dev-dependencies]
+atomic-core = { package = "atomic-agentic-core", path = "../atomic-core", features = ["fake-model"] }
+atomic-exec = { package = "atomic-agentic-exec", path = "../atomic-exec" }

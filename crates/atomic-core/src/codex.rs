@@ -83,6 +83,10 @@ use codex_core_api::passthrough_image_store;
 use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
 use codex_extension_api::SkillInvocationContributor;
+use codex_extension_api::{
+    FunctionCallError, JsonToolOutput, ResponsesApiTool, ToolCall, ToolContributor, ToolExecutor,
+    ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, parse_tool_input_schema,
+};
 use codex_protocol::config_types::TrustLevel;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -136,6 +140,125 @@ pub struct TurnSpec {
     /// directory, which it may not write, is out of its reach too: it cannot
     /// even list it.
     pub denied: Vec<PathBuf>,
+    /// Host-owned tools for this attempt. The host supplies a fixed, bounded
+    /// list; model calls cannot add tools or grant themselves authority.
+    pub native_tools: Option<Arc<dyn NativeToolHost>>,
+}
+
+/// Model-visible definition of one host-owned tool.
+#[derive(Clone, Debug)]
+pub struct NativeToolSpec {
+    /// Stable model-facing name.
+    pub name: &'static str,
+    /// Purpose presented to the model.
+    pub description: &'static str,
+    /// Advertised JSON argument shape; the host validates again at execution.
+    pub parameters: serde_json::Value,
+    /// Read responses contain graph text and are treated as external context.
+    pub external_context: bool,
+}
+
+/// A capability attached by the host to one turn, never by an atom's input.
+pub trait NativeToolHost: Send + Sync + std::fmt::Debug {
+    /// Fixed tool definitions available on this turn.
+    fn specs(&self) -> Vec<NativeToolSpec>;
+    /// Execute a bounded argument. The host owns all authority and state.
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        arguments: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send + 'a>,
+    >;
+}
+
+struct NativeToolContributor {
+    tools: Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>>,
+}
+
+impl ToolContributor for NativeToolContributor {
+    fn tools(
+        &self,
+        _session_store: &codex_extension_api::ExtensionData,
+        _thread_store: &codex_extension_api::ExtensionData,
+    ) -> Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> {
+        self.tools.clone()
+    }
+}
+
+struct NativeToolExecutor {
+    host: Arc<dyn NativeToolHost>,
+    name: &'static str,
+    spec: ToolSpec,
+    external_context: bool,
+}
+
+impl<'call> ToolExecutor<ToolCall<'call>> for NativeToolExecutor {
+    fn tool_name(&self) -> ToolName {
+        ToolName::new(None, self.name)
+    }
+    fn spec(&self) -> ToolSpec {
+        self.spec.clone()
+    }
+    fn handle<'a>(&'a self, call: ToolCall<'call>) -> ToolExecutorFuture<'a>
+    where
+        ToolCall<'call>: 'a,
+    {
+        Box::pin(async move {
+            let raw = call.function_arguments()?;
+            if raw.len() > 16 * 1024 {
+                return Err(FunctionCallError::RespondToModel(
+                    "tool argument exceeds 16 KiB".into(),
+                ));
+            }
+            let arguments = serde_json::from_str(raw).map_err(|e| {
+                FunctionCallError::RespondToModel(format!("invalid tool argument: {e}"))
+            })?;
+            let value = self
+                .host
+                .call(self.name, arguments)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            let output = JsonToolOutput::new(value);
+            let output = if self.external_context {
+                output.with_external_context()
+            } else {
+                output
+            };
+            Ok(Box::new(output) as Box<dyn ToolOutput>)
+        })
+    }
+}
+
+fn native_tool_contributor(host: Arc<dyn NativeToolHost>) -> anyhow::Result<NativeToolContributor> {
+    let mut tools: Vec<Arc<dyn for<'call> ToolExecutor<ToolCall<'call>>>> = Vec::new();
+    let specs = host.specs();
+    anyhow::ensure!(specs.len() <= 16, "too many native tools");
+    let mut names = std::collections::HashSet::new();
+    for spec in specs {
+        anyhow::ensure!(names.insert(spec.name), "duplicate native tool name");
+        anyhow::ensure!(
+            spec.name.starts_with("graph_"),
+            "unsupported native tool name"
+        );
+        let parameters = parse_tool_input_schema(&spec.parameters)
+            .with_context(|| format!("parse {} tool schema", spec.name))?;
+        let tool = ToolSpec::Function(ResponsesApiTool {
+            name: spec.name.to_owned(),
+            description: spec.description.to_owned(),
+            strict: false,
+            defer_loading: None,
+            parameters,
+            output_schema: None,
+        });
+        tools.push(Arc::new(NativeToolExecutor {
+            host: Arc::clone(&host),
+            name: spec.name,
+            spec: tool,
+            external_context: spec.external_context,
+        }));
+    }
+    Ok(NativeToolContributor { tools })
 }
 
 /// What a thread's commands are kept out of. It has no default: every
@@ -4968,6 +5091,9 @@ where
     // [`ATOMIC_NEEDS_HOST_SKILLS`]).
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     extensions.skill_invocation_contributor(Arc::new(NoSkillCatalog));
+    if let Some(host) = &spec.native_tools {
+        extensions.tool_contributor(Arc::new(native_tool_contributor(Arc::clone(host))?));
+    }
     let startup = codex_core_api::build_startup_models(
         &config,
         Arc::clone(&auth_manager),
