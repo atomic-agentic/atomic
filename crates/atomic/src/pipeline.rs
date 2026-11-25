@@ -82,7 +82,7 @@ use atomic_durable::{
     WorkflowContext, execute_candidate_told, failpoint, publish_candidate, review_candidate,
 };
 use atomic_graph::{
-    handoff::Handoff,
+    handoff::{FileAtRelease, Handoff, HandoffFileStatus, snapshot_changed_files},
     store::Lease,
     transactional_claim::{self, ClaimNext, ReviewFollowup, WorkItem},
 };
@@ -2091,6 +2091,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                                     &claim_input,
                                     item,
                                     claim_base.as_deref(),
+                                    None,
                                 )
                                 .map(|_| ())
                             },
@@ -2131,6 +2132,29 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     break;
                 }
             };
+            let resolved_handoff = if let Some(handoff) = &item.handoff {
+                let worktrees = run_worktrees
+                    .as_ref()
+                    .ok_or_else(|| failed("graph handoff has no bound repository".into()))?;
+                let repo = worktrees.repo().clone();
+                let base = if let Some(base) = accepted.last() {
+                    base.clone()
+                } else {
+                    worktrees
+                        .base(&id)
+                        .map_err(|e| failed(format!("graph handoff pinned base: {e}")))?
+                        .ok_or_else(|| failed("graph handoff has no pinned base".into()))?
+                };
+                let handoff = handoff.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || handoff.compare_git(&repo, &base))
+                        .await
+                        .map_err(|e| failed(format!("graph handoff comparison task: {e}")))?
+                        .map_err(|e| failed(format!("graph handoff comparison: {e}")))?,
+                )
+            } else {
+                None
+            };
             // This durable step is the boundary between policy edits and a
             // lane already under way. A recovered lane reads its choice from
             // the checkpoint; only a new lane reloads the operator's routes.
@@ -2167,6 +2191,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 &input,
                 &item,
                 accepted.last().map(String::as_str),
+                resolved_handoff.as_deref(),
             )?;
             let review_input = atom_input.clone();
             let run = RunScope {
@@ -2765,12 +2790,20 @@ fn graph_atom_input(
     original: &Value,
     item: &WorkItem,
     base: Option<&str>,
+    resolved_handoff: Option<&[HandoffFileStatus]>,
 ) -> Result<(Value, Value)> {
     let mut current = original.clone();
     let fields = current
         .as_object_mut()
         .ok_or_else(|| failed("graph run input must be an object".into()))?;
-    fields.insert("item".into(), model_graph_item(item)?);
+    let handoff_in_contract = pipeline
+        .input
+        .pointer("/properties/item/properties/handoff")
+        .is_some();
+    fields.insert(
+        "item".into(),
+        model_graph_item(item, resolved_handoff.filter(|_| handoff_in_contract))?,
+    );
     if let Some(base) = base {
         fields.insert("base".into(), Value::String(base.to_owned()));
     }
@@ -2802,15 +2835,29 @@ fn graph_atom_input(
     Ok((current, atom_input))
 }
 
-fn model_graph_item(item: &WorkItem) -> Result<Value> {
+fn model_graph_item(
+    item: &WorkItem,
+    resolved_handoff: Option<&[HandoffFileStatus]>,
+) -> Result<Value> {
     let mut value =
         serde_json::to_value(item).map_err(|e| failed(format!("encode graph item: {e}")))?;
     if let Some(object) = value.as_object_mut() {
         object.remove("criteria");
         object.remove("labels");
-        // Handoff file hashes are host state until the next claimant's
-        // workspace has been compared; never expose unresolved hashes.
+        // Git object IDs are host state. A schema that accepts handoffs sees
+        // only the host-computed changed/unchanged flags and agent prose.
         object.remove("handoff");
+        if let (Some(handoff), Some(files)) = (&item.handoff, resolved_handoff) {
+            object.insert(
+                "handoff".into(),
+                json!({
+                    "attempted": handoff.attempted,
+                    "failed": handoff.failed,
+                    "learned": handoff.learned,
+                    "files": files,
+                }),
+            );
+        }
     }
     Ok(value)
 }
@@ -4489,7 +4536,8 @@ async fn check_candidate_criteria<C: WorkflowContext>(
                 // Human release acknowledges the unknown result, never a
                 // retry. Relinquish a graph claim before terminalizing so an
                 // operator can reconcile the failed epic and start a new run.
-                release_failed_criteria_claim(ctx, &step.id, claim, &detail).await?;
+                release_failed_criteria_claim(ctx, run, &step.id, claim, candidate, &detail)
+                    .await?;
                 return Err(failed(format!(
                     "step `{}`: criterion {} outcome unknown after runner loss; reconcile before a fresh run: {detail}",
                     step.id,
@@ -4503,23 +4551,27 @@ async fn check_candidate_criteria<C: WorkflowContext>(
 
 async fn release_failed_criteria_claim<C: WorkflowContext>(
     ctx: &C,
+    run: &RunScope<'_>,
     step: &str,
     claim: Option<&Lease>,
+    candidate: &Candidate,
     reason: &str,
 ) -> Result<()> {
     let Some(claim) = claim else { return Ok(()) };
+    let files = candidate_handoff_files(run, candidate).await?;
     let token = claim.clone();
     let reason = reason.to_owned();
     let released: bool = ctx
         .transaction(&format!("{step}.criteria.failed"), move |mut tx| {
             let token = token.clone();
             let reason = reason.clone();
+            let files = files.clone();
             Box::pin(async move {
                 let handoff = Handoff {
                     attempted: "Ran the claimed item's acceptance criteria".into(),
                     failed: reason.chars().take(1024).collect(),
                     learned: "Inspect the failed criterion before a new attempt".into(),
-                    files: Vec::new(),
+                    files,
                 };
                 match transactional_claim::release_after_failure_with_handoff(
                     &mut tx, &token, &reason, &handoff,
@@ -4540,6 +4592,53 @@ async fn release_failed_criteria_claim<C: WorkflowContext>(
         )));
     }
     Ok(())
+}
+
+/// Resolve a candidate's host-recorded Git commit before a claim-release
+/// transaction. Reading immutable trees never holds a database transaction
+/// open, and a repeated durable release sees the same snapshot.
+async fn candidate_handoff_files(
+    run: &RunScope<'_>,
+    candidate: &Candidate,
+) -> Result<Vec<FileAtRelease>> {
+    let worktrees = run
+        .worktrees
+        .ok_or_else(|| failed("graph handoff has no bound repository".into()))?;
+    let repo = worktrees.repo().clone();
+    let field = |name: &str| -> Result<String> {
+        candidate
+            .proposal
+            .metadata
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| failed(format!("graph handoff has no host {name}")))
+    };
+    let base = field("base")?;
+    let commit = field("commit")?;
+    let reference = field("commit_ref")?;
+    let workflow = candidate
+        .id
+        .rsplit_once(':')
+        .map(|(run, _)| run.to_owned())
+        .ok_or_else(|| failed("graph handoff candidate ID is invalid".into()))?;
+    tokio::task::spawn_blocking(move || {
+        if !reference.starts_with(&format!("refs/atomic/{workflow}/steps/"))
+            || repo
+                .ref_target(&reference)
+                .map_err(|e| e.to_string())?
+                .as_deref()
+                != Some(commit.as_str())
+            || repo.parents(&commit).map_err(|e| e.to_string())? != [base.clone()]
+        {
+            return Err("graph handoff commit does not match its host ref and base".to_owned());
+        }
+        snapshot_changed_files(&repo, &base, &commit)
+    })
+    .await
+    .map_err(|e| failed(format!("graph handoff snapshot task: {e}")))?
+    .map_err(|e| failed(format!("graph handoff snapshot: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4606,7 +4705,8 @@ async fn unreviewed_with_criteria<C: WorkflowContext>(
                 .await?;
             }
             Some(detail) => {
-                release_failed_criteria_claim(ctx, &step.id, claim, &detail).await?;
+                release_failed_criteria_claim(ctx, run, &step.id, claim, &candidate, &detail)
+                    .await?;
                 return Err(failed(format!(
                     "step `{}`: criteria still fail after {round} author repair round(s); escalate: {detail}",
                     step.id
@@ -5402,7 +5502,15 @@ async fn reviewed<C: WorkflowContext>(
                 .await?;
                 continue;
             }
-            release_failed_criteria_claim(ctx, &step.id, claim.as_deref(), &detail).await?;
+            release_failed_criteria_claim(
+                ctx,
+                run,
+                &step.id,
+                claim.as_deref(),
+                &candidate,
+                &detail,
+            )
+            .await?;
             return Err(failed(format!(
                 "step `{}`: criteria still fail after {round} author repair round(s); escalate: {detail}",
                 step.id
@@ -5920,18 +6028,20 @@ async fn reviewed<C: WorkflowContext>(
     // gate. On approval we must acquire a new token; the gate decision by
     // itself never authorizes publication of the old candidate.
     let released_epoch = if let Some(token) = claim.as_deref() {
+        let files = candidate_handoff_files(run, &candidate).await?;
         let token = token.clone();
         let gate = id.clone();
         Some(
             ctx.transaction(&format!("{id}.claim.release"), move |mut tx| {
                 let token = token.clone();
                 let gate = gate.clone();
+                let files = files.clone();
                 Box::pin(async move {
                     let handoff = Handoff {
                         attempted: format!("Submitted a candidate to review gate {gate}"),
                         failed: "Awaiting a human decision".into(),
                         learned: "Reclaim the graph item before publishing the candidate".into(),
-                        files: Vec::new(),
+                        files,
                     };
                     let release = transactional_claim::release_for_review_gate_with_handoff;
                     release(&mut tx, &token, &gate, &handoff).await
@@ -6999,13 +7109,39 @@ mod tests {
             }],
             kind: "task".into(),
             priority: 2,
-            handoff: None,
+            handoff: Some(Handoff {
+                attempted: "Edited parser".into(),
+                failed: "Fixture failed".into(),
+                learned: "Check EOF".into(),
+                files: vec![FileAtRelease {
+                    path: "src/parser.rs".into(),
+                    entry: Some(atomic_graph::handoff::GitFingerprint {
+                        mode: "100644".into(),
+                        id: "a".repeat(40),
+                    }),
+                }],
+            }),
         };
-        let visible = model_graph_item(&item).expect("model item");
+        let visible = model_graph_item(&item, None).expect("model item");
         assert!(visible.get("criteria").is_none(), "{visible}");
         assert!(visible.get("labels").is_none(), "{visible}");
         assert_eq!(visible["acceptance_criteria"], "Human prose");
         assert_eq!(item.criteria.len(), 1, "host criteria remain frozen");
+        assert!(
+            visible.get("handoff").is_none(),
+            "raw Git IDs stay host-only"
+        );
+        let resolved = model_graph_item(
+            &item,
+            Some(&[HandoffFileStatus {
+                path: "src/parser.rs".into(),
+                changed: true,
+            }]),
+        )
+        .expect("resolved handoff");
+        assert_eq!(resolved["handoff"]["files"][0]["changed"], true);
+        assert_eq!(resolved["handoff"]["attempted"], "Edited parser");
+        assert!(!resolved.to_string().contains(&"a".repeat(40)));
     }
 
     /// A command runs again only through the effects rule: after an

@@ -5,7 +5,7 @@ use atomic_core::workflow::Criterion;
 use atomic_durable::gate::{self, HumanCredential, Principal};
 use atomic_durable::publication::{Acceptance, Candidate, Proposal, Write, publish_candidate_in};
 use atomic_durable::{DurableError, DurableRuntime, Durare, Param};
-use atomic_graph::handoff::{FileAtRelease, Handoff, HandoffFileStatus};
+use atomic_graph::handoff::{FileAtRelease, GitFingerprint, Handoff, HandoffFileStatus};
 use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{
     Actor, Draft, EdgeKind, Evidence, Finish, GraphStore, Status, StoreError,
@@ -965,11 +965,17 @@ async fn terminal_failure_release_fences_exact_claim_and_leaves_handoff() {
         files: vec![
             FileAtRelease {
                 path: "src/changed.rs".into(),
-                sha256: Some("a".repeat(64)),
+                entry: Some(GitFingerprint {
+                    mode: "100644".into(),
+                    id: "a".repeat(40),
+                }),
             },
             FileAtRelease {
                 path: "src/unchanged.rs".into(),
-                sha256: Some("b".repeat(64)),
+                entry: Some(GitFingerprint {
+                    mode: "100644".into(),
+                    id: "b".repeat(40),
+                }),
             },
         ],
     };
@@ -1061,8 +1067,20 @@ async fn terminal_failure_release_fences_exact_claim_and_leaves_handoff() {
     };
     assert_eq!(item.handoff, Some(handoff.clone()));
     let current = BTreeMap::from([
-        ("src/changed.rs".into(), Some("c".repeat(64))),
-        ("src/unchanged.rs".into(), Some("b".repeat(64))),
+        (
+            "src/changed.rs".into(),
+            Some(GitFingerprint {
+                mode: "100644".into(),
+                id: "c".repeat(40),
+            }),
+        ),
+        (
+            "src/unchanged.rs".into(),
+            Some(GitFingerprint {
+                mode: "100644".into(),
+                id: "b".repeat(40),
+            }),
+        ),
     ]);
     assert_eq!(
         handoff
