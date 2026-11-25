@@ -646,18 +646,17 @@ pub async fn record_queue_observation_in(
         "SELECT delivery_run,plan_digest,repository,pull_request_number,head,status,provider_event_id,merge_sha,happened_at,observed_at,detail FROM atomic_delivery_queue_observations WHERE delivery_run=?",
         &[text(run)],
     ).await?;
-    if let Some(row) = &existing {
-        if row.text("plan_digest")? != plan_digest
+    if let Some(row) = &existing
+        && (row.text("plan_digest")? != plan_digest
             || row.text("repository")? != repository
             || row.int("pull_request_number")?
                 != i64::try_from(number)
                     .map_err(|_| refuse("pull request number exceeds stored range"))?
-            || row.text("head")? != head
-        {
-            return Err(refuse(
-                "queue observation conflicts with its frozen delivery",
-            ));
-        }
+            || row.text("head")? != head)
+    {
+        return Err(refuse(
+            "queue observation conflicts with its frozen delivery",
+        ));
     }
     let (status, event, merge_sha, happened_at, detail): (
         &str,

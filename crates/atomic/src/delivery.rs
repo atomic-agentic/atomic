@@ -25,6 +25,12 @@ enum DeliveryDecision {
     Unknown,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InitialQueueRead {
+    outcome: QueueOutcome,
+    observed_at: Option<i64>,
+}
+
 /// Input frozen when the host starts a delivery run.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct DeliveryRun {
@@ -331,11 +337,8 @@ pub(crate) async fn command(
                 .own_run_record(&run_id)
                 .await?
                 .with_context(|| format!("no delivery run {run_id} in this project"))?;
-            if record.workflow != delivery_effect::WORKFLOW
-                || record.version != rt.version()
-                || !matches!(record.status, RunStatus::Succeeded)
-            {
-                bail!("queue observation requires a completed delivery run at this layout");
+            if record.workflow != delivery_effect::WORKFLOW || record.version != rt.version() {
+                bail!("queue observation requires a delivery run at this layout");
             }
             let frozen: DeliveryRun =
                 serde_json::from_value(record.input).context("invalid frozen delivery run")?;
@@ -354,18 +357,13 @@ pub(crate) async fn command(
             {
                 bail!("queue observation source differs from its frozen delivery");
             }
-            let source = frozen.source.clone();
             let plan = frozen.plan.clone();
             let run = run_id.clone();
             let project = rt.project().map(str::to_owned);
             let (pr, queue) = rt
                 .control_transaction(move |mut tx| {
-                    let (source, plan, run, project) =
-                        (source.clone(), plan.clone(), run.clone(), project.clone());
+                    let (plan, run, project) = (plan.clone(), run.clone(), project.clone());
                     Box::pin(async move {
-                        delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
-                            .await
-                            .map_err(|error| failed(format!("delivery source: {error}")))?;
                         delivery_effect::queue_receipts_in(&mut tx, &plan, &run, project.as_deref())
                             .await
                     })
@@ -380,23 +378,14 @@ pub(crate) async fn command(
             let observed_at =
                 i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())
                     .context("observation time exceeds stored range")?;
-            let source = frozen.source;
             let plan = frozen.plan;
             let run = run_id.clone();
             let project = rt.project().map(str::to_owned);
             let observation = rt
                 .control_transaction(move |mut tx| {
-                    let (source, plan, run, project, outcome) = (
-                        source.clone(),
-                        plan.clone(),
-                        run.clone(),
-                        project.clone(),
-                        outcome.clone(),
-                    );
+                    let (plan, run, project, outcome) =
+                        (plan.clone(), run.clone(), project.clone(), outcome.clone());
                     Box::pin(async move {
-                        delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
-                            .await
-                            .map_err(|error| failed(format!("delivery source: {error}")))?;
                         delivery_effect::record_queue_observation_in(
                             &mut tx,
                             &plan,
@@ -610,58 +599,88 @@ async fn execute<C: WorkflowContext>(
         .last()
         .and_then(|effect| effect.get("receipt"))
         .ok_or_else(|| failed("delivery has no applied enqueue receipt"))?;
-    let outcome = match remote.observe_queue(&plan, pr, queue).await {
-        Ok(outcome) => outcome,
-        Err(_) => QueueOutcome::Failed {
-            detail: "provider observation unavailable or inconsistent".into(),
-        },
-    };
-    let observed_at = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| failed("queue observation time is unavailable"))?
-            .as_millis(),
-    )
-    .map_err(|_| failed("queue observation time exceeds stored range"))?;
-    let (source, plan_for_observation, run, project) = (
-        source.clone(),
-        plan.clone(),
-        ctx.workflow_id().to_owned(),
-        ctx.project().map(str::to_owned),
-    );
-    let observation = ctx
-        .control_transaction(move |mut tx| {
-            let (source, plan, run, project, outcome) = (
-                source.clone(),
-                plan_for_observation.clone(),
-                run.clone(),
-                project.clone(),
-                outcome.clone(),
+    let (remote_for_read, plan_for_read, pr_for_read, queue_for_read) =
+        (remote.clone(), plan.clone(), pr.clone(), queue.clone());
+    let initial: InitialQueueRead = ctx
+        .step("delivery.queue_observation.initial", move |_| {
+            let (remote, plan, pr, queue) = (
+                remote_for_read.clone(),
+                plan_for_read.clone(),
+                pr_for_read.clone(),
+                queue_for_read.clone(),
             );
-            Box::pin(async move {
-                delivery_evidence::revalidate_delivery_source_in(&mut tx, &source)
-                    .await
-                    .map_err(|error| failed(format!("delivery source: {error}")))?;
-                delivery_effect::record_queue_observation_in(
-                    &mut tx,
-                    &plan,
-                    &run,
-                    project.as_deref(),
+            async move {
+                let observed_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
+                    Ok(duration) => match i64::try_from(duration.as_millis()) {
+                        Ok(ms) if ms > 0 => Some(ms),
+                        _ => None,
+                    },
+                    Err(_) => None,
+                };
+                let outcome = if observed_at.is_some() {
+                    match remote.observe_queue(&plan, &pr, &queue).await {
+                        Ok(outcome) => outcome,
+                        Err(_) => QueueOutcome::Failed {
+                            detail: "provider observation unavailable or inconsistent".into(),
+                        },
+                    }
+                } else {
+                    QueueOutcome::Failed {
+                        detail: "queue observation clock unavailable".into(),
+                    }
+                };
+                Ok(InitialQueueRead {
                     outcome,
                     observed_at,
-                )
-                .await
-            })
-        })
-        .await?;
-    let initial = observation.clone();
-    let projected = ctx
-        .step("delivery.queue_observation.initial", move |_| async move {
-            Ok(initial)
+                })
+            }
         })
         .await?;
     failpoint("delivery:after-observation");
+    let fallback = json!({
+        "delivery_run":ctx.workflow_id(),
+        "repository":plan.enqueue["repository"],
+        "pull_request_number":pr["number"],
+        "head":plan.enqueue["head"],
+        "outcome":{"status":"failed","detail":"durable queue observation unavailable or inconsistent"},
+        "observed_at":initial.observed_at,
+    });
+    let observation = if let Some(observed_at) = initial.observed_at {
+        let (plan_for_observation, run, project, outcome) = (
+            plan.clone(),
+            ctx.workflow_id().to_owned(),
+            ctx.project().map(str::to_owned),
+            initial.outcome.clone(),
+        );
+        match ctx
+            .control_transaction(move |mut tx| {
+                let (plan, run, project, outcome) = (
+                    plan_for_observation.clone(),
+                    run.clone(),
+                    project.clone(),
+                    outcome.clone(),
+                );
+                Box::pin(async move {
+                    delivery_effect::record_queue_observation_in(
+                        &mut tx,
+                        &plan,
+                        &run,
+                        project.as_deref(),
+                        outcome,
+                        observed_at,
+                    )
+                    .await
+                })
+            })
+            .await
+        {
+            Ok(recorded) => json!(recorded),
+            Err(_) => fallback,
+        }
+    } else {
+        fallback
+    };
     Ok(
-        json!({"source_run":plan.source_run,"occurrence":plan.occurrence,"effects":completed,"queue_observation":projected}),
+        json!({"source_run":plan.source_run,"occurrence":plan.occurrence,"effects":completed,"queue_observation":observation}),
     )
 }

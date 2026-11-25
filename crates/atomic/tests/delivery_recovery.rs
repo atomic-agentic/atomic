@@ -518,7 +518,7 @@ async fn queue_observation_records_pending_failure_merge_and_drop_once_after_res
             serde_json::from_slice(&premature.stdout).expect("parse early observation refusal");
         assert_eq!(
             refused["error"]["description"],
-            "queue observation requires a completed delivery run at this layout",
+            "delivery requires this run's human-approved operator gate",
             "wrong early-observation refusal: {premature:?}"
         );
         assert!(!dir.join("remote-state.json").exists());
@@ -543,6 +543,27 @@ async fn queue_observation_records_pending_failure_merge_and_drop_once_after_res
                 Some(9),
                 "initial queue observation did not checkpoint before process kill: {killed:?}"
             );
+            let state_path = dir.join("remote-state.json");
+            let mut state: Value = serde_json::from_slice(
+                &fs::read(&state_path).expect("read queued provider state after kill"),
+            )
+            .expect("parse queued provider state after kill");
+            let key = state["queue"]
+                .as_object()
+                .expect("queue map after kill")
+                .keys()
+                .next()
+                .expect("queued PR after kill")
+                .clone();
+            state["queue"][&key]["status"] = json!("merged");
+            state["queue"][&key]["event_id"] = json!("queue:merged:1");
+            state["queue"][&key]["merge_sha"] = json!(TRIAL_HEAD);
+            state["queue"][&key]["happened_at"] = json!(1_800_000_000_000_i64);
+            fs::write(
+                state_path,
+                serde_json::to_vec(&state).expect("encode provider transition"),
+            )
+            .expect("record provider transition while atomic is stopped");
         }
         let completed: Value = serde_json::from_slice(&success(resume(&root, None)))
             .expect("parse completed delivery");
@@ -567,29 +588,86 @@ async fn queue_observation_records_pending_failure_merge_and_drop_once_after_res
             serde_json::from_slice(&fs::read(dir.join("remote-state.json")).expect("fake state"))
                 .expect("parse fake state")
         };
-        fs::write(dir.join("unreadable-enqueue"), "").expect("block provider read");
-        let failed = observe();
-        assert_eq!(failed["outcome"]["status"], "failed");
-        fs::remove_file(dir.join("unreadable-enqueue")).expect("restore provider read");
-        let pending = observe();
-        assert_eq!(pending["outcome"]["status"], "pending");
-        assert_eq!(pending["head"], HEAD);
-        assert_eq!(pending["pull_request_number"], 1);
-        let mut config: Value = serde_json::from_slice(
-            &fs::read(dir.join("target.json")).expect("read operator target"),
-        )
-        .expect("parse operator target");
-        config["title"] = json!("Later change");
-        config["repository"] = json!("test/later-repo");
-        config["branch_ref"] = json!("refs/heads/later-lane");
-        config["expected_old"] = json!(HEAD);
-        fs::write(
-            dir.join("target.json"),
-            serde_json::to_vec(&config).expect("encode later target"),
-        )
-        .expect("write later operator target");
-        assert_eq!(observe()["outcome"]["status"], "pending");
-        fs::remove_file(dir.join("target.json")).expect("retire old operator target");
+        if final_status == "merged" {
+            assert_eq!(
+                read_state()["observe_calls"]["enqueue"],
+                1,
+                "replay must use the checkpointed initial read after provider transition"
+            );
+            let rt = Durare::open(
+                &Database::Sqlite(root.join("state/private").join(&id).join("atomic.db")),
+                None,
+                LAYOUT_VERSION,
+                &format!("project/{id}"),
+            )
+            .await
+            .expect("open resumed observation store");
+            let stored: String = rt
+                .control_transaction(|mut tx| {
+                    Box::pin(async move {
+                        tx.query_one(
+                            "SELECT status FROM atomic_delivery_queue_observations WHERE delivery_run=?",
+                            &[text(RUN)],
+                        )
+                        .await?
+                        .text("status")
+                    })
+                })
+                .await
+                .expect("read initial checkpointed observation");
+            assert_eq!(stored, "pending", "row must agree with replayed run output");
+            drop(rt);
+        }
+        if final_status == "removed" {
+            // The remote effect was applied while this run and source were valid.
+            // Later local state changes must not prevent a read-only observation.
+            let rt = Durare::open(
+                &Database::Sqlite(root.join("state/private").join(&id).join("atomic.db")),
+                None,
+                LAYOUT_VERSION,
+                &format!("project/{id}"),
+            )
+            .await
+            .expect("open delivered store for historical observation");
+            rt.control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.execute("UPDATE atomic_graph_items SET status='open' WHERE id='item'", &[])
+                        .await?;
+                    tx.execute(
+                        "UPDATE workflow_status SET status='ERROR', error='later local failure' WHERE workflow_uuid=?",
+                        &[text(RUN)],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("change local run and source after enqueue");
+            drop(rt);
+            fs::write(dir.join("unreadable-enqueue"), "").expect("block provider read");
+            let failed = observe();
+            assert_eq!(failed["outcome"]["status"], "failed");
+            fs::remove_file(dir.join("unreadable-enqueue")).expect("restore provider read");
+            let pending = observe();
+            assert_eq!(pending["outcome"]["status"], "pending");
+            assert_eq!(pending["head"], HEAD);
+            assert_eq!(pending["pull_request_number"], 1);
+            let mut config: Value = serde_json::from_slice(
+                &fs::read(dir.join("target.json")).expect("read operator target"),
+            )
+            .expect("parse operator target");
+            config["title"] = json!("Later change");
+            config["repository"] = json!("test/later-repo");
+            config["branch_ref"] = json!("refs/heads/later-lane");
+            config["expected_old"] = json!(HEAD);
+            fs::write(
+                dir.join("target.json"),
+                serde_json::to_vec(&config).expect("encode later target"),
+            )
+            .expect("write later operator target");
+            assert_eq!(observe()["outcome"]["status"], "pending");
+            fs::remove_file(dir.join("target.json")).expect("retire old operator target");
+        }
         let mut state = read_state();
         let queue_key = state["queue"]
             .as_object()
@@ -598,14 +676,16 @@ async fn queue_observation_records_pending_failure_merge_and_drop_once_after_res
             .next()
             .expect("queued pull request")
             .clone();
-        state["queue"][&queue_key]["head"] = json!(TRIAL_HEAD);
-        fs::write(
-            dir.join("remote-state.json"),
-            serde_json::to_vec(&state).expect("encode wrong provider head"),
-        )
-        .expect("write wrong provider head");
-        assert_eq!(observe()["outcome"]["status"], "failed");
-        state["queue"][&queue_key]["head"] = json!(HEAD);
+        if final_status == "removed" {
+            state["queue"][&queue_key]["head"] = json!(TRIAL_HEAD);
+            fs::write(
+                dir.join("remote-state.json"),
+                serde_json::to_vec(&state).expect("encode wrong provider head"),
+            )
+            .expect("write wrong provider head");
+            assert_eq!(observe()["outcome"]["status"], "failed");
+            state["queue"][&queue_key]["head"] = json!(HEAD);
+        }
         state["queue"][&queue_key]["status"] = json!(final_status);
         state["queue"][&queue_key]["event_id"] = json!(format!("queue:{final_status}:1"));
         state["queue"][&queue_key]["happened_at"] = json!(1_800_000_000_000_i64);
