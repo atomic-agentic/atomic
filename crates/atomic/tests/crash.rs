@@ -1176,6 +1176,7 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
             "graph:after-review-reclaim",
             "graph:after-proof-stage",
             "graph:after-proof-release",
+            "graph:before-finalize",
             "graph:after-finalize-applied",
             "graph:after-verified-publish",
         ];
