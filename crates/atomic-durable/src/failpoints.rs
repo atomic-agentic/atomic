@@ -156,6 +156,11 @@ pub const SITES: &[Site] = &[
                checkpointed",
     },
     Site {
+        name: "delivery:after-observation",
+        what: "the initial read-only queue observation checkpointed; its durable row has not \
+               been recorded and the delivery workflow has not returned",
+    },
+    Site {
         name: "delivery:after-decision",
         what: "the delivery decision checkpointed; a later operation has not started",
     },
