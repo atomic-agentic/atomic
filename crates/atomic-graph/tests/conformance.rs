@@ -895,6 +895,7 @@ fn the_production_source_is_the_recorded_set() {
             "goal.rs",
             "lib.rs",
             "proposal.rs",
+            "publication.rs",
             "sqlite.rs",
             "sqlite/goals.rs",
             "store.rs",
