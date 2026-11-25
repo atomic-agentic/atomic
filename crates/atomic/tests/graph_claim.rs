@@ -1475,6 +1475,7 @@ async fn postgres_contender_cannot_steal_a_lease_renewed_after_its_stale_read() 
 
     let (renewed_tx, mut renewed_rx) = tokio::sync::watch::channel(None::<i64>);
     let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let original_for_validation = original.clone();
     let holder_rt = rt.clone();
     let holder = tokio::spawn(async move {
         holder_rt
@@ -1560,8 +1561,10 @@ async fn postgres_contender_cannot_steal_a_lease_renewed_after_its_stale_read() 
         attempted.is_none(),
         "a stale contender must not replace a lease renewed before its UPSERT"
     );
-    rt.control_transaction(|mut tx| {
+    rt.control_transaction(move |mut tx| {
+        let original = original_for_validation.clone();
         Box::pin(async move {
+            transactional_claim::validate(&mut tx, &original).await?;
             let row = tx
                 .query_one(
                     "SELECT claimant,epoch,expires_at FROM atomic_graph_leases WHERE item_id=?",
