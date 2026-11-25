@@ -10,7 +10,7 @@
 [codex]
 repository = "https://github.com/atomic-agentic/codex"
 upstream = "https://github.com/openai/codex"
-branch = "codex/atomic-key-redirect-pin"
+branch = "atomic"
 tag = "rust-v0.169.0"
 upstream_rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
 rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726"
