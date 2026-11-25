@@ -250,6 +250,116 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
 }
 
 #[tokio::test]
+async fn identical_panel_findings_file_one_task_with_each_reviewer_credited() {
+    let (rt, store, path) = setup("review-panel-coalesce").await;
+    create(&store, "epic", None, true).await;
+    create(&store, "one", Some("epic"), false).await;
+    store
+        .authorize_graph_run("epic", "run-one")
+        .await
+        .expect("authorize");
+    rt.control_transaction(|mut tx| {
+        Box::pin(
+            async move { transactional_claim::bind_epic_run(&mut tx, "epic", "run-one").await },
+        )
+    })
+    .await
+    .expect("bind");
+    let ClaimNext::Claimed { lease, .. } = select(&rt, "claim-panel").await else {
+        panic!("expected claimed item");
+    };
+    let first = ReviewFollowup {
+        reviewer: "reviewer-a".into(),
+        file: "docs/guide.md".into(),
+        line: Some(1),
+        severity: "low".into(),
+        category: "formatting".into(),
+        message: "Remove the trailing space.".into(),
+    };
+    let second = ReviewFollowup {
+        reviewer: "reviewer-b".into(),
+        ..first.clone()
+    };
+    let distinct = ReviewFollowup {
+        reviewer: "reviewer-c".into(),
+        severity: "nit".into(),
+        ..first.clone()
+    };
+    for panel in [
+        vec![first.clone(), distinct.clone(), second.clone()],
+        vec![second, first, distinct],
+    ] {
+        let lease = lease.clone();
+        rt.control_transaction(move |mut tx| {
+            let lease = lease.clone();
+            let panel = panel.clone();
+            Box::pin(async move {
+                transactional_claim::file_review_followups(
+                    &mut tx,
+                    &lease,
+                    "epic",
+                    "run-one",
+                    "one.review",
+                    &panel,
+                )
+                .await
+            })
+        })
+        .await
+        .expect("file or replay panel in a different order");
+    }
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            let count = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE kind='task' AND id LIKE 'atomic-review-%'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(count.int("n")?, 2, "identical findings share one task");
+            let requests = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM atomic_graph_requests WHERE kind='review-followup'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(requests.int("n")?, 2, "replay keeps stable requests");
+            let low = tx
+                .query_one(
+                    "SELECT body,parent FROM atomic_graph_items WHERE body LIKE '%Severity: low%' AND id LIKE 'atomic-review-%'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(low.text_opt("parent")?, None);
+            assert!(
+                low.text("body")?.starts_with("Reviewers:\n- reviewer-a\n- reviewer-b\n"),
+                "both reviewers are credited in stable order"
+            );
+            let nit = tx
+                .query_one(
+                    "SELECT body FROM atomic_graph_items WHERE body LIKE '%Severity: nit%' AND id LIKE 'atomic-review-%'",
+                    &[],
+                )
+                .await?;
+            assert!(nit.text("body")?.contains("Reviewers:\n- reviewer-c\n"));
+            let links = tx
+                .query_one(
+                    "SELECT COUNT(*) AS n FROM atomic_graph_edges WHERE kind='discovered-from' AND target='one' AND source LIKE 'atomic-review-%'",
+                    &[],
+                )
+                .await?;
+            assert_eq!(links.int("n")?, 2);
+            Ok(())
+        })
+    })
+    .await
+    .expect("inspect coalesced tasks");
+    drop(rt);
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn claim_freezes_operator_criteria_separately_from_imported_prose() {
     let (rt, store, path) = setup("item-criteria-snapshot").await;
     create(&store, "epic", None, true).await;
