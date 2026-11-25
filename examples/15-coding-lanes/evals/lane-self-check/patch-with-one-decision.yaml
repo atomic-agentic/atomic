@@ -9,6 +9,6 @@ input:
     +    if findings and not verified(verification):
              return {"confirmed": False, "claim": claim, "reason": "unverified finding"}
 expect:
-- output.decisions.size() == 1
-- output.decisions[0].point == 'candidate publication'
+# The patch has a branch, but the host lists no decision points in this input.
+- output.decisions.size() == 0
 - output.controls.size() == 0
