@@ -91,11 +91,12 @@ confinement and hides other projects’ scratch directories. A failed criterion
 enters a bounded repair round. Diagnostic text is redacted before atomic
 checkpoints it or passes it to the repair model.
 
-`atomic run <workflow> --graph-epic <id> --lanes N` starts up to 16 ready
-coding items at once. Each lane has its own durable child workflow and Git
-worktree. The process admits one backend shell command at a time across its
-lanes; a lane waiting for that slot is named in the log. A restarted run
-reattaches to its recorded children and resumes their unfinished steps.
+`atomic run <workflow> --graph-epic <id> --lanes 1` works ready coding items
+in order. The parallel child workflow machinery has separate durable steps
+and Git worktrees, but the CLI refuses `--lanes` above one before creating
+project state. Its process-local command slot covers backend commands only;
+Codex shell commands and other Atomic processes do not share that slot. A
+host-wide command pool must cover both paths before parallel runs are admitted.
 
 `atomic goals list` and `atomic goals show` use the same read-only inspection
 path as graph export. Graph JSONL preserves a pinned goal item and its child

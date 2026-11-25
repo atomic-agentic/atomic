@@ -4750,6 +4750,44 @@ fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
     });
 }
 
+#[test]
+fn cli_refuses_parallel_lanes_before_it_records_a_run() {
+    on_codex_runtime(async {
+        let root = scratch("unbounded-parallel-lanes");
+        let (project, base) = project(&root);
+        let result = cli(
+            &root,
+            &project,
+            "http://127.0.0.1:9/v1",
+            &[
+                "--json",
+                "run",
+                "workflows/fix.workflow.yaml",
+                "--graph-epic",
+                EPIC,
+                "--lanes",
+                "2",
+                "--data",
+                &json!({"base": base}).to_string(),
+            ],
+        )
+        .await;
+        assert!(!result.status.success(), "parallel run was admitted");
+        let output: Value = serde_json::from_slice(&result.stdout).expect("structured refusal");
+        assert_eq!(output["error"]["kind"], "graph.command_pool_unavailable");
+        assert!(
+            output["error"]["action"]
+                .as_str()
+                .is_some_and(|action| action.contains("--lanes 1")),
+            "{output}"
+        );
+        assert!(
+            !root.join("state-home").exists(),
+            "an unsupported graph run must not touch its durable state"
+        );
+    });
+}
+
 // needs_sandbox
 #[cfg(feature = "sandbox-tests")]
 #[test]
@@ -4804,7 +4842,7 @@ fn cli_run_graph_epic_completes_one_work_item_with_a_real_fixture() {
                     "--graph-epic",
                     EPIC,
                     "--lanes",
-                    "3",
+                    "1",
                     "--run-id",
                     RUN,
                     "--data",

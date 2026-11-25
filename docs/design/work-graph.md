@@ -115,8 +115,10 @@ and runs a one-worktree-step workflow with
 With `--lanes N`, up to N ready children run as separate durable child
 workflows. The parent records each claim and child link in ordinal order,
 then joins the children; each child checkpoints its own turn, review and
-publication, so completion order cannot alter replay. Backend commands share
-one build slot in the process, and the log names a lane while it waits.
+publication, so completion order cannot alter replay. The workflow has a
+process-local slot around backend commands, but Codex shell commands do not
+pass through it. CLI admission therefore refuses `--lanes` above one until a
+host-wide pool covers both paths and can recover a slot after a process crash.
 The workflow's input contract
 declares an optional `item` object, but the operator omits it: atomic selects a
 ready direct child, including an imported Beads `acceptance_criteria` string

@@ -131,7 +131,8 @@ pub struct RunArgs {
     /// Work every ready child of this pinned graph epic with the named workflow template.
     #[arg(long, value_name = "EPIC_ID")]
     pub graph_epic: Option<String>,
-    /// Run this many ready graph items concurrently (1 to 16).
+    /// Run this many ready graph items concurrently (1 to 16). Parallel
+    /// admission currently fails until the host can bound Codex shell commands.
     #[arg(long, value_name = "N", requires = "graph_epic", value_parser = parse_lanes)]
     pub lanes: Option<usize>,
     /// Kill this development build after the named workflow step commits,
@@ -159,6 +160,19 @@ fn parse_lanes(value: &str) -> Result<usize, String> {
         .contains(&lanes)
         .then_some(lanes)
         .ok_or_else(|| "lanes must be an integer from 1 to 16".to_owned())
+}
+
+/// Refuse a parallel graph run before it obtains project state. The current
+/// process-local backend slot cannot cover a Codex shell command.
+pub fn admit_command_pool(args: &RunArgs) -> Result<(), Failure> {
+    if args.lanes.is_some_and(|lanes| lanes > 1) {
+        return Err(Failure::new(
+            "graph.command_pool_unavailable",
+            "parallel graph lanes cannot be bounded across Codex shell and backend commands on this host",
+            "run with --lanes 1 until a host-wide command pool is available",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "dev-failpoints")]
@@ -509,6 +523,7 @@ pub async fn run(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
+    admit_command_pool(&args)?;
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
