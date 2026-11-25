@@ -8690,18 +8690,17 @@ fn a_real_control_runner_proves_the_bound_candidate_before_review() {
             .expect("run cache")
             .expect("run cache entry")
             .path();
-        // Exec cache components include the stable step hash when a name has
-        // dots. Seed the target the old shared-cache behavior would reuse.
+        // Seed the exec-scoped target a controls process would reuse without
+        // the private Cargo home target override.
         let step = "code.controls.0.0";
         let digest = format!("{:x}", Sha256::digest(step.as_bytes()));
-        let predictable_target =
-            run_cache.join(format!("cargo-target/_code_controls_0_0-{}", &digest[..12]));
-        std::fs::create_dir_all(&predictable_target).expect("preseed old target");
+        let predictable_target = run_cache.join(format!("exec-{digest}/cargo-target"));
+        std::fs::create_dir_all(&predictable_target).expect("preseed scoped target");
         std::fs::write(
             predictable_target.join("poison"),
             "candidate preseeded target",
         )
-        .expect("poison old target");
+        .expect("poison scoped target");
         std::fs::write(&release, "continue").expect("release author");
         let out: Value = rt.result("real-host-control").await.expect("proved");
         assert_eq!(out["done"], true);
