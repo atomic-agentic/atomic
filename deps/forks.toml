@@ -11,7 +11,7 @@ upstream = "https://github.com/SamuelXing/durare"
 # The upstream commit the fork's `atomic` branch starts from.
 upstream_base = "0994da0d6425c575ad4192353399c0eb8085b68a"
 branch = "atomic"
-rev = "34bba48c1f28e7fdf8c657717d7453d724e5b4f3"
+rev = "9f4ce3a7c8870ef24974cc766be97170c40b46f2"
 licence = "MIT OR Apache-2.0"
 why = "ported to sqlx 0.9 so it links with Codex's SQLite stack; on SQLite a transaction step that may write begins IMMEDIATE, so its body runs once"
 crates = ["durare", "durare-macros"]
