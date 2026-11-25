@@ -101,9 +101,9 @@ fn examples_and_live_inputs_resolve_the_builtin_artifact_schema() {
         })
         .to_string(),
     )
-    .unwrap();
+    .expect("write artifact schema");
     let mut registry = atomic_schema::registry::Registry::new();
-    let atom = crate::atom::load(&dir.join("test.atom.astro"), &mut registry).unwrap();
+    let atom = crate::atom::load(&dir.join("test.atom.astro"), &mut registry).expect("load atom");
     let compiled = crate::compile::compile(&atom, &registry).expect("compile example");
     let input = json!({"text":reference});
     let mut run = RunInput {
@@ -114,8 +114,18 @@ fn examples_and_live_inputs_resolve_the_builtin_artifact_schema() {
         origins: None,
         step: None,
     };
-    assert!(render(&compiled, &run).unwrap().user.contains(&reference));
+    assert!(
+        render(&compiled, &run)
+            .expect("render artifact reference")
+            .user
+            .contains(&reference)
+    );
     let invalid = json!({"text":"not an artifact"});
     run.input = &invalid;
-    assert!(render(&compiled, &run).unwrap_err().0.contains("input"));
+    assert!(
+        render(&compiled, &run)
+            .expect_err("reject invalid artifact")
+            .0
+            .contains("input")
+    );
 }

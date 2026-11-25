@@ -79,11 +79,11 @@ async fn oversized_provider_responses_are_refused_before_parsing() {
         body: " ".repeat(crate::http_tools::RESPONSE_LIMIT + 1),
     }])
     .await
-    .unwrap();
+    .expect("start fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
     let err = run_lite_atom(&Classify, &note(), &rt, &Default::default())
         .await
-        .unwrap_err();
+        .expect_err("oversized response");
     assert!(err.to_string().contains("response is larger"), "{err}");
 }
 

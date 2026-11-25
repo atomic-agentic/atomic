@@ -373,6 +373,17 @@ fn text(value: &Value) -> String {
     }
 }
 
+/// Type and subtype ignore case. Preserve parameter values, which may
+/// identify different representations even when they differ only in case.
+fn same_request_media(configured: &str, selected: &str) -> bool {
+    match (configured.split_once(';'), selected.split_once(';')) {
+        (Some((a, params_a)), Some((b, params_b))) => {
+            a.trim().eq_ignore_ascii_case(b.trim()) && params_a.trim() == params_b.trim()
+        }
+        _ => configured.trim().eq_ignore_ascii_case(selected.trim()),
+    }
+}
+
 /// A cookie value: bytes outside RFC 6265's cookie-octet, and `%`, are
 /// percent-encoded, so a value cannot add a cookie or attribute.
 fn cookie_value(value: &str) -> String {
@@ -539,7 +550,7 @@ impl HttpToolset {
             if place == "body" {
                 if let Some(media) = &operation.request_media {
                     if headers.iter().any(|(key, val)| {
-                        key.eq_ignore_ascii_case("content-type") && !val.eq_ignore_ascii_case(media)
+                        key.eq_ignore_ascii_case("content-type") && !same_request_media(val, media)
                     }) {
                         return Err(CallError::Refused(format!(
                             "`{name}`: configured Content-Type differs from `{media}`"

@@ -346,7 +346,20 @@ pub fn local_user() -> Option<String> {
 /// The identity used both to name a gate's approver and to enroll or read
 /// its credential, including in service processes without login variables.
 pub fn operator_user() -> String {
-    local_user().unwrap_or_else(|| "operator".into())
+    if let Some(name) = local_user() {
+        return name;
+    }
+    #[cfg(unix)]
+    {
+        let uid = crate::state::effective_uid();
+        crate::state::passwd_name(uid)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("uid-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        "operator".into()
+    }
 }
 
 /// The keyring account of `user`'s operator credential for the project

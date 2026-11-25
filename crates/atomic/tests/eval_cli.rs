@@ -750,10 +750,11 @@ fn live_eval_redacts_output_and_failure_text_in_both_report_formats() {
         let cases = json!({"input": {"text": "example"}, "expect": [
             "output.ticket == 'different' && output.ticket == 'password=placeholdersecret'"
         ]});
-        std::fs::write(project.join("evals/note/cases.jsonl"), cases.to_string()).unwrap();
+        std::fs::write(project.join("evals/note/cases.jsonl"), cases.to_string())
+            .expect("write eval case");
         let model = FakeModel::start(vec![Reply::Text(json!({"ticket": marker}).to_string())])
             .await
-            .unwrap();
+            .expect("start fake model");
         let report = dir.join("report.json");
         let junit = dir.join("report.xml");
         let result = eval_async(
@@ -765,28 +766,29 @@ fn live_eval_redacts_output_and_failure_text_in_both_report_formats() {
                 "--no-cassettes",
                 "--json",
                 "--report",
-                report.to_str().unwrap(),
+                report.to_str().expect("UTF-8 test path"),
                 "--junit",
-                junit.to_str().unwrap(),
+                junit.to_str().expect("UTF-8 test path"),
             ],
         )
         .await;
         assert!(!result.status.success());
         assert_eq!(model.calls(), 1);
-        let json: Value = serde_json::from_slice(&std::fs::read(report).unwrap()).unwrap();
+        let json: Value = serde_json::from_slice(&std::fs::read(report).expect("read report"))
+            .expect("JSON report");
         assert_eq!(
             json[0]["cases"][0]["output"]["ticket"],
             "password=[REDACTED]"
         );
         for public in [
             json.to_string(),
-            std::fs::read_to_string(junit).unwrap(),
+            std::fs::read_to_string(junit).expect("JUnit report"),
             text(&result),
         ] {
             assert!(public.contains("[REDACTED]"), "{public}");
             assert!(!public.contains("placeholdersecret"), "{public}");
         }
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir).expect("remove test directory");
     });
 }
 

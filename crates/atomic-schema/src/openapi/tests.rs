@@ -897,12 +897,9 @@ components:
     assert_eq!(*kept(op, "203"), ResponseBody::NoJsonSchema);
     // A `+json` type is a JSON media type for a reply whichever tree it sits
     // under, which is what kept the `text/vnd.acme.echo+json` schema above. A
-    // request body is read more narrowly: atomic sends every one as
-    // `application/json`, so a body declared only under a `+json` type of the
-    // `text/` tree is one it would send as something the spec never declared,
-    // and the operation stays unsupported with no `body` in its input. A `+json`
-    // type of the `application/` tree is one it sends within that family, so
-    // that operation stays callable with the schema as its `body`.
+    // request body must declare an application JSON representation. The text/
+    // operation stays unsupported, while the application/ one sends the body
+    // under the vendor media type the spec declares.
     let echo = ops
         .iter()
         .find(|op| op.name == "echoThing")
@@ -1688,11 +1685,13 @@ fn request_and_response_use_their_own_view_of_shared_properties() {
         "requestBody":{"required":true,"content":media},
         "responses":{"201":{"content":media}}
     }}}});
-    let op = operations(&spec).unwrap().remove(0);
-    let input = Registry::new().validator_for(&op.input).unwrap();
+    let op = operations(&spec).expect("import operation").remove(0);
+    let input = Registry::new()
+        .validator_for(&op.input)
+        .expect("input validator");
     let output = Registry::new()
-        .validator_for(op.output.as_ref().unwrap())
-        .unwrap();
+        .validator_for(op.output.as_ref().expect("declared output"))
+        .expect("output validator");
     assert!(input.is_valid(&json!({"body":{"credential":"value"}})));
     assert!(!input.is_valid(&json!({"body":{"id":1,"credential":"value"}})));
     assert!(output.is_valid(&json!({"id":1})));
@@ -1705,17 +1704,28 @@ fn content_parameters_require_one_declared_representation() {
         operations(&json!({"openapi":"3.1.0","paths":{"/":{"get":{"parameters":[parameter]}}}}))
     };
     let mut param = json!({"name":"q","in":"query","content":{"text/plain":{}}});
-    let op = build(param.clone()).unwrap().remove(0);
-    assert!(op.unsupported.unwrap().contains("text/plain"));
+    let op = build(param.clone())
+        .expect("import unsupported operation")
+        .remove(0);
+    assert!(
+        op.unsupported
+            .expect("unsupported media type")
+            .contains("text/plain")
+    );
     param["content"]["application/json"] = json!({});
     assert!(
         build(param.clone())
-            .unwrap_err()
+            .expect_err("mixed representations")
             .message
             .contains("exactly one")
     );
     param["schema"] = json!({});
-    assert!(build(param).unwrap_err().message.contains("mixes content"));
+    assert!(
+        build(param)
+            .expect_err("mixed serialization")
+            .message
+            .contains("mixes content")
+    );
 }
 
 #[test]
@@ -1725,13 +1735,19 @@ fn ambiguous_request_media_are_refused_and_parameters_are_preserved() {
         json!({"application/a+json":{},"application/b+json":{}}),
         json!({"application/json; profile=a":{},"application/json; profile=b":{}}),
     ] {
-        let op = operations(&spec(media)).unwrap().remove(0);
-        assert!(op.unsupported.unwrap().contains("equally preferred"));
+        let op = operations(&spec(media))
+            .expect("import ambiguous operation")
+            .remove(0);
+        assert!(
+            op.unsupported
+                .expect("ambiguous representation")
+                .contains("equally preferred")
+        );
         assert!(op.request_media.is_none());
     }
     let content_type = "application/json; profile=custom";
     let op = operations(&spec(json!({(content_type):{"schema":{"const":1}}})))
-        .unwrap()
+        .expect("one parameterized representation")
         .remove(0);
     assert_eq!(op.request_media.as_deref(), Some(content_type));
     assert_eq!(op.input["properties"]["body"]["const"], 1);

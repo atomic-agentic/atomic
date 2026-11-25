@@ -363,8 +363,8 @@ fn styles_for(place: &str) -> &'static [&'static str] {
 /// `application/json`, with or without parameters, or a structured `+json`
 /// type of any tree (`application/`, `text/`, vendor or standards-prefixed
 /// trees alike), which is what RFC 6839 says a `+json` suffix means. A
-/// request body is read by the narrower `is_json_request_media`, because
-/// atomic sends one as `application/json` and nothing else.
+/// request body must use one of the application media types accepted by
+/// `is_json_request_media`.
 pub fn is_json_media(media: &str) -> bool {
     let essence = media_essence(media);
     essence == "application/json" || (essence.contains('/') && essence.ends_with("+json"))

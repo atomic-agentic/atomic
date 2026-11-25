@@ -134,7 +134,10 @@ fn detection_uses_only_the_key_that_selected_the_endpoint() {
     };
     let r = resolved(&d, &args, &[("OPENAI_API_KEY", "test")], &nobody);
     assert_eq!(
-        r.endpoint().unwrap().api_key_env.as_deref(),
+        r.endpoint()
+            .expect("detected endpoint")
+            .api_key_env
+            .as_deref(),
         Some("OPENAI_API_KEY")
     );
     assert!(r.notes.iter().any(|note| note.contains("not used")));

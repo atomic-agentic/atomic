@@ -1,0 +1,1 @@
+operator-project-scope|crates/atomic-durable/src/runtime.rs|Reads::Postgres(_) => self.project(),|Reads::Postgres(_) => None,|-p atomic-agentic-durable --lib --features postgres-tests operator_rotation_only_changes_the_enrolling_project

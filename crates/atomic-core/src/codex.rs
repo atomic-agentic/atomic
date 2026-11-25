@@ -1200,7 +1200,13 @@ impl StateGuard {
                 crate::state::process_data_dir().map(|dir| dir.join("atomic")),
                 crate::state::legacy_config_dir(),
             ];
-            also.extend(defaults.into_iter().flatten());
+            for dir in defaults.into_iter().flatten() {
+                // dirs may derive a relative place from HOME. Keep the
+                // startup directory even before any component exists.
+                also.push(std::path::absolute(&dir).with_context(|| {
+                    format!("resolve default atomic directory {}", dir.display())
+                })?);
+            }
         }
         Ok(Self::Deny(PrivateState {
             state_dir: state_dir.into(),

@@ -153,13 +153,20 @@ fn an_exec_steps_caches_are_its_runs_alone_and_go_with_it() {
 
     let first = probe(&dir, "first");
     let caches = PathBuf::from(first["caches"].as_str().unwrap());
-    let run = caches.parent().unwrap();
-    assert_eq!(run.parent().and_then(Path::file_name).unwrap(), "cache");
+    let run = caches.parent().expect("shared cache under its run");
+    assert_eq!(
+        run.parent().and_then(Path::file_name),
+        Some(std::ffi::OsStr::new("cache"))
+    );
     assert!(caches.starts_with(dir.join("data")), "{first}");
     // Its Cargo target is the step's own, inside them.
-    let target = Path::new(first["target"].as_str().unwrap());
-    assert_eq!(target.file_name().unwrap(), "cargo-target", "{first}");
-    assert_eq!(target.parent().unwrap().parent().unwrap(), run, "{first}");
+    let target = Path::new(first["target"].as_str().expect("reported Cargo target"));
+    assert_eq!(
+        target.file_name().expect("target name"),
+        "cargo-target",
+        "{first}"
+    );
+    assert_eq!(target.parent().and_then(Path::parent), Some(run), "{first}");
     assert!(!target.starts_with(&caches), "{first}");
     // Its own, empty but for the sandbox's read-only placeholders, and
     // writable; nothing beside them.
@@ -168,7 +175,7 @@ fn an_exec_steps_caches_are_its_runs_alone_and_go_with_it() {
     assert_ne!(first["beside"], "ok", "{first}");
     // Gone with the run.
     assert!(!caches.exists(), "{caches:?} outlived its run");
-    let all = run.parent().unwrap();
+    let all = run.parent().expect("parent cache directory");
     assert!(files(all).is_empty(), "left in {all:?}: {:?}", files(all));
 
     // The next run's are its own, and hold nothing the first wrote.

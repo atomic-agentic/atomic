@@ -848,7 +848,7 @@ async fn redelivery_wakes_a_run_whose_decider_stopped_early<R: DurableRuntime>(m
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operator_rotation_only_changes_the_enrolling_project() {
-    let schema = crate::testing::schema("operator_projects").await;
+    let schema = crate::testing::schema("operator_scope").await;
     let db = crate::Database::Postgres {
         url: schema.url().into(),
         schema: schema.name().into(),

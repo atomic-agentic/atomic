@@ -276,7 +276,7 @@ fn allows_null(s: &Value) -> bool {
 fn nullable(s: &Value) -> Value {
     let mut s = s.clone();
     if let Some(obj) = s.as_object_mut() {
-        if ["$ref", "const", "anyOf"]
+        if ["$ref", "const", "enum", "anyOf"]
             .iter()
             .any(|key| obj.contains_key(*key))
         {
@@ -289,9 +289,6 @@ fn nullable(s: &Value) -> Value {
             }
             Some(Value::Array(ts)) => ts.push(json!("null")),
             _ => {}
-        }
-        if let Some(Value::Array(e)) = obj.get_mut("enum") {
-            e.push(Value::Null);
         }
     }
     s

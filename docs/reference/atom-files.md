@@ -269,7 +269,8 @@ refuses one that resolves to an address on this machine or a private network,
 or that does not resolve. Every address the interfaces of atomic's network
 namespace have counts as this machine's, public ones included; a container's
 or a virtual machine's addresses on another namespace are refused only when
-they are private. Three IPv6 prefixes that carry an IPv4 address inside them
+they are private. This includes deprecated IPv6 site-local addresses
+(`fec0::/10`). Three IPv6 prefixes that carry an IPv4 address inside them
 are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
 (which holds the well-known `64:ff9b::/96` and the local-use
 `64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
@@ -357,7 +358,8 @@ Schema keyword (`type`, `properties`, `$ref`, `enum` and the like) is read as
 one, and so is a root with a constraint or annotation keyword (`minLength`,
 `format`, `description` and the like) whose value is not a compact field:
 `description: A city` is JSON Schema, `description: string, what happened` a
-field.
+field. If another key in a full schema reads like a compact field, the loader
+reports the mixed forms and names the field.
 `atomic schemas expand <atom>` prints the contracts as atomic enforces them.
 
 `atomic check` generates direct relative declaration imports under `.atomic/types`.

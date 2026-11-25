@@ -189,9 +189,9 @@ pub struct CodexRuntime {
     pub artifacts: Artifacts,
     /// What admits and settles each turn (see [`crate::usage`]).
     pub meter: Metering,
-    /// The build caches of a worktree step's run, which its turn shares
-    /// with the run's other worktree steps, and nothing else: its commands
-    /// are pointed at them, and may write them under `workspace-write`.
+    /// This worktree step's build and package caches, plus the run's shared
+    /// directory for explicit handoffs. Its commands may write these roots
+    /// under `workspace-write`.
     /// `None` outside worktree steps.
     pub caches: Option<crate::worktree::Caches>,
 }

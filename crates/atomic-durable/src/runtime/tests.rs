@@ -288,28 +288,64 @@ async fn a_step_error_with_a_nul_is_recorded_once<R: DurableRuntime>(mut rt: R) 
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
-async fn transient_atomic_table_errors_keep_finished_steps<R: DurableRuntime>(mut rt: R) {
+async fn transient_atomic_table_errors_keep_finished_steps(mut rt: Durare) {
+    // Only the connection used by atomic's own tables is unavailable.
+    // The engine can still record checkpoints and a terminal outcome.
+    let timeout = Duration::from_millis(250);
+    let (reads, held): (_, Box<dyn Send>) = match &rt.reads {
+        Reads::Sqlite(original) => {
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(timeout)
+                .connect_with((*original.connect_options()).clone())
+                .await
+                .expect("limited SQLite pool");
+            let held = pool.acquire().await.expect("occupy the pool");
+            (Reads::Sqlite(pool), Box::new(held))
+        }
+        Reads::Postgres(original) => {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(timeout)
+                .connect_with((*original.connect_options()).clone())
+                .await
+                .expect("limited PostgreSQL pool");
+            let held = pool.acquire().await.expect("occupy the pool");
+            (Reads::Postgres(pool), Box::new(held))
+        }
+    };
+    rt.reads = reads;
     let bodies = Arc::new(AtomicUsize::new(0));
-    let attempts = Arc::new(AtomicUsize::new(0));
+    let interrupted = Arc::new(tokio::sync::Notify::new());
     let calls = bodies.clone();
-    rt.register("transient", move |ctx: R::Context, (): ()| {
+    let signal = interrupted.clone();
+    rt.register("transient", move |ctx: DurareContext, (): ()| {
         let calls = calls.clone();
-        let attempts = attempts.clone();
+        let signal = signal.clone();
         async move {
             ctx.step("finished", move |_| async move {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
             .await?;
-            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(db(sqlx::Error::PoolTimedOut));
+            let checked = ctx
+                .control_transaction(|mut tx| {
+                    Box::pin(async move { tx.query_one("SELECT 1 AS n", &[]).await?.int("n") })
+                })
+                .await;
+            if checked.is_err() {
+                signal.notify_one();
             }
-            Ok(())
+            checked
         }
     });
     rt.launch().await.expect("launch");
     let id = unique("transient");
     rt.start("transient", &id, ()).await.expect("start");
+    tokio::time::timeout(Duration::from_secs(10), interrupted.notified())
+        .await
+        .expect("control transaction failed");
+    drop(held);
     let until = Instant::now() + Duration::from_secs(20);
     loop {
         match rt.status(&id).await.expect("status") {

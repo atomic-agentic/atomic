@@ -414,9 +414,13 @@ fn inlining_preserves_the_scope_of_evaluated_and_pattern_properties() {
     ] {
         let inline = Registry::new()
             .inline_value(&schema, &root.join("scoped.json"))
-            .unwrap();
-        let original = Registry::new().validator_for(&schema).unwrap();
-        let inlined = Registry::new().validator_for(&inline).unwrap();
+            .expect("inline contract");
+        let original = Registry::new()
+            .validator_for(&schema)
+            .expect("original validator");
+        let inlined = Registry::new()
+            .validator_for(&inline)
+            .expect("inlined validator");
         for value in [json!({}), json!({"note":"hi"}), json!({"x":1})] {
             assert_eq!(
                 original.is_valid(&value),

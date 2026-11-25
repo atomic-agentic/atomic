@@ -1147,13 +1147,17 @@ mod tests {
         keep(&dir, Some(signed_in("example")));
         assert!(
             file.account_for_detection()
-                .unwrap_err()
+                .expect_err("sign-in is in the other store")
                 .to_string()
                 .contains("OS keyring")
         );
         keep(&dir, None);
-        assert!(file.account_for_detection().unwrap().is_none());
-        std::fs::write(dir.join("auth.json"), signed_in("example")).unwrap();
+        assert!(
+            file.account_for_detection()
+                .expect("empty stores")
+                .is_none()
+        );
+        std::fs::write(dir.join("auth.json"), signed_in("example")).expect("write test sign-in");
         let keyring = SignIn {
             store: AuthCredentialsStoreMode::Keyring,
             ..file
@@ -1161,11 +1165,11 @@ mod tests {
         assert!(
             keyring
                 .account_for_detection()
-                .unwrap_err()
+                .expect_err("sign-in is in the other store")
                 .to_string()
                 .contains("file store")
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(dir).expect("remove test directory");
     }
 
     /// With the keyring store, a live sign-in's directory holds only

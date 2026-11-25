@@ -40,12 +40,15 @@ def _is_field(value):
     return isinstance(value, str) and value.partition(",")[0].strip() in SCALARS
 
 
+def _marks_json_schema(key, value):
+    return key in JSON_SCHEMA_KEYWORDS or (key in VALUE_KEYWORDS and not _is_field(value))
+
+
 def is_compact(schema):
     """A non-empty mapping with no JSON Schema keyword at its root, counting a
     constraint or annotation keyword only when its value is not a compact field."""
     return isinstance(schema, dict) and bool(schema) and not any(
-        key in JSON_SCHEMA_KEYWORDS or (key in VALUE_KEYWORDS and not _is_field(value))
-        for key, value in schema.items())
+        _marks_json_schema(key, value) for key, value in schema.items())
 
 
 def _fail(where, message):
@@ -107,7 +110,7 @@ def to_json_schema(schema, where="schema"):
     if is_compact(schema):
         return compile_compact(schema, where)
     if isinstance(schema, dict):
-        keyword = next((k for k in schema if k in JSON_SCHEMA_KEYWORDS), None)
+        keyword = next((key for key, value in schema.items() if _marks_json_schema(key, value)), None)
         if keyword is not None:
             for key, value in schema.items():
                 known = key in JSON_SCHEMA_KEYWORDS or key in VALUE_KEYWORDS or key.startswith("x-")

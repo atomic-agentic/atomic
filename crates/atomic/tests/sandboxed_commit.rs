@@ -253,7 +253,7 @@ fn a_fresh_worktree_reuses_the_shared_cache() {
         let caches = Caches::new(f.dir.join("state/cache"));
         let spec = |tree: &Path| {
             let caches = caches.in_worktree(tree);
-            caches.create().unwrap();
+            caches.create().expect("step caches");
             TurnSpec {
                 env: caches.env(),
                 writable_roots: caches.writable_roots().to_vec(),
