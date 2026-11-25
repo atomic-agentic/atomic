@@ -49,6 +49,9 @@ def coding_turn(exe, project, repository, state, env):
                 item = dict(type="message", id="msg_1", role="assistant", status="completed",
                             content=[dict(type="output_text", text=output, annotations=[])])
             else:
+                for part in request.get("input", []):
+                    if isinstance(part, dict) and part.get("type") == "function_call_output":
+                        print(f"Sandboxed shell returned {str(part.get('output'))[:2000]}", flush=True)
                 self.send_error(400, "Missing evidence from the sandboxed shell")
                 return
             replies.append(item["type"])

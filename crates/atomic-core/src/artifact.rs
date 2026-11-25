@@ -672,7 +672,9 @@ fn metadata_handle(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
         std::fs::OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
             .open(path)
