@@ -1,0 +1,1 @@
+openapi-composed-required|crates/atomic-schema/src/openapi.rs|let mut hidden = inherited.clone();|let mut hidden = BTreeSet::new();|-p atomic-agentic-schema --lib -- openapi::tests::composed_visibility_and_required_apply_to_the_same_object

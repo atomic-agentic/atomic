@@ -1752,3 +1752,38 @@ fn ambiguous_request_media_are_refused_and_parameters_are_preserved() {
     assert_eq!(op.request_media.as_deref(), Some(content_type));
     assert_eq!(op.input["properties"]["body"]["const"], 1);
 }
+
+#[test]
+fn composed_visibility_and_required_apply_to_the_same_object() {
+    let media = json!({"application/json":{"schema":{"$ref":"#/components/schemas/Record"}}});
+    let spec = json!({"openapi":"3.1.0","components":{"schemas":{
+        "Fields":{"properties":{"id":{"readOnly":true},"secret":{"writeOnly":true}}},
+        "Record":{"allOf":[{"$ref":"#/components/schemas/Fields"},{"required":["id","secret","label"]}]}
+    }},"paths":{"/":{"post":{"requestBody":{"required":true,"content":media},"responses":{"200":{"content":media}}}}}});
+    let op = operations(&spec).expect("composed operation").remove(0);
+    let input = Registry::new().validator_for(&op.input).expect("request");
+    let output = Registry::new()
+        .validator_for(op.output.as_ref().expect("response schema"))
+        .expect("response");
+    assert!(input.is_valid(&json!({"body":{"secret":"s","label":"a"}})));
+    assert!(!input.is_valid(&json!({"body":{"id":1,"secret":"s","label":"a"}})));
+    assert!(!input.is_valid(&json!({"body":{"secret":"s"}})));
+    assert!(output.is_valid(&json!({"id":1,"label":"a"})));
+    assert!(!output.is_valid(&json!({"id":1,"secret":"s","label":"a"})));
+}
+
+#[test]
+fn a_shared_requirement_cannot_be_overridden_by_one_use_site() {
+    let media = json!({"application/json":{"schema":{
+        "allOf":[{"$ref":"#/components/schemas/Shared"},{"properties":{"id":{"readOnly":true}}}]
+    }}});
+    let spec = json!({"openapi":"3.1.0","components":{"schemas":{
+        "Shared":{"required":["id"],"properties":{"id":{"type":"integer"}}}
+    }},"paths":{"/":{"post":{"requestBody":{"content":media}}}}});
+    let error = operations(&spec).expect_err("incompatible shared requirement");
+    assert!(
+        error
+            .message
+            .contains("requires `id`, marked readOnly outside")
+    );
+}

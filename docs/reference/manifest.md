@@ -37,6 +37,13 @@ This is a proposed schema, not a manifest verified against a released loader.
 | `decisions` | Recorded choices, each with the evidence it rests on and a review date; see [recorded decisions](#recorded-decisions) | v0.7 |
 | `package`, `exports` | Shared-library publishing metadata | Later; detailed schema not specified |
 
+Imported toolsets exclude `readOnly` properties from requests and `writeOnly`
+properties from responses. Within an `allOf`, the property declaration and
+its `required` entry can appear in different branches. If a referenced
+component requires a property, declare its visibility in that component.
+An operation that adds conflicting visibility only at a use site fails import
+because other operations can reuse the same requirement.
+
 The plan also mentions pure-function registration and deployment/provider policy.
 Their complete manifest schemas are not specified; this draft does not supply
 copyable syntax for them. See [availability](availability.md) before adopting a

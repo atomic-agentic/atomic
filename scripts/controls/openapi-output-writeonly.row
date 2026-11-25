@@ -1,1 +1,1 @@
-openapi-output-writeonly|crates/atomic-schema/src/openapi.rs|project_direction(schema, "writeOnly");|let _ = schema;|-p atomic-agentic-schema --lib -- openapi::tests::request_and_response_use_their_own_view_of_shared_properties
+openapi-output-writeonly|crates/atomic-schema/src/openapi.rs|project_direction(schema, "writeOnly")|Ok::<(), String>(())|-p atomic-agentic-schema --lib -- openapi::tests::request_and_response_use_their_own_view_of_shared_properties

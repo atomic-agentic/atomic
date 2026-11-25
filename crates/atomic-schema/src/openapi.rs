@@ -70,6 +70,7 @@
 //! of the operation, and declares no response at all.
 
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 
 /// What one response of a spec declares about its body, as
 /// [`Operation::responses`] keeps it.
@@ -885,10 +886,10 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             // first: a `200` and a `202` of different shapes both describe the
             // tool's output, as `anyOf`. A key naming no status, such as a
             // bare `2`, is what no status selects, so it describes nothing.
-            project_direction(&mut input, "readOnly");
+            project_direction(&mut input, "readOnly").map_err(|message| fail(&at, message))?;
             for body in kept.values_mut().flatten() {
                 for schema in body.schemas_mut() {
-                    project_direction(schema, "writeOnly");
+                    project_direction(schema, "writeOnly").map_err(|message| fail(&at, message))?;
                 }
             }
             let output = declared_output(&kept);
@@ -917,26 +918,53 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
 /// Project OpenAPI property visibility into an ordinary JSON Schema contract.
 /// A forbidden property is optional and has the false schema, so an open
 /// object cannot accept it as an additional property.
-fn project_direction(schema: &mut Value, forbidden: &str) {
+fn project_direction(schema: &mut Value, forbidden: &str) -> Result<(), String> {
     let root = schema.clone();
-    directional_schema(schema, &root, forbidden);
+    directional_schema(schema, &root, forbidden, &BTreeSet::new())
 }
 
-fn directional_schema(schema: &mut Value, root: &Value, forbidden: &str) {
+fn directional_schema(
+    schema: &mut Value,
+    root: &Value,
+    forbidden: &str,
+    inherited: &BTreeSet<String>,
+) -> Result<(), String> {
+    let mut hidden = inherited.clone();
+    add_hidden_properties(schema, root, forbidden, &mut hidden);
+    // A shared requirement belongs to every caller of the component. Reject
+    // the conflicting use instead of weakening requirements for other callers.
+    if let Some(target) = local_target(schema, root)
+        && !hidden.is_empty()
+    {
+        let mut own = BTreeSet::new();
+        add_hidden_properties(target, root, forbidden, &mut own);
+        for part in conjuncts(target, root) {
+            let required = part.get("required").and_then(Value::as_array);
+            if let Some(name) = required
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .find(|name| hidden.contains(*name) && !own.contains(*name))
+            {
+                return Err(format!(
+                    "a referenced component requires `{name}`, marked {forbidden} outside that component; put its visibility and requirement in the same component"
+                ));
+            }
+        }
+    }
     let Some(result) = schema.as_object_mut() else {
-        return;
+        return Ok(());
     };
-    let mut hidden = std::collections::BTreeSet::new();
+    let separate = BTreeSet::new();
     for (key, value) in result.iter_mut() {
         match key.as_str() {
             "properties" | "patternProperties" | "dependentSchemas" | "$defs" | "definitions" => {
                 if let Some(fields) = value.as_object_mut() {
                     for (name, child) in fields {
-                        if key == "properties" && property_annotation(child, root, forbidden) {
-                            hidden.insert(name.clone());
+                        if key == "properties" && hidden.contains(name) {
                             *child = Value::Bool(false);
                         } else {
-                            directional_schema(child, root, forbidden);
+                            directional_schema(child, root, forbidden, &separate)?;
                         }
                     }
                 }
@@ -944,7 +972,8 @@ fn directional_schema(schema: &mut Value, root: &Value, forbidden: &str) {
             "allOf" | "oneOf" | "anyOf" | "prefixItems" => {
                 if let Some(children) = value.as_array_mut() {
                     for child in children {
-                        directional_schema(child, root, forbidden);
+                        let same_object = if key == "allOf" { &hidden } else { &separate };
+                        directional_schema(child, root, forbidden, same_object)?;
                     }
                 }
             }
@@ -958,7 +987,7 @@ fn directional_schema(schema: &mut Value, root: &Value, forbidden: &str) {
             | "then"
             | "else"
             | "propertyNames" => {
-                directional_schema(value, root, forbidden);
+                directional_schema(value, root, forbidden, &separate)?;
             }
             _ => {}
         }
@@ -968,29 +997,48 @@ fn directional_schema(schema: &mut Value, root: &Value, forbidden: &str) {
     {
         required.retain(|name| name.as_str().is_none_or(|name| !hidden.contains(name)));
     }
+    Ok(())
 }
 
-fn property_annotation(schema: &Value, root: &Value, annotation: &str) -> bool {
+fn local_target<'a>(schema: &Value, root: &'a Value) -> Option<&'a Value> {
+    let pointer = schema.get("$ref")?.as_str()?.strip_prefix('#')?;
+    root.pointer(pointer)
+}
+
+/// Every unconditional conjunct describes the same instance, including a
+/// referenced component. A reference can be recursive, so follow each target once.
+fn conjuncts<'a>(schema: &'a Value, root: &'a Value) -> impl Iterator<Item = &'a Value> {
     let mut pending = vec![schema];
-    let mut followed = std::collections::BTreeSet::new();
-    while let Some(schema) = pending.pop() {
-        if schema.get(annotation) == Some(&Value::Bool(true)) {
-            return true;
-        }
-        if let Some(pointer) = schema
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix('#'))
-            && followed.insert(pointer)
-            && let Some(target) = root.pointer(pointer)
+    let mut followed = BTreeSet::new();
+    std::iter::from_fn(move || {
+        let schema = pending.pop()?;
+        if let Some(target) = local_target(schema, root)
+            && followed.insert(std::ptr::from_ref(target))
         {
             pending.push(target);
         }
         if let Some(parts) = schema.get("allOf").and_then(Value::as_array) {
             pending.extend(parts);
         }
+        Some(schema)
+    })
+}
+
+fn add_hidden_properties(
+    schema: &Value,
+    root: &Value,
+    forbidden: &str,
+    hidden: &mut BTreeSet<String>,
+) {
+    for part in conjuncts(schema, root) {
+        if let Some(properties) = part.get("properties").and_then(Value::as_object) {
+            for (name, property) in properties {
+                if conjuncts(property, root).any(|s| s.get(forbidden) == Some(&Value::Bool(true))) {
+                    hidden.insert(name.clone());
+                }
+            }
+        }
     }
-    false
 }
 
 fn escape(path: &str) -> String {
