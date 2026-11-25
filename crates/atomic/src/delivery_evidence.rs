@@ -262,7 +262,7 @@ pub async fn approved_graph_item(
     let receipt: GraphAcceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
     let accepted = &receipt.acceptance;
     ensure!(accepted.accepted, "source candidate was not accepted");
-    let (round, candidate, turn_name) = round_for(base_step, &steps, &accepted, source_run)?;
+    let (round, candidate, turn_name) = round_for(base_step, &steps, accepted, source_run)?;
     ensure!(
         round <= review.rounds,
         "accepted repair exceeds frozen policy"
