@@ -2281,7 +2281,7 @@ fn next_claimant_receives_fenced_handoff_with_file_statuses() {
             .find(|entry| entry.path == "atoms/fix-item.atom.astro")
             .expect("fixture atom");
         let handoff = Handoff {
-            attempted: "Tried the parser fixture".into(),
+            attempted: "Tried ``` the parser fixture".into(),
             failed: "EOF case failed".into(),
             learned: "Keep the checked file".into(),
             files: vec![
@@ -2321,7 +2321,7 @@ fn next_claimant_receives_fenced_handoff_with_file_statuses() {
         assert_eq!(model.calls(), 1);
         let request = model.requests()[0].to_string();
         for text in [
-            "Tried the parser fixture",
+            "Tried ``` the parser fixture",
             "EOF case failed",
             "Keep the checked file",
             "status: unchanged",
@@ -2333,6 +2333,7 @@ fn next_claimant_receives_fenced_handoff_with_file_statuses() {
             !request.contains(&unchanged.id),
             "Git object ID reached the model"
         );
+        assert!(request.contains("````text"), "stored text closed the handoff fence");
         assert!(
             !request.contains(&"a".repeat(40)),
             "synthetic Git object ID reached the model"
