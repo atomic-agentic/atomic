@@ -683,7 +683,9 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic \
 
 The cold full-repository trial-merge proof runs in the same dedicated shard.
 It checks the current workspace in a fresh private Cargo target with the pinned
-offline registry and Git cache. Run it locally with:
+offline registry and Git cache. Trial-merge Cargo checks have a 900-second
+command limit for cold workspace builds; other trial commands keep their
+300-second limit. Run it locally with:
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic \
