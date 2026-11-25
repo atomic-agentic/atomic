@@ -1,0 +1,1 @@
+graph-parallel-pool-serve|crates/atomic/src/runs.rs|admit_recorded_command_pool(&record)|Ok::<(), Failure>(())|-p atomic-agentic --test graph_work_loop cli_resume_and_serve_refuse_a_recorded_parallel_graph_run

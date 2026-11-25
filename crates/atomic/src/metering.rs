@@ -553,6 +553,11 @@ impl RunBudget {
         self
     }
 
+    /// Charge a durable child lane against its parent graph run's pinned cap.
+    pub fn under_parent_run(self, parent: &str, plan: &BudgetPlan) -> Self {
+        self.under(Scope::run(parent, caps(&plan.run)))
+    }
+
     /// The caps of an atom calling `model` with its own limits `declared`.
     pub fn atom(&self, declared: &Budget, model: &str) -> Result<Resolved, BudgetError> {
         resolve(declared, Level::Atom, &self.settings, &[model])

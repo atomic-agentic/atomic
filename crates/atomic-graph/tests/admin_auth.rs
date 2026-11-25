@@ -560,6 +560,21 @@ async fn only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate
         ),
         "a different run cannot use the lease"
     );
+    assert!(
+        matches!(
+            human
+                .link_verified_child_commit(
+                    lease.clone(),
+                    &worktrees,
+                    "wrong-parent",
+                    "run-proof",
+                    &commit,
+                )
+                .await,
+            Err(StoreError::Fenced { .. })
+        ),
+        "a child worktree cannot bypass the parent claim fence"
+    );
     let mut forged = commit.clone();
     forged.reference = "refs/heads/main".into();
     assert!(

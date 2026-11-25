@@ -1,1 +1,1 @@
-graph-verified-cli-attempt-ref|crates/atomic/src/graph.rs|!= Some(step_commit.reference.as_str())|== Some(step_commit.reference.as_str())|-p atomic-agentic --test graph_work_loop cli_verifies_only_the_recorded_graph_attempt_on_its_authorized_branch
+graph-verified-cli-attempt-ref|crates/atomic/src/graph.rs|!= Some(step_commit.reference.as_str())|== Some(step_commit.reference.as_str())|-p atomic-agentic --test graph_work_loop cli_verifies_only_the_parallel_lane_attempt_on_its_authorized_branch

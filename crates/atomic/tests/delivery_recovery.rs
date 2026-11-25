@@ -167,6 +167,7 @@ async fn seed_admitted_delivery() {
     let source = DeliverySource {
         project: Some(id),
         source_run: SOURCE.into(),
+        evidence_run: None,
         epic_id: "epic".into(),
         base_step: STEP.into(),
         item_id: "item".into(),
