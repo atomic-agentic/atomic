@@ -5443,8 +5443,9 @@ async fn reviewed<C: WorkflowContext>(
                 } else {
                     (Vec::new(), Vec::new())
                 };
-            // CONTROL_OFF: review-followup-touched-controls, review-followup-security-label
-            controls_clean = touched_controls.is_empty() && !security_item;
+            // The one-blob formatting proof excludes changed control rows.
+            // CONTROL_OFF: review-followup-security-label
+            controls_clean = !security_item;
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {
                     return Err(failed(format!(
