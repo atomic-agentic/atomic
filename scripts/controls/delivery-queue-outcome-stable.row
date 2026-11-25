@@ -1,0 +1,1 @@
+delivery-queue-outcome-stable|crates/atomic-durable/src/delivery_effect.rs|WHERE delivery_run=? AND status IN ('pending','failed')|WHERE delivery_run=? /* CONTROL_OFF: terminal queue event can be overwritten */|-p atomic-agentic --test delivery_recovery -- queue_observation_records_pending_failure_merge_and_drop_once_after_restart
