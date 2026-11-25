@@ -2815,7 +2815,7 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("legacy history");
-            assert_eq!(baseline.len(), 13);
+            assert_eq!(baseline.len(), 14);
             assert_eq!(baseline[0].get::<i64, _>("version"), 10);
             assert_eq!(baseline[0].get::<String, _>("name"), "legacy-baseline-v10");
             assert_eq!(baseline[0].get::<Option<String>, _>("checksum"), None);
@@ -2874,10 +2874,15 @@ mod tests {
                 baseline[11].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[20]))
             );
-            assert_eq!(baseline[12].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(baseline[12].get::<i64, _>("version"), 22);
             assert_eq!(
                 baseline[12].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[21]))
+            );
+            assert_eq!(baseline[13].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(
+                baseline[13].get::<Option<String>, _>("checksum"),
+                Some(checksum(&MIGRATIONS[22]))
             );
         }
     }
