@@ -681,6 +681,18 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic \
   -- --ignored --exact
 ```
 
+The cold full-repository trial-merge proof runs in the same dedicated shard.
+It checks the current workspace in a fresh private Cargo target with the pinned
+offline registry and Git cache. Run it locally with:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic \
+  --test pipeline --locked \
+  --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests \
+  fixture_bound_trial_merge_checks_full_atomic_with_rust_runtime \
+  -- --ignored
+```
+
 Confirm its output names the test and reports `1 passed; 0 failed; 0 ignored`.
 A zero-test result does not satisfy this gate.
 
