@@ -95,6 +95,11 @@ records six cassettes, six scored cases, and six route calls. The
 contains the complete structured responses. Offline replay of those six
 cassettes passed 6/6 with six replays and zero model calls; see the
 [replay report](evals/lane-reviewer/reports/sonnet-5-5-2026-11-25.replay.json).
+The [Claude CLI evidence](evals/lane-reviewer/reports/sonnet-5-5-2026-11-25.claude-cli.jsonl)
+records each scored call's model use, cost, request hash, and raw answer; the
+[score manifest](evals/lane-reviewer/reports/sonnet-5-5-2026-11-25.score.json)
+records the per-case predicates and the distinction between production-eligible
+and prompt-only cases.
 
 | Case | Verdict | Measured result |
 | --- | --- | --- |
