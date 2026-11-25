@@ -2291,7 +2291,7 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .expect("history");
-        assert_eq!(rows.len(), 13, "one baseline and twelve new migrations");
+        assert_eq!(rows.len(), 14, "one baseline and thirteen new migrations");
         assert_eq!(rows[0].get::<i64, _>("version"), 10);
         assert_eq!(rows[0].get::<String, _>("name"), "legacy-baseline-v10");
         assert_eq!(rows[0].get::<Option<String>, _>("checksum"), None);
@@ -2376,7 +2376,7 @@ mod tests {
             rows[11].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[20]))
         );
-        assert_eq!(rows[12].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(rows[12].get::<i64, _>("version"), 22);
         assert_eq!(
             rows[12].get::<String, _>("name"),
             "delivery-queue-poll-schedule"
@@ -2384,6 +2384,15 @@ mod tests {
         assert_eq!(
             rows[12].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[21]))
+        );
+        assert_eq!(rows[13].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(
+            rows[13].get::<String, _>("name"),
+            "open-gate-graph-projection"
+        );
+        assert_eq!(
+            rows[13].get::<Option<String>, _>("checksum"),
+            Some(checksum(&MIGRATIONS[22]))
         );
         let _ = std::fs::remove_file(&p);
     }
