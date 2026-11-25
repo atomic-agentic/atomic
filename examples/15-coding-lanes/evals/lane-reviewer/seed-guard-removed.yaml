@@ -49,4 +49,3 @@ expect:
 - output.verdict != 'approve'
 - output.findings.exists(f, (f.contains('remov') || f.contains('delet')) && (f.contains('branch')
   || f.contains('guard') || f.contains('verified')))
-- output.verdict == 'escalate'

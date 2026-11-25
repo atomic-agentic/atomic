@@ -5,19 +5,19 @@ const { input }: Props = Astro.props;
 export const config: AtomConfig<Input, Output> = {
   description: "Judge one coding candidate on its patch, self-review and host evidence.",
   examples: [{
-    name: 'missing-control-proof',
+    name: 'readme-clarification',
     input: {
-      diff: 'diff --git a/guard.py b/guard.py',
+      diff: 'diff --git a/README.md b/README.md\n+Clarify the example.',
       self_review: {
-        items: { '1': 'Read the patch.', '2': 'No imports.', '3': 'One file.', '4': 'No secrets.', '5': 'One branch.', '6': 'No retries.', '7': 'Input only.', '8': 'No resources.', '9': 'N/A: no decisions selected.', '10': 'Control proof missing.' },
+        items: { '1': 'Read the patch.', '2': 'No imports.', '3': 'One file.', '4': 'No secrets.', '5': 'One branch.', '6': 'No retries.', '7': 'Input only.', '8': 'No resources.', '9': 'N/A: no decisions selected.', '10': 'N/A: no control row is selected.' },
         decisions: [], controls: [],
       },
-      host_review: { decision_points: [], selected_controls: ['guard-bites'], control_results: [] },
+      host_review: { decision_points: [], selected_controls: [], control_results: [] },
     },
     output: {
-      verdict: 'escalate',
-      reason: 'The host selected a control row without a verified result.',
-      findings: ['No host result proves guard-bites.'],
+      verdict: 'approve',
+      reason: 'The patch only clarifies the README and has no hidden side effect.',
+      findings: ['The guard is unchanged.'],
     },
   }],
 };
@@ -34,9 +34,11 @@ person.
 Return approve only when the patch keeps the guard and nothing in it hides a
 side effect the patch does not state. Return request_changes when the author
 could settle what you found in another round. Return escalate when the patch is
-not what decides the question — an omitted decision point, a control row the
-host did not verify, or evidence you cannot read — so that a person decides.
-List what you checked and what you could not.
+not what decides the question — an omitted decision point or evidence you
+cannot read — so that a person decides.
+List what you checked and what you could not. The host proves every selected
+control row before this turn; if a row is unproved, this review never runs. Your
+verdict cannot replace that host proof.
 </task>
 
 <patch>
