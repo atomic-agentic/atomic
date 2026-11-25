@@ -343,6 +343,25 @@ pub fn local_user() -> Option<String> {
         .find_map(|v| std::env::var(v).ok().filter(|u| !u.is_empty()))
 }
 
+/// The identity used both to name a gate's approver and to enroll or read
+/// its credential, including in service processes without login variables.
+pub fn operator_user() -> String {
+    if let Some(name) = local_user() {
+        return name;
+    }
+    #[cfg(unix)]
+    {
+        let uid = crate::state::effective_uid();
+        crate::state::passwd_name(uid)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| format!("uid-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        "operator".into()
+    }
+}
+
 /// The keyring account of `user`'s operator credential for the project
 /// whose state is `state`: one credential per user and project.
 pub fn operator_account(state: &crate::state::ProjectState, user: &str) -> String {

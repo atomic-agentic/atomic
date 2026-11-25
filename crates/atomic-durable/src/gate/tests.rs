@@ -845,6 +845,61 @@ async fn redelivery_wakes_a_run_whose_decider_stopped_early<R: DurableRuntime>(m
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_operator_rotation_only_changes_the_enrolling_project() {
+    let schema = crate::testing::schema("operator_scope").await;
+    let db = crate::Database::Postgres {
+        url: schema.url().into(),
+        schema: schema.name().into(),
+    };
+    let mut a = Durare::open(&db, Some("a"), crate::DEFAULT_VERSION, "a")
+        .await
+        .expect("project a");
+    let b = Durare::open(&db, Some("b"), crate::DEFAULT_VERSION, "b")
+        .await
+        .expect("project b");
+    let legacy = Durare::postgres(schema.url(), schema.name())
+        .await
+        .expect("legacy verifier");
+    let first = HumanCredential::new(operator(), "project a secret");
+    enroll(&legacy, &first).await.expect("legacy enrollment");
+    assert!(
+        !enrolled(&a, &operator())
+            .await
+            .expect("unattributed verifier")
+    );
+    let second = HumanCredential::new(operator(), "project b secret");
+    enroll(&b, &second).await.expect("independent enrollment");
+    let rotated = HumanCredential::new(operator(), "replacement for b");
+    assert_eq!(
+        replace_enrollment(&b, &rotated).await.expect("rotate b"),
+        Enrollment::Replaced
+    );
+    register(&mut a);
+    a.launch().await.expect("launch");
+    let (run, gate) = start_gated(&a, input(None)).await;
+    assert_eq!(
+        decide(&a, &first, command(&gate, "legacy", Verdict::Approve)).await,
+        Err(DecideError::NotEnrolled(operator())),
+        "a username-only verifier cannot authorize a scoped gate"
+    );
+    enroll(&a, &first)
+        .await
+        .expect("re-enroll existing protected secret");
+    for other in [&second, &rotated] {
+        assert_eq!(
+            decide(&a, other, command(&gate, "wrong", Verdict::Approve)).await,
+            Err(DecideError::BadCredential(operator()))
+        );
+    }
+    decide(&a, &first, command(&gate, "a", Verdict::Approve))
+        .await
+        .expect("project a still approves");
+    assert!(outcome(&a, &run).await.expect("finished").approved());
+    a.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 /// Two projects sharing one store, each on a runtime of its own: the
 /// second neither lists, finds nor decides the first one's gate, nor sees
 /// its run, nor wakes it, and the first does all of these for its own.

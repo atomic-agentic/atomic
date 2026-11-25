@@ -306,7 +306,9 @@ fn live_tally(state: &Path, run: &str, atom: &str) -> Option<usize> {
         .ok()?
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .find_map(|e| std::fs::read_to_string(e.path().join(format!("{atom}.tally"))).ok())
+        .find_map(|e| {
+            std::fs::read_to_string(e.path().join("shared").join(format!("{atom}.tally"))).ok()
+        })
         .map(|text| text.lines().count())
 }
 
@@ -401,7 +403,7 @@ fn ran(dir: &Path, atom: &str) -> usize {
 }
 
 /// The file named `name` that an exec atom's confined command wrote into
-/// its run's caches, `<state>/cache/<run>/<name>`, under any of the atomic
+/// its run's caches, `<state>/cache/<run>/shared/<name>`, under any of the atomic
 /// homes in `dir`, while the run has them: a command may write only those
 /// and its scratch directory, and the caches go when the run ends. A path
 /// that does not exist when none has.
@@ -427,7 +429,7 @@ fn run_files(dir: &Path, name: &str) -> Vec<PathBuf> {
                 .flatten()
                 .flatten()
             {
-                let file = run.path().join(name);
+                let file = run.path().join("shared").join(name);
                 if file.exists() {
                     found.push(file);
                 }

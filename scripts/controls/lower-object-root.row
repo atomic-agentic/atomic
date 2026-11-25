@@ -1,0 +1,1 @@
+lower-object-root|crates/atomic-schema/src/lower.rs|if !is_object_root(contract) {|if !is_object_schema(contract) {|-p atomic-agentic-schema --lib -- lower::tests::nullable_objects_are_allowed_only_below_the_generation_root

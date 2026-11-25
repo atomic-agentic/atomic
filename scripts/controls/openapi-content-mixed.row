@@ -1,0 +1,1 @@
+openapi-content-mixed|crates/atomic-schema/src/openapi.rs|["schema", "style", "explode"]|["__unused"]|-p atomic-agentic-schema --lib -- openapi::tests::content_parameters_require_one_declared_representation

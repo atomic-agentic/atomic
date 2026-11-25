@@ -741,3 +741,12 @@ fn a_syntax_error_carries_its_position() {
     assert!(e.at.line >= 1);
     assert!(!e.message.is_empty());
 }
+
+#[test]
+fn nested_collections_stop_at_the_loader_limit() {
+    for (open, close) in [("[", "]"), ("{a: ", "}")] {
+        let nested = |n| format!("{}0{}", open.repeat(n), close.repeat(n));
+        ok(&nested(64));
+        assert!(err(&nested(65)).message.contains("nesting"));
+    }
+}

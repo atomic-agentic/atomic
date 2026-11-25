@@ -1,0 +1,1 @@
+exec-network-site-local|crates/atomic-core/src/network.rs|        .chain(SITE_LOCAL)|        .chain(&SITE_LOCAL[..0])|-p atomic-agentic-core --lib --features fake-model -- network::tests::embedded_ipv4_and_this_machines_addresses_are_never_reached

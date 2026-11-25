@@ -803,6 +803,9 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
         "{refused}"
     );
     assert!(!is_released(&mine, &park.id).await.expect("released?"));
+    crate::gate::enroll(&mine, &operator)
+        .await
+        .expect("project A's enrollment");
     assert!(
         release_park(&mine, &operator, command(&unowned, "a-unowned", None))
             .await

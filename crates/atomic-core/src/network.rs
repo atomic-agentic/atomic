@@ -349,8 +349,11 @@ const EMBEDDING_IPV4: &[&str] = &["64:ff9b:*", "2002:*:*", "2001:0:*", "2001::*"
 /// deny list against a request's host and again, when it dials, against
 /// every address a declared name resolved to.
 fn denied_addresses(own: &BTreeSet<IpAddr>) -> Vec<String> {
+    // fec0::/10 (deprecated site-local unicast) is still locally routable.
+    const SITE_LOCAL: &[&str] = &["fec?:*:*", "fed?:*:*", "fee?:*:*", "fef?:*:*"];
     EMBEDDING_IPV4
         .iter()
+        .chain(SITE_LOCAL)
         .map(|p| (*p).to_owned())
         .chain(own.iter().map(IpAddr::to_string))
         .collect()
@@ -1191,6 +1194,13 @@ mod tests {
             ("[2002:a00:1::1]", "6to4 for 10.0.0.1"),
             ("[2001:0:4136:e378:8000:63bf:3fff:fdd2]", "Teredo"),
             ("[2001::1]", "Teredo, compressed"),
+            ("[fec0::]", "first site-local address"),
+            ("[fed0::1]", "site-local address"),
+            ("[fee0::1]", "site-local address"),
+            (
+                "[feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]",
+                "last site-local address",
+            ),
             ("[2001:db8::5]", "this machine's public address"),
         ] {
             assert_eq!(fetch_from(&addr, None, host), "403 denied", "{why}: {host}");

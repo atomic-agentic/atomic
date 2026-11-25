@@ -285,8 +285,9 @@ impl Contracts {
 }
 
 fn fits(schema: &Value, value: &Value, what: &str) -> Result<(), String> {
-    let validator =
-        jsonschema::validator_for(schema).map_err(|e| format!("{what}: the schema: {e}"))?;
+    let validator = atomic_schema::registry::Registry::new()
+        .validator_for(schema)
+        .map_err(|e| format!("{what}: the schema: {e}"))?;
     let errors: Vec<String> = validator
         .iter_errors(value)
         .map(|e| {
@@ -1051,7 +1052,7 @@ fn suite(report: &Report) -> String {
 /// such as other control characters a model put in its output, dropped.
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
+    for c in crate::redact::text(text).chars() {
         match c {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
