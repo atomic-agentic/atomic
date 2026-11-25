@@ -222,6 +222,79 @@ fn enrolled_person_creates_links_claims_and_closes_with_json() {
 }
 
 #[test]
+fn graph_search_cli_resolves_punctuated_ids_filters_status_and_rebuilds() {
+    let fixture = Fixture::new("search");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    success(&fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Violet sample",
+            "--id",
+            "at-search.1",
+            "--body",
+            "Plain excerpt",
+        ],
+    ));
+    let exact: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "search", "at-search.1"]),
+    ))
+    .expect("search JSON");
+    assert_eq!(exact["results"][0]["id"], "at-search.1");
+    assert_eq!(exact["results"][0]["excerpt"], "Plain excerpt");
+    let filtered: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &["--json", "graph", "search", "Violet", "--status", "closed"],
+    )))
+    .expect("filtered search JSON");
+    assert_eq!(filtered["results"].as_array().expect("results").len(), 0);
+    success(&fixture.run(&project, &["graph", "search-rebuild"]));
+    let rebuilt = success(&fixture.run(&project, &["graph", "search", "Violet"]));
+    assert!(rebuilt.contains("at-search.1 [open] Violet sample"));
+
+    let input = fixture.root.join("search-beads.jsonl");
+    std::fs::write(
+        &input,
+        concat!(
+            r#"{"id":"bd-search.2-alpha","title":"Closed sample","description":"Unique corundum phrase in a description","status":"closed","priority":2,"issue_type":"task","created_at":"2026-01-02T00:00:00Z"}"#,
+            "\n"
+        ),
+    )
+    .expect("import fixture");
+    let file = input.to_str().expect("fixture path");
+    success(&fixture.run(&project, &["graph", "import", file]));
+    success(&fixture.run(&project, &["graph", "import", file]));
+    let phrase: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "search", "corundum phrase"]),
+    ))
+    .expect("phrase search JSON");
+    assert_eq!(phrase["results"].as_array().expect("hits").len(), 1);
+    assert_eq!(phrase["results"][0]["id"], "bd-search.2-alpha");
+    assert_eq!(phrase["results"][0]["status"], "closed");
+    let excluded: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &[
+            "--json",
+            "graph",
+            "search",
+            "corundum phrase",
+            "--status",
+            "open",
+        ],
+    )))
+    .expect("state-filtered search JSON");
+    assert!(excluded["results"].as_array().expect("hits").is_empty());
+    let punctuated: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &["--json", "graph", "search", "bd-search.2-alpha"],
+    )))
+    .expect("punctuated ID search JSON");
+    assert_eq!(punctuated["results"][0]["id"], "bd-search.2-alpha");
+}
+
+#[test]
 fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
     let fixture = Fixture::new("create-request-key");
     let project = fixture.project("project");
