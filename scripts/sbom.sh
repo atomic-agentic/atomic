@@ -47,7 +47,7 @@ python3 -I - "${SBOM}" "${ROOT}" <<'PY_ASTRO'
 import json, pathlib, sys
 file, root = sys.argv[1:]
 manifest = json.loads((pathlib.Path(root) / "crates/atomic-core/assets/manifest.json").read_text())
-doc = json.loads(pathlib.Path(file).read_text())
+doc = json.loads(pathlib.Path(file).read_text(encoding="utf-8"))
 refs = []
 licenses = {"@astrojs/compiler":"MIT", "typescript":"Apache-2.0", "source-map-js":"BSD-3-Clause"}
 for name, version in manifest["dependencies"].items():
@@ -65,16 +65,16 @@ if dependency is None:
     dependency = {"ref":owner,"dependsOn":[]}
     doc["dependencies"].append(dependency)
 dependency.setdefault("dependsOn", []).extend(refs)
-pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n")
+pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 print("SBOM includes pinned Astro/TypeScript libraries and bundled payload hashes")
 PY_ASTRO
 
 
 if [ -n "${BINARY}" ]; then
     python3 -I - "${SBOM}" "${BINARY}" "${ROOT}" <<'PY'
-import hashlib, json, sys
+import hashlib, json, pathlib, sys
 sbom, binary, root = sys.argv[1:4]
-text = open(sbom, encoding="utf-8").read().replace("path+file://" + root, "path+file:///atomic")
+text = open(sbom, encoding="utf-8").read().replace("path+" + pathlib.Path(root).resolve().as_uri(), "path+file:///atomic")
 doc = json.loads(text)
 digest = hashlib.sha256(open(binary, "rb").read()).hexdigest()
 bins = [c for c in doc["metadata"]["component"].get("components", [])
@@ -82,6 +82,16 @@ bins = [c for c in doc["metadata"]["component"].get("components", [])
 if len(bins) != 1:
     sys.exit("scripts/sbom.sh: the SBOM has no single `atomic` binary component")
 bins[0]["hashes"] = [{"alg": "SHA-256", "content": digest}]
+if pathlib.Path(binary).name == "atomic.exe":
+    for helper in ("codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "codex-windows-sandbox-service.exe"):
+        path = pathlib.Path(binary).with_name(helper)
+        ref = "atomic:windows:" + helper
+        with path.open("rb") as payload:
+            checksum = hashlib.file_digest(payload, "sha256").hexdigest()
+        doc["components"].append({"type": "file", "name": helper, "bom-ref": ref,
+                                  "hashes": [{"alg": "SHA-256", "content": checksum}]})
+        owner = doc["metadata"]["component"]["bom-ref"]
+        next(d for d in doc["dependencies"] if d["ref"] == owner)["dependsOn"].append(ref)
 with open(sbom, "w", encoding="utf-8") as f:
     json.dump(doc, f, indent=2, sort_keys=False)
     f.write("\n")

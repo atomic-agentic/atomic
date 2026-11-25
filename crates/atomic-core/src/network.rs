@@ -377,6 +377,7 @@ fn checked(own: BTreeSet<IpAddr>) -> anyhow::Result<BTreeSet<IpAddr>> {
 /// Every address the interfaces of this process's network namespace have
 /// now: this machine's, as far as the proxy can tell. A container's or a
 /// virtual machine's addresses on another namespace are not among them.
+#[cfg(unix)]
 fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
     let interfaces = nix::ifaddrs::getifaddrs().context("list this machine's network addresses")?;
     Ok(interfaces
@@ -389,6 +390,11 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
             }
         })
         .collect())
+}
+
+#[cfg(windows)]
+fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
+    anyhow::bail!("network allowlists for exec atoms require the Unix sandbox proxy")
 }
 
 /// The most connections the sandbox helper's bridge opens to a command's
@@ -471,6 +477,7 @@ const RAISED_LIMIT: u64 = 1 << 16;
 /// This process's limit on open files: the soft one it is held to, and the
 /// hard one it may raise that to.
 #[allow(unsafe_code)]
+#[cfg(unix)]
 fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -488,6 +495,7 @@ fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
 /// raised as far as the hard one allows, up to [`RAISED_LIMIT`]; the
 /// commands atomic starts afterwards inherit it.
 #[allow(unsafe_code, clippy::unnecessary_cast)]
+#[cfg(unix)]
 fn reserve_room(budget: &'static Budget, each: u64) -> anyhow::Result<Reservation> {
     let mut limit = descriptor_limits()?;
     let refused = match budget.reserve(limit.rlim_cur as u64, each) {
@@ -505,6 +513,11 @@ fn reserve_room(budget: &'static Budget, each: u64) -> anyhow::Result<Reservatio
         return Err(refused);
     }
     budget.reserve(raised, each)
+}
+
+#[cfg(windows)]
+fn reserve_room(_budget: &'static Budget, _each: u64) -> anyhow::Result<Reservation> {
+    anyhow::bail!("network allowlists for exec atoms require the Unix sandbox proxy")
 }
 
 /// What a command holds while it runs: its proxy runs until no command

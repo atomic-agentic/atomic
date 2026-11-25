@@ -8,8 +8,7 @@
 #
 # Writes to target/dist/:
 #
-#   atomic-<version>-<triple>.tar.gz          the binary, LICENSE, NOTICE and
-#                                             THIRD-PARTY-NOTICES.md
+#   atomic-<version>-<triple>.{tar.gz,zip}    executable(s), notices and licences
 #   atomic-<version>-<triple>.cdx.json        the CycloneDX SBOM, which records
 #                                             the binary's SHA-256
 #   <each of the above>.sha256                its checksum, in sha256sum format
@@ -24,7 +23,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${1:?usage: scripts/release-package.sh <target-triple>}"
-BIN="${ROOT}/target/${TARGET}/release/atomic"
+PROGRAM=atomic
+if [[ "${TARGET}" == "x86_64-pc-windows-msvc" ]]; then
+    PROGRAM=atomic.exe
+fi
+BIN="${ROOT}/target/${TARGET}/release/${PROGRAM}"
 [ -x "${BIN}" ] || { echo "scripts/release-package.sh: ${BIN} is not built" >&2; exit 1; }
 # A binary built with the crash tests' failpoints features compiled in could
 # be killed by an environment variable. Never ship one.
@@ -63,7 +66,7 @@ python3 -I - "${ROOT}" "${BIN}" "${DIST}" "${NAME}" "${SOURCE_DATE_EPOCH}" <<'PY
 import gzip, hashlib, io, os, sys, tarfile
 root, binary, dist, name, epoch = sys.argv[1:6]
 epoch = int(epoch)
-members = [("atomic", binary, 0o755)] + [
+members = [(os.path.basename(binary), binary, 0o755)] + [
     (f, os.path.join(root, f), 0o644)
     for f in ("LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md")
 ]
@@ -71,26 +74,40 @@ license_dir = os.path.join(root, "crates", "atomic-core", "assets")
 for filename in sorted(os.listdir(license_dir)):
     if "LICENSE" in filename or filename.endswith("LEGAL.txt"):
         members.append(("licenses/" + filename, os.path.join(license_dir, filename), 0o644))
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
-    top = tarfile.TarInfo(name)
-    top.type, top.mode, top.mtime = tarfile.DIRTYPE, 0o755, epoch
-    top.uname = top.gname = ""
-    tar.addfile(top)
-    for member, source, mode in sorted(members):
-        data = open(source, "rb").read()
-        info = tarfile.TarInfo(f"{name}/{member}")
-        info.size, info.mode, info.mtime = len(data), mode, epoch
-        info.uid = info.gid = 0
-        info.uname = info.gname = ""
-        tar.addfile(info, io.BytesIO(data))
-archive = os.path.join(dist, f"{name}.tar.gz")
-with open(archive, "wb") as raw:
-    with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
-        gz.write(buf.getvalue())
-for f in (f"{name}.tar.gz", f"{name}.cdx.json"):
+if os.path.basename(binary) == "atomic.exe":
+    import datetime, zipfile
+    archive = os.path.join(dist, f"{name}.zip")
+    stamp = datetime.datetime.fromtimestamp(max(epoch, 315532800), datetime.timezone.utc)
+    for helper in ("codex-command-runner.exe", "codex-windows-sandbox-setup.exe", "codex-windows-sandbox-service.exe"):
+        members.append((helper, os.path.join(os.path.dirname(binary), helper), 0o755))
+    with zipfile.ZipFile(archive, "w") as bundle:
+        for member, source, mode in sorted(members):
+            entry = zipfile.ZipInfo(f"{name}/{member}", stamp.timetuple()[:6])
+            entry.create_system = 3
+            entry.external_attr = mode << 16
+            with open(source, "rb") as payload:
+                bundle.writestr(entry, payload.read(), compress_type=zipfile.ZIP_DEFLATED)
+else:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        top = tarfile.TarInfo(name)
+        top.type, top.mode, top.mtime = tarfile.DIRTYPE, 0o755, epoch
+        top.uname = top.gname = ""
+        tar.addfile(top)
+        for member, source, mode in sorted(members):
+            data = open(source, "rb").read()
+            info = tarfile.TarInfo(f"{name}/{member}")
+            info.size, info.mode, info.mtime = len(data), mode, epoch
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            tar.addfile(info, io.BytesIO(data))
+    archive = os.path.join(dist, f"{name}.tar.gz")
+    with open(archive, "wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
+            gz.write(buf.getvalue())
+for f in (os.path.basename(archive), f"{name}.cdx.json"):
     digest = hashlib.sha256(open(os.path.join(dist, f), "rb").read()).hexdigest()
-    with open(os.path.join(dist, f + ".sha256"), "w") as out:
+    with open(os.path.join(dist, f + ".sha256"), "w", newline="\n") as out:
         out.write(f"{digest}  {f}\n")
     print(f"{digest}  {f}")
 PY

@@ -10,6 +10,7 @@ fn identity(name: &str, files: &[&str]) {
         "../../Cargo.lock",
         "src/js_modules.rs",
         "src/js_budget.rs",
+        "src/windows_worker.rs",
     ]
     .into_iter()
     .chain(files.iter().copied())
@@ -43,6 +44,7 @@ fn main() {
             "src/child_memory.rs",
             "src/worker_lifetime.rs",
             "src/astro.rs",
+            "src/astro/windows_paths.rs",
         ],
     );
 }
