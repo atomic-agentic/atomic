@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the extracted release through PowerShell's actual sandbox tool and a scripted Responses API."""
+"""Exercise the extracted release through Codex's Windows sandbox and a scripted Responses API."""
 import hashlib
 import json
 import os
@@ -108,8 +108,7 @@ returns: steps.implement.output
 
 def main():
     archive, sbom = Path(sys.argv[1]), Path(sys.argv[2])
-    # A normal project directory inherits its parent's ACL. Python's tempfile
-    # requests a user-only DACL on Windows, including on the worktree's ancestors.
+    # Exercise a normally created directory with spaces under the operator profile.
     scratch = Path.home() / ("atomic Windows smoke " + secrets.token_hex(6))
     scratch.mkdir()
     try:
@@ -145,6 +144,8 @@ def main():
             coding_turn(exe, project, dest / "repository", state, env)
 
     finally:
+        # Codex can still hold a setup helper open for a background read-ACL refresh.
+        # The disposable runner releases it when the VM shuts down.
         shutil.rmtree(scratch, ignore_errors=True)
 
 

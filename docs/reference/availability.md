@@ -496,8 +496,12 @@ The commands that show budgets and spend come with run inspection.
 
 The v0.2 Windows AMD64 release job exercises the extracted CLI with a scripted
 Codex provider. Its acceptance test requires a write in the fixture worktree
-and a denied read from private Atomic state. Standalone exec commands on Windows
-return an unsupported-confinement error.
+and a denied read from private Atomic state. The test selects `cmd.exe` in the
+Codex shell tool. In a worktree beneath a private Windows directory, PowerShell
+can start at the drive root even though Windows assigned the worktree as the
+process directory. Select `cmd.exe` for commands that use relative file paths
+in that layout. Standalone exec commands on Windows return an
+unsupported-confinement error.
 
 ## Observability stages
 
