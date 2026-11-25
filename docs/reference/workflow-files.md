@@ -121,13 +121,15 @@ file modes. Both entries must be non-executable regular files. The host consider
 only review diffs of at most 2,048 bytes, excludes security-sensitive filenames,
 and requires an item without the `security` label and no touched control rows.
 
-To cite that issue, a reviewer with a structured output contract can return
+A custom graph reviewer can cite this issue if its output schema permits the
+following response
 
 ```json
 {"verdict":"approve","findings":[{"file":"docs/guide.md","line":1,"severity":"nit","category":"formatting","message":"Remove the trailing space."}]}
 ```
 
-The approved verdict must contain only `verdict` and `findings`. The file
+To file a follow-up, the approved verdict must contain only `verdict` and
+`findings`. The file
 must match the host's proof. The finding must contain exactly these
 five fields, with the displayed category, line and message. Supported low
 severities are `minor`, `low` and `nit`. Other structured findings, including
@@ -144,8 +146,8 @@ review behavior on recovery. If an interrupted draft run had already recorded
 acceptance after an explicit change request, recovery refuses the conflicting
 checkpoint before the item can publish.
 
-The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
-own. Its `with` maps its input from what the step can see and from
+A reviewer can include its reasoning when it requests changes or sends a
+candidate to a person. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step
 `candidate.metadata.commit`; each binding must fit the reviewer's input. The
 reviewer runs in the project, not in the step's worktree, so a generic
