@@ -44,6 +44,7 @@ fn main() {
             "src/child_memory.rs",
             "src/worker_lifetime.rs",
             "src/astro.rs",
+            "src/astro/windows_paths.rs",
         ],
     );
 }
