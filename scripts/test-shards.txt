@@ -67,6 +67,7 @@ test goals
 test goals_cli
 test graph_claim
 test graph_cli
+test model_graph_tools
 test helper_binary
 test helper_dispatch
 test large_results
