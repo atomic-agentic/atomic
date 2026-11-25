@@ -307,6 +307,17 @@ jobs:
           cargo test -p atomic-agentic --test pipeline --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests a_full_repository_control_row_uses_host_cargo_in_normal_review -- --ignored --exact 2>&1 | tee "${RUNNER_TEMP}/cold-controls.log"
           grep -Fq 'test a_full_repository_control_row_uses_host_cargo_in_normal_review ... ok' "${RUNNER_TEMP}/cold-controls.log"
           grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/cold-controls.log"
+      # The v0.2 trial check also needs a fresh private target and the pinned
+      # offline Git cache; keep its cold build out of the regular test shard.
+      - name: Cold full-repository trial merge
+        if: ${{ matrix.shard == 1 }}
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
+        run: |
+          set -euo pipefail
+          cargo test -p atomic-agentic --test pipeline --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests fixture_bound_trial_merge_checks_full_atomic_with_rust_runtime -- --ignored --nocapture 2>&1 | tee "${RUNNER_TEMP}/cold-trial.log"
+          grep -Fq 'test fixture_bound_trial_merge_checks_full_atomic_with_rust_runtime ... ok' "${RUNNER_TEMP}/cold-trial.log"
+          grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "${RUNNER_TEMP}/cold-trial.log"
 
   # The crash suite: every failpoint, triggered in turn, against real
   # workflows and the scripted fake model; each run killed there must finish

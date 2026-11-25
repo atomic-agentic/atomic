@@ -7812,6 +7812,87 @@ fn main() {
     });
 }
 
+// The full workspace needs pinned Git sources as well as registry packages.
+// Keep this cold check separate from the regular pipeline shard so its fresh
+// private Cargo target does not compete with other tests for the build pool.
+// needs_sandbox
+#[test]
+#[ignore = "cold full atomic trial check runs in the dedicated CI step"]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+fn fixture_bound_trial_merge_checks_full_atomic_with_rust_runtime() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("trial-cargo-full-atomic");
+        let project = project(&dir);
+        let _ = full_repository_control_fixture(&project);
+        let (mut pipeline, base) = trial_reviewed_command(
+            &project,
+            "[cargo, check, -p, atomic-agentic, --offline, --locked]",
+        );
+        bind_trial_snapshot(&dir, &project, &mut pipeline, &base);
+        let model = FakeModel::start(vec![
+            Reply::Text(json!({"done": true}).to_string()),
+            Reply::Text(complete_self_review().to_string()),
+            Reply::Text(json!({"verdict": "approve"}).to_string()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = trial_cargo_backend(&dir);
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let selected = trial_cargo_selection();
+        eprintln!(
+            "full atomic trial: command=cargo check -p atomic-agentic --offline --locked; registry={}; git_cache={}; fixture={}",
+            selected.registry.display(),
+            selected
+                .registry
+                .parent()
+                .expect("Cargo home")
+                .join("git")
+                .display(),
+            project.display()
+        );
+        let rt = engine_built_with_trial(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            Some(backend),
+            store,
+            None,
+            Some(selected),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        rt.start(
+            PIPELINE,
+            "trial-cargo-full-atomic",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "change", "base": base}),
+            },
+        )
+        .await
+        .expect("start");
+        let _: Value = rt
+            .result("trial-cargo-full-atomic")
+            .await
+            .expect("offline full atomic check and review");
+        eprintln!(
+            "full atomic trial elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        assert_eq!(model.calls(), 3, "author, self-review, reviewer");
+        let steps = rt.steps("trial-cargo-full-atomic").await.expect("steps");
+        assert!(
+            steps.iter().any(|step| step.name == "code.trial_merge.0"),
+            "full Cargo check was not checkpointed"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 #[test]
 #[cfg(target_os = "linux")]
 fn fixture_bound_trial_cargo_failure_returns_to_author_without_reviewer() {

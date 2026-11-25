@@ -5215,7 +5215,15 @@ async fn reviewed<C: WorkflowContext>(
                             cwd: scratch.clone(),
                             env: env.clone(),
                             stdin: Vec::new(),
-                            time_limit: std::time::Duration::from_secs(300),
+                            // A fresh, offline check of the full workspace can
+                            // exceed five minutes on the smaller CI runner.
+                            // Keep a finite bound; other trial commands retain
+                            // their existing five-minute limit.
+                            time_limit: std::time::Duration::from_secs(if cargo_check {
+                                900
+                            } else {
+                                300
+                            }),
                             output_limit: 64 * 1024,
                             cpu_seconds: None,
                             data_bytes: None,
