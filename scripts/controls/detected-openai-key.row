@@ -1,0 +1,1 @@
+detected-openai-key|crates/atomic/src/settings.rs|settings.model.api_key_env = Some("OPENAI_API_KEY".into());|settings.model.api_key_env.get_or_insert("OPENAI_API_KEY".into()); /* CONTROL_OFF */|-p atomic-agentic --bin atomic detection_uses_only_the_key_that_selected_the_endpoint

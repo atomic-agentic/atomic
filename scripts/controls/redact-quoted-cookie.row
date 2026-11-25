@@ -1,0 +1,1 @@
+redact-quoted-cookie|crates/atomic-core/src/redact.rs|apply(&QUOTED_HEADER_PARAMETER,|apply(&regex("a^"),|-p atomic-agentic-core --lib --features fake-model headers_urls_and_flags_are_found

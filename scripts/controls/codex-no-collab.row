@@ -1,0 +1,1 @@
+codex-no-collab|crates/atomic-core/src/codex.rs|    Feature::Collab,|    /* CONTROL_OFF legacy multi-agent */|-p atomic-agentic-core --lib --features fake-model a_scripted_model_drives_a_real_codex_thread_with_an_exact_call_count

@@ -63,14 +63,14 @@ No build cache an atom writes outlives its run. A worktree step's commands,
 and an exec step's command, get build caches of the run's own, which they may
 write and which are removed when the run ends, whether it finishes or fails.
 A run stopped to be resumed, parked, or taken over by another process keeps
-them; one resumed after they went builds cold:
-`XDG_CACHE_HOME`, npm's, pip's and Go's caches
-(`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
-directory in the state directory, shared by the run's worktree and exec steps,
-repair rounds included. No other run's command may write it, though one can
-still read it by its path, so keep nothing secret there.
-`CARGO_TARGET_DIR` is each worktree's own, and each exec step's, so no step
-runs what another built. A worktree step's `HOME` is the attempt's own, empty,
+them. Steps use separate directories for `CARGO_TARGET_DIR`, `XDG_CACHE_HOME`,
+npm, pip and Go (`GOCACHE` and `GOMODCACHE`). A repair of the same step may
+reuse them. A different step builds cold, as does a run resumed from the
+older shared-cache layout. `ATOMIC_CACHE_DIR` is a separate directory shared
+by the run's steps for files they explicitly exchange. Sandboxed commands may
+write only their own build caches and that shared directory. Other steps and
+runs can still read them by path, so keep nothing secret there.
+A worktree step's `HOME` is the attempt's own, empty,
 directory, which its commands may write, and `CARGO_HOME` is `.cargo` inside
 it, never shared and never yours.
 `RUSTUP_HOME` points at the toolchains installed for you (your `RUSTUP_HOME`,

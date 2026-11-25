@@ -373,6 +373,17 @@ fn text(value: &Value) -> String {
     }
 }
 
+/// Type and subtype ignore case. Preserve parameter values, which may
+/// identify different representations even when they differ only in case.
+fn same_request_media(configured: &str, selected: &str) -> bool {
+    match (configured.split_once(';'), selected.split_once(';')) {
+        (Some((a, params_a)), Some((b, params_b))) => {
+            a.trim().eq_ignore_ascii_case(b.trim()) && params_a.trim() == params_b.trim()
+        }
+        _ => configured.trim().eq_ignore_ascii_case(selected.trim()),
+    }
+}
+
 /// A cookie value: bytes outside RFC 6265's cookie-octet, and `%`, are
 /// percent-encoded, so a value cannot add a cookie or attribute.
 fn cookie_value(value: &str) -> String {
@@ -537,6 +548,21 @@ impl HttpToolset {
                 continue;
             };
             if place == "body" {
+                if let Some(media) = &operation.request_media {
+                    if headers.iter().any(|(key, val)| {
+                        key.eq_ignore_ascii_case("content-type") && !same_request_media(val, media)
+                    }) {
+                        return Err(CallError::Refused(format!(
+                            "`{name}`: configured Content-Type differs from `{media}`"
+                        )));
+                    }
+                    if !headers
+                        .iter()
+                        .any(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+                    {
+                        headers.push(("Content-Type".into(), media.clone()));
+                    }
+                }
                 body = Some(value.clone());
                 continue;
             }
@@ -552,7 +578,8 @@ impl HttpToolset {
             let explode = declared
                 .and_then(|s| s["explode"].as_bool())
                 .unwrap_or(style == "form");
-            if value.is_null() {
+            let json_content = declared.and_then(|s| s.get("content")).is_some();
+            if !json_content && value.is_null() {
                 if place == "path" {
                     return Err(invalid(format!(
                         "/{field}: a path parameter cannot be null"
@@ -560,7 +587,11 @@ impl HttpToolset {
                 }
                 continue;
             }
-            let shape = shape(value).map_err(|e| invalid(format!("/{field}: {e}")))?;
+            let shape = if json_content {
+                Shape::Scalar(value.to_string())
+            } else {
+                shape(value).map_err(|e| invalid(format!("/{field}: {e}")))?
+            };
             match place {
                 "path" => {
                     if style != "simple" {
@@ -626,6 +657,14 @@ impl HttpToolset {
             )));
         }
         if !cookies.is_empty() {
+            if headers
+                .iter()
+                .any(|(header, _)| header.eq_ignore_ascii_case("cookie"))
+            {
+                return Err(CallError::Refused(format!(
+                    "`{name}`: cookie parameters conflict with the configured Cookie header"
+                )));
+            }
             headers.push(("Cookie".into(), cookies.join("; ")));
         }
         // The operation's path follows the base URL's whole path: without a
@@ -856,15 +895,15 @@ impl HttpToolset {
     }
 }
 
-async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+pub(crate) async fn read_bounded(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > RESPONSE_LIMIT {
+        if chunk.len() > RESPONSE_LIMIT - bytes.len() {
             return Err(format!(
                 "the response is larger than {RESPONSE_LIMIT} bytes"
             ));
         }
+        bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }

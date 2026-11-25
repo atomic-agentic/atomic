@@ -364,3 +364,45 @@ fn an_optional_reference_to_a_nullable_definition_keeps_its_null() {
         }
     }
 }
+
+#[test]
+fn nullable_objects_and_optional_constants_survive_generation() {
+    let contract = json!({"type":"object","required":["error"],"properties":{
+        "error":{"type":["object","null"],"properties":{"message":{"type":"string"}}},
+        "flag":{"const":true}
+    }});
+    let lowered = lower(&contract, &OPENAI_STRICT).expect("lowers");
+    let validator = jsonschema::validator_for(&lowered.schema).expect("valid generation schema");
+    assert!(validator.is_valid(&json!({"error":null,"flag":null})));
+    assert!(validator.is_valid(&json!({"error":{"message":"failed"},"flag":true})));
+    assert!(!validator.is_valid(&json!({"error":null,"flag":false})));
+    assert_eq!(
+        normalized(&contract, json!({"error":null,"flag":null})),
+        json!({"error":null})
+    );
+}
+
+#[test]
+fn nullable_objects_are_allowed_only_below_the_generation_root() {
+    let contract = json!({"type":["object","null"],"properties":{}});
+    assert!(
+        lower(&contract, &OPENAI_STRICT)
+            .expect_err("nullable generation root")
+            .message
+            .contains("root")
+    );
+    assert!(!check(&contract, &OPENAI_STRICT).is_empty());
+}
+
+#[test]
+fn a_nullable_type_restricted_by_an_enum_can_be_omitted() {
+    let contract = json!({"type":"object","properties":{"color":{
+        "type":["string","null"],"enum":["red"]
+    }}});
+    let lowered = lower(&contract, &OPENAI_STRICT).expect("lower optional enum");
+    let validator = jsonschema::validator_for(&lowered.schema).expect("valid nullable enum");
+    assert!(validator.is_valid(&json!({"color":null})));
+    assert!(validator.is_valid(&json!({"color":"red"})));
+    assert!(!validator.is_valid(&json!({"color":"blue"})));
+    assert_eq!(normalized(&contract, json!({"color":null})), json!({}));
+}

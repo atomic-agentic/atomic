@@ -253,7 +253,7 @@ impl Worktrees {
     }
 
     /// The build caches of run `run`'s worktree steps, beside the worktrees
-    /// in the state directory: `cache/<run>-<nonce>`, named as the run's
+    /// in the state directory: `cache/<run>-<nonce>.v2`, named as the run's
     /// worktrees are and with the nonce its first step recorded, so a run
     /// id used again, after its store was wiped, say, or names that differ
     /// only in case, never finds another run's caches. Nothing one run
@@ -513,24 +513,26 @@ impl Worktrees {
 }
 
 /// Build and package caches kept outside every worktree: a run's own, in
-/// `<state>/cache/<run>-<nonce>` ([`Caches::for_run`]), for its worktree and
+/// `<state>/cache/<run>-<nonce>.v2` ([`Caches::for_run`]), for its worktree and
 /// exec steps, removed when the run ends.
 ///
 /// An atom's commands find them through [`env`](Self::env), and a
-/// `workspace-write` thread is given [`dir`](Self::dir) as a writable root
+/// `workspace-write` thread is given only [`writable_roots`](Self::writable_roots)
 /// (`TurnSpec::env` and `TurnSpec::writable_roots` in [`crate::codex`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Caches {
     dir: PathBuf,
+    /// A pre-isolation cache for the same run, used only for cleanup.
+    legacy: Option<PathBuf>,
     /// The person's rustup toolchains, which commands may only read.
     rustup: Option<PathBuf>,
-    /// Cargo's target directory, one worktree's own.
-    target: Option<PathBuf>,
+    /// Name of the directory for this step's build tools.
+    scope: String,
 }
 
 impl Caches {
     /// The build caches of run `run` under `root`, the state directory's
-    /// `cache/`: `<root>/<run>-<nonce>`, named as the run's worktrees are and
+    /// `cache/`: `<root>/<run>-<nonce>.v2`, named as the run's worktrees are and
     /// with the nonce its first step recorded, so a run id used again, after
     /// its store was wiped, say, or names that differ only in case, never
     /// finds another run's caches. Nothing one run writes there reaches
@@ -554,9 +556,12 @@ impl Caches {
             None => component(run),
         };
         Ok(Caches {
-            dir: root.join(name),
+            // Old versions granted writes to the entire run directory. Resume
+            // cold in a sibling whose contents those versions could not plant.
+            dir: root.join(format!("{name}.v2")),
+            legacy: Some(root.join(name)),
             rustup,
-            target: None,
+            scope: "unscoped".into(),
         })
     }
 
@@ -564,34 +569,38 @@ impl Caches {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            legacy: None,
             rustup: None,
-            target: None,
+            scope: "unscoped".into(),
         }
     }
 
-    /// These caches for the worktree at `tree`: the same caches, with a
-    /// Cargo target directory of that worktree's own, so no worktree runs
-    /// what another built.
+    /// The shared run directory and the build caches of this worktree.
     pub fn in_worktree(&self, tree: &Path) -> Self {
-        let name = tree
-            .file_name()
-            .map_or_else(|| "worktree".into(), |n| n.to_string_lossy().into_owned());
+        self.for_scope(
+            "worktree",
+            tree.file_name().unwrap_or_default().as_encoded_bytes(),
+        )
+    }
+
+    /// The shared run directory and the build caches of exec step `name`.
+    pub fn for_exec(&self, name: &str) -> Self {
+        self.for_scope("exec", name.as_bytes())
+    }
+
+    fn for_scope(&self, kind: &str, name: &[u8]) -> Self {
+        // Keep names distinct even on a case-insensitive filesystem.
         Self {
-            target: Some(self.dir.join("cargo-target").join(name)),
+            scope: format!("{kind}-{:x}", Sha256::digest(name)),
             ..self.clone()
         }
     }
 
-    /// These caches for exec step `name`: the same caches, with a Cargo
-    /// target directory of that step's own, so no step runs what another
-    /// built.
-    /// `cargo-target/<name>`, which no worktree's can be: a worktree's is
-    /// named `<run>.<step>`, and a name as a file name holds no `.`.
-    pub fn for_exec(&self, name: &str) -> Self {
-        Self {
-            target: Some(self.dir.join("cargo-target").join(component(name))),
-            ..self.clone()
-        }
+    /// Writable cache roots for a command. Their common parent belongs
+    /// exclusively to atomic, so a step cannot create a sibling target
+    /// directory or replace one with a link.
+    pub fn writable_roots(&self) -> [PathBuf; 2] {
+        [self.dir.join("shared"), self.dir.join(&self.scope)]
     }
 
     /// The person's rustup toolchains, as found when the caches were made.
@@ -612,22 +621,29 @@ impl Caches {
         if let Some(e) = fail_for_tests(&self.dir) {
             return Err(e);
         }
-        if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(WorktreeError::Invalid(format!(
-                "{} is a link, not the run's cache directory; atomic did not make it",
-                self.dir.display()
-            )));
+        for dir in std::iter::once(self.dir.clone()).chain(self.writable_roots()) {
+            match std::fs::symlink_metadata(&dir) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(WorktreeError::Invalid(format!(
+                        "{} is a link, not the run's cache directory; atomic did not make it",
+                        dir.display()
+                    )));
+                }
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(io("inspect", &dir)(e));
+                }
+                _ => {}
+            }
+            crate::state::private_dir(&dir).map_err(|e| match e {
+                crate::state::StateError::Create { source, .. } => WorktreeError::Io {
+                    what: "create",
+                    path: dir,
+                    source,
+                },
+                e => WorktreeError::Invalid(e.to_string()),
+            })?;
         }
-        crate::state::private_dir(&self.dir).map_err(|e| match e {
-            // As it failed, so a full disk reads as one (see
-            // [`WorktreeError::disk_full`]).
-            crate::state::StateError::Create { source, .. } => WorktreeError::Io {
-                what: "create",
-                path: self.dir.clone(),
-                source,
-            },
-            e => WorktreeError::Invalid(e.to_string()),
-        })
+        Ok(())
     }
 
     /// [`create`](Self::create), as [`crate::runtime::wait_for_room`] reads
@@ -673,7 +689,11 @@ impl Caches {
     /// Directories a tool made read-only, as Go's module cache does, are
     /// made writable first; a link is removed, never followed.
     pub fn remove(&self) -> Result<()> {
-        remove_tree(&self.dir)
+        remove_tree(&self.dir)?;
+        if let Some(legacy) = &self.legacy {
+            remove_tree(legacy)?;
+        }
+        Ok(())
     }
 
     /// The environment that points common build tools at the caches: the
@@ -682,16 +702,12 @@ impl Caches {
     /// at the person's toolchains when they were found. Cargo's home is the
     /// command's own `HOME`'s, never shared.
     pub fn env(&self) -> std::collections::BTreeMap<String, String> {
-        let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
+        let [shared, step] = self.writable_roots();
+        let at = |sub: &str| step.join(sub).to_string_lossy().into_owned();
         [
-            ("ATOMIC_CACHE_DIR", self.dir.to_string_lossy().into_owned()),
+            ("ATOMIC_CACHE_DIR", shared.to_string_lossy().into_owned()),
             ("XDG_CACHE_HOME", at("xdg")),
-            (
-                "CARGO_TARGET_DIR",
-                self.target
-                    .as_ref()
-                    .map_or_else(|| at("cargo-target"), |t| t.to_string_lossy().into_owned()),
-            ),
+            ("CARGO_TARGET_DIR", at("cargo-target")),
             ("npm_config_cache", at("npm")),
             ("PIP_CACHE_DIR", at("pip")),
             ("GOCACHE", at("go-build")),
@@ -892,7 +908,7 @@ mod tests {
         let caches = worktrees
             .caches("run-1", Some("ab12"), Some("/toolchains".into()))
             .expect("caches");
-        assert_eq!(caches.dir(), Path::new("/state/cache/run-1-ab12"));
+        assert_eq!(caches.dir(), Path::new("/state/cache/run-1-ab12.v2"));
         // Another run, the same id started again, and ids that differ in
         // case only: each its own.
         let dir = |run: &str, nonce: &str| {
@@ -942,11 +958,11 @@ mod tests {
             }
         }
         // Each exec step builds into a target of its own, never a
-        // worktree's, and shares the rest of the run's caches.
+        // worktree's, even for two names differing only in case.
         let tree = caches
             .in_worktree(&Path::new("/state/worktrees").join(worktree_name("run-1", "a")))
             .env();
-        let targets: Vec<String> = ["a", "b", "a.b", "_a"]
+        let targets: Vec<String> = ["a", "A", "b", "a.b", "_a"]
             .iter()
             .map(|turn| caches.for_exec(turn).env()["CARGO_TARGET_DIR"].clone())
             .chain([
@@ -954,21 +970,22 @@ mod tests {
                 env["CARGO_TARGET_DIR"].clone(),
             ])
             .collect();
-        let mut distinct = targets.clone();
+        let mut distinct: Vec<_> = targets.iter().map(|t| t.to_lowercase()).collect();
         distinct.sort();
         distinct.dedup();
         assert_eq!(distinct.len(), targets.len(), "{targets:?}");
         let exec = caches.for_exec("a").env();
-        assert!(
-            Path::new(&exec["CARGO_TARGET_DIR"]).starts_with(caches.dir().join("cargo-target"))
-        );
-        for name in [
-            "ATOMIC_CACHE_DIR",
-            "XDG_CACHE_HOME",
-            "GOCACHE",
-            "RUSTUP_HOME",
-        ] {
-            assert_eq!(exec[name], env[name], "{name}");
+        for (name, value) in &exec {
+            match name.as_str() {
+                "ATOMIC_CACHE_DIR" | "RUSTUP_HOME" => assert_eq!(value, &tree[name], "{name}"),
+                _ => {
+                    assert_ne!(value, &tree[name], "{name}");
+                    assert!(
+                        !Path::new(value).starts_with(&exec["ATOMIC_CACHE_DIR"]),
+                        "{name}"
+                    );
+                }
+            }
         }
     }
 
@@ -1183,8 +1200,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("atomic-run-caches-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let caches = Caches::new(dir.join("cache/run-1"));
+        let root = dir.join("cache");
+        let legacy = root.join("run-1-ab12");
+        let caches = Caches::for_run(&root, "run-1", Some("ab12"), None)
+            .expect("caches")
+            .for_exec("build");
+        let prior_target = legacy.join("cargo-target/build");
+        std::fs::create_dir_all(&prior_target).expect("older cache");
+        std::fs::write(prior_target.join("old"), "older build").expect("write");
         caches.create().expect("create");
+        let env = caches.env();
+        assert!(!Path::new(&env["CARGO_TARGET_DIR"]).starts_with(&legacy));
+        assert!(!Path::new(&env["CARGO_TARGET_DIR"]).join("old").exists());
         let mode = std::fs::metadata(caches.dir())
             .expect("made")
             .permissions()
@@ -1192,14 +1219,16 @@ mod tests {
         assert_eq!(mode & 0o777, 0o700);
         std::fs::write(caches.dir().join("built"), "x").expect("write");
         // A directory a tool made read-only, as Go's module cache is.
-        let locked = caches.dir().join("go-mod/m@v1");
+        let modules = Path::new(&env["GOMODCACHE"]);
+        let locked = modules.join("m@v1");
         std::fs::create_dir_all(&locked).expect("locked");
         std::fs::write(locked.join("go.mod"), "module m\n").expect("file");
-        for d in [&locked, &caches.dir().join("go-mod")] {
+        for d in [locked.as_path(), modules] {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o500)).expect("mode");
         }
         caches.remove().expect("remove");
         assert!(!caches.dir().exists());
+        assert!(!legacy.exists());
         caches.remove().expect("a repeat finds nothing");
         // A link in its place, which something else made, is refused.
         std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");

@@ -897,12 +897,9 @@ components:
     assert_eq!(*kept(op, "203"), ResponseBody::NoJsonSchema);
     // A `+json` type is a JSON media type for a reply whichever tree it sits
     // under, which is what kept the `text/vnd.acme.echo+json` schema above. A
-    // request body is read more narrowly: atomic sends every one as
-    // `application/json`, so a body declared only under a `+json` type of the
-    // `text/` tree is one it would send as something the spec never declared,
-    // and the operation stays unsupported with no `body` in its input. A `+json`
-    // type of the `application/` tree is one it sends within that family, so
-    // that operation stays callable with the schema as its `body`.
+    // request body must declare an application JSON representation. The text/
+    // operation stays unsupported, while the application/ one sends the body
+    // under the vendor media type the spec declares.
     let echo = ops
         .iter()
         .find(|op| op.name == "echoThing")
@@ -1671,5 +1668,122 @@ paths:
     assert!(
         said.contains("Failed to resolve '/'") && said.contains("urn:atomic:response:0"),
         "the refusal should name the reference and the member's own base: {said}"
+    );
+}
+
+#[test]
+fn request_and_response_use_their_own_view_of_shared_properties() {
+    let schema = json!({
+        "type":"object", "required":["id","credential"],
+        "properties":{"id":{"type":"integer","readOnly":true},
+                      "credential":{"$ref":"#/components/schemas/Secret"}}
+    });
+    let media = json!({"application/json":{"schema":{"$ref":"#/components/schemas/Record"}}});
+    let spec = json!({"openapi":"3.1.0", "components":{"schemas":{
+        "Record":schema, "Secret":{"type":"string","writeOnly":true}
+    }}, "paths":{"/":{"post":{
+        "requestBody":{"required":true,"content":media},
+        "responses":{"201":{"content":media}}
+    }}}});
+    let op = operations(&spec).expect("import operation").remove(0);
+    let input = Registry::new()
+        .validator_for(&op.input)
+        .expect("input validator");
+    let output = Registry::new()
+        .validator_for(op.output.as_ref().expect("declared output"))
+        .expect("output validator");
+    assert!(input.is_valid(&json!({"body":{"credential":"value"}})));
+    assert!(!input.is_valid(&json!({"body":{"id":1,"credential":"value"}})));
+    assert!(output.is_valid(&json!({"id":1})));
+    assert!(!output.is_valid(&json!({"id":1,"credential":"value"})));
+}
+
+#[test]
+fn content_parameters_require_one_declared_representation() {
+    let build = |parameter: Value| {
+        operations(&json!({"openapi":"3.1.0","paths":{"/":{"get":{"parameters":[parameter]}}}}))
+    };
+    let mut param = json!({"name":"q","in":"query","content":{"text/plain":{}}});
+    let op = build(param.clone())
+        .expect("import unsupported operation")
+        .remove(0);
+    assert!(
+        op.unsupported
+            .expect("unsupported media type")
+            .contains("text/plain")
+    );
+    param["content"]["application/json"] = json!({});
+    assert!(
+        build(param.clone())
+            .expect_err("mixed representations")
+            .message
+            .contains("exactly one")
+    );
+    param["schema"] = json!({});
+    assert!(
+        build(param)
+            .expect_err("mixed serialization")
+            .message
+            .contains("mixes content")
+    );
+}
+
+#[test]
+fn ambiguous_request_media_are_refused_and_parameters_are_preserved() {
+    let spec = |media: Value| json!({"openapi":"3.1.0","paths":{"/":{"post":{"requestBody":{"content":media}}}}});
+    for media in [
+        json!({"application/a+json":{},"application/b+json":{}}),
+        json!({"application/json; profile=a":{},"application/json; profile=b":{}}),
+    ] {
+        let op = operations(&spec(media))
+            .expect("import ambiguous operation")
+            .remove(0);
+        assert!(
+            op.unsupported
+                .expect("ambiguous representation")
+                .contains("equally preferred")
+        );
+        assert!(op.request_media.is_none());
+    }
+    let content_type = "application/json; profile=custom";
+    let op = operations(&spec(json!({(content_type):{"schema":{"const":1}}})))
+        .expect("one parameterized representation")
+        .remove(0);
+    assert_eq!(op.request_media.as_deref(), Some(content_type));
+    assert_eq!(op.input["properties"]["body"]["const"], 1);
+}
+
+#[test]
+fn composed_visibility_and_required_apply_to_the_same_object() {
+    let media = json!({"application/json":{"schema":{"$ref":"#/components/schemas/Record"}}});
+    let spec = json!({"openapi":"3.1.0","components":{"schemas":{
+        "Fields":{"properties":{"id":{"readOnly":true},"secret":{"writeOnly":true}}},
+        "Record":{"allOf":[{"$ref":"#/components/schemas/Fields"},{"required":["id","secret","label"]}]}
+    }},"paths":{"/":{"post":{"requestBody":{"required":true,"content":media},"responses":{"200":{"content":media}}}}}});
+    let op = operations(&spec).expect("composed operation").remove(0);
+    let input = Registry::new().validator_for(&op.input).expect("request");
+    let output = Registry::new()
+        .validator_for(op.output.as_ref().expect("response schema"))
+        .expect("response");
+    assert!(input.is_valid(&json!({"body":{"secret":"s","label":"a"}})));
+    assert!(!input.is_valid(&json!({"body":{"id":1,"secret":"s","label":"a"}})));
+    assert!(!input.is_valid(&json!({"body":{"secret":"s"}})));
+    assert!(output.is_valid(&json!({"id":1,"label":"a"})));
+    assert!(!output.is_valid(&json!({"id":1,"secret":"s","label":"a"})));
+}
+
+#[test]
+fn a_shared_requirement_cannot_be_overridden_by_one_use_site() {
+    let media = json!({"application/json":{"schema":{
+        "allOf":[{"$ref":"#/components/schemas/Shared"},{"properties":{"id":{"readOnly":true}}}]
+    }}});
+    let spec = json!({"openapi":"3.1.0","components":{"schemas":{
+        "Shared":{"required":["id"],"properties":{"id":{"type":"integer"}}}
+    }},"paths":{"/":{"post":{"requestBody":{"content":media}}}}});
+    let error = operations(&spec).expect_err("incompatible shared requirement");
+    assert!(
+        error
+            .message
+            .contains("requires `id`, marked readOnly outside")
     );
 }

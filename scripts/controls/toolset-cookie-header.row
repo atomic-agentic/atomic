@@ -1,0 +1,1 @@
+toolset-cookie-header|crates/atomic-core/src/http_tools.rs|header.eq_ignore_ascii_case("cookie")|false && header.eq_ignore_ascii_case("cookie")|-p atomic-agentic-core --lib -- http_tools::tests::cookie_arguments_preserve_the_configured_cookie_header

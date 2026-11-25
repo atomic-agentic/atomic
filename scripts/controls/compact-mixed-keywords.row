@@ -1,0 +1,1 @@
+compact-mixed-keywords|crates/atomic-schema/src/compact.rs|marks_json_schema(key, value).then_some(key)|JSON_SCHEMA_KEYWORDS.contains(&key.as_str()).then_some(key)|-p atomic-agentic-schema --lib -- compact::tests::annotations_cannot_hide_compact_fields

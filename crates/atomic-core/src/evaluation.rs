@@ -51,23 +51,26 @@ fn judge<'a>(atom: &'a Atom, scorer: &str) -> Result<&'a Value, String> {
 /// Build a judge input only after validating the candidate, case and resulting binding.
 pub fn judge_input(
     atom: &Atom,
-    _registry: &Registry,
+    registry: &Registry,
     scorer: &str,
     values: &Evaluation<'_>,
 ) -> Result<Value, String> {
     let options = options(atom, values.snapshot, values.step_id, values.run_id)?;
     for (key, value) in [("Input", values.input), ("Output", values.output)] {
-        jsonschema::validator_for(&atom.program.contracts[key])
+        registry
+            .validator_for(&atom.program.contracts[key])
             .map_err(|e| e.to_string())?
             .validate(value)
             .map_err(|e| e.to_string())?;
     }
-    jsonschema::validator_for(&atom.case)
+    registry
+        .validator_for(&atom.case)
         .map_err(|e| e.to_string())?
         .validate(values.case)
         .map_err(|e| e.to_string())?;
     let result = atom.program.invoke("judgeInput", json!({"scorer":scorer,"values":{"input":values.input,"output":values.output,"case":values.case},"options":options}))?;
-    jsonschema::validator_for(&judge(atom, scorer)?["input"])
+    registry
+        .validator_for(&judge(atom, scorer)?["input"])
         .map_err(|e| e.to_string())?
         .validate(&result)
         .map_err(|e| e.to_string())?;
@@ -84,7 +87,8 @@ pub fn judge_score(
     run_id: &str,
 ) -> Result<f64, String> {
     let options = options(atom, snapshot, step_id, run_id)?;
-    jsonschema::validator_for(&judge(atom, scorer)?["output"])
+    Registry::new()
+        .validator_for(&judge(atom, scorer)?["output"])
         .map_err(|e| e.to_string())?
         .validate(output)
         .map_err(|e| e.to_string())?;

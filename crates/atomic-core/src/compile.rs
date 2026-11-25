@@ -30,7 +30,7 @@ pub struct Compiled {
 }
 
 /// Compile a loaded atom, checking every declared example against the full contracts.
-pub fn compile(atom: &Atom, _registry: &Registry) -> Result<Compiled, AtomError> {
+pub fn compile(atom: &Atom, registry: &Registry) -> Result<Compiled, AtomError> {
     let fail = |message| AtomError {
         file: atom.file.clone(),
         line: 1,
@@ -52,9 +52,11 @@ pub fn compile(atom: &Atom, _registry: &Registry) -> Result<Compiled, AtomError>
         let values = values
             .as_array()
             .ok_or_else(|| fail("examples must be an array".into()))?;
-        let input = jsonschema::validator_for(&atom.program.contracts["Input"])
+        let input = registry
+            .validator_for(&atom.program.contracts["Input"])
             .map_err(|e| fail(e.to_string()))?;
-        let output = jsonschema::validator_for(&atom.program.contracts["Output"])
+        let output = registry
+            .validator_for(&atom.program.contracts["Output"])
             .map_err(|e| fail(e.to_string()))?;
         for value in values {
             let name = value
