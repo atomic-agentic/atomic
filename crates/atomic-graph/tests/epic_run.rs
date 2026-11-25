@@ -81,6 +81,20 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
     let (rt, store, path) = setup("review-followup").await;
     create(&store, "epic", None, true).await;
     create(&store, "one", Some("epic"), false).await;
+    // A legacy goal may already have been closed and exported to this store.
+    store
+        .import(
+            Actor::human("operator"),
+            json!({
+                "id": "atomic-review-goal-21dfcf220478826051f5b1d3",
+                "title": "Legacy follow-up goal", "status": "closed", "priority": 3,
+                "issue_type": "goal", "created_at": "2026-01-02T00:00:00Z"
+            })
+            .to_string(),
+            false,
+        )
+        .await
+        .expect("import old goal");
     store
         .authorize_graph_run("epic", "run-one")
         .await
@@ -98,10 +112,10 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
     let finding = ReviewFollowup {
         reviewer: "independent-reviewer".into(),
         file: "docs/guide.md".into(),
-        line: Some(12),
+        line: Some(1),
         severity: "low".into(),
-        category: "grammar".into(),
-        message: "Clarify the explanation".into(),
+        category: "formatting".into(),
+        message: "Remove the trailing space.".into(),
     };
     let invalid = ReviewFollowup {
         severity: "blocker".into(),
@@ -131,11 +145,11 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
         Box::pin(async move {
             let row = tx
                 .query_one(
-                    "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE id LIKE 'atomic-review-%'",
+                    "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE id LIKE 'atomic-review-%' AND kind='task'",
                     &[],
                 )
                 .await?;
-            assert_eq!(row.int("n")?, 0, "no partial follow-up or goal");
+            assert_eq!(row.int("n")?, 0, "no partial follow-up");
             Ok(())
         })
     })
@@ -162,27 +176,21 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
         .await
         .expect("file or replay finding");
     }
-    rt.control_transaction(|mut tx| Box::pin(async move {
+    let followup = rt.control_transaction(|mut tx| Box::pin(async move {
         let rows = tx.query_one(
             "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE kind='task' AND id LIKE 'atomic-review-%'",
             &[],
         ).await?;
         assert_eq!(rows.int("n")?, 1, "replay cannot duplicate follow-up");
         let row = tx.query_one(
-            "SELECT f.parent AS parent,g.kind AS parent_kind,g.status AS parent_status, \
-             g.parent AS parent_parent, \
-             e.target AS discovered FROM atomic_graph_items f \
-             JOIN atomic_graph_items g ON g.id=f.parent \
+            "SELECT f.id AS id,f.parent AS parent,e.target AS discovered FROM atomic_graph_items f \
              JOIN atomic_graph_edges e ON e.source=f.id AND e.kind='discovered-from' \
              WHERE f.id LIKE 'atomic-review-%' AND f.kind='task'",
             &[],
         ).await?;
-        assert_eq!(row.text("parent_kind")?, "goal");
-        assert_eq!(row.text("parent_status")?, "pinned");
-        assert_eq!(row.text_opt("parent_parent")?, None);
-        assert!(row.text("parent")?.starts_with("atomic-review-goal-"));
+        assert_eq!(row.text_opt("parent")?, None);
         assert_eq!(row.text("discovered")?, "one");
-        Ok(())
+        row.text("id")
     })).await.expect("inspect follow-up graph");
     let lease_for_close = lease.clone();
     rt.control_transaction(move |mut tx| {
@@ -198,8 +206,44 @@ async fn accepted_low_review_finding_is_deduped_outside_the_active_epic() {
             select(&rt, "after-review-followup").await,
             ClaimNext::Complete
         ),
-        "follow-up goal cannot keep the active epic open"
+        "unassigned follow-up cannot keep the active epic open"
     );
+    create(&store, "later-epic", None, true).await;
+    store
+        .add_edge(
+            Actor::human("operator"),
+            followup.clone(),
+            EdgeKind::ParentChild,
+            "later-epic".into(),
+        )
+        .await
+        .expect("operator assigns the task using the graph link operation");
+    store
+        .authorize_graph_run("later-epic", "run-later")
+        .await
+        .expect("authorize follow-up run");
+    let next = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                transactional_claim::bind_epic_run(&mut tx, "later-epic", "run-later").await?;
+                transactional_claim::claim_next_for_epic(
+                    &mut tx,
+                    "run-later",
+                    "next",
+                    "later-epic",
+                    "run-later",
+                    Duration::from_secs(900),
+                    |_| Ok(()),
+                )
+                .await
+            })
+        })
+        .await
+        .expect("select follow-up");
+    let ClaimNext::Claimed { item, .. } = next else {
+        panic!("operator assigned follow-up must be claimable");
+    };
+    assert_eq!(item.id, followup);
     drop(rt);
     drop(store);
     let _ = std::fs::remove_file(path);

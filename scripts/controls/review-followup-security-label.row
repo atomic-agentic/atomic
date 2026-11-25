@@ -1,0 +1,1 @@
+review-followup-security-label|crates/atomic/src/pipeline.rs|touched_controls.is_empty() && !security_item|touched_controls.is_empty() && (security_item == security_item)|-p atomic-agentic --test graph_work_loop -- imported_security_label_excludes_editorial_followups

@@ -107,51 +107,32 @@ with `approve` among them:
 | `request_changes`, `revise` | The author gets a repair round, while any are left; then a person decides. |
 | `reject`, `escalate`, `insufficient_context` | A person decides. |
 
-For graph-driven `coding: true` steps, `request_changes` and `revise` always
-require repair or a human decision. Reviewers can include plain-text findings
-as evidence for their verdict. With structured findings, even an `approve`
-requires repair unless each finding matches a formatting issue the host verified.
+For graph-driven `coding: true` steps, the host may offer a follow-up only
+for the exact typed formatting finding `Remove the trailing space.` on line 1
+of a safe Markdown file. The host independently verifies that the candidate
+changed one regular prose blob by adding that one trailing ASCII space. A
+reviewer-supplied severity, category, path, or message cannot establish this
+proof. A security-labeled item, a touched control row, any additional change,
+or an explicit `request_changes` or `revise` verdict keeps the blocking review
+path. Older reviewers with plain-text findings keep their verdicts.
 
-The host recognizes one formatting edit. The candidate adds a single ASCII
-space immediately before the final LF of an existing, one-line Markdown file
-under `docs/` or `examples/`. The original line starts with an ASCII letter,
-contains only ASCII letters, digits, spaces, periods and commas, and ends
-without a space. The base and candidate trees must otherwise match, including
-file modes. Both entries must be non-executable regular files. The host considers
-only review diffs of at most 2,048 bytes, excludes security-sensitive filenames,
-and requires an item without the `security` label and no touched control rows.
+For an eligible finding, the candidate's merge gate shows its commit, candidate
+digest, both raw approvals, and the proposed follow-up. An enrolled operator
+must approve that exact candidate and panel before publication. Rejecting the
+classification leaves the item open and files nothing.
 
-A custom graph reviewer can cite this issue if its output schema permits the
-following response
+Follow-ups are filed as unassigned tasks with `discovered-from` links when the
+original item closes. They do not keep its epic open. An operator can schedule
+one with `atomic graph link <task> parent-child <epic>` and a pinned epic.
+Delivery requires two explicit independent approvals and, when findings were
+deferred, the matching human classification. Atomic checks the decision
+against the published reviewer findings at delivery admission and before
+each remote effect. Delivery has its own gate for authorizing those effects.
+The graph run records this routing policy at admission. A run recorded before
+the policy was introduced keeps its original review behavior when recovered.
 
-```json
-{"verdict":"approve","findings":[{"file":"docs/guide.md","line":1,"severity":"nit","category":"formatting","message":"Remove the trailing space."}]}
-```
-
-To file a follow-up, the approved verdict must contain only `verdict` and
-`findings`. The file
-must match the host's proof. The finding must contain exactly these
-five fields, with the displayed category, line and message. Supported low
-severities are `minor`, `low` and `nit`. Other structured findings, including
-spelling, grammar, broken links and high-severity objections, require repair.
-An approver can omit findings when there are none.
-
-When the graph item closes, verified findings are filed with `discovered-from`
-links under a separate pinned goal. If the final panel opens a human gate,
-approval files eligible findings from reviewers who approved that candidate.
-Delivery requires two explicit independent approvals. The host records its
-formatting evidence with the candidate. Each repair gets its own candidate
-and proof. Graph runs admitted before finding routing retain their original
-review behavior on recovery. If an interrupted draft run had already recorded
-acceptance after an explicit change request, recovery refuses the conflicting
-checkpoint before the item can publish. Delivery checks the host formatting
-receipt, accepted candidate and reviewer findings at admission and again before
-each new remote effect. A
-draft acceptance that deferred a finding without this receipt requires a fresh
-review before delivery.
-
-A reviewer can include its reasoning when it requests changes or sends a
-candidate to a person. Its `with` maps its input from what the step can see and from
+The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
+own. Its `with` maps its input from what the step can see and from
 `candidate.output`, the output under review, and for a `worktree: true` step
 `candidate.metadata.commit`; each binding must fit the reviewer's input. The
 reviewer runs in the project, not in the step's worktree, so a generic

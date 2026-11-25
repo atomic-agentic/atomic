@@ -907,6 +907,7 @@ enum PanelHistory {
     AfterFinalize,
     DraftAccepted,
     Shipped,
+    Security,
 }
 
 fn checkpoint_encoding(value: &Value) -> String {
@@ -982,6 +983,28 @@ async fn editorial_panel(
     ]).await.expect("scripted coding panel");
     seed(root).await;
     leave_one_work_child(root).await;
+    if matches!(history, Some(PanelHistory::Security)) {
+        let credential = HumanCredential::new(Principal::local("owner"), SECRET);
+        let graph =
+            SqliteStore::open_authorized(&root.join("atomic.db"), SystemTime::now, credential)
+                .expect("graph for security-labeled item");
+        graph
+            .set_status(Actor::human("owner"), CHILDREN[0].into(), Status::Closed)
+            .await
+            .expect("close ordinary item");
+        graph
+            .import(
+                Actor::human("owner"),
+                json!({"id":"security-panel-task", "title":"Imported security work",
+                "labels":["security"], "status":"open", "priority":2,
+                "issue_type":"task", "parent_issue":EPIC,
+                "created_at":"2026-01-02T00:00:00Z"})
+                .to_string(),
+                false,
+            )
+            .await
+            .expect("import security-labeled item");
+    }
     let project = root.join("project");
     std::fs::create_dir_all(project.join("docs")).expect("fixture guide directory");
     std::fs::write(project.join("docs/guide.md"), "Example text.\n").expect("base guide");
@@ -1046,7 +1069,9 @@ async fn editorial_panel(
                 assert!(!steps.contains(&"graph.00000.fix.publish".to_owned()));
             }
             PanelHistory::DraftAccepted => record_draft_acceptance(&rt).await,
-            PanelHistory::BeforeRouting | PanelHistory::Shipped => unreachable!(),
+            PanelHistory::BeforeRouting | PanelHistory::Shipped | PanelHistory::Security => {
+                unreachable!()
+            }
         }
         let mut recover = child_command(root, &model.base_url(), &base, "recover", None);
         recover.env("HOME", root.join("home"));
@@ -1104,6 +1129,7 @@ fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
     on_codex_runtime(async {
         for (first, candidate, accepted) in [
             ("approve", "Example text. \n", true),
+            ("approve", "Example text. \n", false),
             ("approve", "Publish customer addresses. \n", false),
             ("request_changes", "Example text. \n", false),
         ] {
@@ -1115,7 +1141,11 @@ fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
                 "approve",
                 formatting_finding(),
                 candidate,
-                (!accepted).then_some(Verdict::Reject),
+                Some(if accepted {
+                    Verdict::Approve
+                } else {
+                    Verdict::Reject
+                }),
                 Some(PanelHistory::Shipped),
             )
             .await;
@@ -1141,6 +1171,19 @@ fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
                     .and_then(|step| step.output.as_ref())
                     .expect("accepted graph receipt");
                 assert_eq!(receipt["verified_formatting_path"], "docs/guide.md");
+                let classification = steps
+                    .iter()
+                    .find(|step| step.name == "graph.00000.fix.review.gate")
+                    .and_then(|step| step.output.as_ref())
+                    .expect("candidate-bound classification gate opened");
+                assert_eq!(
+                    classification["show"]["candidate"]["digest"],
+                    receipt["digest"]
+                );
+                assert_eq!(
+                    classification["show"]["proposed_followups"][0]["file"],
+                    "docs/guide.md"
+                );
             } else {
                 result.expect_err("unproved or explicit negative review cannot close");
                 assert_eq!(editorial_followup_count(&rt).await, 0);
@@ -1156,7 +1199,43 @@ fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
 }
 
 #[test]
-fn final_panel_files_editorial_followups_only_for_human_approval() {
+fn imported_security_label_excludes_editorial_followups() {
+    on_codex_runtime(async {
+        let root = std::fs::canonicalize(scratch("security-formatting-review"))
+            .expect("physical fixture path");
+        let (_, rt) = editorial_panel(
+            &root,
+            "approve",
+            "approve",
+            formatting_finding(),
+            "Example text. \n",
+            Some(Verdict::Reject),
+            Some(PanelHistory::Security),
+        )
+        .await;
+        rt.result::<Value>(RUN)
+            .await
+            .expect_err("security item cannot defer a finding");
+        let steps = rt.steps(RUN).await.expect("security review steps");
+        let gate = steps
+            .iter()
+            .find(|step| step.name == "graph.00000.fix.review.gate")
+            .and_then(|step| step.output.as_ref())
+            .expect("security review gate");
+        assert!(
+            gate["show"].get("proposed_followups").is_none(),
+            "security-labeled item may not propose a nonblocking finding"
+        );
+        let rows = rt.control_transaction(|mut tx| Box::pin(async move {
+            tx.query_one("SELECT COUNT(*) AS n FROM atomic_graph_items WHERE created_by='atomic-review'", &[])
+                .await?.int("n")
+        })).await.expect("count review follow-ups");
+        assert_eq!(rows, 0);
+    });
+}
+
+#[test]
+fn explicit_reviewer_change_request_opens_gate_without_followup() {
     on_codex_runtime(async {
         for verdict in [Verdict::Approve, Verdict::Reject] {
             let root = std::fs::canonicalize(scratch("editorial-gate"))
@@ -1173,8 +1252,8 @@ fn final_panel_files_editorial_followups_only_for_human_approval() {
             .await;
             let result = rt.result::<Value>(RUN).await;
             if verdict == Verdict::Approve {
-                result.expect("graph item closed after approval");
-                assert_eq!(editorial_followup_count(&rt).await, 1);
+                result.expect("human approved the explicit change request");
+                assert_eq!(editorial_followup_count(&rt).await, 0);
                 let err =
                     atomic_app::delivery_evidence::approved_graph_item(&rt, RUN, "graph.00000.fix")
                         .await
@@ -1221,6 +1300,16 @@ fn explicit_reviewer_changes_block_even_on_verified_formatting() {
                 .expect_err("explicit objection opened the gate");
             assert!(err.to_string().contains("was rejected"), "{err}");
             assert_eq!(editorial_followup_count(&rt).await, 0);
+            let steps = rt.steps(RUN).await.expect("explicit review steps");
+            let gate = steps
+                .iter()
+                .find(|step| step.name == "graph.00000.fix.review.gate")
+                .and_then(|step| step.output.as_ref())
+                .expect("explicit review gate");
+            assert!(
+                gate["show"].get("proposed_followups").is_none(),
+                "an explicit change request cannot enter classification"
+            );
         }
     });
 }
@@ -1490,7 +1579,7 @@ fn terminal_draft_privacy_finding_refuses_delivery_and_recovered_dispatch() {
         );
         assert!(
             String::from_utf8_lossy(&resumed.stdout)
-                .contains("delivery follow-ups lack a host-verified formatting receipt"),
+                .contains("delivery follow-ups lack a human classification gate"),
             "{resumed:?}"
         );
         assert!(
@@ -1522,7 +1611,7 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
             "approve",
             formatting_finding(),
             "Example text. \n",
-            None,
+            Some(Verdict::Approve),
             Some(PanelHistory::AfterFinalize),
         )
         .await;
@@ -1689,6 +1778,72 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
                 Ok(())
             })
         }).await.expect("restore published verdict");
+        // The operator's recorded decision must remain bound to the original
+        // gate proposal at every outbound reservation.
+        let review_gate = gate::gate_id(RUN, "graph.00000.fix.review");
+        let original_proposal = rt
+            .control_transaction({
+                let review_gate = review_gate.clone();
+                move |mut tx| {
+                    let review_gate = review_gate.clone();
+                    Box::pin(async move {
+                        let row = tx
+                            .query_one(
+                                "SELECT proposal FROM atomic_gates WHERE gate_id=?",
+                                &[Param::Text(review_gate.clone())],
+                            )
+                            .await?;
+                        let original = row.text("proposal")?;
+                        tx.execute(
+                            "UPDATE atomic_gates SET proposal=? WHERE gate_id=?",
+                            &[
+                                Param::Text("tampered-proposal".into()),
+                                Param::Text(review_gate),
+                            ],
+                        )
+                        .await?;
+                        Ok(original)
+                    })
+                }
+            })
+            .await
+            .expect("tamper classification proposal");
+        let invalid_gate = rt
+            .control_transaction({
+                let source = source.clone();
+                move |mut tx| {
+                    let source = source.clone();
+                    Box::pin(async move {
+                        atomic_app::delivery_evidence::revalidate_delivery_source_in(
+                            &mut tx, &source,
+                        )
+                        .await
+                        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))
+                    })
+                }
+            })
+            .await
+            .expect_err("dispatch refuses changed operator proposal");
+        assert!(
+            invalid_gate
+                .to_string()
+                .contains("follow-up classification does not approve"),
+            "{invalid_gate}"
+        );
+        rt.control_transaction(move |mut tx| {
+            let review_gate = review_gate.clone();
+            let original_proposal = original_proposal.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE atomic_gates SET proposal=? WHERE gate_id=?",
+                    &[Param::Text(original_proposal), Param::Text(review_gate)],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("restore classification proposal");
         rt.control_transaction(|mut tx| {
             Box::pin(async move {
                 tx.execute(

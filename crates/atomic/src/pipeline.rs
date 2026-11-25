@@ -2331,6 +2331,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     Arc::new(commit.clone()),
                     Arc::new(precondition.clone()),
                     Arc::new(publish_step.clone()),
+                    // CONTROL_OFF: review-followup-file
                     Arc::new(followups.clone()),
                     Arc::new(epic.clone()),
                     Arc::new(id.clone()),
@@ -4895,6 +4896,8 @@ mod severity_routing_tests {
     }
 }
 
+/// Distinguishes independent acceptance with classified findings from a
+/// plain panel approval, including in older published draft receipts.
 pub(crate) const FOLLOWUP_REASON_PREFIX: &str = "accepted low findings from reviewer(s) ";
 
 /// The two acceptance reasons written by an independently reviewed panel.
@@ -4960,8 +4963,14 @@ async fn reviewed<C: WorkflowContext>(
     } else {
         None
     };
-    let (verdict, said, followups) = loop {
+    let members: Vec<&str> = if review.reviewers.is_empty() {
+        vec![review.reviewer.as_str()]
+    } else {
+        review.reviewers.iter().map(String::as_str).collect()
+    };
+    let (verdict, said, followups, host_requires_changes, deferral_only) = loop {
         let mut controls_clean = !step.coding;
+
         let mut trial_head = None;
         if let Some(trial) = &review.trial_merge {
             let worktrees = run.worktrees.cloned().ok_or_else(|| {
@@ -5434,6 +5443,7 @@ async fn reviewed<C: WorkflowContext>(
                 } else {
                     (Vec::new(), Vec::new())
                 };
+            // CONTROL_OFF: review-followup-touched-controls, review-followup-security-label
             controls_clean = touched_controls.is_empty() && !security_item;
             for point in &host_decisions {
                 if !self_review.decision_points.contains(point) {
@@ -5633,11 +5643,6 @@ async fn reviewed<C: WorkflowContext>(
                 );
             }
         }
-        let members: Vec<&str> = if review.reviewers.is_empty() {
-            vec![review.reviewer.as_str()]
-        } else {
-            review.reviewers.iter().map(String::as_str).collect()
-        };
         // A panel is fixed by the workflow. Check the actual nested host
         // inventory against every member's full input schema before the
         // first reviewer turn; a shallow shape check cannot prove array item
@@ -5736,21 +5741,22 @@ async fn reviewed<C: WorkflowContext>(
                 (said.clone(), Vec::new())
             };
             round_followups.append(&mut followups);
-            let shown = if routed == said {
+            let host_routed = routed != said;
+            let shown = if !host_routed {
                 verdict
             } else {
                 json!({"verdict": routed, "review": verdict,
                     "routing": "host severity policy"})
             };
-            decisions.push(((*reviewer).to_owned(), shown, routed));
+            decisions.push(((*reviewer).to_owned(), shown, routed, host_routed));
         }
-        let rejected = decisions.iter().find(|(_, _, said)| {
+        let rejected = decisions.iter().find(|(_, _, said, _)| {
             !matches!(
                 atomic_core::workflow::Verdict::of(said),
                 atomic_core::workflow::Verdict::Approve | atomic_core::workflow::Verdict::Changes
             )
         });
-        let changes = decisions.iter().find(|(_, _, said)| {
+        let changes = decisions.iter().find(|(_, _, said, _)| {
             matches!(
                 atomic_core::workflow::Verdict::of(said),
                 atomic_core::workflow::Verdict::Changes
@@ -5758,27 +5764,28 @@ async fn reviewed<C: WorkflowContext>(
         });
         let said = rejected
             .or(changes)
-            .map(|(_, _, said)| said.clone())
+            .map(|(_, _, said, _)| said.clone())
             .unwrap_or_else(|| "approve".into());
         let verdict = if review.reviewers.is_empty() {
             decisions[0].1.clone()
         } else {
-            json!({"reviewers": decisions.iter().map(|(atom, verdict, _)|
+            json!({"reviewers": decisions.iter().map(|(atom, verdict, _, _)|
                 json!({"atom": atom, "verdict": verdict})).collect::<Vec<_>>()})
         };
+        let host_requires_changes = changes.is_some_and(|row| row.3);
         match atomic_core::workflow::Verdict::of(&said) {
             atomic_core::workflow::Verdict::Approve => {
+                // CONTROL_OFF: review-classification-required
+                if !round_followups.is_empty() {
+                    break (verdict, said, round_followups, false, true);
+                }
                 let acceptance = Acceptance {
                     candidate: candidate.id.clone(),
                     digest: candidate.digest.clone(),
                     accepted: true,
-                    reason: Some(panel_acceptance_reason(
-                        &members.join(", "),
-                        round,
-                        !round_followups.is_empty(),
-                    )),
+                    reason: Some(panel_acceptance_reason(&members.join(", "), round, false)),
                 };
-                return Ok((candidate, acceptance, round_followups));
+                return Ok((candidate, acceptance, Vec::new()));
             }
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
@@ -5805,13 +5812,18 @@ async fn reviewed<C: WorkflowContext>(
                 )
                 .await?;
             }
-            _ => break (verdict, said, round_followups),
+            _ => break (verdict, said, Vec::new(), host_requires_changes, false),
         }
     };
     // A person decides. The gate's title is atomic's own words; what the
     // reviewer and the author said is what it shows.
     let id = format!("{}.review", step.id);
     let why = match (atomic_core::workflow::Verdict::of(&said), said.as_str()) {
+        (atomic_core::workflow::Verdict::Changes, _) if host_requires_changes => {
+            format!(
+                "reported findings that host review rules require addressing after {round} repair round(s), the most this step allows"
+            )
+        }
         (atomic_core::workflow::Verdict::Changes, _) => {
             format!("asked for changes after {round} repair round(s), the most this step allows")
         }
@@ -5830,9 +5842,13 @@ async fn reviewed<C: WorkflowContext>(
             .cloned()
             .unwrap_or(Value::Null);
     }
-    let spec = GateSpec {
-        workflow: run.pipeline.name.clone(),
-        title: format!(
+    let mut title = if deferral_only {
+        format!(
+            "Step {} of {}: reviewers approved this candidate. Classify its proposed follow-ups before publication",
+            step.id, run.pipeline.name,
+        )
+    } else {
+        format!(
             "Step {} of {}: {} {why}. Approve its output as it stands, or reject it",
             step.id,
             run.pipeline.name,
@@ -5841,7 +5857,18 @@ async fn reviewed<C: WorkflowContext>(
             } else {
                 format!("reviewers {}", review.reviewers.join(", "))
             }
-        ),
+        )
+    };
+    if !followups.is_empty() {
+        show["candidate"] = json!({"id": candidate.id, "digest": candidate.digest});
+        show["review_round"] = json!(round);
+        show["proposed_followups"] = json!(followups);
+        show["deferral_only"] = json!(deferral_only);
+        title.push_str(". Approval classifies the listed findings as follow-up work. Reject if any finding needs a fix first.");
+    }
+    let spec = GateSpec {
+        workflow: run.pipeline.name.clone(),
+        title,
         show,
         evidence: Vec::new(),
         approvers,
@@ -5897,7 +5924,11 @@ async fn reviewed<C: WorkflowContext>(
                 candidate: candidate.id.clone(),
                 digest: candidate.digest.clone(),
                 accepted: true,
-                reason: Some(format!("approved by {} at gate {id}", d.by)),
+                reason: Some(if deferral_only {
+                    panel_acceptance_reason(&members.join(", "), round, true)
+                } else {
+                    format!("approved by {} at gate {id}", d.by)
+                }),
             };
             Ok((candidate, acceptance, followups))
         }
