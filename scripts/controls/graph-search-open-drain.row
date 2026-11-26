@@ -1,0 +1,1 @@
+graph-search-open-drain|crates/atomic-durable/src/store.rs|while !search_backfill_complete|if !search_backfill_complete|-p atomic-agentic-durable --lib store::tests::search_upgrade_open_indexes_every_batch_before_returning
