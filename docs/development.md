@@ -15,6 +15,29 @@ The first run builds the image from [`dev/Dockerfile`](../dev/Dockerfile),
 which takes a few minutes. The image is tagged with a hash of that file, so any
 change to it builds a new image automatically.
 
+### Read-only beads readiness parity
+
+Before moving this repository's work tracking from beads to atomic, run the
+full-export parity probe against a current binary built from the source being
+checked:
+
+```bash
+scripts/dev.sh cargo build --locked -p atomic-agentic
+python3 tools/own_beads_parity.py \
+  --bd-project "$PWD" \
+  --atomic-bin "$PWD/target/debug/atomic"
+```
+
+The probe calls `bd --readonly` for two export and readiness snapshots. It
+refuses a changing snapshot, imports into a private temporary atomic project
+twice to check replay, and compares sorted ready IDs with the graph's SQLite
+readiness query. Imported `in_progress` issues have no leases and are counted
+but are not considered ready. Its JSON result includes the export hash,
+counts, complete sorted ready ID sets, and discrepant IDs. A zero exit code
+means the two complete ready sets match; exit one means a mismatch; exit two
+means the proof could not run. The temporary project and state are removed
+after the run. This check does not switch the repository's work tracker.
+
 The container has:
 
 | Tool | Version | Why |

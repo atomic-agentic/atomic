@@ -12,7 +12,7 @@ use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{Database, DurableRuntime, Durare};
 use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{
-    Actor, ClosePolicySource, Draft, EdgeKind, Evidence, GraphStore, ItemClosePolicy, Report,
+    Actor, ClosePolicySource, Draft, EdgeKind, Evidence, GraphStore, Item, ItemClosePolicy, Report,
     Status, StoreError,
 };
 use atomic_graph::transactional_claim::ClaimNext;
@@ -25,6 +25,14 @@ use std::time::SystemTime;
 
 #[derive(Debug, Subcommand)]
 pub enum GraphCommand {
+    /// List committed items ready to claim without changing the store.
+    Ready {
+        /// Maximum number of items to return (1 to 1000).
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Inspect one committed item and its dependencies.
+    Show { id: String },
     /// Create a committed work item as the enrolled operator.
     Create {
         /// One-line title.
@@ -343,6 +351,20 @@ fn print_report(report: &Report, dry_run: bool, as_json: bool) -> anyhow::Result
     Ok(())
 }
 
+fn item_json(item: &Item) -> serde_json::Value {
+    json!({
+        "id": item.id,
+        "title": item.title,
+        "body": item.body,
+        "kind": item.kind,
+        "priority": item.priority,
+        "status": item.status.as_str(),
+        "parent": item.parent,
+        "trust": item.trust.as_str(),
+        "created_by": item.created_by,
+    })
+}
+
 pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> anyhow::Result<()> {
     let database = crate::engine::database(state)?;
     if matches!(database, Database::Postgres { .. }) {
@@ -381,6 +403,66 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
         Actor::agent("atomic graph CLI")
     };
     match command {
+        GraphCommand::Ready { limit } => {
+            if !(1..=1000).contains(&limit) {
+                bail!("--limit must be between 1 and 1000");
+            }
+            let items = store.ready(actor, limit).await?;
+            if as_json {
+                let items = items.iter().map(item_json).collect::<Vec<_>>();
+                println!("{}", serde_json::to_string(&items)?);
+            } else {
+                for item in items {
+                    println!(
+                        "{}\t{}\t{}",
+                        item.id,
+                        json!(item.title),
+                        item.status.as_str()
+                    );
+                }
+            }
+            Ok(())
+        }
+        GraphCommand::Show { id } => {
+            let (shown, edges, acceptance_criteria) = store
+                .show_with_edges(id.clone())
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("graph item {id} not found"))?;
+            let mut value = item_json(&shown.item);
+            value["acceptance_criteria"] = json!(acceptance_criteria);
+            value["blocked_by"] = json!(shown.blocked_by);
+            value["edges"] = json!(
+                edges
+                    .iter()
+                    .map(|edge| json!({
+                        "kind": edge.kind, "to": edge.to
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            value["notes"] = json!(
+                shown
+                    .notes
+                    .iter()
+                    .map(|note| json!({
+                        "text": note.text, "author": note.author, "trust": note.trust.as_str()
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            value["holder"] = shown
+                .holder
+                .map(|holder| {
+                    json!({
+                        "claimant": holder.claimant, "epoch": holder.epoch
+                    })
+                })
+                .unwrap_or(serde_json::Value::Null);
+            if as_json {
+                println!("{}", serde_json::to_string(&value)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            }
+            Ok(())
+        }
         GraphCommand::Create {
             title,
             id,

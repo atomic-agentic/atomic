@@ -11,7 +11,6 @@ use sqlx::{Connection, Row, SqliteConnection};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -166,9 +165,8 @@ impl SqliteStore {
         path: &Path,
         now: impl Fn() -> SystemTime + Send + Sync + 'static,
     ) -> Result<Self, StoreError> {
-        let url = format!("sqlite://{}", path.display());
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
-            .map_err(db)?
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(30));
         let database = path.to_path_buf();
@@ -214,9 +212,12 @@ impl SqliteStore {
     pub async fn show_with_edges(
         &self,
         id: String,
-    ) -> Result<Option<(Show, Vec<StoredEdge>)>, StoreError> {
+    ) -> Result<Option<(Show, Vec<StoredEdge>, Option<String>)>, StoreError> {
         self.read(move |c| Box::pin(async move {
             let Some(item) = get_item(c, &id).await? else { return Ok(None) };
+            let acceptance_criteria: Option<String> = sqlx::query_scalar(
+                "SELECT json_extract(imported_json,'$.acceptance_criteria') FROM atomic_graph_items WHERE id=?"
+            ).bind(&id).fetch_one(&mut *c).await.map_err(db)?;
             let rows = sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal")
                 .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
             let notes = rows.iter().map(|row| Ok(Note {
@@ -234,7 +235,7 @@ impl SqliteStore {
                 kind: row.try_get("kind").map_err(db)?,
                 to: row.try_get("target").map_err(db)?,
             })).collect::<Result<Vec<_>,StoreError>>()?;
-            Ok(Some((Show { item, notes, blocked_by, holder }, edges)))
+            Ok(Some((Show { item, notes, blocked_by, holder }, edges, acceptance_criteria)))
         })).await
     }
 
@@ -836,8 +837,76 @@ async fn refresh_projection(
     if let Some(pause) = pause {
         pause();
     }
-    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND b.status='pinned')")
-        .execute(conn).await.map_err(db)?;
+    // Imported parent-child relations need the original beads representation:
+    // `parent_issue` alone never blocks, while an explicit dependency inherits
+    // the parent's active blockers. Keep those imported relations out of the
+    // baseline, regardless of the parent's status. Native relations retain
+    // their existing closed/pinned behavior.
+    sqlx::query(r#"
+        INSERT OR IGNORE INTO atomic_graph_blocked (source,target)
+        SELECT e.source,e.target
+        FROM atomic_graph_edges e
+        JOIN atomic_graph_items b ON b.id=e.target
+        JOIN atomic_graph_items child ON child.id=e.source
+        WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for')
+          AND ((e.kind='conditional-blocks'
+                AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure'))
+               OR (e.kind!='conditional-blocks' AND b.status!='closed'))
+          AND NOT (e.kind='parent-child' AND (b.status='pinned' OR
+            (b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL
+             AND NOT COALESCE(
+               json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+               AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+               0))))
+    "#)
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
+    // Follow each active blocker through explicitly imported parent-child
+    // edges. Beads leaves the blocker itself ready when an ancestor depends on
+    // it, so that item can clear the dependency; intermediate ancestors stay
+    // held. The target index finds children at each depth; UNION bounds cycles.
+    sqlx::query(
+        r#"
+        WITH RECURSIVE held(id, blocker) AS (
+            SELECT b.source, b.target
+            FROM atomic_graph_blocked b
+            JOIN atomic_graph_items i ON i.id=b.source
+            WHERE i.imported_json IS NOT NULL
+            UNION
+            SELECT e.source, h.blocker
+            FROM held h
+            JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
+            JOIN atomic_graph_items child ON child.id=e.source
+            WHERE child.imported_json IS NOT NULL
+              AND NOT COALESCE(
+                    json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+                    AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+                    0)
+              AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
+                          WHERE json_extract(d.value,'$.type')='parent-child'
+                            AND json_extract(d.value,'$.depends_on_id')=e.target)
+              AND e.source != h.blocker
+        )
+        INSERT OR IGNORE INTO atomic_graph_blocked (source,target)
+        SELECT e.source,e.target
+        FROM held h
+        JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
+        JOIN atomic_graph_items child ON child.id=e.source
+        WHERE child.imported_json IS NOT NULL
+          AND NOT COALESCE(
+                json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+                AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+                0)
+          AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
+                      WHERE json_extract(d.value,'$.type')='parent-child'
+                        AND json_extract(d.value,'$.depends_on_id')=e.target)
+          AND e.source != h.blocker
+    "#,
+    )
+    .execute(conn)
+    .await
+    .map_err(db)?;
     Ok(())
 }
 async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, StoreError> {
@@ -1335,7 +1404,7 @@ impl GraphStore for SqliteStore {
         async move {
             self.show_with_edges(id)
                 .await
-                .map(|view| view.map(|(show, _)| show))
+                .map(|view| view.map(|(show, _, _)| show))
         }
     }
     fn all_items(
@@ -2046,6 +2115,26 @@ async fn import_jsonl(
                         n + 1
                     ));
                 }
+                if let Some(marker) = v.pointer("/metadata/atomic_graph/native_parent") {
+                    let parent = marker.as_str();
+                    let explicit = v
+                        .get("dependencies")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|dependencies| {
+                            dependencies.iter().any(|dependency| {
+                                json_str(dependency, "type") == Some("parent-child")
+                                    && json_str(dependency, "depends_on_id") == parent
+                            })
+                        });
+                    if v.pointer("/metadata/atomic_graph/schema_version")
+                        != Some(&serde_json::json!(1))
+                        || parent.is_none()
+                        || json_str(&v, "parent_issue") != parent
+                        || !explicit
+                    {
+                        errors.push(format!("line {} has invalid native parent marker", n + 1));
+                    }
+                }
                 for key in [
                     "description",
                     "issue_type",
@@ -2396,6 +2485,13 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
         }
         if let Some(parent) = &i.parent {
             value["parent_issue"] = parent.clone().into();
+            if !imported {
+                if !value["metadata"]["atomic_graph"].is_object() {
+                    value["metadata"]["atomic_graph"] = serde_json::json!({});
+                }
+                value["metadata"]["atomic_graph"]["schema_version"] = 1.into();
+                value["metadata"]["atomic_graph"]["native_parent"] = parent.clone().into();
+            }
         }
         if let Some(due) = i.due_at
             && (!imported || value.get("due_at").is_none())

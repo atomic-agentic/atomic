@@ -387,6 +387,16 @@ PostgreSQL instead, and `database.schema`, `atomic` by default, names the schema
 its tables live in. On PostgreSQL a process must also say who it is:
 `executor_id`. See [running Atomic](../operations/running-atomic.md).
 
+SQLite state paths are literal filesystem paths, including `%`, `?` and `#` in
+directory names. Older atomic builds could interpret those characters as URL
+syntax and write to a different, decoded filename. If an older store appears
+missing after upgrading, stop atomic processes and inspect the literal and
+decoded private state paths before restoring anything. An operator can use
+SQLite's backup operation to copy the verified legacy database into the
+literal project's private state path, keep the source backup, then verify the
+project's graph export and gate list. Atomic never adopts a decoded sibling
+automatically because it could belong to another project.
+
 ### Keep application and runtime databases separate
 
 `ATOMIC_DATABASE_URL` selects atomic's own store. `DATABASE_URL` is never read

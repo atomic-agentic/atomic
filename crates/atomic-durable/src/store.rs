@@ -11,7 +11,6 @@
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection};
 use std::path::Path;
-use std::str::FromStr;
 
 /// One forward migration of atomic's tables.
 #[derive(Clone, Copy)]
@@ -1047,6 +1046,23 @@ pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
     open_sqlite_with(database, MIGRATIONS).await
 }
 
+/// Build the SQLite URL required by durare from a literal filesystem path.
+/// Escaping the path bytes keeps `state%41`, `state?draft`, and similar names
+/// from being decoded as a different path or parsed as URL query parameters.
+pub(crate) fn sqlite_url(database: &Path) -> String {
+    let mut encoded = String::new();
+    for byte in database.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b':' | b'.' | b'_' | b'-' | b'~' | b'\\')
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("sqlite://{encoded}?mode=rwc")
+}
+
 /// Open a current store read-only for inspection. A missing database has
 /// an empty in-memory schema. For older databases, SQLite takes a consistent
 /// snapshot (including committed WAL pages) and only that snapshot migrates.
@@ -1264,8 +1280,8 @@ async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i
         path: path.clone(),
         source,
     };
-    let options = sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{path}"))
-        .map_err(db)?
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database)
         .create_if_missing(true);
     let mut conn = SqliteConnection::connect_with(&options).await.map_err(db)?;
     let result = async {
@@ -1832,6 +1848,13 @@ async fn sqlite_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn sqlite_url_escapes_literal_state_path() {
+        let url = sqlite_url(Path::new("/tmp/state%41?draft/atomic.db"));
+        assert_eq!(url, "sqlite:///tmp/state%2541%3Fdraft/atomic.db?mode=rwc");
+    }
 
     fn db(tag: &str) -> std::path::PathBuf {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

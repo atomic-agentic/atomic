@@ -58,6 +58,11 @@ calibrated decision atoms are not built yet.
 
 The local SQLite work graph accepts beads JSONL through
 `atomic graph import <file>` and writes it through `atomic graph export`.
+`atomic graph ready [--limit N]` lists committed items that can be claimed;
+`atomic graph show <id>` displays an item's body, imported acceptance criteria,
+notes, current blockers and
+outgoing dependency edges. Both inspection commands accept the global `--json`
+option and leave a missing database absent.
 `atomic graph search <phrase-or-id> [--status <status>] [--limit <n>]` searches
 committed titles, descriptions and released handoffs through local FTS5 indexes. An exact item ID,
 including punctuation, resolves directly; title matches rank above matching

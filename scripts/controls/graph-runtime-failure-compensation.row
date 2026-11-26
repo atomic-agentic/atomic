@@ -1,0 +1,1 @@
+graph-runtime-failure-compensation|crates/atomic-graph/src/sqlite.rs|COALESCE(b.terminal_outcome,'unknown')!='failure'|COALESCE(b.terminal_outcome,'unknown')!='success'|-p atomic-agentic --test graph_work_loop a_graph_run_waits_for_a_child_created_mid_turn_and_only_runs_failure_compensation

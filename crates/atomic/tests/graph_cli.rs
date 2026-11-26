@@ -405,6 +405,86 @@ fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
 }
 
 #[test]
+fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
+    let fixture = Fixture::new("literal%41");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    let command = [
+        "--json",
+        "graph",
+        "create",
+        "Literal state item",
+        "--id",
+        "at-literal-state",
+        "--request-id",
+        "literal-state-create",
+    ];
+    let first = success(&fixture.run(&project, &command));
+    assert_eq!(first, success(&fixture.run(&project, &command)));
+    let exported = success(&fixture.run(&project, &["graph", "export"]));
+    assert_eq!(exported.lines().count(), 1);
+    assert!(exported.contains("\"id\":\"at-literal-state\""));
+    let input = fixture.root.join("literal-state-export.jsonl");
+    std::fs::write(&input, &exported).expect("export fixture");
+    let dry_run: Value = serde_json::from_str(&success(&fixture.run(
+        &project,
+        &[
+            "--json",
+            "graph",
+            "import",
+            input.to_str().expect("fixture path"),
+            "--dry-run",
+        ],
+    )))
+    .expect("dry-run JSON");
+    assert_eq!(dry_run["items"], 1);
+    assert_eq!(dry_run["added"], json!([]));
+    assert_eq!(
+        success(&fixture.run(&project, &["graph", "export"])),
+        exported
+    );
+    let literal = fixture.database(&project);
+    assert!(literal.exists(), "literal state database is missing");
+    let decoded = PathBuf::from(literal.to_string_lossy().replace("%41", "A"));
+    assert!(!decoded.exists(), "write landed in percent-decoded sibling");
+
+    // Simulate an older writer's decoded database, then perform the documented
+    // operator-directed SQLite backup into the literal state location.
+    std::fs::create_dir_all(decoded.parent().expect("decoded state parent"))
+        .expect("decoded state directory");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("backup runtime");
+    runtime.block_on(async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&literal);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("literal database");
+        sqlx::query("VACUUM INTO ?")
+            .bind(decoded.to_str().expect("decoded state path"))
+            .execute(&mut connection)
+            .await
+            .expect("consistent legacy snapshot");
+        connection.close().await.expect("close database");
+    });
+    std::fs::remove_file(&literal).expect("remove literal fixture");
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", literal.display()));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).expect("remove stale sidecar");
+        }
+    }
+    assert!(decoded.exists(), "legacy snapshot is missing");
+    std::fs::copy(&decoded, &literal).expect("restore verified legacy snapshot");
+    assert_eq!(
+        success(&fixture.run(&project, &["graph", "export"])),
+        exported
+    );
+    assert_eq!(success(&fixture.run(&project, &command)), first);
+}
+
+#[test]
 fn distinct_create_keys_with_the_same_short_hash_keep_separate_items_and_replay() {
     let fixture = Fixture::new("create-request-collision");
     let project = fixture.project("project");
@@ -1440,6 +1520,46 @@ fn inspection_from_the_cli_leaves_a_missing_database_missing() {
         !has_atomic_database(&fixture.root),
         "inspection created a database"
     );
+}
+
+#[test]
+fn ready_and_show_inspect_imported_items_without_opening_an_absent_store() {
+    let fixture = Fixture::new("ready-show");
+    let project = fixture.project("project");
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("empty ready JSON");
+    assert_eq!(ready, json!([]));
+    assert!(!has_atomic_database(&fixture.root));
+    let missing = fixture.run(&project, &["graph", "show", "bd-absent"]);
+    assert!(!missing.status.success(), "missing item must be reported");
+    assert!(!has_atomic_database(&fixture.root));
+
+    fixture.enroll(&project);
+    let items = concat!(
+        r#"{"id":"bd-open","title":"Clear blocker","description":"First body","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"id":"bd-blocked","title":"Held item","description":"Implementation body","acceptance_criteria":"Acceptance text","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","dependencies":[{"issue_id":"bd-blocked","depends_on_id":"bd-open","type":"blocks"}]}"#,
+        "\n"
+    );
+    success(&fixture.run_stdin(&project, &["graph", "import", "-"], items));
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("ready JSON");
+    assert_eq!(ready.as_array().expect("ready array").len(), 1);
+    assert_eq!(ready[0]["id"], "bd-open");
+    let shown: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "show", "bd-blocked"]),
+    ))
+    .expect("show JSON");
+    assert_eq!(shown["id"], "bd-blocked");
+    assert_eq!(shown["body"], "Implementation body");
+    assert_eq!(shown["acceptance_criteria"], "Acceptance text");
+    assert_eq!(shown["status"], "open");
+    assert_eq!(shown["blocked_by"], json!(["bd-open"]));
+    assert_eq!(shown["edges"], json!([{"kind":"blocks","to":"bd-open"}]));
 }
 
 #[test]
