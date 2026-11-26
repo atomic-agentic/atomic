@@ -2609,6 +2609,50 @@ mod tests {
             .await
             .expect("seed item");
 
+        let reached = path.with_extension("handoff-search-crash-reached");
+        let _ = std::fs::remove_file(&reached);
+        let mut crash = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "sqlite::tests::handoff_search_before_commit_child",
+            ])
+            .env("ATOMIC_TEST_HANDOFF_SEARCH_DB", &path)
+            .env("ATOMIC_TEST_HANDOFF_SEARCH_REACHED", &reached)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start handoff publication child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if matches!(std::fs::read_to_string(&reached), Ok(ref marker) if marker == "graph-handoff-search:before-commit")
+            {
+                break;
+            }
+            if let Some(status) = crash.try_wait().expect("child status") {
+                let output = crash.wait_with_output().expect("child output");
+                panic!("handoff child exited before named crash point: {status}; {output:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = crash.kill();
+                let output = crash.wait_with_output().expect("timed out child output");
+                panic!("handoff child did not reach crash point: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crash
+            .kill()
+            .expect("kill handoff publication before commit");
+        let killed = crash.wait_with_output().expect("reap killed child");
+        assert!(!killed.status.success(), "child did not crash: {killed:?}");
+        assert!(
+            store
+                .search_items("cobalt signal", None, 10)
+                .await
+                .expect("after crash")
+                .is_empty()
+        );
+
         let record = serde_json::json!({
             "attempted": "mapped the cobalt signal",
             "failed": "criterion rejected cobalt signal",
@@ -2670,7 +2714,34 @@ mod tests {
                 .expect("rebuilt search"),
             hits
         );
+        std::fs::remove_file(reached).expect("remove crash marker");
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    #[ignore = "run by search_finds_only_committed_handoffs_once_after_retry_and_rebuild"]
+    async fn handoff_search_before_commit_child() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ATOMIC_TEST_HANDOFF_SEARCH_DB").expect("child database path"),
+        );
+        let reached = std::path::PathBuf::from(
+            std::env::var_os("ATOMIC_TEST_HANDOFF_SEARCH_REACHED").expect("crash marker path"),
+        );
+        let store = SqliteStore::open(&path, SystemTime::now).expect("child graph store");
+        store
+            .run(move |conn| {
+                Box::pin(async move {
+                    let record = serde_json::json!({"attempted": "mapped the cobalt signal", "failed": "", "learned": "", "files": []}).to_string();
+                    sqlx::query("INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-handoff-search',2,?)")
+                        .bind(record).execute(&mut *conn).await.map_err(db)?;
+                    std::fs::write(reached, "graph-handoff-search:before-commit").map_err(db)?;
+                    // The parent kills this process with the transaction open.
+                    std::thread::sleep(Duration::from_secs(30));
+                    Ok(())
+                })
+            })
+            .await
+            .expect("child handoff transaction");
     }
 
     #[tokio::test]
