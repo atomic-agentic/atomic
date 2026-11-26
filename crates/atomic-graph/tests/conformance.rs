@@ -2407,6 +2407,17 @@ fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
             .export(actor.clone())
             .await
             .expect("export first parent");
+        let exported_child: serde_json::Value = serde_json::from_str(
+            first_parent
+                .lines()
+                .find(|line| line.contains("\"id\":\"at-child\""))
+                .expect("exported child line"),
+        )
+        .expect("exported child JSON");
+        assert_eq!(
+            exported_child["metadata"]["atomic_graph"]["native_parent"],
+            "at-parent-one"
+        );
         assert!(matches!(
             store
                 .add_edge(
@@ -2439,14 +2450,119 @@ fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
             .expect("show imported child")
             .expect("imported child exists");
         assert_eq!(imported_child.item.parent.as_deref(), Some("at-parent-one"));
-        // Import uses beads' explicit hierarchy rule: this task parent has
-        // no active dependency for the child to inherit. The native source
-        // graph still holds its child, as asserted above.
-        assert!(imported_child.blocked_by.is_empty());
+        assert_eq!(imported_child.blocked_by, ["at-parent-one"]);
+        assert!(
+            imported
+                .claim(
+                    Actor::agent("worker"),
+                    "worker".to_owned(),
+                    "at-child".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim imported native child")
+                .is_none()
+        );
+        let reexport = imported
+            .export(Actor::agent("reader"))
+            .await
+            .expect("re-export imported native graph");
+        let reexported_child: serde_json::Value = serde_json::from_str(
+            reexport
+                .lines()
+                .find(|line| line.contains("\"id\":\"at-child\""))
+                .expect("re-exported child line"),
+        )
+        .expect("re-exported child JSON");
+        assert_eq!(
+            reexported_child["metadata"]["atomic_graph"]["native_parent"],
+            "at-parent-one"
+        );
     });
     drop(store);
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(imported_path);
+}
+
+#[test]
+fn sqlite_import_refuses_invalid_native_parent_markers_atomically() {
+    use store_contract::{Actor, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-native-parent-marker-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let parent =
+        serde_json::json!({"id":"at-parent","title":"Parent","status":"open","issue_type":"task"});
+    let child = serde_json::json!({
+        "id":"at-child", "title":"Child", "status":"open", "issue_type":"task",
+        "parent_issue":"at-parent",
+        "dependencies":[{"issue_id":"at-child","depends_on_id":"at-parent","type":"parent-child"}],
+        "metadata":{"atomic_graph":{"schema_version":1,"native_parent":"at-parent"}},
+    });
+    harness::block_on(async {
+        for (label, changed) in [
+            ("wrong parent", serde_json::json!("at-other")),
+            ("non-string parent", serde_json::json!(true)),
+        ] {
+            let mut invalid = child.clone();
+            invalid["metadata"]["atomic_graph"]["native_parent"] = changed;
+            let input = format!("{}\n{}\n", parent, invalid);
+            assert!(
+                matches!(
+                    store.import(Actor::agent("importer"), input, false).await,
+                    Err(StoreError::ImportRefused(_))
+                ),
+                "accepted {label} native parent marker"
+            );
+            assert!(
+                store
+                    .all_items(Actor::agent("reader"))
+                    .await
+                    .expect("all items")
+                    .is_empty()
+            );
+        }
+        let mut invalid = child.clone();
+        invalid["metadata"]["atomic_graph"]["schema_version"] = 2.into();
+        assert!(matches!(
+            store
+                .import(
+                    Actor::agent("importer"),
+                    format!("{}\n{}\n", parent, invalid),
+                    false
+                )
+                .await,
+            Err(StoreError::ImportRefused(_))
+        ));
+        let mut invalid = child;
+        invalid
+            .as_object_mut()
+            .expect("child object")
+            .remove("dependencies");
+        assert!(matches!(
+            store
+                .import(
+                    Actor::agent("importer"),
+                    format!("{}\n{}\n", parent, invalid),
+                    false
+                )
+                .await,
+            Err(StoreError::ImportRefused(_))
+        ));
+        assert!(
+            store
+                .all_items(Actor::agent("reader"))
+                .await
+                .expect("all items")
+                .is_empty()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

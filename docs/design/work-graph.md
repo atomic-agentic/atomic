@@ -102,6 +102,11 @@ stays ready so it can clear the dependency. The original JSONL distinguishes
 the two forms even though both create a graph edge. Native open parents retain
 their own blocking rule. An explicit `blocks` edge still holds its source.
 Imported items keep their original status and JSONL representation.
+An atomic-created parent edge exports with
+`metadata.atomic_graph.native_parent` naming its parent and `schema_version: 1`.
+Import requires that name to match both `parent_issue` and an explicit
+`parent-child` dependency, then restores the native blocking rule. This keeps
+an atomic export's ready and claim state through reimport.
 
 An atomic-native pinned item uses a versioned JSONL extension so it remains a
 valid beads issue: `status` is `open`, `pinned` is `true`, and

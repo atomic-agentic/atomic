@@ -828,8 +828,26 @@ async fn refresh_projection(
     // the parent's active blockers. Keep those imported relations out of the
     // baseline, regardless of the parent's status. Native relations retain
     // their existing closed/pinned behavior.
-    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target JOIN atomic_graph_items child ON child.id=e.source WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL)))")
-        .execute(&mut *conn).await.map_err(db)?;
+    sqlx::query(r#"
+        INSERT OR IGNORE INTO atomic_graph_blocked (source,target)
+        SELECT e.source,e.target
+        FROM atomic_graph_edges e
+        JOIN atomic_graph_items b ON b.id=e.target
+        JOIN atomic_graph_items child ON child.id=e.source
+        WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for')
+          AND ((e.kind='conditional-blocks'
+                AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure'))
+               OR (e.kind!='conditional-blocks' AND b.status!='closed'))
+          AND NOT (e.kind='parent-child' AND (b.status='pinned' OR
+            (b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL
+             AND NOT COALESCE(
+               json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+               AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+               0))))
+    "#)
+    .execute(&mut *conn)
+    .await
+    .map_err(db)?;
     // Follow each active blocker through explicitly imported parent-child
     // edges. Beads leaves the blocker itself ready when an ancestor depends on
     // it, so that item can clear the dependency; intermediate ancestors stay
@@ -847,6 +865,10 @@ async fn refresh_projection(
             JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
             JOIN atomic_graph_items child ON child.id=e.source
             WHERE child.imported_json IS NOT NULL
+              AND NOT COALESCE(
+                    json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+                    AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+                    0)
               AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
                           WHERE json_extract(d.value,'$.type')='parent-child'
                             AND json_extract(d.value,'$.depends_on_id')=e.target)
@@ -858,6 +880,10 @@ async fn refresh_projection(
         JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
         JOIN atomic_graph_items child ON child.id=e.source
         WHERE child.imported_json IS NOT NULL
+          AND NOT COALESCE(
+                json_extract(child.imported_json,'$.metadata.atomic_graph.schema_version')=1
+                AND json_extract(child.imported_json,'$.metadata.atomic_graph.native_parent')=e.target,
+                0)
           AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
                       WHERE json_extract(d.value,'$.type')='parent-child'
                         AND json_extract(d.value,'$.depends_on_id')=e.target)
@@ -2040,6 +2066,26 @@ async fn import_jsonl(
                         n + 1
                     ));
                 }
+                if let Some(marker) = v.pointer("/metadata/atomic_graph/native_parent") {
+                    let parent = marker.as_str();
+                    let explicit = v
+                        .get("dependencies")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|dependencies| {
+                            dependencies.iter().any(|dependency| {
+                                json_str(dependency, "type") == Some("parent-child")
+                                    && json_str(dependency, "depends_on_id") == parent
+                            })
+                        });
+                    if v.pointer("/metadata/atomic_graph/schema_version")
+                        != Some(&serde_json::json!(1))
+                        || parent.is_none()
+                        || json_str(&v, "parent_issue") != parent
+                        || !explicit
+                    {
+                        errors.push(format!("line {} has invalid native parent marker", n + 1));
+                    }
+                }
                 for key in [
                     "description",
                     "issue_type",
@@ -2383,6 +2429,13 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
         }
         if let Some(parent) = &i.parent {
             value["parent_issue"] = parent.clone().into();
+            if !imported {
+                if !value["metadata"]["atomic_graph"].is_object() {
+                    value["metadata"]["atomic_graph"] = serde_json::json!({});
+                }
+                value["metadata"]["atomic_graph"]["schema_version"] = 1.into();
+                value["metadata"]["atomic_graph"]["native_parent"] = parent.clone().into();
+            }
         }
         if let Some(due) = i.due_at
             && (!imported || value.get("due_at").is_none())

@@ -464,6 +464,24 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
     }
 }
 
+#[test]
+fn pinned_bd_accepts_native_parent_metadata_extension() {
+    let fixture = Fixture::new("native-parent-marker");
+    let parent = issue("at-parent", "Native parent", "open", 1, "task");
+    let mut child = issue("at-child", "Native child", "open", 2, "task");
+    child["parent_issue"] = json!("at-parent");
+    dependency(&mut child, "at-parent", "parent-child");
+    child["metadata"] = json!({
+        "atomic_graph": {"schema_version": 1, "native_parent": "at-parent"}
+    });
+    fixture.import(&[parent, child]);
+    let exported = exported_by_id(&fixture.export());
+    assert_eq!(
+        exported["at-child"]["metadata"]["atomic_graph"]["native_parent"],
+        "at-parent"
+    );
+}
+
 #[tokio::test]
 async fn future_due_is_a_documented_nonparity_with_pinned_bd_sqlite() {
     let fixture = Fixture::new("future-due");
