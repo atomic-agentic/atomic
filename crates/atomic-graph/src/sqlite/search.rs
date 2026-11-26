@@ -67,13 +67,29 @@ impl SqliteStore {
             }
             let literal = format!("\"{}\"", query.replace('"', "\"\""));
             let rows = sqlx::query(
-                "SELECT i.id,i.title,i.status,snippet(atomic_graph_search_fts,-1,'','',' … ',24) AS excerpt \
-                 FROM atomic_graph_search_fts JOIN atomic_graph_search_keys k ON k.key=atomic_graph_search_fts.rowid \
-                 JOIN atomic_graph_items i ON i.id=k.item_id \
-                 WHERE atomic_graph_search_fts MATCH ? AND i.projected_gate_id IS NULL AND (? IS NULL OR i.status=?) \
-                 ORDER BY bm25(atomic_graph_search_fts,10.0,1.0),i.id LIMIT ?",
+                "WITH matches AS (\
+                   SELECT i.id,i.title,i.status,snippet(atomic_graph_search_fts,-1,'','',' … ',24) AS excerpt, \
+                          0 AS source,bm25(atomic_graph_search_fts,10.0,1.0) AS score,0 AS release_epoch \
+                   FROM atomic_graph_search_fts JOIN atomic_graph_search_keys k ON k.key=atomic_graph_search_fts.rowid \
+                   JOIN atomic_graph_items i ON i.id=k.item_id \
+                   WHERE atomic_graph_search_fts MATCH ? AND i.projected_gate_id IS NULL AND (? IS NULL OR i.status=?) \
+                   UNION ALL \
+                   SELECT i.id,i.title,i.status,snippet(atomic_graph_handoff_search_fts,0,'','',' … ',24) AS excerpt, \
+                          1 AS source,bm25(atomic_graph_handoff_search_fts) AS score,k.release_epoch \
+                   FROM atomic_graph_handoff_search_fts JOIN atomic_graph_handoff_search_keys k ON k.key=atomic_graph_handoff_search_fts.rowid \
+                   JOIN atomic_graph_items i ON i.id=k.item_id \
+                   WHERE atomic_graph_handoff_search_fts MATCH ? AND i.projected_gate_id IS NULL AND (? IS NULL OR i.status=?) \
+                 ), ranked AS (\
+                   SELECT id,title,status,excerpt,source,score, \
+                          ROW_NUMBER() OVER (PARTITION BY id ORDER BY source,score,release_epoch DESC) AS pick \
+                   FROM matches \
+                 ) \
+                 SELECT id,title,status,excerpt FROM ranked WHERE pick=1 ORDER BY source,score,id LIMIT ?",
             )
-            .bind(literal)
+            .bind(&literal)
+            .bind(&status)
+            .bind(&status)
+            .bind(&literal)
             .bind(&status)
             .bind(&status)
             .bind(limit as i64)
@@ -98,6 +114,14 @@ impl SqliteStore {
             sqlx::query("DELETE FROM atomic_graph_search_fts")
                 .execute(&mut *conn).await.map_err(db)?;
             sqlx::query("DELETE FROM atomic_graph_search_keys")
+                .execute(&mut *conn).await.map_err(db)?;
+            sqlx::query("DELETE FROM atomic_graph_handoff_search_fts")
+                .execute(&mut *conn).await.map_err(db)?;
+            sqlx::query("DELETE FROM atomic_graph_handoff_search_keys")
+                .execute(&mut *conn).await.map_err(db)?;
+            sqlx::query("INSERT INTO atomic_graph_handoff_search_keys(item_id,release_epoch) SELECT h.item_id,h.release_epoch FROM atomic_graph_handoffs h JOIN atomic_graph_items i ON i.id=h.item_id ORDER BY h.item_id,h.release_epoch")
+                .execute(&mut *conn).await.map_err(db)?;
+            sqlx::query("INSERT INTO atomic_graph_handoff_search_fts(rowid,body) SELECT k.key,COALESCE(json_extract(h.record_json,'$.attempted'),'') || ' ' || COALESCE(json_extract(h.record_json,'$.failed'),'') || ' ' || COALESCE(json_extract(h.record_json,'$.learned'),'') FROM atomic_graph_handoff_search_keys k JOIN atomic_graph_handoffs h ON h.item_id=k.item_id AND h.release_epoch=k.release_epoch")
                 .execute(&mut *conn).await.map_err(db)?;
             sqlx::query("UPDATE atomic_graph_search_progress SET last_id='',complete=0 WHERE singleton=1")
                 .execute(&mut *conn).await.map_err(db)?;
