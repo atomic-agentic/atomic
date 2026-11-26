@@ -2471,6 +2471,114 @@ fn sqlite_works_inside_an_existing_tokio_runtime() {
 }
 
 #[test]
+fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
+    use store_contract::Actor;
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-imported-epic-ready-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("importer");
+    let input = concat!(
+        r#"{"id":"at-epic","title":"Imported epic","status":"open","issue_type":"epic"}"#,
+        "\n",
+        r#"{"id":"at-child","title":"Ready child","status":"open","issue_type":"task","parent_issue":"at-epic"}"#,
+        "\n",
+        r#"{"id":"at-blocker","title":"Explicit blocker","status":"open","issue_type":"task"}"#,
+        "\n",
+        r#"{"id":"at-held","title":"Held child","status":"open","issue_type":"task","parent_issue":"at-epic","dependencies":[{"issue_id":"at-held","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-started","title":"Started child","status":"in_progress","issue_type":"task","parent_issue":"at-epic"}"#,
+        "\n",
+        r#"{"id":"at-gated-epic","title":"Blocked epic","status":"open","issue_type":"epic","dependencies":[{"issue_id":"at-gated-epic","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-nested-epic","title":"Nested epic","status":"open","issue_type":"epic","parent_issue":"at-gated-epic"}"#,
+        "\n",
+        r#"{"id":"at-grandchild","title":"Nested child","status":"open","issue_type":"task","parent_issue":"at-nested-epic"}"#,
+        "\n",
+    );
+    harness::block_on(async {
+        store
+            .import(actor.clone(), input.to_owned(), false)
+            .await
+            .expect("import beads hierarchy");
+        let ready = store.ready(actor.clone(), 100).await.expect("ready items");
+        let ids: BTreeSet<_> = ready.iter().map(|item| item.id.as_str()).collect();
+        assert!(
+            ids.contains("at-child"),
+            "imported open epic hid its child: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-held"),
+            "explicit blocks edge was ignored: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-started"),
+            "unleased in_progress item was ready"
+        );
+        assert!(
+            !ids.contains("at-nested-epic"),
+            "blocked parent exposed its epic: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-grandchild"),
+            "nested blocked parent exposed child: {ids:?}"
+        );
+        let child = store
+            .show(actor.clone(), "at-child".to_owned())
+            .await
+            .expect("show child")
+            .expect("imported child");
+        assert!(
+            child.blocked_by.is_empty(),
+            "child blockers: {:?}",
+            child.blocked_by
+        );
+        let held = store
+            .show(actor.clone(), "at-held".to_owned())
+            .await
+            .expect("show held child")
+            .expect("imported held child");
+        assert_eq!(held.blocked_by, ["at-blocker"]);
+        let grandchild = store
+            .show(actor.clone(), "at-grandchild".to_owned())
+            .await
+            .expect("show nested child")
+            .expect("imported nested child");
+        assert_eq!(grandchild.blocked_by, ["at-nested-epic"]);
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-child".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim ready child")
+                .is_some()
+        );
+        assert!(
+            store
+                .claim(
+                    actor,
+                    "worker".to_owned(),
+                    "at-held".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim blocked child")
+                .is_none()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_import_export_roundtrips_beads_fields_and_rejects_malformed_file() {
     use store_contract::{Actor, StoreError};
     let path =

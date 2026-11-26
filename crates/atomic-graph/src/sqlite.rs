@@ -823,8 +823,25 @@ async fn refresh_projection(
     if let Some(pause) = pause {
         pause();
     }
-    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND b.status='pinned')")
-        .execute(conn).await.map_err(db)?;
+    // A beads import uses an open epic as a hierarchy container: its children
+    // can be ready before the epic closes, but only when the parent has no
+    // active blocker of its own. Native open parents still block. Explicit
+    // blocks edges remain active even when their target is an imported epic.
+    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.kind='epic' AND b.status='open' AND b.imported_json IS NOT NULL)))")
+        .execute(&mut *conn).await.map_err(db)?;
+    // A blocked imported epic holds its children, and those children may be
+    // epics with children of their own. Propagate one hierarchy level per
+    // pass; the primary key makes the fixed point finite, including cycles.
+    loop {
+        let added = sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items parent ON parent.id=e.target WHERE e.kind='parent-child' AND parent.kind='epic' AND parent.status='open' AND parent.imported_json IS NOT NULL AND EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=e.target)")
+            .execute(&mut *conn)
+            .await
+            .map_err(db)?
+            .rows_affected();
+        if added == 0 {
+            break;
+        }
+    }
     Ok(())
 }
 async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, StoreError> {

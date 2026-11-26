@@ -273,6 +273,11 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
     dependency(&mut after_closed, "at-closed-prereq", "blocks");
     let mut past_due = issue("at-past-due", "Past due", "open", 2, "task");
     past_due["due_at"] = json!("2025-01-01T00:00:00Z");
+    let mut epic_child = issue("at-epic-child", "Epic child", "open", 2, "task");
+    dependency(&mut epic_child, "at-epic", "parent-child");
+    let mut epic_held = issue("at-epic-held", "Held epic child", "open", 2, "task");
+    dependency(&mut epic_held, "at-epic", "parent-child");
+    dependency(&mut epic_held, "at-blocker", "blocks");
 
     let scenarios = [
         (
@@ -304,6 +309,16 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
                 after_closed,
             ],
             vec!["at-blocker", "at-related", "at-after-closed"],
+        ),
+        (
+            "open-epic-hierarchy",
+            vec![
+                issue("at-epic", "Epic", "open", 1, "epic"),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                epic_child,
+                epic_held,
+            ],
+            vec!["at-epic", "at-blocker", "at-epic-child"],
         ),
     ];
 
