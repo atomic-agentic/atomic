@@ -2096,6 +2096,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             }
         }
         let mut accepted = Vec::<String>::new();
+        let mut accepted_refs = Vec::<String>::new();
         let mut admitted_base: Option<String> = None;
         let mut last_output = None;
         let mut complete = false;
@@ -2537,6 +2538,18 @@ async fn run_pipeline_in<C: WorkflowContext>(
                         ))
                     })?
                     .to_owned();
+                let commit_ref = candidate
+                    .proposal
+                    .metadata
+                    .get("commit_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        failed(format!(
+                            "graph item {} has no host-recorded worktree commit ref",
+                            item.id
+                        ))
+                    })?
+                    .to_owned();
                 let mapped_result = graph_result(
                     &pipeline,
                     &template,
@@ -2681,6 +2694,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     admitted_base = first_base;
                 }
                 accepted.push(commit);
+                accepted_refs.push(commit_ref);
                 closed_count += 1;
                 last_output = Some(mapped_result);
                 failpoint(&format!("pipeline:after:{step_name}"));
@@ -2714,7 +2728,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     if let Some(caches) = caches {
                         remove_caches(&run_id, caches).await;
                     }
-                    tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
+                    tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted_refs))
                         .await
                         .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
                         .map(|c| c.refs.len() + c.worktrees.len())
@@ -2726,6 +2740,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         return Ok(result);
     }
     let mut accepted = Vec::new();
+    let mut accepted_refs = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
         keep_working(&mut working, &id).await;
@@ -2895,6 +2910,17 @@ async fn run_pipeline_in<C: WorkflowContext>(
             && let Some(commit) = published.metadata.get("commit").and_then(Value::as_str)
         {
             accepted.push(commit.to_owned());
+            let commit_ref = published
+                .metadata
+                .get("commit_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    failed(format!(
+                        "step `{}` has no host-recorded worktree commit ref",
+                        step.id
+                    ))
+                })?;
+            accepted_refs.push(commit_ref.to_owned());
         }
         failpoint(&format!("pipeline:after:{}", step.id));
         // A replay keeps the recorded metadata in `steps`, thread and all, so
@@ -2947,7 +2973,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     // Never in the way of removing the worktrees.
                     remove_caches(&run_id, caches).await;
                 }
-                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
+                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted_refs))
                     .await
                     .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
                     .map(|c| c.refs.len() + c.worktrees.len())
