@@ -583,6 +583,7 @@ async fn engine_built_with_trial(
         &mut rt,
         Services {
             runtimes,
+            graph_database: None,
             model_endpoint_configured: true,
             store,
             deployment: local(),

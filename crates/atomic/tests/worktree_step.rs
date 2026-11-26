@@ -392,7 +392,7 @@ fn a_kill_after_the_commit_leaves_an_orphan_that_cleanup_removes() {
 
         // Retention: only what the accepted candidate names stays.
         let wts = worktrees(&dir);
-        let report = wts.cleanup(RUN, std::slice::from_ref(&commit)).unwrap();
+        let report = wts.cleanup(RUN, std::slice::from_ref(&refs[1].0)).unwrap();
         assert_eq!(report.refs, [refs[0].0.clone()]);
         assert_eq!(report.worktrees, [wts.path(RUN, "implement")]);
         assert_eq!(attempt_refs(&dir), [refs[1].clone()]);

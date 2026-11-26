@@ -130,6 +130,10 @@ pub const SITES: &[Site] = &[
                not started",
     },
     Site {
+        name: "graph:before-finalize",
+        what: "the accepted graph candidate is ready; its atomic publication and close have not started",
+    },
+    Site {
         name: "graph:after-finalize-applied",
         what: "the graph item was atomically published and closed; the publish step has not \
                checkpointed",

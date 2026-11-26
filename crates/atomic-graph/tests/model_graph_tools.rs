@@ -8,12 +8,22 @@ use atomic_core::runtime::{Artifacts, CodexRuntime, run_turn};
 use atomic_core::testing::{FakeModel, Reply, denying_nothing, on_codex_runtime};
 use atomic_core::typed::AtomConfig;
 use atomic_core::usage::Metering;
+use atomic_durable::gate::{self, HumanCredential, Principal};
+use atomic_durable::publication::{Proposal, publish_candidate_in, review_candidate};
+use atomic_durable::release::{ReleaseCommand, release_park};
+use atomic_durable::{
+    DurableError, DurableRuntime, Durare, DurareContext, WorkflowContext, execute_candidate_told,
+    parks,
+};
 use atomic_graph::proposal::{AttemptKey, GraphOp, ProposalBuffer};
+use atomic_graph::publication::apply_candidate_batch;
 use atomic_graph::sqlite::SqliteStore;
+use atomic_graph::store::Lease;
 use atomic_graph::store::{Actor, Draft, EdgeKind, GraphStore};
 use atomic_graph::tools::GraphTurnTools;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[tokio::test]
@@ -137,6 +147,204 @@ async fn graph_show_includes_committed_edges_and_current_blockers() {
     assert_eq!(view["trust"], "agent");
     assert_eq!(view["due_at"], -1000);
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn parked_graph_author_uses_first_turn_identity_when_later_candidate_publishes() {
+    on_codex_runtime(async {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "atomic-graph-park-tool-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(root.join("home")).expect("model home");
+        std::fs::create_dir_all(root.join("cwd")).expect("model cwd");
+        let database = root.join("graph.db");
+        let mut runtime = Durare::sqlite(&database).await.expect("durable database");
+        let store = Arc::new(SqliteStore::open(&database, SystemTime::now).expect("graph store"));
+        store
+            .create_item(
+                Actor::agent("fixture"),
+                "create-root".into(),
+                Draft::new("at-root", "Root"),
+            )
+            .await
+            .expect("root item");
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({
+                    "title":"After park", "body":"first attempt identity",
+                    "kind":"task", "priority":2,
+                }),
+            },
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .expect("scripted model");
+        let codex = CodexRuntime {
+            paths: CodexPaths::without_helpers(),
+            codex_home: root.join("home"),
+            guard: StateGuard::NoProjectState,
+            cwd: root.join("cwd"),
+            endpoint: ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            },
+            defaults: AtomConfig::default(),
+            artifacts: Artifacts::none(),
+            meter: Metering::none(),
+            caches: None,
+        };
+        let turns = Arc::new(AtomicUsize::new(0));
+        let scoped_store = Arc::clone(&store);
+        runtime.register("parked-graph-author", move |ctx: DurareContext, (): ()| {
+            let turns = Arc::clone(&turns);
+            let store = Arc::clone(&scoped_store);
+            let codex = codex.clone();
+            async move {
+                let (candidate, first_position) =
+                    execute_candidate_told(&ctx, "author.turn", move |info| {
+                        let turns = Arc::clone(&turns);
+                        let store = Arc::clone(&store);
+                        let codex = codex.clone();
+                        async move {
+                            if turns.fetch_add(1, Ordering::SeqCst) == 0 {
+                                return Err(DurableError::Parked {
+                                    reason: "wait for operator".into(),
+                                    scope: None,
+                                });
+                            }
+                            let attempt = AttemptKey::new(
+                                &info.workflow_id,
+                                "author",
+                                u32::try_from(info.step_id).expect("nonnegative author position")
+                                    + 1,
+                            )
+                            .map_err(|error| DurableError::Failed(error.to_string()))?;
+                            let tools =
+                                Arc::new(GraphTurnTools::new(store, ProposalBuffer::new(attempt)));
+                            let spec = TurnSpec {
+                                prompt: "Create a follow-up after release.".into(),
+                                native_tools: Some(tools.clone()),
+                                ..TurnSpec::default()
+                            };
+                            let answer =
+                                run_turn(&codex, &denying_nothing(Default::default()), &spec)
+                                    .await
+                                    .map_err(|error| DurableError::Failed(error.to_string()))?;
+                            Ok(Proposal {
+                                output: json!(answer),
+                                metadata: json!({
+                                    "graph_attempt_step":"author",
+                                    "graph_attempt_position":info.step_id,
+                                    "graph_operations":tools.operations().await,
+                                }),
+                                writes: Vec::new(),
+                            })
+                        }
+                    })
+                    .await?;
+                let current_position: i32 = candidate
+                    .id
+                    .rsplit_once(':')
+                    .and_then(|(_, position)| position.parse().ok())
+                    .expect("candidate position");
+                assert!(
+                    current_position > first_position,
+                    "author did not retry after park"
+                );
+                let candidate = Arc::new(candidate);
+                ctx.transaction("author.publish", move |mut tx| {
+                    let candidate = Arc::clone(&candidate);
+                    Box::pin(async move {
+                        publish_candidate_in(
+                            &mut tx,
+                            "author.publish",
+                            &candidate,
+                            &review_candidate(&candidate),
+                            &[],
+                        )
+                        .await?;
+                        apply_candidate_batch(
+                            &mut tx,
+                            &candidate,
+                            &Lease {
+                                item_id: "at-root".into(),
+                                claimant: "worker".into(),
+                                session: 1,
+                                epoch: 1,
+                                acquisition: "park-claim".into(),
+                            },
+                        )
+                        .await
+                    })
+                })
+                .await?;
+                Ok(first_position)
+            }
+        });
+        let credential = HumanCredential::new(Principal::local("operator"), "graph-park-secret");
+        gate::enroll(&runtime, &credential)
+            .await
+            .expect("enroll operator");
+        runtime.launch().await.expect("launch runtime");
+        let run = "graph-park-author";
+        runtime
+            .start("parked-graph-author", run, ())
+            .await
+            .expect("start graph author");
+        let park = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let Some(park) = parks(&runtime, run)
+                    .await
+                    .expect("read parks")
+                    .first()
+                    .cloned()
+                {
+                    break park;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("author park");
+        release_park(
+            &runtime,
+            &credential,
+            ReleaseCommand {
+                command_id: "release-graph-author".into(),
+                park: park.id,
+                raise: None,
+                comment: None,
+            },
+        )
+        .await
+        .expect("release parked author");
+        let _: i32 = runtime
+            .result(run)
+            .await
+            .expect("published graph candidate");
+        assert_eq!(model.calls(), 2, "park repeated a model call");
+        assert_eq!(
+            store
+                .ready(Actor::agent("reader"), 10)
+                .await
+                .expect("committed items")
+                .iter()
+                .filter(|item| item.title == "After park")
+                .count(),
+            1,
+        );
+        runtime
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown runtime");
+        let _ = std::fs::remove_dir_all(root);
+    });
 }
 
 #[test]

@@ -1,1 +1,1 @@
-coding-review-no-author-reasoning|crates/atomic/src/pipeline.rs|if step.coding && review.with.len() != 1 {|if false {|-p atomic-agentic --test pipeline coding_step_does_not_send_author_reasoning_to_reviewer
+coding-review-no-author-reasoning|crates/atomic/src/pipeline.rs|if step.coding && !coding_review_input_allowed {|if false {|-p atomic-agentic --test pipeline coding_step_does_not_send_author_reasoning_to_reviewer
