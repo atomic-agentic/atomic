@@ -29,8 +29,8 @@ def coding_turn(exe, project, repository, state, env, shell_kind="cmd"):
         escaped_canary = str(canary).replace("'", "''")
         command = (
             "$ErrorActionPreference='Stop'; "
-            "$location=[IO.Path]::GetFullPath((Get-Location).ProviderPath).TrimEnd([char]92); "
-            "$cwd=[IO.Path]::GetFullPath([Environment]::CurrentDirectory).TrimEnd([char]92); "
+            "$location=(Get-Location).ProviderPath; "
+            "$cwd=cmd /c cd; "
             "if ($location -ne $cwd) { throw 'PowerShell location mismatch' }; "
             "Copy-Item -LiteralPath 'pricing.py' -Destination 'windows-ps-copy.py' -ErrorAction Stop; "
             "Write-Output 'CWD_OK'; "
