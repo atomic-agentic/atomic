@@ -1,9 +1,9 @@
 # Availability and delivery stages
 
-These docs sketch Atomic's intended product experience. As of this draft, this
-repository contains plans and example definitions, not a released Atomic runtime.
-The CLI snippets are proposed product behavior and have not been executed against
-an Atomic binary.
+Atomic v0.1.0 is published. This page distinguishes that release, v0.2 work
+implemented in main but not yet released, and later planned stages. Built CLI
+behavior is exercised by repository tests; staged and planned behavior is
+identified where it appears.
 
 The first-release path and the full interactive CLI arrive at different stages.
 The documentation leads with the complete product picture so readers can see why
@@ -12,7 +12,8 @@ the coding agent and framework belong together.
 | Stage | Target experience |
 | --- | --- |
 | **v0.1 · one developer** | `init`, `run`, `runs resume`, local headless `serve`, `check`, evals and run inspection; file-defined Codex/lite/exec atoms; sequential durable workflows; local gates; local artifacts, budgets and basic spans |
-| **v0.5 · a team** | Full interactive CLI attachment, live agent supervision, work graph and messages, Postgres, initial identity/audit controls, full OpenTelemetry integration and optional local trace helper, Slack approvals, OpenAPI tools, triggers, parallel composition and merge queue |
+| **v0.2 · local graph and authoring, in development** | SQLite work graph with Beads import/export and single-lane graph runs; Astro authoring with Boa helpers; coding review and delivery gates. Parallel coding lanes and final release acceptance remain in progress. |
+| **v0.5 · a team** | Full interactive CLI attachment, live agent supervision, shared Postgres graph and messages, initial identity/audit controls, full OpenTelemetry integration and optional local trace helper, Slack approvals, OpenAPI tools, triggers, parallel composition and merge queue |
 | **v0.7 · models and data** | Planner and code context, broader model routing, TypeScript in atoms on Deno, application data sources, typed files, retrieval, multimodal work and outcome-based learning |
 | **v1.0 · platform** | Remote workers/environments, Kubernetes/Substrate execution, extended TUI panes, TypeScript workflows, published MCP workflows, A2A, broader enterprise controls and web console |
 
@@ -143,8 +144,8 @@ links. To register it in the destination, an enrolled operator runs
 `atomic goals add <name>` with the local `goals/<name>.goal.yaml`. This
 activates the restored goal using that definition. Repeating the command for
 an already registered goal preserves and reports its current active or paused
-state. PostgreSQL
-graph storage remains staged; this v0.2 work is not a released runtime.
+state. PostgreSQL graph storage remains staged; these v0.2 graph and goal
+features are implemented in main but are not part of the published v0.1.0 release.
 
 The staged `atomic delivery start` command reads a committed graph coding
 item's accepted candidate, two clean independent reviews, self-review,
@@ -566,15 +567,14 @@ its intended stage and any unresolved integration contracts.
 
 ## What has been checked in this repository
 
-The existing example catalog includes offline schema/fixture checks and executable
-Python transforms. One example's TypeScript also runs today under Deno, against
-a local stand-in for S3. None of this establishes live-model quality, command compatibility
-or crash recovery in an Atomic runtime. Those need the implementation and phase
-acceptance tests.
+The example catalog has executable checks, and the runtime and CLI have
+integration and crash tests. One example's TypeScript also runs under Deno
+against a local stand-in for S3. These checks do not establish live-model
+quality or the integration contracts planned for later stages.
 
 The release workflow builds, packages and Sigstore-signs the Linux and macOS
-archives with their SBOMs ([verifying a download](../getting-started/installation.md#verifying-a-download)),
-but no release has been published yet.
+archives with their SBOMs ([verifying a download](../getting-started/installation.md#verifying-a-download)).
+It published v0.1.0; v0.2 remains in development.
 
 Installation packaging, standalone-session behavior and some control commands
 remain open decisions, tracked with the rest of the work in the project's issue
