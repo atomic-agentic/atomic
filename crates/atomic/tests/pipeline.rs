@@ -2528,6 +2528,7 @@ fn find_worktree(root: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn all_worktrees(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut queue = vec![(root.to_owned(), 0)];
