@@ -5,61 +5,80 @@ It builds on OpenAI's open-source Codex crates and gets durable execution from
 a fork of durare. A workflow of atoms survives a crash without redoing finished
 work, and a person signs off at durable gates.
 
-**Status: early development.** The build is recorded as beads. The current
-phase is v0.1.
+**Status: early development.** The current phase is v0.2. After the M5
+cutover, this repository tracks its work in atomic's local work graph.
 
 ## Where things are
 
 | What | Where |
 | --- | --- |
-| The work to do | Beads (`bd ready`) |
+| The work to do | Atomic work graph (`atomic --json graph ready`) |
 | User documentation, as designed | `docs/` (`docs/reference/availability.md` says what is built) |
 | The example catalog, the v0.1 authoring contract | `examples/`, checked by `tools/check_examples.py` in CI |
 | Design notes and private references | `AGENTS.local.md`, if present (not in git) |
 
 Read `AGENTS.local.md` when it exists: it holds maintainer-local pointers to
-design material that is not part of this repository. If a bead cites a document
+design material that is not part of this repository. If an item cites a document
 you cannot find, say so instead of working from memory.
 
 ## Work tracking
 
-All work is tracked with `bd` (beads). Session hooks load `bd prime`, the full
-command reference; run it yourself if that context is missing.
+After the owner imports the Beads export and verifies ready-set parity, atomic's
+local SQLite graph is the source of truth for new work. Imported items keep
+their Beads IDs and acceptance criteria. Run these read-only commands from the
+repository root; `--json` is a global option and precedes `graph`:
 
 ```bash
-bd ready                  # work with no open blocker
-bd show <id>              # description, acceptance criteria, dependencies
-bd update <id> --claim    # claim before starting
-bd close <id> --reason "…"
-bd list -l M3             # everything in one milestone
-bd children <epic-id>     # the tasks under an epic
+atomic --json graph ready --limit 1000  # committed items ready to claim
+atomic --json graph show ITEM_ID         # body, criteria, blockers and edges
+atomic --json graph search '<phrase>'   # find committed items and handoffs
 ```
 
-How the beads are organized:
+The imported work keeps this structure:
 
-- **Three levels.** A phase epic (`v0.1`, `v0.5`, `v0.7`, `v1.0`) holds
+- **Three levels.** A phase epic (`v0.1`, `v0.2`, `v0.5`, `v0.7`, `v1.0`) holds
   milestone epics (`M0` to `M56`, some split into `a` and `b` parts), which hold
   tasks.
 - **Labels.** The phase and the milestone, plus `spike`, `decision`, `test`,
   `security`, `docs` and `benchmark`.
-- **Every milestone ends in an acceptance bead** whose criteria state the
-  milestone's acceptance test. A milestone is done when that bead closes, not when
-  its tasks do.
+- **Every milestone ends in an acceptance item** whose criteria state the
+  milestone's acceptance test. A milestone is done when that item closes, not
+  when its other tasks do.
 - **Later phases are blocked by the phase gate before them.** Do not work
   around a blocker; if a dependency is wrong, fix the dependency and say why.
 
-Rules for working a bead:
+Rules for working an item:
 
 1. Read its acceptance criteria and the design section it cites before
    writing anything.
-2. Close it only when the acceptance criteria hold and you have run the check
-   that shows it. Before you report a change as ready, go through
-   [Before you report a change](#before-you-report-a-change).
-3. File what you discover as a new bead under the same parent, linked with
-   `--deps discovered-from:<id>`, and keep the current bead to its scope.
-4. Beads of type `decision` are the owner's to decide. Gather evidence, record
-   it on the bead and stop there. The same goes for phase gates.
-5. Do not use `bd edit` (it opens an editor). Use `bd update` flags.
+2. Start only after its claim is recorded by an authorized graph workflow or
+   the enrolled operator. Close it only when the acceptance criteria hold and
+   you have run the check that shows it. Before reporting a change as ready,
+   go through [Before you report a change](#before-you-report-a-change).
+3. File discovered work under the same parent with a `discovered-from` link,
+   and keep the current item to its scope. Inside a graph run, typed graph
+   tools add proposals to the current private candidate; publication commits
+   accepted proposals. For manual work, give the proposed item and link to the
+   enrolled operator to record.
+4. Items of kind `decision` are the owner's to decide. Gather evidence, report
+   it to the owner and stop there. The same goes for phase gates.
+5. Committed graph writes require the enrolled human operator credential.
+   Coding agents must not request or use that credential or invoke privileged
+   graph commands from an atom's shell. Graph workflows claim and close their
+   own items through durable steps. Beads is retained only for the historical
+   export and parity checks, not for filing new work.
+
+For manual work, the enrolled operator can use these committed write commands
+after reviewing the item, dependency and evidence. They are **not** commands
+for a coding agent to run:
+
+```bash
+atomic --json graph create 'Task title' --body 'Description and criteria' --kind task --request-id REQUEST_KEY
+atomic --json graph link NEW_ID parent-child PARENT_ID
+atomic --json graph link NEW_ID discovered-from SOURCE_ID
+atomic --json graph claim ITEM_ID
+atomic --json graph close ITEM_ID
+```
 
 ## Architecture rules
 
@@ -243,12 +262,11 @@ first.
 
 ## Git
 
-- Commit only when asked. Never push, and never run `bd dolt push`, unless
-  asked.
+- Commit only when asked. Never push unless asked.
 - Commits carry the repository owner's git identity and nothing else: no AI
   author, no `Co-Authored-By` trailer, no "generated with" line.
-- The bead database is not in git. Only bd's configuration and hooks under
-  `.beads/` are tracked.
+- The work graph's runtime database is not in git. The legacy `.beads/`
+  configuration and hooks remain tracked for export and parity checks.
 
 ## Licensing
 
