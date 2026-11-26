@@ -2,6 +2,7 @@
 //! Claim operations for a durable transaction step. The caller owns the
 //! transaction; its step checkpoint commits with these rows in the same DB.
 
+use crate::handoff::Handoff;
 use crate::store::Lease;
 use atomic_core::workflow::{Criterion, parse_criteria};
 use atomic_durable::{DurableError, Param, Result, Tx};
@@ -34,6 +35,10 @@ pub struct WorkItem {
     pub kind: String,
     /// Lower values are selected first.
     pub priority: i64,
+    /// The previous holder's agent-trust handoff, preserved in the claim
+    /// checkpoint. The host resolves file digests before showing it to a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<Handoff>,
 }
 
 /// A review finding proposed for human classification after the panel.
@@ -295,8 +300,9 @@ pub async fn claim_next_for_epic(
             })
             .transpose()?
             .unwrap_or_default();
+        let item_id = row.text("id")?;
         let item = WorkItem {
-            id: row.text("id")?,
+            id: item_id.clone(),
             title: row.text("title")?,
             body: row.text("body")?,
             acceptance_criteria: imported.as_ref().and_then(|record| {
@@ -324,6 +330,7 @@ pub async fn claim_next_for_epic(
                 .unwrap_or_default(),
             kind: row.text("kind")?,
             priority: row.int("priority")?,
+            handoff: latest_handoff(tx, &item_id).await?,
         };
         validate_input(&item)?;
         let acquisition = acquisition_for(workflow, step, &item.id);
@@ -608,6 +615,98 @@ pub async fn release_for_review_gate(
         &[text(&lease.item_id), Param::Int(next), text(&format!("Review candidate awaits human decision at gate {gate}; the graph claim was released and must be re-claimed before publication.")), text(&lease.claimant)],
     ).await?;
     Ok(released_epoch)
+}
+
+/// Persist the previous holder's bounded handoff in the same transaction as
+/// claim release. The release epoch is unique per item and fences replay.
+pub async fn record_released_handoff(
+    tx: &mut Tx<'_, '_>,
+    lease: &Lease,
+    released_epoch: i64,
+    handoff: &Handoff,
+) -> Result<()> {
+    handoff.validate().map_err(DurableError::Failed)?;
+    if released_epoch
+        != lease.epoch.checked_add(1).ok_or_else(|| {
+            DurableError::Failed("handoff release epoch exceeds stored range".into())
+        })?
+    {
+        return Err(DurableError::Failed(
+            "handoff release epoch does not match claim".into(),
+        ));
+    }
+    let released = tx
+        .query_opt(
+            "SELECT status,claim_epoch FROM atomic_graph_items WHERE id=?",
+            &[text(&lease.item_id)],
+        )
+        .await?;
+    if !matches!(released, Some(ref row) if row.text("status")? == "open"
+        && released_epoch == row.int("claim_epoch")?)
+    {
+        return Err(parked(&lease.item_id));
+    }
+    let acquisition = tx.query_opt(
+        "SELECT item_id,claimant,session,epoch FROM atomic_graph_acquisitions WHERE acquisition=?",
+        &[text(&lease.acquisition)],
+    ).await?;
+    if !matches!(acquisition, Some(ref row) if row.text("item_id")? == lease.item_id
+        && row.text("claimant")? == lease.claimant
+        && row.int("session")? == i64::try_from(lease.session).map_err(|_| parked(&lease.item_id))?
+        && row.int("epoch")? == lease.epoch)
+    {
+        return Err(parked(&lease.item_id));
+    }
+    let encoded = serde_json::to_string(handoff)
+        .map_err(|error| DurableError::Failed(format!("encode graph handoff: {error}")))?;
+    tx.execute(
+        "INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES (?,?,?)",
+        &[
+            text(&lease.item_id),
+            Param::Int(released_epoch),
+            text(&encoded),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Release a review claim and checkpoint a structured handoff atomically.
+pub async fn release_for_review_gate_with_handoff(
+    tx: &mut Tx<'_, '_>,
+    lease: &Lease,
+    gate: &str,
+    handoff: &Handoff,
+) -> Result<i64> {
+    let epoch = release_for_review_gate(tx, lease, gate).await?;
+    record_released_handoff(tx, lease, epoch, handoff).await?;
+    Ok(epoch)
+}
+
+/// Release a failed claim and checkpoint a structured handoff atomically.
+pub async fn release_after_failure_with_handoff(
+    tx: &mut Tx<'_, '_>,
+    lease: &Lease,
+    reason: &str,
+    handoff: &Handoff,
+) -> Result<i64> {
+    let epoch = release_after_failure(tx, lease, reason).await?;
+    record_released_handoff(tx, lease, epoch, handoff).await?;
+    Ok(epoch)
+}
+
+async fn latest_handoff(tx: &mut Tx<'_, '_>, item_id: &str) -> Result<Option<Handoff>> {
+    let row = tx.query_opt(
+        "SELECT record_json FROM atomic_graph_handoffs WHERE item_id=? ORDER BY release_epoch DESC LIMIT 1",
+        &[text(item_id)],
+    ).await?;
+    row.map(|row| {
+        let record: Handoff = serde_json::from_str(&row.text("record_json")?)
+            .map_err(|error| DurableError::Failed(format!("decode graph handoff: {error}")))?;
+        record.validate().map_err(DurableError::Failed)?;
+        Ok(record)
+    })
+    .transpose()
 }
 
 /// Return a claimed child after the graph run has exhausted its repair path.
