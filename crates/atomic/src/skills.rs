@@ -750,17 +750,26 @@ pub fn prompt_reference() -> String {
     }
     out.push_str(
         "## Markdown layout and provenance\n\n\
-         Keep the decision criteria and output contract near the top. Use bullets for \
-         short findings; use a table when named columns make a comparison or lookup \
-         clearer. Preview both `developer` instructions and tagged `user` bindings \
-         with `atomic render` on ordinary, empty, escaped and mixed-origin input. \
+         Put a short decision rubric and the output contract near the top. Use bullets \
+         for short findings; use a table when named columns make a comparison or \
+         lookup clearer, then test it against bullets on the same cases. The paired \
+         pilot used fewer input tokens with bullets and found no reliable correctness \
+         gain from headings, links, bold or italics in two one-factor cases. Do not \
+         use emphasis as a decision or citation control. Preview both `developer` \
+         instructions and tagged `user` bindings with `atomic render` on ordinary, \
+         empty, escaped and mixed-origin input. \
          Static text and imported `.md?raw` text are authored instructions; values \
          from `input`, `context` or component props retain their source path and \
-         origin as data. Preserve record IDs and distinguish author-supplied records \
-         from host-supplied records. A helper result inherits the least trusted \
-         argument's provenance. Only a `mermaid` fence is parsed literally in an \
+         origin as data. Preserve exact record and dependency IDs and distinguish \
+         author-supplied records from host-supplied records. A helper result inherits \
+         the least trusted argument's provenance. Only a `mermaid` fence is parsed \
+         literally in an \
          atom body; put literal JSON and TypeScript fences in a `.md?raw` file. \
-         Validate cited IDs against host records before a gate.\n\n",
+         Check every required row and citation against host records before a gate. An \
+         unavailable host record may be named as provenance, but cannot support a \
+         passing claim; leave its citation list empty when the output contract \
+         requires that. See the repository's `examples/08-templating/evaluation.md` \
+         for the measured pilot and its uncertainty.\n\n",
     );
     out.push_str("## Mistakes `atomic check` refuses\n\n");
     for m in MISTAKES {
