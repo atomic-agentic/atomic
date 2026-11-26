@@ -58,7 +58,7 @@ Extra note: {input.extra?.note ?? 'none'}
 
 ## Name a prompt section
 
-A lowercase tag is literal prompt structure; it is not interpreted.
+A lowercase tag without a hyphen is literal prompt structure; it is not interpreted. Hyphenated tags are custom elements and `atomic check` refuses them.
 
 ```astro
 <rubric>

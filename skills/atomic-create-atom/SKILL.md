@@ -118,6 +118,12 @@ interpreted literally in an atom body; other fenced examples belong in that
 Markdown file. Preview the rendered `developer` and `user` parts for ordinary,
 empty, escaped and mixed-origin inputs before eval.
 
+Use plain lowercase names for prompt section tags, such as `<evidence>`.
+Hyphenated names such as `<review-evidence>` are parsed as custom elements and
+`atomic check` refuses them. A helper result derived from input appears in the
+rendered user part with the helper call as its path; inspect its text there to
+confirm that each record still carries the right source label and original ID.
+
 ## Worked example
 
 Task: "Pull the action items, with their owners, out of meeting notes."
