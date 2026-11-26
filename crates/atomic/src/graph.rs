@@ -10,7 +10,7 @@ use atomic_core::workflow::{Criterion, parse_criteria};
 use atomic_core::worktree::Worktrees;
 use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{Database, DurableRuntime, Durare};
-use atomic_graph::sqlite::SqliteStore;
+use atomic_graph::sqlite::{ReadyInspection, SqliteStore};
 use atomic_graph::store::{
     Actor, ClosePolicySource, Draft, EdgeKind, Evidence, GraphStore, Item, ItemClosePolicy, Report,
     Status, StoreError,
@@ -352,6 +352,50 @@ fn item_json(item: &Item) -> serde_json::Value {
     })
 }
 
+fn ready_json(record: ReadyInspection) -> anyhow::Result<serde_json::Value> {
+    let ReadyInspection {
+        item,
+        imported,
+        note_count,
+    } = record;
+    let Some(mut value) = imported else {
+        return Ok(item_json(&item));
+    };
+    let fields = value
+        .as_object_mut()
+        .context("imported graph item is not a JSON object")?;
+    fields.insert("id".into(), json!(item.id));
+    fields.insert("title".into(), json!(item.title));
+    fields.insert("description".into(), json!(item.body));
+    fields.insert("status".into(), json!(item.status.as_str()));
+    fields.insert("priority".into(), json!(item.priority));
+    fields.insert("issue_type".into(), json!(item.kind));
+    let original_note = i64::from(
+        fields
+            .get("notes")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|note| !note.trim().is_empty()),
+    );
+    for key in [
+        "_type",
+        "parent_issue",
+        "dependencies",
+        "comments",
+        "closed_at",
+    ] {
+        fields.remove(key);
+    }
+    // The pinned SQLite bd ready projection leaves these relation counts at
+    // zero even when edges exist. Comments are hydrated and counted there.
+    fields.insert("dependency_count".into(), json!(0));
+    fields.insert("dependent_count".into(), json!(0));
+    fields.insert(
+        "comment_count".into(),
+        json!((note_count - original_note).max(0)),
+    );
+    Ok(value)
+}
+
 pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> anyhow::Result<()> {
     let database = crate::engine::database(state)?;
     if matches!(database, Database::Postgres { .. }) {
@@ -393,11 +437,16 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             if !(1..=1000).contains(&limit) {
                 bail!("--limit must be between 1 and 1000");
             }
-            let items = store.ready(actor, limit).await?;
             if as_json {
-                let items = items.iter().map(item_json).collect::<Vec<_>>();
+                let items = store
+                    .ready_for_inspection(limit)
+                    .await?
+                    .into_iter()
+                    .map(ready_json)
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 println!("{}", serde_json::to_string(&items)?);
             } else {
+                let items = store.ready(actor, limit).await?;
                 for item in items {
                     println!(
                         "{}\t{}\t{}",

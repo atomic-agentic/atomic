@@ -62,7 +62,11 @@ The local SQLite work graph accepts beads JSONL through
 `atomic graph show <id>` displays an item's body, imported acceptance criteria,
 notes, current blockers and
 outgoing dependency edges. Both inspection commands accept the global `--json`
-option and leave a missing database absent.
+option and leave a missing database absent. For imported items, `graph ready
+--json` preserves Beads' issue fields and ready count fields; native items keep
+Atomic's item JSON fields. The count fields follow the pinned SQLite Beads
+v0.50.3 ready projection: its dependency and dependent counts are zero even
+when edges exist, while comments are counted.
 Committed import and the human `graph create`, `link`, `claim` and `close`
 commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
