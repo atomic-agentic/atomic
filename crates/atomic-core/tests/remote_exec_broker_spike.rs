@@ -547,6 +547,9 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
             b"started",
         )
         .expect("child marker");
+        if std::env::var_os("ATOMIC_BROKER_SPIKE_WAIT_FOR_SIGKILL").is_some() {
+            std::future::pending::<()>().await;
+        }
         // Model an Atomic process crash: destructors and process unregister
         // cannot release the remote shell's host permit.
         std::process::exit(0);
@@ -981,10 +984,11 @@ async fn actual_broker_process_kill_recovers_host_permit() {
                 "ATOMIC_BROKER_SPIKE_RELEASE_MARKER",
                 release.to_str().expect("release path"),
             ),
+            ("ATOMIC_BROKER_SPIKE_WAIT_FOR_SIGKILL", "1"),
         ],
     );
     wait_for_marker(&child_marker, "Atomic client starts shell").await;
-    wait_child_exit(&mut client, "Atomic client exits").await;
+    client.stop();
     assert!(
         journal.exists(),
         "shell start intent must survive client exit"
