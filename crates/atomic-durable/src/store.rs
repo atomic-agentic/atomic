@@ -386,6 +386,11 @@ const MIGRATIONS: &[Migration] = &[
         // PostgreSQL search remains a separate milestone.
         sql: &[],
     },
+    Migration {
+        version: 28,
+        name: "work-graph-first-claim-time",
+        sql: &["ALTER TABLE atomic_graph_items ADD COLUMN first_claimed_at BIGINT"],
+    },
 ];
 
 const SQLITE_SEARCH_SQL: &[&str] = &[
@@ -2240,6 +2245,42 @@ mod tests {
             .fetch_one(&mut inspection).await.expect("stable handoff search");
         assert_eq!(hits, 1, "reopen does not duplicate historical hits");
         inspection.close().await.expect("close inspection");
+        std::fs::remove_file(p).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn first_claim_time_upgrade_preserves_legacy_items_without_inventing_a_start() {
+        let p = db("first-claim-time-upgrade");
+        assert_eq!(
+            open_sqlite_with(&p, &MIGRATIONS[..27])
+                .await
+                .expect("version 27 store"),
+            27
+        );
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&p);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("version 27 connection");
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,claim_epoch) VALUES ('old-claim','Old claim','','task',2,'in_progress',NULL,'agent','test',42,1)")
+            .execute(&mut conn)
+            .await
+            .expect("legacy item");
+        conn.close().await.expect("close old connection");
+
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("upgraded connection");
+        let (created, first): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT created_at,first_claimed_at FROM atomic_graph_items WHERE id='old-claim'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("legacy item after upgrade");
+        assert_eq!(created, 42);
+        assert_eq!(first, None, "an older claim time cannot be inferred");
+        conn.close().await.expect("close upgraded connection");
+        assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
         std::fs::remove_file(p).expect("remove fixture");
     }
 
