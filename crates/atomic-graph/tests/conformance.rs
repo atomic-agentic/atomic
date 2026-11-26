@@ -2495,9 +2495,11 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
         "\n",
         r#"{"id":"at-gated-epic","title":"Blocked epic","status":"open","issue_type":"epic","dependencies":[{"issue_id":"at-gated-epic","depends_on_id":"at-blocker","type":"blocks"}]}"#,
         "\n",
-        r#"{"id":"at-nested-epic","title":"Nested epic","status":"open","issue_type":"epic","parent_issue":"at-gated-epic"}"#,
+        r#"{"id":"at-nested-epic","title":"Nested epic","status":"open","issue_type":"epic","dependencies":[{"issue_id":"at-nested-epic","depends_on_id":"at-gated-epic","type":"parent-child"}]}"#,
         "\n",
-        r#"{"id":"at-grandchild","title":"Nested child","status":"open","issue_type":"task","parent_issue":"at-nested-epic"}"#,
+        r#"{"id":"at-grandchild","title":"Nested child","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-grandchild","depends_on_id":"at-nested-epic","type":"parent-child"}]}"#,
+        "\n",
+        r#"{"id":"at-shorthand","title":"Shorthand child","status":"open","issue_type":"task","parent_issue":"at-gated-epic"}"#,
         "\n",
     );
     harness::block_on(async {
@@ -2526,6 +2528,10 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
         assert!(
             !ids.contains("at-grandchild"),
             "nested blocked parent exposed child: {ids:?}"
+        );
+        assert!(
+            ids.contains("at-shorthand"),
+            "shorthand child was blocked: {ids:?}"
         );
         let child = store
             .show(actor.clone(), "at-child".to_owned())
@@ -2572,6 +2578,124 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
                 .await
                 .expect("claim blocked child")
                 .is_none()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_imported_deep_epic_chain_refreshes_without_depth_scans() {
+    use store_contract::{Actor, Draft, Finish};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-imported-deep-epics-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("importer");
+    let mut lines = vec![
+        serde_json::json!({"id":"at-root-blocker","title":"Blocker","status":"open","issue_type":"task"}).to_string(),
+    ];
+    for ordinal in 0_u32..5_000 {
+        let id = format!("at-epic-{ordinal:04}");
+        let parent = format!("at-epic-{:04}", ordinal.saturating_sub(1));
+        let dependencies = if ordinal == 0 {
+            vec![
+                serde_json::json!({"issue_id":id,"depends_on_id":"at-root-blocker","type":"blocks"}),
+            ]
+        } else {
+            vec![serde_json::json!({"issue_id":id,"depends_on_id":parent,"type":"parent-child"})]
+        };
+        lines.push(
+            serde_json::json!({
+                "id": id,
+                "title": "Imported epic",
+                "status": "open",
+                "issue_type": "epic",
+                "dependencies": dependencies,
+            })
+            .to_string(),
+        );
+    }
+    lines.push(serde_json::json!({
+        "id": "at-leaf",
+        "title": "Leaf",
+        "status": "open",
+        "issue_type": "task",
+        "dependencies": [{"issue_id":"at-leaf","depends_on_id":"at-epic-4999","type":"parent-child"}],
+    }).to_string());
+    lines.push(
+        serde_json::json!({
+            "id": "at-shorthand-leaf",
+            "title": "Shorthand leaf",
+            "status": "open",
+            "issue_type": "task",
+            "parent_issue": "at-epic-4999",
+        })
+        .to_string(),
+    );
+    let input = lines.join("\n");
+    harness::block_on(async {
+        store
+            .import(actor.clone(), input, false)
+            .await
+            .expect("import deep hierarchy");
+        let leaf = store
+            .show(actor.clone(), "at-leaf".to_owned())
+            .await
+            .expect("show blocked leaf")
+            .expect("leaf exists");
+        assert_eq!(leaf.blocked_by, ["at-epic-4999"]);
+        let shorthand = store
+            .show(actor.clone(), "at-shorthand-leaf".to_owned())
+            .await
+            .expect("show shorthand leaf")
+            .expect("shorthand leaf exists");
+        assert!(shorthand.blocked_by.is_empty());
+
+        let started = Instant::now();
+        store
+            .create_item(
+                actor.clone(),
+                "unrelated-write".to_owned(),
+                Draft::new("at-unrelated", "Unrelated"),
+            )
+            .await
+            .expect("write alongside deep hierarchy");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "projection refresh rescanned the deep hierarchy: {:?}",
+            started.elapsed()
+        );
+
+        let blocker = store
+            .claim(
+                actor.clone(),
+                "worker".to_owned(),
+                "at-root-blocker".to_owned(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim root blocker")
+            .expect("root blocker is ready");
+        store
+            .finish(blocker, Finish::Close)
+            .await
+            .expect("close root blocker");
+        assert!(
+            store
+                .claim(
+                    actor,
+                    "worker".to_owned(),
+                    "at-leaf".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim released leaf")
+                .is_some()
         );
     });
     drop(store);

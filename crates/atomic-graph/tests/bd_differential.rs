@@ -278,6 +278,25 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
     let mut epic_held = issue("at-epic-held", "Held epic child", "open", 2, "task");
     dependency(&mut epic_held, "at-epic", "parent-child");
     dependency(&mut epic_held, "at-blocker", "blocks");
+    let mut blocked_epic = issue("at-epic", "Blocked epic", "open", 1, "epic");
+    dependency(&mut blocked_epic, "at-blocker", "blocks");
+    let mut explicit_child = issue("at-child", "Explicit child", "open", 2, "task");
+    dependency(&mut explicit_child, "at-epic", "parent-child");
+    let mut shorthand_child = issue("at-child", "Shorthand child", "open", 2, "task");
+    shorthand_child["parent_issue"] = json!("at-epic");
+    let mut both_child = explicit_child.clone();
+    both_child["parent_issue"] = json!("at-epic");
+    let mut closed_blocked_epic = blocked_epic.clone();
+    closed_blocked_epic["status"] = json!("closed");
+    closed_blocked_epic["closed_at"] = json!("2026-01-02T00:00:00Z");
+    let mut self_blocked_epic = issue("at-epic", "Self blocked epic", "open", 1, "epic");
+    dependency(&mut self_blocked_epic, "at-child", "blocks");
+    let mut nested_epic = issue("at-nested", "Nested epic", "open", 2, "epic");
+    dependency(&mut nested_epic, "at-epic", "parent-child");
+    let mut nested_child = issue("at-child", "Nested child", "open", 2, "task");
+    dependency(&mut nested_child, "at-nested", "parent-child");
+    let mut sibling = issue("at-sibling", "Sibling", "open", 2, "task");
+    dependency(&mut sibling, "at-epic", "parent-child");
 
     let scenarios = [
         (
@@ -319,6 +338,67 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
                 epic_held,
             ],
             vec!["at-epic", "at-blocker", "at-epic-child"],
+        ),
+        (
+            "explicit-parent-inherits-blocker",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                explicit_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "shorthand-parent-does-not-inherit",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                shorthand_child,
+            ],
+            vec!["at-blocker", "at-child"],
+        ),
+        (
+            "explicit-edge-wins-over-shorthand",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                both_child,
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "closed-parent-still-inherits-blocker",
+            vec![
+                closed_blocked_epic,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                explicit_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "child-clears-own-parent-blocker",
+            vec![self_blocked_epic.clone(), explicit_child.clone()],
+            vec!["at-child"],
+        ),
+        (
+            "sibling-waits-while-child-clears-parent-blocker",
+            vec![self_blocked_epic.clone(), explicit_child, sibling],
+            vec!["at-child"],
+        ),
+        (
+            "nested-explicit-parent-inherits-blocker",
+            vec![
+                blocked_epic,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                nested_epic.clone(),
+                nested_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "descendant-clears-ancestor-blocker",
+            vec![self_blocked_epic, nested_epic, nested_child],
+            vec!["at-child"],
         ),
     ];
 

@@ -823,25 +823,50 @@ async fn refresh_projection(
     if let Some(pause) = pause {
         pause();
     }
-    // A beads import uses an open epic as a hierarchy container: its children
-    // can be ready before the epic closes, but only when the parent has no
-    // active blocker of its own. Native open parents still block. Explicit
-    // blocks edges remain active even when their target is an imported epic.
-    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.kind='epic' AND b.status='open' AND b.imported_json IS NOT NULL)))")
+    // Imported parent-child relations need the original beads representation:
+    // `parent_issue` alone never blocks, while an explicit dependency inherits
+    // the parent's active blockers. Keep those imported relations out of the
+    // baseline, regardless of the parent's status. Native relations retain
+    // their existing closed/pinned behavior.
+    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target JOIN atomic_graph_items child ON child.id=e.source WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.kind='epic' AND b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL)))")
         .execute(&mut *conn).await.map_err(db)?;
-    // A blocked imported epic holds its children, and those children may be
-    // epics with children of their own. Propagate one hierarchy level per
-    // pass; the primary key makes the fixed point finite, including cycles.
-    loop {
-        let added = sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items parent ON parent.id=e.target WHERE e.kind='parent-child' AND parent.kind='epic' AND parent.status='open' AND parent.imported_json IS NOT NULL AND EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=e.target)")
-            .execute(&mut *conn)
-            .await
-            .map_err(db)?
-            .rows_affected();
-        if added == 0 {
-            break;
-        }
-    }
+    // Follow each active blocker through explicitly imported parent-child
+    // edges. Beads leaves the blocker itself ready when an ancestor depends on
+    // it, so that item can clear the dependency; intermediate ancestors stay
+    // held. The target index finds children at each depth; UNION bounds cycles.
+    sqlx::query(
+        r#"
+        WITH RECURSIVE held(id, blocker) AS (
+            SELECT b.source, b.target
+            FROM atomic_graph_blocked b
+            JOIN atomic_graph_items i ON i.id=b.source
+            WHERE i.kind='epic' AND i.imported_json IS NOT NULL
+            UNION
+            SELECT e.source, h.blocker
+            FROM held h
+            JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
+            JOIN atomic_graph_items child ON child.id=e.source
+            WHERE child.kind='epic' AND child.imported_json IS NOT NULL
+              AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
+                          WHERE json_extract(d.value,'$.type')='parent-child'
+                            AND json_extract(d.value,'$.depends_on_id')=e.target)
+              AND e.source != h.blocker
+        )
+        INSERT OR IGNORE INTO atomic_graph_blocked (source,target)
+        SELECT e.source,e.target
+        FROM held h
+        JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
+        JOIN atomic_graph_items child ON child.id=e.source
+        WHERE child.imported_json IS NOT NULL
+          AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
+                      WHERE json_extract(d.value,'$.type')='parent-child'
+                        AND json_extract(d.value,'$.depends_on_id')=e.target)
+          AND e.source != h.blocker
+    "#,
+    )
+    .execute(conn)
+    .await
+    .map_err(db)?;
     Ok(())
 }
 async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, StoreError> {

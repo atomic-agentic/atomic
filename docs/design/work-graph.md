@@ -94,13 +94,14 @@ beads project can come into atomic or leave it. Importing one export twice
 leaves the graph unchanged. Differential tests compare issue fields and
 `ready` results with the pinned SQLite `bd` v0.50.3 release.
 
-An imported open epic is a hierarchy container for readiness, as it is in
-beads: its `parent-child` edges release children while the epic itself has no
-active blocker. If an ancestor is blocked, the hold reaches descendants too.
-Native open parents still hold their children, and an explicit `blocks` edge
-still holds an item even when its target is an imported open epic. The
-imported epic keeps its original `open` status and JSONL representation; it is
-not converted to an atomic-native pinned item.
+For imported beads, a `parent_issue` field alone records hierarchy without
+holding the child. An explicit `parent-child` dependency inherits the
+parent's active dependencies; that hold reaches descendants linked by explicit
+edges until it reaches the item that is itself the dependency target. That item
+stays ready so it can clear the dependency. The original JSONL distinguishes
+the two forms even though both create a graph edge. Native open parents retain
+their own blocking rule. An explicit `blocks` edge still holds its source.
+Imported epics keep their original status and JSONL representation.
 
 An atomic-native pinned item uses a versioned JSONL extension so it remains a
 valid beads issue: `status` is `open`, `pinned` is `true`, and
