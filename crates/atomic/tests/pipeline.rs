@@ -1113,13 +1113,11 @@ fn pipeline_child() {
     };
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
-        let rt = Arc::new(
-            if std::env::var(ENV_RUN).ok().as_deref() == Some("admission-recovery") {
-                engine_with_controls_cargo(&dir, &url).await
-            } else {
-                engine(&dir, &url).await
-            },
-        );
+        let rt = Arc::new(match std::env::var(ENV_RUN).ok().as_deref() {
+            #[cfg(target_os = "linux")]
+            Some("admission-recovery") => engine_with_controls_cargo(&dir, &url).await,
+            _ => engine(&dir, &url).await,
+        });
         if role == "replay" {
             // A replay of the recorded run `recorded`, noting a panic where
             // the parent looks.
