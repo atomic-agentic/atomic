@@ -2573,6 +2573,239 @@ fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
     });
 }
 
+async fn proposed_graph_state(rt: &Durare, title: &str) -> (String, i64, i64, i64) {
+    let title = title.to_owned();
+    rt.control_transaction(move |mut tx| {
+        let title = title.clone();
+        Box::pin(async move {
+            let status = tx
+                .query_one("SELECT status FROM atomic_graph_items WHERE id=?", &[Param::Text(CHILDREN[0].into())])
+                .await?
+                .text("status")?;
+            let followups = tx
+                .query_one("SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title=?", &[Param::Text(title)])
+                .await?
+                .int("n")?;
+            let links = tx
+                .query_one("SELECT COUNT(*) AS n FROM atomic_graph_commit_links WHERE item_id=?", &[Param::Text(CHILDREN[0].into())])
+                .await?
+                .int("n")?;
+            let edges = tx
+                .query_one("SELECT COUNT(*) AS n FROM atomic_graph_edges WHERE kind='discovered-from' AND target=?", &[Param::Text(CHILDREN[0].into())])
+                .await?
+                .int("n")?;
+            Ok((status, followups, links, edges))
+        })
+    })
+    .await
+    .expect("committed graph state")
+}
+
+fn proposed_id_from_tool_receipt(request: &Value) -> Option<String> {
+    request["input"]
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|entry| entry["type"] == "function_call_output")?
+        .get("output")?
+        .as_str()
+        .and_then(|output| serde_json::from_str::<Value>(output).ok())?
+        .get("provisional_id")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+#[test]
+fn reviewer_rejected_close_and_followup_leave_committed_graph_unchanged() {
+    on_codex_runtime(async {
+        let title = "Rejected dated follow-up";
+        let due_at = 1_900_000_000_000_i64;
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let model = FakeModel::respond(move |request| match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({"title":title,"body":"Proposed by the atom",
+                    "kind":"task","priority":2,"parent":CHILDREN[0],"due_at":due_at}),
+            },
+            1 => Reply::Tool {
+                name: "graph_dep_add".into(),
+                arguments: json!({"from":proposed_id_from_tool_receipt(request).expect("create receipt"),
+                    "kind":"discovered-from","to":CHILDREN[0]}),
+            },
+            2 => Reply::Tool {
+                name: "graph_close".into(),
+                arguments: json!({"item_id":CHILDREN[0],"reason":"Proposed close"}),
+            },
+            3 => Reply::Text(r#"{"done":true}"#.into()),
+            4 => Reply::Text(r#"{"verdict":"reject"}"#.into()),
+            _ => Reply::Text("unexpected extra model call".into()),
+        })
+        .await
+        .expect("scripted proposals and rejection");
+        let root = scratch("review-rejects-graph-proposals");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_graph_project(&project);
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "graph review fixture"]);
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let rt = durable(&root).await;
+        let before = proposed_graph_state(&rt, title).await;
+        let url = model.base_url();
+        let mut run = child_command(&root, &url, &base, "start", None)
+            .spawn()
+            .expect("reviewed graph run");
+        let gate = wait_for_review_gate(&rt).await;
+        assert_eq!(
+            model.calls(),
+            5,
+            "three tool calls, author result and reviewer"
+        );
+        let request = model.requests()[4].to_string();
+        assert!(
+            request.contains(title),
+            "reviewer missed proposed follow-up: {request}"
+        );
+        assert!(
+            request.contains("Proposed close"),
+            "reviewer missed proposed close: {request}"
+        );
+        assert!(
+            request.contains("discovered-from"),
+            "reviewer missed follow-up edge: {request}"
+        );
+        assert!(
+            request.contains(&due_at.to_string()),
+            "reviewer missed due date: {request}"
+        );
+        assert_eq!(
+            proposed_graph_state(&rt, title).await,
+            before,
+            "unaccepted graph proposals changed committed state"
+        );
+        decide_review_gate(&rt, &gate, "reject-graph-proposals", Verdict::Reject).await;
+        let status = tokio::task::spawn_blocking(move || run.wait().expect("reap rejected run"))
+            .await
+            .expect("rejected run worker");
+        assert!(
+            status.success(),
+            "graph child did not record rejection: {status}"
+        );
+        let result = std::fs::read_to_string(root.join("result.txt")).expect("graph result");
+        assert!(result.contains("was rejected"), "review refusal: {result}");
+        assert_eq!(model.calls(), 5, "rejection repeated or added a model call");
+        assert_eq!(
+            proposed_graph_state(&rt, title).await,
+            before,
+            "rejected close or follow-up changed committed graph state"
+        );
+    });
+}
+
+#[test]
+fn dated_agent_followup_reaches_review_before_publication() {
+    on_codex_runtime(async {
+        let title = "Dated agent follow-up";
+        let due_at = 1_900_000_000_000_i64;
+        let release = scratch("dated-followup-gate");
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let continue_review = release.join("continue-review");
+        let model = FakeModel::respond(move |request| match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+            0 => Reply::Tool {
+                name: "graph_create".into(),
+                arguments: json!({"title":title,"body":"Untrusted atom text",
+                    "kind":"task","priority":2,"parent":CHILDREN[0],"due_at":due_at}),
+            },
+            1 => Reply::Tool {
+                name: "graph_dep_add".into(),
+                arguments: json!({"from":proposed_id_from_tool_receipt(request).expect("create receipt"),
+                    "kind":"discovered-from","to":CHILDREN[0]}),
+            },
+            2 => Reply::Text(r#"{"done":true}"#.into()),
+            3 => Reply::Gated {
+                file: continue_review.clone(),
+                reply: Box::new(Reply::Text(r#"{"verdict":"approve"}"#.into())),
+            },
+            _ => Reply::Text("unexpected extra model call".into()),
+        })
+        .await
+        .expect("scripted dated proposal and approval");
+        let root = scratch("dated-followup-review");
+        let _ = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let project = root.join("project");
+        review_graph_project(&project);
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-q", "-m", "graph review fixture"]);
+        let base = git(&project, &["rev-parse", "HEAD"]);
+        let rt = durable(&root).await;
+        let before = proposed_graph_state(&rt, title).await;
+        let url = model.base_url();
+        let mut run = child_command(&root, &url, &base, "start", None)
+            .spawn()
+            .expect("reviewed graph run");
+        wait_for("dated proposal at reviewer", || model.calls() == 4).await;
+        let request = model.requests()[3].to_string();
+        assert!(
+            request.contains(title),
+            "reviewer missed follow-up: {request}"
+        );
+        assert!(
+            request.contains(&due_at.to_string()),
+            "reviewer missed due date: {request}"
+        );
+        assert!(
+            request.contains("graph_proposals"),
+            "reviewer missed proposal binding: {request}"
+        );
+        assert!(
+            request.contains("discovered-from"),
+            "reviewer missed follow-up edge: {request}"
+        );
+        let during_review = proposed_graph_state(&rt, title).await;
+        assert_eq!(
+            during_review.0, "in_progress",
+            "the claimed work item changed status unexpectedly"
+        );
+        assert_eq!(
+            (during_review.1, during_review.2, during_review.3),
+            (before.1, before.2, before.3),
+            "tainted author wrote the dated item before review accepted it"
+        );
+        std::fs::write(release.join("continue-review"), "approve").expect("release reviewer");
+        let status = tokio::task::spawn_blocking(move || run.wait().expect("reap approved run"))
+            .await
+            .expect("approved run worker");
+        assert!(status.success(), "approved graph child: {status}");
+        assert_eq!(
+            model.calls(),
+            4,
+            "two tool calls, author result and reviewer"
+        );
+        let followup = rt
+            .control_transaction(move |mut tx| {
+                Box::pin(async move {
+                    let row = tx
+                        .query_one(
+                            "SELECT trust,due_at,parent FROM atomic_graph_items WHERE title=?",
+                            &[Param::Text(title.into())],
+                        )
+                        .await?;
+                    Ok((row.text("trust")?, row.int("due_at")?, row.text("parent")?))
+                })
+            })
+            .await
+            .expect("accepted dated follow-up");
+        assert_eq!(followup, ("agent".into(), due_at, CHILDREN[0].into()));
+        assert_eq!(
+            editorial_followup_count(&rt).await,
+            1,
+            "accepted follow-up edge"
+        );
+    });
+}
+
 #[test]
 fn graph_tool_proposal_without_review_binding_refuses_before_reviewer() {
     on_codex_runtime(async {

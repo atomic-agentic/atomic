@@ -1,0 +1,26 @@
+# M6 graph-driven workflow: each clause of docs/design/milestones.md § M6.
+
+## Kill the loop and restart it: no item is claimed or closed a second time, and the retried step keeps the claim it already had.
+# The process is killed at each named graph boundary. Recovery checks the
+# claim and final close, and counts scripted model calls.
+graph_work_loop process_crashes_at_each_graph_boundary_recover_without_repeating_completed_turns
+graph_work_loop parallel_graph_crash_replays_completed_lane_without_another_model_call
+
+## The next agent to claim an item gets the earlier holder's handoff, with each file flagged as changed or untouched since.
+graph_work_loop next_claimant_receives_fenced_handoff_with_file_statuses
+
+## Proposals to close an item or file follow-ups that review rejects leave the committed graph as it was.
+# The reviewer sees both proposals; before review and after the human rejects
+# its escalation, the committed item, follow-up, link and publication counts
+# match the state before the author turn.
+graph_work_loop reviewer_rejected_close_and_followup_leave_committed_graph_unchanged
+
+## A crash after the candidate is saved and before it is published reuses the model's output and never publishes part of a batch.
+graph_work_loop graph_tool_followup_publishes_with_candidate_and_replays_after_crash
+graph_work_loop crash_after_atomic_finalize_replays_publish_and_close_projections_without_a_turn
+
+## A dated follow-up from a tainted atom arrives as a proposal for review to accept or reject; it is never written to the item directly.
+# Both verdict paths receive the dated proposal in the reviewer input; the
+# committed follow-up is absent until the reviewer approves it.
+graph_work_loop dated_agent_followup_reaches_review_before_publication
+graph_work_loop reviewer_rejected_close_and_followup_leave_committed_graph_unchanged
