@@ -108,3 +108,4 @@ codex-exec-server = { workspace = true }
 codex-http-client = { workspace = true }
 futures-util = "=0.3.34"
 tokio-tungstenite = "=0.28.0"
+tempfile = "=3.27.0"

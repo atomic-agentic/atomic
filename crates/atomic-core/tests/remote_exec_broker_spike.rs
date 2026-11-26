@@ -146,7 +146,7 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
         let cwd = std::env::current_dir().expect("child cwd");
         let params: ExecParams = serde_json::from_value(serde_json::json!({
             "processId": "atomic-broker-crashed-client",
-            "argv": ["/bin/sh", "-c", "while [ ! -e \"$ATOMIC_BROKER_RELEASE\" ]; do sleep 0.05; done"],
+            "argv": ["timeout", "60s", "/bin/sh", "-c", "while [ ! -e \"$ATOMIC_BROKER_RELEASE\" ]; do sleep 0.05; done"],
             "cwd": format!("file://{}", cwd.display()),
             "env": {"ATOMIC_BROKER_RELEASE": release_marker},
             "tty": false,
@@ -207,8 +207,11 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
         tokio_tungstenite::connect_async(&relay_url).await.is_err(),
         "relay must reject a client without its bearer token"
     );
-    let home = std::env::temp_dir().join(format!("atomic-broker-spike-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("private Codex home");
+    let temporary_home = tempfile::Builder::new()
+        .prefix("atomic-broker-spike-")
+        .tempdir()
+        .expect("private Codex home");
+    let home = temporary_home.path().to_path_buf();
     std::fs::write(
         home.join("environments.toml"),
         format!(
@@ -434,7 +437,6 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
     })
     .await
     .expect("second shell slot returned");
-    std::fs::remove_dir_all(home).expect("remove private proof files");
     relay.abort();
     server.abort();
 }
