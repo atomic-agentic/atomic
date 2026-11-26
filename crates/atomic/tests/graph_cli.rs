@@ -10,7 +10,7 @@ use sqlx::{Connection, Row};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 const EXPORT: &str = concat!(
@@ -27,8 +27,14 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
+        // Containerized test binaries can reuse a PID and start NEXT at zero
+        // on a later run against the same warm target directory.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_nanos();
         let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "atomic-graph-cli-{label}-{}-{}",
+            "atomic-graph-cli-{label}-{}-{}-{nonce}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -163,6 +169,14 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+struct RemoveDirOnDrop(PathBuf);
+
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -407,6 +421,30 @@ fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
 #[test]
 fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     let fixture = Fixture::new("literal%41");
+    assert!(
+        !fixture
+            .root
+            .parent()
+            .expect("fixture parent")
+            .to_str()
+            .expect("UTF-8 target directory")
+            .contains("%41"),
+        "test target parent contains the percent escape under test"
+    );
+    // VACUUM INTO below deliberately creates this sibling. Keep it scoped to
+    // the test even if an assertion panics, so a later test run is independent.
+    let decoded_label = fixture
+        .root
+        .file_name()
+        .expect("fixture directory")
+        .to_string_lossy()
+        .replace("%41", "A");
+    let decoded_root = fixture.root.with_file_name(decoded_label);
+    assert!(
+        !decoded_root.exists(),
+        "decoded fixture path already exists"
+    );
+    let decoded_cleanup = RemoveDirOnDrop(decoded_root.clone());
     let project = fixture.project("project");
     fixture.enroll(&project);
     let command = [
@@ -445,7 +483,11 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     );
     let literal = fixture.database(&project);
     assert!(literal.exists(), "literal state database is missing");
-    let decoded = PathBuf::from(literal.to_string_lossy().replace("%41", "A"));
+    let decoded = decoded_root.join(
+        literal
+            .strip_prefix(&fixture.root)
+            .expect("database inside fixture"),
+    );
     assert!(!decoded.exists(), "write landed in percent-decoded sibling");
 
     // Simulate an older writer's decoded database, then perform the documented
@@ -482,6 +524,11 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
         exported
     );
     assert_eq!(success(&fixture.run(&project, &command)), first);
+    drop(decoded_cleanup);
+    assert!(
+        !decoded_root.exists(),
+        "decoded test fixture was not removed"
+    );
 }
 
 #[test]
