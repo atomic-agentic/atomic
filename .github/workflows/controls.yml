@@ -139,6 +139,11 @@ jobs:
         with:
           target-cache: test
           backends: "true"
+      - name: Pin SQLite-capable bd for the ready JSON differential control
+        if: ${{ contains(matrix.rows, 'graph-ready-json-comment-count') }}
+        run: |
+          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
+          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
       - name: Run the rows
         # Under the job's limit, so the summary below still runs.
         timeout-minutes: 290
