@@ -1,0 +1,1 @@
+graph-runtime-late-wait|crates/atomic-graph/src/sqlite.rs|e.kind IN ('blocks','parent-child','conditional-blocks','waits-for')|e.kind IN ('blocks','parent-child','conditional-blocks')|-p atomic-agentic --test graph_work_loop a_graph_run_waits_for_a_child_created_mid_turn_and_only_runs_failure_compensation

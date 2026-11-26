@@ -5,6 +5,7 @@ use atomic_core::workflow::Criterion;
 use atomic_durable::gate::{self, HumanCredential, Principal};
 use atomic_durable::publication::{Acceptance, Candidate, Proposal, Write, publish_candidate_in};
 use atomic_durable::{DurableError, DurableRuntime, Durare, Param};
+use atomic_graph::handoff::{FileAtRelease, GitFingerprint, Handoff, HandoffFileStatus};
 use atomic_graph::sqlite::SqliteStore;
 use atomic_graph::store::{
     Actor, Draft, EdgeKind, Evidence, Finish, GraphStore, Status, StoreError,
@@ -12,6 +13,7 @@ use atomic_graph::store::{
 use atomic_graph::transactional_claim::{self, ClaimNext, CommitProof, ReviewFollowup};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -956,16 +958,81 @@ async fn terminal_failure_release_fences_exact_claim_and_leaves_handoff() {
     let ClaimNext::Claimed { lease, .. } = select(&rt, "claim-for-failure").await else {
         panic!("ready child");
     };
-    let released = rt
+    let handoff = Handoff {
+        attempted: "Tried the criteria check".into(),
+        failed: "The fixture failed after repair".into(),
+        learned: "Inspect the parser boundary".into(),
+        files: vec![
+            FileAtRelease {
+                path: "src/changed.rs".into(),
+                entry: Some(GitFingerprint {
+                    mode: "100644".into(),
+                    id: "a".repeat(40),
+                }),
+            },
+            FileAtRelease {
+                path: "src/unchanged.rs".into(),
+                entry: Some(GitFingerprint {
+                    mode: "100644".into(),
+                    id: "b".repeat(40),
+                }),
+            },
+        ],
+    };
+    let mut invalid = handoff.clone();
+    invalid.files[0].path = "../outside".into();
+    let rejected = rt
         .control_transaction({
             let lease = lease.clone();
             move |mut tx| {
                 let lease = lease.clone();
+                let invalid = invalid.clone();
                 Box::pin(async move {
-                    transactional_claim::release_after_failure(
+                    transactional_claim::release_after_failure_with_handoff(
+                        &mut tx,
+                        &lease,
+                        "invalid handoff",
+                        &invalid,
+                    )
+                    .await
+                })
+            }
+        })
+        .await;
+    assert!(rejected.is_err(), "unsafe handoff path released the claim");
+    let retained = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                let status = tx
+                    .query_one("SELECT status FROM atomic_graph_items WHERE id='one'", &[])
+                    .await?
+                    .text("status")?;
+                let leases = tx
+                    .query_one(
+                        "SELECT COUNT(*) AS n FROM atomic_graph_leases WHERE item_id='one'",
+                        &[],
+                    )
+                    .await?
+                    .int("n")?;
+                Ok((status, leases))
+            })
+        })
+        .await
+        .expect("inspect rejected handoff");
+    assert_eq!(retained, ("in_progress".into(), 1));
+    let released = rt
+        .control_transaction({
+            let lease = lease.clone();
+            let handoff = handoff.clone();
+            move |mut tx| {
+                let lease = lease.clone();
+                let handoff = handoff.clone();
+                Box::pin(async move {
+                    transactional_claim::release_after_failure_with_handoff(
                         &mut tx,
                         &lease,
                         "criteria failed after repair",
+                        &handoff,
                     )
                     .await
                 })
@@ -995,6 +1062,41 @@ async fn terminal_failure_release_fences_exact_claim_and_leaves_handoff() {
         .await
         .expect_err("stale token must park");
     assert!(matches!(stale, DurableError::Parked { .. }));
+    let ClaimNext::Claimed { item, .. } = select(&rt, "claim-after-failure").await else {
+        panic!("next claimant did not receive released item");
+    };
+    assert_eq!(item.handoff, Some(handoff.clone()));
+    let current = BTreeMap::from([
+        (
+            "src/changed.rs".into(),
+            Some(GitFingerprint {
+                mode: "100644".into(),
+                id: "c".repeat(40),
+            }),
+        ),
+        (
+            "src/unchanged.rs".into(),
+            Some(GitFingerprint {
+                mode: "100644".into(),
+                id: "b".repeat(40),
+            }),
+        ),
+    ]);
+    assert_eq!(
+        handoff
+            .compare_files(&current)
+            .expect("host file comparison"),
+        vec![
+            HandoffFileStatus {
+                path: "src/changed.rs".into(),
+                changed: true
+            },
+            HandoffFileStatus {
+                path: "src/unchanged.rs".into(),
+                changed: false
+            },
+        ]
+    );
     drop(store);
     let _ = std::fs::remove_file(path);
 }
