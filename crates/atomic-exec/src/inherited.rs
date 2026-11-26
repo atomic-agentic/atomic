@@ -151,6 +151,67 @@ pub(crate) fn keep_listed_from_children(
 mod tests {
     use super::*;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const DESCRIPTOR_TEST_CHILD: &str = "ATOMIC_TEST_INHERITED_FDS_ISOLATED_CHILD";
+
+    /// The listing fallback sees every descriptor in its process. Other lib
+    /// tests open and close descriptors concurrently, so run this assertion
+    /// in a fresh copy of the test binary with only its own test selected.
+    fn run_descriptor_test_isolated() {
+        let mut child = Command::new(std::env::current_exe().expect("test binary path"))
+            .args([
+                "--exact",
+                "inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(DESCRIPTOR_TEST_CHILD, "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start isolated descriptor test");
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if started.elapsed() < Duration::from_secs(30) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let killed = child.kill();
+                    let output = child.wait_with_output().expect("reap timed-out test");
+                    panic!(
+                        "isolated descriptor test timed out; kill={killed:?}; status={}; stdout={}; stderr={}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    );
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("wait for isolated descriptor test: {error}");
+                }
+            }
+        }
+        let output = child.wait_with_output().expect("collect isolated test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated descriptor test failed: status={}; stdout={stdout}; stderr={stderr}",
+            output.status,
+        );
+        assert!(
+            stdout.contains("running 1 test")
+                && stdout.contains(
+                    "test inherited::tests::descriptors_are_kept_from_children_but_those_kept_on_purpose ... ok"
+                ),
+            "isolated descriptor assertion did not run: stdout={stdout}; stderr={stderr}",
+        );
+    }
 
     /// A descriptor this process holds that passes to the programs it
     /// starts: a copy of `fd` without close-on-exec.
@@ -181,6 +242,10 @@ mod tests {
     /// the ones kept on purpose, both by `close_range` and by the listing.
     #[test]
     fn descriptors_are_kept_from_children_but_those_kept_on_purpose() {
+        if std::env::var_os(DESCRIPTOR_TEST_CHILD).is_none() {
+            run_descriptor_test_isolated();
+            return;
+        }
         let _held = DESCRIPTORS_HELD.lock().unwrap_or_else(|e| e.into_inner());
         let file = std::fs::File::open("/dev/null").expect("file");
         for how in ["close_range", "either", "listing"] {
