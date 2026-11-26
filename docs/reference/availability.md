@@ -62,7 +62,11 @@ The local SQLite work graph accepts beads JSONL through
 `atomic graph show <id>` displays an item's body, imported acceptance criteria,
 notes, current blockers and
 outgoing dependency edges. Both inspection commands accept the global `--json`
-option and leave a missing database absent.
+option and leave a missing database absent. For imported items, `atomic --json
+graph ready` preserves Beads' issue fields and ready count fields; native items keep
+Atomic's item JSON fields. The count fields follow the pinned SQLite Beads
+v0.50.3 ready projection: its dependency and dependent counts are zero even
+when edges exist, while comments are counted.
 `atomic graph search <phrase-or-id> [--status <status>] [--limit <n>]` searches
 committed titles, descriptions and released handoffs through local FTS5 indexes. An exact item ID,
 including punctuation, resolves directly; title matches rank above matching

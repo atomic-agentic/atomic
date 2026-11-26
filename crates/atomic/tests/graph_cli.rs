@@ -1610,6 +1610,226 @@ fn ready_and_show_inspect_imported_items_without_opening_an_absent_store() {
 }
 
 #[test]
+fn ready_json_matches_pinned_bd_sqlite_for_imported_scenarios() {
+    use std::collections::BTreeMap;
+
+    let bd = PathBuf::from(
+        std::env::var_os("ATOMIC_TEST_BD_SQLITE_BIN")
+            .expect("pinned bd v0.50.3 is required for the ready JSON differential"),
+    );
+    assert!(bd.is_absolute(), "pinned bd path must be absolute");
+    let version = Command::new(&bd)
+        .arg("version")
+        .output()
+        .expect("pinned bd version");
+    assert!(version.status.success(), "bd version: {version:?}");
+    assert_eq!(
+        String::from_utf8(version.stdout)
+            .expect("version UTF-8")
+            .trim(),
+        "bd version 0.50.3 (bd25acbc: HEAD@bd25acbcb1e7)"
+    );
+
+    let issue = |id: &str, status: &str, kind: &str| {
+        json!({
+            "id": id,
+            "title": format!("Title for {id}"),
+            "description": format!("Body for {id}"),
+            "status": status,
+            "priority": 2,
+            "issue_type": kind,
+            "owner": "fixture",
+            "created_by": "fixture",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "labels": ["differential"]
+        })
+    };
+    let mut held = issue("at-held", "open", "task");
+    held["dependencies"] = json!([{
+        "issue_id":"at-held", "depends_on_id":"at-blocker", "type":"blocks"
+    }]);
+    let mut related = issue("at-related", "open", "bug");
+    related["dependencies"] = json!([{
+        "issue_id":"at-related", "depends_on_id":"at-blocker", "type":"related"
+    }]);
+    let mut child = issue("at-child", "open", "task");
+    child["parent_issue"] = json!("at-epic");
+    child["dependencies"] = json!([{
+        "issue_id":"at-child", "depends_on_id":"at-epic", "type":"parent-child"
+    }]);
+    let mut rich = issue("at-rich", "open", "task");
+    rich["design"] = json!("Design text");
+    rich["acceptance_criteria"] = json!("Acceptance text");
+    rich["notes"] = json!("Owner note");
+    rich["assignee"] = json!("builder");
+    rich["metadata"] = json!({"sample":true});
+    rich["comments"] = json!([{
+        "id":1, "issue_id":"at-rich", "author":"fixture", "text":"A comment",
+        "created_at":"2026-01-01T00:00:00Z"
+    }]);
+    let scenarios = [
+        (
+            "statuses",
+            vec![
+                issue("at-open", "open", "task"),
+                issue("at-closed", "closed", "task"),
+                issue("at-progress", "in_progress", "task"),
+                issue("at-deferred", "deferred", "task"),
+            ],
+        ),
+        (
+            "dependencies",
+            vec![issue("at-blocker", "open", "task"), held, related],
+        ),
+        ("hierarchy", vec![issue("at-epic", "open", "epic"), child]),
+        ("rich-fields", vec![rich]),
+    ];
+
+    for (label, rows) in scenarios {
+        let fixture = Fixture::new(&format!("bd-ready-{label}"));
+        let oracle = fixture.root.join("oracle");
+        std::fs::create_dir_all(&oracle).expect("isolated bd oracle");
+        let database = oracle.join(".beads/beads.db");
+        let bd_run = |args: &[&str]| -> String {
+            let output = Command::new(&bd)
+                .arg("--db")
+                .arg(&database)
+                .args(args)
+                .current_dir(&oracle)
+                .env("BD_ACTOR", "fixture")
+                .env("XDG_CACHE_HOME", fixture.root.join("bd-cache"))
+                .output()
+                .expect("run pinned SQLite bd");
+            assert!(
+                output.status.success(),
+                "bd {args:?} in {label}: status={}, stderr={}, stdout={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            String::from_utf8(output.stdout).expect("bd UTF-8")
+        };
+        bd_run(&[
+            "init",
+            "--backend",
+            "sqlite",
+            "--prefix",
+            "at",
+            "--skip-hooks",
+            "--skip-merge-driver",
+            "--quiet",
+        ]);
+        let input = rows
+            .iter()
+            .map(|row| serde_json::to_string(row).expect("row JSON"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let input_path = oracle.join("items.jsonl");
+        std::fs::write(&input_path, input).expect("oracle input");
+        bd_run(&[
+            "import",
+            "--input",
+            input_path.to_str().expect("fixture path UTF-8"),
+        ]);
+        let bd_ready: Vec<Value> =
+            serde_json::from_str(&bd_run(&["ready", "--json", "--limit", "100"]))
+                .expect("bd ready JSON");
+        let export = bd_run(&["export"]);
+
+        let project = fixture.project("project");
+        fixture.enroll(&project);
+        success(&fixture.run_stdin(&project, &["graph", "import", "-"], &export));
+        let atomic_ready: Vec<Value> = serde_json::from_str(&success(
+            &fixture.run(&project, &["--json", "graph", "ready", "--limit", "100"]),
+        ))
+        .expect("atomic ready JSON");
+        let by_id = |values: Vec<Value>| -> BTreeMap<String, Value> {
+            values
+                .into_iter()
+                .map(|value| (value["id"].as_str().expect("ready ID").to_owned(), value))
+                .collect()
+        };
+        assert_eq!(
+            by_id(atomic_ready),
+            by_id(bd_ready),
+            "ready set and JSON fields: {label}"
+        );
+        if label == "dependencies" {
+            bd_run(&["dep", "add", "at-related", "at-blocker", "--type", "blocks"]);
+            success(&fixture.run(
+                &project,
+                &["graph", "link", "at-related", "blocks", "at-blocker"],
+            ));
+            let bd_after: Vec<Value> =
+                serde_json::from_str(&bd_run(&["ready", "--json", "--limit", "100"]))
+                    .expect("bd ready after new edge");
+            let atomic_after: Vec<Value> = serde_json::from_str(&success(
+                &fixture.run(&project, &["--json", "graph", "ready", "--limit", "100"]),
+            ))
+            .expect("atomic ready after new edge");
+            assert_eq!(
+                by_id(atomic_after),
+                by_id(bd_after),
+                "ready JSON after edge addition"
+            );
+
+            bd_run(&["close", "at-blocker"]);
+            success(&fixture.run(&project, &["graph", "close", "at-blocker"]));
+            let bd_after: Vec<Value> =
+                serde_json::from_str(&bd_run(&["ready", "--json", "--limit", "100"]))
+                    .expect("bd ready after blocker close");
+            let atomic_after: Vec<Value> = serde_json::from_str(&success(
+                &fixture.run(&project, &["--json", "graph", "ready", "--limit", "100"]),
+            ))
+            .expect("atomic ready after blocker close");
+            assert_eq!(
+                by_id(atomic_after),
+                by_id(bd_after),
+                "ready JSON after status change"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_ready_json_keeps_atomic_item_fields() {
+    let fixture = Fixture::new("native-ready-json");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    success(&fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Native work",
+            "--id",
+            "at-native",
+            "--body",
+            "Native body",
+        ],
+    ));
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("native ready JSON");
+    let native = ready
+        .as_array()
+        .expect("ready array")
+        .iter()
+        .find(|item| item["id"] == "at-native")
+        .expect("native item ready");
+    assert_eq!(native["body"], "Native body");
+    assert_eq!(native["kind"], "task");
+    assert_eq!(native["trust"], "human");
+    assert!(
+        native.get("description").is_none(),
+        "native fields remain distinct from imported Beads fields"
+    );
+}
+
+#[test]
 fn inspection_works_while_another_connection_holds_the_write_lock() {
     use sqlx::{Connection, SqliteConnection};
     let fixture = Fixture::new("inspection-lock");

@@ -159,7 +159,50 @@ pub struct StoredEdge {
     pub to: String,
 }
 
+/// A ready item with its imported Beads record and current note count from
+/// the same read snapshot. Native items have no imported record.
+pub struct ReadyInspection {
+    /// Canonical item with its current title, status and priority.
+    pub item: Item,
+    /// Preserved Beads JSON for an imported item, if one exists.
+    pub imported: Option<serde_json::Value>,
+    /// Stored notes, including imported notes and comments.
+    pub note_count: i64,
+}
+
 impl SqliteStore {
+    /// Read ready membership and the preserved import fields together. The
+    /// public CLI uses this snapshot to render Beads-compatible JSON without
+    /// exporting every item in a large graph or racing a concurrent edit.
+    pub async fn ready_for_inspection(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReadyInspection>, StoreError> {
+        self.read_at(move |conn, now| Box::pin(async move {
+            let items = ready_items(conn, now, limit, false).await?;
+            if items.is_empty() {
+                return Ok(Vec::new());
+            }
+            let ids = serde_json::to_string(&items.iter().map(|item| &item.id).collect::<Vec<_>>())
+                .map_err(db)?;
+            let rows = sqlx::query("SELECT i.id,i.imported_json,(SELECT COUNT(*) FROM atomic_graph_notes n WHERE n.item_id=i.id) AS note_count FROM atomic_graph_items i WHERE i.id IN (SELECT value FROM json_each(?))")
+                .bind(ids).fetch_all(&mut *conn).await.map_err(db)?;
+            let mut records = std::collections::BTreeMap::new();
+            for row in rows {
+                let id: String = row.try_get("id").map_err(db)?;
+                let raw: Option<String> = row.try_get("imported_json").map_err(db)?;
+                let imported = raw.map(|raw| serde_json::from_str(&raw).map_err(db)).transpose()?;
+                let note_count: i64 = row.try_get("note_count").map_err(db)?;
+                records.insert(id, (imported, note_count));
+            }
+            items.into_iter().map(|item| {
+                let (imported, note_count) = records.remove(&item.id)
+                    .ok_or_else(|| db("ready item vanished from its read snapshot"))?;
+                Ok(ReadyInspection { item, imported, note_count })
+            }).collect()
+        })).await
+    }
+
     /// Open a graph database. Existing graph rows survive reopening.
     pub fn open(
         path: &Path,
