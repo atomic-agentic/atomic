@@ -210,9 +210,12 @@ impl SqliteStore {
     pub async fn show_with_edges(
         &self,
         id: String,
-    ) -> Result<Option<(Show, Vec<StoredEdge>)>, StoreError> {
+    ) -> Result<Option<(Show, Vec<StoredEdge>, Option<String>)>, StoreError> {
         self.read(move |c| Box::pin(async move {
             let Some(item) = get_item(c, &id).await? else { return Ok(None) };
+            let acceptance_criteria: Option<String> = sqlx::query_scalar(
+                "SELECT json_extract(imported_json,'$.acceptance_criteria') FROM atomic_graph_items WHERE id=?"
+            ).bind(&id).fetch_one(&mut *c).await.map_err(db)?;
             let rows = sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal")
                 .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
             let notes = rows.iter().map(|row| Ok(Note {
@@ -230,7 +233,7 @@ impl SqliteStore {
                 kind: row.try_get("kind").map_err(db)?,
                 to: row.try_get("target").map_err(db)?,
             })).collect::<Result<Vec<_>,StoreError>>()?;
-            Ok(Some((Show { item, notes, blocked_by, holder }, edges)))
+            Ok(Some((Show { item, notes, blocked_by, holder }, edges, acceptance_criteria)))
         })).await
     }
 
@@ -1399,7 +1402,7 @@ impl GraphStore for SqliteStore {
         async move {
             self.show_with_edges(id)
                 .await
-                .map(|view| view.map(|(show, _)| show))
+                .map(|view| view.map(|(show, _, _)| show))
         }
     }
     fn all_items(

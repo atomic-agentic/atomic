@@ -58,6 +58,11 @@ calibrated decision atoms are not built yet.
 
 The local SQLite work graph accepts beads JSONL through
 `atomic graph import <file>` and writes it through `atomic graph export`.
+`atomic graph ready [--limit N]` lists committed items that can be claimed;
+`atomic graph show <id>` displays an item's body, imported acceptance criteria,
+notes, current blockers and
+outgoing dependency edges. Both inspection commands accept the global `--json`
+option and leave a missing database absent.
 Committed import and the human `graph create`, `link`, `claim` and `close`
 commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
