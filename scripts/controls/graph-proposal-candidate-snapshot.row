@@ -1,0 +1,1 @@
+graph-proposal-candidate-snapshot|crates/atomic/src/pipeline.rs|let operations = graph_tools.operations().await;|let operations = graph_tools.operations().await.into_iter().take(0).collect::<Vec<_>>();|-p atomic-agentic --test graph_work_loop graph_tool_followup_publishes_with_candidate_and_replays_after_crash

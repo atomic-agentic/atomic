@@ -662,15 +662,16 @@ impl Worktrees {
         Ok((out, commit))
     }
 
-    /// Remove run `run`'s worktrees, and every attempt ref of its steps that
-    /// names none of `accepted`, the commits of its accepted candidates. The
-    /// run's pinned base stays. Commits no ref names are left for git's own
-    /// garbage collection.
-    pub fn cleanup(&self, run: &str, accepted: &[String]) -> Result<Cleanup> {
+    /// Remove run `run`'s worktrees, and every attempt ref of its steps except
+    /// the exact refs of accepted candidates. Two attempts can create the same
+    /// commit object, so a commit ID alone cannot identify the accepted one.
+    /// The run's pinned base stays. Commits no ref names are left for git's
+    /// own garbage collection.
+    pub fn cleanup(&self, run: &str, accepted_refs: &[String]) -> Result<Cleanup> {
         let mut report = Cleanup::default();
         let prefix = format!("refs/atomic/{}/steps/", component(run));
         for r in self.repo.refs(&prefix)? {
-            if !accepted.contains(&r.sha) {
+            if !accepted_refs.contains(&r.name) {
                 self.repo.delete_ref(&r.name, &r.sha)?;
                 report.refs.push(r.name);
             }

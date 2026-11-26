@@ -5,6 +5,7 @@
 pub mod goal;
 pub mod handoff;
 pub mod proposal;
+pub mod publication;
 pub mod sqlite;
 pub mod store;
 pub mod tools;

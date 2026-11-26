@@ -83,7 +83,10 @@ use atomic_durable::{
 };
 use atomic_graph::{
     handoff::{FileSnapshot, Handoff, HandoffFileStatus, snapshot_changed_files},
+    proposal::{AttemptKey, ProposalBuffer},
+    sqlite::SqliteStore,
     store::Lease,
+    tools::GraphTurnTools,
     transactional_claim::{self, ClaimNext, ReviewFollowup, WorkItem},
 };
 use atomic_schema::expr::Shape;
@@ -2094,6 +2097,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             }
         }
         let mut accepted = Vec::<String>::new();
+        let mut accepted_refs = Vec::<String>::new();
         let mut admitted_base: Option<String> = None;
         let mut last_output = None;
         let mut complete = false;
@@ -2543,6 +2547,12 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     .await?;
                     (candidate, acceptance, Vec::new())
                 };
+                if template.review.is_none() && graph_proposal_summary(&candidate)?.is_some() {
+                    return Err(failed(format!(
+                        "graph item {} proposed graph writes without an independent reviewer",
+                        item.id
+                    )));
+                }
                 let kept = GraphAcceptance {
                     acceptance,
                     verified_formatting_path: followups.first().map(|finding| finding.file.clone()),
@@ -2565,6 +2575,18 @@ async fn run_pipeline_in<C: WorkflowContext>(
                         ))
                     })?
                     .to_owned();
+                let commit_ref = candidate
+                    .proposal
+                    .metadata
+                    .get("commit_ref")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        failed(format!(
+                            "graph item {} has no host-recorded worktree commit ref",
+                            item.id
+                        ))
+                    })?
+                    .to_owned();
                 let mapped_result = graph_result(
                     &pipeline,
                     &template,
@@ -2574,6 +2596,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 )?;
                 let precondition = lease_precondition(&lease)?;
                 let publish_step = format!("{}.publish", step_name);
+                failpoint("graph:before-finalize");
                 // Every proof decision is a durable sibling. If a process dies
                 // while parked and a human supplies proof offline, replay still
                 // sees the checkpointed Missing outcome and resumes that park.
@@ -2648,6 +2671,10 @@ async fn run_pipeline_in<C: WorkflowContext>(
                                                     &[(*precondition).clone()],
                                                 )
                                                 .await?;
+                                            atomic_graph::publication::apply_candidate_batch(
+                                                &mut tx, &candidate, &token,
+                                            )
+                                            .await?;
                                             transactional_claim::file_review_followups(
                                                 &mut tx,
                                                 &token,
@@ -2704,6 +2731,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     admitted_base = first_base;
                 }
                 accepted.push(commit);
+                accepted_refs.push(commit_ref);
                 closed_count += 1;
                 last_output = Some(mapped_result);
                 failpoint(&format!("pipeline:after:{step_name}"));
@@ -2737,7 +2765,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     if let Some(caches) = caches {
                         remove_caches(&run_id, caches).await;
                     }
-                    tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
+                    tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted_refs))
                         .await
                         .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
                         .map(|c| c.refs.len() + c.worktrees.len())
@@ -2749,6 +2777,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         return Ok(result);
     }
     let mut accepted = Vec::new();
+    let mut accepted_refs = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
         keep_working(&mut working, &id).await;
@@ -2920,6 +2949,17 @@ async fn run_pipeline_in<C: WorkflowContext>(
             && let Some(commit) = published.metadata.get("commit").and_then(Value::as_str)
         {
             accepted.push(commit.to_owned());
+            let commit_ref = published
+                .metadata
+                .get("commit_ref")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    failed(format!(
+                        "step `{}` has no host-recorded worktree commit ref",
+                        step.id
+                    ))
+                })?;
+            accepted_refs.push(commit_ref.to_owned());
         }
         failpoint(&format!("pipeline:after:{}", step.id));
         // A replay keeps the recorded metadata in `steps`, thread and all, so
@@ -2972,7 +3012,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                     // Never in the way of removing the worktrees.
                     remove_caches(&run_id, caches).await;
                 }
-                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
+                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted_refs))
                     .await
                     .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
                     .map(|c| c.refs.len() + c.worktrees.len())
@@ -3616,6 +3656,11 @@ async fn turn<C: WorkflowContext>(
     } else {
         None
     };
+    let graph_database = if t.claim.is_some() && t.worktree && atom.kind == "codex" {
+        services.graph_database.clone()
+    } else {
+        None
+    };
     // What an exec step's command hands over is held until the turn has
     // recorded the output that references it, then let go; and let go too
     // when the turn is dropped or panics before that.
@@ -3641,6 +3686,7 @@ async fn turn<C: WorkflowContext>(
         let claim = claim.clone();
         let trial_head = trial_head.clone();
         let lane_endpoint = lane_endpoint.clone();
+        let graph_database = graph_database.clone();
         let place = place.clone();
         // In a replay, the step's recorded result, with no model call
         // and no command run; a step with none fails rather than run
@@ -3734,6 +3780,24 @@ async fn turn<C: WorkflowContext>(
                      'idempotent' }}` (or `'read-only'` if it only reads)"
                 )));
             }
+            let graph_tools = if let Some(database) = graph_database {
+                let store = SqliteStore::open_for_inspection(&database)
+                    .await
+                    .map_err(|error| failed(format!("open graph tool view: {error}")))?;
+                let attempt = u32::try_from(position.step_id)
+                    .ok()
+                    .and_then(|position| position.checked_add(1))
+                    .ok_or_else(|| failed("graph turn position is invalid".into()))?;
+                let key = AttemptKey::new(&run_id, &id, attempt)
+                    .map_err(|error| failed(error.to_string()))?;
+                Some(Arc::new(GraphTurnTools::new(
+                    Arc::new(store),
+                    ProposalBuffer::new(key),
+                )))
+            } else {
+                None
+            };
+            let graph_attempt_step = id.clone();
             let proposal = match (tree, guard) {
                 (_, Some((_, _, opened, identity))) => {
                     let clock = runtimes.clock.clone();
@@ -3799,6 +3863,7 @@ async fn turn<C: WorkflowContext>(
                             snapshot.as_ref(),
                             repair.as_ref(),
                             &runtimes,
+                            None,
                             host_brief.as_deref(),
                         )
                         .await
@@ -3816,11 +3881,25 @@ async fn turn<C: WorkflowContext>(
                         repair,
                         host_brief,
                         coding: t.coding,
+                        graph_tools: graph_tools.clone(),
                     };
                     in_worktree(worktrees, caches, request, call, runtimes, &place, bound).await
                 }
             }?;
             let mut proposal = proposal;
+            if let Some(graph_tools) = &graph_tools {
+                let operations = graph_tools.operations().await;
+                let Value::Object(metadata) = &mut proposal.metadata else {
+                    return Err(failed("an atom step's metadata is not an object".into()));
+                };
+                metadata.insert("graph_attempt_step".into(), Value::String(graph_attempt_step));
+                metadata.insert("graph_attempt_position".into(), json!(position.step_id));
+                metadata.insert(
+                    "graph_operations".into(),
+                    serde_json::to_value(operations)
+                        .map_err(|error| failed(format!("encode graph proposals: {error}")))?,
+                );
+            }
             let Value::Object(metadata) = &mut proposal.metadata else {
                 return Err(failed("an atom step's metadata is not an object".into()));
             };
@@ -4796,7 +4875,8 @@ async fn check_candidate_criteria<C: WorkflowContext>(
         .get(&step.atom)
         .and_then(|atom| atom.program.contracts.get("Output"));
     let commit_schema = json!({"type":"object","properties":{
-        "commit":{"type":"string"}, "diff":{"type":"string"}
+        "commit":{"type":"string"}, "diff":{"type":"string"},
+        "graph_proposals":{"type":"string"}
     }});
     let mut fields = vec![("output", author.map_or(Shape::Untyped, Shape::Schema))];
     let mut seen = json!({"output": candidate.proposal.output});
@@ -5425,6 +5505,24 @@ pub(crate) fn panel_acceptance_reason(members: &str, round: u64, followups: bool
     }
 }
 
+/// Model-authored graph operations are external data. Reviewers receive this
+/// host-rendered snapshot beside the diff; the same snapshot is shown at a
+/// human escalation gate. No model can choose to omit one of its tool calls.
+fn graph_proposal_summary(candidate: &Candidate) -> Result<Option<String>> {
+    let Some(raw) = candidate.proposal.metadata.get("graph_operations") else {
+        return Ok(None);
+    };
+    let operations = raw
+        .as_array()
+        .ok_or_else(|| failed("checkpointed graph operations are not an array".into()))?;
+    if operations.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string_pretty(raw)
+        .map(Some)
+        .map_err(|error| failed(format!("render graph proposals for review: {error}")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn reviewed<C: WorkflowContext>(
     ctx: &C,
@@ -5447,9 +5545,9 @@ async fn reviewed<C: WorkflowContext>(
         .and_then(|a| a.program.contracts.get("Output"));
     let mut seen_shape = vec![("output", author.map_or(Shape::Untyped, Shape::Schema))];
     let commit_schema = if step.coding {
-        json!({"type": "object", "properties": {"commit": {"type": "string"}, "diff": {"type": "string"}}})
+        json!({"type": "object", "properties": {"commit": {"type": "string"}, "diff": {"type": "string"}, "graph_proposals": {"type": "string"}}})
     } else {
-        json!({"type": "object", "properties": {"commit": {"type": "string"}}})
+        json!({"type": "object", "properties": {"commit": {"type": "string"}, "graph_proposals": {"type": "string"}}})
     };
     if step.worktree {
         seen_shape.push(("metadata", Shape::Schema(&commit_schema)));
@@ -5902,6 +6000,7 @@ async fn reviewed<C: WorkflowContext>(
             )));
         }
         let mut seen = json!({"output": candidate.proposal.output});
+        let graph_proposals = graph_proposal_summary(&candidate)?;
         if step.worktree {
             seen["metadata"] = if step.coding {
                 json!({
@@ -5911,6 +6010,17 @@ async fn reviewed<C: WorkflowContext>(
             } else {
                 json!({"commit": candidate.proposal.metadata.get("commit").cloned().unwrap_or(Value::Null)})
             };
+        }
+        if let Some(summary) = &graph_proposals {
+            seen["metadata"]["graph_proposals"] = Value::String(summary.clone());
+            if review.with.get("graph_proposals").map(String::as_str)
+                != Some("candidate.metadata.graph_proposals")
+            {
+                return Err(failed(format!(
+                    "step `{}`: graph proposals require a reviewer binding to host graph_proposals",
+                    step.id
+                )));
+            }
         }
         let scope = [values[0], values[1], ("candidate", &seen, &candidate_shape)];
         let mut mapped = Map::new();
@@ -6210,6 +6320,9 @@ async fn reviewed<C: WorkflowContext>(
         let mut decisions = Vec::new();
         let mut round_followups = Vec::new();
         let mut reviewer_origins = review.origins.clone();
+        if graph_proposals.is_some() {
+            reviewer_origins.insert("graph_proposals".into(), "external".into());
+        }
         if review.self_review.is_some() {
             reviewer_origins.insert("self_review".into(), "external".into());
         }
@@ -6365,6 +6478,9 @@ async fn reviewed<C: WorkflowContext>(
     let approvers = gate::resolve(&id, None, &run.services.deployment)
         .map_err(|e| failed(format!("gate `{id}`: {e}")))?;
     let mut show = json!({"output": candidate.proposal.output, "verdict": verdict});
+    if let Some(summary) = graph_proposal_summary(&candidate)? {
+        show["graph_proposals"] = Value::String(summary);
+    }
     if step.worktree {
         show["commit"] = candidate
             .proposal
@@ -6553,9 +6669,18 @@ fn check_reviews(pipeline: &Pipeline) -> Result<()> {
                 step.id
             )));
         }
-        if step.coding && review.with.len() != 1 {
+        let coding_review_input_allowed = review.with.len() <= 2
+            && review
+                .with
+                .keys()
+                .all(|field| field == "diff" || field == "graph_proposals")
+            && review
+                .with
+                .get("graph_proposals")
+                .is_none_or(|binding| binding == "candidate.metadata.graph_proposals");
+        if step.coding && !coding_review_input_allowed {
             return Err(failed(format!(
-                "step `{}`: a coding reviewer receives the host diff and self-review evidence, without author reasoning",
+                "step `{}`: a coding reviewer receives only the host diff, graph proposals and self-review evidence, without author reasoning",
                 step.id
             )));
         }
@@ -6764,6 +6889,7 @@ async fn run_in(
     snapshot: Option<&atomic_core::context::ContextSnapshot>,
     repair: Option<&Value>,
     runtimes: &Runtimes,
+    native_tools: Option<Arc<dyn atomic_core::codex::NativeToolHost>>,
     host_brief: Option<&str>,
 ) -> std::result::Result<(Value, atomic_core::runtime::RunMetadata), AtomError> {
     let mut registry = Registry::new();
@@ -6789,7 +6915,7 @@ async fn run_in(
         }),
         repair,
         runtimes,
-        None,
+        native_tools,
         host_brief,
     )
     .await
@@ -6806,6 +6932,7 @@ struct StepCall {
     repair: Option<Value>,
     host_brief: Option<String>,
     coding: bool,
+    graph_tools: Option<Arc<GraphTurnTools>>,
 }
 
 /// Run a step's atom in its worktree, reset to the step's base, and commit
@@ -6830,6 +6957,7 @@ async fn in_worktree(
         repair,
         host_brief,
         coding,
+        graph_tools,
     } = call;
     let step = request.step.clone();
     let finished = contained(async move {
@@ -6860,6 +6988,9 @@ async fn in_worktree(
                     snapshot.as_ref(),
                     repair.as_ref(),
                     &here,
+                    graph_tools
+                        .clone()
+                        .map(|tools| tools as Arc<dyn atomic_core::codex::NativeToolHost>),
                     host_brief.as_deref(),
                 )
                 .await
@@ -7008,6 +7139,9 @@ async fn run_gate<C: WorkflowContext>(
 pub struct Services {
     /// Where atoms run.
     pub runtimes: Arc<Runtimes>,
+    /// The durable project's SQLite graph, opened read-only for model tools.
+    /// Graph writes still go through the accepted publication transaction.
+    pub graph_database: Option<PathBuf>,
     /// An ordinary model run must never use the unconfigured endpoint that a
     /// graph-only routing policy allows the engine to carry while resuming.
     pub model_endpoint_configured: bool,
