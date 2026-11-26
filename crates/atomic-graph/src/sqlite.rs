@@ -828,7 +828,7 @@ async fn refresh_projection(
     // the parent's active blockers. Keep those imported relations out of the
     // baseline, regardless of the parent's status. Native relations retain
     // their existing closed/pinned behavior.
-    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target JOIN atomic_graph_items child ON child.id=e.source WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.kind='epic' AND b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL)))")
+    sqlx::query("INSERT OR IGNORE INTO atomic_graph_blocked (source,target) SELECT e.source,e.target FROM atomic_graph_edges e JOIN atomic_graph_items b ON b.id=e.target JOIN atomic_graph_items child ON child.id=e.source WHERE e.kind IN ('blocks','parent-child','conditional-blocks','waits-for') AND ((e.kind='conditional-blocks' AND (b.status!='closed' OR COALESCE(b.terminal_outcome,'unknown')!='failure')) OR (e.kind!='conditional-blocks' AND b.status!='closed')) AND NOT (e.kind='parent-child' AND (b.status='pinned' OR (b.imported_json IS NOT NULL AND child.imported_json IS NOT NULL)))")
         .execute(&mut *conn).await.map_err(db)?;
     // Follow each active blocker through explicitly imported parent-child
     // edges. Beads leaves the blocker itself ready when an ancestor depends on
@@ -840,13 +840,13 @@ async fn refresh_projection(
             SELECT b.source, b.target
             FROM atomic_graph_blocked b
             JOIN atomic_graph_items i ON i.id=b.source
-            WHERE i.kind='epic' AND i.imported_json IS NOT NULL
+            WHERE i.imported_json IS NOT NULL
             UNION
             SELECT e.source, h.blocker
             FROM held h
             JOIN atomic_graph_edges e ON e.target=h.id AND e.kind='parent-child'
             JOIN atomic_graph_items child ON child.id=e.source
-            WHERE child.kind='epic' AND child.imported_json IS NOT NULL
+            WHERE child.imported_json IS NOT NULL
               AND EXISTS (SELECT 1 FROM json_each(child.imported_json,'$.dependencies') d
                           WHERE json_extract(d.value,'$.type')='parent-child'
                             AND json_extract(d.value,'$.depends_on_id')=e.target)

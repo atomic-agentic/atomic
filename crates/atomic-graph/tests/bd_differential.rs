@@ -297,6 +297,20 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
     dependency(&mut nested_child, "at-nested", "parent-child");
     let mut sibling = issue("at-sibling", "Sibling", "open", 2, "task");
     dependency(&mut sibling, "at-epic", "parent-child");
+    let mut blocked_task = issue("at-parent", "Blocked task parent", "open", 1, "task");
+    dependency(&mut blocked_task, "at-blocker", "blocks");
+    let mut task_child = issue("at-child", "Task child", "open", 2, "task");
+    dependency(&mut task_child, "at-parent", "parent-child");
+    let mut task_shorthand_child = task_child.clone();
+    task_shorthand_child
+        .as_object_mut()
+        .expect("issue object")
+        .remove("dependencies");
+    task_shorthand_child["parent_issue"] = json!("at-parent");
+    let mut nested_task = issue("at-middle", "Nested task parent", "open", 2, "task");
+    dependency(&mut nested_task, "at-parent", "parent-child");
+    let mut nested_task_child = issue("at-child", "Nested task child", "open", 2, "task");
+    dependency(&mut nested_task_child, "at-middle", "parent-child");
 
     let scenarios = [
         (
@@ -399,6 +413,34 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
             "descendant-clears-ancestor-blocker",
             vec![self_blocked_epic, nested_epic, nested_child],
             vec!["at-child"],
+        ),
+        (
+            "task-parent-explicit-inherits-blocker",
+            vec![
+                blocked_task.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                task_child,
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "task-parent-shorthand-does-not-inherit",
+            vec![
+                blocked_task.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                task_shorthand_child,
+            ],
+            vec!["at-blocker", "at-child"],
+        ),
+        (
+            "nested-task-parents-inherit-blocker",
+            vec![
+                blocked_task,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                nested_task,
+                nested_task_child,
+            ],
+            vec!["at-blocker"],
         ),
     ];
 

@@ -2439,7 +2439,10 @@ fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
             .expect("show imported child")
             .expect("imported child exists");
         assert_eq!(imported_child.item.parent.as_deref(), Some("at-parent-one"));
-        assert_eq!(imported_child.blocked_by, ["at-parent-one"]);
+        // Import uses beads' explicit hierarchy rule: this task parent has
+        // no active dependency for the child to inherit. The native source
+        // graph still holds its child, as asserted above.
+        assert!(imported_child.blocked_by.is_empty());
     });
     drop(store);
     let _ = std::fs::remove_file(path);
@@ -2471,7 +2474,7 @@ fn sqlite_works_inside_an_existing_tokio_runtime() {
 }
 
 #[test]
-fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
+fn sqlite_imported_parent_origin_controls_ready_and_claim() {
     use store_contract::Actor;
 
     let path = std::env::temp_dir().join(format!(
@@ -2500,6 +2503,12 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
         r#"{"id":"at-grandchild","title":"Nested child","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-grandchild","depends_on_id":"at-nested-epic","type":"parent-child"}]}"#,
         "\n",
         r#"{"id":"at-shorthand","title":"Shorthand child","status":"open","issue_type":"task","parent_issue":"at-gated-epic"}"#,
+        "\n",
+        r#"{"id":"at-task-parent","title":"Blocked task parent","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-task-parent","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-task-explicit","title":"Explicit task child","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-task-explicit","depends_on_id":"at-task-parent","type":"parent-child"}]}"#,
+        "\n",
+        r#"{"id":"at-task-shorthand","title":"Shorthand task child","status":"open","issue_type":"task","parent_issue":"at-task-parent"}"#,
         "\n",
     );
     harness::block_on(async {
@@ -2533,6 +2542,8 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
             ids.contains("at-shorthand"),
             "shorthand child was blocked: {ids:?}"
         );
+        assert!(ids.contains("at-task-shorthand"));
+        assert!(!ids.contains("at-task-explicit"));
         let child = store
             .show(actor.clone(), "at-child".to_owned())
             .await
@@ -2555,6 +2566,12 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
             .expect("show nested child")
             .expect("imported nested child");
         assert_eq!(grandchild.blocked_by, ["at-nested-epic"]);
+        let task_child = store
+            .show(actor.clone(), "at-task-explicit".to_owned())
+            .await
+            .expect("show task child")
+            .expect("imported task child");
+        assert_eq!(task_child.blocked_by, ["at-task-parent"]);
         assert!(
             store
                 .claim(
@@ -2566,6 +2583,30 @@ fn sqlite_imported_open_epic_children_are_ready_unless_explicitly_blocked() {
                 .await
                 .expect("claim ready child")
                 .is_some()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-task-shorthand".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim task shorthand child")
+                .is_some()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-task-explicit".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim task explicit child")
+                .is_none()
         );
         assert!(
             store

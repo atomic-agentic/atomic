@@ -101,7 +101,7 @@ edges until it reaches the item that is itself the dependency target. That item
 stays ready so it can clear the dependency. The original JSONL distinguishes
 the two forms even though both create a graph edge. Native open parents retain
 their own blocking rule. An explicit `blocks` edge still holds its source.
-Imported epics keep their original status and JSONL representation.
+Imported items keep their original status and JSONL representation.
 
 An atomic-native pinned item uses a versioned JSONL extension so it remains a
 valid beads issue: `status` is `open`, `pinned` is `true`, and
