@@ -2852,7 +2852,7 @@ mod tests {
         assert_eq!(newest.get::<i64, _>("version"), STORE_VERSION);
         assert_eq!(
             newest.get::<String, _>("name"),
-            "sqlite-work-graph-handoff-search"
+            "work-graph-first-claim-time"
         );
         assert_eq!(
             newest.get::<Option<String>, _>("checksum"),
