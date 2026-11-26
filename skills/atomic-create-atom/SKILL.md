@@ -95,15 +95,23 @@ Read these before writing, and again when a check fails:
 
 ## Writing the prompt
 
-Put the decision and its criteria before long background. Use short headings
-for separate rules and bullets for short findings. A table helps when its
-columns make a real comparison or lookup easier to scan; test it against bullets
-on the same cases before adopting it for repeated evidence rows. In the paired
-review evaluations, short bullet triage kept the decisions correct with fewer
-input tokens; headings, links and emphasis had no consistent measured gain.
-Neither layout guarantees exact record IDs or citations. Keep the required
-output schema explicit, and check each cited ID against the host records before
-a gate. The host scorer and JSON Schema remain the authority for the answer.
+Put a short decision rubric and the required output contract before long
+background. Use short headings to separate rules and bullets for short
+findings. Group evidence only when its source and record IDs stay visible. A
+table helps when named columns make a comparison or lookup easier to scan;
+test it against bullets on the same cases before adopting it for repeated
+rows. In the paired pilot, bullets used fewer input tokens with the same
+observed triage decisions and file attribution. The two-case check, with one
+call for each variant, found no reliable correctness gain from headings, links,
+bold or italics; do not use emphasis as a decision or citation control.
+
+Check every required row and cited ID against host evidence, even when the
+overall model decision is right. Preserve exact record and dependency IDs.
+An unavailable host record can be named as provenance, but it cannot support
+a passing claim; leave its citation list empty when the output contract
+requires that. The host scorer and JSON Schema remain the authority for the
+answer. See the measured results in the repository's
+`examples/08-templating/evaluation.md`.
 
 Write static instructions as authored text. Interpolate source records only
 through `{input.…}` or a component prop so their origin and path stay attached
