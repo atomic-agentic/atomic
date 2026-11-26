@@ -1479,6 +1479,26 @@ impl GraphStore for SqliteStore {
             .await
         }
     }
+    fn first_claimed_at_ms(
+        &self,
+        item_id: String,
+    ) -> impl Future<Output = Result<Option<i64>, StoreError>> + Send {
+        async move {
+            self.read(move |c| {
+                Box::pin(async move {
+                    let row =
+                        sqlx::query("SELECT first_claimed_at FROM atomic_graph_items WHERE id=?")
+                            .bind(&item_id)
+                            .fetch_optional(&mut *c)
+                            .await
+                            .map_err(db)?
+                            .ok_or(StoreError::MissingItem { item_id })?;
+                    row.try_get("first_claimed_at").map_err(db)
+                })
+            })
+            .await
+        }
+    }
     fn claim(
         &self,
         actor: Actor,
@@ -2032,8 +2052,9 @@ async fn claim_id(
         .execute(&mut *c)
         .await
         .map_err(db)?;
-    sqlx::query("UPDATE atomic_graph_items SET status='in_progress', claim_epoch=? WHERE id=?")
+    sqlx::query("UPDATE atomic_graph_items SET status='in_progress', claim_epoch=?, first_claimed_at=COALESCE(first_claimed_at,?) WHERE id=?")
         .bind(epoch)
+        .bind(now) // CONTROL_OFF: graph-first-claim-time
         .bind(id)
         .execute(c)
         .await

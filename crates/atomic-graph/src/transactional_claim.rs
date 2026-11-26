@@ -872,8 +872,13 @@ pub async fn claim(
         return Ok(None);
     }
     let updated = tx.execute(
-        "UPDATE atomic_graph_items SET status='in_progress',claim_epoch=? WHERE id=? AND claim_epoch=? AND status IN ('open','in_progress')",
-        &[Param::Int(epoch), text(item_id), Param::Int(old_epoch)],
+        "UPDATE atomic_graph_items SET status='in_progress',claim_epoch=?,first_claimed_at=COALESCE(first_claimed_at,?) WHERE id=? AND claim_epoch=? AND status IN ('open','in_progress')",
+        &[
+            Param::Int(epoch),
+            Param::Int(now), // CONTROL_OFF: graph-workflow-first-claim-time
+            text(item_id),
+            Param::Int(old_epoch),
+        ],
     ).await?;
     if updated != 1 {
         return Err(DurableError::Interrupted(

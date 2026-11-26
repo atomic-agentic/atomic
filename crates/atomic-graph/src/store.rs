@@ -752,6 +752,19 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
     ) -> impl Future<Output = Result<Vec<Item>, StoreError>> + Send;
 
+    /// UTC Unix milliseconds when this item was first successfully claimed.
+    /// `None` means the item has never been claimed in this store, including
+    /// items imported with `in_progress` status but no local acquisition.
+    /// A missing item is an error rather than an unclaimed item.
+    fn first_claimed_at_ms(
+        &self,
+        _item_id: String,
+    ) -> impl Future<Output = Result<Option<i64>, StoreError>> + Send {
+        std::future::ready(Err(StoreError::MissingImplementation {
+            operation: "first_claimed_at_ms",
+        }))
+    }
+
     /// Claim `id` for `claimant` for `lease_for`, or `None` if it cannot be
     /// taken: held, blocked, closed, missing, deferred, or not yet due. A
     /// credentialed human claim derives `claimant` from the credential.
