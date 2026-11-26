@@ -380,6 +380,12 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX atomic_graph_children_by_priority ON atomic_graph_items (parent, priority, id)",
         ],
     },
+    Migration {
+        version: 27,
+        name: "sqlite-work-graph-handoff-search",
+        // PostgreSQL search remains a separate milestone.
+        sql: &[],
+    },
 ];
 
 const SQLITE_SEARCH_SQL: &[&str] = &[
@@ -392,11 +398,25 @@ const SQLITE_SEARCH_SQL: &[&str] = &[
     "CREATE TRIGGER atomic_graph_search_delete AFTER DELETE ON atomic_graph_items BEGIN DELETE FROM atomic_graph_search_fts WHERE rowid=(SELECT key FROM atomic_graph_search_keys WHERE item_id=OLD.id); DELETE FROM atomic_graph_search_keys WHERE item_id=OLD.id; END",
 ];
 
+/// A handoff has its own row so earlier committed narratives remain
+/// searchable after later releases. The key is stable across replay and
+/// rebuild, and both tables are populated in the same transaction as the
+/// canonical handoff insert.
+const SQLITE_HANDOFF_SEARCH_SQL: &[&str] = &[
+    "CREATE TABLE atomic_graph_handoff_search_keys (key INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL, release_epoch BIGINT NOT NULL, UNIQUE(item_id,release_epoch))",
+    "CREATE VIRTUAL TABLE atomic_graph_handoff_search_fts USING fts5(body,tokenize='unicode61')",
+    "INSERT INTO atomic_graph_handoff_search_keys(item_id,release_epoch) SELECT h.item_id,h.release_epoch FROM atomic_graph_handoffs h JOIN atomic_graph_items i ON i.id=h.item_id ORDER BY h.item_id,h.release_epoch",
+    "INSERT INTO atomic_graph_handoff_search_fts(rowid,body) SELECT k.key,COALESCE(json_extract(h.record_json,'$.attempted'),'') || ' ' || COALESCE(json_extract(h.record_json,'$.failed'),'') || ' ' || COALESCE(json_extract(h.record_json,'$.learned'),'') FROM atomic_graph_handoff_search_keys k JOIN atomic_graph_handoffs h ON h.item_id=k.item_id AND h.release_epoch=k.release_epoch",
+    "CREATE TRIGGER atomic_graph_handoff_search_insert AFTER INSERT ON atomic_graph_handoffs BEGIN INSERT INTO atomic_graph_handoff_search_keys(item_id,release_epoch) VALUES (NEW.item_id,NEW.release_epoch); INSERT INTO atomic_graph_handoff_search_fts(rowid,body) VALUES ((SELECT key FROM atomic_graph_handoff_search_keys WHERE item_id=NEW.item_id AND release_epoch=NEW.release_epoch),COALESCE(json_extract(NEW.record_json,'$.attempted'),'') || ' ' || COALESCE(json_extract(NEW.record_json,'$.failed'),'') || ' ' || COALESCE(json_extract(NEW.record_json,'$.learned'),'')); END",
+    "CREATE TRIGGER atomic_graph_handoff_search_delete AFTER DELETE ON atomic_graph_handoffs BEGIN DELETE FROM atomic_graph_handoff_search_fts WHERE rowid=(SELECT key FROM atomic_graph_handoff_search_keys WHERE item_id=OLD.item_id AND release_epoch=OLD.release_epoch); DELETE FROM atomic_graph_handoff_search_keys WHERE item_id=OLD.item_id AND release_epoch=OLD.release_epoch; END",
+    "CREATE TRIGGER atomic_graph_handoff_search_item_delete AFTER DELETE ON atomic_graph_items BEGIN DELETE FROM atomic_graph_handoff_search_fts WHERE rowid IN (SELECT key FROM atomic_graph_handoff_search_keys WHERE item_id=OLD.id); DELETE FROM atomic_graph_handoff_search_keys WHERE item_id=OLD.id; END",
+];
+
 fn sqlite_extra(migration: &Migration) -> &'static [&'static str] {
-    if migration.version == 25 {
-        SQLITE_SEARCH_SQL
-    } else {
-        &[]
+    match migration.version {
+        25 => SQLITE_SEARCH_SQL,
+        27 => SQLITE_HANDOFF_SEARCH_SQL,
+        _ => &[],
     }
 }
 
@@ -2187,6 +2207,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_search_upgrade_indexes_only_committed_v26_records() {
+        let p = db("handoff-search-upgrade");
+        assert_eq!(
+            open_sqlite_with(&p, &MIGRATIONS[..26])
+                .await
+                .expect("version 26 store"),
+            26
+        );
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&p);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("version 26 connection");
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('at-old-handoff','Old item','plain body','task',2,'open',NULL,'human','test',1)")
+            .execute(&mut conn).await.expect("old item");
+        sqlx::query("INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-old-handoff',2,?)")
+            .bind(r#"{"attempted":"found amber clue","failed":"","learned":"","files":[]}"#)
+            .execute(&mut conn).await.expect("old committed handoff");
+        conn.close().await.expect("close old connection");
+
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("upgraded connection");
+        let hits: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_handoff_search_fts WHERE atomic_graph_handoff_search_fts MATCH '\"amber clue\"'")
+            .fetch_one(&mut conn).await.expect("indexed old handoff");
+        assert_eq!(hits, 1);
+        conn.close().await.expect("close upgraded connection");
+        assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
+        let mut inspection = inspect_sqlite(&p).await.expect("inspect upgraded store");
+        let hits: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_handoff_search_fts WHERE atomic_graph_handoff_search_fts MATCH '\"amber clue\"'")
+            .fetch_one(&mut inspection).await.expect("stable handoff search");
+        assert_eq!(hits, 1, "reopen does not duplicate historical hits");
+        inspection.close().await.expect("close inspection");
+        std::fs::remove_file(p).expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn search_upgrade_open_indexes_every_batch_before_returning() {
         let p = db("search-upgrade-open");
         open_sqlite_with(&p, &MIGRATIONS[..24])
@@ -2754,7 +2811,7 @@ mod tests {
         assert_eq!(newest.get::<i64, _>("version"), STORE_VERSION);
         assert_eq!(
             newest.get::<String, _>("name"),
-            "work-graph-epic-child-selection"
+            "sqlite-work-graph-handoff-search"
         );
         assert_eq!(
             newest.get::<Option<String>, _>("checksum"),

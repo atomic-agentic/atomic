@@ -64,14 +64,16 @@ notes, current blockers and
 outgoing dependency edges. Both inspection commands accept the global `--json`
 option and leave a missing database absent.
 `atomic graph search <phrase-or-id> [--status <status>] [--limit <n>]` searches
-committed titles and descriptions through a local FTS5 index. An exact item ID,
+committed titles, descriptions and released handoffs through local FTS5 indexes. An exact item ID,
 including punctuation, resolves directly; title matches rank above matching
 description text. Results contain the ID, title, status and plain-text excerpt.
 The global `--json` option emits the same fields in `results`. SQLite maintains
-the index on item changes, and `atomic graph search-rebuild` reconstructs it
-from committed items. An older store upgrades to an empty index in the schema
-transaction, then fills it in resumable batches with a durable cursor while
-new edits remain indexed.
+the indexes on item changes and committed handoff releases; multiple matching
+handoffs return one canonical item. `atomic graph search-rebuild` reconstructs
+them from committed records. An older store upgrades to an empty item index in
+the schema transaction, then fills it in resumable batches with a durable
+cursor while new edits remain indexed. Preexisting handoffs are indexed in the
+upgrade transaction.
 Committed import and the human `graph create`, `link`, `claim` and `close`
 commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
