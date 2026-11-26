@@ -37,7 +37,7 @@ atomic --json graph search '<phrase>'   # find committed items and handoffs
 The imported work keeps this structure:
 
 - **Three levels.** A phase epic (`v0.1`, `v0.2`, `v0.5`, `v0.7`, `v1.0`) holds
-  milestone epics (`M0` to `M56`, some split into `a` and `b` parts), which hold
+  milestone epics (`M0` onward, some split into `a` and `b` parts), which hold
   tasks.
 - **Labels.** The phase and the milestone, plus `spike`, `decision`, `test`,
   `security`, `docs` and `benchmark`.
