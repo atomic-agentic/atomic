@@ -552,7 +552,7 @@ checksum = "c59bdb34bc650a32731b31bd8f0829cc15d24a708ee31559e0bb34f2bc320cba"
 
 [[package]]
 name = "atomic-agentic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "atomic-agentic-atoms",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-atoms"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atomic-agentic-core",
  "atomic-agentic-schema",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "astro2tsx",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-durable"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "durare",
  "getrandom 0.3.4",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-exec"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -686,7 +686,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "atomic-agentic-core",
  "atomic-agentic-durable",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "atomic-agentic-schema"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cel",
  "jsonschema",
