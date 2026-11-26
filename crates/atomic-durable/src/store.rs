@@ -1249,9 +1249,12 @@ async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i
                 .map_err(db)?;
         }
         if version >= 25 {
-            graph_search_backfill_batch(&mut conn, 128)
-                .await
-                .map_err(db)?;
+            let mut search_backfill_complete = false;
+            while !search_backfill_complete {
+                search_backfill_complete = graph_search_backfill_batch(&mut conn, 128)
+                    .await
+                    .map_err(db)?;
+            }
         }
         Ok(version)
     }
@@ -2111,6 +2114,44 @@ mod tests {
         assert_eq!(open_sqlite(&p).await.expect("open"), STORE_VERSION);
         assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn search_upgrade_open_indexes_every_batch_before_returning() {
+        let p = db("search-upgrade-open");
+        open_sqlite_with(&p, &MIGRATIONS[..24])
+            .await
+            .expect("version 24 store");
+        let url = format!("sqlite://{}", p.display());
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("old connection");
+        for i in 0..260 {
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,'upgradeword','task',2,'open',NULL,'human','test',1)")
+                .bind(format!("at-upgrade-{i:03}"))
+                .bind(format!("Upgrade {i}"))
+                .execute(&mut conn)
+                .await
+                .expect("old item");
+        }
+        conn.close().await.expect("close old connection");
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("upgraded connection");
+        let hits: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_search_fts WHERE atomic_graph_search_fts MATCH 'upgradeword'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("search all upgraded rows");
+        let complete: i64 = sqlx::query_scalar(
+            "SELECT complete FROM atomic_graph_search_progress WHERE singleton=1",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("durable completion marker");
+        assert_eq!((hits, complete), (260, 1));
+        conn.close().await.expect("close upgraded connection");
+        std::fs::remove_file(p).expect("remove fixture");
     }
 
     #[tokio::test]
