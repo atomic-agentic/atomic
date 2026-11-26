@@ -109,6 +109,19 @@ pub enum GraphCommand {
     },
     /// Write this project's graph in beads JSONL format to standard output.
     Export,
+    /// Search committed item titles, descriptions, or an exact item ID.
+    Search {
+        /// Literal phrase or exact item ID.
+        query: String,
+        /// Restrict results to one graph status, such as open or closed.
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of results, from 1 to 100.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Rebuild the local FTS5 index from committed graph items.
+    SearchRebuild,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -371,6 +384,7 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
                 | GraphCommand::Close { .. }
                 | GraphCommand::VerifyCommit { .. }
                 | GraphCommand::Import { dry_run: false, .. }
+                | GraphCommand::SearchRebuild
         ),
     };
     let store = if privileged {
@@ -855,6 +869,36 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
                 println!("{}", serde_json::to_string(&json!({"jsonl": jsonl}))?);
             } else {
                 print!("{jsonl}");
+            }
+            Ok(())
+        }
+        GraphCommand::Search {
+            query,
+            status,
+            limit,
+        } => {
+            let hits = store.search_items(&query, status.as_deref(), limit).await?;
+            if as_json {
+                println!("{}", serde_json::to_string(&json!({"results":hits}))?);
+            } else {
+                for hit in hits {
+                    println!(
+                        "{} [{}] {} — {}",
+                        hit.id,
+                        hit.status,
+                        hit.title.replace(['\n', '\r'], " "),
+                        hit.excerpt
+                    );
+                }
+            }
+            Ok(())
+        }
+        GraphCommand::SearchRebuild => {
+            store.rebuild_search_index(actor).await?;
+            if as_json {
+                println!("{}", serde_json::to_string(&json!({"rebuilt":true}))?);
+            } else {
+                println!("rebuilt graph search index");
             }
             Ok(())
         }

@@ -1,0 +1,1 @@
+graph-search-upsert-trigger|crates/atomic-durable/src/store.rs|SELECT NEW.id WHERE NOT EXISTS (SELECT 1 FROM atomic_graph_search_keys WHERE item_id=NEW.id)|SELECT NEW.id|-p atomic-agentic --test graph_cli operator_restores_an_imported_goal_from_yaml_with_its_children

@@ -63,6 +63,15 @@ The local SQLite work graph accepts beads JSONL through
 notes, current blockers and
 outgoing dependency edges. Both inspection commands accept the global `--json`
 option and leave a missing database absent.
+`atomic graph search <phrase-or-id> [--status <status>] [--limit <n>]` searches
+committed titles and descriptions through a local FTS5 index. An exact item ID,
+including punctuation, resolves directly; title matches rank above matching
+description text. Results contain the ID, title, status and plain-text excerpt.
+The global `--json` option emits the same fields in `results`. SQLite maintains
+the index on item changes, and `atomic graph search-rebuild` reconstructs it
+from committed items. An older store upgrades to an empty index in the schema
+transaction, then fills it in resumable batches with a durable cursor while
+new edits remain indexed.
 Committed import and the human `graph create`, `link`, `claim` and `close`
 commands require the enrolled operator credential; their writes verify it in
 the graph transaction. Import refuses an unusable file as a unit, and repeated
@@ -95,6 +104,14 @@ or publication. Test and HTTP criteria require a runner that has verified
 confinement and hides other projects’ scratch directories. A failed criterion
 enters a bounded repair round. Diagnostic text is redacted before atomic
 checkpoints it or passes it to the repair model.
+On criterion failure or before a human review gate, that loop records a
+bounded, agent-trust handoff in the same transaction that releases its claim.
+The next claimant receives the previous attempt, failure and lesson in its
+author prompt. Atomic compares recorded Git tree entries with the next
+claimant's base and marks each retained file changed or unchanged, without
+passing object IDs to the model. If a candidate changes more than 128 files
+or contains paths the handoff cannot safely represent, the note states how
+many paths were omitted; the claim still releases.
 
 `atomic run <workflow> --graph-epic <id> --lanes 1` works ready coding items
 in order. The parallel child workflow machinery has separate durable steps

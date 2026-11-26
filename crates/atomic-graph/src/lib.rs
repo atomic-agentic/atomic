@@ -3,6 +3,7 @@
 //! atomic's work graph: items, edges, claims and messages.
 
 pub mod goal;
+pub mod handoff;
 pub mod proposal;
 pub mod publication;
 pub mod sqlite;

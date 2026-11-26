@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod goals;
+mod search;
+pub use search::SearchHit;
 
 type DbFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, StoreError>> + 'a>>;
 fn db(error: impl std::fmt::Display) -> StoreError {
@@ -2579,6 +2581,110 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn search_ranks_titles_and_tracks_edits_deletes_rebuild_and_exact_ids() {
+        let path =
+            std::env::temp_dir().join(format!("atomic-graph-search-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        store.run(|conn| Box::pin(async move {
+            for (id, title, body, status) in [
+                ("at-search.1", "violet sample", "plain body", "open"),
+                ("at-search.2", "unrelated", "violet sample in the body", "closed"),
+                ("at-search.3", "other", "no match", "open"),
+            ] {
+                sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,?,'task',2,?,NULL,'human','test',1)")
+                    .bind(id).bind(title).bind(body).bind(status)
+                    .execute(&mut *conn).await.map_err(db)?;
+            }
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES ('gate:search','violet sample gate','violet sample private gate','gate',0,'blocked',NULL,'agent','gate-store',1,'run:search')")
+                .execute(&mut *conn).await.map_err(db)?;
+            Ok(())
+        })).await.expect("seed items");
+        let hits = store
+            .search_items("violet sample", None, 10)
+            .await
+            .expect("search");
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["at-search.1", "at-search.2"]
+        );
+        assert!(!hits[1].excerpt.contains('<'), "excerpt is plain text");
+        assert_eq!(
+            store
+                .search_items("at-search.2", None, 10)
+                .await
+                .expect("exact id")[0]
+                .id,
+            "at-search.2"
+        );
+        assert_eq!(
+            store
+                .search_items("at-search.2", Some("open"), 10)
+                .await
+                .expect("filtered id")
+                .len(),
+            0
+        );
+        assert!(
+            store
+                .search_items("gate:search", None, 10)
+                .await
+                .expect("private gate ID")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_items("violet sample", Some("closed"), 10)
+                .await
+                .expect("filtered")
+                .len(),
+            1
+        );
+
+        store.run(|conn| Box::pin(async move {
+            sqlx::query("UPDATE atomic_graph_items SET title='moved',body='changed' WHERE id='at-search.1'")
+                .execute(&mut *conn).await.map_err(db)?;
+            sqlx::query("DELETE FROM atomic_graph_items WHERE id='at-search.2'")
+                .execute(&mut *conn).await.map_err(db)?;
+            Ok(())
+        })).await.expect("edit and delete");
+        assert!(
+            store
+                .search_items("violet sample", None, 10)
+                .await
+                .expect("stale search")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_items("changed", None, 10)
+                .await
+                .expect("fresh search")[0]
+                .id,
+            "at-search.1"
+        );
+        store
+            .rebuild_search_index(Actor::agent("test"))
+            .await
+            .expect("rebuild");
+        assert_eq!(
+            store
+                .search_items("changed", None, 10)
+                .await
+                .expect("rebuilt search")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .search_items("violet sample", None, 10)
+                .await
+                .expect("rebuilt stale search")
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn gate_copies_are_visible_but_never_work_or_exported_items() {

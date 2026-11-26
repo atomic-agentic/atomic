@@ -1,0 +1,1 @@
+graph-search-edit-trigger|crates/atomic-durable/src/store.rs|AFTER UPDATE OF title,body ON atomic_graph_items|AFTER UPDATE OF inactive_column ON atomic_graph_items|-p atomic-agentic-graph --lib sqlite::tests::search_ranks_titles_and_tracks_edits_deletes_rebuild_and_exact_ids
