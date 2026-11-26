@@ -957,6 +957,79 @@ async fn inspect(root: &Path) -> (Vec<(String, String, String)>, Vec<String>) {
     (rows, steps)
 }
 
+/// Count actual close transitions, including ones that happened before a
+/// killed process returned. A final `closed` row alone cannot reveal replay.
+async fn record_graph_close_transitions(root: &Path) {
+    let rt = durable(root).await;
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute(
+                "CREATE TABLE graph_test_close_transitions (item_id TEXT NOT NULL)",
+                &[],
+            )
+            .await?;
+            tx.execute(
+                "CREATE TRIGGER graph_test_count_close AFTER UPDATE OF status ON atomic_graph_items \
+                 WHEN OLD.status!='closed' AND NEW.status='closed' BEGIN \
+                 INSERT INTO graph_test_close_transitions(item_id) VALUES (NEW.id); END",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("install close-transition audit");
+}
+
+/// The acquisition ID and claim epoch expose a second claim; the test trigger
+/// exposes a second close transition. `last_finish_acquisition` ties the close
+/// to the same lease that the crashed step acquired.
+async fn graph_claim_and_close_evidence(
+    root: &Path,
+) -> Vec<(String, i64, Vec<String>, i64, Option<String>)> {
+    let rt = durable(root).await;
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            let mut result = Vec::new();
+            for id in CHILDREN {
+                let item = tx
+                    .query_one(
+                        "SELECT claim_epoch,last_finish_acquisition FROM atomic_graph_items WHERE id=?",
+                        &[Param::Text(id.into())],
+                    )
+                    .await?;
+                let acquisitions = tx
+                    .query_all(
+                        "SELECT acquisition FROM atomic_graph_acquisitions WHERE item_id=? ORDER BY acquisition",
+                        &[Param::Text(id.into())],
+                    )
+                    .await?
+                    .into_iter()
+                    .map(|row| row.text("acquisition"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let closes = tx
+                    .query_one(
+                        "SELECT COUNT(*) AS n FROM graph_test_close_transitions WHERE item_id=?",
+                        &[Param::Text(id.into())],
+                    )
+                    .await?
+                    .int("n")?;
+                result.push((
+                    id.into(),
+                    item.int("claim_epoch")?,
+                    acquisitions,
+                    closes,
+                    item.text_opt("last_finish_acquisition")?,
+                ));
+            }
+            Ok(result)
+        })
+    })
+    .await
+    .expect("inspect graph claim and close evidence")
+}
+
 #[test]
 fn three_dependent_items_make_three_model_calls_and_close_with_host_commits() {
     on_codex_runtime(async {
@@ -3034,6 +3107,7 @@ fn process_crashes_at_each_graph_boundary_recover_without_repeating_completed_tu
                 .expect("scripted model");
             let root = scratch(&boundary.replace(':', "-"));
             let base = seed(&root).await;
+            record_graph_close_transitions(&root).await;
             let url = model.base_url();
             let (r, u, b) = (root.clone(), url.clone(), base.clone());
             let status =
@@ -3046,12 +3120,39 @@ fn process_crashes_at_each_graph_boundary_recover_without_repeating_completed_tu
                 calls_before,
                 "{boundary} model calls before crash"
             );
+            let before = graph_claim_and_close_evidence(&root).await;
+            assert_eq!(before[0].1, 1, "{boundary} did not persist its first claim");
+            assert_eq!(
+                before[0].2.len(),
+                1,
+                "{boundary} claimed twice before replay"
+            );
+            let first_acquisition = before[0].2[0].clone();
             let (r, u, b) = (root.clone(), url.clone(), base.clone());
             let status = tokio::task::spawn_blocking(move || child(&r, &u, &b, "recover", None))
                 .await
                 .expect("recovery child");
             assert!(status.success(), "{boundary} recovery: {status}");
             assert_eq!(model.calls(), 3, "{boundary} repeated a completed turn");
+            let after = graph_claim_and_close_evidence(&root).await;
+            for (id, epoch, acquisitions, closes, finished_by) in &after {
+                assert_eq!(*epoch, 1, "{boundary}: {id} was claimed more than once");
+                assert_eq!(
+                    acquisitions.len(),
+                    1,
+                    "{boundary}: {id} has repeated acquisitions"
+                );
+                assert_eq!(*closes, 1, "{boundary}: {id} closed more than once");
+                assert_eq!(
+                    finished_by.as_deref(),
+                    Some(acquisitions[0].as_str()),
+                    "{boundary}: {id} closed under a different claim"
+                );
+            }
+            assert_eq!(
+                after[0].2[0], first_acquisition,
+                "{boundary}: retried step did not reuse its claim"
+            );
             let (rows, _) = inspect(&root).await;
             assert!(
                 rows.iter()
@@ -3059,6 +3160,61 @@ fn process_crashes_at_each_graph_boundary_recover_without_repeating_completed_tu
                 "{boundary}: {rows:?}"
             );
         }
+    });
+}
+
+#[test]
+fn process_killed_during_graph_model_turn_reuses_its_claim_on_recovery() {
+    on_codex_runtime(async {
+        let root = scratch("kill-during-graph-model-turn");
+        let base = seed(&root).await;
+        record_graph_close_transitions(&root).await;
+        let release = root.join("release-killed-model");
+        let mut script = vec![Reply::Gated {
+            file: release.clone(),
+            reply: Box::new(Reply::Text(r#"{"done":true}"#.into())),
+        }];
+        script.extend(vec![Reply::Text(r#"{"done":true}"#.into()); 3]);
+        let model = FakeModel::start(script).await.expect("scripted model");
+        let url = model.base_url();
+        let mut running = child_command(&root, &url, &base, "start", None)
+            .spawn()
+            .expect("start graph process");
+        wait_for("the first graph model turn", || model.calls() == 1).await;
+        let before = graph_claim_and_close_evidence(&root).await;
+        assert_eq!(before[0].1, 1, "model turn began without a durable claim");
+        assert_eq!(before[0].2.len(), 1, "first item was claimed twice");
+        assert_eq!(before[0].3, 0, "item closed during its model turn");
+        let first_acquisition = before[0].2[0].clone();
+        running.kill().expect("kill during the model turn");
+        assert!(!running.wait().expect("reap killed graph process").success());
+        std::fs::write(release, "go").expect("release fake model response");
+
+        let (r, u, b) = (root.clone(), url, base);
+        let recovered = tokio::task::spawn_blocking(move || child(&r, &u, &b, "recover", None))
+            .await
+            .expect("recovery child");
+        assert!(recovered.success(), "mid-turn recovery: {recovered}");
+        assert_eq!(
+            model.calls(),
+            4,
+            "unfinished model turn was not retried once"
+        );
+        let after = graph_claim_and_close_evidence(&root).await;
+        for (id, epoch, acquisitions, closes, finished_by) in &after {
+            assert_eq!(*epoch, 1, "{id} was claimed more than once");
+            assert_eq!(acquisitions.len(), 1, "{id} has repeated acquisitions");
+            assert_eq!(*closes, 1, "{id} closed more than once");
+            assert_eq!(
+                finished_by.as_deref(),
+                Some(acquisitions[0].as_str()),
+                "{id} closed under a different claim"
+            );
+        }
+        assert_eq!(
+            after[0].2[0], first_acquisition,
+            "the unfinished turn did not reuse its claim"
+        );
     });
 }
 
