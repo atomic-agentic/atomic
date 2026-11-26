@@ -271,7 +271,10 @@ fn cleanup_removes_an_orphan_ref_even_when_it_names_the_accepted_commit() {
         .repo()
         .create_ref(&second, &first.commit)
         .unwrap();
-    let report = f.worktrees.cleanup("run", &[second.clone()]).unwrap();
+    let report = f
+        .worktrees
+        .cleanup("run", std::slice::from_ref(&second))
+        .unwrap();
     assert_eq!(report.refs, [first.reference]);
     let refs = f.worktrees.repo().refs("refs/atomic/run/steps/").unwrap();
     assert_eq!(refs.len(), 1);
