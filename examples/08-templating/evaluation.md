@@ -13,9 +13,11 @@ The local endpoint reported `radium`; its deployed artifact was
 The endpoint did not report a model source revision. The frontier endpoint
 reported `claude-sonnet-5-5` through Claude Code 2.1.330. Both received the
 rendered developer text as instructions and the bound external values as the
-user turn, with the same JSON output schema. Temperature was zero. The triage
-limit was 2,048 output tokens; the review limit was 8,192. The frontier calls
-used no tools or repository access.
+user turn, with the same JSON output schema. The local Radium requests used
+temperature 0, with 2,048 output tokens for triage and 8,192 for review. The
+frontier request envelopes specified those values, but Claude Code did not
+expose flags to verify their realized settings. No external shell, web or
+repository tools were enabled for the frontier calls.
 
 The six triage fixtures were `blocker`, `no-findings`, `interleaved`,
 `hard-cases`, `interleaved-duplicates`, and `adjacent-duplicates`. Each was
@@ -89,8 +91,9 @@ summary counts per model matched the host scorer. They often put the
 unavailable record ID in `citations`; the host scorer permits that ID in
 `record` for provenance but requires an empty citation list. Radium omitted it
 only with bold wording; Sonnet cited it in every variant. Sonnet had cited the
-unavailable case correctly in the earlier paired pilot, so this is a recorded
-citation regression across runs, not evidence that bold is a reliable fix.
+unavailable case correctly in the earlier paired pilot. That pilot used a
+different prompt and request/CLI settings, so the observed difference is not
+a controlled run-to-run regression or evidence that bold is a reliable fix.
 There were no required-row omissions in these ten cases; the earlier paired
 review cases still show that correct overall decisions can hide row errors.
 
@@ -117,8 +120,10 @@ Claude Code 2.1.332; the provider did not report a source revision. The
 request envelope specified temperature 0, 8,192 maximum output tokens, no
 streaming and a strict JSON schema. Claude Code exposed the schema and model
 controls but no temperature or maximum-output flag, so the realized values of
-those two settings are unverified. The run used no tools or repository access;
-all ten replies exited successfully and reported zero web requests.
+those two settings are unverified. No external shell, web or repository tools
+were enabled. Schema structured output used Claude Code's internal
+`stop_reason: tool_use`; all ten replies exited successfully and reported zero
+web requests.
 
 ## Authoring guidance and limits
 
