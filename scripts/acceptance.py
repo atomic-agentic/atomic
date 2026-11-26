@@ -35,8 +35,9 @@ its own acceptance; a "b" part finishes its parent's work, so its clauses are
 its parent's, with any of its own blocks after them.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
-test features (FEATURES, which must match CI's test build, and which
-scripts/test-shards.py shares), so nothing rebuilds after that build.
+test features by default (FEATURES, shared with scripts/test-shards.py).
+Milestones with a feature-gated acceptance test can supply `--features`; CI
+must name those features in its acceptance step.
 
 The check fails when any listed test fails, is ignored, or does not run at all
 (renamed, removed, or built out by a feature), when the same name runs only in
@@ -320,11 +321,11 @@ def cargo_errors(log):
     return [l for l in plain(log).splitlines() if CARGO_FAILED.match(l)]
 
 
-def run(clauses):
+def run(clauses, features=FEATURES):
     names = sorted({test for c in clauses for _, test in c.all_tests()})
     cmd = [
         "cargo", "test", "--workspace", "--locked", "--no-fail-fast", "--color", "never",
-        "--features", FEATURES, "--tests", "--", "--exact", *names,
+        "--features", features, "--tests", "--", "--exact", *names,
     ]
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as out:
         code = subprocess.call(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
@@ -359,6 +360,7 @@ def main():
     parser.add_argument("--list", help="the list to read instead of scripts/acceptance/<milestone>.txt")
     parser.add_argument("--milestones", default=MILESTONES, help="the milestones document")
     parser.add_argument("--check", action="store_true", help="check the list against the milestone and stop")
+    parser.add_argument("--features", default=FEATURES, help="Cargo features for this milestone's tests")
     args = parser.parse_args()
     title = args.milestone.upper()
     path = args.list or os.path.join(ROOT, "scripts", "acceptance", f"{args.milestone.lower()}.txt")
@@ -384,7 +386,7 @@ def main():
         # Only a log says whether cargo failed: a real run's exit code does.
         errors = cargo_errors(log)
     else:
-        code, log = run(clauses)
+        code, log = run(clauses, args.features)
         errors = cargo_errors(log) if code != 0 else []
     seen = results(log)
 

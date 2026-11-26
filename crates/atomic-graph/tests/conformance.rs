@@ -347,7 +347,7 @@ const SCENARIOS: &[Scenario] = &[
         group: "lease_checks",
         at: "due",
         first: "create_item",
-        needs: &["create_item", "ready"],
+        needs: &["create_item", "add_edge", "ready", "claim", "finish"],
     },
     Scenario {
         name: "pinned_items_never_show_up_in_ready",
