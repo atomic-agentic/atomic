@@ -26,7 +26,7 @@ use atomic_durable::publication::{Acceptance, Candidate};
 use atomic_durable::{Database, DurableRuntime, Durare, Param};
 use atomic_graph::handoff::{FileAtRelease, GitFingerprint, Handoff};
 use atomic_graph::sqlite::SqliteStore;
-use atomic_graph::store::{Actor, Draft, EdgeKind, GraphStore, Status};
+use atomic_graph::store::{Actor, Draft, EdgeKind, Finish, GraphStore, Status};
 use atomic_schema::registry::Registry;
 use serde_json::{Value, json};
 use sqlx::Connection;
@@ -1056,6 +1056,193 @@ fn three_ready_graph_lanes_begin_before_any_model_reply() {
             assert_eq!(sha.len(), 40, "{id} needs a host commit");
             assert!(commits.insert(sha), "each lane needs its own branch commit");
         }
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_graph_run_waits_for_a_child_created_mid_turn_and_only_runs_failure_compensation() {
+    on_codex_runtime(async {
+        let root = scratch("dynamic-fanout");
+        let base = seed(&root).await;
+        leave_one_work_child(&root).await;
+        let actor = Actor::agent("fanout-test");
+        let graph = SqliteStore::open_authorized(
+            &root.join("atomic.db"),
+            SystemTime::now,
+            HumanCredential::new(Principal::local("owner"), SECRET),
+        )
+        .expect("authorized graph");
+        for (id, title) in [
+            ("at-fanout-gate", "Fanout parent"),
+            ("at-success-comp", "Success must not compensate"),
+            ("at-failure-source", "Failed work"),
+            ("at-failure-comp", "Compensate failed work"),
+        ] {
+            graph
+                .create_item(actor.clone(), format!("create-{id}"), Draft::new(id, title))
+                .await
+                .expect("create fanout fixture");
+        }
+        for (source, kind, target) in [
+            ("at-fanout-gate", EdgeKind::WaitFor, CHILDREN[0]),
+            ("at-success-comp", EdgeKind::ConditionalBlocks, CHILDREN[0]),
+            (
+                "at-failure-comp",
+                EdgeKind::ConditionalBlocks,
+                "at-failure-source",
+            ),
+        ] {
+            graph
+                .add_edge(actor.clone(), source.into(), kind, target.into())
+                .await
+                .expect("add fanout fixture edge");
+        }
+        let release = root.join("release-dynamic-turn");
+        let model = FakeModel::start(vec![Reply::Gated {
+            file: release.clone(),
+            reply: Box::new(Reply::Text(r#"{"done":true}"#.into())),
+        }])
+        .await
+        .expect("scripted model");
+        let rt = engine(&root, &model.base_url(), true).await;
+        rt.start(
+            GRAPH_PIPELINE,
+            RUN,
+            GraphPipelineRun {
+                run: PipelineRun {
+                    pipeline: pipeline(&root.join("project")),
+                    input: json!({"base": base}),
+                },
+                epic: EPIC.into(),
+                model_source: None,
+                review_routing: true,
+                lanes: 1,
+            },
+        )
+        .await
+        .expect("start graph run");
+        wait_for("work item at the model", || model.calls() == 1).await;
+
+        // The parent already waits for the work-loop child. A second child is
+        // created and linked while that child's model turn is still running.
+        graph
+            .create_item(
+                actor.clone(),
+                "create-at-late-child".into(),
+                Draft::new("at-late-child", "Discovered during the turn"),
+            )
+            .await
+            .expect("create late child");
+        graph
+            .add_edge(
+                actor.clone(),
+                "at-fanout-gate".into(),
+                EdgeKind::WaitFor,
+                "at-late-child".into(),
+            )
+            .await
+            .expect("attach late child");
+        let before = graph
+            .show(actor.clone(), "at-fanout-gate".into())
+            .await
+            .expect("show waiting parent")
+            .expect("parent");
+        assert_eq!(before.blocked_by.len(), 2);
+        std::fs::write(release, "go").expect("release the model turn");
+        let result: Value = rt.result(RUN).await.expect("graph run result");
+        assert!(result.is_object(), "{result}");
+        assert_eq!(model.calls(), 1, "the run processed one work-loop child");
+
+        let after = graph
+            .show(actor.clone(), "at-fanout-gate".into())
+            .await
+            .expect("show waiting parent after run")
+            .expect("parent");
+        assert_eq!(after.blocked_by, ["at-late-child"]);
+        assert!(
+            graph
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "at-fanout-gate".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("blocked parent claim")
+                .is_none(),
+            "the parent proceeded before its late child closed"
+        );
+        let late = graph
+            .claim(
+                actor.clone(),
+                "worker".into(),
+                "at-late-child".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim late child")
+            .expect("late child is ready");
+        graph
+            .finish(late, Finish::Close)
+            .await
+            .expect("close late child");
+        let parent = graph
+            .claim(
+                actor.clone(),
+                "worker".into(),
+                "at-fanout-gate".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim released parent")
+            .expect("parent proceeds after both children close");
+        graph
+            .finish(parent, Finish::Close)
+            .await
+            .expect("close parent");
+
+        assert!(
+            graph
+                .claim(
+                    actor.clone(),
+                    "worker".into(),
+                    "at-success-comp".into(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("successful work compensation claim")
+                .is_none(),
+            "successful work queued a compensation"
+        );
+        let failed = graph
+            .claim(
+                actor.clone(),
+                "worker".into(),
+                "at-failure-source".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim failing work")
+            .expect("failing work is ready");
+        graph
+            .finish(failed, Finish::Fail)
+            .await
+            .expect("persist failure");
+        let compensation = graph
+            .claim(
+                actor,
+                "worker".into(),
+                "at-failure-comp".into(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim failure compensation")
+            .expect("failed work released its compensation");
+        graph
+            .finish(compensation, Finish::Close)
+            .await
+            .expect("run compensation");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
