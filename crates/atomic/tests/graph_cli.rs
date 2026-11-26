@@ -421,6 +421,16 @@ fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
 #[test]
 fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     let fixture = Fixture::new("literal%41");
+    assert!(
+        !fixture
+            .root
+            .parent()
+            .expect("fixture parent")
+            .to_str()
+            .expect("UTF-8 target directory")
+            .contains("%41"),
+        "test target parent contains the percent escape under test"
+    );
     // VACUUM INTO below deliberately creates this sibling. Keep it scoped to
     // the test even if an assertion panics, so a later test run is independent.
     let decoded_label = fixture
