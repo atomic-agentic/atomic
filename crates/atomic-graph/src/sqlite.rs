@@ -11,7 +11,6 @@ use sqlx::{Connection, Row, SqliteConnection};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -164,9 +163,8 @@ impl SqliteStore {
         path: &Path,
         now: impl Fn() -> SystemTime + Send + Sync + 'static,
     ) -> Result<Self, StoreError> {
-        let url = format!("sqlite://{}", path.display());
-        let options = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
-            .map_err(db)?
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
             .create_if_missing(true)
             .busy_timeout(Duration::from_secs(30));
         let database = path.to_path_buf();

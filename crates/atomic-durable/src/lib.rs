@@ -48,7 +48,7 @@ pub async fn probe(database: &Path) -> std::result::Result<usize, DurableError> 
     store::open_sqlite(database)
         .await
         .map_err(|e| DurableError::Engine(e.to_string()))?;
-    let url = format!("sqlite://{}?mode=rwc", database.display());
+    let url = store::sqlite_url(database);
     let provider = Arc::new(durare::SqliteProvider::connect(&url).await?);
     let mut engine = durare::DurableEngine::new(provider).await?;
     engine.register(
