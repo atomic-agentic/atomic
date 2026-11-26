@@ -379,6 +379,11 @@ jobs:
       - name: M45 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m45
+      - name: Pin SQLite-capable bd for M5 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
+          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
       # M5's process-kill test is compiled only with dev-failpoints. Keep this
       # command explicit so a feature-less acceptance run cannot pass it by omission.
       - name: M5 acceptance, including claim-commit process kill

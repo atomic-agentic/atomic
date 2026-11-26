@@ -4,7 +4,7 @@
 
 ## Run the same scenarios through beads on its SQLite backend and through atomic: the ready sets and the JSON fields agree.
 # The pinned bd SQLite differential lands with atomic-st48 (#326).
-bd_differential ready_json_matches_pinned_bd_sqlite_for_imported_scenarios
+graph_cli ready_json_matches_pinned_bd_sqlite_for_imported_scenarios
 
 ## Of 50 simultaneous claims on a single item, one succeeds.
 conformance sqlite_fifty_contenders_have_exactly_one_claim_winner
