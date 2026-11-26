@@ -423,7 +423,17 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     let fixture = Fixture::new("literal%41");
     // VACUUM INTO below deliberately creates this sibling. Keep it scoped to
     // the test even if an assertion panics, so a later test run is independent.
-    let decoded_root = PathBuf::from(fixture.root.to_string_lossy().replace("%41", "A"));
+    let decoded_label = fixture
+        .root
+        .file_name()
+        .expect("fixture directory")
+        .to_string_lossy()
+        .replace("%41", "A");
+    let decoded_root = fixture.root.with_file_name(decoded_label);
+    assert!(
+        !decoded_root.exists(),
+        "decoded fixture path already exists"
+    );
     let decoded_cleanup = RemoveDirOnDrop(decoded_root.clone());
     let project = fixture.project("project");
     fixture.enroll(&project);
@@ -463,7 +473,11 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     );
     let literal = fixture.database(&project);
     assert!(literal.exists(), "literal state database is missing");
-    let decoded = PathBuf::from(literal.to_string_lossy().replace("%41", "A"));
+    let decoded = decoded_root.join(
+        literal
+            .strip_prefix(&fixture.root)
+            .expect("database inside fixture"),
+    );
     assert!(!decoded.exists(), "write landed in percent-decoded sibling");
 
     // Simulate an older writer's decoded database, then perform the documented
