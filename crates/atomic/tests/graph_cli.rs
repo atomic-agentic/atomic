@@ -1674,6 +1674,42 @@ fn ready_json_matches_pinned_bd_sqlite_for_imported_scenarios() {
 }
 
 #[test]
+fn native_ready_json_keeps_atomic_item_fields() {
+    let fixture = Fixture::new("native-ready-json");
+    let project = fixture.project("project");
+    fixture.enroll(&project);
+    success(&fixture.run(
+        &project,
+        &[
+            "graph",
+            "create",
+            "Native work",
+            "--id",
+            "at-native",
+            "--body",
+            "Native body",
+        ],
+    ));
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("native ready JSON");
+    let native = ready
+        .as_array()
+        .expect("ready array")
+        .iter()
+        .find(|item| item["id"] == "at-native")
+        .expect("native item ready");
+    assert_eq!(native["body"], "Native body");
+    assert_eq!(native["kind"], "task");
+    assert_eq!(native["trust"], "human");
+    assert!(
+        native.get("description").is_none(),
+        "native fields remain distinct from imported Beads fields"
+    );
+}
+
+#[test]
 fn inspection_works_while_another_connection_holds_the_write_lock() {
     use sqlx::{Connection, SqliteConnection};
     let fixture = Fixture::new("inspection-lock");
