@@ -241,7 +241,7 @@ pub async fn a_synthetic_export_imports_with_its_shape<S: GraphStore>(
     let (counts, want_ready) = expected(&input);
     let ids = want_ids(&input);
     let Some(report) = run
-        .ok("import", || store.import(atom(), input.clone(), false))
+        .ok("import", || store.import(atom(), input, false))
         .await
     else {
         return run.finish();
@@ -635,7 +635,7 @@ pub async fn an_item_atomic_made_is_never_overwritten<S: GraphStore>(
         return run.finish();
     }
     let Some(report) = run
-        .ok("import", || store.import(atom(), input, false))
+        .ok("import", || store.import(atom(), input.clone(), false))
         .await
     else {
         return run.finish();
@@ -864,7 +864,7 @@ pub async fn the_synthetic_counts_are_counted_the_same_way<S: GraphStore>(
         return run.finish();
     }
     if run
-        .ok("import", || store.import(atom(), input, false))
+        .ok("import", || store.import(atom(), input.clone(), false))
         .await
         .is_none()
     {
@@ -896,10 +896,26 @@ pub async fn the_synthetic_counts_are_counted_the_same_way<S: GraphStore>(
         blocking += shown.blocked_by.len();
         notes += shown.notes.len();
     }
-    if blocking != counts.blocking {
+    // `show().blocked_by` is the active projection, not a count of all
+    // imported edges. The fixture has one `blocks` edge to a closed target;
+    // its imported open epic is a hierarchy container, not an active blocker.
+    let lines: Vec<Line> = input
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(read)
+        .collect();
+    let statuses: BTreeMap<&str, &str> = lines
+        .iter()
+        .map(|line| (line.id.as_str(), line.status.as_str()))
+        .collect();
+    let active_blocks = lines
+        .iter()
+        .flat_map(|line| &line.blockers)
+        .filter(|target| statuses.get(target.as_str()) != Some(&"closed"))
+        .count();
+    if blocking != active_blocks {
         run.fail(&format!(
-            "the file has {} blocking edges and the store has {blocking}",
-            counts.blocking
+            "the file has {active_blocks} active blocking edges and the store has {blocking}"
         ));
     }
     if parents != counts.parents {

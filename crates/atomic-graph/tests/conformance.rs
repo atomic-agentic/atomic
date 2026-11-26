@@ -2408,6 +2408,17 @@ fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
             .export(actor.clone())
             .await
             .expect("export first parent");
+        let exported_child: serde_json::Value = serde_json::from_str(
+            first_parent
+                .lines()
+                .find(|line| line.contains("\"id\":\"at-child\""))
+                .expect("exported child line"),
+        )
+        .expect("exported child JSON");
+        assert_eq!(
+            exported_child["metadata"]["atomic_graph"]["native_parent"],
+            "at-parent-one"
+        );
         assert!(matches!(
             store
                 .add_edge(
@@ -2441,10 +2452,118 @@ fn sqlite_edge_endpoints_and_parent_identity_are_atomic() {
             .expect("imported child exists");
         assert_eq!(imported_child.item.parent.as_deref(), Some("at-parent-one"));
         assert_eq!(imported_child.blocked_by, ["at-parent-one"]);
+        assert!(
+            imported
+                .claim(
+                    Actor::agent("worker"),
+                    "worker".to_owned(),
+                    "at-child".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim imported native child")
+                .is_none()
+        );
+        let reexport = imported
+            .export(Actor::agent("reader"))
+            .await
+            .expect("re-export imported native graph");
+        let reexported_child: serde_json::Value = serde_json::from_str(
+            reexport
+                .lines()
+                .find(|line| line.contains("\"id\":\"at-child\""))
+                .expect("re-exported child line"),
+        )
+        .expect("re-exported child JSON");
+        assert_eq!(
+            reexported_child["metadata"]["atomic_graph"]["native_parent"],
+            "at-parent-one"
+        );
     });
     drop(store);
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_file(imported_path);
+}
+
+#[test]
+fn sqlite_import_refuses_invalid_native_parent_markers_atomically() {
+    use store_contract::{Actor, StoreError};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-native-parent-marker-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let parent =
+        serde_json::json!({"id":"at-parent","title":"Parent","status":"open","issue_type":"task"});
+    let child = serde_json::json!({
+        "id":"at-child", "title":"Child", "status":"open", "issue_type":"task",
+        "parent_issue":"at-parent",
+        "dependencies":[{"issue_id":"at-child","depends_on_id":"at-parent","type":"parent-child"}],
+        "metadata":{"atomic_graph":{"schema_version":1,"native_parent":"at-parent"}},
+    });
+    harness::block_on(async {
+        for (label, changed) in [
+            ("wrong parent", serde_json::json!("at-other")),
+            ("non-string parent", serde_json::json!(true)),
+        ] {
+            let mut invalid = child.clone();
+            invalid["metadata"]["atomic_graph"]["native_parent"] = changed;
+            let input = format!("{}\n{}\n", parent, invalid);
+            assert!(
+                matches!(
+                    store.import(Actor::agent("importer"), input, false).await,
+                    Err(StoreError::ImportRefused(_))
+                ),
+                "accepted {label} native parent marker"
+            );
+            assert!(
+                store
+                    .all_items(Actor::agent("reader"))
+                    .await
+                    .expect("all items")
+                    .is_empty()
+            );
+        }
+        let mut invalid = child.clone();
+        invalid["metadata"]["atomic_graph"]["schema_version"] = 2.into();
+        assert!(matches!(
+            store
+                .import(
+                    Actor::agent("importer"),
+                    format!("{}\n{}\n", parent, invalid),
+                    false
+                )
+                .await,
+            Err(StoreError::ImportRefused(_))
+        ));
+        let mut invalid = child;
+        invalid
+            .as_object_mut()
+            .expect("child object")
+            .remove("dependencies");
+        assert!(matches!(
+            store
+                .import(
+                    Actor::agent("importer"),
+                    format!("{}\n{}\n", parent, invalid),
+                    false
+                )
+                .await,
+            Err(StoreError::ImportRefused(_))
+        ));
+        assert!(
+            store
+                .all_items(Actor::agent("reader"))
+                .await
+                .expect("all items")
+                .is_empty()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -2469,6 +2588,276 @@ fn sqlite_works_inside_an_existing_tokio_runtime() {
         drop(store);
         let _ = std::fs::remove_file(path);
     });
+}
+
+#[test]
+fn sqlite_imported_parent_origin_controls_ready_and_claim() {
+    use store_contract::Actor;
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-imported-epic-ready-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("importer");
+    let input = concat!(
+        r#"{"id":"at-epic","title":"Imported epic","status":"open","issue_type":"epic"}"#,
+        "\n",
+        r#"{"id":"at-child","title":"Ready child","status":"open","issue_type":"task","parent_issue":"at-epic"}"#,
+        "\n",
+        r#"{"id":"at-blocker","title":"Explicit blocker","status":"open","issue_type":"task"}"#,
+        "\n",
+        r#"{"id":"at-held","title":"Held child","status":"open","issue_type":"task","parent_issue":"at-epic","dependencies":[{"issue_id":"at-held","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-started","title":"Started child","status":"in_progress","issue_type":"task","parent_issue":"at-epic"}"#,
+        "\n",
+        r#"{"id":"at-gated-epic","title":"Blocked epic","status":"open","issue_type":"epic","dependencies":[{"issue_id":"at-gated-epic","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-nested-epic","title":"Nested epic","status":"open","issue_type":"epic","dependencies":[{"issue_id":"at-nested-epic","depends_on_id":"at-gated-epic","type":"parent-child"}]}"#,
+        "\n",
+        r#"{"id":"at-grandchild","title":"Nested child","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-grandchild","depends_on_id":"at-nested-epic","type":"parent-child"}]}"#,
+        "\n",
+        r#"{"id":"at-shorthand","title":"Shorthand child","status":"open","issue_type":"task","parent_issue":"at-gated-epic"}"#,
+        "\n",
+        r#"{"id":"at-task-parent","title":"Blocked task parent","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-task-parent","depends_on_id":"at-blocker","type":"blocks"}]}"#,
+        "\n",
+        r#"{"id":"at-task-explicit","title":"Explicit task child","status":"open","issue_type":"task","dependencies":[{"issue_id":"at-task-explicit","depends_on_id":"at-task-parent","type":"parent-child"}]}"#,
+        "\n",
+        r#"{"id":"at-task-shorthand","title":"Shorthand task child","status":"open","issue_type":"task","parent_issue":"at-task-parent"}"#,
+        "\n",
+    );
+    harness::block_on(async {
+        store
+            .import(actor.clone(), input.to_owned(), false)
+            .await
+            .expect("import beads hierarchy");
+        let ready = store.ready(actor.clone(), 100).await.expect("ready items");
+        let ids: BTreeSet<_> = ready.iter().map(|item| item.id.as_str()).collect();
+        assert!(
+            ids.contains("at-child"),
+            "imported open epic hid its child: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-held"),
+            "explicit blocks edge was ignored: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-started"),
+            "unleased in_progress item was ready"
+        );
+        assert!(
+            !ids.contains("at-nested-epic"),
+            "blocked parent exposed its epic: {ids:?}"
+        );
+        assert!(
+            !ids.contains("at-grandchild"),
+            "nested blocked parent exposed child: {ids:?}"
+        );
+        assert!(
+            ids.contains("at-shorthand"),
+            "shorthand child was blocked: {ids:?}"
+        );
+        assert!(ids.contains("at-task-shorthand"));
+        assert!(!ids.contains("at-task-explicit"));
+        let child = store
+            .show(actor.clone(), "at-child".to_owned())
+            .await
+            .expect("show child")
+            .expect("imported child");
+        assert!(
+            child.blocked_by.is_empty(),
+            "child blockers: {:?}",
+            child.blocked_by
+        );
+        let held = store
+            .show(actor.clone(), "at-held".to_owned())
+            .await
+            .expect("show held child")
+            .expect("imported held child");
+        assert_eq!(held.blocked_by, ["at-blocker"]);
+        let grandchild = store
+            .show(actor.clone(), "at-grandchild".to_owned())
+            .await
+            .expect("show nested child")
+            .expect("imported nested child");
+        assert_eq!(grandchild.blocked_by, ["at-nested-epic"]);
+        let task_child = store
+            .show(actor.clone(), "at-task-explicit".to_owned())
+            .await
+            .expect("show task child")
+            .expect("imported task child");
+        assert_eq!(task_child.blocked_by, ["at-task-parent"]);
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-child".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim ready child")
+                .is_some()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-task-shorthand".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim task shorthand child")
+                .is_some()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "worker".to_owned(),
+                    "at-task-explicit".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim task explicit child")
+                .is_none()
+        );
+        assert!(
+            store
+                .claim(
+                    actor,
+                    "worker".to_owned(),
+                    "at-held".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim blocked child")
+                .is_none()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_imported_deep_epic_chain_refreshes_without_depth_scans() {
+    use store_contract::{Actor, Draft, Finish};
+
+    let path = std::env::temp_dir().join(format!(
+        "atomic-graph-imported-deep-epics-{}.sqlite",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let store =
+        sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("open graph store");
+    let actor = Actor::agent("importer");
+    let mut lines = vec![
+        serde_json::json!({"id":"at-root-blocker","title":"Blocker","status":"open","issue_type":"task"}).to_string(),
+    ];
+    for ordinal in 0_u32..5_000 {
+        let id = format!("at-epic-{ordinal:04}");
+        let parent = format!("at-epic-{:04}", ordinal.saturating_sub(1));
+        let dependencies = if ordinal == 0 {
+            vec![
+                serde_json::json!({"issue_id":id,"depends_on_id":"at-root-blocker","type":"blocks"}),
+            ]
+        } else {
+            vec![serde_json::json!({"issue_id":id,"depends_on_id":parent,"type":"parent-child"})]
+        };
+        lines.push(
+            serde_json::json!({
+                "id": id,
+                "title": "Imported epic",
+                "status": "open",
+                "issue_type": "epic",
+                "dependencies": dependencies,
+            })
+            .to_string(),
+        );
+    }
+    lines.push(serde_json::json!({
+        "id": "at-leaf",
+        "title": "Leaf",
+        "status": "open",
+        "issue_type": "task",
+        "dependencies": [{"issue_id":"at-leaf","depends_on_id":"at-epic-4999","type":"parent-child"}],
+    }).to_string());
+    lines.push(
+        serde_json::json!({
+            "id": "at-shorthand-leaf",
+            "title": "Shorthand leaf",
+            "status": "open",
+            "issue_type": "task",
+            "parent_issue": "at-epic-4999",
+        })
+        .to_string(),
+    );
+    let input = lines.join("\n");
+    harness::block_on(async {
+        store
+            .import(actor.clone(), input, false)
+            .await
+            .expect("import deep hierarchy");
+        let leaf = store
+            .show(actor.clone(), "at-leaf".to_owned())
+            .await
+            .expect("show blocked leaf")
+            .expect("leaf exists");
+        assert_eq!(leaf.blocked_by, ["at-epic-4999"]);
+        let shorthand = store
+            .show(actor.clone(), "at-shorthand-leaf".to_owned())
+            .await
+            .expect("show shorthand leaf")
+            .expect("shorthand leaf exists");
+        assert!(shorthand.blocked_by.is_empty());
+
+        let started = Instant::now();
+        store
+            .create_item(
+                actor.clone(),
+                "unrelated-write".to_owned(),
+                Draft::new("at-unrelated", "Unrelated"),
+            )
+            .await
+            .expect("write alongside deep hierarchy");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "projection refresh rescanned the deep hierarchy: {:?}",
+            started.elapsed()
+        );
+
+        let blocker = store
+            .claim(
+                actor.clone(),
+                "worker".to_owned(),
+                "at-root-blocker".to_owned(),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("claim root blocker")
+            .expect("root blocker is ready");
+        store
+            .finish(blocker, Finish::Close)
+            .await
+            .expect("close root blocker");
+        assert!(
+            store
+                .claim(
+                    actor,
+                    "worker".to_owned(),
+                    "at-leaf".to_owned(),
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim released leaf")
+                .is_some()
+        );
+    });
+    drop(store);
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

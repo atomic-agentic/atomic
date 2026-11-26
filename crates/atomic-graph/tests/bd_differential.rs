@@ -273,6 +273,44 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
     dependency(&mut after_closed, "at-closed-prereq", "blocks");
     let mut past_due = issue("at-past-due", "Past due", "open", 2, "task");
     past_due["due_at"] = json!("2025-01-01T00:00:00Z");
+    let mut epic_child = issue("at-epic-child", "Epic child", "open", 2, "task");
+    dependency(&mut epic_child, "at-epic", "parent-child");
+    let mut epic_held = issue("at-epic-held", "Held epic child", "open", 2, "task");
+    dependency(&mut epic_held, "at-epic", "parent-child");
+    dependency(&mut epic_held, "at-blocker", "blocks");
+    let mut blocked_epic = issue("at-epic", "Blocked epic", "open", 1, "epic");
+    dependency(&mut blocked_epic, "at-blocker", "blocks");
+    let mut explicit_child = issue("at-child", "Explicit child", "open", 2, "task");
+    dependency(&mut explicit_child, "at-epic", "parent-child");
+    let mut shorthand_child = issue("at-child", "Shorthand child", "open", 2, "task");
+    shorthand_child["parent_issue"] = json!("at-epic");
+    let mut both_child = explicit_child.clone();
+    both_child["parent_issue"] = json!("at-epic");
+    let mut closed_blocked_epic = blocked_epic.clone();
+    closed_blocked_epic["status"] = json!("closed");
+    closed_blocked_epic["closed_at"] = json!("2026-01-02T00:00:00Z");
+    let mut self_blocked_epic = issue("at-epic", "Self blocked epic", "open", 1, "epic");
+    dependency(&mut self_blocked_epic, "at-child", "blocks");
+    let mut nested_epic = issue("at-nested", "Nested epic", "open", 2, "epic");
+    dependency(&mut nested_epic, "at-epic", "parent-child");
+    let mut nested_child = issue("at-child", "Nested child", "open", 2, "task");
+    dependency(&mut nested_child, "at-nested", "parent-child");
+    let mut sibling = issue("at-sibling", "Sibling", "open", 2, "task");
+    dependency(&mut sibling, "at-epic", "parent-child");
+    let mut blocked_task = issue("at-parent", "Blocked task parent", "open", 1, "task");
+    dependency(&mut blocked_task, "at-blocker", "blocks");
+    let mut task_child = issue("at-child", "Task child", "open", 2, "task");
+    dependency(&mut task_child, "at-parent", "parent-child");
+    let mut task_shorthand_child = task_child.clone();
+    task_shorthand_child
+        .as_object_mut()
+        .expect("issue object")
+        .remove("dependencies");
+    task_shorthand_child["parent_issue"] = json!("at-parent");
+    let mut nested_task = issue("at-middle", "Nested task parent", "open", 2, "task");
+    dependency(&mut nested_task, "at-parent", "parent-child");
+    let mut nested_task_child = issue("at-child", "Nested task child", "open", 2, "task");
+    dependency(&mut nested_task_child, "at-middle", "parent-child");
 
     let scenarios = [
         (
@@ -305,6 +343,105 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
             ],
             vec!["at-blocker", "at-related", "at-after-closed"],
         ),
+        (
+            "open-epic-hierarchy",
+            vec![
+                issue("at-epic", "Epic", "open", 1, "epic"),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                epic_child,
+                epic_held,
+            ],
+            vec!["at-epic", "at-blocker", "at-epic-child"],
+        ),
+        (
+            "explicit-parent-inherits-blocker",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                explicit_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "shorthand-parent-does-not-inherit",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                shorthand_child,
+            ],
+            vec!["at-blocker", "at-child"],
+        ),
+        (
+            "explicit-edge-wins-over-shorthand",
+            vec![
+                blocked_epic.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                both_child,
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "closed-parent-still-inherits-blocker",
+            vec![
+                closed_blocked_epic,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                explicit_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "child-clears-own-parent-blocker",
+            vec![self_blocked_epic.clone(), explicit_child.clone()],
+            vec!["at-child"],
+        ),
+        (
+            "sibling-waits-while-child-clears-parent-blocker",
+            vec![self_blocked_epic.clone(), explicit_child, sibling],
+            vec!["at-child"],
+        ),
+        (
+            "nested-explicit-parent-inherits-blocker",
+            vec![
+                blocked_epic,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                nested_epic.clone(),
+                nested_child.clone(),
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "descendant-clears-ancestor-blocker",
+            vec![self_blocked_epic, nested_epic, nested_child],
+            vec!["at-child"],
+        ),
+        (
+            "task-parent-explicit-inherits-blocker",
+            vec![
+                blocked_task.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                task_child,
+            ],
+            vec!["at-blocker"],
+        ),
+        (
+            "task-parent-shorthand-does-not-inherit",
+            vec![
+                blocked_task.clone(),
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                task_shorthand_child,
+            ],
+            vec!["at-blocker", "at-child"],
+        ),
+        (
+            "nested-task-parents-inherit-blocker",
+            vec![
+                blocked_task,
+                issue("at-blocker", "Blocker", "open", 1, "task"),
+                nested_task,
+                nested_task_child,
+            ],
+            vec!["at-blocker"],
+        ),
     ];
 
     for (label, rows, expected) in scenarios {
@@ -325,6 +462,24 @@ async fn ready_sets_and_portable_json_fields_match_pinned_bd_sqlite() {
             .expect("Atomic export");
         compare_ready_fields(&bd, &atomic, &exported_by_id(&exported));
     }
+}
+
+#[test]
+fn pinned_bd_accepts_native_parent_metadata_extension() {
+    let fixture = Fixture::new("native-parent-marker");
+    let parent = issue("at-parent", "Native parent", "open", 1, "task");
+    let mut child = issue("at-child", "Native child", "open", 2, "task");
+    child["parent_issue"] = json!("at-parent");
+    dependency(&mut child, "at-parent", "parent-child");
+    child["metadata"] = json!({
+        "atomic_graph": {"schema_version": 1, "native_parent": "at-parent"}
+    });
+    fixture.import(&[parent, child]);
+    let exported = exported_by_id(&fixture.export());
+    assert_eq!(
+        exported["at-child"]["metadata"]["atomic_graph"]["native_parent"],
+        "at-parent"
+    );
 }
 
 #[tokio::test]
