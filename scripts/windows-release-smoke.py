@@ -86,20 +86,42 @@ def context_checkpoint(exe, env):
         raise AssertionError("Tampered context checkpoint was not rejected")
 
 
-def coding_turn(exe, project, repository, state, env):
+def coding_turn(exe, project, repository, state, env, shell_kind="cmd"):
     """The second model call must carry proof of a workspace write and an ACL refusal."""
     canary = state / "private" / "smoke.txt"
     canary.parent.mkdir(parents=True, exist_ok=True)
     canary.write_text(secrets.token_hex(32))
     expected = hashlib.sha256((repository / "pricing.py").read_bytes()).hexdigest().upper()
-    # cmd.exe uses the worktree assigned to the Windows process. Built-in
-    # TYPE must report access denied for the existing private file.
-    command = (
-        'copy /b pricing.py windows-copy.py >nul && '
-        'certutil -hashfile windows-copy.py SHA256 && '
-        f'type "{canary}" >nul'
-    )
-    shell = str(Path(os.environ["SystemRoot"]) / "System32/cmd.exe")
+    if shell_kind == "powershell":
+        # PowerShell resolves its own provider location rather than using the
+        # inherited process directory handle. It must reach the assigned
+        # worktree through the normally private profile ancestors.
+        escaped_canary = str(canary).replace("'", "''")
+        command = (
+            "$ErrorActionPreference='Stop'; "
+            "$location=(Get-Location).ProviderPath; "
+            "$cwd=cmd /c cd; "
+            "if ($location -ne $cwd) { throw 'PowerShell location mismatch' }; "
+            "Copy-Item -LiteralPath 'pricing.py' -Destination 'windows-ps-copy.py' -ErrorAction Stop; "
+            "Write-Output 'CWD_OK'; "
+            "(Get-FileHash -LiteralPath 'windows-ps-copy.py' -Algorithm SHA256).Hash; "
+            f"try {{ $null=Get-Content -LiteralPath '{escaped_canary}' -ErrorAction Stop; "
+            "throw 'private state readable' } catch { "
+            "if ($_.Exception.Message -notmatch 'denied') { throw }; "
+            "Write-Output 'PRIVATE_DENIED' }"
+        )
+        shell = str(Path(os.environ["ProgramFiles"]) / "PowerShell/7/pwsh.exe")
+        if not Path(shell).is_file():
+            raise RuntimeError("PowerShell 7 is required for the Windows smoke")
+    else:
+        # cmd.exe uses the worktree assigned to the Windows process. Built-in
+        # TYPE must report access denied for the existing private file.
+        command = (
+            'copy /b pricing.py windows-copy.py >nul && '
+            'certutil -hashfile windows-copy.py SHA256 && '
+            f'type "{canary}" >nul'
+        )
+        shell = str(Path(os.environ["SystemRoot"]) / "System32/cmd.exe")
     output = (project / "fixtures/implement-step/quantity.output.json").read_text()
     replies = []
 
@@ -115,8 +137,12 @@ def coding_turn(exe, project, repository, state, env):
             elif len(replies) == 1 and any(
                 part.get("type") == "function_call_output" and part.get("call_id") == "call_1"
                 and expected in str(part.get("output")).upper()
-                and "Access is denied" in str(part.get("output"))
-                and "Process exited with code 1" in str(part.get("output"))
+                and (("CWD_OK" in str(part.get("output"))
+                      and "PRIVATE_DENIED" in str(part.get("output"))
+                      and "Process exited with code 0" in str(part.get("output")))
+                     if shell_kind == "powershell" else
+                     ("Access is denied" in str(part.get("output"))
+                      and "Process exited with code 1" in str(part.get("output"))))
                 for part in request.get("input", []) if isinstance(part, dict)
             ):
                 item = dict(type="message", id="msg_1", role="assistant", status="completed",
@@ -213,6 +239,7 @@ def main():
         # Reuse the project to cover Codex's already-provisioned helper cache.
         for _ in range(2):
             coding_turn(exe, project, dest / "repository", state, env)
+        coding_turn(exe, project, dest / "repository", state, env, "powershell")
 
     finally:
         # Codex can still hold a setup helper open for a background read-ACL refresh.

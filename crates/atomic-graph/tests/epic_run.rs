@@ -678,6 +678,64 @@ async fn three_dependent_children_close_with_commits_and_refresh_ready_projectio
 }
 
 #[tokio::test]
+async fn indexed_child_selection_preserves_priority_id_and_eligibility() {
+    let (rt, store, path) = setup("indexed-order").await;
+    create(&store, "epic", None, true).await;
+    create(&store, "other-epic", None, true).await;
+    create(&store, "outside", Some("other-epic"), false).await;
+    create(&store, "blocker", None, false).await;
+    for (id, priority) in [("a", 2), ("b", 1), ("c", 1), ("blocked", 0), ("future", 0)] {
+        let mut draft = Draft::new(id, id);
+        draft.kind = "task".into();
+        draft.parent = Some("epic".into());
+        draft.priority = priority;
+        if id == "future" {
+            draft.due_at = Some(SystemTime::now() + Duration::from_secs(3600));
+        }
+        store
+            .create_item(Actor::human("operator"), format!("create-{id}"), draft)
+            .await
+            .expect("create child");
+    }
+    store
+        .add_edge(
+            Actor::human("operator"),
+            "blocked".into(),
+            EdgeKind::Blocks,
+            "blocker".into(),
+        )
+        .await
+        .expect("block priority-zero child");
+    store
+        .authorize_graph_run("epic", "run-one")
+        .await
+        .expect("authorize run");
+    rt.control_transaction(|mut tx| {
+        Box::pin(
+            async move { transactional_claim::bind_epic_run(&mut tx, "epic", "run-one").await },
+        )
+    })
+    .await
+    .expect("bind run");
+
+    for (ordinal, expected) in ["b", "c", "a"].into_iter().enumerate() {
+        let ClaimNext::Claimed { item, .. } = select(&rt, &format!("indexed-{ordinal}")).await
+        else {
+            panic!("expected child {expected}");
+        };
+        assert_eq!(item.id, expected, "selection order or active lease changed");
+    }
+    assert_eq!(
+        select(&rt, "indexed-pending").await,
+        ClaimNext::Pending,
+        "blocked and future work should remain pending"
+    );
+    drop(store);
+    drop(rt);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
 async fn invalid_item_mapping_refuses_before_any_claim_or_epoch_change() {
     let (rt, store, path) = setup("invalid-mapping").await;
     create(&store, "epic", None, true).await;

@@ -389,6 +389,9 @@ jobs:
       - name: M5 acceptance, including claim-commit process kill
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m5 --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests,atomic-agentic/dev-failpoints
+      - name: M6 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m6
       # A suite that cannot reach its backend fails; it never skips. The
       # Postgres and sandbox suites run once more with their backend missing,
       # and every one of their tests must fail, naming it. The sandbox half

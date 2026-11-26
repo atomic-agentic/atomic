@@ -93,6 +93,7 @@ codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f0819
 codex-config = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-core = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-windows-sandbox-service = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
+codex-windows-sandbox = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-login = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }

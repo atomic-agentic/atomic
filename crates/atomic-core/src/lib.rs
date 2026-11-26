@@ -46,6 +46,8 @@ pub mod testing;
 pub mod typed;
 pub mod usage;
 #[cfg(windows)]
+mod windows_cwd;
+#[cfg(windows)]
 mod windows_worker;
 #[cfg(any(target_os = "macos", all(test, unix)))]
 mod worker_lifetime;

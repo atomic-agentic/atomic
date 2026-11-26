@@ -2730,6 +2730,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_finds_only_committed_handoffs_once_after_retry_and_rebuild() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-handoff-search-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        store
+            .run(|conn| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('at-handoff-search','A quiet item','ordinary description','task',2,'open',NULL,'human','test',1)")
+                        .execute(&mut *conn).await.map_err(db)?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("seed item");
+
+        let reached = path.with_extension("handoff-search-crash-reached");
+        let _ = std::fs::remove_file(&reached);
+        let mut crash = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "sqlite::tests::handoff_search_before_commit_child",
+            ])
+            .env("ATOMIC_TEST_HANDOFF_SEARCH_DB", &path)
+            .env("ATOMIC_TEST_HANDOFF_SEARCH_REACHED", &reached)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("start handoff publication child");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if matches!(std::fs::read_to_string(&reached), Ok(ref marker) if marker == "graph-handoff-search:before-commit")
+            {
+                break;
+            }
+            if let Some(status) = crash.try_wait().expect("child status") {
+                let output = crash.wait_with_output().expect("child output");
+                panic!("handoff child exited before named crash point: {status}; {output:?}");
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = crash.kill();
+                let output = crash.wait_with_output().expect("timed out child output");
+                panic!("handoff child did not reach crash point: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        crash
+            .kill()
+            .expect("kill handoff publication before commit");
+        let killed = crash.wait_with_output().expect("reap killed child");
+        assert!(!killed.status.success(), "child did not crash: {killed:?}");
+        assert!(
+            store
+                .search_items("cobalt signal", None, 10)
+                .await
+                .expect("after crash")
+                .is_empty()
+        );
+
+        let record = serde_json::json!({
+            "attempted": "mapped the cobalt signal",
+            "failed": "criterion rejected cobalt signal",
+            "learned": "the earlier cobalt signal belongs here",
+            "files": []
+        })
+        .to_string();
+        let rejected = store
+            .run(move |conn| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-handoff-search',2,?)")
+                        .bind(&record).execute(&mut *conn).await.map_err(db)?;
+                    Err::<(), StoreError>(db("synthetic rejected candidate"))
+                })
+            })
+            .await;
+        assert!(rejected.is_err(), "reject provisional handoff");
+        assert!(
+            store
+                .search_items("cobalt signal", None, 10)
+                .await
+                .expect("unpublished search")
+                .is_empty()
+        );
+
+        store
+            .run(|conn| {
+                Box::pin(async move {
+                    for (epoch, text) in [(2, "mapped the cobalt signal"), (4, "retried the cobalt signal")] {
+                        let record = serde_json::json!({"attempted": text, "failed": "", "learned": "", "files": []}).to_string();
+                        sqlx::query("INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-handoff-search',?,?)")
+                            .bind(epoch).bind(record).execute(&mut *conn).await.map_err(db)?;
+                    }
+                    // A replay of the same publication key cannot add another handoff.
+                    let replayed = sqlx::query("INSERT OR IGNORE INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-handoff-search',4,'{}')")
+                        .execute(&mut *conn).await.map_err(db)?;
+                    assert_eq!(replayed.rows_affected(), 0);
+                    Ok(())
+                })
+            })
+            .await
+            .expect("commit two handoffs");
+        let hits = store
+            .search_items("cobalt signal", None, 10)
+            .await
+            .expect("committed search");
+        assert_eq!(hits.len(), 1, "multiple matching handoffs return one item");
+        assert_eq!(hits[0].id, "at-handoff-search");
+        assert!(hits[0].excerpt.contains("cobalt signal"));
+
+        store
+            .rebuild_search_index(Actor::agent("test"))
+            .await
+            .expect("rebuild");
+        assert_eq!(
+            store
+                .search_items("cobalt signal", None, 10)
+                .await
+                .expect("rebuilt search"),
+            hits
+        );
+        std::fs::remove_file(reached).expect("remove crash marker");
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    #[ignore = "run by search_finds_only_committed_handoffs_once_after_retry_and_rebuild"]
+    async fn handoff_search_before_commit_child() {
+        let path = std::path::PathBuf::from(
+            std::env::var_os("ATOMIC_TEST_HANDOFF_SEARCH_DB").expect("child database path"),
+        );
+        let reached = std::path::PathBuf::from(
+            std::env::var_os("ATOMIC_TEST_HANDOFF_SEARCH_REACHED").expect("crash marker path"),
+        );
+        let store = SqliteStore::open(&path, SystemTime::now).expect("child graph store");
+        store
+            .run(move |conn| {
+                Box::pin(async move {
+                    let record = serde_json::json!({"attempted": "mapped the cobalt signal", "failed": "", "learned": "", "files": []}).to_string();
+                    sqlx::query("INSERT INTO atomic_graph_handoffs (item_id,release_epoch,record_json) VALUES ('at-handoff-search',2,?)")
+                        .bind(record).execute(&mut *conn).await.map_err(db)?;
+                    std::fs::write(reached, "graph-handoff-search:before-commit").map_err(db)?;
+                    // The parent kills this process with the transaction open.
+                    std::thread::sleep(Duration::from_secs(30));
+                    Ok(())
+                })
+            })
+            .await
+            .expect("child handoff transaction");
+    }
+
+    #[tokio::test]
     async fn gate_copies_are_visible_but_never_work_or_exported_items() {
         let path = std::env::temp_dir().join(format!(
             "atomic-graph-gate-copy-{}.sqlite",
@@ -2845,6 +2999,76 @@ mod tests {
                 "blocker lookup materialized a recursive result: {plan:?}"
             );
         }
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_child_selection_uses_migrated_parent_index() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-parent-plan-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("migrated graph store");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut conn = store.conn.lock().expect("graph connection");
+        let ready_sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::transactional_claim::READY_CHILD_SQL
+        );
+        let pending_sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::transactional_claim::UNFINISHED_CHILD_SQL
+        );
+        let plans = runtime.block_on(async {
+            let ready = sqlx::query(sqlx::AssertSqlSafe(ready_sql))
+                .bind("my-epic")
+                .bind(0_i64)
+                .bind(0_i64)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("workflow claim plan");
+            let pending = sqlx::query(sqlx::AssertSqlSafe(pending_sql))
+                .bind("my-epic")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("workflow pending plan");
+            [ready, pending].map(|rows| {
+                rows.iter()
+                    .map(|row| row.try_get::<String, _>("detail").expect("plan detail"))
+                    .collect::<Vec<_>>()
+            })
+        });
+        for plan in &plans {
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("atomic_graph_children_by_priority (parent=?)")),
+                "workflow scanned unrelated parents: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "workflow sorted children separately: {plan:?}"
+            );
+        }
+        assert!(
+            plans[0]
+                .iter()
+                .any(|line| line.contains("SEARCH b USING") && line.contains("(source=?)")),
+            "workflow did not use the blocker source index: {:?}",
+            plans[0]
+        );
+        assert!(
+            !plans[0]
+                .iter()
+                .any(|line| line.contains("CO-ROUTINE") || line.contains("MATERIALIZE")),
+            "workflow expanded unrelated blocker paths: {:?}",
+            plans[0]
+        );
         drop(conn);
         drop(store);
         let _ = std::fs::remove_file(path);

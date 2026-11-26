@@ -1,0 +1,1 @@
+graph-handoff-search-insert|crates/atomic-durable/src/store.rs|AFTER INSERT ON atomic_graph_handoffs BEGIN|AFTER UPDATE ON atomic_graph_handoffs BEGIN|-p atomic-agentic-graph --lib sqlite::tests::search_finds_only_committed_handoffs_once_after_retry_and_rebuild
