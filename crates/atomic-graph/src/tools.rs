@@ -85,7 +85,7 @@ impl GraphTurnTools {
                     .show_with_edges(id.clone())
                     .await
                     .map_err(|e| e.to_string())?
-                    .map(|(show, edges)| committed_view(show, edges));
+                    .map(|(show, edges, _)| committed_view(show, edges));
                 let view = self.buffer.lock().await.show(&self.attempt, &id, committed);
                 serde_json::to_value(view).map_err(|e| e.to_string())
             }

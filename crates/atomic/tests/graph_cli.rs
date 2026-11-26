@@ -1523,6 +1523,46 @@ fn inspection_from_the_cli_leaves_a_missing_database_missing() {
 }
 
 #[test]
+fn ready_and_show_inspect_imported_items_without_opening_an_absent_store() {
+    let fixture = Fixture::new("ready-show");
+    let project = fixture.project("project");
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("empty ready JSON");
+    assert_eq!(ready, json!([]));
+    assert!(!has_atomic_database(&fixture.root));
+    let missing = fixture.run(&project, &["graph", "show", "bd-absent"]);
+    assert!(!missing.status.success(), "missing item must be reported");
+    assert!(!has_atomic_database(&fixture.root));
+
+    fixture.enroll(&project);
+    let items = concat!(
+        r#"{"id":"bd-open","title":"Clear blocker","description":"First body","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z"}"#,
+        "\n",
+        r#"{"id":"bd-blocked","title":"Held item","description":"Implementation body","acceptance_criteria":"Acceptance text","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","dependencies":[{"issue_id":"bd-blocked","depends_on_id":"bd-open","type":"blocks"}]}"#,
+        "\n"
+    );
+    success(&fixture.run_stdin(&project, &["graph", "import", "-"], items));
+    let ready: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "ready"]),
+    ))
+    .expect("ready JSON");
+    assert_eq!(ready.as_array().expect("ready array").len(), 1);
+    assert_eq!(ready[0]["id"], "bd-open");
+    let shown: Value = serde_json::from_str(&success(
+        &fixture.run(&project, &["--json", "graph", "show", "bd-blocked"]),
+    ))
+    .expect("show JSON");
+    assert_eq!(shown["id"], "bd-blocked");
+    assert_eq!(shown["body"], "Implementation body");
+    assert_eq!(shown["acceptance_criteria"], "Acceptance text");
+    assert_eq!(shown["status"], "open");
+    assert_eq!(shown["blocked_by"], json!(["bd-open"]));
+    assert_eq!(shown["edges"], json!([{"kind":"blocks","to":"bd-open"}]));
+}
+
+#[test]
 fn inspection_works_while_another_connection_holds_the_write_lock() {
     use sqlx::{Connection, SqliteConnection};
     let fixture = Fixture::new("inspection-lock");
