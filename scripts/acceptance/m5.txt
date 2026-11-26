@@ -1,0 +1,47 @@
+# M5, local work graph: each clause of docs/design/milestones.md § M5,
+# word for word, and the tests that show it as `<binary> <test path>`.
+# CI runs this list with dev-failpoints so the claim-commit kill test exists.
+
+## Run the same scenarios through beads on its SQLite backend and through atomic: the ready sets and the JSON fields agree.
+# The pinned bd SQLite differential lands with atomic-st48 (#326).
+graph_cli ready_json_matches_pinned_bd_sqlite_for_imported_scenarios
+
+## Of 50 simultaneous claims on a single item, one succeeds.
+conformance sqlite_fifty_contenders_have_exactly_one_claim_winner
+
+## Once a claim has been taken over, the previous holder can no longer write.
+# The SQLite conformance test runs the named takeover scenario.
+conformance sqlite_conforms_to_the_behavioral_scenarios
+
+## A lease that ran out but that nobody else picked up keeps working for the agent that held it.
+# The same conformance test runs a_lapsed_lease_nobody_took_still_works.
+conformance sqlite_conforms_to_the_behavioral_scenarios
+
+## A second import of one beads export is a no-op.
+# The conformance suite runs importing_a_second_time_changes_nothing.
+conformance sqlite_conforms_to_the_behavioral_scenarios
+graph_cli import_twice_and_export_reimport_are_stable
+
+## When two workflows compete for an item, only one model turn starts.
+graph_claim contending_workflows_start_exactly_one_turn_dispatch
+
+## A crash at the moment a claim commits ends with the same acquisition reused, or with the takeover detected.
+# This test kills its child process at checkpoint:after:claim and checks the
+# persisted acquisition and epoch after a fresh process resumes.
+graph_claim killing_process_after_claim_commit_reuses_acquisition_on_restart
+
+## An item whose `due_at` lies ahead stays out of `ready` until that time, even with every dependency closed, and shows up once the time passes; an item that is both due and blocked waits for both.
+### An item whose `due_at` lies ahead stays out of `ready` until that time, even with every dependency closed, and shows up once the time passes
+conformance sqlite_conforms_to_the_behavioral_scenarios
+### an item that is both due and blocked waits for both
+conformance sqlite_conforms_to_the_behavioral_scenarios
+
+## A goal never shows up in `ready`; its child items do.
+goals goal_is_pinned_children_are_ready_and_next_brief_sees_feedback
+conformance sqlite_conforms_to_the_behavioral_scenarios
+
+## Feedback added during one run is in the brief of the next run; an expired ignore entry is not.
+### Feedback added during one run is in the brief of the next run
+goals goal_is_pinned_children_are_ready_and_next_brief_sees_feedback
+### an expired ignore entry is not
+goals goal_is_pinned_children_are_ready_and_next_brief_sees_feedback

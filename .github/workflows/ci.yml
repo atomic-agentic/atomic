@@ -351,8 +351,8 @@ jobs:
           target-cache: test
           backends: "true"
           warm: "true"
-      # The test features scripts/acceptance.py and scripts/test-shards.py
-      # use, so nothing rebuilds for the steps below.
+      # The default test features scripts/acceptance.py and scripts/test-shards.py
+      # use. M5 adds dev-failpoints in its own step and recompiles that target.
       - name: Build the tests
         id: build
         run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --no-run
@@ -379,6 +379,16 @@ jobs:
       - name: M45 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m45
+      - name: Pin SQLite-capable bd for M5 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: |
+          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
+          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
+      # M5's process-kill test is compiled only with dev-failpoints. Keep this
+      # command explicit so a feature-less acceptance run cannot pass it by omission.
+      - name: M5 acceptance, including claim-commit process kill
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m5 --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests,atomic-agentic/dev-failpoints
       - name: M6 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m6

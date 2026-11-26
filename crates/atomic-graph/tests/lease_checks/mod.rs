@@ -1230,7 +1230,7 @@ pub async fn agent_memories_never_enter_a_prompt<S: GraphStore>(
 
 /// M5's due-at clause, which Errai had no equivalent of: an item whose `due_at`
 /// lies ahead stays out of `ready` even with every dependency closed, and shows
-/// up once the time passes.
+/// up once the time passes. An item that is also blocked waits for both.
 pub async fn due_items_stay_out_of_ready_until_their_time<S: GraphStore>(
     store: &S,
     clock: &Clock,
@@ -1238,6 +1238,8 @@ pub async fn due_items_stay_out_of_ready_until_their_time<S: GraphStore>(
 ) -> Vec<String> {
     let mut run = Run::new();
     let due = format!("{at}-due");
+    let blocked_due = format!("{at}-blocked-due");
+    let blocker = format!("{at}-blocker");
     let free = format!("{at}-free");
     if item(&mut run, store, &free, 2).await.is_none() {
         return run.finish();
@@ -1253,13 +1255,41 @@ pub async fn due_items_stay_out_of_ready_until_their_time<S: GraphStore>(
     {
         return run.finish();
     }
+    let mut draft = Draft::new(&blocked_due, "synthetic, due and blocked");
+    draft.due_at = Some(clock.now() + Duration::from_secs(60));
+    if run
+        .ok("create_item both due and blocked", || {
+            store.create_item(atom(), format!("create-{blocked_due}"), draft)
+        })
+        .await
+        .is_none()
+    {
+        return run.finish();
+    }
+    if item(&mut run, store, &blocker, 2).await.is_none() {
+        return run.finish();
+    }
+    if run
+        .ok("block the due item", || {
+            store.add_edge(
+                atom(),
+                blocked_due.clone(),
+                EdgeKind::Blocks,
+                blocker.clone(),
+            )
+        })
+        .await
+        .is_none()
+    {
+        return run.finish();
+    }
     let Some(before) = run
         .ok("ready before the due time", || store.ready(atom(), 100))
         .await
     else {
         return run.finish();
     };
-    let listed = run.due_ids(&before, &[due.as_str()]);
+    let listed = run.due_ids(&before, &[due.as_str(), blocked_due.as_str()]);
     if !listed.contains(&free) {
         run.fail(&format!("{free} is ready and was not listed: {listed:?}"));
     }
@@ -1273,6 +1303,34 @@ pub async fn due_items_stay_out_of_ready_until_their_time<S: GraphStore>(
     let listed = run.ids(&after);
     if !listed.contains(&due) {
         run.fail(&format!("{due} is due and was not listed: {listed:?}"));
+    }
+    if listed.contains(&blocked_due) {
+        run.fail(&format!(
+            "{blocked_due} is due but still blocked: {listed:?}"
+        ));
+    }
+    let Some(lease) = hold(&mut run, store, "unblocker", &blocker, LONG).await else {
+        return run.finish();
+    };
+    if run
+        .ok("close the blocker", || store.finish(lease, Finish::Close))
+        .await
+        .is_none()
+    {
+        return run.finish();
+    }
+    let Some(unblocked) = run
+        .ok("ready after due time and blocker closure", || {
+            store.ready(atom(), 100)
+        })
+        .await
+    else {
+        return run.finish();
+    };
+    if !run.ids(&unblocked).contains(&blocked_due) {
+        run.fail(&format!(
+            "{blocked_due} did not become ready after both conditions"
+        ));
     }
     run.finish()
 }
