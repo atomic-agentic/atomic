@@ -1,9 +1,9 @@
 # Availability and delivery stages
 
-Atomic v0.1.0 is published. This page distinguishes that release, v0.2 work
-implemented in main but not yet released, and later planned stages. Built CLI
-behavior is exercised by repository tests; staged and planned behavior is
-identified where it appears.
+Atomic v0.1.0 established the first release. This page describes capabilities
+by stage and identifies later plans where they appear. Built CLI behavior is
+exercised by repository tests; the [release page](https://github.com/atomic-agentic/atomic/releases)
+shows which versions and artifacts are currently published.
 
 The first-release path and the full interactive CLI arrive at different stages.
 The documentation leads with the complete product picture so readers can see why
@@ -12,7 +12,7 @@ the coding agent and framework belong together.
 | Stage | Target experience |
 | --- | --- |
 | **v0.1 · one developer** | `init`, `run`, `runs resume`, local headless `serve`, `check`, evals and run inspection; file-defined Codex/lite/exec atoms; sequential durable workflows; local gates; local artifacts, budgets and basic spans |
-| **v0.2 · local graph and authoring, in development** | SQLite work graph with Beads import/export and single-lane graph runs; Astro authoring with Boa helpers; coding review and delivery gates. Parallel coding lanes and final release acceptance remain in progress. |
+| **v0.2 · local graph and authoring** | SQLite work graph with Beads import/export and graph-driven work; Astro authoring with Boa helpers; coding review and delivery gates |
 | **v0.5 · a team** | Full interactive CLI attachment, live agent supervision, shared Postgres graph and messages, initial identity/audit controls, full OpenTelemetry integration and optional local trace helper, Slack approvals, OpenAPI tools, triggers, parallel composition and merge queue |
 | **v0.7 · models and data** | Planner and code context, broader model routing, TypeScript in atoms on Deno, application data sources, typed files, retrieval, multimodal work and outcome-based learning |
 | **v1.0 · platform** | Remote workers/environments, Kubernetes/Substrate execution, extended TUI panes, TypeScript workflows, published MCP workflows, A2A, broader enterprise controls and web console |
@@ -144,8 +144,8 @@ links. To register it in the destination, an enrolled operator runs
 `atomic goals add <name>` with the local `goals/<name>.goal.yaml`. This
 activates the restored goal using that definition. Repeating the command for
 an already registered goal preserves and reports its current active or paused
-state. PostgreSQL graph storage remains staged; these v0.2 graph and goal
-features are implemented in main but are not part of the published v0.1.0 release.
+state. The v0.2 local graph and goal path uses SQLite; PostgreSQL graph storage
+belongs to the later team/server stage.
 
 The staged `atomic delivery start` command reads a committed graph coding
 item's accepted candidate, two clean independent reviews, self-review,
@@ -572,9 +572,11 @@ integration and crash tests. One example's TypeScript also runs under Deno
 against a local stand-in for S3. These checks do not establish live-model
 quality or the integration contracts planned for later stages.
 
-The release workflow builds, packages and Sigstore-signs the Linux and macOS
-archives with their SBOMs ([verifying a download](../getting-started/installation.md#verifying-a-download)).
-It published v0.1.0; v0.2 remains in development.
+The release workflow packages Linux and macOS archives and a Windows AMD64 ZIP,
+with CycloneDX SBOMs and Sigstore signatures. It smoke-tests the extracted
+Windows ZIP on Windows Server 2025 before signing. See
+[verifying a download](../getting-started/installation.md#verifying-a-download)
+for the published artifacts.
 
 Installation packaging, standalone-session behavior and some control commands
 remain open decisions, tracked with the rest of the work in the project's issue
