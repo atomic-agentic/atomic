@@ -108,6 +108,15 @@ passing object IDs to the model. If a candidate changes more than 128 files
 or contains paths the handoff cannot safely represent, the note states how
 many paths were omitted; the claim still releases.
 
+`atomic run <workflow> --graph-epic <id> --lanes 1` works ready coding items
+in order. The parallel child workflow machinery has separate durable steps
+and Git worktrees, but the CLI refuses `--lanes` above one before creating
+project state. Its process-local command slot covers backend commands only;
+Codex shell commands and other Atomic processes do not share that slot. A
+host-wide command pool must cover both paths before parallel runs are admitted.
+`atomic runs resume` and `atomic serve` also refuse unfinished parallel graph
+runs recorded by an earlier binary with the same durable layout.
+
 `atomic goals list` and `atomic goals show` use the same read-only inspection
 path as graph export. Graph JSONL preserves a pinned goal item and its child
 links. To register it in the destination, an enrolled operator runs
@@ -438,12 +447,12 @@ and the staged `--effects preview` mode are planned for v0.5. The `file` tag
 follows with code context in v0.7. The committed `atomic.policy.lock`, and
 `atomic import` and `atomic export`, are planned for v1.0.
 
-The v0.2 host controls proof, criteria checkpoints and graph lane model choices
-change the durable pipeline layout from `atomic.pipeline.7` to
-`atomic.pipeline.10`. An unfinished run recorded under `.7` or the staged `.8`
-or `.9` layouts is not resumed or replayed by a `.10` binary. Finish it with
-the matching older binary, or inspect its completed effects and start a new run
-under `.10`.
+The v0.2 host controls proof, criteria checkpoints, graph lane model choices,
+and parallel graph child workflows change the durable pipeline layout from
+`atomic.pipeline.7` to `atomic.pipeline.11`. An unfinished run recorded under
+`.7`, the staged `.8` or `.9` layouts, or `.10` is not resumed or replayed by a
+`.11` binary. Finish it with the matching older binary, or inspect its
+completed effects and start a new run under `.11`.
 
 Mermaid diagrams written by hand in docs need nothing from Atomic. The
 [diagram exporters](../guides/diagrams.md) for workflows, the work graph and

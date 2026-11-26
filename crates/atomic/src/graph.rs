@@ -3,7 +3,7 @@
 //! Import and export the project's work graph through the public CLI.
 
 use anyhow::{Context, bail};
-use atomic_app::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step};
+use atomic_app::pipeline::{GRAPH_LANE, GRAPH_PIPELINE, GraphPipelineRun, LAYOUT_VERSION, Step};
 use atomic_core::git::Git;
 use atomic_core::state::ProjectState;
 use atomic_core::workflow::{Criterion, parse_criteria};
@@ -511,6 +511,12 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             if record.workflow != GRAPH_PIPELINE {
                 bail!("run {run} is not a graph epic run");
             }
+            if record.version != LAYOUT_VERSION {
+                bail!(
+                    "run {run} uses layout {}; verify it with the matching atomic binary",
+                    record.version
+                );
+            }
             let frozen: GraphPipelineRun = serde_json::from_value(record.input)
                 .with_context(|| format!("read frozen graph run {run}"))?;
             let template = match frozen.run.pipeline.steps.as_slice() {
@@ -523,8 +529,8 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
                 template.review.as_ref().map_or(1, |review| review.rounds),
             )
             .ok_or_else(|| anyhow::anyhow!("step {step} is not a generated step in run {run}"))?;
-            let steps = rt.steps(&run).await?;
-            let claim = steps
+            let parent_steps = rt.steps(&run).await?;
+            let claim = parent_steps
                 .iter()
                 .find(|record| record.name == claim_step)
                 .and_then(|record| record.output.clone())
@@ -539,6 +545,39 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             if item.id != id || lease.item_id != id || lease.claimant != run {
                 bail!("step {claim_step} did not claim item {id} for run {run}");
             }
+            let evidence_run = if frozen.lanes > 1 {
+                let ordinal = claim_step
+                    .strip_prefix("graph.")
+                    .and_then(|tail| tail.strip_suffix(".claim"))
+                    .ok_or_else(|| anyhow::anyhow!("invalid graph claim step {claim_step}"))?;
+                let child_step = format!("graph.{ordinal}.child");
+                let child_id = parent_steps
+                    .iter()
+                    .find(|record| record.name == child_step)
+                    .and_then(|record| record.output.as_ref())
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("step {child_step} has no child run"))?;
+                if !child_id.starts_with(&format!("{run}-")) {
+                    bail!("step {child_step} does not link a child of {run}");
+                }
+                let child = rt
+                    .own_run_record(child_id)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("graph lane child {child_id} is absent"))?;
+                if child.workflow != GRAPH_LANE
+                    || child.version != LAYOUT_VERSION
+                    || child.input["claim"]["parent"] != run
+                    || child.input["claim"]["ordinal"] != ordinal.parse::<usize>()?
+                    || child.input["claim"]["item"] != serde_json::to_value(&item)?
+                    || child.input["claim"]["lease"] != serde_json::to_value(&lease)?
+                {
+                    bail!("graph lane child {child_id} differs from its parent claim");
+                }
+                child_id.to_owned()
+            } else {
+                run.clone()
+            };
+            let steps = rt.steps(&evidence_run).await?;
             let release_step = format!("{base_step}.review.claim.release");
             let lease = if let Some(release) =
                 steps.iter().find(|record| record.name == release_step)
@@ -631,11 +670,11 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             })?;
             let repo = Git::find()?.repo(&fixture.snapshot).without_filters()?;
             let worktrees = Worktrees::new(repo, fixture.worktrees);
-            if worktrees.base(&run)?.as_deref() != Some(fixture.commit.as_str()) {
+            if worktrees.base(&evidence_run)?.as_deref() != Some(fixture.commit.as_str()) {
                 bail!("graph run {run}'s pinned Git base differs from its frozen fixture");
             }
             let step_commit = worktrees
-                .recorded_step_commit(&run, &step, attempt)?
+                .recorded_step_commit(&evidence_run, &step, attempt)?
                 .ok_or_else(|| anyhow::anyhow!("no recorded Git attempt {attempt} for {step}"))?;
             if candidate
                 .proposal
@@ -658,9 +697,21 @@ pub async fn run(command: GraphCommand, state: &ProjectState, as_json: bool) -> 
             {
                 bail!("Git attempt {attempt} does not match the step's checkpointed Git record");
             }
-            store
-                .link_verified_commit(lease, &worktrees, &run, &step_commit)
-                .await?;
+            if frozen.lanes > 1 {
+                store
+                    .link_verified_child_commit(
+                        lease,
+                        &worktrees,
+                        &run,
+                        &evidence_run,
+                        &step_commit,
+                    )
+                    .await?;
+            } else {
+                store
+                    .link_verified_commit(lease, &worktrees, &run, &step_commit)
+                    .await?;
+            }
             let sha = step_commit.commit;
             if as_json {
                 println!(

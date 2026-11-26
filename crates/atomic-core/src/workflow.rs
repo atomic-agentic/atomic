@@ -1176,13 +1176,14 @@ struct Roots<'a> {
 
 /// The schema of what a reviewer sees as `candidate`: the output under
 /// review, for a worktree step its `metadata.commit`, and for a coding step
-/// the host-computed `metadata.diff`.
+/// the host-computed `metadata.diff` and graph proposal summary.
 pub fn candidate_schema(output: &Value, worktree: bool, coding: bool) -> Value {
     let mut properties = Map::new();
     properties.insert("output".into(), output.clone());
     if worktree {
         let mut metadata = Map::new();
         metadata.insert("commit".into(), json!({"type": "string"}));
+        metadata.insert("graph_proposals".into(), json!({"type": "string"}));
         if coding {
             metadata.insert("diff".into(), json!({"type": "string"}));
         }

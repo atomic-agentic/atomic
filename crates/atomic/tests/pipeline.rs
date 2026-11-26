@@ -583,6 +583,7 @@ async fn engine_built_with_trial(
         &mut rt,
         Services {
             runtimes,
+            graph_database: None,
             model_endpoint_configured: true,
             store,
             deployment: local(),
@@ -8435,7 +8436,7 @@ fn legacy_fake_controls_receipt_cannot_resume_or_replay_under_current_layout() {
             .await
             .expect("old runtime shutdown");
 
-        assert_eq!(atomic_app::pipeline::LAYOUT_VERSION, "atomic.pipeline.10");
+        assert_eq!(atomic_app::pipeline::LAYOUT_VERSION, "atomic.pipeline.11");
         let mut upgraded = Durare::open(
             &database,
             None,
@@ -8468,7 +8469,7 @@ fn legacy_fake_controls_receipt_cannot_resume_or_replay_under_current_layout() {
             error
                 .to_string()
                 .contains("recorded under layout atomic.pipeline.7")
-                && error.to_string().contains("atomic.pipeline.10"),
+                && error.to_string().contains("atomic.pipeline.11"),
             "{error}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;

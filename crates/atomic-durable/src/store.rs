@@ -3299,7 +3299,8 @@ mod tests {
         );
 
         let legacy = crate::testing::schema("hist_case_old").await;
-        legacy_postgres(legacy.url(), legacy.name(), 10, false).await;
+        let legacy_version = 10;
+        legacy_postgres(legacy.url(), legacy.name(), legacy_version, false).await;
         let mixed_legacy = legacy.name().to_ascii_uppercase();
         assert_eq!(
             open_postgres(legacy.url(), &mixed_legacy)
@@ -3322,7 +3323,10 @@ mod tests {
                 .expect("history")
                 .expect("recorded history")
                 .len(),
-            13
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version >= legacy_version)
+                .count()
         );
     }
 

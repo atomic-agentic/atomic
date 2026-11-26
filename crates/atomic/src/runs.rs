@@ -20,7 +20,7 @@ use crate::target;
 use atomic_app::pipeline::{GRAPH_PIPELINE, GraphPipelineRun, PIPELINE, ProjectWorktrees, Step};
 use atomic_core::codex::CodexPaths;
 use atomic_core::state::ProjectState;
-use atomic_durable::{DurableError, DurableRuntime, RunStatus};
+use atomic_durable::{DurableError, DurableRuntime, RunRecord, RunStatus};
 use clap::Args;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -131,6 +131,10 @@ pub struct RunArgs {
     /// Work every ready child of this pinned graph epic with the named workflow template.
     #[arg(long, value_name = "EPIC_ID")]
     pub graph_epic: Option<String>,
+    /// Run this many ready graph items concurrently (1 to 16). Parallel
+    /// admission currently fails until the host can bound Codex shell commands.
+    #[arg(long, value_name = "N", requires = "graph_epic", value_parser = parse_lanes)]
+    pub lanes: Option<usize>,
     /// Kill this development build after the named workflow step commits,
     /// so `atomic runs resume` can exercise recovery through the real CLI.
     #[cfg(feature = "dev-failpoints")]
@@ -146,6 +150,65 @@ pub struct RunArgs {
     pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+fn parse_lanes(value: &str) -> Result<usize, String> {
+    let lanes = value
+        .parse::<usize>()
+        .map_err(|_| "lanes must be an integer from 1 to 16".to_owned())?;
+    (1..=16)
+        .contains(&lanes)
+        .then_some(lanes)
+        .ok_or_else(|| "lanes must be an integer from 1 to 16".to_owned())
+}
+
+/// Refuse a parallel graph run before it obtains project state. The current
+/// process-local backend slot cannot cover a Codex shell command.
+pub fn admit_command_pool(args: &RunArgs) -> Result<(), Failure> {
+    if args.lanes.is_some_and(|lanes| lanes > 1) {
+        return Err(Failure::new(
+            "graph.command_pool_unavailable",
+            "parallel graph lanes cannot be bounded across Codex shell and backend commands on this host",
+            "run with --lanes 1 until a host-wide command pool is available",
+        ));
+    }
+    Ok(())
+}
+
+/// An older binary may have recorded a parallel graph run before new-run
+/// admission became fail-closed. Inspect its frozen input before resume or
+/// serve dispatches it. An invalid graph input is refused as well.
+fn admit_recorded_command_pool(record: &RunRecord) -> Result<(), Failure> {
+    if record.workflow != GRAPH_PIPELINE {
+        return Ok(());
+    }
+    let lanes = record
+        .input
+        .as_object()
+        .ok_or_else(invalid_graph_run)?
+        .get("lanes")
+        .map_or(Ok(1), |value| {
+            value
+                .as_u64()
+                .filter(|lanes| (1..=16).contains(lanes))
+                .ok_or_else(invalid_graph_run)
+        })?;
+    if lanes > 1 {
+        return Err(Failure::new(
+            "graph.command_pool_unavailable",
+            "a recorded parallel graph run cannot be bounded across Codex shell and backend commands on this host",
+            "continue it with an atomic that has a host-wide command pool; do not resume it here",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_graph_run() -> Failure {
+    Failure::new(
+        "graph.record_invalid",
+        "the recorded graph run has no valid lane count",
+        "inspect the run's frozen input and continue it with the atomic layout that recorded it",
+    )
 }
 
 #[cfg(feature = "dev-failpoints")]
@@ -496,6 +559,7 @@ pub async fn run(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
+    admit_command_pool(&args)?;
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
@@ -685,6 +749,7 @@ pub async fn run(
                 epic,
                 model_source: engine.lane_policy.clone(),
                 review_routing: true,
+                lanes: args.lanes.unwrap_or(1),
             })?,
         ),
         None => (PIPELINE, serde_json::to_value(run)?),
@@ -844,6 +909,10 @@ pub async fn resume(
                 )
                 .into());
             }
+            if let Err(refused) = admit_recorded_command_pool(record) {
+                let _ = engine.rt.shutdown(SHUTDOWN).await;
+                return Err(refused.into());
+            }
             // A run parked because atomic's own workflow code panicked will
             // likely panic again: say so, and note afresh what this resume
             // finds.
@@ -890,7 +959,7 @@ pub async fn resume(
                 .shown(&format!("run {}: resuming", crate::shown::line(id)))
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
-            engine.rt.resume(id).await?;
+            engine.rt.resume_family(id).await?;
             // Resumed: what it does now is noted afresh.
             atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
@@ -1078,6 +1147,17 @@ pub async fn serve(
         engine::Takes::Waiting,
     )
     .await?;
+    // Recovery queues unfinished runs before the engine dispatches them. A
+    // recorded parallel run from an earlier binary must not bypass the new
+    // CLI admission guard through this batch recovery path.
+    for record in engine.rt.own_unfinished().await? {
+        if record.version == engine.rt.version()
+            && let Err(refused) = admit_recorded_command_pool(&record)
+        {
+            let _ = engine.rt.shutdown(SHUTDOWN).await;
+            return Err(refused.into());
+        }
+    }
     atomic_core::log_line!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),
