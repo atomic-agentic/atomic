@@ -1169,7 +1169,7 @@ impl Durare {
         crate::store::open_sqlite(path)
             .await
             .map_err(|e| DurableError::Engine(e.to_string()))?;
-        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let url = crate::store::sqlite_url(path);
         let provider = durare::SqliteProvider::connect(&url)
             .await
             .map_err(from_durare)?;
@@ -1358,7 +1358,7 @@ impl Durare {
                 crate::store::open_sqlite(path)
                     .await
                     .map_err(|e| DurableError::Engine(e.to_string()))?;
-                let url = format!("sqlite://{}?mode=rwc", path.display());
+                let url = crate::store::sqlite_url(path);
                 let provider = durare::SqliteProvider::connect(&url)
                     .await
                     .map_err(from_durare)?;
