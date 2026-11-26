@@ -2471,6 +2471,8 @@ async fn prepare_windows_turn(config: &mut Config) -> anyhow::Result<()> {
             .map(|value| (name.to_owned(), value))
     })
     .collect();
+    let grant_cwd = cwd.clone();
+    let grant_home = home.clone();
     tokio::task::spawn_blocking(move || {
         codex_core::windows_sandbox::prepare_elevated_sandbox(
             &profile,
@@ -2482,7 +2484,9 @@ async fn prepare_windows_turn(config: &mut Config) -> anyhow::Result<()> {
     })
     .await
     .context("join Windows sandbox setup")?
-    .context("prepare the Windows sandbox for this turn")
+    .context("prepare the Windows sandbox for this turn")?;
+    crate::windows_cwd::allow_private_profile_cwd_ancestors(&grant_cwd, &grant_home)
+        .context("allow PowerShell to resolve its sandbox worktree")
 }
 
 #[cfg(windows)]
