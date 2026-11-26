@@ -366,7 +366,32 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE TABLE atomic_graph_handoffs (item_id TEXT NOT NULL, release_epoch BIGINT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (item_id,release_epoch))",
         ],
     },
+    Migration {
+        version: 25,
+        name: "sqlite-work-graph-search",
+        // PostgreSQL search is a separate milestone. SQLite-specific DDL is
+        // applied within this numbered migration's transaction below.
+        sql: &[],
+    },
 ];
+
+const SQLITE_SEARCH_SQL: &[&str] = &[
+    "CREATE TABLE atomic_graph_search_keys (key INTEGER PRIMARY KEY AUTOINCREMENT, item_id TEXT NOT NULL UNIQUE)",
+    "CREATE VIRTUAL TABLE atomic_graph_search_fts USING fts5(title,body,tokenize='unicode61')",
+    "CREATE TABLE atomic_graph_search_progress (singleton INTEGER PRIMARY KEY CHECK(singleton=1), last_id TEXT NOT NULL DEFAULT '', complete INTEGER NOT NULL DEFAULT 0)",
+    "INSERT INTO atomic_graph_search_progress (singleton,last_id,complete) VALUES (1,'',0)",
+    "CREATE TRIGGER atomic_graph_search_insert AFTER INSERT ON atomic_graph_items BEGIN INSERT INTO atomic_graph_search_keys(item_id) VALUES (NEW.id); INSERT INTO atomic_graph_search_fts(rowid,title,body) VALUES ((SELECT key FROM atomic_graph_search_keys WHERE item_id=NEW.id),NEW.title,NEW.body); END",
+    "CREATE TRIGGER atomic_graph_search_update AFTER UPDATE OF title,body ON atomic_graph_items BEGIN INSERT INTO atomic_graph_search_keys(item_id) SELECT NEW.id WHERE NOT EXISTS (SELECT 1 FROM atomic_graph_search_keys WHERE item_id=NEW.id); DELETE FROM atomic_graph_search_fts WHERE rowid=(SELECT key FROM atomic_graph_search_keys WHERE item_id=OLD.id); INSERT INTO atomic_graph_search_fts(rowid,title,body) VALUES ((SELECT key FROM atomic_graph_search_keys WHERE item_id=NEW.id),NEW.title,NEW.body); END",
+    "CREATE TRIGGER atomic_graph_search_delete AFTER DELETE ON atomic_graph_items BEGIN DELETE FROM atomic_graph_search_fts WHERE rowid=(SELECT key FROM atomic_graph_search_keys WHERE item_id=OLD.id); DELETE FROM atomic_graph_search_keys WHERE item_id=OLD.id; END",
+];
+
+fn sqlite_extra(migration: &Migration) -> &'static [&'static str] {
+    if migration.version == 25 {
+        SQLITE_SEARCH_SQL
+    } else {
+        &[]
+    }
+}
 
 const HISTORY_TABLE: &str = "CREATE TABLE atomic_store_history (
     version BIGINT PRIMARY KEY,
@@ -384,7 +409,7 @@ fn history_required(version: i64) -> bool {
 
 fn checksum(migration: &Migration) -> String {
     let mut hash = Sha256::new();
-    for sql in migration.sql {
+    for sql in migration.sql.iter().chain(sqlite_extra(migration)) {
         hash.update((sql.len() as u64).to_be_bytes());
         hash.update(sql.as_bytes());
     }
@@ -571,7 +596,7 @@ async fn verify_legacy_sqlite(
         .await
         .map_err(|e| fail(format!("cannot build a reference marker: {e}")))?;
     for migration in migrations.iter().filter(|m| m.version <= found) {
-        for sql in migration.sql {
+        for sql in migration.sql.iter().chain(sqlite_extra(migration)) {
             sqlx::query(*sql)
                 .execute(&mut expected)
                 .await
@@ -1046,7 +1071,13 @@ pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreEr
                     .fetch_one(&mut source)
                     .await
                     .map_err(db)?;
-                if pending == 0 {
+                let search_complete: i64 = sqlx::query_scalar(
+                    "SELECT complete FROM atomic_graph_search_progress WHERE singleton=1",
+                )
+                .fetch_one(&mut source)
+                .await
+                .map_err(db)?;
+                if pending == 0 && search_complete != 0 {
                     return Ok(source);
                 }
             }
@@ -1072,7 +1103,105 @@ pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreEr
             .await
             .map_err(db)?;
     }
+    if version >= 25 {
+        while !graph_search_backfill_batch(&mut conn, 128)
+            .await
+            .map_err(db)?
+        {}
+    }
     Ok(conn)
+}
+
+/// Populate at most `limit` pre-v25 graph rows after the schema transaction
+/// commits. The cursor and indexed rows commit together, so a crash repeats
+/// only the unfinished batch. Triggers keep concurrent graph edits current.
+pub async fn graph_search_backfill_batch(
+    conn: &mut SqliteConnection,
+    limit: i64,
+) -> Result<bool, sqlx::Error> {
+    if !(1..=1024).contains(&limit) {
+        return Err(sqlx::Error::Protocol(
+            "invalid graph search backfill limit".into(),
+        ));
+    }
+    // A current store has no backfill work, so opening it must stay a read
+    // even when another connection holds the write lock.
+    let complete: i64 =
+        sqlx::query_scalar("SELECT complete FROM atomic_graph_search_progress WHERE singleton=1")
+            .fetch_one(&mut *conn)
+            .await?;
+    if complete != 0 {
+        return Ok(true);
+    }
+    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+    let result = async {
+        let progress = sqlx::query(
+            "SELECT last_id,complete FROM atomic_graph_search_progress WHERE singleton=1",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        let complete: i64 = progress.try_get("complete")?;
+        if complete != 0 {
+            return Ok(true);
+        }
+        let last_id: String = progress.try_get("last_id")?;
+        let rows = sqlx::query(
+            "SELECT id,title,body FROM atomic_graph_items WHERE id>? ORDER BY id LIMIT ?",
+        )
+        .bind(last_id)
+        .bind(limit)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut cursor = String::new();
+        for row in &rows {
+            let id: String = row.try_get("id")?;
+            let title: String = row.try_get("title")?;
+            let body: String = row.try_get("body")?;
+            sqlx::query("INSERT OR IGNORE INTO atomic_graph_search_keys(item_id) VALUES (?)")
+                .bind(&id)
+                .execute(&mut *conn)
+                .await?;
+            let key: i64 =
+                sqlx::query_scalar("SELECT key FROM atomic_graph_search_keys WHERE item_id=?")
+                    .bind(&id)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            sqlx::query("DELETE FROM atomic_graph_search_fts WHERE rowid=?")
+                .bind(key)
+                .execute(&mut *conn)
+                .await?;
+            sqlx::query("INSERT INTO atomic_graph_search_fts(rowid,title,body) VALUES (?,?,?)")
+                .bind(key)
+                .bind(title)
+                .bind(body)
+                .execute(&mut *conn)
+                .await?;
+            cursor = id;
+        }
+        let done = rows.len() < limit as usize;
+        if done {
+            sqlx::query("UPDATE atomic_graph_search_progress SET complete=1 WHERE singleton=1")
+                .execute(&mut *conn)
+                .await?;
+        } else {
+            sqlx::query("UPDATE atomic_graph_search_progress SET last_id=? WHERE singleton=1")
+                .bind(cursor)
+                .execute(&mut *conn)
+                .await?;
+        }
+        Ok(done)
+    }
+    .await;
+    match result {
+        Ok(done) => {
+            sqlx::query("COMMIT").execute(&mut *conn).await?;
+            Ok(done)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            Err(error)
+        }
+    }
 }
 
 // The graph's SQLite store opens the same database as the gate store. A
@@ -1134,6 +1263,14 @@ async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i
             backfill_gate_projection_sqlite(&mut conn)
                 .await
                 .map_err(db)?;
+        }
+        if version >= 25 {
+            let mut search_backfill_complete = false;
+            while !search_backfill_complete {
+                search_backfill_complete = graph_search_backfill_batch(&mut conn, 128)
+                    .await
+                    .map_err(db)?;
+            }
         }
         Ok(version)
     }
@@ -1559,7 +1696,7 @@ async fn migrate_with_probe_hook(
             }
         }
         for m in migrations.iter().filter(|m| m.version > found) {
-            for sql in m.sql {
+            for sql in m.sql.iter().chain(sqlite_extra(m)) {
                 sqlx::query(*sql).execute(&mut *conn).await.map_err(db)?;
             }
             sqlx::query(
@@ -1729,7 +1866,7 @@ mod tests {
             .await
             .expect("marker");
         for migration in MIGRATIONS.iter().filter(|m| m.version <= version) {
-            for sql in migration.sql {
+            for sql in migration.sql.iter().chain(sqlite_extra(migration)) {
                 sqlx::query(*sql)
                     .execute(&mut conn)
                     .await
@@ -2000,6 +2137,135 @@ mod tests {
         assert_eq!(open_sqlite(&p).await.expect("open"), STORE_VERSION);
         assert_eq!(open_sqlite(&p).await.expect("reopen"), STORE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn search_upgrade_open_indexes_every_batch_before_returning() {
+        let p = db("search-upgrade-open");
+        open_sqlite_with(&p, &MIGRATIONS[..24])
+            .await
+            .expect("version 24 store");
+        let url = format!("sqlite://{}", p.display());
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("old connection");
+        for i in 0..260 {
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,'upgradeword','task',2,'open',NULL,'human','test',1)")
+                .bind(format!("at-upgrade-{i:03}"))
+                .bind(format!("Upgrade {i}"))
+                .execute(&mut conn)
+                .await
+                .expect("old item");
+        }
+        conn.close().await.expect("close old connection");
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("upgraded connection");
+        let hits: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_search_fts WHERE atomic_graph_search_fts MATCH 'upgradeword'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("search all upgraded rows");
+        let complete: i64 = sqlx::query_scalar(
+            "SELECT complete FROM atomic_graph_search_progress WHERE singleton=1",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("durable completion marker");
+        assert_eq!((hits, complete), (260, 1));
+        conn.close().await.expect("close upgraded connection");
+        std::fs::remove_file(p).expect("remove fixture");
+    }
+
+    #[tokio::test]
+    async fn search_backfill_resumes_after_edits_and_deletion_without_stale_rows() {
+        let p = db("search-backfill-resume");
+        open_sqlite_with(&p, &MIGRATIONS[..24])
+            .await
+            .expect("version 24 store");
+        let url = format!("sqlite://{}", p.display());
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("old connection");
+        for i in 0..260 {
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,?,'oldword','task',2,'open',NULL,'human','test',1)")
+                .bind(format!("at-search-{i:03}"))
+                .bind(format!("Original {i}"))
+                .execute(&mut conn).await.expect("old item");
+        }
+        migrate(&mut conn, &p.display().to_string(), MIGRATIONS)
+            .await
+            .expect("schema commit");
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM atomic_graph_search_fts")
+                .fetch_one(&mut conn)
+                .await
+                .expect("empty index"),
+            0
+        );
+        assert!(
+            !graph_search_backfill_batch(&mut conn, 128)
+                .await
+                .expect("first batch")
+        );
+        let cursor: String = sqlx::query_scalar("SELECT last_id FROM atomic_graph_search_progress")
+            .fetch_one(&mut conn)
+            .await
+            .expect("durable cursor");
+        assert_eq!(cursor, "at-search-127");
+        let mut inspection = inspect_sqlite(&p).await.expect("inspect pending backfill");
+        let inspected: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM atomic_graph_search_fts WHERE atomic_graph_search_fts MATCH 'oldword'",
+        )
+        .fetch_one(&mut inspection)
+        .await
+        .expect("complete snapshot search");
+        assert_eq!(inspected, 260);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM atomic_graph_search_fts")
+                .fetch_one(&mut conn)
+                .await
+                .expect("source still partial"),
+            128
+        );
+        inspection.close().await.expect("close inspection");
+        conn.close().await.expect("interrupt by closing connection");
+
+        let mut conn = SqliteConnection::connect(&url)
+            .await
+            .expect("resume connection");
+        sqlx::query("UPDATE atomic_graph_items SET title='freshword',body='current' WHERE id='at-search-001'")
+            .execute(&mut conn).await.expect("edit indexed item");
+        sqlx::query("UPDATE atomic_graph_items SET title='freshword',body='current' WHERE id='at-search-200'")
+            .execute(&mut conn).await.expect("edit not-yet-indexed item");
+        sqlx::query("DELETE FROM atomic_graph_items WHERE id='at-search-210'")
+            .execute(&mut conn)
+            .await
+            .expect("delete not-yet-indexed item");
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('at-search-000a','freshword','new','task',2,'open',NULL,'human','test',1)")
+            .execute(&mut conn).await.expect("insert behind cursor");
+        while !graph_search_backfill_batch(&mut conn, 37)
+            .await
+            .expect("resume batch")
+        {}
+        let old: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_search_fts WHERE atomic_graph_search_fts MATCH 'oldword'")
+            .fetch_one(&mut conn).await.expect("old hits");
+        let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_search_fts WHERE atomic_graph_search_fts MATCH 'freshword'")
+            .fetch_one(&mut conn).await.expect("fresh hits");
+        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM atomic_graph_search_fts")
+            .fetch_one(&mut conn)
+            .await
+            .expect("total hits");
+        assert_eq!((old, fresh, total), (257, 3, 260));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT complete FROM atomic_graph_search_progress")
+                .fetch_one(&mut conn)
+                .await
+                .expect("complete cursor"),
+            1
+        );
+        conn.close().await.expect("close");
+        std::fs::remove_file(p).expect("remove fixture");
     }
 
     #[tokio::test]
@@ -2321,7 +2587,7 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .expect("history");
-        assert_eq!(rows.len(), 15, "one baseline and fourteen new migrations");
+        assert_eq!(rows.len(), 16, "one baseline and fifteen new migrations");
         assert_eq!(rows[0].get::<i64, _>("version"), 10);
         assert_eq!(rows[0].get::<String, _>("name"), "legacy-baseline-v10");
         assert_eq!(rows[0].get::<Option<String>, _>("checksum"), None);
@@ -2424,14 +2690,14 @@ mod tests {
             rows[13].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[22]))
         );
-        assert_eq!(rows[14].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(rows[15].get::<i64, _>("version"), STORE_VERSION);
         assert_eq!(
-            rows[14].get::<String, _>("name"),
-            "work-graph-claim-handoffs"
+            rows[15].get::<String, _>("name"),
+            "sqlite-work-graph-search"
         );
         assert_eq!(
-            rows[14].get::<Option<String>, _>("checksum"),
-            Some(checksum(&MIGRATIONS[23]))
+            rows[15].get::<Option<String>, _>("checksum"),
+            Some(checksum(&MIGRATIONS[24]))
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -2854,7 +3120,7 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("legacy history");
-            assert_eq!(baseline.len(), 15);
+            assert_eq!(baseline.len(), 16);
             assert_eq!(baseline[0].get::<i64, _>("version"), 10);
             assert_eq!(baseline[0].get::<String, _>("name"), "legacy-baseline-v10");
             assert_eq!(baseline[0].get::<Option<String>, _>("checksum"), None);
@@ -2923,10 +3189,10 @@ mod tests {
                 baseline[13].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[22]))
             );
-            assert_eq!(baseline[14].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(baseline[15].get::<i64, _>("version"), STORE_VERSION);
             assert_eq!(
-                baseline[14].get::<Option<String>, _>("checksum"),
-                Some(checksum(&MIGRATIONS[23]))
+                baseline[15].get::<Option<String>, _>("checksum"),
+                Some(checksum(&MIGRATIONS[24]))
             );
         }
     }
@@ -2994,7 +3260,8 @@ mod tests {
         );
 
         let legacy = crate::testing::schema("hist_case_old").await;
-        legacy_postgres(legacy.url(), legacy.name(), 10, false).await;
+        let legacy_version = 10;
+        legacy_postgres(legacy.url(), legacy.name(), legacy_version, false).await;
         let mixed_legacy = legacy.name().to_ascii_uppercase();
         assert_eq!(
             open_postgres(legacy.url(), &mixed_legacy)
@@ -3017,7 +3284,10 @@ mod tests {
                 .expect("history")
                 .expect("recorded history")
                 .len(),
-            15
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version >= legacy_version)
+                .count()
         );
     }
 

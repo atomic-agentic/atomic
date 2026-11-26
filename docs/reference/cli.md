@@ -180,6 +180,8 @@ authentication](../getting-started/authentication.md).
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | `atomic graph import <file>` | Import beads JSONL into the local SQLite work graph; `-` reads stdin, `--dry-run` reports without writing, and a repeat leaves existing items unchanged | v0.2, SQLite |
 | `atomic graph export` | Write the local work graph as beads JSONL on stdout, one item per line | v0.2, SQLite |
+| `atomic graph search <phrase-or-id> [--status <status>] [--limit <n>]` | Search committed titles and descriptions, or resolve a punctuated exact ID; supports global `--json` | v0.2, SQLite |
+| `atomic graph search-rebuild` | Rebuild the local FTS5 index from committed items | v0.2, SQLite |
 | `atomic graph pin <item>` | Pin an imported open epic with the enrolled operator credential so a graph run can work its children; repeating the command is safe | v0.2, SQLite |
 | `atomic graph reconcile-failed <epic> --run <run>` | Release the named terminal failed graph run's epic binding after checking that it holds no item lease; requires the enrolled operator credential | v0.2, SQLite |
 | `atomic graph policy set <item> --require commit` | Set an item-specific close rule; `--require verified-commit --branch refs/heads/<name>` binds host-verified evidence to a branch; `policy show` and `policy clear` inspect and remove the rule | v0.2, SQLite |
