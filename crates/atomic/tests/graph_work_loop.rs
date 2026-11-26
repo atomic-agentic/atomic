@@ -2441,19 +2441,46 @@ fn crash_after_atomic_finalize_replays_publish_and_close_projections_without_a_t
 #[test]
 fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![
-            Reply::Tool {
-                name: "graph_create".into(),
-                arguments: json!({
-                    "title":"Tool follow-up", "body":"Agent-authored follow-up",
-                    "kind":"task", "priority":2,
-                }),
-            },
-            Reply::Text(r#"{"done":true}"#.into()),
-            Reply::Text(r#"{"verdict":"approve"}"#.into()),
-        ])
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let model = FakeModel::respond(move |request| {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => Reply::Tool {
+                    name: "graph_create".into(),
+                    arguments: json!({
+                        "title":"Tool follow-up", "body":"Agent-authored follow-up",
+                        "kind":"task", "priority":2,
+                    }),
+                },
+                1 => {
+                    let provisional_id = request["input"]
+                        .as_array()
+                        .and_then(|input| {
+                            input
+                                .iter()
+                                .rev()
+                                .find(|item| item["type"] == "function_call_output")
+                        })
+                        .and_then(|item| item["output"].as_str())
+                        .and_then(|output| serde_json::from_str::<Value>(output).ok())
+                        .and_then(|receipt| receipt["provisional_id"].as_str().map(str::to_owned));
+                    match provisional_id {
+                        Some(from) => Reply::Tool {
+                            name: "graph_dep_add".into(),
+                            arguments: json!({
+                                "from":from, "kind":"discovered-from", "to":CHILDREN[0],
+                            }),
+                        },
+                        None => Reply::Text("missing graph_create receipt".into()),
+                    }
+                }
+                2 => Reply::Text(r#"{"done":true}"#.into()),
+                3 => Reply::Text(r#"{"verdict":"approve"}"#.into()),
+                _ => Reply::Text("unexpected extra model call".into()),
+            }
+        })
         .await
         .expect("scripted graph tool and author output");
+        const FOLLOWUP_EDGE_SQL: &str = "SELECT COUNT(*) AS n FROM atomic_graph_edges e JOIN atomic_graph_items i ON i.id=e.source WHERE i.title='Tool follow-up' AND e.kind='discovered-from' AND e.target=?";
         let root = scratch("graph-tool-candidate-crash");
         let _ = seed(&root).await;
         leave_one_work_child(&root).await;
@@ -2487,6 +2514,10 @@ fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
                         )
                         .await?
                         .int("n")?;
+                    let links = tx
+                        .query_one(FOLLOWUP_EDGE_SQL, &[Param::Text(CHILDREN[0].into())])
+                        .await?
+                        .int("n")?;
                     let publications = tx
                         .query_one(
                             "SELECT COUNT(*) AS n FROM atomic_publications",
@@ -2494,15 +2525,15 @@ fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
                         )
                         .await?
                         .int("n")?;
-                    Ok((followups, publications))
+                    Ok((followups, links, publications))
                 })
             })
             .await
             .expect("inspect atomic graph publication");
         assert_eq!(
-            after_crash.0,
-            0,
-            "graph batch escaped before candidate publication; child stderr: {}",
+            after_crash,
+            (0, 0, 1),
+            "follow-up or source link escaped before candidate publication; child stderr: {}",
             String::from_utf8_lossy(&crashed.stderr)
         );
         let (r, u, b) = (root.clone(), url.clone(), base.clone());
@@ -2528,19 +2559,23 @@ fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
                         )
                         .await?
                         .int("n")?;
+                    let links = tx
+                        .query_one(FOLLOWUP_EDGE_SQL, &[Param::Text(CHILDREN[0].into())])
+                        .await?
+                        .int("n")?;
                     let publications = tx
                         .query_one("SELECT COUNT(*) AS n FROM atomic_publications", &[])
                         .await?
                         .int("n")?;
-                    Ok((followups, publications))
+                    Ok((followups, links, publications))
                 })
             })
             .await
             .expect("inspect committed graph publication");
         assert_eq!(
             after_commit,
-            (1, 2),
-            "graph batch was not atomic with publication"
+            (1, 1, 2),
+            "follow-up and discovered-from link were not atomic with publication"
         );
         let (r, u, b) = (root.clone(), url, base);
         let recovered = tokio::task::spawn_blocking(move || child(&r, &u, &b, "recover", None))
@@ -2549,27 +2584,38 @@ fn graph_tool_followup_publishes_with_candidate_and_replays_after_crash() {
         assert!(recovered.success(), "graph tool recovery: {recovered}");
         assert_eq!(
             model.calls(),
-            3,
+            4,
             "recovery repeated the author or reviewer call"
         );
         assert!(
-            model.requests()[2].to_string().contains("Tool follow-up"),
-            "reviewer did not see the untrusted proposed graph write"
+            model.requests()[3].to_string().contains("Tool follow-up")
+                && model.requests()[3].to_string().contains("discovered-from"),
+            "reviewer did not see the untrusted follow-up and source link"
         );
-        let final_count = rt
+        let final_counts = rt
             .control_transaction(|mut tx| {
                 Box::pin(async move {
-                    tx.query_one(
-                        "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Tool follow-up'",
-                        &[],
-                    )
-                    .await?
-                    .int("n")
+                    let followups = tx
+                        .query_one(
+                            "SELECT COUNT(*) AS n FROM atomic_graph_items WHERE title='Tool follow-up'",
+                            &[],
+                        )
+                        .await?
+                        .int("n")?;
+                    let links = tx
+                        .query_one(FOLLOWUP_EDGE_SQL, &[Param::Text(CHILDREN[0].into())])
+                        .await?
+                        .int("n")?;
+                    Ok((followups, links))
                 })
             })
             .await
             .expect("inspect replay");
-        assert_eq!(final_count, 1, "replay duplicated the follow-up");
+        assert_eq!(
+            final_counts,
+            (1, 1),
+            "replay duplicated the follow-up or its source link"
+        );
     });
 }
 
