@@ -359,6 +359,13 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE UNIQUE INDEX atomic_graph_gate_projection_key ON atomic_graph_items (projected_gate_id)",
         ],
     },
+    Migration {
+        version: 24,
+        name: "work-graph-claim-handoffs",
+        sql: &[
+            "CREATE TABLE atomic_graph_handoffs (item_id TEXT NOT NULL, release_epoch BIGINT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY (item_id,release_epoch))",
+        ],
+    },
 ];
 
 const HISTORY_TABLE: &str = "CREATE TABLE atomic_store_history (
@@ -2314,7 +2321,7 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .expect("history");
-        assert_eq!(rows.len(), 14, "one baseline and thirteen new migrations");
+        assert_eq!(rows.len(), 15, "one baseline and fourteen new migrations");
         assert_eq!(rows[0].get::<i64, _>("version"), 10);
         assert_eq!(rows[0].get::<String, _>("name"), "legacy-baseline-v10");
         assert_eq!(rows[0].get::<Option<String>, _>("checksum"), None);
@@ -2408,7 +2415,7 @@ mod tests {
             rows[12].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[21]))
         );
-        assert_eq!(rows[13].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(rows[13].get::<i64, _>("version"), 23);
         assert_eq!(
             rows[13].get::<String, _>("name"),
             "open-gate-graph-projection"
@@ -2416,6 +2423,15 @@ mod tests {
         assert_eq!(
             rows[13].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[22]))
+        );
+        assert_eq!(rows[14].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(
+            rows[14].get::<String, _>("name"),
+            "work-graph-claim-handoffs"
+        );
+        assert_eq!(
+            rows[14].get::<Option<String>, _>("checksum"),
+            Some(checksum(&MIGRATIONS[23]))
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -2838,7 +2854,7 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("legacy history");
-            assert_eq!(baseline.len(), 14);
+            assert_eq!(baseline.len(), 15);
             assert_eq!(baseline[0].get::<i64, _>("version"), 10);
             assert_eq!(baseline[0].get::<String, _>("name"), "legacy-baseline-v10");
             assert_eq!(baseline[0].get::<Option<String>, _>("checksum"), None);
@@ -2902,10 +2918,15 @@ mod tests {
                 baseline[12].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[21]))
             );
-            assert_eq!(baseline[13].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(baseline[13].get::<i64, _>("version"), 23);
             assert_eq!(
                 baseline[13].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[22]))
+            );
+            assert_eq!(baseline[14].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(
+                baseline[14].get::<Option<String>, _>("checksum"),
+                Some(checksum(&MIGRATIONS[23]))
             );
         }
     }
@@ -2996,7 +3017,7 @@ mod tests {
                 .expect("history")
                 .expect("recorded history")
                 .len(),
-            14
+            15
         );
     }
 

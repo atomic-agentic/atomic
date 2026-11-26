@@ -1,0 +1,1 @@
+graph-handoff-prompt-delivery|crates/atomic/src/pipeline.rs|graph_handoff_brief: graph_handoff_brief.as_deref()|graph_handoff_brief: None|-p atomic-agentic --test graph_work_loop next_claimant_receives_fenced_handoff_with_file_statuses

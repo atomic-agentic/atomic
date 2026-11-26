@@ -90,6 +90,14 @@ or publication. Test and HTTP criteria require a runner that has verified
 confinement and hides other projects’ scratch directories. A failed criterion
 enters a bounded repair round. Diagnostic text is redacted before atomic
 checkpoints it or passes it to the repair model.
+On criterion failure or before a human review gate, that loop records a
+bounded, agent-trust handoff in the same transaction that releases its claim.
+The next claimant receives the previous attempt, failure and lesson in its
+author prompt. Atomic compares recorded Git tree entries with the next
+claimant's base and marks each retained file changed or unchanged, without
+passing object IDs to the model. If a candidate changes more than 128 files
+or contains paths the handoff cannot safely represent, the note states how
+many paths were omitted; the claim still releases.
 
 `atomic run <workflow> --graph-epic <id> --lanes 1` works ready coding items
 in order. The parallel child workflow machinery has separate durable steps
