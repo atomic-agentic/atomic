@@ -578,6 +578,6 @@ Windows ZIP on Windows Server 2025 before signing. See
 [verifying a download](../getting-started/installation.md#verifying-a-download)
 for the published artifacts.
 
-Installation packaging, standalone-session behavior and some control commands
-remain open decisions, tracked with the rest of the work in the project's issue
-tracker. No feature in this table should be read as already shipped.
+v0.1 is the first shipped stage. Later rows identify the feature sequence; the
+[release page](https://github.com/atomic-agentic/atomic/releases) identifies
+which versions and artifacts are currently available.
