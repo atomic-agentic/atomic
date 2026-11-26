@@ -4,6 +4,7 @@
 # The process is killed at each named graph boundary. Recovery checks the
 # claim and final close, and counts scripted model calls.
 graph_work_loop process_crashes_at_each_graph_boundary_recover_without_repeating_completed_turns
+graph_work_loop process_killed_during_graph_model_turn_reuses_its_claim_on_recovery
 graph_work_loop parallel_graph_crash_replays_completed_lane_without_another_model_call
 
 ## The next agent to claim an item gets the earlier holder's handoff, with each file flagged as changed or untouched since.
