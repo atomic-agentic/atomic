@@ -323,6 +323,12 @@ fn real_main() -> anyhow::Result<()> {
         failure::report(&refused, cli.json);
         std::process::exit(1);
     }
+    if let Some(Command::Run(args)) = &cli.command
+        && let Err(refused) = runs::admit_command_pool(args)
+    {
+        failure::report(&refused, cli.json);
+        std::process::exit(1);
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. Without one, nothing starts: there is no Codex
     // home to give it.

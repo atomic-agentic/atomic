@@ -557,12 +557,15 @@ fn receipt(request: &Value, number: Option<u64>) -> Value {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const PROVIDER: &[u8] = include_bytes!("../tests/support/delivery_remote.py");
     const HEAD: &str = "b1228db9b29124d5a071673ca8192f4d3a915377";
     const SECOND: &str = "e792c2f3194be3dff25dc7946d67bb2d91a0c925";
+    static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture(PathBuf);
 
@@ -572,12 +575,29 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("delivery remote test operation succeeds")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "atomic-delivery-adapter-{}-{nonce}",
-                std::process::id()
-            ));
+            Self::with_nonce(nonce)
+        }
+
+        fn with_nonce(nonce: u128) -> Self {
+            // CI can start two tests in the same clock tick. Create the root
+            // exclusively so a reused PID or stale fixture cannot share a
+            // fake provider's durable state with this test.
+            let path = (0..1024)
+                .find_map(|_| {
+                    let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+                    let path = std::env::temp_dir().join(format!(
+                        "atomic-delivery-adapter-{}-{nonce}-{sequence}",
+                        std::process::id()
+                    ));
+                    match fs::create_dir(&path) {
+                        Ok(()) => Some(path),
+                        Err(error) if error.kind() == ErrorKind::AlreadyExists => None,
+                        Err(error) => panic!("create delivery fixture root: {error}"),
+                    }
+                })
+                .expect("unique delivery fixture root after 1024 attempts");
             let dir = path.join("delivery");
-            fs::create_dir_all(&dir).expect("delivery remote test operation succeeds");
+            fs::create_dir(&dir).expect("delivery remote test operation succeeds");
             fs::write(dir.join("adapter"), PROVIDER)
                 .expect("delivery remote test operation succeeds");
             fs::set_permissions(dir.join("adapter"), fs::Permissions::from_mode(0o700))
@@ -592,6 +612,25 @@ mod tests {
         fn remote(&self) -> DeliveryRemote {
             DeliveryRemote::from_private(&self.0).expect("delivery remote test operation succeeds")
         }
+    }
+
+    #[test]
+    fn delivery_remote_fixtures_do_not_share_state_in_one_clock_tick() {
+        let (first, second) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| Fixture::with_nonce(42));
+            let b = scope.spawn(|| Fixture::with_nonce(42));
+            (
+                a.join().expect("first fixture"),
+                b.join().expect("second fixture"),
+            )
+        });
+        assert_ne!(first.0, second.0);
+        fs::write(first.0.join("delivery/remote-state.json"), b"first-only")
+            .expect("write first fake provider state");
+        assert!(
+            !second.0.join("delivery/remote-state.json").exists(),
+            "concurrent fixtures must not share remote state"
+        );
     }
 
     impl Drop for Fixture {

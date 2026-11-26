@@ -4,8 +4,8 @@
 //! attest its own review or to recreate evidence from a source run.
 
 use crate::pipeline::{
-    FOLLOWUP_REASON_PREFIX, GRAPH_PIPELINE, GraphAcceptance, GraphPipelineRun, LAYOUT_VERSION,
-    Step, panel_acceptance_reason, route_review_findings,
+    FOLLOWUP_REASON_PREFIX, GRAPH_LANE, GRAPH_PIPELINE, GraphAcceptance, GraphLaneRun,
+    GraphPipelineRun, LAYOUT_VERSION, Step, panel_acceptance_reason, route_review_findings,
 };
 use anyhow::{Context, Result, bail, ensure};
 use atomic_durable::gate::{self, Resolution, Verdict};
@@ -24,6 +24,10 @@ pub struct DeliverySource {
     pub project: Option<String>,
     /// Durable workflow ID that created the accepted item.
     pub source_run: String,
+    /// Child run that recorded coding evidence for a parallel lane. Older
+    /// single-lane records keep their evidence in `source_run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_run: Option<String>,
     /// Pinned epic that owned the item when its run began.
     pub epic_id: String,
     /// Exact graph coding step prefix, including ordinal and template ID.
@@ -50,6 +54,12 @@ pub struct DeliverySource {
     pub trial_main_ref: String,
     /// Protected branch head whose trial merge checks passed.
     pub trial_checked_sha: String,
+}
+
+impl DeliverySource {
+    fn evidence_run(&self) -> &str {
+        self.evidence_run.as_deref().unwrap_or(&self.source_run)
+    }
 }
 
 fn step<'a>(steps: &'a [StepRecord], name: &str) -> Result<&'a StepRecord> {
@@ -247,10 +257,10 @@ pub async fn approved_graph_item(
         self_review.controls_atom.is_some() || self_review.selected_controls.is_empty(),
         "source selected controls have no proof atom"
     );
-    let steps = rt.steps(source_run).await?;
-    step(&steps, "epic.bind")?;
+    let parent_steps = rt.steps(source_run).await?;
+    step(&parent_steps, "epic.bind")?;
     let claim_name = format!("graph.{number}.claim");
-    let claimed: ClaimNext = serde_json::from_value(output(&steps, &claim_name)?.clone())?;
+    let claimed: ClaimNext = serde_json::from_value(output(&parent_steps, &claim_name)?.clone())?;
     let ClaimNext::Claimed { item, lease } = claimed else {
         bail!("source graph step did not claim an item");
     };
@@ -258,11 +268,42 @@ pub async fn approved_graph_item(
         lease.claimant == source_run && lease.item_id == item.id,
         "source claim has wrong run or item"
     );
+    let evidence_run = if frozen.lanes > 1 {
+        let child_name = format!("graph.{number}.child");
+        let child_id: String = serde_json::from_value(output(&parent_steps, &child_name)?.clone())?;
+        ensure!(
+            child_id.starts_with(&format!("{source_run}-")),
+            "graph lane child is not linked to its parent"
+        );
+        let record = rt
+            .own_run_record(&child_id)
+            .await?
+            .context("graph lane child is absent from this project")?;
+        ensure!(
+            record.workflow == GRAPH_LANE && record.version == LAYOUT_VERSION,
+            "graph lane child has a different workflow or layout"
+        );
+        let child: GraphLaneRun = serde_json::from_value(record.input)?;
+        ensure!(
+            child.claim.parent == source_run
+                && child.claim.ordinal == number.parse::<usize>()?
+                && child.claim.item == *item
+                && child.claim.lease == lease
+                && child.epic == frozen.epic
+                && child.run.pipeline.pins == frozen.run.pipeline.pins,
+            "graph lane child differs from its parent claim or pinned source"
+        );
+        Some(child_id)
+    } else {
+        None
+    };
+    let evidence_id = evidence_run.as_deref().unwrap_or(source_run);
+    let steps = rt.steps(evidence_id).await?;
     let accepted_name = format!("{base_step}.accepted");
     let receipt: GraphAcceptance = serde_json::from_value(output(&steps, &accepted_name)?.clone())?;
     let accepted = &receipt.acceptance;
     ensure!(accepted.accepted, "source candidate was not accepted");
-    let (round, candidate, turn_name) = round_for(base_step, &steps, accepted, source_run)?;
+    let (round, candidate, turn_name) = round_for(base_step, &steps, accepted, evidence_id)?;
     ensure!(
         round <= review.rounds,
         "accepted repair exceeds frozen policy"
@@ -311,7 +352,7 @@ pub async fn approved_graph_item(
     let mut previous = step(&steps, &trial_name)?;
     for (index, row) in self_review.selected_controls.iter().enumerate() {
         let name = format!("{base_step}.controls.{round}.{index}");
-        let proof = turn(&steps, &format!("{name}.turn"), source_run)?;
+        let proof = turn(&steps, &format!("{name}.turn"), evidence_id)?;
         let proof_output = output(&steps, &format!("{name}.publish"))?;
         let entry = proof_output
             .get("rows")
@@ -348,7 +389,7 @@ pub async fn approved_graph_item(
         .await?;
     }
     let self_name = format!("{base_step}.self_review.{round}");
-    let self_candidate = turn(&steps, &format!("{self_name}.turn"), source_run)?;
+    let self_candidate = turn(&steps, &format!("{self_name}.turn"), evidence_id)?;
     let self_output = output(&steps, &format!("{self_name}.publish"))?;
     ensure!(
         self_output
@@ -380,7 +421,7 @@ pub async fn approved_graph_item(
     let mut panel = Vec::new();
     for index in 0..2 {
         let name = format!("{base_step}.review.{round}.{index}");
-        let reviewer = turn(&steps, &format!("{name}.turn"), source_run)?;
+        let reviewer = turn(&steps, &format!("{name}.turn"), evidence_id)?;
         let verdict = output(&steps, &format!("{name}.publish"))?;
         ensure!(
             verdict.get("verdict").and_then(Value::as_str) == Some("approve"),
@@ -432,7 +473,7 @@ pub async fn approved_graph_item(
     );
     let lease = if deferred {
         let gate_step = format!("{base_step}.review");
-        let gate = gate::find(rt, &gate::gate_id(source_run, &gate_step))
+        let gate = gate::find(rt, &gate::gate_id(evidence_id, &gate_step))
             .await?
             .context("accepted follow-ups lack a human classification gate")?;
         verify_classification(
@@ -514,6 +555,7 @@ pub async fn approved_graph_item(
     let source = DeliverySource {
         project: rt.project().map(str::to_owned),
         source_run: source_run.to_owned(),
+        evidence_run,
         epic_id: frozen.epic,
         base_step: base_step.to_owned(),
         item_id: item.id,
@@ -612,19 +654,20 @@ async fn recheck_classification_in(
 ) -> Result<()> {
     let base = &source.base_step;
     let round = source.review_round;
+    let evidence_run = source.evidence_run();
     let gate_step = format!("{base}.review");
-    let gate = gate::find_in(tx, &gate::gate_id(&source.source_run, &gate_step), project)
+    let gate = gate::find_in(tx, &gate::gate_id(evidence_run, &gate_step), project)
         .await?
         .context("delivery follow-ups lack a human classification gate")?;
     let opened: gate::Gate = serde_json::from_value(
-        checkpoint_in(tx, &source.source_run, &format!("{gate_step}.gate")).await?,
+        checkpoint_in(tx, evidence_run, &format!("{gate_step}.gate")).await?,
     )
     .context("invalid opened classification gate checkpoint")?;
     ensure!(
         opened.id == gate.id
-            && opened.run == source.source_run
+            && opened.run == evidence_run
             && opened.step == gate_step
-            && gate.run == source.source_run
+            && gate.run == evidence_run
             && gate.step == gate_step
             && opened.show == gate.show
             && opened.title == gate.title
@@ -637,8 +680,8 @@ async fn recheck_classification_in(
     } else {
         format!("{base}.repair.{round}.turn")
     };
-    let recorded = checkpoint_in(tx, &source.source_run, &author).await?;
-    let candidate = candidate_from_turn(&recorded, &author, &source.source_run)?;
+    let recorded = checkpoint_in(tx, evidence_run, &author).await?;
+    let candidate = candidate_from_turn(&recorded, &author, evidence_run)?;
     ensure!(
         candidate.id == source.candidate_id
             && candidate.digest == source.digest
@@ -651,7 +694,7 @@ async fn recheck_classification_in(
         "delivery classification differs from its accepted candidate"
     );
     let receipt: GraphAcceptance = serde_json::from_value(
-        checkpoint_in(tx, &source.source_run, &format!("{base}.accepted")).await?,
+        checkpoint_in(tx, evidence_run, &format!("{base}.accepted")).await?,
     )?;
     let path = receipt
         .verified_formatting_path
@@ -674,7 +717,7 @@ async fn recheck_classification_in(
     let mut expected_followups = Vec::new();
     for (index, entry) in reviewers.iter().enumerate() {
         let name = format!("{base}.review.{round}.{index}.publish");
-        let verdict = checkpoint_in(tx, &source.source_run, &name).await?;
+        let verdict = checkpoint_in(tx, evidence_run, &name).await?;
         ensure!(
             verdict["verdict"] == "approve",
             "independent reviewer did not approve"
@@ -723,11 +766,39 @@ pub async fn revalidate_delivery_source_in(
         ),
         "source moved to a different project state"
     );
+    let evidence_run = source.evidence_run();
+    if let Some(child) = &source.evidence_run {
+        let ordinal = source
+            .base_step
+            .strip_prefix("graph.")
+            .and_then(|tail| tail.split_once('.'))
+            .map(|(number, _)| number)
+            .context("invalid graph lane step")?;
+        let linked: String = serde_json::from_value(
+            checkpoint_in(tx, &source.source_run, &format!("graph.{ordinal}.child")).await?,
+        )?;
+        ensure!(linked == *child, "source graph lane link changed");
+        let lane = tx
+            .query_opt(
+                "SELECT w.name,p.project FROM workflow_status w LEFT JOIN atomic_run_projects p ON p.run_id=w.workflow_uuid WHERE w.workflow_uuid=?",
+                &[Param::Text(child.clone())],
+            )
+            .await?
+            .context("source graph lane disappeared")?;
+        ensure!(
+            lane.text("name")? == GRAPH_LANE
+                && same_state_scope(
+                    lane.text_opt("project")?.as_deref(),
+                    source.project.as_deref()
+                ),
+            "source graph lane changed workflow or project"
+        );
+    }
     let accepted = tx
         .query_opt(
             "SELECT output,error FROM operation_outputs WHERE workflow_uuid=? AND function_name=?",
             &[
-                Param::Text(source.source_run.clone()),
+                Param::Text(evidence_run.to_owned()),
                 Param::Text(format!("{}.accepted", source.base_step)),
             ],
         )
@@ -760,7 +831,7 @@ pub async fn revalidate_delivery_source_in(
         recheck_classification_in(tx, source, project.as_deref()).await?;
     } else {
         let step = format!("{}.review", source.base_step);
-        let id = gate::gate_id(&source.source_run, &step);
+        let id = gate::gate_id(evidence_run, &step);
         ensure!(
             gate::find_in(tx, &id, project.as_deref()).await?.is_none(),
             "source review gate is missing its human classification acceptance"
@@ -781,7 +852,7 @@ pub async fn revalidate_delivery_source_in(
         .query_opt(
             "SELECT output,error FROM operation_outputs WHERE workflow_uuid=? AND function_name=?",
             &[
-                Param::Text(source.source_run.clone()),
+                Param::Text(evidence_run.to_owned()),
                 Param::Text(format!(
                     "{}.finalize.{}",
                     source.base_step, source.occurrence
@@ -805,7 +876,7 @@ pub async fn revalidate_delivery_source_in(
         .query_opt(
             "SELECT output,error FROM operation_outputs WHERE workflow_uuid=? AND function_name=?",
             &[
-                Param::Text(source.source_run.clone()),
+                Param::Text(evidence_run.to_owned()),
                 Param::Text(format!(
                     "{}.trial_merge.{}",
                     source.base_step, source.review_round
@@ -921,6 +992,7 @@ mod tests {
         StepRecord {
             step_id: position,
             name: name.into(),
+            child_workflow_id: None,
             output: Some(json!({"Candidate": candidate})),
             error: None,
             started_at: Some(position as i64),

@@ -473,10 +473,37 @@ impl SqliteStore {
         run_id: &str,
         step_commit: &StepCommit,
     ) -> Result<(), StoreError> {
+        self.link_verified_commit_from(lease, worktrees, run_id, run_id, step_commit)
+            .await
+    }
+
+    /// Verify a child lane's branch for a lease held by its parent graph run.
+    /// The caller verifies the child's frozen claim; this store rechecks the
+    /// durable parent-child link and fences the parent token in its write.
+    pub async fn link_verified_child_commit(
+        &self,
+        lease: Lease,
+        worktrees: &Worktrees,
+        parent_run: &str,
+        child_run: &str,
+        step_commit: &StepCommit,
+    ) -> Result<(), StoreError> {
+        self.link_verified_commit_from(lease, worktrees, parent_run, child_run, step_commit)
+            .await
+    }
+
+    async fn link_verified_commit_from(
+        &self,
+        lease: Lease,
+        worktrees: &Worktrees,
+        claimant_run: &str,
+        worktree_run: &str,
+        step_commit: &StepCommit,
+    ) -> Result<(), StoreError> {
         // This method mints evidence that the model-facing graph API cannot.
         // The credential is verified again by `run` inside the write Tx.
         let principal = self.verified_operator()?;
-        if lease.claimant != run_id {
+        if lease.claimant != claimant_run {
             return Err(StoreError::Fenced {
                 item_id: lease.item_id,
                 epoch: lease.epoch,
@@ -500,7 +527,7 @@ impl SqliteStore {
             });
         }
         let Some(proof) = worktrees
-            .verify_step_commit_on_branch(run_id, step_commit, &branch)
+            .verify_step_commit_on_branch(worktree_run, step_commit, &branch)
             .map_err(db)?
         else {
             return Err(StoreError::NeedsEvidence {
@@ -508,6 +535,8 @@ impl SqliteStore {
                 required: "host-verified commit on the authorized branch".into(),
             });
         };
+        let child_run = (worktree_run != claimant_run).then(|| worktree_run.to_owned());
+        let parent_run = claimant_run.to_owned();
         self.run(move |conn| {
             Box::pin(async move {
                 authorize_lease(
@@ -518,6 +547,26 @@ impl SqliteStore {
                 )
                 .await?;
                 check_lease(conn, &lease).await?;
+                if let Some(child) = child_run {
+                    let linked = sqlx::query(
+                        "SELECT parent_workflow_id FROM workflow_status WHERE workflow_uuid=?",
+                    )
+                    .bind(&child)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(db)?;
+                    let parent: Option<String> = linked
+                        .as_ref()
+                        .map(|row| row.try_get("parent_workflow_id").map_err(db))
+                        .transpose()?
+                        .flatten();
+                    if parent.as_deref() != Some(parent_run.as_str()) {
+                        return Err(StoreError::Fenced {
+                            item_id: lease.item_id.clone(),
+                            epoch: lease.epoch,
+                        });
+                    }
+                }
                 let current = sqlx::query("SELECT requires_verified_commit,authorized_branch FROM atomic_graph_item_policy WHERE item_id=?")
                     .bind(&lease.item_id).fetch_optional(&mut *conn).await.map_err(db)?;
                 let still_authorized = match current {

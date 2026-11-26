@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -14,6 +15,75 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from zipfile import ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def context_checkpoint(exe, env):
+    """Exercise direct checkpoint publication through the extracted CLI."""
+    context_project = ROOT / "examples/12-execution-context"
+    state = Path(env["ATOMIC_HOME"])
+
+    def command(run_id):
+        return [exe, "render", "atoms/context-reply.atom.astro", "--input",
+                "fixtures/context-reply/ordinary.input.json", "--context-settings",
+                "context.settings.json", "--run-id", run_id]
+
+    def frozen_region(output):
+        prompt = json.loads(output)
+        frozen_region = re.findall(
+            r'<(data-[0-9a-f]+) path="context\.env\.SUPPORT_REGION" origin="team">([^<]+)</\1>',
+            prompt["user"],
+        )
+        values = [value for _, value in frozen_region]
+        if len(values) != 1:
+            raise AssertionError(f"Expected one tagged context region, got {values}")
+        return values[0]
+
+    def checkpoint_file(run_id):
+        name = hashlib.sha256(run_id.encode()).hexdigest() + ".json"
+        files = list(state.rglob(name))
+        if len(files) != 1:
+            raise AssertionError(f"Expected one complete checkpoint for {run_id}, got {files}")
+        return files[0]
+
+    run_id = "windows-context-smoke"
+    for region in ["eu-west", "us-east"]:
+        result = subprocess.run(command(run_id), cwd=context_project,
+                                env={**env, "SUPPORT_REGION": region}, check=True,
+                                capture_output=True, text=True, timeout=120)
+        if frozen_region(result.stdout) != "eu-west":
+            raise AssertionError("Direct invocation did not reuse its frozen context")
+
+    key = state / "keys/context.key"
+    if not key.is_file() or len(key.read_bytes()) != 32:
+        raise AssertionError("Direct invocation did not create its authentication key")
+    checkpoint_file(run_id)
+
+    race_id = "windows-context-race"
+    writers = [subprocess.Popen(command(race_id), cwd=context_project,
+                                env={**env, "SUPPORT_REGION": region},
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+               for region in ["eu-west", "us-east"]]
+    winners = []
+    for writer in writers:
+        output, error = writer.communicate(timeout=120)
+        if writer.returncode:
+            raise AssertionError(f"Concurrent context render failed: {error}")
+        winners.append(frozen_region(output))
+    if len(set(winners)) != 1 or winners[0] not in {"eu-west", "us-east"}:
+        raise AssertionError(f"Concurrent publishers disagreed: {winners}")
+    checkpoint_file(race_id)
+    if list(state.rglob(".context-*.tmp")):
+        raise AssertionError("Concurrent context publishers left temporary files")
+
+    file = checkpoint_file(run_id)
+    envelope = json.loads(file.read_text(encoding="utf-8"))
+    envelope["snapshot"]["context"]["profile"] = "prod"
+    file.write_text(json.dumps(envelope), encoding="utf-8")
+    rejected = subprocess.run(command(run_id), cwd=context_project,
+                              env={**env, "SUPPORT_REGION": "us-east"},
+                              capture_output=True, text=True, timeout=120)
+    if rejected.returncode == 0 or "authentication" not in rejected.stderr.lower():
+        raise AssertionError("Tampered context checkpoint was not rejected")
 
 
 def coding_turn(exe, project, repository, state, env):
@@ -139,6 +209,7 @@ def main():
         for args in [["--version"], ["check"],
                      ["render", "atoms/implement-step.atom.astro", "--input", "fixtures/implement-step/quantity.input.json"]]:
             subprocess.run([exe, *args], cwd=project, env=env, check=True, timeout=120)
+        context_checkpoint(exe, env)
         # Reuse the project to cover Codex's already-provisioned helper cache.
         for _ in range(2):
             coding_turn(exe, project, dest / "repository", state, env)

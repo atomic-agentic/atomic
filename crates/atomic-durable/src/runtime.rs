@@ -120,6 +120,8 @@ pub struct StepRecord {
     pub step_id: i32,
     /// Its name.
     pub name: String,
+    /// Child workflow this durable invocation started, if it was a child call.
+    pub child_workflow_id: Option<String>,
     /// What it returned, if it finished.
     pub output: Option<Value>,
     /// Its error, if it failed.
@@ -475,6 +477,26 @@ impl Tx<'_, '_> {
 /// A boxed future borrowing a transaction for `'t`.
 pub type TxFuture<'t, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 't>>;
 
+/// A child workflow with its own ordered checkpoint stream. The parent may
+/// start several children in a fixed order, then await their results in any
+/// order without changing its own durable step layout.
+pub struct ChildWorkflow<O> {
+    id: String,
+    result: Pin<Box<dyn Future<Output = Result<O>> + Send>>,
+}
+
+impl<O> ChildWorkflow<O> {
+    /// The durable child run ID, stable across parent replay.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Wait for the child result; polling this does not take a parent step.
+    pub async fn result(self) -> Result<O> {
+        self.result.await
+    }
+}
+
 /// What a running workflow can do.
 pub trait WorkflowContext: Clone + Send + Sync + 'static {
     /// The workflow's id.
@@ -483,6 +505,17 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
     /// The project the workflow runs for, as its runtime was opened with
     /// (see [`DurableRuntime::project`]).
     fn project(&self) -> Option<&str>;
+
+    /// Start a durable child in the parent's deterministic operation order.
+    /// The child owns its own step positions and survives a crash independently.
+    fn start_child<I, O>(
+        &self,
+        name: &str,
+        input: I,
+    ) -> impl Future<Output = Result<ChildWorkflow<O>>> + Send
+    where
+        I: Serialize + Send + 'static,
+        O: DeserializeOwned + Send + 'static;
 
     /// Run `body` as a durable step: its output is recorded, and on replay
     /// it is returned without running `body` again. The body runs at least
@@ -795,6 +828,31 @@ impl WorkflowContext for DurareContext {
 
     fn project(&self) -> Option<&str> {
         self.project.as_deref()
+    }
+
+    fn start_child<I, O>(
+        &self,
+        name: &str,
+        input: I,
+    ) -> impl Future<Output = Result<ChildWorkflow<O>>> + Send
+    where
+        I: Serialize + Send + 'static,
+        O: DeserializeOwned + Send + 'static,
+    {
+        // Claim the parent position now, before any child can run. Its own
+        // context then records all of its turns in an independent sequence.
+        let pending =
+            self.engine
+                .start_workflow::<I, O>(name, input, durare::WorkflowOptions::default());
+        let lost = self.lost.clone();
+        async move {
+            let handle = lost.keep(pending.await.map_err(from_durare))?;
+            let id = handle.id().to_owned();
+            Ok(ChildWorkflow {
+                id,
+                result: Box::pin(async move { handle.result().await.map_err(from_durare) }),
+            })
+        }
     }
 
     fn step<T, F, Fut>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -1326,6 +1384,53 @@ impl Durare {
         format!("{RESUME_QUEUES}{}/{run}", self.engine.executor_id())
     }
 
+    /// Direct children recorded by durare as invocations of `parent`.
+    /// A child call is durable before the parent's next checkpoint, so this
+    /// also finds children created just before a process crash.
+    pub async fn child_runs(&self, parent: &str) -> Result<Vec<String>> {
+        if self.own_run_record(parent).await?.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut children = Vec::new();
+        for step in self.steps(parent).await? {
+            if let Some(child) = step.child_workflow_id {
+                if self.own_run_record(&child).await?.is_none() {
+                    return Err(DurableError::Engine(format!(
+                        "child {child} of run {parent} is outside this project"
+                    )));
+                }
+                children.push(child);
+            }
+        }
+        Ok(children)
+    }
+
+    /// Resume a graph parent and the children it already started. Child
+    /// queues are taken before this is called by `take_resumed_runs`.
+    pub async fn resume_family(&self, parent: &str) -> Result<()> {
+        let owner = self
+            .own_run_record(parent)
+            .await?
+            .ok_or_else(|| DurableError::Engine(format!("run {parent} is absent")))?
+            .executor;
+        for child in self.child_runs(parent).await? {
+            let record = self
+                .own_run_record(&child)
+                .await?
+                .ok_or_else(|| DurableError::Engine(format!("child {child} is absent")))?;
+            if record.status != RunStatus::Succeeded && record.executor != owner {
+                return Err(DurableError::Engine(format!(
+                    "child {child} is owned by executor {}, not its parent run's executor {owner}",
+                    record.executor
+                )));
+            }
+            if record.status != RunStatus::Succeeded {
+                self.resume(&child).await?;
+            }
+        }
+        self.resume(parent).await
+    }
+
     /// Take resumed runs of this executor: run `only`, or with `None`,
     /// every run already waiting on one of this executor's resume queues.
     /// [`DurableRuntime::resume`] puts a run on its queue, which only an
@@ -1334,7 +1439,11 @@ impl Durare {
     /// [`launch`](DurableRuntime::launch).
     pub async fn take_resumed_runs(&mut self, only: Option<&str>) -> Result<()> {
         let queues: Vec<String> = match only {
-            Some(run) => vec![self.resume_queue(run)],
+            Some(run) => {
+                let mut ids = vec![run.to_owned()];
+                ids.extend(self.child_runs(run).await?);
+                ids.iter().map(|id| self.resume_queue(id)).collect()
+            }
             None => {
                 // Only this project's: another's run on a queue of the same
                 // executor identity is not this engine's to run.
@@ -1907,6 +2016,7 @@ impl DurableRuntime for Durare {
                 .map(|s| StepRecord {
                     step_id: s.step_id,
                     name: s.name,
+                    child_workflow_id: s.child_workflow_id,
                     output: s.output,
                     error: s.error,
                     started_at: s.started_at.map(|t| t.timestamp_millis()),

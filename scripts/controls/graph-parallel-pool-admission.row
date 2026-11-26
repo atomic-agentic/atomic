@@ -1,0 +1,1 @@
+graph-parallel-pool-admission|crates/atomic/src/main.rs|runs::admit_command_pool(args)|Ok::<(), crate::failure::Failure>(())|-p atomic-agentic --test graph_work_loop cli_refuses_parallel_lanes_before_it_records_a_run
