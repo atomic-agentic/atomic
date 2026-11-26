@@ -1570,7 +1570,22 @@ fn operator_restores_an_imported_goal_from_yaml_with_its_children() {
         success(&fixture.run(&destination, &["--json", "goals", "list"])).trim(),
         "[]"
     );
+    let imported_search: Value = serde_json::from_str(&success(
+        &fixture.run(&destination, &["--json", "graph", "search", "Imported"]),
+    ))
+    .expect("imported title search");
+    assert_eq!(imported_search["results"][0]["id"], "goal-review");
     success(&fixture.run(&destination, &["goals", "add", "review"]));
+    let stale_search: Value = serde_json::from_str(&success(
+        &fixture.run(&destination, &["--json", "graph", "search", "Imported"]),
+    ))
+    .expect("stale title search");
+    assert_eq!(stale_search["results"], json!([]));
+    let restored_search: Value = serde_json::from_str(&success(
+        &fixture.run(&destination, &["--json", "graph", "search", "Registered"]),
+    ))
+    .expect("restored title search");
+    assert_eq!(restored_search["results"][0]["id"], "goal-review");
     let brief: Value = serde_json::from_str(&success(
         &fixture.run(&destination, &["--json", "goals", "show", "review"]),
     ))
