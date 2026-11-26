@@ -90,6 +90,8 @@ ctor = "=1.0.6"
 # Only atomic-core may depend on these.
 codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
+codex-exec-server = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
+codex-http-client = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-config = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-core = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 codex-windows-sandbox-service = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }

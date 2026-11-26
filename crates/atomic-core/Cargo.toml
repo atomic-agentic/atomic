@@ -104,3 +104,7 @@ sha2 = { workspace = true }
 [dev-dependencies]
 ctor = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }
+codex-exec-server = { workspace = true }
+codex-http-client = { workspace = true }
+futures-util = "=0.3.34"
+tokio-tungstenite = "=0.28.0"
