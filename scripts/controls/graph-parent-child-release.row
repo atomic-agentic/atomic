@@ -1,0 +1,1 @@
+graph-parent-child-release|crates/atomic-graph/src/sqlite.rs|e.kind IN ('blocks','parent-child','conditional-blocks','waits-for')|e.kind IN ('blocks','conditional-blocks','waits-for')|-p atomic-agentic-graph --test conformance sqlite_conforms_to_the_behavioral_scenarios
