@@ -374,6 +374,41 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     assert!(literal.exists(), "literal state database is missing");
     let decoded = PathBuf::from(literal.to_string_lossy().replace("%41", "A"));
     assert!(!decoded.exists(), "write landed in percent-decoded sibling");
+
+    // Simulate an older writer's decoded database, then perform the documented
+    // operator-directed SQLite backup into the literal state location.
+    std::fs::create_dir_all(decoded.parent().expect("decoded state parent"))
+        .expect("decoded state directory");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("backup runtime");
+    runtime.block_on(async {
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&literal);
+        let mut connection = sqlx::SqliteConnection::connect_with(&options)
+            .await
+            .expect("literal database");
+        sqlx::query("VACUUM INTO ?")
+            .bind(decoded.to_str().expect("decoded state path"))
+            .execute(&mut connection)
+            .await
+            .expect("consistent legacy snapshot");
+        connection.close().await.expect("close database");
+    });
+    std::fs::remove_file(&literal).expect("remove literal fixture");
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = PathBuf::from(format!("{}{suffix}", literal.display()));
+        if sidecar.exists() {
+            std::fs::remove_file(sidecar).expect("remove stale sidecar");
+        }
+    }
+    assert!(decoded.exists(), "legacy snapshot is missing");
+    std::fs::copy(&decoded, &literal).expect("restore verified legacy snapshot");
+    assert_eq!(
+        success(&fixture.run(&project, &["graph", "export"])),
+        exported
+    );
+    assert_eq!(success(&fixture.run(&project, &command)), first);
 }
 
 #[test]
