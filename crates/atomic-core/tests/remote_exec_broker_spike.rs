@@ -134,6 +134,8 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
     use tokio::net::TcpListener;
 
     if let Ok(home) = std::env::var("ATOMIC_BROKER_SPIKE_CHILD_HOME") {
+        let release_marker =
+            std::env::var("ATOMIC_BROKER_SPIKE_RELEASE_MARKER").expect("release marker path");
         let manager = EnvironmentManager::from_codex_home(
             home,
             None,
@@ -144,9 +146,9 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
         let cwd = std::env::current_dir().expect("child cwd");
         let params: ExecParams = serde_json::from_value(serde_json::json!({
             "processId": "atomic-broker-crashed-client",
-            "argv": ["/bin/sh", "-c", "sleep 2"],
+            "argv": ["/bin/sh", "-c", "while [ ! -e \"$ATOMIC_BROKER_RELEASE\" ]; do sleep 0.05; done"],
             "cwd": format!("file://{}", cwd.display()),
-            "env": {},
+            "env": {"ATOMIC_BROKER_RELEASE": release_marker},
             "tty": false,
             "arg0": null,
             "sandbox": null
@@ -328,11 +330,14 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
     }
 
     let child_marker = home.join("child-started");
+    let release_marker = home.join("release-shell");
+    assert!(!release_marker.exists(), "release marker must begin absent");
     let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"))
         .arg("--exact")
         .arg("pinned_codex_can_run_a_shell_through_its_remote_exec_server")
         .env("ATOMIC_BROKER_SPIKE_CHILD_HOME", &home)
         .env("ATOMIC_BROKER_SPIKE_CHILD_MARKER", &child_marker)
+        .env("ATOMIC_BROKER_SPIKE_RELEASE_MARKER", &release_marker)
         .spawn()
         .expect("crash client process");
     let child_status = tokio::time::timeout(Duration::from_secs(10), async {
@@ -399,8 +404,25 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
             }
         }
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let second_start_seen = methods
+                .lock()
+                .expect("methods")
+                .iter()
+                .filter(|method| method.as_str() == "process/start")
+                .count()
+                == 3;
+            if second_start_seen {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("second shell reached relay");
     assert!(!waiting.is_finished(), "second shell bypassed host permit");
+    std::fs::write(&release_marker, b"release").expect("release first shell");
     tokio::time::timeout(Duration::from_secs(10), waiting)
         .await
         .expect("second shell remained blocked")
