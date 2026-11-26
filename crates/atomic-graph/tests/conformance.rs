@@ -898,6 +898,7 @@ fn the_production_source_is_the_recorded_set() {
             "sqlite.rs",
             "sqlite/goals.rs",
             "store.rs",
+            "tools.rs",
             "transactional_claim.rs",
         ]
     );
@@ -2945,16 +2946,19 @@ fn sqlite_import_rejects_wrong_shapes_and_preserves_signed_dates() {
         r#"{"id":"at-bad","title":"Bad","status":"open","priority":2,"issue_type":"task","dependencies":{}}"#,
         r#"{"id":"at-bad","title":"Bad","status":"open","priority":2,"issue_type":"task","comments":{}}"#,
         r#"{"id":"at-bad","title":"Bad","status":"open","priority":2,"issue_type":"task","comments":[{"author":7,"text":"x"}]}"#,
+        r#"{"id":"at-bad","title":"Bad","status":"open","priority":2,"issue_type":"task","pinned":"true"}"#,
     ];
     harness::block_on(async {
         for malformed in bad {
             let input = format!("{valid}\n{malformed}\n");
+            let refusal = store
+                .import(actor.clone(), input, false)
+                .await
+                .expect_err("malformed second line must refuse the batch");
             assert!(
-                matches!(
-                    store.import(actor.clone(), input, false).await,
-                    Err(StoreError::ImportRefused(_))
-                ),
-                "accepted {malformed}"
+                matches!(refusal, StoreError::ImportRefused(ref problems)
+                    if problems.iter().any(|problem| problem.contains("line 2"))),
+                "refusal did not identify the malformed source line: {refusal:?}"
             );
             assert!(
                 store
@@ -3459,7 +3463,9 @@ fn sqlite_export_includes_committed_changes_after_import() {
         "atomic-graph-export-live-{}.sqlite",
         std::process::id()
     ));
+    let restored_path = path.with_extension("restored.sqlite");
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&restored_path);
     let store =
         sqlite_authorized_for_tests(&path, std::time::SystemTime::now).expect("test operation");
     let actor = Actor::human("owner");
@@ -3497,7 +3503,10 @@ fn sqlite_export_includes_committed_changes_after_import() {
             )
             .await
             .expect("test operation");
-        let export = store.export(actor).await.expect("test operation");
+        let export = store
+            .export(actor.clone())
+            .await
+            .expect("export changed graph");
         let first: serde_json::Value =
             serde_json::from_str(export.lines().next().expect("test operation"))
                 .expect("test operation");
@@ -3505,9 +3514,40 @@ fn sqlite_export_includes_committed_changes_after_import() {
         assert_eq!(first["custom"]["keep"], true);
         assert_eq!(first["comments"][0]["text"], "new note");
         assert_eq!(first["dependencies"][0]["type"], "related");
+        let restored = sqlite_authorized_for_tests(&restored_path, std::time::SystemTime::now)
+            .expect("open restored graph");
+        restored
+            .import(actor.clone(), export, false)
+            .await
+            .expect("reimport changed graph");
+        let original = store
+            .show(actor.clone(), "at-a".into())
+            .await
+            .expect("show source")
+            .expect("source item");
+        let copy = restored
+            .show(actor.clone(), "at-a".into())
+            .await
+            .expect("show copy")
+            .expect("copied item");
+        assert_eq!(copy.item.status, original.item.status);
+        assert_eq!(copy.item.body, original.item.body);
+        assert_eq!(copy.item.created_at, original.item.created_at);
+        assert_eq!(copy.notes.len(), original.notes.len());
+        assert_eq!(copy.notes[0].text, "new note");
+        assert_eq!(copy.blocked_by, original.blocked_by);
+        assert_eq!(
+            restored
+                .export(actor.clone())
+                .await
+                .expect("export restored graph"),
+            store.export(actor).await.expect("export source graph"),
+            "roundtrip lost the live edge, note, or unrepresented imported field"
+        );
     });
     drop(store);
     let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(restored_path);
 }
 
 #[test]
@@ -3919,7 +3959,19 @@ fn sqlite_export_keeps_current_closed_time_and_stamped_import_creation_time() {
         first
             .set_status(human.clone(), "at-closed".into(), Status::Closed)
             .await
-            .expect("administrative close without evidence policy");
+            .expect("first new close");
+        let first_new_close = clock.now();
+        first
+            .set_status(human.clone(), "at-closed".into(), Status::Open)
+            .await
+            .expect("reopen after first new close");
+        clock.advance(Duration::from_secs(20));
+        first
+            .set_status(human.clone(), "at-closed".into(), Status::Closed)
+            .await
+            .expect("latest close");
+        let latest_close = clock.now();
+        assert_ne!(first_new_close, latest_close);
         let export = first.export(human.clone()).await.expect("export dates");
         let rows: Vec<serde_json::Value> = export
             .lines()
@@ -3931,6 +3983,13 @@ fn sqlite_export_keeps_current_closed_time_and_stamped_import_creation_time() {
             .expect("closed row");
         assert_eq!(closed["created_at"], "2026-01-01T00:00:00Z");
         assert_ne!(closed["closed_at"], "2026-01-02T00:00:00Z");
+        let current = first
+            .show(human.clone(), "at-closed".into())
+            .await
+            .expect("show current closed item")
+            .expect("current closed item");
+        assert_eq!(current.item.status, Status::Closed);
+        assert_eq!(current.item.closed_at, Some(latest_close));
         let stamped = rows
             .iter()
             .find(|row| row["id"] == "at-no-created")
@@ -3951,11 +4010,19 @@ fn sqlite_export_keeps_current_closed_time_and_stamped_import_creation_time() {
             .expect("show first")
             .expect("first item");
         let after = second
-            .show(human, "at-no-created".into())
+            .show(human.clone(), "at-no-created".into())
             .await
             .expect("show second")
             .expect("second item");
         assert_eq!(before.item.created_at, after.item.created_at);
+        let restored_closed = second
+            .show(human, "at-closed".into())
+            .await
+            .expect("show restored closed item")
+            .expect("restored closed item");
+        assert_eq!(restored_closed.item.created_at, current.item.created_at);
+        assert_eq!(restored_closed.item.closed_at, current.item.closed_at);
+        assert_eq!(restored_closed.item.closed_at, Some(latest_close));
     });
     drop(first);
     for path in [first_path, second_path] {
@@ -3994,14 +4061,13 @@ fn sqlite_exports_beads_memory_records_without_promoting_imported_trust() {
             .await
             .expect("human memory");
         first
-            .remember(
-                agent.clone(),
-                "a1".into(),
-                "agent-key".into(),
-                "agent value".into(),
+            .import(
+                human.clone(),
+                r#"{"_type":"memory","key":"external-key","value":"external value"}"#.into(),
+                false,
             )
             .await
-            .expect("agent memory");
+            .expect("external memory");
         let export = first
             .export(human.clone())
             .await
@@ -4031,11 +4097,26 @@ fn sqlite_exports_beads_memory_records_without_promoting_imported_trust() {
             .export(agent)
             .await
             .expect("export restored memories");
-        assert_eq!(restored.lines().count(), 3);
-        assert!(
-            restored.contains("human-key")
-                && restored.contains("agent-key")
-                && restored.contains("forged")
+        let restored_values: std::collections::BTreeMap<String, String> = restored
+            .lines()
+            .map(|line| {
+                let row: serde_json::Value =
+                    serde_json::from_str(line).expect("restored memory JSON");
+                assert_eq!(row["_type"], "memory");
+                (
+                    row["key"].as_str().expect("memory key").to_owned(),
+                    row["value"].as_str().expect("memory value").to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            restored_values,
+            std::collections::BTreeMap::from([
+                ("human-key".to_owned(), "human value".to_owned()),
+                ("external-key".to_owned(), "external value".to_owned()),
+                ("forged".to_owned(), "outside".to_owned()),
+            ]),
+            "memory values must survive export and reimport exactly"
         );
     });
     drop(first);

@@ -122,7 +122,7 @@ sandbox)
         expected="${#tests[@]}"
         check "the ${#tests[@]} sandbox tests of ${name} with no sandbox" \
             "the sandbox tests need Codex's Linux sandbox" \
-            --workspace --features "${FEATURES}" --test "${name}" -- --exact "${tests[@]}"
+            --workspace --features "${FEATURES}" --test "${name}" -- --include-ignored --exact "${tests[@]}"
         expected=""
     done
     [ "${#suites[@]}" -gt 0 ] || { echo "scripts/backends-check.sh: no sandbox suite found" >&2; exit 1; }

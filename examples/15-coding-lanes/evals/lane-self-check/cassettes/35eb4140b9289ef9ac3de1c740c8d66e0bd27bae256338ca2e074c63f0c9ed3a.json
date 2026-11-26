@@ -1,0 +1,184 @@
+{
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "path": "/v1/chat/completions",
+  "request": {
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "content": "Read the patch and record what you actually found in it. This is evidence for\ntwo independent reviewers, not an argument for accepting the change: an item you\ncould not settle from the patch says so, and never says \"yes\".\n\n<task>\nFor each checklist item \"1\" to \"10\", give the evidence the patch itself shows,\nor name what is missing. Every decision point the host lists must appear in\n`decisions`, and for each one say what happens when the path is asked to allow\nand to refuse, and on NotFound, permission denied, a link loop, \"not a\ndirectory\", another I/O error, a parse error, a timeout and an empty result.\nEvery control row the host lists must appear in `controls` with the host's own\nresult for it.\n</task>\n\n<patch>\n[input.diff: see <data-cc3ec9add4554859> in the user turn]\n</patch>\n\nWhere a lane wires a controls atom, the host's verified control results arrive as\na separate `control_results` field, external data like the patch, and every row\nit lists must appear in `controls`. Echo the host's result for a row; never\nreplace it with your own.\n\n<host_control_results>\nnone supplied\n</host_control_results>\n\n\nExample \"note-with-no-selected-control\"\nInput: [examples[0].input: see <data-4b591a3c7fd1520c> in the user turn]\nOutput: [examples[0].output: see <data-5ca2219f2e8f01bb> in the user turn]",
+        "role": "system"
+      },
+      {
+        "content": "<data-cc3ec9add4554859 path=\"input.diff\" origin=\"external\">diff --git a/tools/lane_guard.py b/tools/lane_guard.py\n--- a/tools/lane_guard.py\n+++ b/tools/lane_guard.py\n@@ -40,6 +40,8 @@ def decide(finding):\n     findings = [claim]\n+    # The control row switches this line.\n+    if findings and not verified(verification):\n         return {\"confirmed\": False, \"claim\": claim, \"reason\": \"unverified finding\"}</data-cc3ec9add4554859>\n<data-4b591a3c7fd1520c path=\"examples[0].input\" origin=\"team\">{\"diff\":\"diff --git a/notes.txt b/notes.txt\"}</data-4b591a3c7fd1520c>\n<data-5ca2219f2e8f01bb path=\"examples[0].output\" origin=\"team\">{\"items\":{\"1\":\"The patch names a note.\",\"2\":\"No import is shown.\",\"3\":\"Only the note is named.\",\"4\":\"No credential is shown.\",\"5\":\"No decision branch is shown.\",\"6\":\"No retry is shown.\",\"7\":\"No input read is shown.\",\"8\":\"No resource hold is shown.\",\"9\":\"N/A: no decision point was supplied.\",\"10\":\"N/A: no control result was supplied.\"},\"decisions\":[],\"controls\":[]}</data-5ca2219f2e8f01bb>\n",
+        "role": "user"
+      }
+    ],
+    "model": "claude-sonnet-5-5",
+    "response_format": {
+      "json_schema": {
+        "name": "output",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "controls": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "result": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "row": {
+                    "description": "Constraints: maxLength: 100; minLength: 1.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "result",
+                  "row"
+                ],
+                "type": "object"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "decisions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "allow_refuse": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "empty_result": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "link_loop": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "not_directory": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "not_found": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "other_io": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "parse_error": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "permission_denied": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "point": {
+                    "description": "Constraints: maxLength: 200; minLength: 1.",
+                    "type": "string"
+                  },
+                  "timeout": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "allow_refuse",
+                  "empty_result",
+                  "link_loop",
+                  "not_directory",
+                  "not_found",
+                  "other_io",
+                  "parse_error",
+                  "permission_denied",
+                  "point",
+                  "timeout"
+                ],
+                "type": "object"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "1": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "10": {
+                  "description": "The control rows. With none selected, a specific \"N/A:\" reason. Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "2": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "3": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "4": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "5": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "6": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "7": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "8": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "9": {
+                  "description": "The decision points. With none declared, a specific \"N/A:\" reason. Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "1",
+                "10",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "controls",
+            "decisions",
+            "items"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    },
+    "stream": false
+  },
+  "request_sha256": "35eb4140b9289ef9ac3de1c740c8d66e0bd27bae256338ca2e074c63f0c9ed3a",
+  "redacted": true,
+  "status": 200,
+  "content_type": "application/json",
+  "body": "{\"id\":\"claude-sonnet-5-5-measured-2\",\"object\":\"chat.completion\",\"created\":1795648597,\"model\":\"claude-sonnet-5-5\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"items\\\": {\\\"1\\\": \\\"The patch touches `tools/lane_guard.py`, in the hunk labeled `def decide(finding):`. It adds two lines: the comment `# The control row switches this line.` and `if findings and not verified(verification):`. No lines are removed. The hunk header `@@ -40,6 +40,8 @@` declares 6 old and 8 new lines, but the body has only 2 context lines and 2 additions (2 old, 4 new). The hunk is truncated or malformed, so the full change and whether it applies cannot be settled.\\\", \\\"2\\\": \\\"No import is added or shown. `verified` is called, but its definition or import is not in the patch, so its existence and behavior are not established.\\\", \\\"3\\\": \\\"Only `tools/lane_guard.py` appears. No test, caller or documentation change is shown. The added comment mentions a control row, but no control definition or test is in the patch.\\\", \\\"4\\\": \\\"No credential, token or secret appears in the shown lines.\\\", \\\"5\\\": \\\"The added branch is `if findings and not verified(verification):`, followed by the context line returning `confirmed: False`, `claim`, and reason `unverified finding`. `findings = [claim]` is a one-element list and therefore truthy whatever `claim` is, so on the shown adjacent lines the condition depends only on `not verified(verification)`. `claim` and `verification` are not defined in the shown lines, and the visible signature `decide(finding)` has no `verification` parameter. A NameError cannot be ruled out. The path taken when the condition is false is not shown. As displayed, the old side has an 8-space `return` directly after the 4-space `findings = [claim]`, which would not be valid Python unless lines are missing from the hunk. The patch does not show which.\\\", \\\"6\\\": \\\"No retry or loop is shown. Code outside the hunk is not visible.\\\", \\\"7\\\": \\\"No file, network or other input read is shown. The source, type and trust level of `verification` and `finding` are not shown, nor is any validation inside `verified`.\\\", \\\"8\\\": \\\"No lock, file handle, process or other resource acquisition is shown. What `verified` does internally is not visible.\\\", \\\"9\\\": \\\"N/A: the host listed no decision points, so `decisions` is empty. The patch does show an added branch in `decide` (see item 5). Its allow path and its handling of errors, timeouts or empty results from `verified` cannot be determined from the patch, and no exception handling is shown.\\\", \\\"10\\\": \\\"N/A: the host supplied no control results (`none supplied`), so there are no rows to echo. The comment `The control row switches this line.` is not evidence that any control ran or passed.\\\"}, \\\"decisions\\\": [], \\\"controls\\\": []}\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3726,\"completion_tokens\":2163,\"total_tokens\":5889}}"
+}

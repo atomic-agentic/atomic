@@ -104,6 +104,17 @@ fn parse_edge(s: &str) -> Option<EdgeKind> {
         _ => return None,
     })
 }
+
+async fn is_gate_copy(c: &mut SqliteConnection, id: &str) -> Result<bool, StoreError> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM atomic_graph_items WHERE id=? AND projected_gate_id IS NOT NULL",
+    )
+    .bind(id)
+    .fetch_one(c)
+    .await
+    .map_err(db)?;
+    Ok(count != 0)
+}
 fn item(row: &sqlx::sqlite::SqliteRow) -> Result<Item, StoreError> {
     let status: String = row.try_get("status").map_err(db)?;
     let tr: String = row.try_get("trust").map_err(db)?;
@@ -137,6 +148,16 @@ pub struct SqliteStore {
     #[cfg(debug_assertions)]
     projection_pause: Option<Arc<dyn Fn() + Send + Sync>>,
 }
+
+/// One committed outgoing edge read with a graph item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEdge {
+    /// Edge kind as stored.
+    pub kind: String,
+    /// Target item ID.
+    pub to: String,
+}
+
 impl SqliteStore {
     /// Open a graph database. Existing graph rows survive reopening.
     pub fn open(
@@ -184,6 +205,35 @@ impl SqliteStore {
             #[cfg(debug_assertions)]
             projection_pause: None,
         })
+    }
+
+    /// Read one item, its notes, current blockers and all outgoing edges in
+    /// one read transaction for a consistent model-facing graph view.
+    pub async fn show_with_edges(
+        &self,
+        id: String,
+    ) -> Result<Option<(Show, Vec<StoredEdge>)>, StoreError> {
+        self.read(move |c| Box::pin(async move {
+            let Some(item) = get_item(c, &id).await? else { return Ok(None) };
+            let rows = sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal")
+                .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
+            let notes = rows.iter().map(|row| Ok(Note {
+                text: row.try_get("text").map_err(db)?,
+                author: row.try_get("author").map_err(db)?,
+                trust: parse_trust(&row.try_get::<String,_>("trust").map_err(db)?),
+            })).collect::<Result<Vec<_>,StoreError>>()?;
+            let blocked_by = blocked(c, &id).await?;
+            let holder = lease_row(c, &id).await?.map(|(lease, _)| Holder {
+                claimant: lease.claimant, epoch: lease.epoch,
+            });
+            let rows = sqlx::query("SELECT kind,target FROM atomic_graph_edges WHERE source=? ORDER BY kind,target")
+                .bind(&id).fetch_all(&mut *c).await.map_err(db)?;
+            let edges = rows.iter().map(|row| Ok(StoredEdge {
+                kind: row.try_get("kind").map_err(db)?,
+                to: row.try_get("target").map_err(db)?,
+            })).collect::<Result<Vec<_>,StoreError>>()?;
+            Ok(Some((Show { item, notes, blocked_by, holder }, edges)))
+        })).await
     }
 
     /// Open a graph store for a person whose enrolled credential is checked
@@ -423,10 +473,37 @@ impl SqliteStore {
         run_id: &str,
         step_commit: &StepCommit,
     ) -> Result<(), StoreError> {
+        self.link_verified_commit_from(lease, worktrees, run_id, run_id, step_commit)
+            .await
+    }
+
+    /// Verify a child lane's branch for a lease held by its parent graph run.
+    /// The caller verifies the child's frozen claim; this store rechecks the
+    /// durable parent-child link and fences the parent token in its write.
+    pub async fn link_verified_child_commit(
+        &self,
+        lease: Lease,
+        worktrees: &Worktrees,
+        parent_run: &str,
+        child_run: &str,
+        step_commit: &StepCommit,
+    ) -> Result<(), StoreError> {
+        self.link_verified_commit_from(lease, worktrees, parent_run, child_run, step_commit)
+            .await
+    }
+
+    async fn link_verified_commit_from(
+        &self,
+        lease: Lease,
+        worktrees: &Worktrees,
+        claimant_run: &str,
+        worktree_run: &str,
+        step_commit: &StepCommit,
+    ) -> Result<(), StoreError> {
         // This method mints evidence that the model-facing graph API cannot.
         // The credential is verified again by `run` inside the write Tx.
         let principal = self.verified_operator()?;
-        if lease.claimant != run_id {
+        if lease.claimant != claimant_run {
             return Err(StoreError::Fenced {
                 item_id: lease.item_id,
                 epoch: lease.epoch,
@@ -450,7 +527,7 @@ impl SqliteStore {
             });
         }
         let Some(proof) = worktrees
-            .verify_step_commit_on_branch(run_id, step_commit, &branch)
+            .verify_step_commit_on_branch(worktree_run, step_commit, &branch)
             .map_err(db)?
         else {
             return Err(StoreError::NeedsEvidence {
@@ -458,6 +535,8 @@ impl SqliteStore {
                 required: "host-verified commit on the authorized branch".into(),
             });
         };
+        let child_run = (worktree_run != claimant_run).then(|| worktree_run.to_owned());
+        let parent_run = claimant_run.to_owned();
         self.run(move |conn| {
             Box::pin(async move {
                 authorize_lease(
@@ -468,6 +547,26 @@ impl SqliteStore {
                 )
                 .await?;
                 check_lease(conn, &lease).await?;
+                if let Some(child) = child_run {
+                    let linked = sqlx::query(
+                        "SELECT parent_workflow_id FROM workflow_status WHERE workflow_uuid=?",
+                    )
+                    .bind(&child)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(db)?;
+                    let parent: Option<String> = linked
+                        .as_ref()
+                        .map(|row| row.try_get("parent_workflow_id").map_err(db))
+                        .transpose()?
+                        .flatten();
+                    if parent.as_deref() != Some(parent_run.as_str()) {
+                        return Err(StoreError::Fenced {
+                            item_id: lease.item_id.clone(),
+                            epoch: lease.epoch,
+                        });
+                    }
+                }
                 let current = sqlx::query("SELECT requires_verified_commit,authorized_branch FROM atomic_graph_item_policy WHERE item_id=?")
                     .bind(&lease.item_id).fetch_optional(&mut *conn).await.map_err(db)?;
                 let still_authorized = match current {
@@ -753,7 +852,7 @@ async fn blocked(conn: &mut SqliteConnection, id: &str) -> Result<Vec<String>, S
 // `atomic_graph_blocked` already holds every unresolved direct blocker. Any
 // longer path starts with one of these rows, so source membership needs only
 // this indexed lookup; expanding all reachable pairs adds no information.
-const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
+const READY_ITEMS_SQL: &str = "SELECT i.* FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id WHERE (i.status='open' OR (i.status='in_progress' AND l.expires_at<=?) OR (?=1 AND i.status='in_progress' AND l.item_id IS NULL)) AND i.kind NOT IN ('goal','message') AND i.projected_gate_id IS NULL AND (i.due_at IS NULL OR i.due_at<=?) AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) ORDER BY i.priority, i.id LIMIT ?";
 const CLAIM_HAS_BLOCKER_SQL: &str =
     "SELECT EXISTS (SELECT 1 FROM atomic_graph_blocked WHERE source=?)";
 async fn ready_items(
@@ -1005,11 +1104,19 @@ impl GraphStore for SqliteStore {
             if draft.status == Status::Closed {
                 return Err(StoreError::CannotCreateClosed { item_id: draft.id });
             }
+            if draft.kind == "gate" || draft.id.starts_with("gate:") {
+                return Err(StoreError::InvalidStatusTransition {
+                    detail: "gate items are read-only copies of the gate store".into(),
+                });
+            }
             let actor = self.actor_for_write(actor, "create a human item")?;
             let fingerprint = create_request_fingerprint(&actor, &draft)?;
             self.run_at(move |c, now|Box::pin(async move {
    if create_request_seen(c,&request_id,&draft.id,&fingerprint).await? { return get_item(c,&draft.id).await?.ok_or_else(||db("create request refers to missing item")); }
-   if let Some(parent)=&draft.parent && get_item(c,parent).await?.is_none() { return Err(StoreError::MissingItem { item_id: parent.clone() }); }
+   if let Some(parent)=&draft.parent {
+       if get_item(c,parent).await?.is_none() { return Err(StoreError::MissingItem { item_id: parent.clone() }); }
+       if is_gate_copy(c,parent).await? { return Err(StoreError::InvalidEdge { detail: "a gate copy cannot be a parent".into() }); }
+   }
    let status=draft.status.as_str();let closed=if draft.status==Status::Closed {Some(now)}else{None};let tr=trust(&actor);
    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,closed_at,due_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").bind(&draft.id).bind(&draft.title).bind(&draft.body).bind(&draft.kind).bind(draft.priority).bind(status).bind(&draft.parent).bind(tr.as_str()).bind(&actor.principal).bind(now).bind(closed).bind(draft.due_at.map(millis)).execute(&mut *c).await.map_err(db)?;
    if let Some(parent)=&draft.parent {sqlx::query("INSERT OR IGNORE INTO atomic_graph_edges VALUES (?,'parent-child',?)").bind(&draft.id).bind(parent).execute(&mut *c).await.map_err(db)?;}
@@ -1088,7 +1195,13 @@ impl GraphStore for SqliteStore {
                         }
                     }
                     for endpoint in [&from, &to] {
-                        if get_item(c, endpoint).await?.is_none() {
+                        let item = get_item(c, endpoint).await?;
+                        if is_gate_copy(c, endpoint).await? {
+                            return Err(StoreError::InvalidEdge {
+                                detail: "gate items are read-only copies of the gate store".into(),
+                            });
+                        }
+                        if item.is_none() {
                             return Err(StoreError::MissingItem {
                                 item_id: endpoint.clone(),
                             });
@@ -1137,6 +1250,11 @@ impl GraphStore for SqliteStore {
                         .ok_or_else(|| StoreError::MissingItem {
                             item_id: id.clone(),
                         })?;
+                    if is_gate_copy(c, &id).await? {
+                        return Err(StoreError::InvalidStatusTransition {
+                            detail: "gate items are read-only copies of the gate store".into(),
+                        });
+                    }
                     // CONTROL_OFF: graph-admin-pin-epic-only
                     // Import leaves Beads epics open; only an operator may pin
                     // an open epic for a graph run. A terminal or non-epic
@@ -1213,7 +1331,9 @@ impl GraphStore for SqliteStore {
         id: String,
     ) -> impl Future<Output = Result<Option<Show>, StoreError>> + Send {
         async move {
-            self.read(move |c|Box::pin(async move{let Some(i)=get_item(c,&id).await? else{return Ok(None)};let rows=sqlx::query("SELECT text,author,trust FROM atomic_graph_notes WHERE item_id=? ORDER BY ordinal").bind(&id).fetch_all(&mut *c).await.map_err(db)?;let notes=rows.iter().map(|r|Ok(Note{text:r.try_get("text").map_err(db)?,author:r.try_get("author").map_err(db)?,trust:parse_trust(&r.try_get::<String,_>("trust").map_err(db)?)})).collect::<Result<Vec<_>,StoreError>>()?;let blockers=blocked(c,&id).await?;let holder=lease_row(c,&id).await?.map(|(l,_)|Holder{claimant:l.claimant,epoch:l.epoch});Ok(Some(Show{item:i,notes,blocked_by:blockers,holder}))})).await
+            self.show_with_edges(id)
+                .await
+                .map(|view| view.map(|(show, _)| show))
         }
     }
     fn all_items(
@@ -1499,6 +1619,11 @@ impl GraphStore for SqliteStore {
                     if get_item(c, &item_id).await?.is_none() {
                         return Err(StoreError::MissingItem { item_id });
                     }
+                    if is_gate_copy(c, &item_id).await? {
+                        return Err(StoreError::InvalidClosePolicy {
+                            detail: "gate copies are read-only".into(),
+                        });
+                    }
                     let verified = requires.contains(&Evidence::VerifiedCommit);
                     if verified != authorized_branch.is_some()
                         || authorized_branch
@@ -1607,6 +1732,11 @@ impl GraphStore for SqliteStore {
                 Box::pin(async move {
                     if get_item(c, &item_id).await?.is_none() {
                         return Err(StoreError::MissingItem { item_id });
+                    }
+                    if is_gate_copy(c, &item_id).await? {
+                        return Err(StoreError::InvalidCriteria {
+                            detail: "gate copies are read-only".into(),
+                        });
                     }
                     if validated.is_empty() {
                         sqlx::query("DELETE FROM atomic_graph_item_criteria WHERE item_id=?")
@@ -1754,6 +1884,7 @@ async fn claim_id(
     }
     if i.kind == "goal"
         || i.kind == "message"
+        || is_gate_copy(c, id).await?
         || i.due_at.is_some_and(|due| millis(due) > now)
         || sqlx::query_scalar::<_, i64>(CLAIM_HAS_BLOCKER_SQL)
             .bind(id)
@@ -1871,6 +2002,11 @@ async fn import_jsonl(
                 if json_str(&v, "id").is_none() || json_str(&v, "title").is_none() {
                     errors.push(format!("line {} needs id and title", n + 1));
                 }
+                if json_str(&v, "id").is_some_and(|id| id.starts_with("gate:"))
+                    || json_str(&v, "issue_type") == Some("gate")
+                {
+                    errors.push(format!("line {} uses the reserved gate projection", n + 1));
+                }
                 let status = json_str(&v, "status").unwrap_or("");
                 if status == "pinned" || Status::parse(status).is_none() {
                     errors.push(format!("line {} has unsupported status {status}", n + 1));
@@ -1980,6 +2116,9 @@ async fn import_jsonl(
         let mut parents = std::collections::BTreeSet::new();
         if let Some(parent) = json_str(v, "parent_issue") {
             parents.insert(parent);
+            if is_gate_copy(c, parent).await? {
+                errors.push(format!("{id} parent {parent} is a read-only gate copy"));
+            }
             if !ids.contains(parent) && get_item(c, parent).await?.is_none() {
                 errors.push(format!("{id} parent {parent} is missing"))
             }
@@ -1998,6 +2137,9 @@ async fn import_jsonl(
                 }
                 if kind == "parent-child" {
                     parents.insert(target);
+                }
+                if is_gate_copy(c, target).await? {
+                    errors.push(format!("{id} dependency {target} is a read-only gate copy"));
                 }
                 if !ids.contains(target) && get_item(c, target).await?.is_none() {
                     errors.push(format!("{id} dependency {target} is missing"))
@@ -2186,10 +2328,11 @@ async fn import_jsonl(
     Ok(report)
 }
 async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
-    let rows = sqlx::query("SELECT * FROM atomic_graph_items ORDER BY id")
-        .fetch_all(&mut *c)
-        .await
-        .map_err(db)?;
+    let rows =
+        sqlx::query("SELECT * FROM atomic_graph_items WHERE projected_gate_id IS NULL ORDER BY id")
+            .fetch_all(&mut *c)
+            .await
+            .map_err(db)?;
     let mut out = String::new();
     for row in rows {
         let i = item(&row)?;
@@ -2340,6 +2483,72 @@ async fn export_jsonl(c: &mut SqliteConnection) -> Result<String, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn gate_copies_are_visible_but_never_work_or_exported_items() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-gate-copy-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("graph store");
+        store
+            .run(|conn| {
+                Box::pin(async move {
+                    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES ('gate:run:ship','Ship','open human gate','gate',0,'blocked',NULL,'agent','gate-store',1,'run:ship')")
+                        .execute(conn)
+                        .await
+                        .map_err(db)?;
+                    Ok(())
+                })
+            })
+            .await
+            .expect("project gate");
+
+        let actor = Actor::agent("test");
+        let shown = store
+            .show(actor.clone(), "gate:run:ship".into())
+            .await
+            .expect("show")
+            .expect("gate copy");
+        assert_eq!(shown.item.kind, "gate");
+        assert_eq!(shown.item.status, Status::Blocked);
+        assert!(
+            store
+                .ready(actor.clone(), 10)
+                .await
+                .expect("ready")
+                .is_empty()
+        );
+        assert!(
+            store
+                .claim(
+                    actor.clone(),
+                    "test".into(),
+                    "gate:run:ship".into(),
+                    Duration::from_secs(30)
+                )
+                .await
+                .expect("claim")
+                .is_none()
+        );
+        assert_eq!(store.export(actor.clone()).await.expect("export"), "");
+
+        for mut draft in [
+            Draft::new("gate:fake", "fake"),
+            Draft::new("at-fake", "fake"),
+        ] {
+            if draft.id == "at-fake" {
+                draft.kind = "gate".into();
+            }
+            assert!(matches!(
+                store
+                    .create_item(actor.clone(), draft.id.clone(), draft)
+                    .await,
+                Err(StoreError::InvalidStatusTransition { .. })
+            ));
+        }
+    }
 
     #[test]
     fn readiness_and_claim_use_the_blocker_source_index_without_a_recursive_closure() {

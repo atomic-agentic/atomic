@@ -142,6 +142,7 @@ mod tests {
         StepRecord {
             step_id: 0,
             name: "s".into(),
+            child_workflow_id: None,
             output: None,
             error: None,
             started_at,

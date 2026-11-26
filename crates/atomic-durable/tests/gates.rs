@@ -18,6 +18,7 @@ use atomic_durable::gate::{
 use atomic_durable::{DurableRuntime, Durare, DurareContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sqlx::Connection;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -226,6 +227,40 @@ async fn a_gate_survives_a_kill_and_is_approved_from_a_second_process(store: Sto
     // never runs workflows itself.
     let second = store.open().await;
     let opened = start_and_kill(&store, &second, &run, 3_600_000).await;
+    if let Store::Sqlite(path) = &store {
+        let url = format!("sqlite://{}", path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url)
+            .await
+            .expect("graph store");
+        let projected: (String, String, String) =
+            sqlx::query_as("SELECT kind,status,created_by FROM atomic_graph_items WHERE id=?")
+                .bind(format!("gate:{}", opened.id))
+                .fetch_one(&mut conn)
+                .await
+                .expect("open gate projection");
+        assert_eq!(
+            projected,
+            ("gate".into(), "blocked".into(), "gate-store".into())
+        );
+        // A row written by an older importer must not leave a stale blocker
+        // after the gate-store copy disappears on decision.
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('at-waiting','Waiting','work','task',2,'open',NULL,'human','owner',1)")
+            .execute(&mut conn)
+            .await
+            .expect("waiting item");
+        sqlx::query(
+            "INSERT INTO atomic_graph_edges (source,kind,target) VALUES ('at-waiting','blocks',?)",
+        )
+        .bind(format!("gate:{}", opened.id))
+        .execute(&mut conn)
+        .await
+        .expect("old edge");
+        sqlx::query("INSERT INTO atomic_graph_blocked (source,target) VALUES ('at-waiting',?)")
+            .bind(format!("gate:{}", opened.id))
+            .execute(&mut conn)
+            .await
+            .expect("old blocker projection");
+    }
     let deadline = opened.deadline.expect("a deadline");
 
     let recovering = child(&store, &run, "recover", 0);
@@ -249,6 +284,32 @@ async fn a_gate_survives_a_kill_and_is_approved_from_a_second_process(store: Sto
     )
     .await
     .expect("decided");
+
+    if let Store::Sqlite(path) = &store {
+        let url = format!("sqlite://{}", path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url)
+            .await
+            .expect("graph store");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items WHERE id=?")
+            .bind(format!("gate:{}", opened.id))
+            .fetch_one(&mut conn)
+            .await
+            .expect("resolved gate projection");
+        assert_eq!(count, 0, "deciding a gate removes its graph copy");
+        let edges: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_edges WHERE source='at-waiting' OR target='at-waiting'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("old edges");
+        let blocked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_blocked WHERE source='at-waiting' OR target='at-waiting'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("old blockers");
+        assert_eq!(
+            (edges, blocked),
+            (0, 0),
+            "no stale blocker survives decision"
+        );
+    }
 
     let out = finished(recovering, &run).await;
     assert_eq!(out, Resolution::Decided(decision));
@@ -286,6 +347,18 @@ async fn a_deadline_that_passes_while_offline_rejects_on_recovery(store: Store) 
     assert!(at >= deadline);
     assert_eq!(on_timeout, OnTimeout::Reject);
     assert!(!out.approved());
+    if let Store::Sqlite(path) = &store {
+        let url = format!("sqlite://{}", path.display());
+        let mut conn = sqlx::SqliteConnection::connect(&url)
+            .await
+            .expect("graph store");
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_graph_items WHERE id=?")
+            .bind(format!("gate:{}", opened.id))
+            .fetch_one(&mut conn)
+            .await
+            .expect("expired gate projection");
+        assert_eq!(count, 0, "expiry removes the gate's graph copy");
+    }
     second
         .shutdown(Duration::from_secs(5))
         .await

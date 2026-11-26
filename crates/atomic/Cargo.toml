@@ -27,6 +27,7 @@ postgres-tests = ["atomic-durable/postgres-tests"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "signal", "macros", "time"] }
+futures-util = "=0.3.34"
 anyhow = { workspace = true }
 getrandom = { workspace = true }
 libc = { workspace = true }

@@ -38,7 +38,7 @@
 //! `kind` names.
 
 use crate::atom::Atom as AtomFile;
-use crate::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
+use crate::codex::{self, CodexPaths, ModelEndpoint, NativeToolHost, TurnSpec};
 use crate::compile::Compiled;
 use crate::lite::{self, LiteRuntime};
 use crate::render::{self, RunInput};
@@ -892,6 +892,7 @@ struct Request<'a> {
     place: Place,
     /// The environment the atom declares for its commands.
     env: std::collections::BTreeMap<String, String>,
+    native_tools: Option<Arc<dyn NativeToolHost>>,
 }
 
 /// Run `request`, with one repair turn.
@@ -918,6 +919,7 @@ async fn run_contract(
         output_schema: Some(lowered.schema.clone()),
         model: request.model,
         sandbox: request.sandbox,
+        native_tools: request.native_tools,
         ..TurnSpec::default()
     };
     let model = spec
@@ -932,6 +934,14 @@ async fn run_contract(
     ] {
         h.update(part.as_bytes());
         h.update([0]);
+    }
+    if let Some(host) = &spec.native_tools {
+        for tool in host.specs() {
+            h.update(tool.name.as_bytes());
+            h.update([0]);
+            h.update(tool.parameters.to_string().as_bytes());
+            h.update([0]);
+        }
     }
     let prompt_hash = format!("{:x}", h.finalize());
 
@@ -1375,6 +1385,7 @@ async fn run_typed<A: Atom>(
         name: A::NAME,
         place: Place::unrecorded(A::NAME),
         env: Default::default(),
+        native_tools: None,
     };
     let (value, metadata) = run_contract(backend, request, &|value| {
         Box::pin(std::future::ready(check(&value)))
@@ -1482,6 +1493,30 @@ pub async fn run_declarative_repairing(
     repair: Option<&Value>,
     runtimes: &Runtimes,
 ) -> Result<(Value, RunMetadata), AtomError> {
+    run_declarative_repairing_with_tools(
+        atom, compiled, _registry, run, context, repair, runtimes, None,
+    )
+    .await
+}
+
+/// Run a declarative Codex atom with attempt-scoped host tools. The caller
+/// snapshots those tools' private state with the candidate after this returns.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_declarative_repairing_with_tools(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    _registry: &mut Registry,
+    run: &RunInput<'_>,
+    context: Option<DispatchContext<'_>>,
+    repair: Option<&Value>,
+    runtimes: &Runtimes,
+    native_tools: Option<Arc<dyn NativeToolHost>>,
+) -> Result<(Value, RunMetadata), AtomError> {
+    if native_tools.is_some() && atom.kind != "codex" {
+        return Err(AtomError::Runtime(
+            "native tools require a Codex atom".into(),
+        ));
+    }
     let input = run.input;
     if compiled.hash != atom.program.hash() {
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
@@ -1612,6 +1647,7 @@ pub async fn run_declarative_repairing(
         // Outside a workflow, the atom's own name stands in for the step.
         place: Place::of(run.run_id, run.step.unwrap_or(&atom.name)),
         env: declared_env(atom),
+        native_tools,
     };
     run_contract(backend, request, &check).await
 }

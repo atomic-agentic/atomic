@@ -34,6 +34,69 @@ async fn enrolled(label: &str) -> (PathBuf, Durare, HumanCredential) {
 }
 
 #[tokio::test]
+async fn gate_copies_refuse_operator_policy_criteria_parent_and_import_edges() {
+    let (path, _runtime, credential) = enrolled("gate-copy-writes").await;
+    let human = SqliteStore::open_authorized(&path, SystemTime::now, credential)
+        .expect("authorized graph store");
+    let mut conn = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .expect("graph database");
+    sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) VALUES ('gate:run:ship','Ship','open gate','gate',0,'blocked',NULL,'agent','gate-store',1,'run:ship')")
+        .execute(&mut conn)
+        .await
+        .expect("projected gate fixture");
+    conn.close().await.expect("close fixture connection");
+
+    let mut child = Draft::new("at-child", "Child");
+    child.parent = Some("gate:run:ship".into());
+    assert!(matches!(
+        human
+            .create_item(Actor::human("owner"), "child-request".into(), child)
+            .await,
+        Err(StoreError::InvalidEdge { .. })
+    ));
+    assert!(matches!(
+        human
+            .set_item_close_policy(Actor::human("owner"), "gate:run:ship".into(), vec![], None)
+            .await,
+        Err(StoreError::InvalidClosePolicy { .. })
+    ));
+    assert!(matches!(
+        human
+            .set_item_criteria(Actor::human("owner"), "gate:run:ship".into(), vec![])
+            .await,
+        Err(StoreError::InvalidCriteria { .. })
+    ));
+
+    for relation in [
+        r#""parent_issue":"gate:run:ship""#,
+        r#""dependencies":[{"issue_id":"at-imported","depends_on_id":"gate:run:ship","type":"blocks"}]"#,
+    ] {
+        let jsonl = format!(
+            "{{\"id\":\"at-valid\",\"title\":\"Valid\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"created_at\":\"2026-01-01T00:00:00Z\"}}\n{{\"id\":\"at-imported\",\"title\":\"Imported\",\"status\":\"open\",\"issue_type\":\"task\",\"priority\":2,\"created_at\":\"2026-01-01T00:00:00Z\",{relation}}}\n"
+        );
+        assert!(matches!(
+            human.import(Actor::human("owner"), jsonl, false).await,
+            Err(StoreError::ImportRefused(_))
+        ));
+        assert!(
+            human
+                .show(Actor::agent("test"), "at-valid".into())
+                .await
+                .expect("show valid")
+                .is_none()
+        );
+        assert!(
+            human
+                .show(Actor::agent("test"), "at-imported".into())
+                .await
+                .expect("show imported")
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
 async fn operator_close_then_reopen_advances_the_release_epoch() {
     let (path, _runtime, credential) = enrolled("status-revokes-review").await;
     let human = SqliteStore::open_authorized(&path, SystemTime::now, credential)
@@ -559,6 +622,21 @@ async fn only_host_git_proof_meets_verified_policy_and_branch_changes_invalidate
             Err(StoreError::Fenced { .. })
         ),
         "a different run cannot use the lease"
+    );
+    assert!(
+        matches!(
+            human
+                .link_verified_child_commit(
+                    lease.clone(),
+                    &worktrees,
+                    "wrong-parent",
+                    "run-proof",
+                    &commit,
+                )
+                .await,
+            Err(StoreError::Fenced { .. })
+        ),
+        "a child worktree cannot bypass the parent claim fence"
     );
     let mut forged = commit.clone();
     forged.reference = "refs/heads/main".into();

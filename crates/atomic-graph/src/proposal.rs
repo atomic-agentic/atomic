@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Private, typed graph proposals for one atom attempt. This module does not
-//! touch the committed graph. A future host bridge can expose its operations
-//! as tools, then publish an accepted batch under the claim's lease fence.
+//! touch the committed graph. The host bridge exposes its operations as
+//! tools, then publishes an accepted batch under the claim's lease fence.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -304,6 +304,9 @@ pub struct GraphView {
     pub notes: Vec<ViewNote>,
     /// Outgoing edges visible in this view.
     pub edges: Vec<ViewEdge>,
+    /// Committed items currently blocking readiness. A proposed edge is not
+    /// added here until publication refreshes the committed blocker projection.
+    pub blocked_by: Vec<String>,
 }
 
 /// Private proposals belonging to exactly one atom attempt. This type has
@@ -330,6 +333,11 @@ impl ProposalBuffer {
             attempt,
             operations: Vec::new(),
         }
+    }
+
+    /// The owning attempt, for the host's private read overlay.
+    pub fn attempt(&self) -> &AttemptKey {
+        &self.attempt
     }
 
     /// Parse and validate a JSON tool argument before assigning its stable
@@ -416,6 +424,7 @@ impl ProposalBuffer {
                         close_intent: None,
                         notes: Vec::new(),
                         edges: Vec::new(),
+                        blocked_by: Vec::new(),
                     });
                 }
                 GraphOp::CloseIntent {
@@ -797,6 +806,7 @@ mod tests {
                 provisional: false,
             }],
             edges: vec![],
+            blocked_by: vec![],
         };
         buffer
             .propose(GraphOp::Remember {

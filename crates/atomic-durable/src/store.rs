@@ -349,6 +349,17 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX atomic_delivery_queue_observations_due ON atomic_delivery_queue_observations (status,next_poll_at,delivery_run)",
         ],
     },
+    Migration {
+        version: 23,
+        name: "open-gate-graph-projection",
+        // The column identifies gate-store copies even when an older user
+        // item owns the natural gate:<id> name. Backfill allocates an unused
+        // name after the migration commits and resumes on every store open.
+        sql: &[
+            "ALTER TABLE atomic_graph_items ADD COLUMN projected_gate_id TEXT",
+            "CREATE UNIQUE INDEX atomic_graph_gate_projection_key ON atomic_graph_items (projected_gate_id)",
+        ],
+    },
 ];
 
 const HISTORY_TABLE: &str = "CREATE TABLE atomic_store_history (
@@ -1005,7 +1016,16 @@ pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreEr
             if version >= STORE_VERSION {
                 // Reuse the normal newer-version and migration-history checks.
                 migrate(&mut source, &path, MIGRATIONS).await?;
-                return Ok(source);
+                // A crash after the schema commit and before the resumable
+                // backfill must not make a read-only graph inspection miss an
+                // open gate. Repair only the snapshot; never write the source.
+                let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM atomic_gates g WHERE g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items i WHERE i.projected_gate_id=g.gate_id)")
+                    .fetch_one(&mut source)
+                    .await
+                    .map_err(db)?;
+                if pending == 0 {
+                    return Ok(source);
+                }
             }
             // Named memory databases are process-local. The open destination
             // holds this one alive until the caller finishes its inspection.
@@ -1023,8 +1043,55 @@ pub async fn inspect_sqlite(database: &Path) -> Result<SqliteConnection, StoreEr
             copy
         }
     };
-    migrate(&mut conn, &path, MIGRATIONS).await?;
+    let version = migrate(&mut conn, &path, MIGRATIONS).await?;
+    if version >= 23 {
+        backfill_gate_projection_sqlite(&mut conn)
+            .await
+            .map_err(db)?;
+    }
     Ok(conn)
+}
+
+// The graph's SQLite store opens the same database as the gate store. A
+// projection can be rebuilt after a crash or a schema upgrade; the gate row
+// decides whether it exists. A candidate colliding with a pre-v23 user item
+// is skipped without renaming that item.
+async fn backfill_gate_projection_sqlite(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
+    let gates = sqlx::query("SELECT g.gate_id FROM atomic_gates g WHERE g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items i WHERE i.projected_gate_id=g.gate_id) ORDER BY g.gate_id")
+        .fetch_all(&mut *conn)
+        .await?;
+    for gate in gates {
+        let gate_id: String = gate.try_get("gate_id")?;
+        let mut suffix = 0_u64;
+        loop {
+            let id = if suffix == 0 {
+                format!("gate:{gate_id}")
+            } else {
+                format!("gate:{gate_id}#{suffix}")
+            };
+            let inserted = sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) SELECT ?,g.title,'Open human gate for run ' || g.run,'gate',0,'blocked',NULL,'agent','gate-store',g.opened_at,g.gate_id FROM atomic_gates g WHERE g.gate_id=? AND g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items WHERE projected_gate_id=g.gate_id) ON CONFLICT(id) DO NOTHING")
+                .bind(id)
+                .bind(&gate_id)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            if inserted == 1 {
+                break;
+            }
+            let done: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id=?) + (SELECT COUNT(*) FROM atomic_gates WHERE gate_id=? AND state!='open')")
+                .bind(&gate_id)
+                .bind(&gate_id)
+                .fetch_one(&mut *conn)
+                .await?;
+            if done != 0 {
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                sqlx::Error::Protocol("gate projection name space exhausted".into())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// [`open_sqlite`], migrating with `migrations`.
@@ -1038,7 +1105,16 @@ async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i
         .map_err(db)?
         .create_if_missing(true);
     let mut conn = SqliteConnection::connect_with(&options).await.map_err(db)?;
-    let result = migrate(&mut conn, &path, migrations).await;
+    let result = async {
+        let version = migrate(&mut conn, &path, migrations).await?;
+        if version >= 23 {
+            backfill_gate_projection_sqlite(&mut conn)
+                .await
+                .map_err(db)?;
+        }
+        Ok(version)
+    }
+    .await;
     let _ = conn.close().await;
     result
 }
@@ -1118,6 +1194,15 @@ async fn open_postgres_with(
             });
         }
         if present && found == to && history.is_some() {
+            if to >= 23 {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "SET LOCAL search_path TO {schema}"
+                )))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+                backfill_gate_projection_pg(&mut tx).await.map_err(db)?;
+            }
             tx.commit().await.map_err(db)?;
             return Ok(to);
         }
@@ -1191,12 +1276,59 @@ async fn open_postgres_with(
             .await
             .map_err(db)?;
         }
+        if to >= 23 {
+            backfill_gate_projection_pg(&mut tx).await.map_err(db)?;
+        }
         tx.commit().await.map_err(db)?;
         Ok(to)
     }
     .await;
     let _ = conn.close().await;
     result
+}
+
+async fn backfill_gate_projection_pg(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+    // A decision updates this same row. Holding its lock until the insert
+    // commits prevents a decision from deleting an absent copy and then
+    // having backfill publish a stale blocked copy from its earlier snapshot.
+    let gates = sqlx::query(
+        "SELECT g.gate_id FROM atomic_gates g WHERE g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items i WHERE i.projected_gate_id=g.gate_id) ORDER BY g.gate_id FOR UPDATE OF g",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    for gate in gates {
+        let gate_id: String = gate.try_get("gate_id")?;
+        let mut suffix = 0_u64;
+        loop {
+            let id = if suffix == 0 {
+                format!("gate:{gate_id}")
+            } else {
+                format!("gate:{gate_id}#{suffix}")
+            };
+            let inserted = sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at,projected_gate_id) SELECT $1,g.title,'Open human gate for run ' || g.run,'gate',0,'blocked',NULL,'agent','gate-store',g.opened_at,g.gate_id FROM atomic_gates g WHERE g.gate_id=$2 AND g.state='open' AND NOT EXISTS (SELECT 1 FROM atomic_graph_items WHERE projected_gate_id=g.gate_id) ON CONFLICT(id) DO NOTHING")
+                .bind(id)
+                .bind(&gate_id)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected();
+            if inserted == 1 {
+                break;
+            }
+            let done: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id=$1) + (SELECT COUNT(*) FROM atomic_gates WHERE gate_id=$1 AND state!='open')")
+                .bind(&gate_id)
+                .fetch_one(&mut **tx)
+                .await?;
+            if done != 0 {
+                break;
+            }
+            suffix = suffix.checked_add(1).ok_or_else(|| {
+                sqlx::Error::Protocol("gate projection name space exhausted".into())
+            })?;
+        }
+    }
+    Ok(())
 }
 
 async fn pg_marker(
@@ -1840,6 +1972,220 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    #[tokio::test]
+    async fn gate_projection_migration_backfills_only_open_gates() {
+        let p = db("gate-projection-backfill");
+        open_sqlite_with(&p, &MIGRATIONS[..22])
+            .await
+            .expect("version 22 store");
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("connect old store");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:open','run','wf','open','Open gate','{}','[]','digest','[]','low',1,NULL,'reject','open'),('run:closed','run','wf','closed','Closed gate','{}','[]','digest','[]','low',2,NULL,'reject','approved')")
+            .execute(&mut conn)
+            .await
+            .expect("old gates");
+        for id in ["gate:run:open", "gate:run:open#1"] {
+            sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES (?,'Older user item','kept on upgrade','task',2,'open',NULL,'human','owner',1)")
+                .bind(id)
+                .execute(&mut conn)
+                .await
+                .expect("older user item");
+        }
+        conn.close().await.expect("close old connection");
+
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("connect upgraded store");
+        let projected: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT id,kind,status FROM atomic_graph_items WHERE projected_gate_id IS NOT NULL ORDER BY id",
+        )
+        .fetch_all(&mut conn)
+        .await
+        .expect("gate copies");
+        assert_eq!(
+            projected,
+            vec![("gate:run:open#2".into(), "gate".into(), "blocked".into())]
+        );
+        let old: Vec<(String, String)> = sqlx::query_as("SELECT id,title FROM atomic_graph_items WHERE id IN ('gate:run:open','gate:run:open#1') ORDER BY id")
+            .fetch_all(&mut conn)
+            .await
+            .expect("older items survive");
+        assert_eq!(old.len(), 2);
+        assert!(old.iter().all(|(_, title)| title == "Older user item"));
+        conn.close().await.expect("close upgraded connection");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[tokio::test]
+    async fn gate_projection_backfill_resumes_after_schema_commit_without_mutating_inspection_source()
+     {
+        let p = db("gate-projection-resume");
+        open_sqlite(&p).await.expect("current store");
+        let mut source = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("connect store");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:pending','run','wf','pending','Pending gate','{}','[]','digest','[]','low',1,NULL,'reject','open')")
+            .execute(&mut source)
+            .await
+            .expect("gate committed before projection");
+        let mut copy = inspect_sqlite(&p).await.expect("inspect repaired snapshot");
+        let projected: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id='run:pending'",
+        )
+        .fetch_one(&mut copy)
+        .await
+        .expect("snapshot gate copy");
+        assert_eq!(projected, 1);
+        let in_source: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id='run:pending'",
+        )
+        .fetch_one(&mut source)
+        .await
+        .expect("source gate copy");
+        assert_eq!(in_source, 0, "inspection does not mutate source");
+        copy.close().await.expect("close snapshot");
+        source.close().await.expect("close source");
+        open_sqlite(&p).await.expect("resume backfill");
+        let mut source = SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+            .await
+            .expect("reopen source");
+        let repaired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id='run:pending'",
+        )
+        .fetch_one(&mut source)
+        .await
+        .expect("repaired source");
+        assert_eq!(repaired, 1);
+        source.close().await.expect("close repaired source");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[tokio::test]
+    async fn postgres_gate_projection_upgrade_keeps_older_colliding_item() {
+        let schema = crate::testing::schema("hist_gate_copy").await;
+        open_postgres_with(schema.url(), schema.name(), &MIGRATIONS[..22])
+            .await
+            .expect("version 22 schema");
+        let mut conn = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("connect old schema");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {}",
+            schema.name()
+        )))
+        .execute(&mut conn)
+        .await
+        .expect("select schema");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:open','run','wf','open','Open gate','{}','[]','digest','[]','low',1,NULL,'reject','open')")
+            .execute(&mut conn)
+            .await
+            .expect("old gate");
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('gate:run:open','Older user item','kept on upgrade','task',2,'open',NULL,'human','owner',1)")
+            .execute(&mut conn)
+            .await
+            .expect("older user item");
+        conn.close().await.expect("close old schema");
+
+        open_postgres(schema.url(), schema.name())
+            .await
+            .expect("upgrade with collision");
+        let mut conn = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("connect upgraded schema");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {}",
+            schema.name()
+        )))
+        .execute(&mut conn)
+        .await
+        .expect("select upgraded schema");
+        let copy: (String, String) = sqlx::query_as(
+            "SELECT id,status FROM atomic_graph_items WHERE projected_gate_id='run:open'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("gate copy");
+        assert_eq!(copy, ("gate:run:open#1".into(), "blocked".into()));
+        let old: String =
+            sqlx::query_scalar("SELECT title FROM atomic_graph_items WHERE id='gate:run:open'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("older item");
+        assert_eq!(old, "Older user item");
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[tokio::test]
+    async fn postgres_gate_backfill_waits_for_a_decision_in_progress() {
+        let schema = crate::testing::schema("hist_gate_race").await;
+        open_postgres(schema.url(), schema.name())
+            .await
+            .expect("current schema");
+        let mut owner = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("connect gate owner");
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET search_path TO {}",
+            schema.name()
+        )))
+        .execute(&mut owner)
+        .await
+        .expect("select schema");
+        sqlx::query("INSERT INTO atomic_gates (gate_id,run,workflow,step,title,show,evidence,proposal,approvers,tier,opened_at,deadline,on_timeout,state) VALUES ('run:race','run','wf','race','Racing gate','{}','[]','digest','[]','low',1,NULL,'reject','open')")
+            .execute(&mut owner)
+            .await
+            .expect("open gate without projection");
+
+        let mut deciding = owner.begin().await.expect("begin decision");
+        sqlx::query("UPDATE atomic_gates SET state='approved' WHERE gate_id='run:race'")
+            .execute(&mut *deciding)
+            .await
+            .expect("hold decision row lock");
+        let app = "gate_backfill_race";
+        let separator = if schema.url().contains('?') { '&' } else { '?' };
+        let url = format!("{}{separator}application_name={app}", schema.url());
+        let name = schema.name().to_owned();
+        let backfill = tokio::spawn(async move { open_postgres(&url, &name).await });
+        let mut observer = sqlx::PgConnection::connect(schema.url())
+            .await
+            .expect("observe backfill");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: Option<String> = sqlx::query_scalar("SELECT COALESCE(wait_event_type,'') FROM pg_stat_activity WHERE application_name=$1 AND state='active' AND query LIKE '%atomic_gates%'")
+                .bind(app)
+                .fetch_optional(&mut observer)
+                .await
+                .expect("observe gate lock");
+            if waiting.as_deref() == Some("Lock") {
+                break;
+            }
+            assert!(
+                !backfill.is_finished(),
+                "backfill passed the uncommitted decision"
+            );
+            assert!(
+                std::time::Instant::now() < until,
+                "backfill never waited on the gate row"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        deciding.commit().await.expect("commit decision");
+        backfill
+            .await
+            .expect("backfill task")
+            .expect("backfill completed");
+        let stale: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM atomic_graph_items WHERE projected_gate_id='run:race'",
+        )
+        .fetch_one(&mut owner)
+        .await
+        .expect("projection after decision");
+        assert_eq!(stale, 0, "a resolved gate has no blocked graph copy");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_open_reads_marker_and_history_from_one_snapshot() {
         let path = db("concurrent-open");
@@ -1945,7 +2291,7 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .expect("history");
-        assert_eq!(rows.len(), 13, "one baseline and twelve new migrations");
+        assert_eq!(rows.len(), 14, "one baseline and thirteen new migrations");
         assert_eq!(rows[0].get::<i64, _>("version"), 10);
         assert_eq!(rows[0].get::<String, _>("name"), "legacy-baseline-v10");
         assert_eq!(rows[0].get::<Option<String>, _>("checksum"), None);
@@ -2030,7 +2376,7 @@ mod tests {
             rows[11].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[20]))
         );
-        assert_eq!(rows[12].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(rows[12].get::<i64, _>("version"), 22);
         assert_eq!(
             rows[12].get::<String, _>("name"),
             "delivery-queue-poll-schedule"
@@ -2038,6 +2384,15 @@ mod tests {
         assert_eq!(
             rows[12].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[21]))
+        );
+        assert_eq!(rows[13].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(
+            rows[13].get::<String, _>("name"),
+            "open-gate-graph-projection"
+        );
+        assert_eq!(
+            rows[13].get::<Option<String>, _>("checksum"),
+            Some(checksum(&MIGRATIONS[22]))
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -2460,7 +2815,7 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("legacy history");
-            assert_eq!(baseline.len(), 13);
+            assert_eq!(baseline.len(), 14);
             assert_eq!(baseline[0].get::<i64, _>("version"), 10);
             assert_eq!(baseline[0].get::<String, _>("name"), "legacy-baseline-v10");
             assert_eq!(baseline[0].get::<Option<String>, _>("checksum"), None);
@@ -2519,10 +2874,15 @@ mod tests {
                 baseline[11].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[20]))
             );
-            assert_eq!(baseline[12].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(baseline[12].get::<i64, _>("version"), 22);
             assert_eq!(
                 baseline[12].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[21]))
+            );
+            assert_eq!(baseline[13].get::<i64, _>("version"), STORE_VERSION);
+            assert_eq!(
+                baseline[13].get::<Option<String>, _>("checksum"),
+                Some(checksum(&MIGRATIONS[22]))
             );
         }
     }
@@ -2613,7 +2973,7 @@ mod tests {
                 .expect("history")
                 .expect("recorded history")
                 .len(),
-            13
+            14
         );
     }
 
