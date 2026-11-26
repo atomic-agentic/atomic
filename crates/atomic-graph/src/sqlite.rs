@@ -2663,6 +2663,76 @@ mod tests {
     }
 
     #[test]
+    fn workflow_child_selection_uses_migrated_parent_index() {
+        let path = std::env::temp_dir().join(format!(
+            "atomic-graph-parent-plan-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let store = SqliteStore::open(&path, SystemTime::now).expect("migrated graph store");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let mut conn = store.conn.lock().expect("graph connection");
+        let ready_sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::transactional_claim::READY_CHILD_SQL
+        );
+        let pending_sql = format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::transactional_claim::UNFINISHED_CHILD_SQL
+        );
+        let plans = runtime.block_on(async {
+            let ready = sqlx::query(sqlx::AssertSqlSafe(ready_sql))
+                .bind("my-epic")
+                .bind(0_i64)
+                .bind(0_i64)
+                .fetch_all(&mut *conn)
+                .await
+                .expect("workflow claim plan");
+            let pending = sqlx::query(sqlx::AssertSqlSafe(pending_sql))
+                .bind("my-epic")
+                .fetch_all(&mut *conn)
+                .await
+                .expect("workflow pending plan");
+            [ready, pending].map(|rows| {
+                rows.iter()
+                    .map(|row| row.try_get::<String, _>("detail").expect("plan detail"))
+                    .collect::<Vec<_>>()
+            })
+        });
+        for plan in &plans {
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("atomic_graph_children_by_priority (parent=?)")),
+                "workflow scanned unrelated parents: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+                "workflow sorted children separately: {plan:?}"
+            );
+        }
+        assert!(
+            plans[0]
+                .iter()
+                .any(|line| line.contains("SEARCH b USING") && line.contains("(source=?)")),
+            "workflow did not use the blocker source index: {:?}",
+            plans[0]
+        );
+        assert!(
+            !plans[0]
+                .iter()
+                .any(|line| line.contains("CO-ROUTINE") || line.contains("MATERIALIZE")),
+            "workflow expanded unrelated blocker paths: {:?}",
+            plans[0]
+        );
+        drop(conn);
+        drop(store);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sqlite_commit_failure_rolls_back_and_next_operation_runs() {
         let path = std::env::temp_dir().join(format!(
             "atomic-graph-commit-failure-{}.sqlite",

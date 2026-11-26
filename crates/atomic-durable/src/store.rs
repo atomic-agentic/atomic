@@ -374,6 +374,13 @@ const MIGRATIONS: &[Migration] = &[
         // applied within this numbered migration's transaction below.
         sql: &[],
     },
+    Migration {
+        version: 26,
+        name: "work-graph-epic-child-selection",
+        sql: &[
+            "CREATE INDEX atomic_graph_children_by_priority ON atomic_graph_items (parent, priority, id)",
+        ],
+    },
 ];
 
 const SQLITE_SEARCH_SQL: &[&str] = &[
@@ -2117,6 +2124,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parent_selection_index_upgrades_an_existing_v25_store() {
+        let p = db("parent-index-upgrade");
+        assert_eq!(
+            open_sqlite_with(&p, &MIGRATIONS[..25])
+                .await
+                .expect("version 25 store"),
+            25
+        );
+        let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&p);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("version 25 connection");
+        sqlx::query("INSERT INTO atomic_graph_items (id,title,body,kind,priority,status,parent,trust,created_by,created_at) VALUES ('at-child','Child','','task',2,'open','at-parent','human','test',1)")
+            .execute(&mut conn)
+            .await
+            .expect("existing child");
+        conn.close().await.expect("close old connection");
+
+        assert_eq!(open_sqlite(&p).await.expect("upgrade"), STORE_VERSION);
+        let mut conn = SqliteConnection::connect_with(&options)
+            .await
+            .expect("upgraded connection");
+        let index_sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='atomic_graph_children_by_priority'",
+        )
+        .fetch_one(&mut conn)
+        .await
+        .expect("parent index");
+        assert!(index_sql.contains("(parent, priority, id)"));
+        let parent: String =
+            sqlx::query_scalar("SELECT parent FROM atomic_graph_items WHERE id='at-child'")
+                .fetch_one(&mut conn)
+                .await
+                .expect("existing child survives upgrade");
+        assert_eq!(parent, "at-parent");
+        conn.close().await.expect("close upgraded connection");
+        std::fs::remove_file(p).expect("remove fixture");
+    }
+
+    #[tokio::test]
     async fn search_upgrade_open_indexes_every_batch_before_returning() {
         let p = db("search-upgrade-open");
         open_sqlite_with(&p, &MIGRATIONS[..24])
@@ -2564,7 +2611,11 @@ mod tests {
         .fetch_all(&mut conn)
         .await
         .expect("history");
-        assert_eq!(rows.len(), 16, "one baseline and fifteen new migrations");
+        assert_eq!(
+            rows.len(),
+            (STORE_VERSION - 10 + 1) as usize,
+            "one baseline and every later migration"
+        );
         assert_eq!(rows[0].get::<i64, _>("version"), 10);
         assert_eq!(rows[0].get::<String, _>("name"), "legacy-baseline-v10");
         assert_eq!(rows[0].get::<Option<String>, _>("checksum"), None);
@@ -2667,7 +2718,7 @@ mod tests {
             rows[13].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[22]))
         );
-        assert_eq!(rows[15].get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(rows[15].get::<i64, _>("version"), 25);
         assert_eq!(
             rows[15].get::<String, _>("name"),
             "sqlite-work-graph-search"
@@ -2675,6 +2726,16 @@ mod tests {
         assert_eq!(
             rows[15].get::<Option<String>, _>("checksum"),
             Some(checksum(&MIGRATIONS[24]))
+        );
+        let newest = rows.last().expect("latest migration history");
+        assert_eq!(newest.get::<i64, _>("version"), STORE_VERSION);
+        assert_eq!(
+            newest.get::<String, _>("name"),
+            "work-graph-epic-child-selection"
+        );
+        assert_eq!(
+            newest.get::<Option<String>, _>("checksum"),
+            Some(checksum(MIGRATIONS.last().expect("latest migration")))
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -3097,7 +3158,7 @@ mod tests {
             .fetch_all(&mut conn)
             .await
             .expect("legacy history");
-            assert_eq!(baseline.len(), 16);
+            assert_eq!(baseline.len(), (STORE_VERSION - 10 + 1) as usize);
             assert_eq!(baseline[0].get::<i64, _>("version"), 10);
             assert_eq!(baseline[0].get::<String, _>("name"), "legacy-baseline-v10");
             assert_eq!(baseline[0].get::<Option<String>, _>("checksum"), None);
@@ -3166,10 +3227,11 @@ mod tests {
                 baseline[13].get::<Option<String>, _>("checksum"),
                 Some(checksum(&MIGRATIONS[22]))
             );
-            assert_eq!(baseline[15].get::<i64, _>("version"), STORE_VERSION);
+            let newest = baseline.last().expect("latest migration history");
+            assert_eq!(newest.get::<i64, _>("version"), STORE_VERSION);
             assert_eq!(
-                baseline[15].get::<Option<String>, _>("checksum"),
-                Some(checksum(&MIGRATIONS[24]))
+                newest.get::<Option<String>, _>("checksum"),
+                Some(checksum(MIGRATIONS.last().expect("latest migration")))
             );
         }
     }
