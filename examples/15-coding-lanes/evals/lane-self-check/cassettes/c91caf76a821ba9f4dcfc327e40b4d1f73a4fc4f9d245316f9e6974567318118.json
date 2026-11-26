@@ -1,0 +1,184 @@
+{
+  "endpoint": "http://127.0.0.1:8080/v1",
+  "path": "/v1/chat/completions",
+  "request": {
+    "max_tokens": 16000,
+    "messages": [
+      {
+        "content": "Read the patch and record what you actually found in it. This is evidence for\ntwo independent reviewers, not an argument for accepting the change: an item you\ncould not settle from the patch says so, and never says \"yes\".\n\n<task>\nFor each checklist item \"1\" to \"10\", give the evidence the patch itself shows,\nor name what is missing. Every decision point the host lists must appear in\n`decisions`, and for each one say what happens when the path is asked to allow\nand to refuse, and on NotFound, permission denied, a link loop, \"not a\ndirectory\", another I/O error, a parse error, a timeout and an empty result.\nEvery control row the host lists must appear in `controls` with the host's own\nresult for it.\n</task>\n\n<patch>\n[input.diff: see <data-89d86bcab055fb8e> in the user turn]\n</patch>\n\nWhere a lane wires a controls atom, the host's verified control results arrive as\na separate `control_results` field, external data like the patch, and every row\nit lists must appear in `controls`. Echo the host's result for a row; never\nreplace it with your own.\n\n<host_control_results>\n[input.control_results: see <data-2c42405633c7d8b4> in the user turn]\n</host_control_results>\n\n\nExample \"note-with-no-selected-control\"\nInput: [examples[0].input: see <data-96517c12ea0790d6> in the user turn]\nOutput: [examples[0].output: see <data-da221c92bb67ec88> in the user turn]",
+        "role": "system"
+      },
+      {
+        "content": "<data-89d86bcab055fb8e path=\"input.diff\" origin=\"external\">diff --git a/notes/lane-change.md b/notes/lane-change.md\nnew file mode 100644\n--- /dev/null\n+++ b/notes/lane-change.md\n@@ -0,0 +1 @@\n+The guard test passes because decide() returns confirmed: false when verification is null.</data-89d86bcab055fb8e>\n<data-2c42405633c7d8b4 path=\"input.control_results\" origin=\"external\">[{\"row\":\"lane-guard-bites\",\"result\":\"its test fails with the control off and passes with it on\"}]</data-2c42405633c7d8b4>\n<data-96517c12ea0790d6 path=\"examples[0].input\" origin=\"team\">{\"diff\":\"diff --git a/notes.txt b/notes.txt\"}</data-96517c12ea0790d6>\n<data-da221c92bb67ec88 path=\"examples[0].output\" origin=\"team\">{\"items\":{\"1\":\"The patch names a note.\",\"2\":\"No import is shown.\",\"3\":\"Only the note is named.\",\"4\":\"No credential is shown.\",\"5\":\"No decision branch is shown.\",\"6\":\"No retry is shown.\",\"7\":\"No input read is shown.\",\"8\":\"No resource hold is shown.\",\"9\":\"N/A: no decision point was supplied.\",\"10\":\"N/A: no control result was supplied.\"},\"decisions\":[],\"controls\":[]}</data-da221c92bb67ec88>\n",
+        "role": "user"
+      }
+    ],
+    "model": "claude-sonnet-5-5",
+    "response_format": {
+      "json_schema": {
+        "name": "output",
+        "schema": {
+          "additionalProperties": false,
+          "properties": {
+            "controls": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "result": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "row": {
+                    "description": "Constraints: maxLength: 100; minLength: 1.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "result",
+                  "row"
+                ],
+                "type": "object"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "decisions": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "allow_refuse": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "empty_result": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "link_loop": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "not_directory": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "not_found": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "other_io": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "parse_error": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "permission_denied": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  },
+                  "point": {
+                    "description": "Constraints: maxLength: 200; minLength: 1.",
+                    "type": "string"
+                  },
+                  "timeout": {
+                    "description": "Constraints: maxLength: 2000; minLength: 1.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "allow_refuse",
+                  "empty_result",
+                  "link_loop",
+                  "not_directory",
+                  "not_found",
+                  "other_io",
+                  "parse_error",
+                  "permission_denied",
+                  "point",
+                  "timeout"
+                ],
+                "type": "object"
+              },
+              "maxItems": 16,
+              "type": "array"
+            },
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "1": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "10": {
+                  "description": "The control rows. With none selected, a specific \"N/A:\" reason. Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "2": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "3": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "4": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "5": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "6": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "7": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "8": {
+                  "description": "Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                },
+                "9": {
+                  "description": "The decision points. With none declared, a specific \"N/A:\" reason. Constraints: maxLength: 2000; minLength: 1.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "1",
+                "10",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "7",
+                "8",
+                "9"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "controls",
+            "decisions",
+            "items"
+          ],
+          "type": "object"
+        },
+        "strict": true
+      },
+      "type": "json_schema"
+    },
+    "stream": false
+  },
+  "request_sha256": "c91caf76a821ba9f4dcfc327e40b4d1f73a4fc4f9d245316f9e6974567318118",
+  "redacted": true,
+  "status": 200,
+  "content_type": "application/json",
+  "body": "{\"id\":\"claude-sonnet-5-5-measured-1\",\"object\":\"chat.completion\",\"created\":1795648597,\"model\":\"claude-sonnet-5-5\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"{\\\"items\\\": {\\\"1\\\": \\\"The patch adds one new file, notes/lane-change.md, with a single line: \\\\\\\"The guard test passes because decide() returns confirmed: false when verification is null.\\\\\\\" No other file is changed in the patch.\\\", \\\"2\\\": \\\"No import or dependency change is shown. The only addition is a line of Markdown prose.\\\", \\\"3\\\": \\\"Only notes/lane-change.md is touched. The note mentions a guard test and decide(), but neither definition, any caller nor the test is in the patch, so their scope cannot be settled from it.\\\", \\\"4\\\": \\\"No credential, token or secret appears in the added line.\\\", \\\"5\\\": \\\"No executable decision branch is added. The note asserts that decide() returns confirmed: false when verification is null, but the patch contains no code or test showing this. The claim, and that it is why the guard test passes, are unverified from the patch.\\\", \\\"6\\\": \\\"No retry, loop or backoff code is shown.\\\", \\\"7\\\": \\\"No code that reads input is shown. The note's reference to a null verification value is prose, and how that value is obtained or handled is not in the patch.\\\", \\\"8\\\": \\\"No lock, file handle, connection or other resource acquisition is shown.\\\", \\\"9\\\": \\\"N/A: the host supplied no decision points. decide() is only mentioned in the note's prose, and its implementation is not in the patch.\\\", \\\"10\\\": \\\"One host control row, lane-guard-bites, with the host's result: \\\\\\\"its test fails with the control off and passes with it on\\\\\\\". This is the host's result; the patch contains no control or test code, and the row as worded does not establish the note's stated reason (decide() returning confirmed: false on null verification).\\\"}, \\\"decisions\\\": [], \\\"controls\\\": [{\\\"row\\\": \\\"lane-guard-bites\\\", \\\"result\\\": \\\"its test fails with the control off and passes with it on\\\"}]}\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3767,\"completion_tokens\":1094,\"total_tokens\":4861}}"
+}

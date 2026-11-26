@@ -625,6 +625,10 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
+            graph_database: match &database {
+                Database::Sqlite(path) => Some(path.clone()),
+                Database::Postgres { .. } => None,
+            },
             model_endpoint_configured,
             store: store.clone(),
             deployment: deployment(),

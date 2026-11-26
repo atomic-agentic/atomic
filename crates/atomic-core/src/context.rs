@@ -80,9 +80,14 @@ fn publish(state_dir: &Path, file: &Path, bytes: &[u8]) -> Result<(), String> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.to_string()),
         }
+        // A directory handle can be opened and synced this way on Unix. On
+        // Windows, File::open on a directory is denied; the completed file was
+        // flushed before its hard link was published.
+        #[cfg(unix)]
         std::fs::File::open(state_dir)
             .and_then(|dir| dir.sync_all())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        Ok(())
     })();
     let _ = std::fs::remove_file(temporary);
     result
@@ -441,6 +446,35 @@ pub fn resolve_fresh(
 mod tests {
     use super::*;
     use crate::{atom, compile, render};
+
+    #[test]
+    fn concurrent_context_publishers_keep_one_complete_winner() {
+        let state = crate::state::TestScratch::new("context-publish-race");
+        let file = state.join("checkpoint.json");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut writers = Vec::new();
+        for letter in [b'a', b'b'] {
+            let state = state.to_path_buf();
+            let file = file.clone();
+            let start = start.clone();
+            writers.push(std::thread::spawn(move || {
+                let bytes = vec![letter; 65_536];
+                start.wait();
+                publish(&state, &file, &bytes).expect("publish");
+            }));
+        }
+        start.wait();
+        for writer in writers {
+            writer.join().expect("writer");
+        }
+        let actual = std::fs::read(&file).expect("winner");
+        assert!(actual == vec![b'a'; 65_536] || actual == vec![b'b'; 65_536]);
+        assert_eq!(
+            std::fs::read_dir(&*state).expect("state").count(),
+            1,
+            "temporary candidates were removed"
+        );
+    }
 
     #[test]
     fn production_context_reuses_its_checkpoint_rebinds_steps_and_rejects_tampering() {

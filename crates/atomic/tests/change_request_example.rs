@@ -211,6 +211,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
         &mut rt,
         Services {
             runtimes,
+            graph_database: None,
             model_endpoint_configured: true,
             store: LocalStore::open(dir.join("state/artifacts")).expect("artifact store"),
             deployment: local(),

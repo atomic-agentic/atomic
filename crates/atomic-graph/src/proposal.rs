@@ -35,7 +35,8 @@ pub fn operation_schema() -> &'static Value {
                                   "pattern": "^[^\\x00\\r\\n]*[^\\s\\x00\\r\\n][^\\x00\\r\\n]*$"},
                         "body": {"type": "string", "maxLength": 8192, "pattern": "^[^\\x00]*$"},
                         "kind": {"type": "string", "minLength": 1, "maxLength": 64,
-                                 "pattern": "^[^\\s\\x00]+$"},
+                                 "pattern": "^[^\\s\\x00]+$",
+                                 "not": {"enum": ["gate", "goal"]}},
                         "priority": {"type": "integer", "minimum": -2147483648_i64,
                                      "maximum": 2147483647_i64},
                         "parent": {"type": ["string", "null"], "minLength": 1,
@@ -203,7 +204,7 @@ impl std::error::Error for ProposalError {}
 
 /// The host-generated receipt returned to the proposing atom. It never says
 /// that the operation is committed.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposalReceipt {
     /// Zero-based position in this attempt's private batch.
     pub index: usize,
@@ -214,7 +215,7 @@ pub struct ProposalReceipt {
 }
 
 /// One validated operation and the identities the host assigned it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedOp {
     /// The validated operation.
     pub op: GraphOp,
@@ -520,6 +521,9 @@ fn validate(op: &GraphOp) -> Result<(), ProposalError> {
             if !bounded_text(kind, 64) || kind.chars().any(char::is_whitespace) {
                 return Err(invalid("create kind is invalid"));
             }
+            if matches!(kind.as_str(), "gate" | "goal") {
+                return Err(invalid("create kind is reserved for the host"));
+            }
             if parent.as_deref().is_some_and(|id| !bounded_id(id)) {
                 return Err(invalid("create parent is invalid"));
             }
@@ -639,6 +643,7 @@ mod tests {
         for invalid in [
             json!({"op":"create","title":"","body":"","kind":"task","priority":2}),
             json!({"op":"create","title":"follow up","body":"","kind":"task","priority":2,"actor":"human"}),
+            json!({"op":"create","title":"Fake gate","body":"","kind":"gate","priority":2}),
             json!({"op":"close_intent","item_id":"at-a","reason":""}),
             json!({"op":"dep_add","from":"at-a","kind":"unknown","to":"at-b"}),
             json!({"op":"remember","item_id":"at-a","text":""}),

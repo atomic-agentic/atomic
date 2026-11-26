@@ -226,7 +226,7 @@ fn cleanup_keeps_only_what_an_accepted_candidate_names() {
 
     let report = f
         .worktrees
-        .cleanup("run", std::slice::from_ref(&accepted.commit))
+        .cleanup("run", std::slice::from_ref(&accepted.reference))
         .unwrap();
     assert_eq!(report.refs, std::slice::from_ref(&orphan.reference));
     assert_eq!(report.worktrees.len(), 2);
@@ -252,9 +252,34 @@ fn cleanup_keeps_only_what_an_accepted_candidate_names() {
     );
     // Cleaning up again finds nothing more.
     assert_eq!(
-        f.worktrees.cleanup("run", &[accepted.commit]).unwrap(),
+        f.worktrees.cleanup("run", &[accepted.reference]).unwrap(),
         Default::default()
     );
+}
+
+#[test]
+fn cleanup_removes_an_orphan_ref_even_when_it_names_the_accepted_commit() {
+    let f = fixture("cleanup-identical-commit");
+    let wt = f.worktrees.prepare("run", "step", &f.first).unwrap();
+    write(&wt.path.join("a.txt"), "same attempt result\n");
+    let first = f
+        .worktrees
+        .commit(&wt, "same result", &Signature::default())
+        .unwrap();
+    let second = "refs/atomic/run/steps/step/2".to_string();
+    f.worktrees
+        .repo()
+        .create_ref(&second, &first.commit)
+        .unwrap();
+    let report = f
+        .worktrees
+        .cleanup("run", std::slice::from_ref(&second))
+        .unwrap();
+    assert_eq!(report.refs, [first.reference]);
+    let refs = f.worktrees.repo().refs("refs/atomic/run/steps/").unwrap();
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].name, second);
+    assert_eq!(refs[0].sha, first.commit);
 }
 
 #[test]
