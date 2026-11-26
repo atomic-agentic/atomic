@@ -80,6 +80,20 @@ atomic --json graph claim ITEM_ID
 atomic --json graph close ITEM_ID
 ```
 
+To admit an imported open epic to the graph work loop, the operator pins it
+and starts a workflow with exactly one worktree atom step. Both commands use
+the operator credential; an external coding agent does not launch the run.
+Parallel lanes currently refuse admission, so use one lane:
+
+```bash
+atomic --json graph pin EPIC_ID
+atomic run WORKFLOW_NAME --graph-epic EPIC_ID --fixture "$PWD" --fixture-rev BASE_COMMIT --lanes 1
+```
+
+The admitted workflow selects and claims a ready child, gives its criteria to
+the atom, and publishes accepted follow-ups. The operator supplies a real
+`WORKFLOW_NAME` and `BASE_COMMIT` for this project before running it.
+
 ## Architecture rules
 
 These are the rules that are easiest to break:
