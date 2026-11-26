@@ -98,6 +98,141 @@ fn clear_journal(path: &std::path::Path) {
 }
 
 #[cfg(target_os = "linux")]
+fn try_file_permit(path: &std::path::Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .expect("open host permit file");
+    // flock is advisory; this prototype controls both admission paths.
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(locked) => Some(locked),
+        Err((_file, nix::errno::Errno::EWOULDBLOCK)) => None,
+        Err((_file, error)) => panic!("host lock: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn acquire_file_permit(path: &std::path::Path) -> nix::fcntl::Flock<std::fs::File> {
+    loop {
+        if let Some(file) = try_file_permit(path) {
+            return file;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(target_os = "linux")]
+impl KillOnDrop {
+    fn stop(&mut self) {
+        use std::os::unix::process::ExitStatusExt as _;
+        self.0.kill().expect("send SIGKILL to test subprocess");
+        let status = self.0.wait().expect("reap test subprocess");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_test_child(test_name: &str, env: &[(&str, &str)]) -> KillOnDrop {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    command.arg("--exact").arg(test_name);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    KillOnDrop(command.spawn().expect("spawn test subprocess"))
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_marker(path: &std::path::Path, what: &'static str) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(what);
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_child_exit(child: &mut KillOnDrop, what: &'static str) {
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().expect("test subprocess status") {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(what);
+    assert!(status.success(), "{what}: {status}");
+}
+
+#[cfg(target_os = "linux")]
+async fn run_broker_or_backend_subprocess() {
+    use atomic_exec::ExecutionBackend as _;
+    if let Ok(home) = std::env::var("ATOMIC_BROKER_SPIKE_BROKER_HOME") {
+        let home = std::path::PathBuf::from(home);
+        let upstream = std::env::var("ATOMIC_BROKER_SPIKE_UPSTREAM").expect("upstream URL");
+        let (url, _methods, _permits, _relay, _recovery_hold, _recovery_file) =
+            authenticated_relay(
+                upstream,
+                home.join("broker-journal.json"),
+                Some(home.join("host-permit.lock")),
+            )
+            .await;
+        std::fs::write(home.join("broker-ready"), url).expect("announce broker address");
+        std::future::pending::<()>().await;
+    }
+    if let Ok(home) = std::env::var("ATOMIC_BROKER_SPIKE_BACKEND_HOME") {
+        let home = std::path::PathBuf::from(home);
+        std::fs::write(home.join("backend-attempted"), b"attempted")
+            .expect("announce backend attempt");
+        let lock = home.join("host-permit.lock");
+        let journal = home.join("broker-journal.json");
+        loop {
+            if let Some(_permit) = try_file_permit(&lock) {
+                // The lock is released by SIGKILL; the journal prevents an
+                // unrelated backend process from entering before reconciliation.
+                if !journal.exists() {
+                    std::fs::write(home.join("backend-admitted"), b"admitted")
+                        .expect("announce backend admission");
+                    let command = atomic_exec::Command {
+                        program: "/bin/sh".into(),
+                        args: vec!["-c".into(), "printf backend-process-ok".into()],
+                        cwd: std::env::current_dir().expect("backend cwd"),
+                        time_limit: std::time::Duration::from_secs(10),
+                        output_limit: 1024,
+                        ..Default::default()
+                    };
+                    let backend = atomic_exec::LocalBackend::in_dir(home.join("backend-scratch"));
+                    let done = backend.run(&command).expect("real backend command");
+                    assert_eq!(done.code, Some(0));
+                    assert_eq!(done.stdout, b"backend-process-ok");
+                    std::fs::write(home.join("backend-done"), b"done")
+                        .expect("announce backend completion");
+                    std::process::exit(0);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn reconcile_orphan(upstream_url: String, journal: std::path::PathBuf) {
     use futures_util::SinkExt as _;
     use futures_util::StreamExt as _;
@@ -139,6 +274,14 @@ async fn reconcile_orphan(upstream_url: String, journal: std::path::PathBuf) {
             if response["error"]["code"] == -32010 {
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
                 continue;
+            }
+            if let Some(error) = response.get("error") {
+                std::fs::write(
+                    journal.with_file_name("recovery-refusal.json"),
+                    serde_json::to_vec(error).expect("encode resume refusal"),
+                )
+                .expect("record resume refusal for test");
+                panic!("resume refused: {error}");
             }
             assert_eq!(
                 response["result"]["sessionId"], session_id,
@@ -201,12 +344,14 @@ async fn reconcile_orphan(upstream_url: String, journal: std::path::PathBuf) {
 async fn authenticated_relay(
     upstream_url: String,
     journal: std::path::PathBuf,
+    host_lock: Option<std::path::PathBuf>,
 ) -> (
     String,
     std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     std::sync::Arc<tokio::sync::Semaphore>,
     tokio::task::JoinHandle<()>,
     std::sync::Arc<std::sync::Mutex<Option<tokio::sync::OwnedSemaphorePermit>>>,
+    std::sync::Arc<std::sync::Mutex<Option<nix::fcntl::Flock<std::fs::File>>>>,
 ) {
     use futures_util::SinkExt as _;
     use futures_util::StreamExt as _;
@@ -220,6 +365,15 @@ async fn authenticated_relay(
     let methods = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let recorded = std::sync::Arc::clone(&methods);
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let recovery_file_hold = if journal.exists() {
+        match &host_lock {
+            Some(path) => Some(acquire_file_permit(path).await),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let recovery_file_hold = std::sync::Arc::new(std::sync::Mutex::new(recovery_file_hold));
     let recovery_hold = if journal.exists() {
         Some(
             std::sync::Arc::clone(&permits)
@@ -235,9 +389,11 @@ async fn authenticated_relay(
         let recovery_journal = journal.clone();
         let recovery_url = upstream_url.clone();
         let recovery_hold_for_task = std::sync::Arc::clone(&recovery_hold);
+        let recovery_file_for_task = std::sync::Arc::clone(&recovery_file_hold);
         tokio::spawn(async move {
             reconcile_orphan(recovery_url, recovery_journal).await;
             recovery_hold_for_task.lock().expect("recovery hold").take();
+            recovery_file_for_task.lock().expect("recovery file").take();
         });
     }
     let shared_permits = std::sync::Arc::clone(&permits);
@@ -255,13 +411,19 @@ async fn authenticated_relay(
             let methods = std::sync::Arc::clone(&recorded);
             let permits = std::sync::Arc::clone(&shared_permits);
             let journal = journal.clone();
+            let host_lock = host_lock.clone();
             clients.spawn(async move {
                 let Ok(mut client) = accept_hdr_async(socket, authorize_relay).await else {
                     return;
                 };
                 let (mut upstream, _) = connect_async(upstream_url).await.expect("upstream");
-                let mut held =
-                    std::collections::HashMap::<String, tokio::sync::OwnedSemaphorePermit>::new();
+                let mut held = std::collections::HashMap::<
+                    String,
+                    (
+                        tokio::sync::OwnedSemaphorePermit,
+                        Option<nix::fcntl::Flock<std::fs::File>>,
+                    ),
+                >::new();
                 let mut client_open = true;
                 let mut session_id: Option<String> = None;
                 loop {
@@ -290,8 +452,12 @@ async fn authenticated_relay(
                                         .acquire_owned()
                                         .await
                                         .expect("host permit");
+                                    let file_permit = match &host_lock {
+                                        Some(path) => Some(acquire_file_permit(path).await),
+                                        None => None,
+                                    };
                                     persist_journal(&journal, session_id.as_deref().expect("session before process start"), process_id);
-                                    assert!(held.insert(process_id.to_owned(), permit).is_none());
+                                    assert!(held.insert(process_id.to_owned(), (permit, file_permit)).is_none());
                                 }
                             }
                             upstream.send(message).await.expect("forward request");
@@ -326,7 +492,14 @@ async fn authenticated_relay(
             });
         }
     });
-    (url, methods, permits, relay, recovery_hold)
+    (
+        url,
+        methods,
+        permits,
+        relay,
+        recovery_hold,
+        recovery_file_hold,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -416,8 +589,8 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
         .expect("private Codex home");
     let home = temporary_home.path().to_path_buf();
     let journal = home.join("broker-journal.json");
-    let (relay_url, methods, permits, relay, _first_recovery_hold) =
-        authenticated_relay(url.clone(), journal.clone()).await;
+    let (relay_url, methods, permits, relay, _first_recovery_hold, _first_recovery_file) =
+        authenticated_relay(url.clone(), journal.clone(), None).await;
     assert!(
         tokio_tungstenite::connect_async(&relay_url).await.is_err(),
         "relay must reject a client without its bearer token"
@@ -587,8 +760,14 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
     relay
         .await
         .expect_err("broker task abort must cancel client handlers");
-    let (restart_relay_url, restart_methods, restart_permits, restart_relay, _recovery_hold) =
-        authenticated_relay(url, journal.clone()).await;
+    let (
+        restart_relay_url,
+        restart_methods,
+        restart_permits,
+        restart_relay,
+        _recovery_hold,
+        _recovery_file,
+    ) = authenticated_relay(url, journal.clone(), None).await;
     assert_eq!(
         restart_permits.available_permits(),
         0,
@@ -723,4 +902,237 @@ async fn pinned_codex_can_run_a_shell_through_its_remote_exec_server() {
     .expect("second shell slot returned");
     restart_relay.abort();
     server.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_broker_process_kill_recovers_host_permit() {
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+
+    run_broker_or_backend_subprocess().await;
+    let home = tempfile::Builder::new()
+        .prefix("atomic-broker-process-")
+        .tempdir()
+        .expect("broker home");
+    let home_path = home.path();
+    let home_text = home_path.to_str().expect("UTF-8 broker home");
+    let journal = home_path.join("broker-journal.json");
+    let lock = home_path.join("host-permit.lock");
+    let ready = home_path.join("broker-ready");
+    let release = home_path.join("release-shell");
+    let child_marker = home_path.join("child-started");
+    let backend_attempted = home_path.join("backend-attempted");
+    let backend_admitted = home_path.join("backend-admitted");
+    let backend_done = home_path.join("backend-done");
+
+    let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream port");
+    let address = port.local_addr().expect("upstream address");
+    drop(port);
+    let upstream_url = format!("ws://{address}");
+    let server_url = upstream_url.clone();
+    let upstream = tokio::spawn(async move {
+        codex_exec_server::run_main(
+            &server_url,
+            codex_exec_server::ExecServerRuntimeOptions::new(
+                std::env::current_exe().expect("test executable"),
+                None,
+            )
+            .expect("upstream runtime paths"),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .await
+        .expect("upstream exec server");
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(address).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upstream server starts");
+
+    let test_name = "actual_broker_process_kill_recovers_host_permit";
+    let mut broker = spawn_test_child(
+        test_name,
+        &[
+            ("ATOMIC_BROKER_SPIKE_BROKER_HOME", home_text),
+            ("ATOMIC_BROKER_SPIKE_UPSTREAM", &upstream_url),
+        ],
+    );
+    wait_for_marker(&ready, "broker process starts").await;
+    let relay_url = std::fs::read_to_string(&ready).expect("broker URL");
+    std::fs::write(
+        home_path.join("environments.toml"),
+        format!("include_local = false\ndefault = \"broker\"\n[[environments]]\nid = \"broker\"\nurl = \"{relay_url}\"\nauth_bearer_token = \"test-broker-token\"\n"),
+    )
+    .expect("broker client config");
+    let mut client = spawn_test_child(
+        "pinned_codex_can_run_a_shell_through_its_remote_exec_server",
+        &[
+            ("ATOMIC_BROKER_SPIKE_CHILD_HOME", home_text),
+            (
+                "ATOMIC_BROKER_SPIKE_CHILD_MARKER",
+                child_marker.to_str().expect("marker path"),
+            ),
+            (
+                "ATOMIC_BROKER_SPIKE_RELEASE_MARKER",
+                release.to_str().expect("release path"),
+            ),
+        ],
+    );
+    wait_for_marker(&child_marker, "Atomic client starts shell").await;
+    wait_child_exit(&mut client, "Atomic client exits").await;
+    assert!(
+        journal.exists(),
+        "shell start intent must survive client exit"
+    );
+    assert!(
+        try_file_permit(&lock).is_none(),
+        "broker shell must own host lock"
+    );
+
+    let mut backend = spawn_test_child(
+        test_name,
+        &[("ATOMIC_BROKER_SPIKE_BACKEND_HOME", home_text)],
+    );
+    wait_for_marker(&backend_attempted, "backend process attempts command").await;
+    assert!(
+        !backend_admitted.exists(),
+        "backend entered while shell held host lock"
+    );
+    broker.stop(); // std::process::Child::kill sends SIGKILL on Linux.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(journal.exists(), "SIGKILL must leave the start journal");
+    assert!(
+        !backend_admitted.exists(),
+        "backend bypassed orphan journal after broker SIGKILL"
+    );
+
+    std::fs::remove_file(&ready).expect("clear old ready marker");
+    let mut restarted = spawn_test_child(
+        test_name,
+        &[
+            ("ATOMIC_BROKER_SPIKE_BROKER_HOME", home_text),
+            ("ATOMIC_BROKER_SPIKE_UPSTREAM", &upstream_url),
+        ],
+    );
+    wait_for_marker(&ready, "restarted broker process starts").await;
+    assert!(
+        try_file_permit(&lock).is_none(),
+        "restarted broker must reserve orphan host lock"
+    );
+    assert!(
+        !backend_admitted.exists(),
+        "backend entered before trusted drain"
+    );
+    std::fs::write(&release, b"release").expect("release orphan shell");
+    wait_for_marker(&backend_done, "backend runs after broker confirms exit").await;
+    wait_child_exit(&mut backend, "backend process exits").await;
+    assert!(!journal.exists(), "trusted exit clears broker journal");
+    restarted.stop();
+    upstream.abort();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_orphan_refuses_host_permit() {
+    use codex_http_client::HttpClientFactory;
+    use codex_http_client::OutboundProxyPolicy;
+
+    run_broker_or_backend_subprocess().await;
+    let home = tempfile::Builder::new()
+        .prefix("atomic-broker-unknown-")
+        .tempdir()
+        .expect("broker home");
+    let home_path = home.path();
+    let home_text = home_path.to_str().expect("UTF-8 broker home");
+    persist_journal(
+        &home_path.join("broker-journal.json"),
+        "unknown-session",
+        "unknown-process",
+    );
+    let port = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream port");
+    let address = port.local_addr().expect("upstream address");
+    drop(port);
+    let upstream_url = format!("ws://{address}");
+    let server_url = upstream_url.clone();
+    let upstream = tokio::spawn(async move {
+        codex_exec_server::run_main(
+            &server_url,
+            codex_exec_server::ExecServerRuntimeOptions::new(
+                std::env::current_exe().expect("test executable"),
+                None,
+            )
+            .expect("upstream runtime paths"),
+            HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+        )
+        .await
+        .expect("upstream exec server");
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while tokio::net::TcpStream::connect(address).await.is_err() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("upstream server starts");
+    let test_name = "unknown_orphan_refuses_host_permit";
+    let mut broker = spawn_test_child(
+        test_name,
+        &[
+            ("ATOMIC_BROKER_SPIKE_BROKER_HOME", home_text),
+            ("ATOMIC_BROKER_SPIKE_UPSTREAM", &upstream_url),
+        ],
+    );
+    wait_for_marker(
+        &home_path.join("broker-ready"),
+        "unknown-orphan broker starts",
+    )
+    .await;
+    let refusal = home_path.join("recovery-refusal.json");
+    wait_for_marker(&refusal, "pinned server refuses unknown session").await;
+    let error: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(refusal).expect("read resume refusal"))
+            .expect("parse resume refusal");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("unknown session id unknown-session")),
+        "unexpected resume refusal: {error}"
+    );
+    assert!(
+        try_file_permit(&home_path.join("host-permit.lock")).is_none(),
+        "unknown orphan must reserve host lock"
+    );
+    let mut backend = spawn_test_child(
+        test_name,
+        &[("ATOMIC_BROKER_SPIKE_BACKEND_HOME", home_text)],
+    );
+    wait_for_marker(
+        &home_path.join("backend-attempted"),
+        "backend attempts unknown orphan",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        !home_path.join("backend-admitted").exists(),
+        "unknown orphan admitted backend"
+    );
+    broker.stop();
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(
+        home_path.join("broker-journal.json").exists(),
+        "failed resume must retain journal"
+    );
+    assert!(
+        !home_path.join("backend-admitted").exists(),
+        "unknown orphan admitted backend after broker SIGKILL"
+    );
+    backend.stop();
+    upstream.abort();
 }

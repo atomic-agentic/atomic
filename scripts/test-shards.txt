@@ -75,6 +75,7 @@ test large_results
 test log_lines
 test retention
 test render_cli
+test remote_exec_broker_spike
 test sandboxed_commit
 test self_approval
 test setup_cli
