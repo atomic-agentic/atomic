@@ -11,6 +11,20 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+/// The projection holds unresolved direct blockers. Any longer blocked path
+/// starts with one of those rows, so an indexed existence check is sufficient.
+/// Select the next eligible direct child in stable priority and ID order.
+pub(crate) const READY_CHILD_SQL: &str = "SELECT i.id,i.title,i.body,i.kind,i.priority,i.imported_json,c.criteria_json \
+    FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id \
+    LEFT JOIN atomic_graph_item_criteria c ON c.item_id=i.id \
+    WHERE i.parent=? AND (i.status='open' OR (i.status='in_progress' AND (l.item_id IS NULL OR l.expires_at<=?))) \
+    AND i.kind NOT IN ('goal','message') AND i.status!='pinned' AND (i.due_at IS NULL OR i.due_at<=?) \
+    AND NOT EXISTS (SELECT 1 FROM atomic_graph_blocked b WHERE b.source=i.id) \
+    ORDER BY i.priority,i.id LIMIT 1";
+
+/// Detect direct work children that have not completed after ready selection.
+pub(crate) const UNFINISHED_CHILD_SQL: &str = "SELECT id FROM atomic_graph_items WHERE parent=? AND kind NOT IN ('goal','message') AND status NOT IN ('closed','pinned') LIMIT 1";
+
 /// The immutable fields a graph work loop gives one atom invocation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkItem {
@@ -196,11 +210,14 @@ pub async fn finish_epic_run(tx: &mut Tx<'_, '_>, epic: &str, run_id: &str) -> R
             "graph epic {epic} changed from pinned before completion"
         )));
     }
-    if tx.query_opt(
-        "SELECT id FROM atomic_graph_items WHERE parent=? AND kind NOT IN ('goal','message') AND status NOT IN ('closed','pinned') LIMIT 1",
-        &[text(epic)],
-    ).await?.is_some() {
-        return Err(DurableError::Interrupted(format!("graph epic {epic} has unfinished work children")));
+    if tx
+        .query_opt(UNFINISHED_CHILD_SQL, &[text(epic)])
+        .await?
+        .is_some()
+    {
+        return Err(DurableError::Interrupted(format!(
+            "graph epic {epic} has unfinished work children"
+        )));
     }
     tx.execute(
         "UPDATE atomic_graph_epic_runs SET state='done' WHERE epic_id=? AND run_id=?",
@@ -254,17 +271,7 @@ pub async fn claim_next_for_epic(
     let now = now_millis()?;
     let ready = tx
         .query_opt(
-            "WITH RECURSIVE blocked_chain(source,target) AS (\
-             SELECT source,target FROM atomic_graph_blocked \
-             UNION SELECT chain.source,b.target FROM blocked_chain chain \
-             JOIN atomic_graph_blocked b ON b.source=chain.target) \
-             SELECT i.id,i.title,i.body,i.kind,i.priority,i.imported_json,c.criteria_json \
-             FROM atomic_graph_items i LEFT JOIN atomic_graph_leases l ON l.item_id=i.id \
-             LEFT JOIN atomic_graph_item_criteria c ON c.item_id=i.id \
-             WHERE i.parent=? AND (i.status='open' OR (i.status='in_progress' AND (l.item_id IS NULL OR l.expires_at<=?))) \
-             AND i.kind NOT IN ('goal','message') AND i.status!='pinned' AND (i.due_at IS NULL OR i.due_at<=?) \
-             AND NOT EXISTS (SELECT 1 FROM blocked_chain chain WHERE chain.source=i.id) \
-             ORDER BY i.priority,i.id LIMIT 1",
+            READY_CHILD_SQL,
             &[text(epic), Param::Int(now), Param::Int(now)],
         )
         .await?;
@@ -342,10 +349,7 @@ pub async fn claim_next_for_epic(
         }
     }
     if tx
-        .query_opt(
-            "SELECT id FROM atomic_graph_items WHERE parent=? AND kind NOT IN ('goal','message') AND status NOT IN ('closed','pinned') LIMIT 1",
-            &[text(epic)],
-        )
+        .query_opt(UNFINISHED_CHILD_SQL, &[text(epic)])
         .await?
         .is_some()
     {
