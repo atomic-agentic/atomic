@@ -1,0 +1,1 @@
+graph-context-quoted-fields|crates/atomic/src/pipeline.rs|format!("{label}: {}\n", json!(value))|format!("{label}: {}\n", value)|-p atomic-agentic --test graph_work_loop graph_context_brief_quotes_stored_labels_and_filters_memories
