@@ -1,0 +1,1 @@
+v8-archive-hash-binding|crates/atomic-core/build/v8_archive.rs|(&pin.binding, &pin.binding_sha256),|(&pin.file, &pin.sha256),|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_tampered_binding

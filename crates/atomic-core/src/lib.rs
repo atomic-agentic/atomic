@@ -9,6 +9,7 @@ pub mod astro;
 pub mod atom;
 pub mod budget;
 mod buffer_budget;
+// The build script's V8 archive check, compiled here only for its tests.
 pub mod cassette;
 mod child_exit;
 mod child_memory;
@@ -45,6 +46,12 @@ pub mod terminal;
 pub mod testing;
 pub mod typed;
 pub mod usage;
+#[cfg(test)]
+#[path = "../build/v8_archive.rs"]
+mod v8_archive;
+#[cfg(test)]
+#[path = "../build/v8_archive_tests.rs"]
+mod v8_archive_tests;
 #[cfg(windows)]
 mod windows_cwd;
 #[cfg(windows)]

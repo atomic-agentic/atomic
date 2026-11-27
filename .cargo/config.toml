@@ -4,7 +4,11 @@
 # mirror instead of downloading them. scripts/v8-archive.sh fills it with the
 # files deps/v8.toml pins, after checking their SHA-256; until it has run the
 # build fails here, before anything unverified is fetched or linked.
-# scripts/dev.sh and CI set RUSTY_V8_MIRROR to their own verified caches.
-# atomic-core's build script checks the archive again, and refuses
-# RUSTY_V8_ARCHIVE, V8_FROM_SOURCE and a remote mirror.
+# scripts/dev.sh and CI set RUSTY_V8_MIRROR to their own verified caches,
+# and RUSTY_V8_ARCHIVE_SHA256 to the pinned archive hash
+# (`scripts/v8-archive.sh --sha256` prints it), which rusty_v8 checks too.
+# atomic-core's build script checks the archive and bindings again, and
+# refuses a build without that hash, with a remote or templated mirror, or
+# with any rusty_v8 setting that reads or links something else
+# (crates/atomic-core/build/v8_archive.rs).
 RUSTY_V8_MIRROR = { value = "target/v8-mirror", relative = true }

@@ -1,0 +1,1 @@
+v8-archive-refuse-template|crates/atomic-core/build/v8_archive.rs|if mirror.contains('{') {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_url_template_mirror

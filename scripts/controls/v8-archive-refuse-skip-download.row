@@ -1,0 +1,1 @@
+v8-archive-refuse-skip-download|crates/atomic-core/build/v8_archive.rs|"RUSTY_V8_SKIP_DOWNLOAD",|"CONTROL_OFF_RUSTY_V8_SKIP_DOWNLOAD",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_skipping_the_download

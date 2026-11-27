@@ -1,0 +1,1 @@
+v8-archive-refuse-remote|crates/atomic-core/build/v8_archive.rs|if remote(&mirror) {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_remote_mirror

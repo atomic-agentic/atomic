@@ -1,0 +1,1 @@
+v8-archive-locked-version|crates/atomic-core/build/v8_archive.rs|if versions.len() != 1 {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::takes_the_version_from_the_lockfile

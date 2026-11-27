@@ -34,7 +34,8 @@
 #   ATOMIC_TEST_*, RUST_LOG, RUST_BACKTRACE are passed through when set.
 #
 # The prebuilt V8 archive is verified against deps/v8.toml before the container starts
-# (scripts/v8-archive.sh) and read from ${ATOMIC_DEV_CACHE}/v8-mirror through RUSTY_V8_MIRROR.
+# (scripts/v8-archive.sh) and read from ${ATOMIC_DEV_CACHE}/v8-mirror through RUSTY_V8_MIRROR,
+# with its pinned hash in RUSTY_V8_ARCHIVE_SHA256.
 #
 # Exit codes: the command's own, or
 #   1    the V8 archive failed verification, or the watcher could not be started
@@ -298,11 +299,11 @@ case "$(uname -m)" in
     arm64 | aarch64) v8_target=aarch64-unknown-linux-gnu ;;
     *) v8_target=x86_64-unknown-linux-gnu ;;
 esac
-if ! "${ROOT}/scripts/v8-archive.sh" --mirror "${CACHE}/v8-mirror" "${v8_target}" >/dev/null; then
+if ! v8_sha="$(GITHUB_ENV= "${ROOT}/scripts/v8-archive.sh" --mirror "${CACHE}/v8-mirror" --sha256 "${v8_target}")"; then
     echo "scripts/dev.sh: the V8 archive could not be verified, so nothing was started" >&2
     exit 1
 fi
-env_flags+=(-e RUSTY_V8_MIRROR=/cache/v8-mirror)
+env_flags+=(-e RUSTY_V8_MIRROR=/cache/v8-mirror -e "RUSTY_V8_ARCHIVE_SHA256=${v8_sha}")
 
 mount_flags=()
 if [ -n "${ATOMIC_DEV_MOUNTS:-}" ]; then

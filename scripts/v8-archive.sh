@@ -5,22 +5,27 @@
 # the V8 version in Cargo.lock, laid out as the local mirror rusty_v8's build
 # script reads through RUSTY_V8_MIRROR.
 #
-#   scripts/v8-archive.sh [--mirror DIR] [TARGET]
+#   scripts/v8-archive.sh [--mirror DIR] [--sha256] [TARGET]
 #
 # TARGET defaults to the host's triple. DIR defaults to target/v8-mirror, the
 # path the workspace's .cargo/config.toml gives RUSTY_V8_MIRROR. A cached file
 # is checked again on every run, so a tampered cache fails; a missing one is
 # downloaded once from the release URL. With no V8 in Cargo.lock it does
-# nothing. Prints the mirror directory.
+# nothing. Prints the mirror directory, or with --sha256 the archive's pinned
+# SHA-256, which a build must give rusty_v8 as RUSTY_V8_ARCHIVE_SHA256
+# (atomic-core's build script refuses one without it). In a GitHub Actions job
+# it also sets RUSTY_V8_ARCHIVE_SHA256 for the job's later steps.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIRROR="${ROOT}/target/v8-mirror"
 TARGET=""
+PRINT_SHA=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --mirror) MIRROR="$2"; shift 2 ;;
-        -*) echo "usage: scripts/v8-archive.sh [--mirror DIR] [TARGET]" >&2; exit 2 ;;
+        --sha256) PRINT_SHA=1; shift ;;
+        -*) echo "usage: scripts/v8-archive.sh [--mirror DIR] [--sha256] [TARGET]" >&2; exit 2 ;;
         *) TARGET="$1"; shift ;;
     esac
 done
@@ -91,4 +96,7 @@ fetch() {
 }
 fetch "${FILE}" "${SHA}"
 fetch "${BINDING}" "${BINDING_SHA}"
-echo "${MIRROR}"
+if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "RUSTY_V8_ARCHIVE_SHA256=${SHA}" >>"${GITHUB_ENV}"
+fi
+if [ -n "${PRINT_SHA}" ]; then echo "${SHA}"; else echo "${MIRROR}"; fi

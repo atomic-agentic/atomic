@@ -1,0 +1,1 @@
+v8-archive-hash-match|crates/atomic-core/build/v8_archive.rs|if digest != *want {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_tampered_archive v8_archive_tests::refuses_a_tampered_binding
