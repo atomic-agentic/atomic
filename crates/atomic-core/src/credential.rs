@@ -23,6 +23,11 @@
 //!   `request_key`, after leaving the session keyring (see
 //!   [`crate::codex::dispatch`]).
 //!
+//! On macOS the keyring is the login keychain. Commands run under Seatbelt,
+//! which denies them `private/`, the credential file store and the
+//! keychain files, and, with no network, every Mach service the keychain
+//! is reached through (the macOS sandbox suites show each).
+//!
 //! On other platforms the sandboxes have not been examined for this, so the
 //! platform stores refuse ([`CredentialError::Unprotected`]) and no
 //! credentialed decision can be made there.
@@ -62,8 +67,8 @@ pub enum CredentialError {
     /// On this platform atomic has not verified that atoms' sandboxes cannot
     /// reach the credential, so it keeps none.
     #[error(
-        "operator credentials are kept only on Linux, where atomic has verified that atoms' \
-         sandboxes cannot reach them; on {0} credentialed gate decisions are refused"
+        "operator credentials are kept only on Linux and macOS, where atomic has verified that \
+         atoms' sandboxes cannot reach them; on {0} credentialed gate decisions are refused"
     )]
     Unprotected(&'static str),
     /// There is already a credential for the account; enrolling again
@@ -84,7 +89,7 @@ pub enum CredentialError {
 /// Refused unless this platform's sandbox has been verified to keep atoms
 /// away from the credential.
 pub fn protected_platform() -> Result<(), CredentialError> {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         Ok(())
     } else {
         Err(CredentialError::Unprotected(std::env::consts::OS))
@@ -113,7 +118,8 @@ pub trait SecretStore: std::fmt::Debug + Send + Sync {
 }
 
 /// The platform keyring: the Secret Service (with the kernel keyrings as
-/// its cache) on Linux. Refused elsewhere (see [`protected_platform`]).
+/// its cache) on Linux, the login keychain on macOS. Refused elsewhere (see
+/// [`protected_platform`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct OsKeyring;
 
@@ -464,7 +470,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn scratch(tag: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("atomic-credential-{tag}-{}", std::process::id()));
@@ -472,7 +478,7 @@ mod tests {
         dir
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_file_store_is_private_atomic_and_kept_apart() {
         use std::os::unix::fs::PermissionsExt;
@@ -590,7 +596,7 @@ mod tests {
         );
         std::fs::rename(legacy.join("6f70"), new.join("6f70")).expect("moved");
         let moved_store = configured_store(&scratch.join("project"));
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             let store = moved_store.expect("the moved store");
             assert_eq!(
                 store.load("op").ok().flatten().as_deref(),
