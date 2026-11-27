@@ -76,7 +76,12 @@ fn kill_self() -> ! {
     unsafe {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
-    // SIGKILL cannot be caught or ignored, so this is not reached; where
-    // there is no SIGKILL, abort ends the process just as abruptly.
+    // SIGKILL cannot be caught or ignored, but on macOS kill can return
+    // before it ends a process with several threads: wait for it there.
+    #[cfg(unix)]
+    for _ in 0..1000 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Where there is no SIGKILL, abort ends the process just as abruptly.
     std::process::abort()
 }
