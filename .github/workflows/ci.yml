@@ -61,6 +61,9 @@ jobs:
       - run: scripts/lock-check.sh
       # The V8 rule in lock-check against small lockfiles.
       - run: scripts/lock-check-test.sh
+      # The vendored deno_core and deno_v8 are the pinned crates.io releases
+      # with the carried change, and an edited copy is refused.
+      - run: scripts/deno-vendor-check-test.sh
       # Fails when a control is switched off in the commit: every row's switch
       # text is in the file it names exactly once, and a replacement that holds
       # its own switch text is not in that file at all, on the lines the row

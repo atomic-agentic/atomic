@@ -40,15 +40,13 @@ One hand-port: the pull request edits 13 sites in `modules/map.rs` that the
 applied there with the same rewrite. `serde_v8` and `deno_ops` need no
 change and come from crates.io.
 
-To check it, unpack the two `.crate` files from crates.io (their SHA-256 is
-above) and apply the diff:
-
-```sh
-patch -p1 < pr-36665.diff   # in a directory holding deno_core/ and deno_v8/
-```
-
-The result is byte-for-byte these directories, except for the `LICENSE.md`
-files atomic adds.
+`scripts/deno-vendor-check.sh` checks it: it unpacks the two `.crate` files
+from crates.io (their SHA-256 is above), applies the diff, adds the
+`LICENSE.md` files atomic adds, and fails unless the result is byte for byte
+these directories. CI runs it through `scripts/deno-vendor-check-test.sh`.
+atomic-core's build script hashes every file of both directories into the
+compiler and helper runtime identities, so a run recorded on one copy does
+not resume its helpers on an edited one.
 
 `deno_core`'s own library tests pass on Codex's V8 with these changes, except
 `tests::located_script_name`, which expects the source path

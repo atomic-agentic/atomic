@@ -132,6 +132,7 @@ scripts/forks-check.sh         # each fork in deps/forks.toml resolves at its pi
 scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions
 scripts/lock-check-test.sh     # exercise the one-V8 rule on small lockfiles
 scripts/v8-archive-test.sh     # a tampered V8 archive or binding, or an unpinned target, is refused
+scripts/deno-vendor-check.sh   # third_party/deno is the pinned crates.io releases plus pr-36665.diff
 scripts/dev.sh scripts/lock-check.sh v8-built   # each V8 version deps/v8.toml lists as unbuilt stays out of the build
 scripts/dev.sh scripts/lock-resolves.sh   # a fresh resolution keeps Codex's libsqlite3-sys
 scripts/dev.sh cargo deny --locked check bans licenses sources   # deny.toml
