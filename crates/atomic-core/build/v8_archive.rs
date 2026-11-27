@@ -30,7 +30,11 @@ pub(crate) const REFUSED: &[&str] = &[
     "DENO_TRYBUILD",
 ];
 
-/// The rusty_v8 settings the check reads.
+/// The rusty_v8 settings the check reads, which the build reruns on.
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "only the build script reruns on them")
+)]
 pub(crate) const READ: &[&str] = &["RUSTY_V8_MIRROR", "RUSTY_V8_ARCHIVE_SHA256"];
 
 /// One archive deps/v8.toml pins.
