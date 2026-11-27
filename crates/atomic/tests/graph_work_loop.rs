@@ -1567,6 +1567,7 @@ fn shipped_lane_reviewer_rejects_empty_findings() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
     on_codex_runtime(async {
@@ -1641,6 +1642,7 @@ fn shipped_lane_reviewer_routes_verified_formatting_and_blocks_other_changes() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn imported_security_label_excludes_editorial_followups() {
     on_codex_runtime(async {
@@ -1677,6 +1679,7 @@ fn imported_security_label_excludes_editorial_followups() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn explicit_reviewer_change_request_opens_gate_without_followup() {
     on_codex_runtime(async {
@@ -1714,6 +1717,7 @@ fn explicit_reviewer_change_request_opens_gate_without_followup() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn explicit_reviewer_changes_block_even_on_verified_formatting() {
     on_codex_runtime(async {
@@ -1757,6 +1761,7 @@ fn explicit_reviewer_changes_block_even_on_verified_formatting() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn unproved_formatting_and_mislabeled_privacy_findings_require_repair() {
     on_codex_runtime(async {
@@ -1798,6 +1803,7 @@ fn unproved_formatting_and_mislabeled_privacy_findings_require_repair() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn recovery_refuses_a_draft_acceptance_after_an_explicit_change_request() {
     on_codex_runtime(async {
@@ -1925,6 +1931,7 @@ async fn open_cli_delivery(
     (cli_rt, delivery_dir, target, opened)
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn terminal_draft_privacy_finding_refuses_delivery_and_recovered_dispatch() {
     on_codex_runtime(async {
@@ -2053,6 +2060,7 @@ fn terminal_draft_privacy_finding_refuses_delivery_and_recovered_dispatch() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     on_codex_runtime(async {
@@ -2388,6 +2396,7 @@ fn delivery_evidence_accepts_real_graph_panel_and_refuses_reopened_item() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn delivery_evidence_follows_parallel_graph_lane_child() {
     on_codex_runtime(async {
@@ -3456,6 +3465,7 @@ fn graph_context_brief_quotes_stored_labels_and_filters_memories() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn graph_item_test_and_cel_criteria_pass_before_independent_review() {
     on_codex_runtime(async {
@@ -4975,6 +4985,7 @@ fn recovery_without_graph_registrar_cannot_dispatch_unfinished_graph_run() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cli_verifies_only_the_parallel_lane_attempt_on_its_authorized_branch() {
     on_codex_runtime(async {
@@ -5235,6 +5246,7 @@ fn cli_verifies_only_the_parallel_lane_attempt_on_its_authorized_branch() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
     on_codex_runtime(async {
@@ -5419,6 +5431,7 @@ fn cli_verifies_only_the_accepted_no_review_criteria_repair_commit() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim() {
     on_codex_runtime(async {
@@ -5651,6 +5664,7 @@ fn cli_verifies_repaired_review_candidate_only_after_its_branch_and_live_claim()
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cli_verifies_reviewed_candidate_with_the_post_gate_reclaim_token() {
     on_codex_runtime(async {
@@ -6760,6 +6774,7 @@ async fn decide_lane_gate(root: &Path, project: &Path, url: &str, id: &str, comm
 /// person approving that as it stands; publication; and the lane's own
 /// `authorize-merge` gate, approved by the same enrolled operator. The run
 /// returns the author's recorded output.
+#[cfg(target_os = "linux")]
 #[test]
 fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
     support::require_sandbox();
@@ -7217,6 +7232,7 @@ fn seed_lane_reviewer_private_read(worktree: &Path) {
     .expect("seed the versioned reviewer eval's hidden private-file read");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn reference_coding_lane_offline_repairs_after_request_changes() {
     support::require_sandbox();

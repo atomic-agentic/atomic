@@ -3,8 +3,9 @@
 //! Recovery from a lost remote response. The seed process writes an admitted
 //! delivery input and a finalized source item. Every recovery, gate decision
 //! and park release runs through the actual CLI in its own OS process.
+//! Enrolled operator credentials for these write paths are supported on Linux.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use atomic_app::delivery_evidence::DeliverySource;
 use atomic_app::pipeline::{GRAPH_PIPELINE, LAYOUT_VERSION};
