@@ -6496,12 +6496,11 @@ fn seed_self_review_fixture(project: &Path, with_controls: bool, blind: bool) ->
         }),
         object(json!({"verdict": {"type": "string", "enum": ["approve", "request_changes"]}})),
     );
-    let workflow = if with_controls {
+    if with_controls {
         controls_self_review_workflow()
     } else {
         SELF_REVIEW_WORKFLOW.to_owned()
-    };
-    workflow
+    }
 }
 
 #[cfg(target_os = "linux")]
