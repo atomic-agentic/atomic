@@ -219,7 +219,7 @@ runs out) are built; `atomic gates answer` answers one from another terminal.
 
 Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
 `model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
-only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+and macOS, for the developer's own runs: a shared store and `atomic serve` refuse it.
 Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is

@@ -39,7 +39,7 @@ Which commands are built and which are a later stage's plan is listed in
 - Model access through an eligible ChatGPT subscription with Codex access, an
   API key, or a local OpenAI-compatible endpoint. Codex atoms take the
   subscription sign-in from `atomic model login`, which atomic accepts on Linux
-  for now; the API-key path detects `OPENAI_API_KEY`.
+  and macOS for now; the API-key path detects `OPENAI_API_KEY`.
 - Git that supports `--no-lazy-fetch` for worktree and fixture operations.
   On macOS, install a current Git with Homebrew if the bundled Git lacks that
   option. Atomic looks for Homebrew Git at its standard installation paths.
