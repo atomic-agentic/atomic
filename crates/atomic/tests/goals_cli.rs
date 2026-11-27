@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Real goal commands against a private enrolled project store on Linux.
-
-#![cfg(target_os = "linux")]
+//! Real goal commands against a private enrolled project store.
 
 use serde_json::{Value, from_str};
 use std::path::Path;

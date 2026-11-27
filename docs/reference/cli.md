@@ -216,8 +216,8 @@ machine with no OS keyring, such as a headless server or a container, atomic
 refuses with an error rather than store the secret elsewhere; to keep it in a
 directory readable by you only (`$ATOMIC_HOME/credentials`, or
 `~/.config/atomic/credentials`), opt in with `ATOMIC_CREDENTIAL_STORE=file`.
-Credentialed decisions are available on Linux only for now (see
-[availability](availability.md)).
+Credentialed decisions are available on Linux and macOS (see
+[availability](availability.md)); on macOS the keyring is the login keychain.
 
 Live-thread cancel, pause and take-over command spellings and keyboard shortcuts
 remain unspecified. Run recovery uses the v0.1 command above. The
