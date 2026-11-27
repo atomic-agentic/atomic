@@ -1,16 +1,28 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Beads JSONL import and export through the installed `atomic` executable.
+//! Credentialed cases run on Linux; read-only inspection also runs on macOS.
 
+// Some tests here need Linux-only features, so on other platforms the
+// helpers only they use are unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
+#[cfg(target_os = "linux")]
 use atomic_app::pipeline::GRAPH_PIPELINE;
+#[cfg(target_os = "linux")]
 use atomic_graph::sqlite::SqliteStore;
+#[cfg(target_os = "linux")]
 use atomic_graph::store::{Actor, Evidence, Finish, GraphStore, Status};
 use serde_json::{Value, json};
-use sqlx::{Connection, Row};
+use sqlx::Connection;
+#[cfg(target_os = "linux")]
+use sqlx::Row;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 const EXPORT: &str = concat!(
@@ -86,6 +98,7 @@ impl Fixture {
             .expect("atomic graph command ran")
     }
 
+    #[cfg(target_os = "linux")]
     fn enroll(&self, project: &Path) {
         success(&self.run(project, &["graph", "export"]));
         let id = self.state_id(project);
@@ -189,6 +202,7 @@ fn success(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("UTF-8 output")
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn enrolled_person_creates_links_claims_and_closes_with_json() {
     let fixture = Fixture::new("human-commands");
@@ -235,6 +249,7 @@ fn enrolled_person_creates_links_claims_and_closes_with_json() {
     assert!(exported.contains(r#""status":"closed""#));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn graph_search_cli_resolves_punctuated_ids_filters_status_and_rebuilds() {
     let fixture = Fixture::new("search");
@@ -308,6 +323,7 @@ fn graph_search_cli_resolves_punctuated_ids_filters_status_and_rebuilds() {
     assert_eq!(punctuated["results"][0]["id"], "bd-search.2-alpha");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
     let fixture = Fixture::new("create-request-key");
@@ -418,6 +434,7 @@ fn graph_create_request_key_replays_without_extra_rows_and_refuses_conflicts() {
     assert_ne!(fresh_a, fresh_b, "ordinary create lost its fresh key");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     let fixture = Fixture::new("literal%41");
@@ -531,6 +548,7 @@ fn percent_escape_state_home_keeps_create_export_and_dry_run_on_one_database() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn distinct_create_keys_with_the_same_short_hash_keep_separate_items_and_replay() {
     let fixture = Fixture::new("create-request-collision");
@@ -582,6 +600,7 @@ fn distinct_create_keys_with_the_same_short_hash_keep_separate_items_and_replay(
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn keyed_create_replays_its_preexisting_short_id() {
     let fixture = Fixture::new("create-legacy-short-id");
@@ -620,6 +639,7 @@ fn keyed_create_replays_its_preexisting_short_id() {
     assert_eq!(replay["id"], old_id);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn operator_cli_reconciles_only_the_named_failed_epic_binding() {
     let fixture = Fixture::new("reconcile-failed");
@@ -719,6 +739,7 @@ fn operator_cli_reconciles_only_the_named_failed_epic_binding() {
     });
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn refused_human_close_leaves_no_claim_and_evidenced_close_succeeds() {
     let fixture = Fixture::new("close-policy");
@@ -847,6 +868,7 @@ fn refused_human_close_leaves_no_claim_and_evidenced_close_succeeds() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn repeated_human_close_preserves_terminal_outcome_and_finish_identity() {
     let fixture = Fixture::new("repeat-close");
@@ -916,6 +938,7 @@ fn repeated_human_close_preserves_terminal_outcome_and_finish_identity() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn operator_sets_shows_and_clears_one_item_policy_with_json() {
     let fixture = Fixture::new("item-policy");
@@ -1036,6 +1059,7 @@ fn operator_sets_shows_and_clears_one_item_policy_with_json() {
     success(&fixture.run(&project, &["graph", "close", "at-policy-a"]));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn operator_sets_shows_and_clears_structured_item_criteria() {
     let fixture = Fixture::new("item-criteria");
@@ -1121,6 +1145,7 @@ fn operator_sets_shows_and_clears_structured_item_criteria() {
     assert_eq!(cleared["set_by"], Value::Null);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn fake_and_rotated_cli_credentials_cannot_write_an_item_policy() {
     let fixture = Fixture::new("policy-credential");
@@ -1223,6 +1248,7 @@ fn fake_and_rotated_cli_credentials_cannot_write_an_item_policy() {
     assert_eq!(shown["policy"], Value::Null);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn policy_show_and_clear_name_the_legacy_fallback() {
     let fixture = Fixture::new("policy-legacy");
@@ -1291,6 +1317,7 @@ fn policy_show_and_clear_name_the_legacy_fallback() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("commit"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn import_twice_and_export_reimport_are_stable() {
     let fixture = Fixture::new("roundtrip");
@@ -1335,6 +1362,7 @@ fn import_twice_and_export_reimport_are_stable() {
     assert_eq!(json_export["jsonl"], exported);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn operator_pins_an_imported_open_epic_only() {
     let fixture = Fixture::new("import-pin");
@@ -1386,6 +1414,7 @@ fn operator_pins_an_imported_open_epic_only() {
     assert!(exported.contains("\"pinned\":true"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn malformed_file_refuses_every_line_and_dry_run_writes_nothing() {
     let fixture = Fixture::new("refusal");
@@ -1427,6 +1456,7 @@ fn malformed_file_refuses_every_line_and_dry_run_writes_nothing() {
 }
 
 #[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn unreadable_link_loop_is_refused_without_importing() {
     use std::os::unix::fs::symlink;
@@ -1517,6 +1547,7 @@ fn has_atomic_database(dir: &Path) -> bool {
     false
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn import_redacts_provider_credentials_in_stored_rows_and_exports() {
     let fixture = Fixture::new("import-redaction");
@@ -1569,6 +1600,7 @@ fn inspection_from_the_cli_leaves_a_missing_database_missing() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ready_and_show_inspect_imported_items_without_opening_an_absent_store() {
     let fixture = Fixture::new("ready-show");
@@ -1609,6 +1641,7 @@ fn ready_and_show_inspect_imported_items_without_opening_an_absent_store() {
     assert_eq!(shown["edges"], json!([{"kind":"blocks","to":"bd-open"}]));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ready_json_matches_pinned_bd_sqlite_for_imported_scenarios() {
     use std::collections::BTreeMap;
@@ -1793,6 +1826,7 @@ fn ready_json_matches_pinned_bd_sqlite_for_imported_scenarios() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn native_ready_json_keeps_atomic_item_fields() {
     let fixture = Fixture::new("native-ready-json");
@@ -1829,6 +1863,7 @@ fn native_ready_json_keeps_atomic_item_fields() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn inspection_works_while_another_connection_holds_the_write_lock() {
     use sqlx::{Connection, SqliteConnection};
@@ -1930,6 +1965,7 @@ fn goals_inspection_leaves_missing_and_older_databases_untouched() {
     assert_eq!(std::fs::read(path).expect("inspected bytes"), before);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn operator_restores_an_imported_goal_from_yaml_with_its_children() {
     let fixture = Fixture::new("goal-restore");

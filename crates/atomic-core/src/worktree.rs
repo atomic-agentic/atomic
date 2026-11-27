@@ -1598,6 +1598,9 @@ mod tests {
             .expect("Git dependency marker");
         std::fs::write(index.join("serde-1.0.0/src/lib.rs"), "trusted serde")
             .expect("serde source");
+        // macOS temp_dir may spell /private/var as /var. The production
+        // caller supplies a canonical registry path.
+        let registry = std::fs::canonicalize(&registry).expect("canonical registry");
         let scratch = dir.join("trial");
         std::fs::create_dir(&scratch).expect("trial scratch");
         let cache = Caches::new(dir.join("unused"))
@@ -1642,6 +1645,7 @@ mod tests {
         for part in ["index", "cache", "src/index.test/serde-1.0.0"] {
             std::fs::create_dir_all(registry.join(part)).expect("trusted registry");
         }
+        let registry = std::fs::canonicalize(&registry).expect("canonical registry");
         let cache = Caches::new(dir.join("private/run-cache"));
         cache.create().expect("private run cache");
         let first = cache.prepare_exec_cargo(&registry).expect("first attempt");

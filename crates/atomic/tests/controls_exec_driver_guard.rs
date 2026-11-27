@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Focused removal tests for the controls exec driver's own trust checks.
+//! The driver uses GNU `timeout`, provided by the Linux development image.
+
+#![cfg(target_os = "linux")]
 
 use std::path::Path;
 use std::process::Command;

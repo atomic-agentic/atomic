@@ -1567,9 +1567,10 @@ fn a_racer_that_could_not_start_is_reported_instead_of_hanging_the_drive() {
     );
     let refusal = refused[0].clone();
     assert!(
-        refusal.contains("(os error "),
-        "the refusal dropped the reason the operating system gave, so a reader cannot tell a \
-         refused stack from any other failure to start a thread: {refusal}"
+        refusal.contains("(os error ")
+            || (cfg!(target_os = "macos") && refusal.ends_with(": invalid stack size")),
+        "the refusal dropped the thread-start reason, so a reader cannot tell a refused stack \
+         from any other failure to start a thread: {refusal}"
     );
     let called_off: Vec<&String> = drives
         .problems
