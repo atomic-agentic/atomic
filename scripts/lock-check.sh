@@ -31,17 +31,23 @@ v8_unbuilt() {
 
 # Fails when LOCKFILE holds two V8 builds that are not listed as unbuilt. A
 # build is a V8 binding crate (v8, or deno_v8's alternative v8x) at one
-# version; entries under [[patch.unused]] are not in the graph.
+# version from one source, so one version from two sources is two builds;
+# entries under [[patch.unused]] are not in the graph.
 v8_check() {
     local lockfile="$1" builds unbuilt built status=0
+    # "name version source" for each V8 package; "-" for a package with no source.
     builds="$(awk '
-        /^\[\[/ { in_package = ($0 == "[[package]]"); name = "" }
+        function flush() { if (name == "v8" || name == "v8x") print name, version, (source == "" ? "-" : source) }
+        /^\[\[/ { if (in_package) flush(); in_package = ($0 == "[[package]]"); name = version = source = "" }
         in_package && /^name = / { gsub(/"/, "", $3); name = $3 }
-        in_package && /^version = / && (name == "v8" || name == "v8x") { gsub(/"/, "", $3); print name, $3 }
+        in_package && /^version = / { gsub(/"/, "", $3); version = $3 }
+        in_package && /^source = / { gsub(/"/, "", $3); source = $3 }
+        END { if (in_package) flush() }
     ' "${lockfile}" | sort -u)"
     unbuilt="$(v8_unbuilt)"
-    built="$(comm -23 <(printf '%s\n' "${builds}" | sed '/^$/d') <(printf '%s\n' "${unbuilt}" | sed '/^$/d') \
-        | sort -u)"
+    built="$(printf '%s\n' "${builds}" | sed '/^$/d' | while read -r name version source; do
+        printf '%s\n' "${unbuilt}" | grep -qxF "${name} ${version}" || echo "${name} ${version} ${source}"
+    done | sort -u)"
     if [ "$(printf '%s\n' "${built}" | sed '/^$/d' | wc -l)" -gt 1 ]; then
         echo "scripts/lock-check.sh: ${lockfile} holds more than one V8 build, and two V8 builds cannot be linked into one binary:" >&2
         printf '%s\n' "${builds}" | sed 's/^/    /' >&2
@@ -50,7 +56,7 @@ v8_check() {
     fi
     while read -r name version; do
         [ -n "${name}" ] || continue
-        if ! printf '%s\n' "${builds}" | grep -qxF "${name} ${version}"; then
+        if ! printf '%s\n' "${builds}" | grep -qF "${name} ${version} "; then
             echo "scripts/lock-check.sh: deps/v8.toml lists ${name} ${version}, which ${lockfile} no longer holds; remove it" >&2
             status=1
         fi

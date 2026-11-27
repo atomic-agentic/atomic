@@ -40,6 +40,7 @@ expect() {
 expect pass "no V8 at all" "$(package serde 1.0.0)"
 expect pass "one V8 version" "$(package v8 150.4.0)"
 expect fail "two V8 lines (150 and 152)" "$(package v8 150.4.0)$(package v8 152.2.0 git+https://example.invalid/rusty_v8.git)"
+expect fail "one V8 version from two sources" "$(package v8 152.2.0)$(package v8 152.2.0 git+https://example.invalid/rusty_v8.git)"
 expect fail "two versions of one V8 line" "$(package v8 150.4.0)$(package v8 150.5.0)"
 expect fail "v8 and deno_v8's alternative v8x" "$(package v8 150.4.0)$(package v8x 149.4.0-rc.4)"
 expect pass "a patch Cargo.lock records as unused is not built" "$(package v8 150.4.0)$(unused v8 152.2.0)"
