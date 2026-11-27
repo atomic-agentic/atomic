@@ -243,7 +243,8 @@ EOF
 )" || fail ".github/workflows/ci.yml against scripts/test-shards.txt: ${out}"
 
 # cache-trim.py keeps the dependencies' entries in each profile and removes
-# the workspace's (by the hashes of their fingerprints), and all else.
+# the workspace's (by the hashes of their fingerprints), and all else but the
+# verified V8 mirror.
 T="${WORK}/target"
 mkdir -p "${T}/debug/deps" "${T}/debug/build/serde-1111/out" "${T}/debug/build/pkg-a-2222/out" \
     "${T}/debug/.fingerprint/serde-1111" "${T}/debug/.fingerprint/pkg-a-3333" "${T}/debug/.fingerprint/pkg-a-2222" \
@@ -262,7 +263,7 @@ python3 "${ROOT}/scripts/cache-trim.py" --metadata "${WORK}/meta.json" >/dev/nul
 GITHUB_ACTIONS=true python3 "${ROOT}/scripts/cache-trim.py" --metadata "${WORK}/meta.json" >/dev/null || fail "cache-trim.py failed in CI"
 python3 "${ROOT}/scripts/cache-trim.py" --force --metadata "${WORK}/meta.json" >/dev/null || fail "cache-trim.py --force failed"
 got="$(cd "${T}" && find . -mindepth 1 | LC_ALL=C sort | tr '\n' ' ')"
-want="./CACHEDIR.TAG ./debug ./debug/.fingerprint ./debug/.fingerprint/serde-1111 ./debug/build ./debug/build/serde-1111 ./debug/build/serde-1111/out ./debug/deps ./debug/deps/libserde-1111.rlib ./debug/deps/serde-1111.d ./release ./release/.fingerprint ./release/.fingerprint/serde-5555 ./release/deps ./release/deps/libserde-5555.rlib "
+want="./CACHEDIR.TAG ./debug ./debug/.fingerprint ./debug/.fingerprint/serde-1111 ./debug/build ./debug/build/serde-1111 ./debug/build/serde-1111/out ./debug/deps ./debug/deps/libserde-1111.rlib ./debug/deps/serde-1111.d ./release ./release/.fingerprint ./release/.fingerprint/serde-5555 ./release/deps ./release/deps/libserde-5555.rlib ./v8-mirror ./v8-mirror/v1 ./v8-mirror/v1/librusty_v8.a "
 [ "${got}" = "${want}" ] || fail "cache-trim.py left: ${got}"
 
 # Only pushes to main save caches: every use of rust-cache-save in ci.yml is
