@@ -138,8 +138,10 @@ pub struct Command {
     /// Optional per-process CPU seconds, inherited by children. This is not
     /// an aggregate process-tree quota.
     pub cpu_seconds: Option<u64>,
-    /// Optional per-process writable data bytes (Unix `RLIMIT_DATA`), inherited
-    /// by children. This is not an aggregate process-tree quota.
+    /// Optional per-process writable data bytes (`RLIMIT_DATA` on Linux; on
+    /// macOS, which refuses such a limit, held by the waiting process from
+    /// each process's footprint), inherited by children. This is not an
+    /// aggregate process-tree quota.
     pub data_bytes: Option<u64>,
     /// The directories it may write, such as its workspace's scratch
     /// directory, when its backend confines it (see [`Confine`]). A backend
