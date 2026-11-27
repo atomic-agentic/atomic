@@ -8,11 +8,14 @@
 //! can still read the project, write its own scratch directory and open a
 //! network connection.
 //!
-//! Needs bubblewrap and unprivileged user namespaces, so it runs with the
-//! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
-//! fails the test.
+//! On Linux it needs bubblewrap and unprivileged user namespaces, and on
+//! macOS Seatbelt, so it runs with the `sandbox-tests` feature; with the
+//! feature on, a sandbox that cannot start fails the test.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "sandbox-tests"
+))]
 #![recursion_limit = "512"]
 
 mod support;
@@ -73,7 +76,8 @@ def write_home():
         f.write('x')
 json.dump({name: attempt(f) for name, f in [('read_db', read_db), ('write_gate', write_gate),
     ('read_credential', read_credential), ('read_signin', read_signin), ('read_home_secret', read_home_secret), ('read_other_db', read_other_db), ('read_project', read_project), ('write_home', write_home), ('unix_socket', unix_socket), ('tcp_socket', tcp_socket)]}
-    | {'env': ' '.join(sorted(n for n in os.environ if n != 'LC_CTYPE'))},
+    | {'env': ' '.join(sorted(n for n in os.environ
+        if n != 'LC_CTYPE' and n not in ('__CF_USER_TEXT_ENCODING', '__PYVENV_LAUNCHER__')))},
     sys.stdout)
 "#;
 
@@ -276,11 +280,20 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
                  TARGET_CREDENTIAL TARGET_DB TARGET_PORT TARGET_SIGNIN TARGET_SOCKET TMPDIR",
                 "{what}"
             );
+            // Seatbelt refuses with EPERM where bubblewrap's empty mounts
+            // give EACCES.
             let denied = |path: &Path| {
-                format!(
-                    "PermissionError: [Errno 13] Permission denied: '{}'",
-                    path.display()
-                )
+                if cfg!(target_os = "macos") {
+                    format!(
+                        "PermissionError: [Errno 1] Operation not permitted: '{}'",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "PermissionError: [Errno 13] Permission denied: '{}'",
+                        path.display()
+                    )
+                }
             };
             assert_eq!(out["read_db"], denied(&db), "{what}");
             assert_eq!(

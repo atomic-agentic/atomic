@@ -104,6 +104,10 @@ codex-process-hardening = { git = "https://github.com/atomic-agentic/codex", rev
 codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 # The proxy that limits an exec command declaring network access to its hosts.
 codex-network-proxy = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
+# The Seatbelt policy that confines an exec command on macOS, and the path
+# type its requests take.
+codex-sandboxing = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
+codex-utils-path-uri = { git = "https://github.com/atomic-agentic/codex", rev = "f08195033e1e1585b9a7c6fd0b9d0e068c18a726" }
 
 # Codex is a large dependency; full debug info for every crate makes a debug
 # build tens of gigabytes. Keep line tables for atomic's own crates (enough for

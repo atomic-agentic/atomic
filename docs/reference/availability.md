@@ -424,9 +424,17 @@ on a full disk, makes the step wait, as a backend with no room does. Atoms that 
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's
 execution lock. On macOS it kills each command's process group and does not wait, so a
-process that left its group may outlive atomic and the lock. Standalone exec
-commands run unconfined on macOS. On Windows, atomic refuses standalone exec
-commands. Both platforms refuse credentialed gate decisions.
+process that left its group may outlive atomic and the lock. On macOS a
+standalone exec command runs under Seatbelt, the macOS sandbox, with the
+policy Codex writes for the same permissions as on Linux. The macOS sandbox
+suite shows such a command cannot read a project's database or write a gate
+decision into it, cannot read the operator credential store, a ChatGPT
+sign-in, another project's database or a key in your home directory, and
+cannot open a socket or a network connection. A command whose atom declares
+hosts is refused on macOS for now: there atomic cannot yet tell its
+connections from another command's, so it gives it no proxy. On Windows,
+atomic refuses standalone exec commands. Both platforms refuse credentialed
+gate decisions.
 
 An exec atom's command hands large results over by reference: it writes a
 file to its outputs directory and names it in its output, and the next step's

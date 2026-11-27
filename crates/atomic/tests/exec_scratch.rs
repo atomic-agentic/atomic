@@ -6,11 +6,14 @@
 //! the project's scratch roots are denied to a confined command, its own
 //! directory apart, on the local backend and through a runner process.
 //!
-//! Needs bubblewrap and unprivileged user namespaces, so it runs with the
-//! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
-//! fails the test.
+//! On Linux it needs bubblewrap and unprivileged user namespaces, and on
+//! macOS Seatbelt, so it runs with the `sandbox-tests` feature; with the
+//! feature on, a sandbox that cannot start fails the test.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "sandbox-tests"
+))]
 #![recursion_limit = "512"]
 
 mod support;

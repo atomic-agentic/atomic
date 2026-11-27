@@ -614,6 +614,8 @@ dependencies = [
  "codex-network-proxy",
  "codex-process-hardening",
  "codex-protocol",
+ "codex-sandboxing",
+ "codex-utils-path-uri",
  "codex-windows-sandbox",
  "codex-windows-sandbox-service",
  "ctor 1.0.6",

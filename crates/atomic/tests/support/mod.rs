@@ -4,11 +4,25 @@
 
 use std::process::Command;
 
-/// Fail, naming what is missing, unless Codex's Linux sandbox can start
-/// here. The sandbox runs commands under bubblewrap from `PATH`, which needs
-/// unprivileged user namespaces and a fresh `/proc`. A suite that cannot
-/// reach its backend fails; it never skips.
+/// Fail, naming what is missing, unless Codex's sandbox can start here. On
+/// Linux it runs commands under bubblewrap from `PATH`, which needs
+/// unprivileged user namespaces and a fresh `/proc`; on macOS under
+/// `/usr/bin/sandbox-exec`. A suite that cannot reach its backend fails; it
+/// never skips.
 pub fn require_sandbox() {
+    if cfg!(target_os = "macos") {
+        let probe = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
+            .output();
+        match probe {
+            Ok(out) if out.status.success() => return,
+            Ok(out) => panic!(
+                "the sandbox tests need macOS's Seatbelt, and sandbox-exec cannot start here: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(e) => panic!("the sandbox tests need /usr/bin/sandbox-exec: {e}"),
+        }
+    }
     let probe = Command::new("bwrap")
         .args([
             "--unshare-user",
