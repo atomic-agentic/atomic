@@ -3852,11 +3852,13 @@ async fn turn<C: WorkflowContext>(
                     .map_err(|e| failed(format!("step `{id}`: {e}")))?;
                 let now = atomic_core::astro::Program::current_helper_runtime();
                 if pinned_helpers.as_deref() != Some(now.as_str()) {
+                    let describe = atomic_core::astro::Program::describe_helper_runtime;
                     return Err(failed(format!(
                         "step `{id}`: this run started on another helper runtime ({}), and \
-                             its helpers cannot resume on this one ({now}); their behaviour could \
+                             its helpers cannot resume on this one ({}); their behaviour could \
                              differ from what the run already recorded. Start a new run",
-                        pinned_helpers.as_deref().unwrap_or("not recorded"),
+                        pinned_helpers.as_deref().map_or("not recorded".into(), describe),
+                        describe(&now),
                     )));
                 }
             }

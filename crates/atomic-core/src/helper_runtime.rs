@@ -54,6 +54,12 @@ pub fn identity() -> String {
     env!("ATOMIC_HELPER_HASH").to_owned()
 }
 
+/// The engine helpers run on, as a run's helper runtime records it: the V8
+/// version (`deno_core` 0.413.0 embeds it).
+pub fn engine() -> String {
+    format!("v8 {}", v8::VERSION_STRING)
+}
+
 /// A captured helper module graph, already transpiled to JavaScript.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Captured {
