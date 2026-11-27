@@ -78,6 +78,29 @@ bill of materials.
   the fixtures in atomic's redaction tests come from rig-core's tests.
   atomic does not depend on rig-core.
 
+## deno_core and deno_v8
+
+- Upstream: <https://github.com/denoland/deno> (`libs/core` and
+  `libs/deno_v8`, published as the crates `deno_core` 0.413.0 and `deno_v8`
+  0.5.0)
+- Licence: MIT
+- Copyright 2018-2026 the Deno authors
+- Use: atomic embeds V8 through `deno_core`, linked into the `atomic` binary.
+  Both crates are vendored in [`third_party/deno`](third_party/deno/README.md)
+  with the `libs/core` and `libs/deno_v8` changes of denoland/deno pull
+  request 36665, which move them to the V8 Codex pins; that README lists the
+  crates.io checksums and the change. `serde_v8`, `deno_ops` and the other
+  Deno crates they use come unmodified from crates.io.
+
+## rusty_v8, and the fork Codex uses
+
+- Upstream: <https://github.com/denoland/rusty_v8> (crate `v8`, 152.2.0)
+- Fork: <https://github.com/openai-oss-forks/rusty_v8>, the source Codex
+  patches in (revision in [`deps/forks.toml`](deps/forks.toml))
+- Licence: MIT; V8 itself is BSD-3-Clause
+- Use: the V8 JavaScript engine, linked into the `atomic` binary as the
+  prebuilt static library [`deps/v8.toml`](deps/v8.toml) pins.
+
 The MIT License, as it applies to the projects above that use it:
 
 > Permission is hereby granted, free of charge, to any person obtaining a copy

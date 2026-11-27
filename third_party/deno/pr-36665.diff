@@ -1,0 +1,418 @@
+diff --git a/deno_core/error.rs b/deno_core/error.rs
+index cdf8de8..64aaa70 100644
+--- a/deno_core/error.rs
++++ b/deno_core/error.rs
+@@ -403,7 +403,7 @@ pub fn to_v8_error<'s, 'i>(
+     .borrow()
+     .clone()
+     .expect("Custom error builder must be set");
+-  let cb = cb.open(tc_scope);
++  let cb = v8::Local::new(tc_scope, &cb);
+   let this = v8::undefined(tc_scope).into();
+   let class = v8::String::new(tc_scope, &error.get_class()).unwrap();
+   let message = v8::String::new(tc_scope, &error.get_message()).unwrap();
+@@ -1040,7 +1040,7 @@ impl JsError {
+     let js_format_exception_cb =
+       exception_state.js_format_exception_cb.borrow().clone();
+     if let Some(format_exception_cb) = js_format_exception_cb {
+-      let format_exception_cb = format_exception_cb.open(scope);
++      let format_exception_cb = v8::Local::new(scope, &format_exception_cb);
+       let this = v8::undefined(scope).into();
+       let formatted = format_exception_cb.call(scope, this, &[exception]);
+       if let Some(formatted) = formatted
+diff --git a/deno_core/modules/map.rs b/deno_core/modules/map.rs
+index da47878..932d23a 100644
+--- a/deno_core/modules/map.rs
++++ b/deno_core/modules/map.rs
+@@ -1740,7 +1740,7 @@ impl ModuleMap {
+       .get_handle(module_id)
+       .expect("ModuleInfo not found");
+ 
+-    let module = module_handle.open(scope);
++    let module = v8::Local::new(scope, &module_handle);
+ 
+     if module.get_status() == v8::ModuleStatus::Errored {
+       let exception = module.get_exception();
+diff --git a/deno_core/modules/map/dynamic.rs b/deno_core/modules/map/dynamic.rs
+index 5bae182..1126151 100644
+--- a/deno_core/modules/map/dynamic.rs
++++ b/deno_core/modules/map/dynamic.rs
+@@ -98,7 +98,7 @@ impl ModuleMap {
+         }
+ 
+         // No pending TLA, safe to resolve immediately
+-        let resolver = resolver_handle.open(scope);
++        let resolver = v8::Local::new(scope, &resolver_handle);
+         let module_namespace = module.get_module_namespace();
+         resolver.resolve(scope, module_namespace).unwrap();
+ 
+@@ -115,7 +115,7 @@ impl ModuleMap {
+     {
+       match self.lazy_load_esm_module(scope, module_specifier.as_str()) {
+         Ok(module_ns) => {
+-          let resolver = resolver_handle.open(scope);
++          let resolver = v8::Local::new(scope, &resolver_handle);
+           let module_ns_local = v8::Local::new(scope, module_ns);
+           resolver.resolve(scope, module_ns_local).unwrap();
+           return false;
+@@ -123,7 +123,7 @@ impl ModuleMap {
+         Err(e) => {
+           let exception = e.to_v8_error(scope);
+           let exception_local = v8::Local::new(scope, exception);
+-          let resolver = resolver_handle.open(scope);
++          let resolver = v8::Local::new(scope, &resolver_handle);
+           resolver.reject(scope, exception_local).unwrap();
+           return false;
+         }
+@@ -146,7 +146,7 @@ impl ModuleMap {
+         .lazy_load_synthetic_esm_module(scope, module_specifier.as_str())
+       {
+         Ok(module_ns) => {
+-          let resolver = resolver_handle.open(scope);
++          let resolver = v8::Local::new(scope, &resolver_handle);
+           let module_ns_local = v8::Local::new(scope, module_ns);
+           resolver.resolve(scope, module_ns_local).unwrap();
+           return false;
+@@ -154,7 +154,7 @@ impl ModuleMap {
+         Err(e) => {
+           let exception = e.to_v8_error(scope);
+           let exception_local = v8::Local::new(scope, exception);
+-          let resolver = resolver_handle.open(scope);
++          let resolver = v8::Local::new(scope, &resolver_handle);
+           resolver.reject(scope, exception_local).unwrap();
+           return false;
+         }
+@@ -210,7 +210,7 @@ impl ModuleMap {
+     let module_handle = self.get_handle(id).expect("ModuleInfo not found");
+ 
+     let status = {
+-      let module = module_handle.open(scope);
++      let module = v8::Local::new(scope, &module_handle);
+       module.get_status()
+     };
+ 
+@@ -306,7 +306,7 @@ impl ModuleMap {
+     let mut resolved_any = false;
+     let mut still_pending = vec![];
+     for eval in pending {
+-      let promise = eval.promise.open(scope);
++      let promise = v8::Local::new(scope, &eval.promise);
+       match promise.state() {
+         v8::PromiseState::Pending => {
+           still_pending.push(eval);
+@@ -341,7 +341,7 @@ impl ModuleMap {
+       let module_namespace = module.get_module_namespace();
+ 
+       for resolver_handle in waiters {
+-        let resolver = resolver_handle.open(scope);
++        let resolver = v8::Local::new(scope, &resolver_handle);
+         resolver.resolve(scope, module_namespace).unwrap();
+       }
+       if !JsRealm::state_from_scope(scope).has_tick_scheduled() {
+@@ -361,7 +361,7 @@ impl ModuleMap {
+     if let Some(waiters) = waiters {
+       let exception = v8::Local::new(scope, exception);
+       for resolver_handle in waiters {
+-        let resolver = resolver_handle.open(scope);
++        let resolver = v8::Local::new(scope, &resolver_handle);
+         resolver.reject(scope, exception).unwrap();
+       }
+       if !JsRealm::state_from_scope(scope).has_tick_scheduled() {
+@@ -382,7 +382,7 @@ impl ModuleMap {
+       .remove(&id)
+       .expect("Invalid dynamic import id")
+       .resolver;
+-    let resolver = resolver_handle.open(scope);
++    let resolver = v8::Local::new(scope, &resolver_handle);
+ 
+     let exception = v8::Local::new(scope, exception);
+     resolver.reject(scope, exception).unwrap();
+@@ -403,7 +403,7 @@ impl ModuleMap {
+       .remove(&id)
+       .expect("Invalid dynamic import id")
+       .resolver;
+-    let resolver = resolver_handle.open(scope);
++    let resolver = v8::Local::new(scope, &resolver_handle);
+ 
+     let module = self
+       .data
+@@ -627,7 +627,7 @@ impl ModuleMap {
+                     .remove(&dyn_import_id)
+                     .expect("Invalid dynamic import id")
+                     .resolver;
+-                  let resolver = resolver_handle.open(tc_scope);
++                  let resolver = v8::Local::new(tc_scope, &resolver_handle);
+                   resolver.resolve(tc_scope, module_namespace).unwrap();
+                   tc_scope.perform_microtask_checkpoint();
+                 }
+@@ -675,7 +675,7 @@ impl ModuleMap {
+                 let source = data.sources.get(&key).expect("Source had to have been inserted successfully, or recursion would error.");
+                 v8::Local::new(scope, source).into()
+               };
+-              let resolver = state.resolver.open(scope);
++              let resolver = v8::Local::new(scope, &state.resolver);
+               resolver.resolve(scope, source).unwrap();
+             }
+           }
+diff --git a/deno_core/ops_builtin_v8.rs b/deno_core/ops_builtin_v8.rs
+index 7fb6b99..3243f9b 100644
+--- a/deno_core/ops_builtin_v8.rs
++++ b/deno_core/ops_builtin_v8.rs
+@@ -1433,9 +1433,7 @@ pub fn wasm_streaming_callback<'a>(
+ 
+   let undefined = v8::undefined(scope);
+   let rid = serde_v8::to_v8(scope, streaming_rid).unwrap();
+-  cb_handle
+-    .open(scope)
+-    .call(scope, undefined.into(), &[arg, rid]);
++  v8::Local::new(scope, &cb_handle).call(scope, undefined.into(), &[arg, rid]);
+ }
+ 
+ // This op is re-entrant as it makes a v8 call. It also cannot be fast because
+diff --git a/deno_core/runtime/jsrealm.rs b/deno_core/runtime/jsrealm.rs
+index 7347315..8b65764 100644
+--- a/deno_core/runtime/jsrealm.rs
++++ b/deno_core/runtime/jsrealm.rs
+@@ -369,7 +369,7 @@ impl JsRealmInner {
+     std::mem::take(&mut *state.js_wasm_streaming_cb.borrow_mut());
+ 
+     {
+-      let ctx = self.context().open(scope);
++      let ctx = v8::Local::new(scope, self.context());
+       // SAFETY: Clear all embedder data
+       unsafe {
+         let ctx_state =
+diff --git a/deno_core/runtime/jsruntime.rs b/deno_core/runtime/jsruntime.rs
+index b859b91..3279259 100644
+--- a/deno_core/runtime/jsruntime.rs
++++ b/deno_core/runtime/jsruntime.rs
+@@ -2107,7 +2107,7 @@ impl JsRuntime {
+   ) -> impl Future<Output = Result<v8::Global<v8::Value>, Box<JsError>>> + use<>
+   {
+     v8::tc_scope!(let scope, scope);
+-    let cb = function.open(scope);
++    let cb = v8::Local::new(scope, function);
+     let this = v8::undefined(scope).into();
+     let promise = if args.is_empty() {
+       cb.call(scope, this, &[])
+@@ -3424,7 +3424,7 @@ impl JsRuntime {
+     let run_immediate_callbacks_cb =
+       context_state.run_immediate_callbacks_cb.borrow();
+     let run_immediate_callbacks_cb =
+-      run_immediate_callbacks_cb.as_ref().unwrap().open(tc_scope);
++      v8::Local::new(tc_scope, run_immediate_callbacks_cb.as_ref().unwrap());
+ 
+     run_immediate_callbacks_cb.call(tc_scope, undefined, &[]);
+ 
+@@ -3494,7 +3494,8 @@ impl JsRuntime {
+     v8::tc_scope!(let tc_scope, scope);
+ 
+     let process_timers_cb = context_state.js_process_timers_cb.borrow();
+-    let process_timers_fn = process_timers_cb.as_ref().unwrap().open(tc_scope);
++    let process_timers_fn =
++      v8::Local::new(tc_scope, process_timers_cb.as_ref().unwrap());
+     let now_val = v8::Number::new(tc_scope, now);
+     let undefined: v8::Local<v8::Value> = v8::undefined(tc_scope).into();
+ 
+@@ -3605,7 +3606,7 @@ impl JsRuntime {
+     v8::tc_scope!(let tc_scope, scope);
+ 
+     let tick_cb = context_state.js_event_loop_tick_cb.borrow();
+-    let tick_fn = tick_cb.as_ref().unwrap().open(tc_scope);
++    let tick_fn = v8::Local::new(tc_scope, tick_cb.as_ref().unwrap());
+     tick_fn.call(tc_scope, undefined, args.as_slice());
+ 
+     if let Some(exception) = tc_scope.exception() {
+@@ -3637,7 +3638,7 @@ impl JsRuntime {
+         .borrow()
+         .as_ref()
+       {
+-        let function = handler.open(scope);
++        let function = v8::Local::new(scope, handler);
+         let args = [
+           v8::Local::new(scope, promise).into(),
+           v8::Local::new(scope, result),
+@@ -3683,7 +3684,7 @@ impl JsRuntime {
+ 
+     let handle_rejections_cb = context_state.js_handle_rejections_cb.borrow();
+     let handle_rejections_fn =
+-      handle_rejections_cb.as_ref().unwrap().open(tc_scope);
++      v8::Local::new(tc_scope, handle_rejections_cb.as_ref().unwrap());
+     let undefined: v8::Local<v8::Value> = v8::undefined(tc_scope).into();
+     handle_rejections_fn.call(tc_scope, undefined, args.as_slice());
+ 
+@@ -3730,7 +3731,7 @@ impl JsRuntime {
+     v8::tc_scope!(let tc_scope, scope);
+ 
+     let drain_cb = context_state.js_drain_next_tick_and_macrotasks_cb.borrow();
+-    let drain_fn = drain_cb.as_ref().unwrap().open(tc_scope);
++    let drain_fn = v8::Local::new(tc_scope, drain_cb.as_ref().unwrap());
+     drain_fn.call(tc_scope, undefined, &[]);
+ 
+     if let Some(exception) = tc_scope.exception() {
+diff --git a/deno_core/runtime/setup.rs b/deno_core/runtime/setup.rs
+index aad5395..c7213a1 100644
+--- a/deno_core/runtime/setup.rs
++++ b/deno_core/runtime/setup.rs
+@@ -164,7 +164,6 @@ fn v8_init(
+   }
+ 
+   let base_flags = concat!(
+-    " --no-validate-asm",
+     " --turbo_fast_api_calls",
+     " --harmony-temporal",
+     " --js-float16array",
+diff --git a/deno_core/runtime/tests/misc.rs b/deno_core/runtime/tests/misc.rs
+index 0d0d620..7841177 100644
+--- a/deno_core/runtime/tests/misc.rs
++++ b/deno_core/runtime/tests/misc.rs
+@@ -47,13 +47,13 @@ fn test_execute_script_return_value() {
+   let value_global = runtime.execute_script("a.js", "a = 1 + 2").unwrap();
+   {
+     deno_core::scope!(scope, runtime);
+-    let value = value_global.open(scope);
++    let value = v8::Local::new(scope, &value_global);
+     assert_eq!(value.integer_value(scope).unwrap(), 3);
+   }
+   let value_global = runtime.execute_script("b.js", "b = 'foobar'").unwrap();
+   {
+     deno_core::scope!(scope, runtime);
+-    let value = value_global.open(scope);
++    let value = v8::Local::new(scope, &value_global);
+     assert!(value.is_string());
+     assert_eq!(
+       value.to_string(scope).unwrap().to_rust_string_lossy(scope),
+@@ -280,13 +280,13 @@ async fn test_resolve_value_generic(
+     }
+     Ok(Some(v)) => {
+       let value = result_global.unwrap();
+-      let value = value.open(scope);
++      let value = v8::Local::new(scope, &value);
+       assert_eq!(value.integer_value(scope).unwrap(), v as i64);
+     }
+     Err(e) => {
+       let Err(err) = result_global else {
+         let value = result_global.unwrap();
+-        let value = value.open(scope);
++        let value = v8::Local::new(scope, &value);
+         panic!(
+           "Expected an error, got {}",
+           value.to_rust_string_lossy(scope)
+@@ -418,7 +418,7 @@ async fn wasm_streaming_op_invocation_in_import() {
+   #[allow(deprecated, reason = "test code")]
+   let value = runtime.resolve_value(promise).await.unwrap();
+   deno_core::scope!(scope, runtime);
+-  let val = value.open(scope);
++  let val = v8::Local::new(scope, &value);
+   assert!(val.is_object());
+ }
+ 
+@@ -564,7 +564,7 @@ fn test_heap_limits() {
+     .unwrap();
+   let _guard = tokio.enter();
+   let create_params =
+-    v8::Isolate::create_params().heap_limits(0, 5 * 1024 * 1024);
++    v8::Isolate::create_params().heap_limits(0, 20 * 1024 * 1024);
+   let mut runtime = JsRuntime::new(RuntimeOptions {
+     create_params: Some(create_params),
+     ..Default::default()
+@@ -613,7 +613,7 @@ fn test_heap_limit_cb_multiple() {
+     .unwrap();
+   let _guard = tokio.enter();
+   let create_params =
+-    v8::Isolate::create_params().heap_limits(0, 5 * 1024 * 1024);
++    v8::Isolate::create_params().heap_limits(0, 20 * 1024 * 1024);
+   let mut runtime = JsRuntime::new(RuntimeOptions {
+     create_params: Some(create_params),
+     ..Default::default()
+@@ -1339,7 +1339,7 @@ async fn generic_in_extension_middleware() {
+ 
+   // Check the result
+   deno_core::scope!(scope, &mut runtime);
+-  let value = value_global.open(scope);
++  let value = v8::Local::new(scope, &value_global);
+ 
+   let result = value.to_rust_string_lossy(scope);
+   assert_eq!(result, "Hello World and Hello World");
+@@ -1559,7 +1559,7 @@ async fn global_template_middleware() {
+     _key: v8::Local<'s, v8::Name>,
+     _value: v8::Local<'s, v8::Value>,
+     _args: v8::PropertyCallbackArguments<'s>,
+-    _rv: v8::ReturnValue<()>,
++    _rv: v8::PropertyInterceptorReturnValue<'_>,
+   ) -> v8::Intercepted {
+     CALLS.lock().push("setter".to_string());
+     v8::Intercepted::kNo
+@@ -1570,7 +1570,7 @@ async fn global_template_middleware() {
+     _key: v8::Local<'s, v8::Name>,
+     _descriptor: &v8::PropertyDescriptor,
+     _args: v8::PropertyCallbackArguments<'s>,
+-    _rv: v8::ReturnValue<()>,
++    _rv: v8::PropertyInterceptorReturnValue<'_>,
+   ) -> v8::Intercepted {
+     CALLS.lock().push("definer".to_string());
+     v8::Intercepted::kNo
+diff --git a/deno_core/runtime/tests/ops.rs b/deno_core/runtime/tests/ops.rs
+index 79010da..7f9c7d0 100644
+--- a/deno_core/runtime/tests/ops.rs
++++ b/deno_core/runtime/tests/ops.rs
+@@ -193,7 +193,7 @@ fn test_op_high_arity() {
+     .execute_script("test.js", "Deno.core.ops.op_add_4(1, 2, 3, 4)")
+     .unwrap();
+   deno_core::scope!(scope, runtime);
+-  assert_eq!(r.open(scope).integer_value(scope), Some(10));
++  assert_eq!(v8::Local::new(scope, &r).integer_value(scope), Some(10));
+ }
+ 
+ #[test]
+diff --git a/deno_v8/Cargo.toml b/deno_v8/Cargo.toml
+index 4361cb9..c062528 100644
+--- a/deno_v8/Cargo.toml
++++ b/deno_v8/Cargo.toml
+@@ -59,7 +59,7 @@ name = "deno_v8"
+ path = "lib.rs"
+ 
+ [dependencies.rusty_v8]
+-version = "150.4.0"
++version = "152.2.0"
+ optional = true
+ default-features = false
+ package = "v8"
+diff --git a/deno_v8/lib.rs b/deno_v8/lib.rs
+index 9f30947..f705009 100644
+--- a/deno_v8/lib.rs
++++ b/deno_v8/lib.rs
+@@ -10,3 +10,33 @@ compile_error!("either feature `v8` or `quickjs` must be enabled");
+ pub use rusty_v8::*;
+ #[cfg(all(feature = "quickjs", not(feature = "v8")))]
+ pub use v8x_backend::*;
++
++/// The `ReturnValue` handed to the named and indexed property *setter* and
++/// *definer* interceptors.
++///
++/// V8 152 changed these two interceptors from `ReturnValue<()>` to
++/// `ReturnValue<Boolean>`, bringing them in line with the deleter interceptor,
++/// which already carried a `Boolean`. The QuickJS backend vendors an older
++/// rusty_v8 and still expects `ReturnValue<()>`, so interceptor callbacks name
++/// this alias rather than writing the payload type out and only compiling
++/// against one backend.
++#[cfg(all(feature = "v8", not(feature = "quickjs")))]
++pub type PropertyInterceptorReturnValue<'cb> =
++  rusty_v8::ReturnValue<'cb, rusty_v8::Boolean>;
++#[cfg(all(feature = "quickjs", not(feature = "v8")))]
++pub type PropertyInterceptorReturnValue<'cb> =
++  v8x_backend::ReturnValue<'cb, ()>;
++
++/// What `MicrotaskQueue::new` hands back: an owning RAII handle that releases
++/// the queue on drop and derefs to [`MicrotaskQueue`].
++///
++/// V8 152 returns a `MicrotaskQueueHandle`, which owns a root into the
++/// isolate's heap rather than the queue itself. The QuickJS backend vendors an
++/// older rusty_v8 that returns `UniqueRef<MicrotaskQueue>`, which owns the
++/// queue allocation directly. Both drop correctly on their own, so holders can
++/// name this alias and let ordinary ownership do the cleanup.
++#[cfg(all(feature = "v8", not(feature = "quickjs")))]
++pub type OwnedMicrotaskQueue = rusty_v8::MicrotaskQueueHandle;
++#[cfg(all(feature = "quickjs", not(feature = "v8")))]
++pub type OwnedMicrotaskQueue =
++  v8x_backend::UniqueRef<v8x_backend::MicrotaskQueue>;
