@@ -4084,6 +4084,12 @@ pub struct ExecSandbox {
     loopback_for_tests: Vec<String>,
 }
 
+/// Whether [`ExecSandbox`] confines commands on this platform: on Linux,
+/// through Codex's sandbox helper, and on macOS, through Seatbelt. What
+/// needs a command confined, such as trial-merge checks and controls proof,
+/// is refused where it does not.
+pub const CONFINES_EXEC: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
 /// What puts an exec atom's command under Codex's sandbox.
 #[derive(Clone, Debug)]
 enum Launcher {

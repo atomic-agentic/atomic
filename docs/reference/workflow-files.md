@@ -241,9 +241,9 @@ commit, base and ref, the run's bound Git repository, and that one declared row.
 The self-review atom receives those host results as `control_results`; its
 input schema must accept that field. An unproved row, or self-review evidence
 that differs from the host results, stops the workflow before the independent
-reviewer. Controls proofs require Linux's exec sandbox and declare no network
-hosts; a workflow that configures one is refused on platforms without that
-sandbox. The host requires every selected row file to be the same regular Git
+reviewer. Controls proofs require a confined exec sandbox, which atomic has on
+Linux and macOS, and declare no network hosts; a workflow that configures one
+is refused on platforms without that sandbox. The host requires every selected row file to be the same regular Git
 blob and mode in the candidate and its bound base commit. A candidate that
 rewrites a selected row is refused before the proof step; change row definitions
 in a separate trusted update. A failed control proof stops the workflow at that
@@ -269,7 +269,7 @@ and runs each declared check there without network access. A conflict, failed
 check, timeout or tracked-file rewrite goes to the author for repair while
 rounds remain; the independent reviewer is not called for that candidate.
 The main ref and check commands are fixed by the workflow, and this path
-requires the Linux exec sandbox. Direct Cargo checks also require the operator
+requires a confined exec sandbox, which atomic has on Linux and macOS. Direct Cargo checks also require the operator
 to set `ATOMIC_TRIAL_CARGO_REGISTRY` to a trusted registry cache and
 `ATOMIC_TRIAL_RUSTUP_TOOLCHAIN` to an installed toolchain. The check uses a
 scratch-local `CARGO_HOME` and target directory, reads that registry cache

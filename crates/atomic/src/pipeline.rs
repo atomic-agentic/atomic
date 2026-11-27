@@ -6769,9 +6769,10 @@ fn check_reviews(pipeline: &Pipeline) -> Result<()> {
                 step.id
             )));
         }
-        if review.trial_merge.is_some() && !cfg!(target_os = "linux") {
+        if review.trial_merge.is_some() && !atomic_core::codex::CONFINES_EXEC {
             return Err(failed(format!(
-                "step `{}`: trial-merge checks need a Linux execution sandbox",
+                "step `{}`: trial-merge checks need a confined execution sandbox, which atomic \
+                 has on Linux and macOS",
                 step.id
             )));
         }
@@ -6875,9 +6876,10 @@ fn check_reviews(pipeline: &Pipeline) -> Result<()> {
                 )));
             }
             if let Some(controls_atom) = &self_review.controls_atom {
-                if !cfg!(target_os = "linux") {
+                if !atomic_core::codex::CONFINES_EXEC {
                     return Err(failed(format!(
-                        "step `{}`: controls proof requires the Linux exec sandbox",
+                        "step `{}`: controls proof requires a confined exec sandbox, which \
+                         atomic has on Linux and macOS",
                         step.id
                     )));
                 }
