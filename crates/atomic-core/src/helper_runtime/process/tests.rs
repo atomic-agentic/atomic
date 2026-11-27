@@ -56,6 +56,56 @@ fn oversized_helper_limits_are_rejected_before_spawning() {
     );
 }
 
+// The CPU limit's hard bound is a second past its soft bound, so the kernel
+// signals SIGXCPU before it kills the child.
+#[cfg(unix)]
+#[test]
+fn the_cpu_limit_signals_before_it_kills() {
+    let limits = self_limits(&Limits::default()).expect("limits");
+    let (_, cpu) = limits
+        .iter()
+        .find(|(resource, _)| *resource == libc::RLIMIT_CPU as libc::c_int)
+        .expect("a CPU limit");
+    assert_eq!(
+        (cpu.rlim_cur, cpu.rlim_max),
+        (3 as libc::rlim_t, 4 as libc::rlim_t)
+    );
+}
+
+// A child the kernel stops at its soft CPU limit, with SIGXCPU, has run past
+// its deadline. The child here is a shell that spins under a one-second soft
+// limit, so the signal is the kernel's own.
+#[cfg(unix)]
+#[test]
+fn a_child_stopped_at_its_cpu_limit_has_run_past_its_deadline() {
+    let command = HostCommand {
+        program: std::path::PathBuf::from("/bin/sh"),
+        args: vec![
+            "-c".to_owned(),
+            "ulimit -S -t 1; while :; do :; done".to_owned(),
+        ],
+        env: Vec::new(),
+    };
+    let captured = Captured {
+        modules: Default::default(),
+        entry: ENTRY.to_owned(),
+    };
+    let limits = Limits {
+        deadline: Duration::from_secs(20),
+        ..Limits::default()
+    };
+    let started = Instant::now();
+    assert_eq!(
+        run(&command, &captured, "probe", &json!([]), limits, CLOCK),
+        Err(Failure::Deadline)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn a_call_runs_in_a_child_and_returns_its_result() {
     assert_eq!(probe("({ sum: 1 + 2 })"), Ok(json!({ "sum": 3 })));

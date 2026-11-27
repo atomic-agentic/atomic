@@ -371,7 +371,10 @@ pub(super) fn supervised(
     let _watchdog = controls.watchdog.then(|| {
         std::thread::spawn(move || {
             if finished.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                std::process::exit(crate::child_exit::DEADLINE);
+                // SAFETY: _exit ends the process at once, without the exit
+                // handlers and static destructors that `exit` would run
+                // while V8 is still running the call on another thread.
+                unsafe { libc::_exit(crate::child_exit::DEADLINE) }
             }
         })
     });
@@ -380,28 +383,40 @@ pub(super) fn supervised(
     result
 }
 
-/// Limits this process: its CPU time and core files, and its writable memory
-/// except on macOS. macOS refuses a data limit below its address map, so the
-/// host holds the memory limit there (see `child_memory`).
+/// The limits this process sets on itself: its CPU time and core files, and
+/// its writable memory except on macOS. macOS refuses a data limit below its
+/// address map, so the host holds the memory limit there (see
+/// `child_memory`). The CPU limit's hard bound is a second past its soft one,
+/// so the kernel sends SIGXCPU, which the host reports as the deadline,
+/// before SIGKILL.
 #[cfg(unix)]
-fn limit_self(limits: &Limits) -> Result<(), Failure> {
+fn self_limits(limits: &Limits) -> Result<Vec<(libc::c_int, libc::rlimit)>, Failure> {
     let memory = byte_limits(limits)?.0;
     #[cfg(target_os = "macos")]
     let _ = memory;
     let cpu = cpu_seconds(limits)?;
-    for (resource, value) in [
+    let cpu_hard = cpu
+        .checked_add(1)
+        .ok_or_else(|| Failure::Host("helper CPU limit is too large".into()))?;
+    let limit = |soft: u64, hard: u64| libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    Ok(vec![
         #[cfg(not(target_os = "macos"))]
-        (libc::RLIMIT_DATA, memory),
-        (libc::RLIMIT_CPU, cpu),
-        (libc::RLIMIT_CORE, 0),
-    ] {
-        let limit = libc::rlimit {
-            rlim_cur: value as libc::rlim_t,
-            rlim_max: value as libc::rlim_t,
-        };
+        (libc::RLIMIT_DATA as libc::c_int, limit(memory, memory)),
+        (libc::RLIMIT_CPU as libc::c_int, limit(cpu, cpu_hard)),
+        (libc::RLIMIT_CORE as libc::c_int, limit(0, 0)),
+    ])
+}
+
+/// Applies [`self_limits`] to this process.
+#[cfg(unix)]
+fn limit_self(limits: &Limits) -> Result<(), Failure> {
+    for (resource, limit) in self_limits(limits)? {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
-        if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
             return Err(Failure::Host(format!(
                 "cannot limit the helper process: {}",
                 std::io::Error::last_os_error()
