@@ -116,8 +116,8 @@ pub struct Explained {
 pub enum SignInError {
     /// Not on a platform where atoms' reach to it has been verified.
     #[error(
-        "a ChatGPT sign-in is kept only on Linux, where atomic has verified that atoms' \
-         sandboxes cannot reach it; on {0} configure a model endpoint and API key instead"
+        "a ChatGPT sign-in is kept only on Linux and macOS, where atomic has verified that \
+         atoms' sandboxes cannot reach it; on {0} configure a model endpoint and API key instead"
     )]
     Unprotected(&'static str),
     /// The store could not be chosen or opened.
@@ -193,7 +193,7 @@ pub fn protected() -> Result<(), SignInError> {
 }
 
 fn protected_on(os: &'static str) -> Result<(), SignInError> {
-    if os == "linux" {
+    if matches!(os, "linux" | "macos") {
         Ok(())
     } else {
         Err(SignInError::Unprotected(os))
@@ -808,7 +808,7 @@ mod tests {
 
     // Sign-ins are kept on Linux only: off it, these are refused before
     // they look.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn explain_names_how_and_where_and_no_secret() {
         let dir = std::env::temp_dir().join(format!("atomic-signin-{}", std::process::id()));
@@ -843,7 +843,7 @@ mod tests {
     /// A test issuer on loopback: it hands out a sign-in for `account` at
     /// its token endpoint and records the request line of everything it is
     /// asked.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn issuer(account: &'static str) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let issuer = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -892,10 +892,10 @@ mod tests {
     /// it reads the state from the authorize URL and comes back to the
     /// login server's callback with a code.
     /// The addresses browser logins were started at, as Codex built them.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static LOGIN_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn browser_login(sign_in: &SignIn) -> anyhow::Result<()> {
         static STARTED: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, u16)>>> =
             std::sync::Mutex::new(None);
@@ -941,7 +941,7 @@ mod tests {
     /// the machine. Then Codex's login restrictions: a workspace the issuer
     /// does not sign in to keeps nothing, and a machine that allows only
     /// API keys refuses before the issuer is asked.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn login_keeps_the_sign_in_the_issuer_gives_as_codex_restrictions_allow() {
         crate::testing::on_codex_runtime(async {
@@ -1121,7 +1121,7 @@ mod tests {
     }
 
     /// Keep `json` (or nothing) in the test keyring for `dir`.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn keep(dir: &Path, json: Option<String>) {
         KEYRING
             .lock()
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     /// A ChatGPT sign-in for `account`, as the keyring keeps it.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn signed_in(account: &str) -> String {
         let id_token = crate::testing::fake_id_token("dev@example.invalid", account);
         serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
@@ -1139,7 +1139,7 @@ mod tests {
         .to_string()
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn detection_refuses_a_sign_in_in_the_other_store() {
         let dir = auth_dir("switched-store");
@@ -1176,7 +1176,7 @@ mod tests {
     /// Codex's lock files. A login that fails there keeps the directory,
     /// and the sign-in with it. One the login made itself is removed again,
     /// but never while a lock in it is held.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_failed_login_keeps_a_directory_it_did_not_make() {
         crate::testing::on_codex_runtime(async {
@@ -1242,7 +1242,7 @@ mod tests {
     /// The directory is checked again where it was made: a link that
     /// appeared after the sign-in was located, leading into the checkout
     /// holding the project, is refused there, and nothing is left inside.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_sign_in_is_checked_again_where_its_directory_is_made() {
         let dir = auth_dir("made-at");
@@ -1305,7 +1305,7 @@ mod tests {
 
     /// Another login kept a sign-in while this one waited: this one fails
     /// in a directory it made, and the sign-in the other kept stays.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_sign_in_kept_while_a_login_waited_outlives_its_failure() {
         crate::testing::on_codex_runtime(async {
@@ -1346,7 +1346,7 @@ mod tests {
     /// A login stopped part way, as by Ctrl-C at the browser step, after
     /// it made the directory, leaves no entry that outlived the directory
     /// standing as a sign-in: it was forgotten before the flow began.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_login_stopped_part_way_does_not_revive_an_entry_that_outlived_its_directory() {
         crate::testing::on_codex_runtime(async {
@@ -1374,7 +1374,7 @@ mod tests {
 
     /// A keyring entry that outlived its directory is no sign-in, and a
     /// login that makes the directory and fails does not make it one.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_failed_login_does_not_revive_an_entry_that_outlived_its_directory() {
         crate::testing::on_codex_runtime(async {
@@ -1403,7 +1403,7 @@ mod tests {
     /// A keyring that cannot be read leaves a directory with a lock file in
     /// it, which a save of another login's may have left, and removes one
     /// with none.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn an_unreadable_keyring_keeps_a_directory_a_save_may_have_used() {
         crate::testing::on_codex_runtime(async {
@@ -1441,7 +1441,7 @@ mod tests {
     /// keyring will not take a value, leaves an entry that outlived its
     /// directory no sign-in: no save's locks are there, and the directory
     /// goes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_login_refused_before_it_forgot_does_not_revive_an_entry() {
         crate::testing::on_codex_runtime(async {
@@ -1477,7 +1477,7 @@ mod tests {
 
     /// A logout that made the directory and stops before the stores leaves
     /// no directory beside an entry that outlived an earlier one.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_logout_that_stops_short_leaves_no_directory_it_made() {
         crate::testing::on_codex_runtime(async {
@@ -1509,7 +1509,7 @@ mod tests {
     /// A logout trusts a sign-in it finds once its own delete went through,
     /// or when the directory was there before it: one it made, whose delete
     /// did not go through, goes.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_logout_trusts_what_it_finds_only_once_its_delete_went_through() {
         for (made, deleted, kept) in [
@@ -1559,12 +1559,13 @@ mod tests {
     }
 
     #[test]
-    fn sign_in_is_refused_off_linux_with_its_own_message() {
+    fn sign_in_is_refused_off_linux_and_macos_with_its_own_message() {
         assert!(protected_on("linux").is_ok());
-        for os in ["macos", "windows"] {
+        assert!(protected_on("macos").is_ok());
+        for os in ["windows", "freebsd"] {
             let refused = protected_on(os).expect_err("refused").to_string();
             assert!(
-                refused.contains("ChatGPT sign-in is kept only on Linux"),
+                refused.contains("ChatGPT sign-in is kept only on Linux and macOS"),
                 "{refused}"
             );
             assert!(refused.contains(os), "{refused}");
@@ -1575,7 +1576,7 @@ mod tests {
     /// atomic's credentials are still at their old place and the new one
     /// holds none, also after the denial has made the new directory, empty:
     /// a sign-in kept at the old place would otherwise read as signed out.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_sign_in_is_refused_while_an_older_atomics_credentials_are_stranded() {
         let scratch = crate::state::TestScratch::new("stranded-sign-in");
