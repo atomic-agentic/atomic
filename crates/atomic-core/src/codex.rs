@@ -333,6 +333,9 @@ pub const HOME_SECRETS: &[&str] = &[
     ".config/rclone/rclone.conf",
     ".password-store",
     ".local/share/keyrings",
+    // The login and other keychains on macOS: encrypted, but a copy can be
+    // attacked offline.
+    "Library/Keychains",
     ".profile",
     ".bash_profile",
     ".bash_login",
