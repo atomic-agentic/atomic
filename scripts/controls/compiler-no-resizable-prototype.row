@@ -1,0 +1,1 @@
+compiler-no-resizable-prototype|crates/atomic-core/src/compiler_host.rs|Object.defineProperty(prototype, 'constructor'|Object.defineProperty({}, 'constructor'|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

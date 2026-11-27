@@ -257,8 +257,11 @@ fn node_source(name: &str) -> String {
 
 /// Hands the host's operations to `host.js` as the `op_compiler_*` globals it
 /// takes and deletes, and removes what deno_core and V8 add that the worker
-/// is not given: `__bootstrap` (deno_core's internals) and `WebAssembly`.
-/// `host.js` then replaces `Deno`, which holds `Deno.core`.
+/// is not given: `__bootstrap` (deno_core's internals) and `WebAssembly`, and
+/// the memory V8 reserves outside the ArrayBuffer budget, `SharedArrayBuffer`
+/// and resizable `ArrayBuffer`s (the constructor takes a length and nothing
+/// else, and the original is unreachable from its prototype). `host.js` then
+/// replaces `Deno`, which holds `Deno.core`.
 const BRIDGE: &str = r#"((core) => {
   const ops = core.ops, g = globalThis;
   for (const name of ['op_compiler_read', 'op_compiler_write', 'op_compiler_exit', 'op_compiler_random',
@@ -268,6 +271,18 @@ const BRIDGE: &str = r#"((core) => {
   g.op_compiler_timer = (callback, delay) => { createTimer(callback, delay, undefined, false, true); };
   delete g.__bootstrap;
   delete g.WebAssembly;
+  delete g.SharedArrayBuffer;
+  const Original = g.ArrayBuffer, prototype = Original.prototype, construct = Reflect.construct;
+  const Guarded = function ArrayBuffer(length) {
+    if (new.target === undefined) throw new TypeError("Constructor ArrayBuffer requires 'new'");
+    if (arguments.length > 1 && arguments[1] !== undefined) throw new RangeError('the Astro compiler has no resizable ArrayBuffers');
+    return construct(Original, [length], new.target === Guarded ? Original : new.target);
+  };
+  Guarded.prototype = prototype;
+  Guarded.isView = Original.isView;
+  Object.defineProperty(prototype, 'constructor', { value: Guarded, writable: true, configurable: true, enumerable: false });
+  Object.defineProperty(g, 'ArrayBuffer', { value: Guarded, writable: true, configurable: true, enumerable: false });
+  delete prototype.resize;
 })(globalThis.Deno.core);"#;
 
 /// Reads the protocol's stdin into `buffer`: the count, -1 at its end, -2 on

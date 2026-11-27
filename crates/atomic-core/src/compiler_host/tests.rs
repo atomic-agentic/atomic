@@ -475,6 +475,32 @@ fn console_output_stays_off_the_protocol() {
 #[test]
 fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
     assert_eq!(probe("return typeof WebAssembly;"), Ok(json!("undefined")));
+    // Memory V8 reserves outside the budget is not offered either: shared
+    // memory, and resizable buffers reached directly or from a prototype.
+    assert_eq!(
+        probe("return typeof SharedArrayBuffer;"),
+        Ok(json!("undefined"))
+    );
+    let resizable = refusal("new ArrayBuffer(8, { maxByteLength: 1024 }).maxByteLength");
+    assert!(
+        resizable.contains("no resizable ArrayBuffers"),
+        "{resizable}"
+    );
+    let inherited = refusal(
+        "new (Object.getPrototypeOf(new Uint8Array(1).buffer).constructor)(8, { maxByteLength: 1024 }).maxByteLength",
+    );
+    assert!(
+        inherited.contains("no resizable ArrayBuffers"),
+        "{inherited}"
+    );
+    assert_eq!(
+        probe("return typeof new ArrayBuffer(8).resize;"),
+        Ok(json!("undefined"))
+    );
+    assert_eq!(
+        probe("return new Uint8Array(new ArrayBuffer(8)).length;"),
+        Ok(json!(8))
+    );
     let heap = 8 << 20;
     let error = probe_with(
         "return new Uint8Array(9 << 20).length;",
