@@ -65,6 +65,8 @@ cp "${ROOT}/crates/atomic-core/assets/manifest.json" "${repo}/crates/atomic-core
 cp "${ROOT}"/{LICENSE,NOTICE,THIRD-PARTY-NOTICES.md} "${repo}/"
 cp "${ROOT}"/crates/atomic-core/assets/*LICENSE* "${repo}/crates/atomic-core/assets/"
 touch "${repo}/deps/forks.toml"
+# A lockfile with no V8, so the SBOM lists no V8 archive.
+touch "${repo}/Cargo.lock"
 for program in atomic codex-command-runner codex-windows-sandbox-setup codex-windows-sandbox-service; do
     echo "fixture: ${program}" >"${release}/${program}.exe"
     chmod +x "${release}/${program}.exe"
