@@ -107,8 +107,6 @@ fn identity(name: &str, files: &[&str]) {
         "../../third_party/deno/pr-36665.diff",
         "src/buffer_budget.rs",
         "src/child_exit.rs",
-        "src/js_modules.rs",
-        "src/js_budget.rs",
         "src/windows_worker.rs",
     ]
     .into_iter()
@@ -141,6 +139,7 @@ fn main() {
         &[
             "src/helper_runtime.rs",
             "src/helper_runtime/process.rs",
+            "src/helper_runtime/zone.rs",
             "src/child_memory.rs",
             "src/worker_lifetime.rs",
             "src/astro.rs",

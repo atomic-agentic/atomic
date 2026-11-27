@@ -1,0 +1,1 @@
+helper-no-dynamic-import|crates/atomic-core/src/helper_runtime.rs|if matches!(kind, ResolutionKind::DynamicImport) {|if false && matches!(kind, ResolutionKind::DynamicImport) {|-p atomic-agentic-core --lib -- helper_runtime::tests::imports_outside_the_capture_and_dynamic_imports_are_refused

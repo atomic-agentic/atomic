@@ -73,7 +73,6 @@ pub fn dispatch_embedded_child() {
     if arg.as_deref() == Some(crate::helper_runtime::CHILD_ARG.as_ref()) {
         std::process::exit(crate::helper_runtime::serve());
     }
-    crate::js_budget::ordinary_process();
 }
 
 /// Serves one compiler call on stdin and stdout and returns the exit status:

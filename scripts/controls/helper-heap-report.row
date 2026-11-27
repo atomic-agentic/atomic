@@ -1,0 +1,1 @@
+helper-heap-report|crates/atomic-core/src/helper_runtime.rs|flag.store(true, Ordering::Release);|let _ = &flag; // CONTROL_OFF|-p atomic-agentic-core --lib -- helper_runtime::tests::heap_exhaustion_fails_the_call_and_the_host_survives

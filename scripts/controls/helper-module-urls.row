@@ -1,0 +1,1 @@
+helper-module-urls|crates/atomic-core/src/helper_runtime.rs|!name.starts_with("atomic-helper:///"))|name.is_empty()) // CONTROL_OFF|-p atomic-agentic-core --lib -- helper_runtime::tests::a_module_outside_the_helper_scheme_is_refused

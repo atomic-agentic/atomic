@@ -1,0 +1,1 @@
+helper-no-microtask|crates/atomic-core/src/helper_runtime.rs|delete globalThis.queueMicrotask;|void globalThis.queueMicrotask;|-p atomic-agentic-core --lib -- helper_runtime::tests::the_isolate_has_no_host_capabilities
