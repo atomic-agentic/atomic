@@ -574,7 +574,8 @@ quality or the integration contracts planned for later stages.
 
 The release workflow packages Linux and macOS archives and a Windows AMD64 ZIP,
 with CycloneDX SBOMs and Sigstore signatures. It smoke-tests the extracted
-Windows ZIP on Windows Server 2025 before signing. See
+Windows ZIP on Windows Server 2025 and the extracted macOS archive on macOS 15
+before signing. See
 [verifying a download](../getting-started/installation.md#verifying-a-download)
 for the published artifacts.
 
