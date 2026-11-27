@@ -818,8 +818,8 @@ export const reviewLabel = (change: Change): string => `${change.id} (${change.s
 - **What runs.** `atomic check` type-checks a helper with the atoms and
   components that import it, then captures its runtime imports (local `.ts`
   modules only) with the compiled atom. Type-only imports, such as generated
-  schema types, are checked and never captured. Each call runs in a fresh Boa
-  runtime, in a short-lived child process of its own, with ECMAScript
+  schema types, are checked and never captured. Each call runs in a fresh V8
+  isolate, in a short-lived child process of its own, with ECMAScript
   built-ins and the JSON arguments it is given: no network, files,
   environment, process, timers, WebAssembly, shared memory or code built from
   strings (`eval`, `new Function`), and no state survives between calls. If the
@@ -833,13 +833,17 @@ export const reviewLabel = (change: Change): string => `${change.id} (${change.s
   logical time and seed the step records when it first starts, so a step
   retried after a crash renders the same prompt and reaches the same validator
   decisions. Local time is UTC and an unspecified locale is `en-US`, whatever
-  the host's. New runs use Boa's ISO date parsing and available `Intl`
-  methods. Legacy date parsing and localized formatting are not guaranteed to
-  match earlier helper runtimes.
+  the host's. Legacy date parsing and localized formatting follow V8 and its
+  bundled ICU, and are not guaranteed to match earlier helper runtimes.
 - **Durability.** A run keeps the helpers it captured when it started; editing
   a helper affects new runs only. A run cannot resume a helper step on a
   different helper runtime (a newer atomic whose engine, prelude or compiler
-  differs); start a new run instead.
+  differs); start a new run instead. Steps the run already finished replay
+  from their checkpoints and do not run again. A run atomic 0.2 started
+  recorded its helpers on Boa; resumed by atomic 0.3, which runs them on V8,
+  its next helper step fails with `this run started on another helper
+  runtime (…, recorded by atomic 0.2 or earlier; atomic 0.2 ran helpers on
+  Boa)`.
 - **Contracts.** Validators, `scorers.with` and `scorers.score` may call
   helpers and keep their return types. A helper that throws or hits a limit
   fails the operation; in a validator that is an error, not a rejection that

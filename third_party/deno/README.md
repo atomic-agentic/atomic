@@ -50,6 +50,11 @@ patch -p1 < pr-36665.diff   # in a directory holding deno_core/ and deno_v8/
 The result is byte-for-byte these directories, except for the `LICENSE.md`
 files atomic adds.
 
+`deno_core`'s own library tests pass on Codex's V8 with these changes, except
+`tests::located_script_name`, which expects the source path
+`libs/core/lib.rs` of the Deno repository and sees this directory's layout
+instead.
+
 ## How it is used
 
 The workspace `Cargo.toml` patches `deno_core` and `deno_v8` to these paths

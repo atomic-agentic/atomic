@@ -59,7 +59,7 @@ A named import of a local `.ts` module, written without the extension
 (`import { label } from '../lib/review'`), imports helpers. The compiler
 captures the helper graph's runtime imports, type-checks it with the atom and
 records it with the compiled atom; type-only imports are never captured. Each
-call runs in a fresh Boa runtime with ECMAScript built-ins only: no network,
+call runs in a fresh V8 isolate with ECMAScript built-ins only: no network,
 files, environment, timers, WebAssembly or shared memory. Arguments and
 results are JSON. A result is as trusted as its least trusted argument; one
 computed from literals alone is authored and may be instructions. Date,

@@ -49,7 +49,7 @@ Which commands are built and which are a later stage's plan is listed in
   executable itself runs with no container. The Rust toolchain and other build tools are in the
   [development container](../development.md#the-development-container).
 
-Atomic embeds the native Astro compiler and the Boa helper runtime, so `atomic check` and `atomic render` need no Deno, Node or npm. From
+Atomic embeds the native Astro compiler and a V8 helper runtime, so `atomic check` and `atomic render` need no Deno, Node or npm. From
 v0.7, atom code and scripts run on a [Deno](../guides/atom-code-runtime.md)
 that Atomic downloads and verifies itself the first time a project needs it.
 

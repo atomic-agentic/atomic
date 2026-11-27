@@ -148,7 +148,7 @@ as systemd or a container restart policy. M3 covers the panic case.
 | [durare](https://github.com/SamuelXing/durare) | MIT OR Apache-2.0 | Durable workflows, steps, queues, timers and `send`/`recv`, through a fork |
 | [beads](https://github.com/gastownhall/beads) | MIT | The work-graph model, reimplemented in Rust and credited in the third-party notices |
 | [Astro](https://astro.build) | MIT | The `.astro` syntax of declarative atoms, read by the bundled compiler |
-| [Boa](https://github.com/boa-dev/boa) | MIT or Unlicense | Embedded Rust engine for the declarative worker and captured TypeScript helpers |
+| [deno_core](https://github.com/denoland/deno) | MIT | The V8 embedding the declarative worker and captured TypeScript helpers run on, carried onto Codex's V8 in `third_party/deno` |
 | [Deno](https://deno.com) | MIT | Managed runtime planned for v0.7 code atoms and scripts |
 | [Agent2Agent](https://a2a-protocol.org) | Apache-2.0 | The remote-agent protocol, served and consumed |
 | [Model Context Protocol](https://modelcontextprotocol.io) | MIT | Tools for models and clients, served and consumed |
