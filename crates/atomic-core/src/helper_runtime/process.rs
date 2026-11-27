@@ -240,6 +240,12 @@ fn run(
     };
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();
+    outcome(status, &out, &err)
+}
+
+/// What a finished child's exit status, stdout and stderr say about its call.
+fn outcome(status: std::process::ExitStatus, out: &[u8], err: &[u8]) -> Result<Value, Failure> {
+    let host = |message: String| Failure::Host(message);
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -253,7 +259,7 @@ fn run(
     if status.code() == Some(crate::child_exit::DEADLINE) {
         return Err(Failure::Deadline);
     }
-    let text = String::from_utf8_lossy(&out);
+    let text = String::from_utf8_lossy(out);
     if let Some(line) = text.lines().find_map(|line| line.strip_prefix(RESULT)) {
         return match serde_json::from_str(line) {
             Ok(Response::Ok(value)) => Ok(value),
@@ -261,7 +267,7 @@ fn run(
             Err(e) => Err(host(format!("the helper process answered badly: {e}"))),
         };
     }
-    let stderr = String::from_utf8_lossy(&err);
+    let stderr = String::from_utf8_lossy(err);
     // V8 reports what it could not allocate and aborts, and Rust reports an
     // unsatisfied allocation; the operating system's limit on the child's
     // memory makes allocations fail the same way. Each is the call

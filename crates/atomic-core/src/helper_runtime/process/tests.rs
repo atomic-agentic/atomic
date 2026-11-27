@@ -116,6 +116,24 @@ fn a_call_runs_in_a_child_and_returns_its_result() {
     );
 }
 
+// V8's report of a fatal "invalid size" error, the whole of a child's stderr
+// when it aborts on one, is the call exhausting its memory.
+#[cfg(unix)]
+#[test]
+fn a_v8_invalid_size_abort_is_the_call_exhausting_its_memory() {
+    use std::os::unix::process::ExitStatusExt;
+    let stderr = "\n\n#\n# Fatal error with no security impact:\n\
+                  # Fatal JavaScript invalid size error 536870888 (see crbug.com/1201626)\n#\n\n";
+    assert_eq!(
+        outcome(
+            std::process::ExitStatus::from_raw(libc::SIGTRAP),
+            b"",
+            stderr.as_bytes()
+        ),
+        Err(Failure::Heap)
+    );
+}
+
 // V8 aborts the process on these, which no isolate limit catches.
 #[test]
 fn a_v8_fatal_error_fails_the_call_and_the_host_survives() {

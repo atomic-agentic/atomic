@@ -1,1 +1,1 @@
-helper-fatal-contained|crates/atomic-core/src/helper_runtime/process.rs|"invalid size",|"CONTROL_OFF invalid size",|-p atomic-agentic-core --lib -- helper_runtime::process::tests::a_v8_fatal_error_fails_the_call_and_the_host_survives
+helper-fatal-contained|crates/atomic-core/src/helper_runtime/process.rs|"invalid size",|"CONTROL_OFF invalid size",|-p atomic-agentic-core --lib -- helper_runtime::process::tests::a_v8_invalid_size_abort_is_the_call_exhausting_its_memory
