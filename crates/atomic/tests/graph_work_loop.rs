@@ -2,6 +2,9 @@
 
 //! An epic work loop runs real file-defined atoms through the scripted model.
 
+// Some tests here need Linux-only features, so on other platforms the
+// helpers only they use are unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 #![recursion_limit = "512"]
 
 use atomic_app::model_policy::{LanePolicy, LanePolicySource};

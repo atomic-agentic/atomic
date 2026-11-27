@@ -3,6 +3,10 @@
 //! Beads JSONL import and export through the installed `atomic` executable.
 //! Credentialed cases run on Linux; read-only inspection also runs on macOS.
 
+// Some tests here need Linux-only features, so on other platforms the
+// helpers only they use are unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 #[cfg(target_os = "linux")]
 use atomic_app::pipeline::GRAPH_PIPELINE;
 #[cfg(target_os = "linux")]

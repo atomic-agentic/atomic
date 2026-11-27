@@ -6,6 +6,10 @@
 //! fixture input, and every exec atom, run for real, turns its fixture input
 //! into exactly its fixture output.
 
+// Some tests here need Linux-only features, so on other platforms the
+// helpers only they use are unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
+
 use atomic_core::render::{self, RunInput};
 use atomic_core::{atom, collections, compile, eval, project, runtime};
 use atomic_schema::registry::Registry;

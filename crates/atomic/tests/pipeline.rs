@@ -23,6 +23,9 @@
 // Codex's turn futures nest deeply inside the workflow's; proving them Send
 // needs more than the default query depth.
 #![recursion_limit = "512"]
+// Some tests here need Linux-only features, so on other platforms the
+// helpers only they use are unused.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 use atomic_app::pipeline::{
     PIPELINE, Pinned, Pipeline, PipelineRun, ProjectWorktrees, REPLAY, SNAPSHOT_MEDIA_TYPE,
