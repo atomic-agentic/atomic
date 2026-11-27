@@ -216,6 +216,9 @@ fn console_output_is_accepted_and_discarded() {
     assert_eq!(call("print", json!([])), Ok(json!(1)));
 }
 
+// The module loader's `resolve` refuses an uncaptured import, so this test
+// (and its controls row, helper-uncaptured-module) shows that refusal and its
+// message; `load` refusing on its own is the next test's.
 #[test]
 fn imports_outside_the_capture_and_dynamic_imports_are_refused() {
     let escaping = captured(
@@ -255,6 +258,30 @@ fn a_module_outside_the_helper_scheme_is_refused() {
     assert_eq!(
         invoke(&outside, "prepare", &json!([]), Limits::default(), CLOCK),
         Err(Failure::Refused("invalid helper module URL".into()))
+    );
+}
+
+// `load` serves only captured modules, whatever `resolve` let through.
+#[test]
+fn the_loader_loads_only_captured_modules() {
+    let loader = Loader(graph().modules);
+    let load = |url: &str| {
+        let url = ModuleSpecifier::parse(url).expect("a URL");
+        let options = ModuleLoadOptions {
+            is_dynamic_import: false,
+            is_synchronous: false,
+            requested_module_type: deno_core::RequestedModuleType::None,
+        };
+        match loader.load(&url, None, options) {
+            ModuleLoadResponse::Sync(result) => result.map(|_| ()).map_err(|e| e.to_string()),
+            ModuleLoadResponse::Async(_) => Err("an asynchronous load".into()),
+        }
+    };
+    assert_eq!(load(LIB), Ok(()));
+    let error = load("atomic-helper:///uncaptured.js").expect_err("refused");
+    assert!(
+        error.contains("the helper has no module atomic-helper:///uncaptured.js"),
+        "{error}"
     );
 }
 
