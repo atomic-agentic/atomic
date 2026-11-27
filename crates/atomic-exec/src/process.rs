@@ -200,6 +200,21 @@ pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
 }
 
+/// When process `pid` started, where the system says: in clock ticks after
+/// boot on Linux and in microseconds since the epoch on macOS, so a later
+/// process given the same id is told from it. `None` elsewhere, or when no
+/// such process is there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn started(pid: u32) -> Option<u64> {
+    descendants::started(pid)
+}
+
+/// See the Linux and macOS [`started`]: nothing to go by here.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn started(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// The processes of atomic's own tools, such as its git, which stopping
 /// waits for and never kills: a git killed mid-commit could leave its
 /// repository locked.
