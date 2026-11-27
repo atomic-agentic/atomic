@@ -61,9 +61,11 @@ to the model from atomic's own process, which cannot be dumped or read through
 which denies them the credential directory; and they can neither use the
 kernel keyrings nor reach the Secret Service. A signed-in atom has none of
 ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
-nothing else, and an atom's tools are the ones its file declares. As with the
-operator credential, this has been verified on Linux only, so `atomic model
-login` is refused on macOS and Windows for now. atomic does not reuse an
+nothing else, and an atom's tools are the ones its file declares. On macOS the
+sign-in is kept in the login keychain or the file store, and commands run
+under Seatbelt, which denies them both. As with the operator credential, this
+has been verified on Linux and macOS, so `atomic model login` is refused on
+Windows for now. atomic does not reuse an
 existing `codex login`. A sign-in kept inside a checkout that holds the
 project (`ATOMIC_HOME` pointed there, directly or through a link), the
 project's own or one around it such as a submodule's superproject or the main

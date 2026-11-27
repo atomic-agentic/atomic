@@ -172,7 +172,7 @@ does a ChatGPT sign-in (`atomic model login`): a configured endpoint comes first
 then the sign-in, for Codex atoms, then detection. A sign-in is personal, so
 atomic declines to use it where the store is shared or under `atomic serve`,
 rather than quietly falling back to something else, and a sign-in works on
-Linux only. If changing `ATOMIC_CREDENTIAL_STORE` leaves a sign-in in the
+Linux and macOS. If changing `ATOMIC_CREDENTIAL_STORE` leaves a sign-in in the
 other store, atomic asks you to select that store or log out before detecting
 another account.
 
@@ -274,7 +274,8 @@ Built is one model endpoint per command: an OpenAI-compatible API at
 `model.base_url`, serving the model named by `model.name`, unless an atom's own
 `model` names another, keyed by the variable named by `model.api_key_env`. That
 model value is sent to the endpoint as written; a tier name is not mapped yet. A
-Codex atom can instead run on your ChatGPT sign-in, which works on Linux only.
+Codex atom can instead run on your ChatGPT sign-in, which works on Linux and
+macOS.
 A local server such as Ollama, llama.cpp, vLLM or Lemonade is reached the same
 way, by its URL, and the model is named as that endpoint spells it:
 
