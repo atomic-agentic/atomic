@@ -143,8 +143,8 @@ mod memory {
 /// never report how any of them ended, so no step records an outcome its
 /// own process did not reach. Returns how many were running.
 ///
-/// On Linux it then ends every other process descending from this one, as
-/// [`end_all`] does, and returns only once they have ended.
+/// On Linux and macOS it then ends every other process descending from this
+/// one, as [`end_all`] does, and returns only once they have ended.
 ///
 /// Call it, then exit, calling [`end_all`] just before. The steps that were
 /// running stay unfinished, and their attempt guards decide whether their
@@ -154,12 +154,12 @@ pub fn stop_all(report: &mut dyn FnMut(&str)) -> usize {
     // here or never started.
     let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     STOPPING.store(true, Ordering::SeqCst);
-    // On Linux, everything is found and stopped before any group is killed:
-    // a process whose parent died first would have left this one's
-    // descendants, and not be found.
-    #[cfg(target_os = "linux")]
+    // On Linux and macOS, everything is found and stopped before any group
+    // is killed: a process whose parent died first would have left this
+    // one's descendants, and not be found.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     descendants::end(&running, report);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         for group in running.iter() {
             kill_group(*group);
@@ -183,8 +183,12 @@ pub fn stop_all(report: &mut dyn FnMut(&str)) -> usize {
 /// so the process, and any lock it holds, outlasts them all: only SIGKILL
 /// ends it. A process that left this one's descendants, as one that
 /// daemonizes outside a sandbox's process namespace does, is not found.
-/// Elsewhere than Linux it does nothing more than [`stop_all`]'s kill.
-/// Returns how many commands [`run`] had running.
+/// On macOS the same holds with libproc in place of `/proc`, with one
+/// difference: macOS has no subreaper, and no command has a process
+/// namespace of its own, so a process whose parent ended before the stop
+/// found it has gone to launchd and is not found. Elsewhere it does nothing
+/// more than [`stop_all`]'s kill. Returns how many commands [`run`] had
+/// running.
 pub fn end_all(report: &mut dyn FnMut(&str)) -> usize {
     stop_all(report)
 }
@@ -228,9 +232,9 @@ pub fn spawn_own_tool(
     let mut own = OWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
     let child = command.spawn()?;
     let pid = child.id();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let started = descendants::started(pid).unwrap_or(0);
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let started = 0;
     own.push((pid, started));
     Ok((child, OwnTool(pid)))
@@ -244,16 +248,22 @@ pub fn kill_own_tool(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// The processes descending from this one, found through `/proc`: each
-/// known by its process id and when it started, which tells it from a
-/// later process given the same id.
-#[cfg(target_os = "linux")]
+/// The processes descending from this one, found through `/proc` on Linux
+/// and through libproc on macOS: each known by its process id and when it
+/// started, which tells it from a later process given the same id.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod descendants {
     use super::OWN_TOOLS;
-    use std::collections::{HashMap, HashSet};
+    #[cfg(target_os = "linux")]
+    use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::io::ErrorKind;
+    #[cfg(target_os = "linux")]
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::AtomicBool;
+    #[cfg(any(target_os = "linux", test))]
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     /// How long the processes found at first are stopped and looked for
@@ -266,7 +276,8 @@ mod descendants {
     const FIRST_REPORT: Duration = Duration::from_secs(10);
     const REPORT_EVERY: Duration = Duration::from_secs(30);
 
-    /// A process, by its id and its start time in clock ticks after boot.
+    /// A process, by its id and its start time: in clock ticks after boot on
+    /// Linux, in microseconds since the epoch on macOS.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     struct Process {
         pid: libc::pid_t,
@@ -281,6 +292,7 @@ mod descendants {
     }
 
     /// Read `/proc/<pid>/stat`: `Ok(None)` when no such process is there.
+    #[cfg(target_os = "linux")]
     fn stat(pid: libc::pid_t) -> std::io::Result<Option<Stat>> {
         let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             Ok(text) => text,
@@ -318,6 +330,53 @@ mod descendants {
         }))
     }
 
+    /// What libproc says of process `pid`: `Ok(None)` when no such process
+    /// is there. A zombie shows as `Z`, anything else as `R`.
+    #[cfg(target_os = "macos")]
+    fn stat(pid: libc::pid_t) -> std::io::Result<Option<Stat>> {
+        let size = std::mem::size_of::<libc::proc_bsdinfo>();
+        // SAFETY: proc_bsdinfo is plain data, for which zeroes are valid,
+        // and proc_pidinfo writes at most `size` bytes into it.
+        #[allow(unsafe_code)]
+        let (got, info) = unsafe {
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let got = libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size as libc::c_int,
+            );
+            (got, info)
+        };
+        if usize::try_from(got).is_ok_and(|got| got == size) {
+            return Ok(Some(Stat {
+                state: if info.pbi_status == libc::SZOMB {
+                    'Z'
+                } else {
+                    'R'
+                },
+                parent: libc::pid_t::try_from(info.pbi_ppid).unwrap_or(0),
+                started: info
+                    .pbi_start_tvsec
+                    .saturating_mul(1_000_000)
+                    .saturating_add(info.pbi_start_tvusec),
+            }));
+        }
+        let error = std::io::Error::last_os_error();
+        if got <= 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        Err(if got > 0 {
+            std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("process {pid}: libproc gave {got} bytes, not {size}"),
+            )
+        } else {
+            error
+        })
+    }
+
     fn ended(state: char) -> bool {
         matches!(state, 'Z' | 'X' | 'x')
     }
@@ -332,6 +391,7 @@ mod descendants {
 
     /// Whether a process whose leader shows as a zombie has a thread that is
     /// not: one that cannot be read counts as running.
+    #[cfg(target_os = "linux")]
     fn threads_run(pid: libc::pid_t) -> bool {
         match std::fs::read_dir(format!("/proc/{pid}/task")) {
             Ok(tasks) => tasks.flatten().any(|task| {
@@ -346,6 +406,12 @@ mod descendants {
             }),
             Err(e) => e.kind() != ErrorKind::NotFound,
         }
+    }
+
+    /// On macOS a process is a zombie only once all its threads have ended.
+    #[cfg(target_os = "macos")]
+    fn threads_run(_pid: libc::pid_t) -> bool {
+        false
     }
 
     /// Whether `process` may still run: there, the same process, and with a
@@ -371,6 +437,7 @@ mod descendants {
     /// already. That `proc` cannot be listed at all is reported once for a
     /// whole stop, which `listed` records: the wait looks again every few
     /// milliseconds and the reason never changes.
+    #[cfg(target_os = "linux")]
     fn found(
         proc: &Path,
         report: &mut dyn FnMut(&str),
@@ -447,6 +514,119 @@ mod descendants {
         (out, complete)
     }
 
+    /// [`found`] on macOS, which has no `/proc`: the tree is walked down from
+    /// this process, each process's children listed by libproc, so only
+    /// processes of this one's own user are read. A process whose parent
+    /// ended before it was found has gone to launchd, and is not found.
+    #[cfg(target_os = "macos")]
+    fn found(
+        report: &mut dyn FnMut(&str),
+        unreadable: &mut HashSet<libc::pid_t>,
+        listed: &mut bool,
+        deadline: Instant,
+    ) -> (Vec<(Process, libc::pid_t)>, bool) {
+        let me = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        let own_start = stat(me).ok().flatten().map_or(0, |s| s.started);
+        let mut out = Vec::new();
+        let mut next = vec![(me, own_start)];
+        let mut complete = true;
+        while let Some((parent, parent_started)) = next.pop() {
+            if Instant::now() >= deadline {
+                complete = false;
+                break;
+            }
+            let children = match children(parent) {
+                Ok(children) => children,
+                Err(e) => {
+                    // Once for the whole stop, as on Linux.
+                    if !*listed {
+                        *listed = true;
+                        report(&format!(
+                            "cannot list the processes process {parent} started, so they \
+                             cannot be found: {e}"
+                        ));
+                    }
+                    complete = false;
+                    continue;
+                }
+            };
+            for pid in children {
+                match stat(pid) {
+                    // A process older than its parent had a parent once
+                    // given the same id: not this one's.
+                    Ok(Some(stat))
+                        if stat.parent == parent
+                            && !ended(stat.state)
+                            && stat.started >= parent_started =>
+                    {
+                        out.push((
+                            Process {
+                                pid,
+                                started: stat.started,
+                            },
+                            parent,
+                        ));
+                        next.push((pid, stat.started));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if unreadable.insert(pid) {
+                            report(&format!("cannot read process {pid}: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+        (out, complete)
+    }
+
+    /// The processes whose parent is `pid`, as libproc lists them.
+    #[cfg(target_os = "macos")]
+    fn children(pid: libc::pid_t) -> std::io::Result<Vec<libc::pid_t>> {
+        let mut room = 64usize;
+        loop {
+            let mut pids: Vec<libc::pid_t> = vec![0; room];
+            let bytes = libc::c_int::try_from(room * std::mem::size_of::<libc::pid_t>())
+                .map_err(|_| std::io::Error::other("too many processes to list"))?;
+            // SAFETY: the buffer holds `bytes` bytes, which is all
+            // proc_listchildpids writes.
+            #[allow(unsafe_code)]
+            let listed = unsafe { libc::proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
+            let Ok(listed) = usize::try_from(listed) else {
+                return Err(std::io::Error::last_os_error());
+            };
+            // A full buffer may have left some out: look again with more.
+            if listed < room {
+                pids.truncate(listed);
+                pids.retain(|p| *p > 0);
+                return Ok(pids);
+            }
+            room *= 4;
+        }
+    }
+
+    /// What one look in a stop finds: [`found`], from `/proc`.
+    #[cfg(target_os = "linux")]
+    fn look(
+        report: &mut dyn FnMut(&str),
+        unreadable: &mut HashSet<libc::pid_t>,
+        listed: &mut bool,
+        deadline: Instant,
+    ) -> (Vec<(Process, libc::pid_t)>, bool) {
+        found(Path::new("/proc"), report, unreadable, listed, deadline)
+    }
+
+    /// What one look in a stop finds: [`found`], through libproc.
+    #[cfg(target_os = "macos")]
+    fn look(
+        report: &mut dyn FnMut(&str),
+        unreadable: &mut HashSet<libc::pid_t>,
+        listed: &mut bool,
+        deadline: Instant,
+    ) -> (Vec<(Process, libc::pid_t)>, bool) {
+        found(report, unreadable, listed, deadline)
+    }
+
     /// The processes of atomic's own tools, and every process they started.
     fn own(found: &[(Process, libc::pid_t)], tools: &[(u32, u64)]) -> HashSet<Process> {
         let tools: HashSet<Process> = tools
@@ -473,6 +653,7 @@ mod descendants {
     /// Send `signal` to `process` if it is still the same process, through
     /// a process file descriptor where there is one, so that a process
     /// given its id since cannot get it.
+    #[cfg(target_os = "linux")]
     fn signal(process: &Process, signal: libc::c_int) {
         let same = || {
             stat(process.pid)
@@ -500,6 +681,23 @@ mod descendants {
             {
                 // No descriptor to be had, as where a seccomp profile refuses
                 // the call or descriptors run out: by id, just checked.
+                libc::kill(process.pid, signal);
+            }
+        }
+    }
+
+    /// Send `signal` to `process` if it is still the same process. macOS has
+    /// no process file descriptor, so the id is checked just before.
+    #[cfg(target_os = "macos")]
+    fn signal(process: &Process, signal: libc::c_int) {
+        if stat(process.pid)
+            .ok()
+            .flatten()
+            .is_some_and(|s| s.started == process.started)
+        {
+            // SAFETY: kill takes plain integers.
+            #[allow(unsafe_code)]
+            unsafe {
                 libc::kill(process.pid, signal);
             }
         }
@@ -541,7 +739,9 @@ mod descendants {
     pub(super) fn end(groups: &[u32], report: &mut dyn FnMut(&str)) {
         // Held throughout: atomic's own tools start before this or after.
         let tools = OWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_os = "linux")]
         let me = std::process::id().to_string();
+        #[cfg(target_os = "linux")]
         if std::fs::read_link("/proc/self")
             .ok()
             .and_then(|p| p.to_str().map(str::to_owned))
@@ -564,7 +764,8 @@ mod descendants {
         // first process of a sandbox's process namespace, say, once the
         // group kill below has ended what started it.
         // SAFETY: prctl with these arguments only sets a flag of this
-        // process.
+        // process. macOS has no such flag.
+        #[cfg(target_os = "linux")]
         #[allow(unsafe_code)]
         unsafe {
             libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
@@ -574,13 +775,7 @@ mod descendants {
         let begun = Instant::now();
         let (mut watched, settled) = stop_phase(
             &mut |deadline| {
-                let (all, complete) = found(
-                    Path::new("/proc"),
-                    report,
-                    &mut unreadable,
-                    &mut listed,
-                    deadline,
-                );
+                let (all, complete) = look(report, &mut unreadable, &mut listed, deadline);
                 let own = own(&all, &tools);
                 let others = all
                     .into_iter()
@@ -612,8 +807,7 @@ mod descendants {
         wait_phase(
             &mut watched,
             &mut |deadline| {
-                let (all, complete) = found(
-                    Path::new("/proc"),
+                let (all, complete) = look(
                     &mut |what| (report.borrow_mut())(what),
                     &mut unreadable,
                     &mut listed,
@@ -873,6 +1067,7 @@ mod descendants {
         /// A look that cannot list the process directory fails at once, so
         /// the wait comes round to it every few milliseconds: that it cannot
         /// be listed is told once for the whole wait, not once a look.
+        #[cfg(target_os = "linux")]
         #[test]
         fn the_notice_that_proc_cannot_be_listed_is_told_once_per_wait() {
             // How many looks fail before one gets through, which is more

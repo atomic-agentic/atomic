@@ -423,8 +423,11 @@ the run goes on once the sandbox starts. A sandbox that fails in a way that may 
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's
-execution lock. On macOS it kills each command's process group and does not wait, so a
-process that left its group may outlive atomic and the lock. On macOS a
+execution lock. On macOS it does the same for every process that still
+descends from atomic, one in another process group or session included, and
+waits for each to end. macOS has no process namespace and no subreaper, so a
+process whose parent ended before atomic stopped has gone to launchd, and it
+may outlive atomic and the lock. On macOS a
 standalone exec command runs under Seatbelt, the macOS sandbox, with the
 policy Codex writes for the same permissions as on Linux. The macOS sandbox
 suite shows such a command cannot read a project's database or write a gate
