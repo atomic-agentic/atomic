@@ -2100,6 +2100,11 @@ fn an_interrupted_exec_step_declared_read_only_runs_again() {
 /// process with what the sandbox needs, recording nothing: the run stays
 /// pending, its command never ran, and it finishes when resumed where the
 /// sandbox can start. (A step's failure, recorded, would end it for good.)
+///
+/// Linux only: the test stands a refusing helper in for bubblewrap, and on
+/// macOS commands run under the system's own `sandbox-exec`, which cannot be
+/// replaced.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_run_stops_without_an_outcome_where_the_sandbox_cannot_start() {
     on_codex_runtime(async {
