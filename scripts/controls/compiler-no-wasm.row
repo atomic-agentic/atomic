@@ -1,0 +1,1 @@
+compiler-no-wasm|crates/atomic-core/src/compiler_host.rs|delete g.WebAssembly;|void g.WebAssembly;|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

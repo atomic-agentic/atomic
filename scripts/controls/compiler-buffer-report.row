@@ -1,0 +1,1 @@
+compiler-buffer-report|crates/atomic-core/src/compiler_host.rs|if budget.refused() {|if false { // CONTROL_OFF|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

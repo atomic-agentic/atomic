@@ -10,9 +10,9 @@ use std::{
     sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed},
 };
 
-pub(crate) const HEAP_EXIT: i32 = 81;
-pub(crate) const BUFFER_EXIT: i32 = 82;
-pub(crate) const DEADLINE_EXIT: i32 = 83;
+pub(crate) const HEAP_EXIT: i32 = crate::child_exit::HEAP;
+pub(crate) const BUFFER_EXIT: i32 = crate::child_exit::BUFFERS;
+pub(crate) const DEADLINE_EXIT: i32 = crate::child_exit::DEADLINE;
 // Account before main, so even allocations freed after dispatch have a matching charge.
 // Ordinary CLI processes never execute guest code in-process.
 static COUNTING: AtomicBool = AtomicBool::new(true);

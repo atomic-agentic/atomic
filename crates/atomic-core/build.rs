@@ -102,6 +102,11 @@ fn identity(name: &str, files: &[&str]) {
     for file in [
         "Cargo.toml",
         "../../Cargo.lock",
+        // The change carried in the vendored deno_core and deno_v8, which
+        // Cargo.lock does not record.
+        "../../third_party/deno/pr-36665.diff",
+        "src/buffer_budget.rs",
+        "src/child_exit.rs",
         "src/js_modules.rs",
         "src/js_budget.rs",
         "src/windows_worker.rs",

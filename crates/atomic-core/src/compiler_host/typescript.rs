@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Native TypeScript services for frozen compiler requests.
-use super::{string, text};
-use boa_engine::{Context, JsNativeError, JsResult, JsValue};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{JSXText, Statement, StringLiteral};
 use oxc_ast_visit::{Visit, utf8_to_utf16::Utf8ToUtf16};
@@ -13,20 +11,16 @@ use oxc_transformer::{TransformOptions, Transformer};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-pub(super) fn op(_: &JsValue, args: &[JsValue], ctx: &mut Context) -> JsResult<JsValue> {
-    let action = string(args, 0, ctx)?;
-    let file = string(args, 1, ctx)?;
-    let source = string(args, 2, ctx)?;
-    let extra = string(args, 3, ctx)?;
-    let out = match action.as_str() {
-        "parse" => parse(&source),
-        "transpile" => transpile(&source, &file, &extra),
-        "prepare" => prepare(&source, &file),
-        "check" => check(&source),
+/// One TypeScript service call: `action` on `source` (the file `file`), with
+/// `extra` its JSON options. The JSON answer, or why the call was refused.
+pub(super) fn op(action: &str, file: &str, source: &str, extra: &str) -> Result<String, String> {
+    match action {
+        "parse" => parse(source),
+        "transpile" => transpile(source, file, extra),
+        "prepare" => prepare(source, file),
+        "check" => check(source),
         _ => Err("unknown TypeScript operation".into()),
     }
-    .map_err(|e| JsNativeError::error().with_message(e))?;
-    Ok(text(&out))
 }
 
 fn parse(source: &str) -> Result<String, String> {

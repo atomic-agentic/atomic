@@ -344,18 +344,26 @@ fn no_other_module_can_be_imported() {
 
 #[test]
 fn a_heap_blow_up_is_refused_at_the_limit() {
-    let heap = 64 << 20;
+    let heap = 64 * 1024 * 1024;
+    // Within the limit, a compile allocates as it needs.
     assert_eq!(
         probe_with(
-            "return 'x'.repeat(1024).length;",
+            "const kept = []; for (let i = 0; i < 32; i++) kept.push(new Array(1 << 16).fill(i)); return kept.length;",
             &[(HEAP_ENV, heap.to_string())],
-            TIME_LIMIT
+            TIME_LIMIT,
         ),
-        Ok(json!(1024))
+        Ok(json!(32))
     );
     let started = Instant::now();
+    // Three times the limit, past what the limit grows to while a compile
+    // unwinds; a host without the limit would answer.
     let error = probe_with(
-        "return 'x'.repeat(80 << 20).length;",
+        &format!(
+            "const kept = []; let size = 0; \
+             while (size < {}) {{ kept.push(new Array(1 << 16).fill(size)); size += 8 << 16; }} \
+             return kept.length;",
+            3 * heap
+        ),
         &[(HEAP_ENV, heap.to_string())],
         TIME_LIMIT,
     )
