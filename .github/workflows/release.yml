@@ -95,6 +95,11 @@ jobs:
           key: cargo-release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-release-${{ runner.os }}-
 
+      # The prebuilt V8 archive deps/v8.toml pins for this target, checked
+      # against its SHA-256 into the mirror .cargo/config.toml names.
+      - name: V8 archive
+        run: scripts/v8-archive.sh ${{ matrix.target }}
+
       # The checkout and cargo-home paths are remapped so the binary does not
       # carry this runner's directory layout.
       - name: Build
@@ -186,6 +191,12 @@ jobs:
             ~/.cargo/git/db
           key: cargo-release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-release-${{ runner.os }}-
+
+      # The prebuilt V8 archive deps/v8.toml pins for this target, checked
+      # against its SHA-256 into the mirror .cargo/config.toml names.
+      - name: V8 archive
+        shell: bash
+        run: scripts/v8-archive.sh ${{ env.WINDOWS_TARGET }}
 
       # The checkout and cargo-home paths are remapped so the binary does not
       # carry this runner's directory layout.

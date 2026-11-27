@@ -425,6 +425,9 @@ jobs:
         uses: ./.github/actions/rust-setup
         with:
           target-cache: test
+      # v8-archive.sh against copies of the verified mirror rust-setup laid
+      # out: a tampered archive or binding, or an unpinned target, is refused.
+      - run: scripts/v8-archive-test.sh
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
@@ -455,9 +458,9 @@ jobs:
       - name: Lockfile resolves from scratch
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: scripts/lock-resolves.sh
-      # Verify V8 runtime crates stay out of
+      # Each V8 version deps/v8.toml lists as locked but unbuilt stays out of
       # the build graph.
-      - name: Reject V8 in the binary dependency graph
+      - name: Unbuilt V8 versions stay unbuilt
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: scripts/lock-check.sh v8-built
       # The release SBOM must list every fork at its pinned revision.

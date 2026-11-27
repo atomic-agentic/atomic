@@ -1,0 +1,64 @@
+# V8 builds in Cargo.lock. Two V8 builds cannot be linked into one binary, so
+# Cargo.lock may hold at most one V8 binding crate version that is built.
+# scripts/lock-check.sh fails on a second version unless it is listed here as
+# locked but never built, with the reason; `scripts/lock-check.sh v8-built`
+# (it needs cargo, so run it through scripts/dev.sh) proves each listed
+# version stays out of the build graph.
+#
+# The one V8 atomic builds is the one Codex's patch block pins: `v8` 152.2.0
+# from Codex's rusty_v8 fork. deno_core reaches it through the releases
+# carried in third_party/deno (deps/README.md, "One V8").
+
+[[unbuilt]]
+crate = "v8x"
+version = "149.4.0-rc.4"
+reason = "deno_v8 0.5.0's alternative V8 backend, behind its quickjs feature, which nothing enables; deno_core builds deno_v8's v8 backend (v8 152.2.0)"
+
+# The prebuilt V8 archives atomic links, and the generated bindings that go
+# with them. rusty_v8's build script downloads these from GitHub releases and
+# records only the URL, so atomic verifies them instead:
+# scripts/v8-archive.sh fetches each file once, checks its SHA-256 every time
+# and lays the files out as a local mirror; the workspace's
+# .cargo/config.toml points RUSTY_V8_MIRROR there, so a build reads only
+# verified files and works offline once they are cached. A V8 version or
+# target with no entry here cannot be built. Codex's fork changes only Rust
+# code (src/cppgc.rs), so upstream rusty_v8's prebuilt archives for the same
+# version link with it. rusty_v8 152 always builds simdutf in, so these are
+# the plain archives. Hashes were checked against the release's published
+# digests.
+
+[[archive]]
+crate = "v8"
+version = "152.2.0"
+target = "x86_64-unknown-linux-gnu"
+file = "librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
+sha256 = "b6683e9afcb77fbd8cb2c3acf45d34d52029ab216b332522c95179c12f0fed3c"
+binding = "src_binding_release_x86_64-unknown-linux-gnu.rs"
+binding_sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5"
+
+[[archive]]
+crate = "v8"
+version = "152.2.0"
+target = "aarch64-unknown-linux-gnu"
+file = "librusty_v8_release_aarch64-unknown-linux-gnu.a.gz"
+sha256 = "c40196bbf182532e583f65b7daf0196fdbb3354e6fac59b31d0539c20f931f3d"
+binding = "src_binding_release_aarch64-unknown-linux-gnu.rs"
+binding_sha256 = "3e4d5fecdbe0f98a6017e69d7ca82519a77fb032c5eb5e4cdbecdd3e2ec519d5"
+
+[[archive]]
+crate = "v8"
+version = "152.2.0"
+target = "aarch64-apple-darwin"
+file = "librusty_v8_release_aarch64-apple-darwin.a.gz"
+sha256 = "a4a5484444ad4b5f10dc7bed141236dd9dbeabf2006d14520f19b935d4db4227"
+binding = "src_binding_release_aarch64-apple-darwin.rs"
+binding_sha256 = "b9d5652ebca515eb2bf4c2ee4a6551b2567117b5aa720f430d2032616dd7e3b5"
+
+[[archive]]
+crate = "v8"
+version = "152.2.0"
+target = "x86_64-pc-windows-msvc"
+file = "rusty_v8_release_x86_64-pc-windows-msvc.lib.gz"
+sha256 = "0b17ca072bae37dd4ff00e6014d2b413becb031c9342ee11cb8226a5881f62b2"
+binding = "src_binding_release_x86_64-pc-windows-msvc.rs"
+binding_sha256 = "4fbdc0fbb831ff7b26962f0273d77a66fbc3bbb596fbe9e9022c0128f8c88099"

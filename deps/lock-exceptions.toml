@@ -408,3 +408,13 @@ reason = "icu_calendar 2.3.0 requires ^0.11.7 in the Rust authoring dependency g
 crate = "zerovec-derive"
 version = "0.11.7"
 reason = "zerovec 0.11.9 requires ^0.11.7 in the Rust authoring dependency graph"
+
+[[exception]]
+crate = "bindgen"
+version = "0.70.1"
+reason = "v8x 149.4.0-rc.4 (deno_v8's alternative backend, locked but never built; deps/v8.toml) requires ^0.70"
+
+[[exception]]
+crate = "rustc-hash"
+version = "1.1.0"
+reason = "bindgen 0.70.1 requires ^1"
