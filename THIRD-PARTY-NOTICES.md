@@ -134,7 +134,7 @@ The binary links the native Astro parser and TSX converter. The tsz checker chec
 Original licenses and generated bundle notices are retained under
 `crates/atomic-core/assets` and included in release archives under `licenses/`.
 Compiler dependency versions and payload hashes are included in the SBOM.
-The authoring worker and captured helper modules run on Boa 0.22.0 (MIT or Unlicense). The native semantic checker is tsz 0.1.75 (Apache-2.0). Contributor-only npm dependencies are pinned in the
+The authoring worker and captured helper modules run on V8 through `deno_core` (see above). The native semantic checker is tsz 0.1.75 (Apache-2.0). Contributor-only npm dependencies are pinned in the
 authoring package lockfile.
 
 ## Astro’s fork of Oxc

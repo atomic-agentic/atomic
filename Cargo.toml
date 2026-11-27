@@ -80,8 +80,6 @@ seccompiler = "0.5.0"
 # The same sqlx Codex and the durare fork use (the patch block pins its source).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1", default-features = false }
-# Rust ECMAScript engine used by the bundled worker and captured helpers.
-boa_engine = { version = "=0.22.0", features = ["intl_bundled", "annex-b", "temporal"] }
 # The embedded V8 the Astro compiler worker and captured helpers run on:
 # deno_core alone, without deno_runtime's I/O extensions (deps/README.md,
 # "One V8"). The patch block carries it onto Codex's V8.
