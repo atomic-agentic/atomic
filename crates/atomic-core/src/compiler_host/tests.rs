@@ -482,8 +482,10 @@ fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
         TIME_LIMIT,
     )
     .expect_err("buffer budget");
+    // The limit it reached is named: the ArrayBuffer budget, not the heap.
     assert!(
-        error.contains("the Astro compiler exceeded its memory limit"),
+        error.contains("the Astro compiler exceeded its memory limit")
+            && error.contains("the compile reached its ArrayBuffer budget"),
         "{error}"
     );
 }
