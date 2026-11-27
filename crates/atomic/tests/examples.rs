@@ -239,8 +239,8 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
     }
 }
 
-// The coding lane requires the Linux trial-merge sandbox during definition loading.
-#[cfg(target_os = "linux")]
+// The coding lane needs a confined trial-merge sandbox during definition loading.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_lanes_example_passes_the_production_loader() {
     let dir = copy("15-coding-lanes");
