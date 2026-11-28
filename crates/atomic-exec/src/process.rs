@@ -1262,6 +1262,78 @@ fn keep_from_children(fd: std::os::fd::RawFd) {
     }
 }
 
+/// Room for a listing of this process's descriptors, made before a fork:
+/// twice as many as it holds now, and 64 more, for those other threads
+/// open before the child lists them.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn descriptor_listing() -> Vec<libc::proc_fdinfo> {
+    // SAFETY: with no buffer, proc_pidinfo only says how many bytes the
+    // listing takes; it writes nothing.
+    let needed = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let held = usize::try_from(needed).unwrap_or(0) / std::mem::size_of::<libc::proc_fdinfo>();
+    let empty = libc::proc_fdinfo {
+        proc_fd: -1,
+        proc_fdtype: 0,
+    };
+    vec![empty; held.max(128) * 2 + 64]
+}
+
+/// Between fork and exec, mark every descriptor past the standard three
+/// close-on-exec, `keep` apart, from the listing `listed` has room for. A
+/// listing that fills it may have missed some, so the command does not
+/// start. Allocates nothing.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn close_inherited_on_exec(
+    listed: &mut [libc::proc_fdinfo],
+    keep: Option<std::os::fd::RawFd>,
+) -> std::io::Result<()> {
+    let size = std::mem::size_of::<libc::proc_fdinfo>();
+    let room = libc::c_int::try_from(std::mem::size_of_val(listed))
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    // SAFETY: `listed` is `room` bytes of proc_fdinfo, which is what
+    // PROC_PIDLISTFDS writes; it returns how many bytes it wrote.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            libc::getpid(),
+            libc::PROC_PIDLISTFDS,
+            0,
+            listed.as_mut_ptr().cast(),
+            room,
+        )
+    };
+    let Ok(written) = usize::try_from(written) else {
+        return Err(std::io::Error::last_os_error());
+    };
+    if written == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let count = written / size;
+    if count >= listed.len() {
+        return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+    }
+    for info in &listed[..count] {
+        let fd = info.proc_fd;
+        if fd > 2 && Some(fd) != keep {
+            // SAFETY: fcntl with F_SETFD takes integers and touches no
+            // memory.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The [`crate::SecretEnv`] this process was handed on the socket whose
 /// descriptor `fd` names, as [`run_in_with_secret`] hands it: read to its
 /// end, and closed. Refused when `fd` is not a number above 2 or not a
@@ -1479,6 +1551,25 @@ pub fn run_in_with_secret(
                     }
                 }
                 Ok(())
+            });
+        }
+    }
+    // On macOS no sandbox helper closes what this process holds before the
+    // command starts, so a library caller's open descriptors would reach
+    // it: the child marks every one past the standard three close-on-exec,
+    // its secret socket apart. Linux's helper closes them itself.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let keep = secret_end.as_ref().map(AsRawFd::as_raw_fd);
+        let mut listed = descriptor_listing();
+        // SAFETY: between fork and exec the closure makes only
+        // async-signal-safe system calls (proc_pidinfo, fcntl) into a buffer
+        // allocated before the fork, and allocates nothing.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                close_inherited_on_exec(&mut listed, keep)
             });
         }
     }
