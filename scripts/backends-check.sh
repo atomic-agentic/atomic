@@ -96,17 +96,32 @@ sandbox)
     fi
     # Every test file behind sandbox-tests, found by its cfg: whole files,
     # and in a file whose other tests need no sandbox, each test marked
-    # `// needs_sandbox` above its attributes.
+    # `// needs_sandbox` above its attributes. A whole file's cfg is read as
+    # one line, however rustfmt wraps it, and only these forms count: Linux's
+    # own, Linux's and macOS's, which is the same suite here, and macOS's
+    # alone, which builds no test on Linux to check. Any other cfg is read
+    # for marked tests, so a file whose cfg is not understood fails the check.
     suites=()
     found=()
     for file in crates/*/tests/*.rs; do
         grep -q 'feature = "sandbox-tests"' "${file}" || continue
         name="$(basename "${file}" .rs)"
-        if grep -q '^#!\[cfg(all(target_os = "linux", feature = "sandbox-tests"))\]' "${file}"; then
+        cfg="$(awk '
+            !open && /^#!\[cfg\(/ { open = 1 }
+            open { gsub(/^[[:space:]]+|[[:space:]]+$/, ""); text = text (text == "" ? "" : " ") $0 }
+            open && /\)\]$/ { print text; exit }
+        ' "${file}" | sed -E 's/\( /(/g; s/ \)/)/g')"
+        case "${cfg}" in
+        '#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]' | \
+            '#![cfg(all(any(target_os = "linux", target_os = "macos"), feature = "sandbox-tests"))]')
             suites+=(--test "${name}")
             found+=("${name}")
             continue
-        fi
+            ;;
+        '#![cfg(all(target_os = "macos", feature = "sandbox-tests"))]')
+            continue
+            ;;
+        esac
         mapfile -t tests < <(awk '
             /^[[:space:]]*\/\/ needs_sandbox/ { marked = 1; next }
             marked && /^[[:space:]]*(pub(\([a-z]+\))? )?(async )?fn [a-z0-9_]+\(/ {
