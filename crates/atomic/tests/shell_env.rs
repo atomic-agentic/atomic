@@ -502,8 +502,12 @@ fn each_worktree_builds_in_a_target_directory_of_its_own() {
         )
         .await;
         let (first, second) = (&printed[0], &printed[1]);
+        // Refused as bubblewrap's read-only mount refuses it, or, on macOS,
+        // as Seatbelt does (EPERM).
         assert!(
-            first.contains("Read-only file system") || first.contains("Permission denied"),
+            first.contains("Read-only file system")
+                || first.contains("Permission denied")
+                || (cfg!(target_os = "macos") && first.contains("Operation not permitted")),
             "{first}"
         );
         assert!(
