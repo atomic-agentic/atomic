@@ -19,8 +19,15 @@
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature (and `ATOMIC_DEV_SANDBOX=on` in the development
 //! container); with the feature on, a sandbox that cannot start fails it.
+//! On macOS the turns run under Seatbelt; the tests of Codex's Linux
+//! sandbox helper and of bubblewrap are Linux-only.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "sandbox-tests"
+))]
+// Helpers only the Linux-only tests use are unused on macOS.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 #![allow(clippy::unwrap_used)]
 
 mod support;
@@ -911,6 +918,7 @@ fn own_helper(state: &Path) -> PathBuf {
 /// a turn's command still runs, under atomic's own link to itself by its
 /// path, and a program a command put on `PATH` under the helper's name is
 /// never run in the inner stage's place.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_turns_command_runs_under_an_old_bubblewrap_and_never_a_planted_helper() {
     use std::os::unix::fs::PermissionsExt;
@@ -978,6 +986,7 @@ fn a_turns_command_runs_under_an_old_bubblewrap_and_never_a_planted_helper() {
 
 /// The link Codex runs as its helper sits where no command can write: a
 /// turn's command can neither put a file beside it nor point it elsewhere.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_helpers_link_is_out_of_every_commands_reach() {
     support::require_sandbox();
@@ -1130,9 +1139,17 @@ fn a_turns_shell_holds_none_of_the_descriptors_atomic_was_started_with() {
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let command = "python3 -c \"import os; print('fds=' + ','.join(sorted(fd for fd in \
-                       os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + fd))))\"";
-        let printed = look_once_prepared(&dir, &home, command, &[], &|_| {}, true).await;
+        // Listed where the system lists a process's own descriptors.
+        let fd_dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let command = format!(
+            "python3 -c \"import os; print('fds=' + ','.join(sorted(fd for fd in \
+             os.listdir('{fd_dir}') if os.path.exists('{fd_dir}/' + fd))))\""
+        );
+        let printed = look_once_prepared(&dir, &home, &command, &[], &|_| {}, true).await;
         let fds: Vec<i32> = printed_value(&printed, "fds")
             .split(',')
             .map(|fd| fd.trim().parse().unwrap())
@@ -1457,6 +1474,7 @@ fn workload_credentials_beside_aws_stay_denied() {
 /// sandbox, keeps that sandbox's registry of mount points where the turn's
 /// commands keep theirs: in the backend's shared directory in atomic's
 /// state, not in the `TMPDIR` atomic was given.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_turns_patches_keep_their_sandbox_registry_with_its_commands() {
     support::require_sandbox();
@@ -1466,6 +1484,7 @@ fn a_turns_patches_keep_their_sandbox_registry_with_its_commands() {
 /// The same with `ATOMIC_HOME` given relative to the directory atomic
 /// starts in: the file helper, which Codex starts elsewhere, still finds
 /// the shared directory, and the patch lands.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_relative_atomic_home_keeps_patches_and_their_registry_working() {
     support::require_sandbox();
