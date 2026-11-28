@@ -327,7 +327,15 @@ write its own, cannot reach it at all, not even to list it, nor its `TMPDIR`
 or `CARGO_HOME` there. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On macOS
-none of this is verified. An exec atom's command, which has a scratch
+a turn's commands run under Seatbelt, and its tests show they read none of the
+places in your home where credentials are kept, through a link or not, nor any
+descriptor atomic was started with; that they cannot reach another turn's
+scratch is not yet tested there. Two limits remain on macOS. A command a model
+runs can read the arguments and environment of your other processes, atomic's
+included, so there atomic's own environment is not private from it. And a
+`workspace-write` turn cannot look up the directories above its own `HOME`, so a
+tool that walks a full path down from `/`, such as `mkdir -p "$HOME/.cache"`,
+fails there. An exec atom's command, which has a scratch
 directory of its own too, is kept out of the others in the same way, its own
 apart, wherever its command is confined, on Linux; where exec atoms' commands
 run unconfined, it is not. (Codex's sandbox keeps its registry of the mount
