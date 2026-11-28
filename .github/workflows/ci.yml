@@ -529,4 +529,4 @@ jobs:
       # run them under bubblewrap.
       - name: Sandbox tests (macOS)
         if: ${{ !cancelled() }}
-        run: cargo test -p atomic-agentic --locked --no-fail-fast --features atomic-agentic/sandbox-tests --test exec_private_state --test exec_scratch
+        run: cargo test -p atomic-agentic --locked --no-fail-fast --features atomic-agentic/sandbox-tests --test exec_private_state --test exec_scratch --test inherited_fds

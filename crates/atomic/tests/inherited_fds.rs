@@ -15,8 +15,18 @@
 //! keep them from what it starts. (A turn's shell is `shell_env`'s.) Needs bubblewrap and unprivileged
 //! user namespaces, so it runs with the `sandbox-tests` feature; with the
 //! feature on, a sandbox that cannot start fails the test.
+//!
+//! On macOS the first two ways in, through atomic's own entry, are tested
+//! too: atomic marks what it was started with close-on-exec there. The
+//! tests of the Linux sandbox helper, and of a kernel without
+//! `close_range`, are Linux-only.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "sandbox-tests"
+))]
+// Helpers only the Linux-only tests use are unused on macOS.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code, unused_imports))]
 
 mod support;
 
@@ -120,6 +130,7 @@ fn listed_on(backend: &dyn ExecutionBackend, dir: &Path) -> String {
 
 /// Left open in this process, the descriptors reach no confined command:
 /// the sandbox helper this process starts keeps them from it.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_confined_command_holds_none_of_the_descriptors_left_open_in_its_parent() {
     support::require_sandbox();
@@ -281,6 +292,7 @@ fn an_exec_atoms_command_holds_none_of_the_descriptors_atomic_was_started_with()
 /// before 5.11, and, when `no_listing`, in a mount namespace of its own whose
 /// `/proc` is an empty directory, so that it cannot list its descriptors
 /// either.
+#[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn without_close_range(command: &mut std::process::Command, no_listing: bool) {
     // SAFETY: between fork and exec the closure makes only system calls
@@ -362,6 +374,7 @@ fn without_close_range(command: &mut std::process::Command, no_listing: bool) {
 /// atomic, unable to keep the descriptors it was started with from what it
 /// starts, refuses to start, saying why; with only `close_range` refused it
 /// lists them instead, and starts.
+#[cfg(target_os = "linux")]
 #[test]
 fn atomic_refuses_to_start_where_it_cannot_keep_descriptors_from_its_children() {
     support::require_sandbox();
@@ -384,6 +397,7 @@ fn atomic_refuses_to_start_where_it_cannot_keep_descriptors_from_its_children() 
 /// The sandbox helper, unable to keep the descriptors it was started with
 /// from the command, does not start it, saying why; with only `close_range`
 /// refused it lists them instead, and goes on.
+#[cfg(target_os = "linux")]
 #[test]
 fn the_sandbox_helper_refuses_where_it_cannot_keep_descriptors_from_the_command() {
     support::require_sandbox();
