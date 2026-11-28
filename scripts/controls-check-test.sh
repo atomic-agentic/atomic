@@ -222,6 +222,12 @@ exec "${cp_bin}" -p "\$@"
 SH
 chmod +x "${WORK}/bin-oldcp/cp"
 
+# The script runs on macOS under the system's bash, 3.2, which has none of
+# bash 4's mapfile and readarray. Every run here has them switched off, through
+# the startup file a non-interactive bash reads, so a reader that needs them
+# fails here and not first on a Mac.
+printf 'enable -n mapfile readarray\n' >"${WORK}/bash-3.2"
+
 # The controls the script reads, one per file under scripts/controls/, and the
 # files they edit.
 mapfile -d '' -t CONTROL_ROW_FILES < <(
@@ -276,6 +282,7 @@ run() {
     local mode="$1"
     shift
     out="$(cd "${repo}" && FAKE_CARGO="${mode}" CONTROL_FILES="${CONTROL_FILES[*]}" \
+        BASH_ENV="${WORK}/bash-3.2" \
         PATH="${RUN_PATH:+${RUN_PATH}:}${WORK}/bin:${BASE_PATH:-${PATH}}" \
         scripts/controls-check.sh "$@" 2>&1)"
     code=$?
@@ -472,7 +479,7 @@ run honest git-hardening
 [ ! -e "${repo}/cargo-args" ] || fail "an empty row file: cargo ran"
 
 # A row file with no trailing newline holds the one row it holds, which is what
-# mapfile sees: a reader that called that file's last line anything other than
+# controls-check.sh sees: a reader that called that file's last line anything other than
 # the row itself would refuse a control that is there. The row is read here as
 # any other and reaches the rule about the code, which is where its switch text
 # is not in the file. scripts/controls-on.py reads the same file the same way,
@@ -651,7 +658,7 @@ older="$(grep -c '^not-newer ' "${repo}/rebuild.log")"
 # A TERM while cargo runs with a control off, as a time limit sends, stops
 # the script promptly and puts the source back.
 repo="$(fresh)"
-(cd "${repo}" && FAKE_CARGO=hang PATH="${WORK}/bin:${PATH}" exec scripts/controls-check.sh git-hardening) \
+(cd "${repo}" && FAKE_CARGO=hang BASH_ENV="${WORK}/bash-3.2" PATH="${WORK}/bin:${PATH}" exec scripts/controls-check.sh git-hardening) \
     >"${WORK}/term.out" 2>&1 &
 pid=$!
 for _ in $(seq 1 100); do
@@ -696,7 +703,7 @@ lock_cases() {
     # next refuses before it edits anything or asks cargo anything. The run that
     # holds it is asked to stop by the case, so it ends with its own exit.
     repo="$(fresh)"
-    (cd "${repo}" && FAKE_CARGO=hang PATH="${WORK}/bin:${BASE_PATH:-${PATH}}" exec scripts/controls-check.sh git-hardening) \
+    (cd "${repo}" && FAKE_CARGO=hang BASH_ENV="${WORK}/bash-3.2" PATH="${WORK}/bin:${BASE_PATH:-${PATH}}" exec scripts/controls-check.sh git-hardening) \
         >/dev/null 2>&1 &
     holder=$!
     # Not a job of this shell: it is stopped outright below, and a job the shell
@@ -1081,7 +1088,7 @@ run_on
     grep -q "scripts/controls/git-hardening.row has 3 '|' separators, not the 4 between its five fields" <<<"${out}" ||
     fail "controls-on a row missing a field: exit ${code}: ${out}"
 
-# A file holding nothing holds no row, which is what mapfile counts, and is not
+# A file holding nothing holds no row, which is what controls-check.sh counts, and is not
 # one row with nothing in it.
 repo="$(fresh)"
 : >"${repo}/scripts/controls/git-hardening.row"
@@ -1092,7 +1099,7 @@ run_on
 
 # A trailing newline is how the file ends and not a second row, so a row file
 # written without one is the one row it is and is read as that here exactly as
-# mapfile reads it: every control in the tree is still counted, this row's
+# controls-check.sh reads it: every control in the tree is still counted, this row's
 # switch and all.
 repo="$(fresh)"
 printf '%s' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"
@@ -1101,7 +1108,7 @@ run_on
     grep -q "^ok: ${#CONTROL_ROWS[@]} controls are on in this tree$" <<<"${out}" ||
     fail "controls-on a row file with no trailing newline: exit ${code}: ${out}"
 
-# A blank line after the row is a second line to mapfile and a second line here:
+# A blank line after the row is a second line to controls-check.sh and a second line here:
 # taking one trailing newline off is not taking a blank line off.
 repo="$(fresh)"
 printf '%s\n\n' "${gh_row}" >"${repo}/scripts/controls/git-hardening.row"

@@ -179,11 +179,17 @@ for entry in "${entries[@]}"; do
     *.row) ;;
     *) die "${entry} is not named <name>.row, so its control would never be read" ;;
     esac
-    lines=()
-    mapfile -t lines <"${entry}" || die "cannot read ${entry}"
-    [ "${#lines[@]}" -eq 1 ] ||
-        die "${entry} holds ${#lines[@]} rows, not the one it must"
-    row="${lines[0]}"
+    # Read line by line rather than with mapfile, which macOS's own bash (3.2)
+    # does not have. A last line with no newline after it is still a line, and
+    # a blank line is one too, as mapfile counts them.
+    count=0
+    row=""
+    while IFS= read -r line || [ -n "${line}" ]; do
+        count=$((count + 1))
+        row="${line}"
+    done <"${entry}" || die "cannot read ${entry}"
+    [ "${count}" -eq 1 ] ||
+        die "${entry} holds ${count} rows, not the one it must"
     # Five fields, so four separators: a `|` inside a field would move what
     # follows it into the wrong one.
     bars="${row//[^|]/}"
@@ -394,7 +400,7 @@ for row in "${selected[@]}"; do
     run_cargo "${args}"
     removed=$?
     put_back "${file}" || die "cannot put ${file} back"
-    if grep -q "^error\(\[E[0-9]*\]\)\?: could not compile\|^error: could not compile" "${LOG}"; then
+    if grep -qE '^error(\[E[0-9]*\])?: could not compile' "${LOG}"; then
         echo "FAIL ${name}: with the control off the code does not build" >&2
         grep -m5 -E "^error" "${LOG}" >&2
         keep_log "${name}"
