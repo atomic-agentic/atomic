@@ -283,21 +283,10 @@ fn owner() -> &'static str {
     })
 }
 
-/// When process `pid` started, in the system's own units, where it says.
+/// When process `pid` started, in the system's own units, where it says:
+/// clock ticks after boot on Linux, microseconds since the epoch on macOS.
 fn started(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // The command name, in parentheses, may hold spaces; the fields
-        // after it are plain. The start time is field 22.
-        let after = stat.rsplit_once(')')?.1;
-        after.split_whitespace().nth(19)?.parse().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+    crate::process::started(pid)
 }
 
 /// The same scratch exclusions apply to commands run in an atom workspace
