@@ -202,6 +202,15 @@ backend and the process runner apply them to the command before `exec` on Unix:
 `RLIMIT_CPU` caps CPU seconds and `RLIMIT_DATA` caps writable data bytes.
 The limits are inherited by children, but each process has its own counter and
 address space. They are not aggregate quotas for the command's process tree.
+macOS refuses an `RLIMIT_DATA` below the size of a process's whole address
+map, so there the process that waits on the command holds `data_bytes`
+instead (`crates/atomic-exec/src/process.rs`, `mod memory`). About every ten
+milliseconds it reads the physical footprint of each process in the
+command's group, and it kills the group when one process is over the
+limit, or when a process's memory cannot be read. The kill is reported on
+the command's stderr. As on Linux, the limit applies to each process on its
+own. A process can exceed it briefly between two readings, and a process
+that left the command's group is not watched.
 The fields are optional and default to no OS limit; a caller that requires
 these bounds must set them. Non-Unix backends refuse a command that sets either
 field. The command's existing wall time and output limits still apply.

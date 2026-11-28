@@ -38,6 +38,106 @@ fn kill_group(group: u32) {
     let _ = group;
 }
 
+/// A command's writable-data limit on macOS, held by the process that waits
+/// on it.
+///
+/// macOS refuses an `RLIMIT_DATA` or `RLIMIT_AS` below the size of a
+/// process's whole address map, and an arm64 process starts with hundreds of
+/// gigabytes mapped, so a command cannot be given a limit near the memory it
+/// may hold. While it waits, the parent reads the physical footprint of each
+/// process in the command's group, the memory in use that macOS itself
+/// limits processes by, and stops the command when one holds more than its
+/// limit. As on Linux the limit is each process's own, not the group's
+/// total. The kernel does not hold it, so between two readings a process
+/// can go past it by what it writes in that time. A process that left the
+/// command's group is not read. A process in the group whose memory cannot
+/// be read stops the command.
+#[cfg(target_os = "macos")]
+mod memory {
+    /// Why the command must stop: a process in `group`, or `child` where it
+    /// has none of its own, holds more than `limit` bytes or cannot be read.
+    pub(super) fn over(limit: u64, child: u32, group: Option<u32>) -> Option<String> {
+        let pids = match group {
+            Some(group) => match members(group) {
+                Ok(pids) => pids,
+                Err(e) => {
+                    return Some(format!(
+                        "atomic stopped it: its processes could not be listed to hold its \
+                         memory limit ({e})"
+                    ));
+                }
+            },
+            None => libc::pid_t::try_from(child).into_iter().collect(),
+        };
+        for pid in pids {
+            match footprint(pid) {
+                Ok(Some(held)) if held > limit => {
+                    return Some(format!(
+                        "atomic stopped it: process {pid} held {held} bytes, more than its \
+                         memory limit of {limit}"
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    return Some(format!(
+                        "atomic stopped it: the memory of process {pid} could not be read to \
+                         hold its limit ({e})"
+                    ));
+                }
+            }
+        }
+        None
+    }
+
+    /// The processes in process group `group`, as libproc lists them.
+    fn members(group: u32) -> std::io::Result<Vec<libc::pid_t>> {
+        let group = libc::pid_t::try_from(group).map_err(std::io::Error::other)?;
+        let mut room = 64usize;
+        loop {
+            let mut pids: Vec<libc::pid_t> = vec![0; room];
+            let bytes = libc::c_int::try_from(room * std::mem::size_of::<libc::pid_t>())
+                .map_err(|_| std::io::Error::other("too many processes to list"))?;
+            // SAFETY: the buffer holds `bytes` bytes, which is all
+            // proc_listpgrppids writes.
+            #[allow(unsafe_code)]
+            let listed = unsafe { libc::proc_listpgrppids(group, pids.as_mut_ptr().cast(), bytes) };
+            let Ok(listed) = usize::try_from(listed) else {
+                return Err(std::io::Error::last_os_error());
+            };
+            // A full buffer may have left some out: look again with more.
+            if listed < room {
+                pids.truncate(listed);
+                pids.retain(|p| *p > 0);
+                return Ok(pids);
+            }
+            room *= 4;
+        }
+    }
+
+    /// The physical footprint of `pid` in bytes, or `None` for a process
+    /// that has ended or is ending.
+    #[allow(unsafe_code)]
+    fn footprint(pid: libc::pid_t) -> std::io::Result<Option<u64>> {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v0>::zeroed();
+        // SAFETY: `usage` is writable storage with the size and alignment of
+        // the structure the V0 flavor fills, and it lives until the call
+        // returns.
+        let result =
+            unsafe { libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V0, usage.as_mut_ptr().cast()) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: the call filled the structure, whose fields are plain
+        // numbers that zeroed storage is valid for in any case.
+        Ok(Some(unsafe { usage.assume_init() }.ri_phys_footprint))
+    }
+}
+
 /// For a process that is about to exit, not to recover: kill every process
 /// [`run`] started that has not ended, with everything it started, and
 /// never report how any of them ended, so no step records an outcome its
@@ -1267,6 +1367,11 @@ pub fn run_in_with_secret(
     let cpu = checked_rlimit(&name, "CPU", limits.cpu_seconds, 1)?;
     #[cfg(unix)]
     let data = checked_rlimit(&name, "writable data", limits.data_bytes, 0)?;
+    // macOS refuses an `RLIMIT_DATA` below the size of the whole address map,
+    // which starts far larger than any limit a command is given, so there
+    // the parent holds the limit while it waits (see [`memory`]).
+    #[cfg(target_os = "macos")]
+    let data: Option<(libc::rlim_t, libc::rlim_t)> = data.and(None);
     let mut command = std::process::Command::new(program);
     command
         .args(args)
@@ -1532,6 +1637,9 @@ fn finish(
     let stdout = Output::read(stdout, limits.stdout as u64 + 1, false);
     let stderr = Output::read(stderr, limits.stderr as u64, true);
     let started = Instant::now();
+    // Why the parent stopped it, where it holds the memory limit itself.
+    #[cfg(target_os = "macos")]
+    let mut breach: Option<String> = None;
     let status = loop {
         match exited(&mut child).map_err(io)? {
             Some(true) => {
@@ -1563,7 +1671,22 @@ fn finish(
                     seconds: limits.time.as_secs(),
                 });
             }
-            None => std::thread::sleep(Duration::from_millis(10)),
+            None => {
+                #[cfg(target_os = "macos")]
+                if breach.is_none()
+                    && let Some(limit) = limits.data_bytes
+                    && let Some(why) = memory::over(limit, child.id(), group)
+                {
+                    // Everything it started; the next look collects it.
+                    if let Some(group) = group {
+                        kill_group(group);
+                    }
+                    let _ = child.kill();
+                    breach = Some(why);
+                    continue;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     };
     // Its output ends when every process holding it has let go. One that
@@ -1571,7 +1694,13 @@ fn finish(
     // within the grace after the exit is the output.
     let deadline = Instant::now() + OUTPUT_GRACE;
     let stdout = stdout.until(deadline).map_err(io)?;
-    let stderr = stderr.until(deadline).map_err(io)?;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut stderr = stderr.until(deadline).map_err(io)?;
+    // Killed as the kernel would have refused it: how is said on stderr.
+    #[cfg(target_os = "macos")]
+    if let Some(why) = breach {
+        stderr.extend_from_slice(format!("\n{why}\n").as_bytes());
+    }
     // Input it never read is no failure once it has exited.
     let written = written
         .recv_timeout(deadline.saturating_duration_since(Instant::now()))

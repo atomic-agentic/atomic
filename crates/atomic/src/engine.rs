@@ -185,12 +185,13 @@ pub fn exec_backend(
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
     let local = local_backend(state);
-    // Exec atoms' commands run under the same sandbox helper as turns'
-    // commands, denied atomic's private state. Elsewhere than Linux this is
-    // not verified, and they run unconfined (see the availability notes).
-    // They may write their scratch directory and their run's own build
-    // caches, which each workspace names, and nothing shared between runs.
-    #[cfg(target_os = "linux")]
+    // Exec atoms' commands run under Codex's sandbox, as turns' commands do,
+    // denied atomic's private state: on Linux through the sandbox helper,
+    // on macOS through Seatbelt. Elsewhere they run unconfined (see the
+    // availability notes). They may write their scratch directory and their
+    // run's own build caches, which each workspace names, and nothing
+    // shared between runs.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let local = local.confined(std::sync::Arc::new(
         atomic_core::codex::ExecSandbox::new(
             paths,
@@ -200,7 +201,7 @@ pub fn exec_backend(
         .and_then(|sandbox| sandbox.limiting_connections(connections_per_command))
         .context("confine exec atoms' commands")?,
     ));
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = (paths, connections_per_command);
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),

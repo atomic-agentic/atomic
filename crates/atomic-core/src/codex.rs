@@ -4074,7 +4074,7 @@ fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSa
 )]
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
-    helper: PathBuf,
+    launcher: Launcher,
     guard: StateGuard,
     codex_home: PathBuf,
     /// The proxies that limit commands declaring network access to their
@@ -4084,17 +4084,38 @@ pub struct ExecSandbox {
     loopback_for_tests: Vec<String>,
 }
 
+/// What puts an exec atom's command under Codex's sandbox.
+#[derive(Clone, Debug)]
+enum Launcher {
+    /// Codex's Linux sandbox helper at this path, which runs bubblewrap.
+    LinuxHelper(PathBuf),
+    /// macOS's Seatbelt, through `/usr/bin/sandbox-exec`, with the policy
+    /// Codex writes for the same permission profile.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Seatbelt,
+}
+
 impl ExecSandbox {
-    /// Confinement through `paths`' sandbox helper, denying what `guard`
-    /// denies; `codex_home` is the Codex home atom threads use, whose records
-    /// are denied too. Fails where this process has no helper.
+    /// Confinement denying what `guard` denies; `codex_home` is the Codex
+    /// home atom threads use, whose records are denied too. On Linux it runs
+    /// through `paths`' sandbox helper, and fails where this process has
+    /// none; on macOS through Seatbelt. Elsewhere it fails.
     pub fn new(paths: &CodexPaths, guard: StateGuard, codex_home: PathBuf) -> anyhow::Result<Self> {
-        let helper = paths.linux_sandbox().map(Path::to_owned).context(
-            "this process has no Linux sandbox helper to confine exec atoms' commands with; \
-             run atomic itself, which provides one",
-        )?;
+        let launcher = if cfg!(target_os = "macos") {
+            Launcher::Seatbelt
+        } else if cfg!(target_os = "linux") {
+            Launcher::LinuxHelper(paths.linux_sandbox().map(Path::to_owned).context(
+                "this process has no Linux sandbox helper to confine exec atoms' commands with; \
+                 run atomic itself, which provides one",
+            )?)
+        } else {
+            anyhow::bail!(
+                "atomic confines exec atoms' commands on Linux and macOS only, not on {}",
+                std::env::consts::OS
+            )
+        };
         Ok(Self {
-            helper,
+            launcher,
             guard,
             codex_home,
             proxies: crate::network::Proxies::default(),
@@ -4185,6 +4206,161 @@ impl ExecSandbox {
             SANDBOX_NETWORK,
         ))
     }
+
+    /// `command` confined on macOS: run by `/usr/bin/sandbox-exec` under the
+    /// Seatbelt policy Codex writes for the profile the Linux helper is
+    /// given, which denies network and every socket. Its environment is
+    /// exactly the command's own, since the backend starts it with no other,
+    /// and `sandbox-exec` adds none.
+    ///
+    /// A command that declares hosts is refused. On Linux the helper's
+    /// bridge marks each of its connections with a token so the relay can
+    /// count them against that command; on macOS no bridge runs, so the
+    /// relay could not tell its connections from another command's.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn confine_seatbelt(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        use codex_sandboxing::{
+            SandboxCommand, SandboxManager, SandboxSelection, SandboxTransformRequest, SandboxType,
+        };
+        let fail = |message: String| atomic_exec::ExecError::Start {
+            program: command.program.clone(),
+            message,
+        };
+        if !command.network.is_empty() {
+            return Err(fail(format!(
+                "it declares hosts ({}), and on macOS atomic cannot yet give a confined command \
+                 a network proxy of its own; run it on Linux",
+                command.network.join(", ")
+            )));
+        }
+        // Resolved here, on this machine's PATH: the command's own
+        // environment has none unless it declares one.
+        let program = atomic_exec::process::resolve(&command.program).map_err(fail)?;
+        // Codex writes the command line as UTF-8.
+        if program.to_str().is_none() {
+            return Err(fail(format!("{} is not UTF-8", program.display())));
+        }
+        let profile = self
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
+            .map_err(|e| fail(format!("{e:#}")))?;
+        let cwd = AbsolutePathBuf::from_absolute_path(&command.cwd).map_err(|e| {
+            fail(format!(
+                "resolve its directory {}: {e}",
+                command.cwd.display()
+            ))
+        })?;
+        let cwd = codex_utils_path_uri::PathUri::from_abs_path(&cwd);
+        let wrapped = SandboxManager::new()
+            .transform(SandboxTransformRequest {
+                command: SandboxCommand {
+                    program: program.into_os_string(),
+                    args: command.args.clone(),
+                    cwd: cwd.clone(),
+                    env: std::collections::HashMap::new(),
+                    managed_network: None,
+                    additional_permissions: None,
+                },
+                permissions: &profile,
+                workspace_roots: None,
+                runtime_readable_paths: &[],
+                selection: SandboxSelection::Explicit(SandboxType::MacosSeatbelt),
+                enforce_managed_network: false,
+                environment_id: None,
+                network: None,
+                sandbox_policy_cwd: &cwd,
+                sandbox_exe: None,
+                use_legacy_landlock: false,
+                windows_sandbox_level: codex_protocol::config_types::WindowsSandboxLevel::Disabled,
+            })
+            .map_err(|e| fail(format!("write its Seatbelt policy: {e}")))?;
+        let mut argv = wrapped.into_command_request().command.into_iter();
+        let launcher = argv
+            .next()
+            .ok_or_else(|| fail("Codex gave no command to run it under Seatbelt".into()))?;
+        let mut args: Vec<String> = argv.collect();
+        let ancestors = denied_ancestors(&profile, command);
+        if !ancestors.is_empty() {
+            // `-p <policy>` leads, then the policy's `-D` parameters.
+            if args.first().map(String::as_str) != Some("-p") || args.len() < 2 {
+                return Err(fail(
+                    "Codex wrote its Seatbelt command without a policy first".into(),
+                ));
+            }
+            for (index, ancestor) in ancestors.iter().enumerate() {
+                let key = format!("ATOMIC_DENIED_ANCESTOR_{index}");
+                args[1].push_str(&format!(
+                    "\n(allow file-read-metadata (literal (param \"{key}\")))"
+                ));
+                let value = ancestor
+                    .to_str()
+                    .ok_or_else(|| fail(format!("{} is not UTF-8", ancestor.display())))?;
+                args.insert(2 + index, format!("-D{key}={value}"));
+            }
+        }
+        Ok(atomic_exec::Command {
+            program: launcher,
+            args,
+            writable: Vec::new(),
+            read_only: Vec::new(),
+            network: Vec::new(),
+            denied: Vec::new(),
+            ..command.clone()
+        })
+    }
+}
+
+/// The directories inside a denied one that lie above a directory `command`
+/// is given (its working directory, and those it may write or read), each
+/// as named and as resolved.
+///
+/// Codex's Seatbelt policy denies a directory by leaving it out of what may
+/// be read, so a command cannot even `lstat` the directories on the way to
+/// its own scratch directory inside the denied state directory, and resolving
+/// that directory's name (`realpath`) fails. Linux's sandbox reopens that
+/// path, so there it resolves. Seatbelt is given their metadata alone: what
+/// is in them stays denied.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn denied_ancestors(profile: &PermissionProfile, command: &atomic_exec::Command) -> Vec<PathBuf> {
+    use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+    let named_and_resolved = |path: &Path| {
+        let resolved = std::fs::canonicalize(path)
+            .ok()
+            .filter(|resolved| resolved != path);
+        std::iter::once(path.to_owned()).chain(resolved)
+    };
+    let denied: Vec<PathBuf> = profile
+        .file_system_sandbox_policy()
+        .entries
+        .iter()
+        .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+        .filter_map(|entry| match &entry.path {
+            FileSystemPath::Path { path } => Some(path.to_path_buf()),
+            _ => None,
+        })
+        .flat_map(|path| named_and_resolved(&path).collect::<Vec<_>>())
+        .collect();
+    let given = std::iter::once(&command.cwd)
+        .chain(&command.writable)
+        .chain(&command.read_only);
+    let mut ancestors = std::collections::BTreeSet::new();
+    for dir in given {
+        for dir in named_and_resolved(dir) {
+            for ancestor in dir.ancestors().skip(1) {
+                if denied.iter().any(|d| ancestor.starts_with(d)) {
+                    ancestors.extend(named_and_resolved(ancestor));
+                }
+            }
+        }
+    }
+    ancestors.into_iter().collect()
 }
 
 impl atomic_exec::Confine for ExecSandbox {
@@ -4214,6 +4390,10 @@ impl atomic_exec::Confine for ExecSandbox {
         command: &atomic_exec::Command,
         tmp: &Path,
     ) -> Result<(atomic_exec::Command, Option<atomic_exec::Held>), atomic_exec::ExecError> {
+        let helper = match &self.launcher {
+            Launcher::LinuxHelper(helper) => helper,
+            Launcher::Seatbelt => return self.confine_seatbelt(command).map(|c| (c, None)),
+        };
         let fail = |message: String| atomic_exec::ExecError::Start {
             program: command.program.clone(),
             message,
@@ -4336,7 +4516,7 @@ impl atomic_exec::Confine for ExecSandbox {
         args.extend(command.args.iter().cloned());
         Ok((
             atomic_exec::Command {
-                program: text(&self.helper)?,
+                program: text(helper)?,
                 args,
                 env: helper_env,
                 writable: Vec::new(),
@@ -4373,6 +4553,19 @@ impl atomic_exec::Confine for ExecSandbox {
         };
         match done {
             Ok(done) if done.success() => Ok(()),
+            // sandbox-exec has no setup that may pass: a policy it refuses,
+            // or a sandbox it cannot apply, it refuses every time.
+            Ok(done) if matches!(self.launcher, Launcher::Seatbelt) => {
+                Err(atomic_exec::ExecError::Unconfinable {
+                    message: format!(
+                        "exec atoms' commands run under macOS's Seatbelt sandbox, and a trial \
+                         command under it exited with {}: {}",
+                        done.code
+                            .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
+                        String::from_utf8_lossy(&done.stderr).trim()
+                    ),
+                })
+            }
             Ok(done) => {
                 let stderr = String::from_utf8_lossy(&done.stderr);
                 let why = format!(
@@ -9877,6 +10070,7 @@ mod tests {
     /// with exactly the command's environment, then the command: its
     /// profile denies atomic's private state and lets it write only its own
     /// directories and those it is given, such as its run's caches.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
@@ -9950,10 +10144,103 @@ mod tests {
         assert!(text.contains("restricted"), "no network: {text}");
     }
 
+    /// On macOS an exec command, confined, is `sandbox-exec` running the
+    /// command under a Seatbelt policy that denies atomic's private state
+    /// and lets it write its own directories: the command's environment is
+    /// its own, with nothing of atomic's added.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exec_command_is_confined_under_seatbelt_on_macos() {
+        use atomic_exec::Confine;
+        let state_scratch = Scratch::new("exec-seatbelt");
+        let state = state_scratch.0.clone();
+        let scratch_dir = state.join("scratch/a1");
+        std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        std::fs::create_dir_all(state.join("keys")).expect("keys");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: state.join("private"),
+            also: vec![state.join("keys")],
+        });
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex")).expect("Seatbelt");
+        let env = vec![("HOME".to_owned(), scratch_dir.display().to_string())];
+        let confined = sandbox
+            .confine(
+                &atomic_exec::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "true".into()],
+                    cwd: state.clone(),
+                    env: env.clone(),
+                    writable: vec![scratch_dir.clone()],
+                    ..Default::default()
+                },
+                &state.join("scratch/.tmp"),
+            )
+            .expect("confined");
+        assert_eq!(confined.program, "/usr/bin/sandbox-exec");
+        assert_eq!(confined.env, env);
+        assert!(confined.writable.is_empty() && confined.denied.is_empty());
+        assert_eq!(confined.args[0], "-p", "{:?}", confined.args);
+        let split = confined
+            .args
+            .iter()
+            .position(|a| a == "--")
+            .unwrap_or_else(|| panic!("-- in {:?}", confined.args));
+        let rest = &confined.args[split + 1..];
+        assert!(rest[0].ends_with("/sh"), "resolved: {rest:?}");
+        assert_eq!(&rest[1..], ["-c", "true"]);
+        // The policy and its parameters name what it denies and what it may
+        // write, as the kernel sees them.
+        let policy = confined.args[..split].join("\n");
+        for path in [state.join("keys"), scratch_dir] {
+            let real = std::fs::canonicalize(&path).expect("canonical");
+            assert!(
+                policy.contains(&real.display().to_string()),
+                "{real:?}: {policy}"
+            );
+        }
+    }
+
+    /// On macOS a command that declares hosts is refused: atomic cannot yet
+    /// give it a proxy of its own there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_command_with_hosts_is_refused_on_macos() {
+        use atomic_exec::Confine;
+        let state_scratch = Scratch::new("exec-hosts-macos");
+        let state = state_scratch.0.clone();
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("Seatbelt");
+        let command = atomic_exec::Command {
+            program: "sh".into(),
+            cwd: state.clone(),
+            network: vec!["allowed.invalid".into()],
+            ..Default::default()
+        };
+        let Err(error) = sandbox.confine_held(&command, &state) else {
+            panic!("a command that declares hosts was confined on macOS");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("declares hosts (allowed.invalid)"),
+            "{error}"
+        );
+    }
+
     /// A command that declares hosts is confined only with its proxy held:
     /// `confine`, which would drop the proxy before the command starts,
     /// refuses it, and `confine_held` routes it to the proxy and hands back
     /// the hold.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
         use atomic_exec::Confine;
@@ -9988,6 +10275,7 @@ mod tests {
     /// pipe only: it is in neither the helper's exec environment nor its
     /// arguments, both of which other processes can read before the helper
     /// can protect itself.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;

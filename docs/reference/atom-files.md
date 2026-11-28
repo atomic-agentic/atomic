@@ -316,9 +316,9 @@ Know what a listed host can get:
   and a shared host missing from the list is not caught. List exact names
   where you can.
 
-The rule is enforced on Linux only. On macOS and Windows exec commands run
-unconfined, with whatever network the machine has, and a declaration restricts
-nothing.
+The rule is enforced on Linux only. On macOS an exec atom that declares hosts
+is refused for now, since its command, confined under Seatbelt, has no network
+at all; on Windows exec commands are refused.
 
 Only exec atoms declare network access at this version; a codex or lite atom
 that declares `network.allow` is refused, and its commands run with none.

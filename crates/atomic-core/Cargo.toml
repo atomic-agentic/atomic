@@ -79,6 +79,8 @@ codex-core-api = { workspace = true }
 codex-extension-api = { workspace = true }
 codex-protocol = { workspace = true }
 codex-network-proxy = { workspace = true }
+codex-sandboxing = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 boa_engine = { workspace = true }
 ctor = { workspace = true, optional = true }
 codex-keyring-store = { workspace = true }

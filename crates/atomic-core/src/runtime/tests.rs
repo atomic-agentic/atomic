@@ -2208,7 +2208,9 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
 /// codex atom whose turn would run commands, is refused before anything
 /// runs as unconfinable, with what the sandbox needs, which a durable run
 /// stops on without recording anything. A failed check is not kept: each
-/// such atom checks again.
+/// such atom checks again. The helpers here fail as Codex's Linux helper
+/// does; macOS confines through Seatbelt, which takes no helper.
+#[cfg(target_os = "linux")]
 #[test]
 fn only_atoms_that_run_commands_need_the_sandbox() {
     use crate::codex::{CodexPaths, ExecSandbox, StateGuard};
