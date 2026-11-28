@@ -276,7 +276,7 @@ run() {
     local mode="$1"
     shift
     out="$(cd "${repo}" && FAKE_CARGO="${mode}" CONTROL_FILES="${CONTROL_FILES[*]}" \
-        PATH="${RUN_PATH:+${RUN_PATH}:}${WORK}/bin:${PATH}" \
+        PATH="${RUN_PATH:+${RUN_PATH}:}${WORK}/bin:${BASE_PATH:-${PATH}}" \
         scripts/controls-check.sh "$@" 2>&1)"
     code=$?
 }
@@ -686,58 +686,78 @@ run honest git-hardening
 cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
 untouched || fail "after a kill: the saved original does not restore the file"
 
-# One run at a time in a tree. Two runs switch the same files, each saving its
-# own originals, and the one that finishes last puts back what it found, which
-# is the other's switched-off source. While one run holds the tree's lock, the
-# next refuses before it edits anything or asks cargo anything. The run that
-# holds it is asked to stop by the case, so it ends with its own exit.
-repo="$(fresh)"
-(cd "${repo}" && FAKE_CARGO=hang PATH="${WORK}/bin:${PATH}" exec scripts/controls-check.sh git-hardening) \
-    >/dev/null 2>&1 &
-holder=$!
-# Not a job of this shell: it is stopped outright below, and a job the shell
-# reports as killed reads to a reviewer like a failure of the suite.
-disown "${holder}"
-for _ in $(seq 1 100); do
-    [ -e "${repo}/cargo-started" ] && break
-    sleep 0.1
+# The lock cases, run with flock(1) and again with it hidden, as on macOS,
+# where the script takes the same lock through python3. LOCK_HOW labels each
+# failure; BASE_PATH, when set, replaces the PATH the script is run with.
+lock_cases() {
+    # One run at a time in a tree. Two runs switch the same files, each saving its
+    # own originals, and the one that finishes last puts back what it found, which
+    # is the other's switched-off source. While one run holds the tree's lock, the
+    # next refuses before it edits anything or asks cargo anything. The run that
+    # holds it is asked to stop by the case, so it ends with its own exit.
+    repo="$(fresh)"
+    (cd "${repo}" && FAKE_CARGO=hang PATH="${WORK}/bin:${BASE_PATH:-${PATH}}" exec scripts/controls-check.sh git-hardening) \
+        >/dev/null 2>&1 &
+    holder=$!
+    # Not a job of this shell: it is stopped outright below, and a job the shell
+    # reports as killed reads to a reviewer like a failure of the suite.
+    disown "${holder}"
+    for _ in $(seq 1 100); do
+        [ -e "${repo}/cargo-started" ] && break
+        sleep 0.1
+    done
+    [ -e "${repo}/cargo-started" ] || fail "${lock_how}lock held: the first run never reached cargo"
+    # The kernel holds what the first run took, so the second's refusal is the
+    # lock and not a message it happens to print.
+    if flock -n "${repo}/target/controls-check.lock" -c 'exit 0' 2>/dev/null; then
+        fail "${lock_how}lock held: target/controls-check.lock is free while the first run is inside cargo, so its refusal was not the lock"
+    fi
+    # The row the second run names edits redact.rs, a file the first run never
+    # touches, so the refusal is for the lock and not for a dirty file. The first
+    # run has git.rs switched off, which is its own doing and not this run's.
+    run honest braced-esc
+    [ "${code}" -eq 1 ] &&
+        grep -q "target/controls-check.lock is held by another scripts/controls-check.sh run in this tree" <<<"${out}" ||
+        fail "${lock_how}lock held: exit ${code}: ${out}"
+    grep -q "nothing was edited" <<<"${out}" || fail "${lock_how}lock held: the refusal does not say nothing was edited: ${out}"
+    [ -z "$(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)" ] ||
+        fail "${lock_how}lock held: the second run edited a file: $(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)"
+    [ ! -e "${repo}/cargo-args" ] || fail "${lock_how}lock held: the second run asked cargo: $(cat "${repo}/cargo-args")"
+    # The lock is the kernel's, so a run killed outright releases it and the next
+    # starts. The kill finds the holder inside cargo, with its control switched off
+    # and its originals saved, which is the state a lock must outlive.
+    kill -KILL "${holder}" 2>/dev/null
+    # What that run was waiting on is this case's to stop, too: a run killed
+    # outright never gets to stop the cargo it was inside.
+    kill -KILL "$(cat "${repo}/cargo-pid")" 2>/dev/null
+    for _ in $(seq 1 100); do
+        kill -0 "${holder}" 2>/dev/null || break
+        sleep 0.1
+    done
+    git -C "${repo}" diff --quiet HEAD -- crates/atomic-core/src/git.rs &&
+        fail "${lock_how}killed holder: the first run was not mid-run when it was killed, so the next run proves nothing"
+    cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
+    rm -rf "${repo}/target/controls-check"
+    run honest braced-esc
+    [ "${code}" -eq 0 ] && grep -q "^ok braced-esc" <<<"${out}" ||
+        fail "${lock_how}after a killed holder: exit ${code}: ${out}"
+    untouched || fail "${lock_how}after a killed holder: the source is left modified"
+}
+lock_how=""
+lock_cases
+# Every command on PATH but flock, as links in a directory of their own.
+mkdir -p "${WORK}/noflock"
+IFS=: read -ra path_dirs <<<"${PATH}"
+for d in "${path_dirs[@]}"; do
+    for f in "${d}"/*; do
+        n="${f##*/}"
+        [ "${n}" != flock ] && [ -x "${f}" ] && [ ! -e "${WORK}/noflock/${n}" ] &&
+            ln -s "${f}" "${WORK}/noflock/${n}"
+    done
 done
-[ -e "${repo}/cargo-started" ] || fail "lock held: the first run never reached cargo"
-# The kernel holds what the first run took, so the second's refusal is the
-# lock and not a message it happens to print.
-if flock -n "${repo}/target/controls-check.lock" -c 'exit 0' 2>/dev/null; then
-    fail "lock held: target/controls-check.lock is free while the first run is inside cargo, so its refusal was not the lock"
-fi
-# The row the second run names edits redact.rs, a file the first run never
-# touches, so the refusal is for the lock and not for a dirty file. The first
-# run has git.rs switched off, which is its own doing and not this run's.
-run honest braced-esc
-[ "${code}" -eq 1 ] &&
-    grep -q "target/controls-check.lock is held by another scripts/controls-check.sh run in this tree" <<<"${out}" ||
-    fail "lock held: exit ${code}: ${out}"
-grep -q "nothing was edited" <<<"${out}" || fail "lock held: the refusal does not say nothing was edited: ${out}"
-[ -z "$(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)" ] ||
-    fail "lock held: the second run edited a file: $(git -C "${repo}" status --porcelain -- crates/atomic-core/src/redact.rs)"
-[ ! -e "${repo}/cargo-args" ] || fail "lock held: the second run asked cargo: $(cat "${repo}/cargo-args")"
-# The lock is the kernel's, so a run killed outright releases it and the next
-# starts. The kill finds the holder inside cargo, with its control switched off
-# and its originals saved, which is the state a lock must outlive.
-kill -KILL "${holder}" 2>/dev/null
-# What that run was waiting on is this case's to stop, too: a run killed
-# outright never gets to stop the cargo it was inside.
-kill -KILL "$(cat "${repo}/cargo-pid")" 2>/dev/null
-for _ in $(seq 1 100); do
-    kill -0 "${holder}" 2>/dev/null || break
-    sleep 0.1
-done
-git -C "${repo}" diff --quiet HEAD -- crates/atomic-core/src/git.rs &&
-    fail "killed holder: the first run was not mid-run when it was killed, so the next run proves nothing"
-cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
-rm -rf "${repo}/target/controls-check"
-run honest braced-esc
-[ "${code}" -eq 0 ] && grep -q "^ok braced-esc" <<<"${out}" ||
-    fail "after a killed holder: exit ${code}: ${out}"
-untouched || fail "after a killed holder: the source is left modified"
+PATH="${WORK}/noflock" command -v flock >/dev/null && fail "no flock: flock is still on the PATH that hides it"
+lock_how="no flock: "
+BASE_PATH="${WORK}/noflock" lock_cases
 # The lock file is not run state, so it does not trip the rule that refuses a
 # tree holding a run that did not finish.
 [ -e "${repo}/target/controls-check.lock" ] || fail "lock file: the lock is gone from target/"
@@ -827,15 +847,17 @@ kill -KILL "${git_daemon_pid}" 2>/dev/null
 #   [ "${#selected[@]}" -eq 0 ] || ... exit 2       unknown names, the name of
 #                                                   a control whose file is
 #                                                   gone
-#   flock -n 9                                      the lock held
+#   take_lock                                       the lock held, with flock
+#                                                   and with python3
 #   9>&-                              in run_cargo  the orphan left behind, and
 #                                                   the killed holder's cargo
 #   9>&-                              in git()      the daemon the run's git left
 #                                                   behind
-#   command -v flock >/dev/null 2>&1 || die         refuses a run it cannot keep
-#                                                   apart from another; not
-#                                                   tested, because faking that
-#                                                   would hide git and cp too
+#   command -v flock ... || command -v python3      refuses a run it cannot keep
+#     ... || die                                    apart from another; not
+#                                                   tested, because hiding
+#                                                   python3 too would hide what
+#                                                   the cases need
 
 # scripts/controls-on.py: every control is on in the tree. CI runs it on the
 # commit it checks out, where controls-check.sh cannot run (a rebuild per
