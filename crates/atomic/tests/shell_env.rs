@@ -1601,3 +1601,114 @@ fn found(dir: &Path, name: &str) -> Vec<PathBuf> {
     }
     found
 }
+
+/// Every pid's arguments and environment, through sysctl KERN_PROCARGS2:
+/// how many are readable, and which hold the canary.
+const PROCARGS: &str = r#"
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+buf = ctypes.create_string_buffer(1 << 18)
+readable, found, errs = 0, [], {}
+for pid in range(1, 100000):
+    mib = (ctypes.c_int * 3)(1, 49, pid)
+    size = ctypes.c_size_t(1 << 18)
+    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0:
+        readable += 1
+        if b'canary-env-procargs' in buf.raw[:size.value]:
+            found.append(pid)
+    else:
+        e = ctypes.get_errno()
+        errs[e] = errs.get(e, 0) + 1
+print('procargs readable=%d canary_in=%s errs=%s own=%d' % (readable, found, errs, __import__('os').getpid()))
+"#;
+
+/// A probe, not a test: what a read-only turn's command reaches on macOS,
+/// printed for atomic-3akw.1.2. Always fails, to show its output.
+#[cfg(target_os = "macos")]
+#[test]
+fn probe_what_a_macos_turn_reaches() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let state = state_dir_of_look(&dir, &home);
+        let db = state
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("private")
+            .join(state.file_name().unwrap())
+            .join("atomic.db");
+        std::fs::write(dir.join("procargs.py"), PROCARGS).unwrap();
+        let command = format!(
+            "for f in {db} /System/Volumes/Data{db}; do echo \"== $f\"; head -c 15 \"$f\" 2>&1 | head -1; echo; done; \
+             ls {private} 2>&1 | head -2; \
+             echo '== procargs'; python3 {probe} 2>&1 | tail -2; echo probed",
+            db = db.display(),
+            private = db.parent().unwrap().parent().unwrap().display(),
+            probe = dir.join("procargs.py").display(),
+        );
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[("PROBE_CANARY", "canary-env-procargs")],
+        )
+        .await;
+        panic!(
+            "PROBE read-only\ndb: {}\n--- printed ---\n{printed}",
+            db.display()
+        );
+    });
+}
+
+/// A probe, not a test: what a workspace-write turn's command reaches on
+/// macOS, printed for atomic-3akw.1.2. Always fails, to show its output.
+#[cfg(target_os = "macos")]
+#[test]
+fn probe_what_a_macos_writing_turn_reaches() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-probe-w-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data_home = atomic_home_for(&project, "tidy-up");
+        std::fs::write(dir.join("procargs.py"), PROCARGS).unwrap();
+        let command = format!(
+            "mkdir -p \"$HOME/.cache\" 2>&1; echo mk=$?; ls -la \"$HOME\" 2>&1 | head -12; \
+             for f in {ah}/atomic/private/*/atomic.db; do echo \"== $f\"; done; \
+             db=$(find {ah}/atomic -name atomic.db 2>&1 | head -3); echo \"found=$db\"; \
+             ln {ah}/atomic/private/project-*/atomic.db \"$HOME/hard\" 2>&1; echo ln=$?; \
+             head -c 15 \"$HOME/hard\" 2>&1 | head -1; echo; \
+             echo '== procargs'; python3 {probe} 2>&1 | tail -2; echo probed",
+            ah = data_home.display(),
+            probe = dir.join("procargs.py").display(),
+        );
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let printed = run_once(
+            &home,
+            &project,
+            "tidy-up",
+            &data,
+            &command,
+            &[("PROBE_CANARY", "canary-env-procargs")],
+        )
+        .await;
+        let tree = Command::new("find")
+            .arg(data_home.join("atomic"))
+            .args(["-maxdepth", "3"])
+            .output()
+            .unwrap();
+        panic!(
+            "PROBE writing\ntree:\n{}\n--- printed ---\n{printed}",
+            String::from_utf8_lossy(&tree.stdout)
+        );
+    });
+}
