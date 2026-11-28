@@ -120,9 +120,35 @@ fn refuses_skipping_the_download() {
     refuses("RUSTY_V8_SKIP_DOWNLOAD");
 }
 
+// A bindings path is accepted only as the pinned bindings in the mirror,
+// through any spelling of that path; any other file, a missing one or an
+// empty value is refused.
 #[test]
-fn refuses_a_binding_path() {
-    refuses("RUSTY_V8_SRC_BINDING_PATH");
+fn refuses_a_binding_path_but_the_pinned_one() {
+    for spelling in ["v152.2.0/binding.rs", "v152.2.0/../v152.2.0/binding.rs"] {
+        let fixture = Fixture::new("binding-path-ok");
+        let given = fixture.mirror.join(spelling).to_string_lossy().into_owned();
+        let fixture = fixture.set("RUSTY_V8_SRC_BINDING_PATH", &given);
+        assert!(fixture.check().is_ok(), "{given}: {:?}", fixture.check());
+    }
+    let fixture = Fixture::new("binding-path");
+    let other = fixture.mirror.join("other.rs");
+    std::fs::write(&other, BINDING).expect("a copy with the pinned bytes");
+    for given in [
+        other.to_string_lossy().into_owned(),
+        String::new(),
+        "/nonexistent/binding.rs".into(),
+    ] {
+        let error = Fixture::new("binding-path-other")
+            .set("RUSTY_V8_SRC_BINDING_PATH", &given)
+            .refusal();
+        assert!(
+            error.starts_with(&format!(
+                "RUSTY_V8_SRC_BINDING_PATH is {given:?}, not the pinned bindings"
+            )),
+            "{given}: {error}"
+        );
+    }
 }
 
 #[test]

@@ -1,1 +1,1 @@
-v8-archive-refuse-binding-path|crates/atomic-core/build/v8_archive.rs|"RUSTY_V8_SRC_BINDING_PATH",|"CONTROL_OFF_RUSTY_V8_SRC_BINDING_PATH",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_binding_path
+v8-archive-refuse-binding-path|crates/atomic-core/build/v8_archive.rs|if !same {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_binding_path_but_the_pinned_one

@@ -291,7 +291,15 @@ The controls and trial settings can share the same values. Conflicting values
 stop the run. Each proof attempt gets a fresh private Cargo home and writable
 target, with read-only access to the selected registry and no network.
 Atomic supplies `CARGO_HOME`, `CARGO_TARGET_DIR`, `CARGO_NET_OFFLINE`,
-`RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`. The controls atom cannot declare them.
+`RUSTUP_HOME` and `RUSTUP_TOOLCHAIN`, and, when the operator process has
+`RUSTY_V8_MIRROR`, `RUSTY_V8_ARCHIVE_SHA256` and `RUSTY_V8_SRC_BINDING_PATH`
+(as `scripts/dev.sh` and CI set them for atomic's own repository), those
+three with read-only access to that mirror, so a workspace that links V8
+builds offline. Some without the others, a mirror that is not a directory, a
+value that is not a SHA-256 or bindings outside the mirror are refused when
+atomic starts with its offline Cargo settings.
+A trial check's Cargo gets the same mirror. The controls atom cannot declare
+any of these.
 Both project Cargo config spellings must match the bound base. Only empty
 settings are accepted for a controls proof.
 

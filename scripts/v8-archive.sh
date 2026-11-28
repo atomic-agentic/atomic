@@ -5,27 +5,33 @@
 # the V8 version in Cargo.lock, laid out as the local mirror rusty_v8's build
 # script reads through RUSTY_V8_MIRROR.
 #
-#   scripts/v8-archive.sh [--mirror DIR] [--sha256] [TARGET]
+#   scripts/v8-archive.sh [--mirror DIR] [--sha256 | --env-for DIR] [TARGET]
 #
-# TARGET defaults to the host's triple. DIR defaults to target/v8-mirror, the
-# path the workspace's .cargo/config.toml gives RUSTY_V8_MIRROR. A cached file
+# TARGET defaults to the host's triple. DIR defaults to target/v8-mirror; a
+# build gives rusty_v8 the mirror's path in RUSTY_V8_MIRROR. A cached file
 # is checked again on every run, so a tampered cache fails; a missing one is
 # downloaded once from the release URL. With no V8 in Cargo.lock it does
 # nothing. Prints the mirror directory, or with --sha256 the archive's pinned
 # SHA-256, which a build must give rusty_v8 as RUSTY_V8_ARCHIVE_SHA256
-# (atomic-core's build script refuses one without it). In a GitHub Actions job
-# it also sets RUSTY_V8_ARCHIVE_SHA256 for the job's later steps.
+# (atomic-core's build script refuses one without it), or with --env-for DIR
+# the environment a build reads the mirror through when it sits at DIR:
+# RUSTY_V8_MIRROR, RUSTY_V8_ARCHIVE_SHA256 and RUSTY_V8_SRC_BINDING_PATH, the
+# pinned bindings in the mirror, which rusty_v8 then reads in place instead
+# of copying into its own source directory. In a GitHub Actions job it also
+# sets those three for the job's later steps.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MIRROR="${ROOT}/target/v8-mirror"
 TARGET=""
 PRINT_SHA=""
+ENV_FOR=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --mirror) MIRROR="$2"; shift 2 ;;
         --sha256) PRINT_SHA=1; shift ;;
-        -*) echo "usage: scripts/v8-archive.sh [--mirror DIR] [--sha256] [TARGET]" >&2; exit 2 ;;
+        --env-for) ENV_FOR="$2"; shift 2 ;;
+        -*) echo "usage: scripts/v8-archive.sh [--mirror DIR] [--sha256 | --env-for DIR] [TARGET]" >&2; exit 2 ;;
         *) TARGET="$1"; shift ;;
     esac
 done
@@ -96,7 +102,22 @@ fetch() {
 }
 fetch "${FILE}" "${SHA}"
 fetch "${BINDING}" "${BINDING_SHA}"
+# The build environment for the mirror at $1.
+build_env() {
+    echo "RUSTY_V8_MIRROR=$1"
+    echo "RUSTY_V8_ARCHIVE_SHA256=${SHA}"
+    echo "RUSTY_V8_SRC_BINDING_PATH=$1/v${VERSION}/${BINDING}"
+}
 if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "RUSTY_V8_ARCHIVE_SHA256=${SHA}" >>"${GITHUB_ENV}"
+    # rusty_v8 on Windows needs a Windows path, not the shell's.
+    mirror_path="${MIRROR}"
+    if command -v cygpath >/dev/null 2>&1; then mirror_path="$(cygpath -m "${MIRROR}")"; fi
+    build_env "${mirror_path}" >>"${GITHUB_ENV}"
 fi
-if [ -n "${PRINT_SHA}" ]; then echo "${SHA}"; else echo "${MIRROR}"; fi
+if [ -n "${ENV_FOR}" ]; then
+    build_env "${ENV_FOR}"
+elif [ -n "${PRINT_SHA}" ]; then
+    echo "${SHA}"
+else
+    echo "${MIRROR}"
+fi

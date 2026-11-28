@@ -19,7 +19,7 @@ reason = "deno_v8 0.5.0's alternative V8 backend, behind its quickjs feature, wh
 # records only the URL, so atomic verifies them instead:
 # scripts/v8-archive.sh fetches each file once, checks its SHA-256 every time
 # and lays the files out as a local mirror; the workspace's
-# .cargo/config.toml points RUSTY_V8_MIRROR there, so a build reads only
+# scripts/dev.sh and CI point RUSTY_V8_MIRROR there, so a build reads only
 # verified files and works offline once they are cached. A V8 version or
 # target with no entry here cannot be built. Codex's fork changes only Rust
 # code (src/cppgc.rs), so upstream rusty_v8's prebuilt archives for the same

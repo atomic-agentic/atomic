@@ -132,7 +132,8 @@ runs:
         restore-keys: ${{ !(inputs.warm == 'true' && github.ref == 'refs/heads/main') && format('target-{0}-{1}-', inputs.target-cache, runner.os) || '' }}
 
     # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
-    # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
+    # into target/v8-mirror, and RUSTY_V8_MIRROR and RUSTY_V8_ARCHIVE_SHA256
+    # into the job's environment for rusty_v8.
     - name: V8 archive
       shell: bash
       run: scripts/v8-archive.sh

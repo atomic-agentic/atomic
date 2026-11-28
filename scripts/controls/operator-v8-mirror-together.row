@@ -1,0 +1,1 @@
+operator-v8-mirror-together|crates/atomic/src/pipeline.rs|if set.contains(&true) && set.contains(&false) {|if false {|-p atomic-agentic --lib -- pipeline::tests::the_operator_v8_mirror_is_a_directory_with_its_hash_and_bindings

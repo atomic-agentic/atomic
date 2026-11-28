@@ -4,8 +4,8 @@
 //! one deps/v8.toml pins.
 //!
 //! rusty_v8's build script reads its prebuilt archive from RUSTY_V8_MIRROR,
-//! which the workspace's .cargo/config.toml points at a mirror
-//! scripts/v8-archive.sh verified. This build script repeats that check
+//! which scripts/dev.sh and CI point at a mirror scripts/v8-archive.sh
+//! verified. This build script repeats that check
 //! and refuses the rusty_v8 settings that would read or link anything else
 //! (see `build/v8_archive.rs`).
 use sha2::{Digest, Sha256};

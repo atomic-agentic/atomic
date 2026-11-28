@@ -7494,6 +7494,10 @@ fn trial_cargo_selection() -> atomic_app::pipeline::TrialCargo {
     let home = std::env::var_os("CARGO_HOME").expect("pinned dev container CARGO_HOME");
     atomic_app::pipeline::TrialCargo::new(PathBuf::from(home).join("registry"), "1.95.0".into())
         .expect("pinned offline registry")
+        .with_v8(
+            atomic_app::pipeline::V8Mirror::from_operator(&|name| std::env::var(name).ok())
+                .expect("the operator's verified V8 mirror"),
+        )
 }
 
 #[test]
@@ -8092,6 +8096,7 @@ fn trial_cargo_disappeared_registry_refuses_before_model_call() {
         let cargo = atomic_app::pipeline::TrialCargo {
             registry: dir.join("missing-registry"),
             toolchain: "1.95.0".into(),
+            v8: None,
         };
         let rt = engine_built_with_trial(
             &dir,

@@ -1826,8 +1826,12 @@ pub struct ExecCargo {
     pub registry: PathBuf,
     /// Installed rustup toolchain selected by the operator.
     pub toolchain: String,
-    /// Host-selected repository object store for the controls proof reader.
+    /// Host-selected repository object store for the controls proof
+    /// reader, and the operator's V8 mirror when there is one.
     pub read_only_bindings: Vec<PathBuf>,
+    /// Host-selected environment for the command's Cargo: the operator's V8
+    /// mirror and its archive hash, when there is one.
+    pub env: Vec<(String, String)>,
 }
 
 /// Open an exec workspace with host-selected offline Cargo inputs.
@@ -1853,6 +1857,9 @@ pub async fn open_exec_workspace_with_cargo(
             "CARGO_NET_OFFLINE",
             "RUSTUP_HOME",
             "RUSTUP_TOOLCHAIN",
+            "RUSTY_V8_MIRROR",
+            "RUSTY_V8_ARCHIVE_SHA256",
+            "RUSTY_V8_SRC_BINDING_PATH",
         ] {
             if declared_env(atom).contains_key(key) {
                 return Err(AtomError::Runtime(format!(
@@ -1868,6 +1875,7 @@ pub async fn open_exec_workspace_with_cargo(
         );
         env.insert("CARGO_NET_OFFLINE".into(), "true".into());
         env.insert("RUSTUP_TOOLCHAIN".into(), cargo.toolchain.clone());
+        env.extend(cargo.env.iter().cloned());
     }
     // Made in each attempt to open the workspace, so a full disk waits for
     // room as the backend's own lack of it does.

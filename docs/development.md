@@ -65,24 +65,27 @@ Astro compiler worker and the isolates captured TypeScript helpers run in. rusty
 prebuilt static library and checks nothing about it, so atomic pins each
 archive and its generated bindings by SHA-256 in
 [`deps/v8.toml`](../deps/v8.toml). `scripts/v8-archive.sh [TARGET]` fetches
-them once into a local mirror and verifies them on every run;
-[`.cargo/config.toml`](../.cargo/config.toml) points `RUSTY_V8_MIRROR` at
-`target/v8-mirror`, so a plain `cargo build` reads only that mirror and fails
-inside V8's build script, before linking, until the script has filled it.
-`scripts/dev.sh` verifies the archive on the host before the container starts
-and keeps its mirror in `~/.cache/atomic/dev/v8-mirror`, so builds work offline
-once it is cached. A tampered file stops the build; delete it to fetch it again.
-`scripts/dev.sh` and CI also give rusty_v8 the archive's pinned hash in
-`RUSTY_V8_ARCHIVE_SHA256`, and rusty_v8 checks the copy it takes against it,
-including a library an earlier build left. `atomic-core`'s build script
+them once into a local mirror (`target/v8-mirror` unless given
+`--mirror`) and verifies them on every run. `scripts/dev.sh` verifies the
+archive on the host before the container starts, keeps its mirror in
+`~/.cache/atomic/dev/v8-mirror`, so builds work offline once it is cached,
+and gives the container `RUSTY_V8_MIRROR`, the archive's pinned hash in
+`RUSTY_V8_ARCHIVE_SHA256` and the pinned bindings in
+`RUSTY_V8_SRC_BINDING_PATH` (which rusty_v8 then reads in place rather than
+copying into its source directory); in CI, `scripts/v8-archive.sh` sets all
+three for the job's later steps. rusty_v8 checks the copy it takes against that hash. The
+repository has no Cargo configuration of its own, so a build without the
+mirror and the hash, a plain `cargo build` included, stops in `atomic-core`'s
+build script. A tampered file stops the build; delete it to fetch it again. `atomic-core`'s build script
 (`build/v8_archive.rs`) checks the mirrored archive and bindings against
 their pins for the V8 version `Cargo.lock` builds, and refuses a build
 without that hash; with `RUSTY_V8_MIRROR` unset, remote or a URL template;
 with a second copy at the mirror's top level; or with any of
 `RUSTY_V8_ARCHIVE`, `V8_FROM_SOURCE`, `RUSTY_V8_MIRROR_TAG`,
 `RUSTY_V8_MIRROR_FALLBACK`, `RUSTY_V8_SKIP_DOWNLOAD`,
-`RUSTY_V8_SRC_BINDING_PATH`, `RUSTY_V8_SRC_BINDING_URL`, `DOCS_RS` or
-`DENO_TRYBUILD` set. It cannot see rusty_v8's own output directory, so it
+`RUSTY_V8_SRC_BINDING_URL`, `DOCS_RS` or `DENO_TRYBUILD` set, or with
+`RUSTY_V8_SRC_BINDING_PATH` naming anything but the pinned bindings in the
+mirror. It cannot see rusty_v8's own output directory, so it
 does not check files changed inside `target/`.
 
 ### Limits

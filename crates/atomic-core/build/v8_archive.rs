@@ -11,8 +11,9 @@
 //! as a URL template or a remote URL is refused, and so is a copy at the
 //! mirror's top level, which rusty_v8 would read when the tagged copy is
 //! missing. `RUSTY_V8_ARCHIVE_SHA256` must be the pinned archive hash, so
-//! rusty_v8 itself checks the copy it takes and any library a previous build
-//! left. Compiled into the build script, and into atomic-core's tests.
+//! rusty_v8 itself checks the copy it takes, and `RUSTY_V8_SRC_BINDING_PATH`
+//! may name only the pinned bindings in the mirror. Compiled into the build
+//! script, and into atomic-core's tests.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -24,18 +25,24 @@ pub(crate) const REFUSED: &[&str] = &[
     "RUSTY_V8_MIRROR_TAG",
     "RUSTY_V8_MIRROR_FALLBACK",
     "RUSTY_V8_SKIP_DOWNLOAD",
-    "RUSTY_V8_SRC_BINDING_PATH",
     "RUSTY_V8_SRC_BINDING_URL",
     "DOCS_RS",
     "DENO_TRYBUILD",
 ];
 
 /// The rusty_v8 settings the check reads, which the build reruns on.
+/// `RUSTY_V8_SRC_BINDING_PATH` is accepted only naming the pinned bindings in
+/// the mirror: rusty_v8 then reads them there instead of copying them into its
+/// own source directory, which an offline, read-only Cargo home cannot take.
 #[cfg_attr(
     test,
     expect(dead_code, reason = "only the build script reruns on them")
 )]
-pub(crate) const READ: &[&str] = &["RUSTY_V8_MIRROR", "RUSTY_V8_ARCHIVE_SHA256"];
+pub(crate) const READ: &[&str] = &[
+    "RUSTY_V8_MIRROR",
+    "RUSTY_V8_ARCHIVE_SHA256",
+    "RUSTY_V8_SRC_BINDING_PATH",
+];
 
 /// One archive deps/v8.toml pins.
 pub(crate) struct Pin {
@@ -130,7 +137,9 @@ pub(crate) fn check(
     }
     let mirror = env("RUSTY_V8_MIRROR")
         .filter(|mirror| !mirror.is_empty())
-        .ok_or("RUSTY_V8_MIRROR is not set; scripts/dev.sh and .cargo/config.toml set it")?;
+        .ok_or(
+            "RUSTY_V8_MIRROR is not set; scripts/dev.sh and CI set it (scripts/v8-archive.sh)",
+        )?;
     if mirror.contains('{') {
         return Err(format!(
             "RUSTY_V8_MIRROR is {mirror}, a URL template, not the local mirror scripts/v8-archive.sh fills"
@@ -191,5 +200,21 @@ pub(crate) fn check(
         }
         read.push(flat);
     }
+    if let Some(given) = env("RUSTY_V8_SRC_BINDING_PATH") {
+        let pinned = mirror.join(format!("v{version}")).join(&pin.binding);
+        let same = std::fs::canonicalize(&given).ok() == Some(canonical(&pinned)?);
+        if !same {
+            return Err(format!(
+                "RUSTY_V8_SRC_BINDING_PATH is {given:?}, not the pinned bindings {}",
+                pinned.display()
+            ));
+        }
+    }
     Ok(read)
+}
+
+/// `path`, canonical; any error refuses.
+fn canonical(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("cannot resolve {}: {error}", path.display()))
 }

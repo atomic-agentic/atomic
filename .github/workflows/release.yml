@@ -96,7 +96,7 @@ jobs:
           restore-keys: cargo-release-${{ runner.os }}-
 
       # The prebuilt V8 archive deps/v8.toml pins for this target, checked
-      # against its SHA-256 into the mirror .cargo/config.toml names.
+      # against its SHA-256 into target/v8-mirror, which it names to rusty_v8.
       - name: V8 archive
         run: scripts/v8-archive.sh ${{ matrix.target }}
 
@@ -193,7 +193,7 @@ jobs:
           restore-keys: cargo-release-${{ runner.os }}-
 
       # The prebuilt V8 archive deps/v8.toml pins for this target, checked
-      # against its SHA-256 into the mirror .cargo/config.toml names.
+      # against its SHA-256 into target/v8-mirror, which it names to rusty_v8.
       - name: V8 archive
         shell: bash
         run: scripts/v8-archive.sh ${{ env.WINDOWS_TARGET }}

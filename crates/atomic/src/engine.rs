@@ -609,7 +609,11 @@ pub async fn open(
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("operator offline Cargo toolchain is not UTF-8"))?,
             )
-            .map_err(anyhow::Error::msg)?,
+            .map_err(anyhow::Error::msg)?
+            .with_v8(
+                atomic_app::pipeline::V8Mirror::from_operator(&|name| std::env::var(name).ok())
+                    .map_err(anyhow::Error::msg)?,
+            ),
         ),
         None => None,
     };
