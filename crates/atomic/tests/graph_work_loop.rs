@@ -6723,10 +6723,33 @@ fn lane_mirror(root: &Path, project: &Path, base: &str) -> PathBuf {
     mirror
 }
 
+/// How long a lane may take to reach a gate or a model call: seconds on
+/// Linux, longer on a loaded macOS runner.
+const LANE_WAITS: usize = 6_000;
+
+/// What runs for the coding lane tests now, as `ps` lists it, for a lane
+/// that never reached what a test waited for.
+fn lane_processes() -> String {
+    let listed = std::process::Command::new("ps")
+        .args(["-axww", "-o", "pid,ppid,etime,command"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|e| format!("ps: {e}"));
+    listed
+        .lines()
+        .filter(|l| {
+            l.contains("graph-loop-reference-lane")
+                || l.contains("sandbox-exec")
+                || l.contains("controls")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The gate this run opened whose name ends with `suffix`. When it never
 /// opens, the run's `log` says why.
 async fn lane_gate(rt: &Durare, suffix: &str, log: &Path) -> gate::Gate {
-    for _ in 0..1_200 {
+    for _ in 0..LANE_WAITS {
         let open = gate::gates(
             rt,
             GateFilter {
@@ -6741,9 +6764,16 @@ async fn lane_gate(rt: &Durare, suffix: &str, log: &Path) -> gate::Gate {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let steps: Vec<String> = rt
+        .steps(LANE)
+        .await
+        .map(|steps| steps.iter().map(|s| s.name.clone()).collect())
+        .unwrap_or_default();
     panic!(
-        "the lane never opened a gate ending in {suffix}; its log:\n{}",
-        std::fs::read_to_string(log).unwrap_or_default()
+        "the lane never opened a gate ending in {suffix}; its checkpointed steps: {steps:?}\n\
+         its log:\n{}\nits processes:\n{}",
+        std::fs::read_to_string(log).unwrap_or_default(),
+        lane_processes()
     );
 }
 
@@ -7303,7 +7333,7 @@ fn reference_coding_lane_offline_repairs_after_request_changes() {
         // base. Kill the CLI with that turn pending, then resume the same run:
         // every finished first-round step must replay from its checkpoint.
         let mut asked = false;
-        for _ in 0..1_200 {
+        for _ in 0..LANE_WAITS {
             asked = model.calls() >= 5;
             if asked {
                 break;
@@ -7312,8 +7342,11 @@ fn reference_coding_lane_offline_repairs_after_request_changes() {
         }
         if !asked {
             panic!(
-                "timed out waiting for the repair author request; the run's log:\n{}",
-                std::fs::read_to_string(&run.log).unwrap_or_default()
+                "timed out waiting for the repair author request after {} model calls; the \
+                 run's log:\n{}\nits processes:\n{}",
+                model.calls(),
+                std::fs::read_to_string(&run.log).unwrap_or_default(),
+                lane_processes()
             );
         }
         run.child.kill().expect("kill the pending repair turn");
