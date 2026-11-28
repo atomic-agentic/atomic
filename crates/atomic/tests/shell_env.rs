@@ -313,6 +313,12 @@ fn run_caches(project: &Path, target: &str, inside: &str) -> PathBuf {
 }
 
 #[test]
+// Under Seatbelt a turn cannot look up the denied scratch root above its own
+// home, so `mkdir -p` with a full path fails there (availability.md).
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "on macOS a turn cannot walk down to its own home from /"
+)]
 fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
     support::require_sandbox();
     on_codex_runtime(async {
