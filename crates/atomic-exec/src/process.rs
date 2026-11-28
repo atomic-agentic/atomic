@@ -1297,6 +1297,10 @@ fn close_inherited_on_exec(
     listed: &mut [libc::proc_fdinfo],
     keep: Option<std::os::fd::RawFd>,
 ) -> std::io::Result<()> {
+    // CONTROL OFF: nothing is marked close-on-exec.
+    if std::hint::black_box(true) {
+        return Ok(());
+    }
     let size = std::mem::size_of::<libc::proc_fdinfo>();
     let room = libc::c_int::try_from(std::mem::size_of_val(listed))
         .map_err(|_| std::io::Error::from_raw_os_error(libc::EOVERFLOW))?;

@@ -297,6 +297,10 @@ pub(crate) fn started(pid: u32) -> Option<u64> {
     #[cfg(target_os = "macos")]
     #[allow(unsafe_code)]
     {
+        // CONTROL OFF: macOS reports no start time, as before the fix.
+        if std::hint::black_box(true) {
+            return None;
+        }
         let pid = libc::c_int::try_from(pid).ok()?;
         let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
