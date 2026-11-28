@@ -53,6 +53,17 @@ const CANARIES: &[&str] = &[
     "UNRELATED_CANARY",
 ];
 
+/// Keep atomic's home where it is on Linux, `atomic` in `data`: there
+/// `XDG_DATA_HOME` places it, and on macOS, whose home is under
+/// `~/Library/Application Support` (here under the temporary directory,
+/// which atomic refuses for scratch), only `ATOMIC_HOME` does.
+fn home_on_macos(run: &mut Command, data: &Path) {
+    #[cfg(target_os = "macos")]
+    run.env("ATOMIC_HOME", data.join("atomic"));
+    #[cfg(not(target_os = "macos"))]
+    let _ = (run, data);
+}
+
 /// The project: `look`, a read-only codex atom, and `tidy`, one that may
 /// write its workspace.
 fn write_project(project: &Path) {
@@ -220,6 +231,7 @@ async fn run_ending(
     ] {
         run.env_remove(name);
     }
+    home_on_macos(&mut run, &atomic_home);
     for (name, value) in env {
         run.env(name, value);
     }
@@ -661,6 +673,7 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         ] {
             command.env_remove(name);
         }
+        home_on_macos(&mut command, &atomic_home);
         for name in CANARIES {
             command.env(name, format!("canary-{}", name.to_lowercase()));
         }
@@ -845,6 +858,7 @@ async fn look_once_prepared(
         ] {
             run.env_remove(name);
         }
+        home_on_macos(&mut run, &atomic_home);
         for (name, value) in env {
             run.env(name, value);
         }
@@ -886,17 +900,17 @@ fn state_dir_of_look(dir: &Path, home: &Path) -> PathBuf {
         "atomic-shell-env-{}",
         dir.file_name().unwrap().to_string_lossy()
     ));
-    let out = Command::new(env!("CARGO_BIN_EXE_atomic"))
-        .args(["debug", "state-dir"])
+    let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+    run.args(["debug", "state-dir"])
         .current_dir(&project)
         .env("HOME", home)
         .env("XDG_DATA_HOME", &atomic_home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env_remove("ATOMIC_HOME")
         .env_remove("CODEX_HOME")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+        .stdin(Stdio::null());
+    home_on_macos(&mut run, &atomic_home);
+    let out = run.output().unwrap();
     assert!(out.status.success(), "{out:?}");
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
@@ -1171,8 +1185,13 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
         std::fs::create_dir_all(home.join(".kube")).unwrap();
         std::fs::create_dir_all(home.join(".config/fish/bin")).unwrap();
         // A cluster's credentials kept by the system, root's own, outside
-        // the system's program directories: here /etc/hostname stands in.
-        let kept = Path::new("/etc/hostname");
+        // the system's program directories: here /etc/hostname stands in,
+        // and on macOS, which has none, /etc/shells.
+        let kept = Path::new(if cfg!(target_os = "macos") {
+            "/etc/shells"
+        } else {
+            "/etc/hostname"
+        });
         let secret = std::fs::read_to_string(kept).expect("a file the system keeps");
         assert!(!secret.trim().is_empty());
         std::os::unix::fs::symlink(kept, home.join(".kube/config")).unwrap();
@@ -1198,11 +1217,18 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
             home.join(".config/fish/bin/python3"),
         )
         .unwrap();
+        // macOS has no `timeout`; perl's alarm ends the read the same way.
+        let timeout = if cfg!(target_os = "macos") {
+            "perl -e 'alarm 3; exec @ARGV or exit 127'"
+        } else {
+            "timeout 3"
+        };
         let command = format!(
-            "cat {h}/.kube/config /etc/hostname 2>/dev/null; timeout 3 cat {h}/.netrc 2>/dev/null; \
+            "cat {h}/.kube/config {k} 2>/dev/null; {timeout} cat {h}/.netrc 2>/dev/null; \
              echo \"pipe=$?\"; \
              {d}/tools/python3; echo looked",
             h = home.display(),
+            k = kept.display(),
             d = dir.display()
         );
         let printed = look_once(&dir, &home, &command, &[]).await;
