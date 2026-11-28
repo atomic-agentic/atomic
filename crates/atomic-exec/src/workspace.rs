@@ -283,8 +283,9 @@ fn owner() -> &'static str {
     })
 }
 
-/// When process `pid` started, in the system's own units, where it says.
-fn started(pid: u32) -> Option<u64> {
+/// When process `pid` started, in the system's own units, where it says: on
+/// Linux in clock ticks since boot, on macOS in microseconds since the epoch.
+pub(crate) fn started(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -293,7 +294,34 @@ fn started(pid: u32) -> Option<u64> {
         let after = stat.rsplit_once(')')?.1;
         after.split_whitespace().nth(19)?.parse().ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    #[allow(unsafe_code)]
+    {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: the buffer is a whole proc_bsdinfo, `size` bytes long, which
+        // is what PROC_PIDTBSDINFO writes; it returns how many it wrote.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if written != size {
+            return None;
+        }
+        // SAFETY: zeroed, then wholly written by the kernel; every field is
+        // a plain integer.
+        let info = unsafe { info.assume_init() };
+        info.pbi_start_tvsec
+            .checked_mul(1_000_000)?
+            .checked_add(info.pbi_start_tvusec)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = pid;
         None
