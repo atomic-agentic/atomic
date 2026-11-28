@@ -885,7 +885,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atomic-login-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
-        dir
+        // As `located` gives it: the test keyring keys by the real path, and
+        // macOS's temporary directory is under the `/var` link.
+        std::fs::canonicalize(&dir).expect("dir")
     }
 
     /// Log in at the test issuer on `port`, with this test as the browser:
