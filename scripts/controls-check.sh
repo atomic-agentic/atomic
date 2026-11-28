@@ -82,8 +82,28 @@ die_unedited() {
 # ${STATE} rather than inside it, because ${STATE} is deleted on the way out
 # and deleting a lock's file lets a second holder in beside the first.
 LOCK="${ROOT}/target/controls-check.lock"
-command -v flock >/dev/null 2>&1 ||
-    die "flock is not available, so this run cannot be kept apart from another; nothing was edited"
+# Taken with flock(1) where it is installed, and otherwise with python3's
+# fcntl.flock on the same descriptor: macOS has no flock command. Either is a
+# separate process taking a BSD lock on the open file descriptor 9 names, which
+# this process keeps open, so the lock outlives the process that took it and
+# ends with this run. 0 when it is taken, 1 when another run holds it, and
+# anything else when it could not be asked for.
+take_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        flock -n 9
+    else
+        python3 -c 'import errno, fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError as e:
+    if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+        sys.exit(1)
+    print(e, file=sys.stderr)
+    sys.exit(2)'
+    fi
+}
+command -v flock >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1 ||
+    die "neither flock nor python3 is available, so this run cannot be kept apart from another; nothing was edited"
 mkdir -p "${ROOT}/target" || die "cannot create ${ROOT}/target for the run's lock; nothing was edited"
 if ! exec 9>>"${LOCK}"; then
     die "cannot open ${LOCK} for the run's lock; nothing was edited"
@@ -94,8 +114,12 @@ fi
 # that took it ends, however it ends, and removing the file would free nothing
 # while letting a third run lock a fresh file beside the run still holding the
 # old one.
-flock -n 9 ||
-    die "${LOCK} is held by another scripts/controls-check.sh run in this tree; it frees itself when that run ends, so wait for it and do not remove ${LOCK}; nothing was edited"
+take_lock
+case $? in
+0) ;;
+1) die "${LOCK} is held by another scripts/controls-check.sh run in this tree; it frees itself when that run ends, so wait for it and do not remove ${LOCK}; nothing was edited" ;;
+*) die "cannot take the lock on ${LOCK}; nothing was edited" ;;
+esac
 
 # No git is handed the lock's descriptor, as no cargo is. A git whose worktree
 # has core.fsmonitor set starts a fsmonitor daemon out of `git diff` or
