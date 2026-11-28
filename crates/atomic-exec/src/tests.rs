@@ -140,12 +140,15 @@ fn backend(tag: &str) -> LocalBackend {
 
 /// The name this process gives its own attempts' directories.
 fn tagged(pid: u32, attempt: &str) -> String {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-    let start = stat
+    // Read here from /proc on Linux, apart from the code under test.
+    #[cfg(target_os = "linux")]
+    let start = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .unwrap_or_default()
         .rsplit_once(')')
-        .and_then(|(_, after)| after.split_whitespace().nth(19))
-        .unwrap_or("0")
-        .to_owned();
+        .and_then(|(_, after)| after.split_whitespace().nth(19).map(str::to_owned))
+        .unwrap_or_else(|| "0".into());
+    #[cfg(not(target_os = "linux"))]
+    let start = workspace::started(pid).unwrap_or(0).to_string();
     format!("{pid}.{start}-{attempt}")
 }
 
@@ -394,7 +397,7 @@ fn connecting_sweeps_the_scratch_of_killed_attempts_only() {
     assert!(!theirs.exists(), "a killed attempt's scratch goes");
     assert!(!step.exists(), "and its step's directory with it");
     assert!(ours.is_dir(), "this process's own attempts stay");
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert!(
         !reused.exists(),
         "an earlier process with the same id is dead"
