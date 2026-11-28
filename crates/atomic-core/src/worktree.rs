@@ -550,7 +550,11 @@ impl Worktrees {
     /// Check that a trial check did not rewrite tracked merged content.
     pub fn trial_changed_tracked(&self, run: &str, step: &str, tree: &str) -> Result<Vec<String>> {
         let name = worktree_name(run, step);
-        let path = self.dir.join(&name);
+        // Where `prepare` put it: git records the worktree's real path.
+        let dir = std::fs::canonicalize(&self.dir).map_err(io("resolve", &self.dir))?;
+        #[cfg(windows)]
+        let dir = dunce::simplified(&dir);
+        let path = dir.join(&name);
         let git_dir = self.admin_dir(&name);
         self.check_admin(&git_dir, &path)?;
         let repo = self

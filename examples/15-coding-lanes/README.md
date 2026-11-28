@@ -261,7 +261,7 @@ closed output schema also accepts the production driver's `error`, `tree`,
 still accepts only the host driver's bound `passed` result. `intact` is as far
 as a local read-only inspection can honestly go.
 
-`trial_merge` needs the Linux exec sandbox to run for real. A `trial_merge`
+`trial_merge` needs a confined exec sandbox, on Linux or macOS, to run for real. A `trial_merge`
 check that runs Cargo additionally needs `ATOMIC_TRIAL_CARGO_REGISTRY` and
 `ATOMIC_TRIAL_RUSTUP_TOOLCHAIN` from the operator, and a controls driver that
 runs Cargo needs `ATOMIC_CONTROLS_CARGO_REGISTRY` and

@@ -138,7 +138,7 @@ def main():
 
         # One row per file: five fields, so four separators. At most one
         # trailing newline comes off first: that is how the file ends rather than
-        # a second row, which is what scripts/controls-check.sh's mapfile sees,
+        # a second row, which is what scripts/controls-check.sh's reader sees,
         # so a row file written without the newline is refused by neither and one
         # holding a blank line after its row is refused by both. A file holding
         # nothing at all holds no row, which is why empty text counts as zero

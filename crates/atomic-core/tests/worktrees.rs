@@ -116,6 +116,37 @@ fn trial_merge_refuses_info_attributes_that_select_union() {
     assert_eq!(status(&f), before, "source checkout remains unchanged");
 }
 
+/// A trial's check is verified in the worktree the trial checked out, even
+/// where the state directory is reached through a link, as macOS's
+/// temporary directory under `/var` is: git records the worktree's real
+/// path.
+#[test]
+fn a_trial_is_verified_where_the_state_directory_is_a_link() {
+    let scratch = Scratch::new("trial-linked-state");
+    let (project, first, _) = support::project(scratch.path());
+    let real = scratch.path().join("real-state");
+    std::fs::create_dir_all(&real).unwrap();
+    let state = scratch.path().join("state");
+    std::os::unix::fs::symlink(&real, &state).unwrap();
+    let repo = Git::find().unwrap().discover(&project).unwrap();
+    let worktrees = Worktrees::new(repo, state.join("worktrees"));
+    let wt = worktrees.prepare("run", "candidate", &first).unwrap();
+    write(&wt.path.join("trial.txt"), "candidate\n");
+    let candidate = worktrees
+        .commit(&wt, "candidate", &Signature::default())
+        .unwrap();
+    let (_, _, _, tree) = worktrees
+        .trial_merge("run", "trial", &candidate, "main", None)
+        .unwrap();
+    let tree = tree.expect("a clean trial merge");
+    assert_eq!(
+        worktrees
+            .trial_changed_tracked("run", "trial", &tree)
+            .unwrap(),
+        Vec::<String>::new()
+    );
+}
+
 #[test]
 fn every_attempt_starts_from_the_base() {
     let f = fixture("reset");

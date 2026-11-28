@@ -1315,10 +1315,12 @@ fn check_review(
         ));
     }
     if let Some(trial) = r.get("trial_merge") {
-        if !cfg!(target_os = "linux") {
+        if !crate::codex::CONFINES_EXEC {
             return Err(fail(
                 &format!("{rp}/trial_merge"),
-                "trial-merge checks need a Linux execution sandbox".into(),
+                "trial-merge checks need a confined execution sandbox, which atomic has on Linux \
+                 and macOS"
+                    .into(),
             ));
         }
         if !reviewed.coding || !reviewed.worktree {
@@ -1517,10 +1519,12 @@ fn check_review(
             ));
         }
         if let Some(name) = controls_name {
-            if !cfg!(target_os = "linux") {
+            if !crate::codex::CONFINES_EXEC {
                 return Err(fail(
                     &format!("{rp}/self_review/controls_atom"),
-                    "controls proof requires the Linux exec sandbox".into(),
+                    "controls proof requires a confined exec sandbox, which atomic has on Linux \
+                     and macOS"
+                        .into(),
                 ));
             }
             if !reviewed.coding || !selected {

@@ -6304,7 +6304,7 @@ steps:
 returns: steps.code.output
 "#;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_review_refuses_missing_trial_merge_before_any_turn() {
     let dir = scratch("coding-missing-trial");
@@ -6323,7 +6323,7 @@ fn coding_review_refuses_missing_trial_merge_before_any_turn() {
     assert!(error.contains("trial merge"), "wrong refusal: {error}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_review_refuses_runtime_snapshot_without_trial_merge() {
     let dir = scratch("coding-runtime-missing-trial");
@@ -6511,7 +6511,7 @@ fn seed_self_review_fixture(project: &Path, with_controls: bool, blind: bool) ->
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn self_review_fixture(project: &Path, with_controls: bool, blind: bool) -> (Pipeline, String) {
     let workflow = seed_self_review_fixture(project, with_controls, blind);
     let pipeline = load(project, "self-reviewed.workflow.yaml", &workflow);
@@ -6523,12 +6523,12 @@ fn self_review_fixture(project: &Path, with_controls: bool, blind: bool) -> (Pip
     (pipeline, base)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn self_reviewed(project: &Path) -> (Pipeline, String) {
     self_review_fixture(project, false, false)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_review_requires_host_inventory_input_contract() {
     let dir = scratch("review-host-contract");
@@ -6568,7 +6568,7 @@ fn coding_review_requires_host_inventory_input_contract() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_refuses_incompatible_required_host_inventory_schema_before_model() {
     let dir = scratch("panel-host-contract");
@@ -6594,7 +6594,7 @@ fn coding_panel_refuses_incompatible_required_host_inventory_schema_before_model
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_preflights_nested_host_inventory_for_every_member_before_reviewers() {
     on_codex_runtime(async {
@@ -6658,7 +6658,7 @@ fn coding_panel_preflights_nested_host_inventory_for_every_member_before_reviewe
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn panel_reviewed(project: &Path) -> (Pipeline, String) {
     let (_, _) = self_reviewed(project);
     for extension in ["atom.astro", "input.schema.json", "output.schema.json"] {
@@ -8160,7 +8160,7 @@ fn trial_cargo_registry_link_is_read_only_to_candidate_checks() {
 }
 
 #[test]
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn trial_merge_is_refused_at_load_without_a_linux_sandbox() {
     let dir = scratch("trial-no-sandbox");
     let project = project(&dir);
@@ -8169,7 +8169,7 @@ fn trial_merge_is_refused_at_load_without_a_linux_sandbox() {
         SELF_REVIEW_WORKFLOW.replace("checks: [['true']]", "checks: [[python3, -c, 'pass']]");
     let error = try_load(&project, "trial-no-sandbox.workflow.yaml", &workflow)
         .expect_err("trial merge requires Linux confinement");
-    assert!(error.contains("Linux execution sandbox"), "{error}");
+    assert!(error.contains("confined execution sandbox"), "{error}");
 }
 
 #[cfg(target_os = "linux")]
@@ -8515,7 +8515,7 @@ fn legacy_fake_controls_receipt_cannot_resume_or_replay_under_current_layout() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn self_review_evidence_is_a_sibling_step_and_reaches_reviewer_with_diff() {
     on_codex_runtime(async {
@@ -8586,7 +8586,7 @@ fn self_review_evidence_is_a_sibling_step_and_reaches_reviewer_with_diff() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn self_review_cannot_claim_a_control_that_the_host_did_not_prove() {
     on_codex_runtime(async {
@@ -9766,14 +9766,14 @@ fn controls_proof_refuses_declared_network_before_any_model_turn() {
     });
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn controls_proof_requires_the_linux_exec_sandbox() {
     let dir = scratch("controls-proof-linux-only");
     let project = project(&dir);
     let _ = seed_self_review_fixture(&project, true, false);
-    // A coding review is refused earlier on macOS because trial merge itself
-    // needs Linux. Remove that separate dependency to exercise controls proof.
+    // A coding review is refused earlier where trial merge itself cannot be
+    // confined. Remove that separate dependency to exercise controls proof.
     let workflow = controls_self_review_workflow()
         .replace("    coding: true\n", "    coding: false\n")
         .replace(
@@ -9788,10 +9788,10 @@ fn controls_proof_requires_the_linux_exec_sandbox() {
         &workflow,
     )
     .expect_err("source loader refuses controls without Linux sandbox");
-    assert!(error.contains("Linux exec sandbox"), "{error}");
+    assert!(error.contains("confined exec sandbox"), "{error}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn reviewer_gets_the_exact_nonempty_host_patch_with_self_review_evidence() {
     on_codex_runtime(async {
@@ -9864,7 +9864,7 @@ fn reviewer_gets_the_exact_nonempty_host_patch_with_self_review_evidence() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_requires_both_fresh_reviewers_before_publication() {
     on_codex_runtime(async {
@@ -9946,7 +9946,7 @@ fn coding_panel_requires_both_fresh_reviewers_before_publication() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_either_rejection_blocks_publication() {
     for rejected in 0..2 {
@@ -10010,7 +10010,7 @@ fn coding_panel_either_rejection_blocks_publication() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_repairs_then_requires_both_reviewers_again() {
     on_codex_runtime(async {
@@ -10132,7 +10132,7 @@ fn coding_panel_repairs_then_requires_both_reviewers_again() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_recovery_does_not_repeat_first_reviewer() {
     on_codex_runtime(async {
@@ -10198,7 +10198,7 @@ fn coding_panel_recovery_does_not_repeat_first_reviewer() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn recovered_panel_refuses_stale_main_before_unfinished_reviewer() {
     on_codex_runtime(async {
@@ -10275,7 +10275,7 @@ fn recovered_panel_refuses_stale_main_before_unfinished_reviewer() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_panel_selection_is_fixed_by_workflow_source() {
     let dir = scratch("coding-review-panel-policy");
@@ -10301,7 +10301,7 @@ fn coding_panel_selection_is_fixed_by_workflow_source() {
     assert!(error.contains("requires `require: all`"), "{error}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn incomplete_self_review_evidence_refuses_before_reviewer_turn() {
     on_codex_runtime(async {
@@ -10353,7 +10353,7 @@ fn incomplete_self_review_evidence_refuses_before_reviewer_turn() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn host_decision_inventory_refuses_workflow_and_model_omission_before_reviewer() {
     on_codex_runtime(async {
@@ -10994,7 +10994,7 @@ fn reviewed_decision_inventory_refuses_missing_malformed_and_link_loop_base() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn candidate_cannot_rewrite_reviewed_decision_inventory_before_reviewer() {
     on_codex_runtime(async {
@@ -11052,7 +11052,7 @@ fn candidate_cannot_rewrite_reviewed_decision_inventory_before_reviewer() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn earlier_unreviewed_worktree_cannot_replace_admitted_decision_inventory() {
     on_codex_runtime(async {
@@ -11644,7 +11644,7 @@ fn coding_revert_of_control_row_refuses_untrusted_definition_change() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn unreadable_touched_control_source_refuses_before_reviewer() {
     on_codex_runtime(async {
@@ -11759,7 +11759,7 @@ fn self_review_refuses_empty_na_and_omitted_selected_row() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_step_refuses_removed_self_review_before_any_model_turn() {
     on_codex_runtime(async {
@@ -11814,7 +11814,7 @@ fn coding_step_refuses_removed_self_review_before_any_model_turn() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_step_refuses_reviewer_without_host_diff_before_any_model_turn() {
     on_codex_runtime(async {
@@ -11864,7 +11864,7 @@ fn coding_step_refuses_reviewer_without_host_diff_before_any_model_turn() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_step_does_not_send_author_reasoning_to_reviewer() {
     on_codex_runtime(async {
@@ -11914,7 +11914,7 @@ fn coding_step_does_not_send_author_reasoning_to_reviewer() {
     });
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn noncoding_worktree_cannot_claim_a_host_diff_that_is_not_produced() {
     let dir = scratch("noncoding-no-diff");
@@ -11933,7 +11933,7 @@ fn noncoding_worktree_cannot_claim_a_host_diff_that_is_not_produced() {
     assert!(error.contains("review/with/diff"), "{error}");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn coding_author_cannot_be_its_own_reviewer_in_a_direct_pipeline() {
     on_codex_runtime(async {
