@@ -377,3 +377,81 @@ fn executable_criteria_isolate_other_projects_scratch_on_both_runners() {
         Err(atomic_exec::ExecError::Unconfinable { message }) if message == "backend provides no confinement check"));
     std::fs::remove_dir_all(dir).expect("remove fixtures");
 }
+
+/// A probe, not a test: whether a confined exec command reads another
+/// process's environment through KERN_PROCARGS2, with and without an
+/// explicit Seatbelt deny. Always fails, to show its output.
+#[cfg(target_os = "macos")]
+#[test]
+fn probe_procargs_from_a_confined_exec_command() {
+    support::require_sandbox();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-procargs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("cwd")).expect("dir");
+    let dir = std::fs::canonicalize(dir).expect("canonical");
+    let mut holder = std::process::Command::new("sleep")
+        .arg("120")
+        .env("PROBE_CANARY", "canary-env-procargs")
+        .spawn()
+        .expect("holder");
+    let script = "import ctypes\nlibc = ctypes.CDLL(None, use_errno=True)\nbuf = ctypes.create_string_buffer(1 << 18)\nreadable, found, errs = 0, [], {}\nfor pid in range(1, 100000):\n    mib = (ctypes.c_int * 3)(1, 49, pid)\n    size = ctypes.c_size_t(1 << 18)\n    if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) == 0:\n        readable += 1\n        if b'canary-env-procargs' in buf.raw[:size.value]:\n            found.append(pid)\n    else:\n        e = ctypes.get_errno()\n        errs[e] = errs.get(e, 0) + 1\nprint('readable=%d canary_in=%s errs=%s' % (readable, found, errs))\n";
+    let mut report = format!("holder pid {}\n", holder.id());
+    for deny in [false, true] {
+        let sandbox = ExecSandbox::new(
+            &CodexPaths::with_helpers(
+                PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+                PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+            ),
+            StateGuard::NoProjectState,
+            dir.join("codex"),
+        )
+        .expect("confinement");
+        // SAFETY: the probe runs alone in its own test process slot; nothing
+        // else reads this variable concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            if deny {
+                std::env::set_var("ATOMIC_PROBE_DENY_PROCARGS", "1");
+            } else {
+                std::env::remove_var("ATOMIC_PROBE_DENY_PROCARGS");
+            }
+        }
+        let backend =
+            LocalBackend::in_dir(dir.join(format!("scratch-{deny}"))).confined(Arc::new(sandbox));
+        backend.connect().expect("connects");
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        let workspace = backend
+            .open(&atomic_exec::Open {
+                label: "procargs".into(),
+                source: Some(dir.join("project")),
+                ..atomic_exec::Open::default()
+            })
+            .expect("opens");
+        let cwd = dir.join("cwd");
+        let done = backend
+            .run(&atomic_exec::Command {
+                program: "python3".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: cwd.clone(),
+                env: vec![
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("HOME".into(), cwd.display().to_string()),
+                ],
+                time_limit: std::time::Duration::from_secs(120),
+                output_limit: 1 << 16,
+                writable: vec![cwd.clone()],
+                ..atomic_exec::Command::default()
+            })
+            .expect("runs");
+        backend.close(&workspace).expect("closes");
+        report.push_str(&format!(
+            "deny={deny}: {} {}\n",
+            String::from_utf8_lossy(&done.stdout),
+            String::from_utf8_lossy(&done.stderr)
+        ));
+    }
+    let _ = holder.kill();
+    let _ = holder.wait();
+    panic!("PROBE procargs\n{report}");
+}

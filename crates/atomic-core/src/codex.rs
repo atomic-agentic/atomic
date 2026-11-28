@@ -4295,6 +4295,11 @@ impl ExecSandbox {
             .next()
             .ok_or_else(|| fail("Codex gave no command to run it under Seatbelt".into()))?;
         let mut args: Vec<String> = argv.collect();
+        if std::env::var_os("ATOMIC_PROBE_DENY_PROCARGS").is_some() && args.len() > 1 {
+            args[1].push_str(
+                "\n(deny sysctl-read (sysctl-name \"kern.procargs2\") (sysctl-name \"kern.procargs\"))",
+            );
+        }
         let ancestors = denied_ancestors(&profile, command);
         if !ancestors.is_empty() {
             // `-p <policy>` leads, then the policy's `-D` parameters.
