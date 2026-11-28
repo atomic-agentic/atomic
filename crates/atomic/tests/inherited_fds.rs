@@ -16,10 +16,11 @@
 //! user namespaces, so it runs with the `sandbox-tests` feature; with the
 //! feature on, a sandbox that cannot start fails the test.
 //!
-//! On macOS the first two ways in, through atomic's own entry, are tested
-//! too: atomic marks what it was started with close-on-exec there. The
-//! tests of the Linux sandbox helper, and of a kernel without
-//! `close_range`, are Linux-only.
+//! On macOS the first three ways in are tested too: atomic marks what it
+//! was started with close-on-exec there, and a confined command's child
+//! marks what this process holds before it starts `sandbox-exec`. The tests
+//! of the Linux sandbox helper, and of a kernel without `close_range`, are
+//! Linux-only.
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos"),
@@ -129,8 +130,9 @@ fn listed_on(backend: &dyn ExecutionBackend, dir: &Path) -> String {
 }
 
 /// Left open in this process, the descriptors reach no confined command:
-/// the sandbox helper this process starts keeps them from it.
-#[cfg(target_os = "linux")]
+/// on Linux the sandbox helper this process starts keeps them from it, and
+/// on macOS the child marks them close-on-exec before it starts
+/// `sandbox-exec`.
 #[test]
 fn a_confined_command_holds_none_of_the_descriptors_left_open_in_its_parent() {
     support::require_sandbox();

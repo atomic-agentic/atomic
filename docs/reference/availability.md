@@ -308,8 +308,12 @@ a command, or another program atomic starts. On Linux, atomic uses
 it has neither, atomic does not start, and the helper does not start the
 command. Codex's process launcher also marks, as far as it can, what a turn's
 commands would inherit close-on-exec. On macOS atomic marks them from
-the list in `/dev/fd`. Tests on macOS show that an exec atom's command
-holds none of them, run on atomic's own backend or through a runner. That a
+the list in `/dev/fd`. With no sandbox helper there to close them, it also
+marks every descriptor its process holds close-on-exec in each exec command's
+child, before `sandbox-exec` starts, so a program that embeds atomic's
+libraries does not leak its own descriptors either.
+Tests on macOS show that an exec atom's command holds none of them, run on
+atomic's own backend or through a runner, or confined by a library caller. That a
 turn's commands hold none on macOS is not yet tested. Windows, where a process
 inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; a `workspace-write` turn's `HOME` (and `ZDOTDIR`) is a private
