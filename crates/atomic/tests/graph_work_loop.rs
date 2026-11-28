@@ -6723,8 +6723,9 @@ fn lane_mirror(root: &Path, project: &Path, base: &str) -> PathBuf {
     mirror
 }
 
-/// The gate this run opened whose name ends with `suffix`.
-async fn lane_gate(rt: &Durare, suffix: &str) -> gate::Gate {
+/// The gate this run opened whose name ends with `suffix`. When it never
+/// opens, the run's `log` says why.
+async fn lane_gate(rt: &Durare, suffix: &str, log: &Path) -> gate::Gate {
     for _ in 0..1_200 {
         let open = gate::gates(
             rt,
@@ -6740,7 +6741,10 @@ async fn lane_gate(rt: &Durare, suffix: &str) -> gate::Gate {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the lane never opened a gate ending in {suffix}");
+    panic!(
+        "the lane never opened a gate ending in {suffix}; its log:\n{}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
 }
 
 /// Enroll this test's own operator and decide `id` with their credential. This
@@ -6848,7 +6852,7 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         let rt = lane_runtime(&root, &project).await;
 
         // The panel's escalate reaches a person, naming both verdicts.
-        let review = lane_gate(&rt, ":code.review").await;
+        let review = lane_gate(&rt, ":code.review", &run.log).await;
         assert_eq!(review.id, format!("{LANE}:code.review"), "{}", review.id);
         let escalated: Vec<&str> = review.show["verdict"]["reviewers"]
             .as_array()
@@ -6875,7 +6879,7 @@ fn reference_coding_lane_offline_runs_the_declared_lane_to_both_human_gates() {
         decide_lane_gate(&root, &project, &url, &review.id, "lane-review-decision").await;
 
         // The lane's own gate, showing the commit atomic recorded.
-        let merge = lane_gate(&rt, ":authorize-merge").await;
+        let merge = lane_gate(&rt, ":authorize-merge", &run.log).await;
         assert_eq!(merge.id, format!("{LANE}:authorize-merge"));
         decide_lane_gate(&root, &project, &url, &merge.id, "lane-merge-decision").await;
 
@@ -7298,7 +7302,20 @@ fn reference_coding_lane_offline_repairs_after_request_changes() {
         // for repair. The repair turn has its own worktree, based on the bound
         // base. Kill the CLI with that turn pending, then resume the same run:
         // every finished first-round step must replay from its checkpoint.
-        wait_for("the repair author request", || model.calls() >= 5).await;
+        let mut asked = false;
+        for _ in 0..1_200 {
+            asked = model.calls() >= 5;
+            if asked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if !asked {
+            panic!(
+                "timed out waiting for the repair author request; the run's log:\n{}",
+                std::fs::read_to_string(&run.log).unwrap_or_default()
+            );
+        }
         run.child.kill().expect("kill the pending repair turn");
         run.child.wait().expect("reap the interrupted CLI");
         run = LaneChild::start(
@@ -7338,7 +7355,7 @@ fn reference_coding_lane_offline_repairs_after_request_changes() {
         std::fs::write(&repair_release, "release").expect("release repair author");
 
         let rt = lane_runtime(&root, &project).await;
-        let merge = lane_gate(&rt, ":authorize-merge").await;
+        let merge = lane_gate(&rt, ":authorize-merge", &run.log).await;
         assert_eq!(merge.id, format!("{LANE}:authorize-merge"));
         decide_lane_gate(
             &root,
