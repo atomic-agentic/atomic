@@ -527,6 +527,7 @@ const SECRET_DIRS: &[&str] = &[
     ".config/gh",
     ".password-store",
     ".local/share/keyrings",
+    "Library/Keychains",
     ".config/fish",
     ".local/share/fish",
     ".claude",

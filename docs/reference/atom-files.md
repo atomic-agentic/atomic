@@ -496,7 +496,8 @@ configuration directory, nor the file behind a link in it, nor the places in
 your real home directory where credentials are kept: `.ssh`, `.aws`, `.netrc`, `.codex`, `.config/gcloud`,
 `.azure`, `.kube`, `.docker/config.json`, `.gnupg`, `.npmrc`, `.pypirc`,
 `.git-credentials`, `.config/gh`, cargo's `credentials` files,
-`.password-store`, `.local/share/keyrings`, and the shell startup, logout
+`.password-store`, `.local/share/keyrings`, macOS's `Library/Keychains`, and
+the shell startup, logout
 and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,

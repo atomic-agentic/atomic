@@ -219,7 +219,7 @@ runs out) are built; `atomic gates answer` answers one from another terminal.
 
 Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
 `model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
-only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+and macOS, for the developer's own runs: a shared store and `atomic serve` refuse it.
 Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
@@ -433,8 +433,11 @@ sign-in, another project's database or a key in your home directory, and
 cannot open a socket or a network connection. A command whose atom declares
 hosts is refused on macOS for now: there atomic cannot yet tell its
 connections from another command's, so it gives it no proxy. On Windows,
-atomic refuses standalone exec commands. Both platforms refuse credentialed
-gate decisions.
+atomic refuses standalone exec commands and credentialed gate decisions. On
+macOS, operator credentials are kept in the login keychain or the opt-in file
+store, and the macOS sandbox suites show that neither an exec command nor a
+turn's command can read a keychain item, the keychain files or the file
+store.
 
 An exec atom's command hands large results over by reference: it writes a
 file to its outputs directory and names it in its output, and the next step's

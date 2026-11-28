@@ -48,6 +48,7 @@ test epic_run
 test entry_point
 test examples
 test exec_private_state
+test keychain_reach
 test late_links
 test second_mounts
 test stale_roots

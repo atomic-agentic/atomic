@@ -782,7 +782,7 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
         "the credential store was placed at the relative spelling of `HOME`, and the file \
          store refused itself there: {t}"
     );
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert!(
             said.contains(&unsupported.to_string()),
             "wrong refusal: {t}"
@@ -819,7 +819,7 @@ fn a_relative_home_keeps_credentials_at_the_one_configuration_directory() {
     // Which home the password database gives is this machine's; the unit
     // tests of the credential and key places pin that choice with a home
     // they make up.
-    if !cfg!(target_os = "linux") {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(kind, "error", "{t}");
         assert_eq!(description, unsupported.to_string(), "{t}");
     } else if description.contains("the home directory is unknown") {

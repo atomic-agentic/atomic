@@ -3233,7 +3233,7 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             // The operator's credential, enrolled and kept in the file store, as
             // `atomic gates enroll` leaves it.
@@ -3289,9 +3289,9 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         })
         .await
         .expect("child");
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(out.status.success(), "{}", text(&out));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
             let refusal =
                 atomic_core::credential::CredentialError::Unprotected(std::env::consts::OS);
