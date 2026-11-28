@@ -12,7 +12,9 @@
 #    codex-rs/Cargo.toml, between the BEGIN and END markers. atomic adds one entry inside
 #    [patch.crates-io], marked as atomic's: sqlx-postgres from the same sqlx fork revision
 #    Codex uses for sqlx-core, because Codex patches only sqlx-core and sqlx-sqlite and a
-#    crates.io sqlx-postgres does not build against the patched core.
+#    crates.io sqlx-postgres does not build against the patched core. It also adds
+#    deno_core and deno_v8 from third_party/deno, the releases carried onto the V8 Codex
+#    patches in (third_party/deno/README.md), so the build holds one V8.
 # 2. rust-toolchain.toml names the toolchain Codex's rust-toolchain.toml names.
 # 3. deps/codex.toml records that same toolchain.
 # 4. Every git dependency on Codex uses the pinned repository and revision.
@@ -60,7 +62,8 @@ fetch Cargo.toml "${WORK}/codex-Cargo.toml"
 fetch rust-toolchain.toml "${WORK}/codex-toolchain.toml"
 
 # Every [patch...] section of Codex's manifest, verbatim, with trailing blank lines dropped
-# from each section and atomic's sqlx-postgres entry appended to [patch.crates-io].
+# from each section and atomic's sqlx-postgres, deno_core and deno_v8 entries appended to
+# [patch.crates-io].
 generate_block() {
     awk -v begin="${BEGIN}" -v end="${END}" '
         function flush(   i) {
@@ -73,6 +76,9 @@ generate_block() {
                 if (sqlx_core == "") { print "codex [patch.crates-io] has no sqlx-core entry" > "/dev/stderr"; exit 3 }
                 print "# atomic: the Postgres driver from the same sqlx fork revision as sqlx-core."
                 print sqlx_core
+                print "# atomic: deno_core and deno_v8 carried onto the v8 above (third_party/deno/README.md)."
+                print "deno_core = { path = \"third_party/deno/deno_core\" }"
+                print "deno_v8 = { path = \"third_party/deno/deno_v8\" }"
             }
             printed = 1
             header = ""; n = 0

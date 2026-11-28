@@ -62,7 +62,7 @@ fn production_binary_enforces_rust_helper_process_controls() {
              for (let i = 0; i < count; i++) kept.push(new Uint8Array(size));
              return kept.reduce((n, item) => n + item.length, 0);
            };
-           export const grow = () => 'x'.repeat(16 << 20).length;
+           export const grow = () => { const kept = []; while (true) kept.push(new Array(100_000).fill(kept.length)); };
            export const spin = () => { while (true) {} };
            export const dynamic = () => import('./math.js');"#,
     );

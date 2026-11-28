@@ -65,7 +65,7 @@ independently validates complete schemas and the allowed expression AST; ordinar
 Astro tooling accepts syntax that Atomic deliberately rejects.
 
 Project-local `node_modules` are not required for running atoms. The shipped compiler
-includes the native Astro parser, the tsz TypeScript checker and the Boa engine. The authoring package's npm dependencies are contributor tooling for rebuilding and
+includes the native Astro parser, the tsz TypeScript checker and the V8 engine. The authoring package's npm dependencies are contributor tooling for rebuilding and
 testing those assets. The production loader checks fresh virtual declarations even
 when the on-disk editor files are stale.
 

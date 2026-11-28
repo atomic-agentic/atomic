@@ -1,0 +1,1 @@
+compiler-buffer-budget|crates/atomic-core/src/compiler_host.rs|.array_buffer_allocator(allocator),|.array_buffer_allocator(v8::new_default_allocator().make_shared()), // CONTROL_OFF|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

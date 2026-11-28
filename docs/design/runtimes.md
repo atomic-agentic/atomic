@@ -220,7 +220,8 @@ Naming a credential the manifest lacks fails the load. See
 Declarative atoms and planned code atoms use different runtimes.
 
 **Today.** The bundled Astro compiler, which every declarative atom passes
-through, runs on the Boa engine linked into the atomic binary, in a child
+through, runs on the V8 engine linked into the atomic binary through
+`deno_core`, in a child
 process of atomic itself with no network, environment, filesystem or subprocess
 access; no Deno executable is needed. The same engine runs helper isolates.
 

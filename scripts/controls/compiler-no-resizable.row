@@ -1,0 +1,1 @@
+compiler-no-resizable|crates/atomic-core/src/compiler_host.rs|if (arguments.length > 1 && arguments[1] !== undefined)|if (false)|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

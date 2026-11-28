@@ -47,6 +47,6 @@ has been removed from the authoring contract; move its executable work into a
 script step.
 
 Atomic parses Astro and checks TypeScript in Rust. The bundled renderer runs
-in Boa inside a child process with no network, environment, filesystem or
+on V8, embedded through `deno_core`, inside a child process with no network, environment, filesystem or
 subprocess access. See
 [development](../development.md) for rebuilding and testing compiler assets.

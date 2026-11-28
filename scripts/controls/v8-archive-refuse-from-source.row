@@ -1,0 +1,1 @@
+v8-archive-refuse-from-source|crates/atomic-core/build/v8_archive.rs|"V8_FROM_SOURCE",|"CONTROL_OFF_V8_FROM_SOURCE",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_build_from_source

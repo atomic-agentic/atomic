@@ -1,0 +1,1 @@
+helper-uncaptured-module|crates/atomic-core/src/helper_runtime.rs|self.0.contains_key(url.as_str())|true /* CONTROL_OFF */|-p atomic-agentic-core --lib -- helper_runtime::tests::imports_outside_the_capture_and_dynamic_imports_are_refused

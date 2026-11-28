@@ -2,9 +2,14 @@
 
 //! Each helper call runs in a child process of its own.
 //!
-//! A child runs under memory, CPU and wall-time limits. The host reports
-//! allocation failures and termination without sharing guest state. On macOS
-//! the host holds the process memory limit (see `child_memory`).
+//! Some failures inside V8 cannot be caught: an "invalid size" error or an
+//! allocation V8 cannot satisfy aborts the process it runs in, whatever the
+//! isolate's limits. Memory V8 allocates outside its heap (flattened
+//! strings, compiled regular expressions, parser buffers) is also outside
+//! the heap limit. A process boundary contains both: the child runs one
+//! call under an operating-system limit on its writable memory (on macOS the
+//! host holds that limit, see `child_memory`), the host kills it at the
+//! call's deadline, and a child that dies takes nothing with it.
 //! The child is the atomic binary itself, started with [`CHILD_ARG`] and a
 //! cleared environment, so the host's timezone and locale never reach it.
 //! It reads one request on stdin and writes one result line on stdout.
@@ -26,8 +31,8 @@ pub const CHILD_ARG: &str = "__atomic-helper";
 /// harness's) is ignored.
 const RESULT: &str = "atomic-helper-result ";
 
-/// Writable memory the child needs besides the call's own limits: the engine,
-/// its runtime threads and the binary's own data.
+/// Writable memory the child needs besides the call's own limits: V8's
+/// code, its platform threads and the binary's own data.
 const BASE_MEMORY: u64 = 384 * 1024 * 1024;
 
 /// Time the child may take to start before its deadline begins.
@@ -235,6 +240,12 @@ fn run(
     };
     let out = out.join().unwrap_or_default();
     let err = err.join().unwrap_or_default();
+    outcome(status, &out, &err)
+}
+
+/// What a finished child's exit status, stdout and stderr say about its call.
+fn outcome(status: std::process::ExitStatus, out: &[u8], err: &[u8]) -> Result<Value, Failure> {
+    let host = |message: String| Failure::Host(message);
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -244,13 +255,11 @@ fn run(
             return Err(Failure::Deadline);
         }
     }
-    match status.code() {
-        Some(crate::js_budget::HEAP_EXIT) => return Err(Failure::Heap),
-        Some(crate::js_budget::BUFFER_EXIT) => return Err(Failure::ArrayBufferLimit),
-        Some(crate::js_budget::DEADLINE_EXIT) => return Err(Failure::Deadline),
-        _ => {}
+    // The child's own watchdog: a call that ran past its deadline.
+    if status.code() == Some(crate::child_exit::DEADLINE) {
+        return Err(Failure::Deadline);
     }
-    let text = String::from_utf8_lossy(&out);
+    let text = String::from_utf8_lossy(out);
     if let Some(line) = text.lines().find_map(|line| line.strip_prefix(RESULT)) {
         return match serde_json::from_str(line) {
             Ok(Response::Ok(value)) => Ok(value),
@@ -258,10 +267,11 @@ fn run(
             Err(e) => Err(host(format!("the helper process answered badly: {e}"))),
         };
     }
-    let stderr = String::from_utf8_lossy(&err);
-    // Rust reports unsatisfied allocations on stderr; the operating
-    // system's limit on the child's memory makes allocations fail the same
-    // way. Either is the call exhausting its memory.
+    let stderr = String::from_utf8_lossy(err);
+    // V8 reports what it could not allocate and aborts, and Rust reports an
+    // unsatisfied allocation; the operating system's limit on the child's
+    // memory makes allocations fail the same way. Each is the call
+    // exhausting its memory.
     let exhausted = [
         "out of memory",
         "invalid size",
@@ -367,49 +377,52 @@ pub(super) fn supervised(
     let _watchdog = controls.watchdog.then(|| {
         std::thread::spawn(move || {
             if finished.recv_timeout(deadline) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
-                std::process::exit(crate::js_budget::DEADLINE_EXIT);
+                // SAFETY: _exit ends the process at once, without the exit
+                // handlers and static destructors that `exit` would run
+                // while V8 is still running the call on another thread.
+                unsafe { libc::_exit(crate::child_exit::DEADLINE) }
             }
         })
     });
-    crate::js_budget::enter(
-        if controls.heap_callback {
-            limits.heap_bytes
-        } else {
-            usize::MAX
-        },
-        if controls.bounded_array_buffers {
-            limits.array_buffer_bytes
-        } else {
-            usize::MAX
-        },
-    );
     let result = super::invoke_with(captured, export, args, limits, clock, controls);
     let _ = done.send(());
     result
 }
 
-/// Limits this process: its CPU time and core files, and its writable memory
-/// except on macOS. macOS refuses a data limit below its address map, so the
-/// host holds the memory limit there (see `child_memory`).
+/// The limits this process sets on itself: its CPU time and core files, and
+/// its writable memory except on macOS. macOS refuses a data limit below its
+/// address map, so the host holds the memory limit there (see
+/// `child_memory`). The CPU limit's hard bound is a second past its soft one,
+/// so the kernel sends SIGXCPU, which the host reports as the deadline,
+/// before SIGKILL.
 #[cfg(unix)]
-fn limit_self(limits: &Limits) -> Result<(), Failure> {
+fn self_limits(limits: &Limits) -> Result<Vec<(libc::c_int, libc::rlimit)>, Failure> {
     let memory = byte_limits(limits)?.0;
     #[cfg(target_os = "macos")]
     let _ = memory;
     let cpu = cpu_seconds(limits)?;
-    for (resource, value) in [
+    let cpu_hard = cpu
+        .checked_add(1)
+        .ok_or_else(|| Failure::Host("helper CPU limit is too large".into()))?;
+    let limit = |soft: u64, hard: u64| libc::rlimit {
+        rlim_cur: soft as libc::rlim_t,
+        rlim_max: hard as libc::rlim_t,
+    };
+    Ok(vec![
         #[cfg(not(target_os = "macos"))]
-        (libc::RLIMIT_DATA, memory),
-        (libc::RLIMIT_CPU, cpu),
-        (libc::RLIMIT_CORE, 0),
-    ] {
-        let limit = libc::rlimit {
-            rlim_cur: value as libc::rlim_t,
-            rlim_max: value as libc::rlim_t,
-        };
+        (libc::RLIMIT_DATA as libc::c_int, limit(memory, memory)),
+        (libc::RLIMIT_CPU as libc::c_int, limit(cpu, cpu_hard)),
+        (libc::RLIMIT_CORE as libc::c_int, limit(0, 0)),
+    ])
+}
+
+/// Applies [`self_limits`] to this process.
+#[cfg(unix)]
+fn limit_self(limits: &Limits) -> Result<(), Failure> {
+    for (resource, limit) in self_limits(limits)? {
         // SAFETY: `limit` is a valid rlimit that outlives the call; lowering
         // this process's own limits has no other effect on memory safety.
-        if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        if unsafe { libc::setrlimit(resource as _, &limit) } != 0 {
             return Err(Failure::Host(format!(
                 "cannot limit the helper process: {}",
                 std::io::Error::last_os_error()

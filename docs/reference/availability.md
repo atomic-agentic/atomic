@@ -32,16 +32,17 @@ Declarative atoms now use Astro exclusively. The production loader supports loca
 components, named slots with fallback content, frontmatter locals, template
 literals, bounded TypeScript-shaped expressions, typed validators,
 [TypeScript helpers](atom-files.md#typescript-helpers), which run in a fresh,
-bounded Boa isolate in a short-lived child with the step's recorded clock, and
+bounded V8 isolate in a short-lived child with the step's recorded clock, and
 [literal Markdown imports](atom-files.md#literal-prompt-examples), which bind a
 project file's text as authored prompt content.
-On macOS, compiler and helper children have allocator quotas and a parent
-memory monitor, not a hard whole-process memory cap. The compiler has 1 GiB
-heap and buffer allocation budgets and a 2.5 GiB physical-footprint threshold;
+On macOS, compiler and helper children have V8 heap limits, ArrayBuffer
+budgets and a parent memory monitor, not a hard whole-process memory cap. The
+compiler has a 1 GiB V8 heap limit, a 1 GiB ArrayBuffer budget and a 2.5 GiB
+physical-footprint threshold;
 a helper call defaults to a 128 MiB heap, 64 MiB of ArrayBuffers and a process
 threshold of about 700 MiB. The parent requests a footprint reading every
 2 ms while the child runs and kills it after an observed overage or an unreadable
-running child. Native allocations outside the quotas are stopped only if their
+running child. Native allocations outside those limits are stopped only if their
 footprint is observed over the threshold; reserved address space and brief
 peaks can escape the monitor. See the [compiler and helper limit details](../development.md#astro-compiler).
 `atomic check` checks source and generates editor types, including

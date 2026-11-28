@@ -1,0 +1,1 @@
+helper-buffer-budget|crates/atomic-core/src/helper_runtime.rs|params = params.array_buffer_allocator(allocator);|let _ = allocator; // CONTROL_OFF|-p atomic-agentic-core --lib -- helper_runtime::tests::array_buffer_memory_is_bounded

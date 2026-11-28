@@ -56,6 +56,56 @@ fn oversized_helper_limits_are_rejected_before_spawning() {
     );
 }
 
+// The CPU limit's hard bound is a second past its soft bound, so the kernel
+// signals SIGXCPU before it kills the child.
+#[cfg(unix)]
+#[test]
+fn the_cpu_limit_signals_before_it_kills() {
+    let limits = self_limits(&Limits::default()).expect("limits");
+    let (_, cpu) = limits
+        .iter()
+        .find(|(resource, _)| *resource == libc::RLIMIT_CPU as libc::c_int)
+        .expect("a CPU limit");
+    assert_eq!(
+        (cpu.rlim_cur, cpu.rlim_max),
+        (3 as libc::rlim_t, 4 as libc::rlim_t)
+    );
+}
+
+// A child the kernel stops at its soft CPU limit, with SIGXCPU, has run past
+// its deadline. The child here is a shell that spins under a one-second soft
+// limit, so the signal is the kernel's own.
+#[cfg(unix)]
+#[test]
+fn a_child_stopped_at_its_cpu_limit_has_run_past_its_deadline() {
+    let command = HostCommand {
+        program: std::path::PathBuf::from("/bin/sh"),
+        args: vec![
+            "-c".to_owned(),
+            "ulimit -S -t 1; while :; do :; done".to_owned(),
+        ],
+        env: Vec::new(),
+    };
+    let captured = Captured {
+        modules: Default::default(),
+        entry: ENTRY.to_owned(),
+    };
+    let limits = Limits {
+        deadline: Duration::from_secs(20),
+        ..Limits::default()
+    };
+    let started = Instant::now();
+    assert_eq!(
+        run(&command, &captured, "probe", &json!([]), limits, CLOCK),
+        Err(Failure::Deadline)
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn a_call_runs_in_a_child_and_returns_its_result() {
     assert_eq!(probe("({ sum: 1 + 2 })"), Ok(json!({ "sum": 3 })));
@@ -66,8 +116,27 @@ fn a_call_runs_in_a_child_and_returns_its_result() {
     );
 }
 
+// V8's report of a fatal "invalid size" error, the whole of a child's stderr
+// when it aborts on one, is the call exhausting its memory.
+#[cfg(unix)]
 #[test]
-fn a_large_string_split_fails_the_call_and_the_host_survives() {
+fn a_v8_invalid_size_abort_is_the_call_exhausting_its_memory() {
+    use std::os::unix::process::ExitStatusExt;
+    let stderr = "\n\n#\n# Fatal error with no security impact:\n\
+                  # Fatal JavaScript invalid size error 536870888 (see crbug.com/1201626)\n#\n\n";
+    assert_eq!(
+        outcome(
+            std::process::ExitStatus::from_raw(libc::SIGTRAP),
+            b"",
+            stderr.as_bytes()
+        ),
+        Err(Failure::Heap)
+    );
+}
+
+// V8 aborts the process on these, which no isolate limit catches.
+#[test]
+fn a_v8_fatal_error_fails_the_call_and_the_host_survives() {
     let started = Instant::now();
     assert_eq!(
         probe("'x'.repeat(2 ** 29 - 24).split('').length"),
@@ -77,7 +146,7 @@ fn a_large_string_split_fails_the_call_and_the_host_survives() {
     assert_eq!(probe("1"), Ok(json!(1)));
 }
 
-// Memory allocated outside the engine heap, a single allocation larger than the
+// Memory V8 allocates outside its heap, a single allocation larger than the
 // heap, and work inside one long built-in are each bounded.
 #[test]
 fn memory_and_time_outside_the_heap_are_bounded() {
@@ -184,7 +253,7 @@ fn the_first_call_in_a_child_sees_utc_and_en_us() {
             modules: [(
                 ENTRY.to_owned(),
                 "export const probe = () => [(1234.5).toLocaleString([]), (1234.5).toLocaleString('tlh'), \
-                 new Date(0).toLocaleString([]), 'i'.toLocaleUpperCase([]), Number.isNaN(Date.parse('January 1, 2020 00:00:00'))];"
+                 new Date(0).toLocaleString([]), 'i'.toLocaleUpperCase([]), Date.parse('January 1, 2020 00:00:00')];"
                     .to_owned(),
             )]
             .into(),
@@ -208,6 +277,12 @@ fn the_first_call_in_a_child_sees_utc_and_en_us() {
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(
         outputs[0],
-        json!(["1,234.5", "1,234.5", "1/1/70, 12:00:00 AM", "I", true])
+        json!([
+            "1,234.5",
+            "1,234.5",
+            "1/1/1970, 12:00:00 AM",
+            "I",
+            1_577_836_800_000u64
+        ])
     );
 }

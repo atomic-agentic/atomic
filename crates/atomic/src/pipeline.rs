@@ -558,6 +558,92 @@ pub struct TrialCargo {
     pub registry: PathBuf,
     /// The installed rustup toolchain selected by the operator.
     pub toolchain: String,
+    /// The operator's verified V8 mirror, for a workspace that links V8.
+    pub v8: Option<V8Mirror>,
+}
+
+/// The operator's verified prebuilt-V8 mirror and its pinned archive hash,
+/// handed read-only to host Cargo that builds a workspace linking V8, such as
+/// atomic's own. The command has no network, so without it such a build
+/// stops at the V8 archive check (atomic-core's build script refuses a build
+/// without a mirror and the pinned hash), which fails the check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V8Mirror {
+    /// Canonical mirror directory, as `scripts/v8-archive.sh` lays it out.
+    pub dir: PathBuf,
+    /// The archive's pinned SHA-256, given to rusty_v8.
+    pub archive_sha256: String,
+    /// The pinned bindings in the mirror, which rusty_v8 reads in place
+    /// rather than copying into its source directory, which a read-only
+    /// Cargo home cannot take.
+    pub binding: PathBuf,
+}
+
+impl V8Mirror {
+    /// The mirror the operator process builds with: its `RUSTY_V8_MIRROR`,
+    /// `RUSTY_V8_ARCHIVE_SHA256` and `RUSTY_V8_SRC_BINDING_PATH`, as
+    /// scripts/dev.sh and CI set them. None set is no mirror; some without
+    /// the others, a mirror that is not a local directory, a hash that is not
+    /// one, or bindings that are not a file in the mirror, are refused.
+    pub fn from_operator(
+        get: &dyn Fn(&str) -> Option<String>,
+    ) -> std::result::Result<Option<Self>, String> {
+        let (mirror, sha, binding) = (
+            get("RUSTY_V8_MIRROR"),
+            get("RUSTY_V8_ARCHIVE_SHA256"),
+            get("RUSTY_V8_SRC_BINDING_PATH"),
+        );
+        let set = [mirror.is_some(), sha.is_some(), binding.is_some()];
+        if set.contains(&true) && set.contains(&false) {
+            return Err("operator RUSTY_V8_MIRROR, RUSTY_V8_ARCHIVE_SHA256 and RUSTY_V8_SRC_BINDING_PATH must be set together".into());
+        }
+        let (Some(dir), Some(archive_sha256), Some(binding)) = (mirror, sha, binding) else {
+            return Ok(None);
+        };
+        let pinned_hash =
+            archive_sha256.len() == 64 && archive_sha256.bytes().all(|b| b.is_ascii_hexdigit());
+        if !pinned_hash {
+            return Err("operator RUSTY_V8_ARCHIVE_SHA256 is not a SHA-256".into());
+        }
+        let dir =
+            std::fs::canonicalize(&dir).map_err(|e| format!("operator V8 mirror {dir}: {e}"))?;
+        let mirror_is_dir = dir.is_dir();
+        if !mirror_is_dir {
+            return Err(format!(
+                "operator V8 mirror {} is not a directory",
+                dir.display()
+            ));
+        }
+        let binding = std::fs::canonicalize(&binding)
+            .map_err(|e| format!("operator V8 bindings {binding}: {e}"))?;
+        let binding_in_mirror = binding.starts_with(&dir) && binding.is_file();
+        if !binding_in_mirror {
+            return Err(format!(
+                "operator V8 bindings {} are not a file in the mirror",
+                binding.display()
+            ));
+        }
+        Ok(Some(Self {
+            dir,
+            archive_sha256,
+            binding,
+        }))
+    }
+
+    /// The environment a host Cargo command reads the mirror through.
+    pub fn env(&self) -> [(String, String); 3] {
+        [
+            ("RUSTY_V8_MIRROR".to_owned(), self.dir.display().to_string()),
+            (
+                "RUSTY_V8_ARCHIVE_SHA256".to_owned(),
+                self.archive_sha256.clone(),
+            ),
+            (
+                "RUSTY_V8_SRC_BINDING_PATH".to_owned(),
+                self.binding.display().to_string(),
+            ),
+        ]
+    }
 }
 
 impl TrialCargo {
@@ -590,7 +676,13 @@ impl TrialCargo {
         Ok(Self {
             registry,
             toolchain,
+            v8: None,
         })
+    }
+
+    /// The same selection with the operator's V8 mirror.
+    pub fn with_v8(self, v8: Option<V8Mirror>) -> Self {
+        Self { v8, ..self }
     }
 }
 
@@ -712,6 +804,9 @@ fn trusted_controls_atom(
         "CARGO_NET_OFFLINE",
         "RUSTUP_HOME",
         "RUSTUP_TOOLCHAIN",
+        "RUSTY_V8_MIRROR",
+        "RUSTY_V8_ARCHIVE_SHA256",
+        "RUSTY_V8_SRC_BINDING_PATH",
     ] {
         if atom.frontmatter["env"].get(key).is_some() {
             return Err(failed(format!(
@@ -813,7 +908,10 @@ fn prepare_controls_cargo(
         target,
         registry: selected.registry.clone(),
         toolchain: selected.toolchain.clone(),
-        read_only_bindings: vec![source],
+        read_only_bindings: std::iter::once(source)
+            .chain(selected.v8.iter().map(|v8| v8.dir.clone()))
+            .collect(),
+        env: selected.v8.iter().flat_map(V8Mirror::env).collect(),
     })
 }
 
@@ -3852,11 +3950,13 @@ async fn turn<C: WorkflowContext>(
                     .map_err(|e| failed(format!("step `{id}`: {e}")))?;
                 let now = atomic_core::astro::Program::current_helper_runtime();
                 if pinned_helpers.as_deref() != Some(now.as_str()) {
+                    let describe = atomic_core::astro::Program::describe_helper_runtime;
                     return Err(failed(format!(
                         "step `{id}`: this run started on another helper runtime ({}), and \
-                             its helpers cannot resume on this one ({now}); their behaviour could \
+                             its helpers cannot resume on this one ({}); their behaviour could \
                              differ from what the run already recorded. Start a new run",
-                        pinned_helpers.as_deref().unwrap_or("not recorded"),
+                        pinned_helpers.as_deref().map_or("not recorded".into(), describe),
+                        describe(&now),
                     )));
                 }
             }
@@ -5819,6 +5919,7 @@ async fn reviewed<C: WorkflowContext>(
                             ("CARGO_NET_OFFLINE".into(), "true".into()),
                             ("RUSTUP_TOOLCHAIN".into(), selected.toolchain.clone()),
                         ]);
+                        env.extend(selected.v8.iter().flat_map(V8Mirror::env));
                         Some(selected)
                     } else {
                         None
@@ -5951,6 +6052,12 @@ async fn reviewed<C: WorkflowContext>(
                                                 .filter(|git| git.is_dir()),
                                         )
                                 })
+                                .chain(
+                                    cargo
+                                        .iter()
+                                        .flat_map(|selected| selected.v8.iter())
+                                        .map(|v8| v8.dir.clone()),
+                                )
                                 .chain(cargo_home.iter().map(|home| home.join("registry")))
                                 .chain(cargo_home.iter().cloned())
                                 .chain(config_mount)
@@ -7700,6 +7807,69 @@ fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<St
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn operator_v8(
+        mirror: Option<&Path>,
+        sha: Option<&str>,
+        binding: Option<&Path>,
+    ) -> std::result::Result<Option<V8Mirror>, String> {
+        let get = |name: &str| match name {
+            "RUSTY_V8_MIRROR" => mirror.map(|p| p.display().to_string()),
+            "RUSTY_V8_ARCHIVE_SHA256" => sha.map(str::to_owned),
+            "RUSTY_V8_SRC_BINDING_PATH" => binding.map(|p| p.display().to_string()),
+            _ => None,
+        };
+        V8Mirror::from_operator(&get)
+    }
+
+    // The operator's V8 mirror is passed to host Cargo only as a local
+    // directory with a pinned hash and its bindings in it; anything else is
+    // refused, never dropped.
+    #[test]
+    fn the_operator_v8_mirror_is_a_directory_with_its_hash_and_bindings() {
+        let dir = std::env::temp_dir().join(format!("atomic-v8-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("v1")).expect("mirror");
+        let binding = dir.join("v1/binding.rs");
+        std::fs::write(&binding, "").expect("bindings");
+        let sha = "b6683e9afcb77fbd8cb2c3acf45d34d52029ab216b332522c95179c12f0fed3c";
+        assert_eq!(operator_v8(None, None, None), Ok(None));
+        let found = operator_v8(Some(&dir), Some(sha), Some(&binding))
+            .expect("accepted")
+            .expect("a mirror");
+        assert_eq!(found.dir, std::fs::canonicalize(&dir).expect("canonical"));
+        assert_eq!(
+            found.env()[1],
+            ("RUSTY_V8_ARCHIVE_SHA256".to_owned(), sha.to_owned())
+        );
+        let together = "operator RUSTY_V8_MIRROR, RUSTY_V8_ARCHIVE_SHA256 and RUSTY_V8_SRC_BINDING_PATH must be set together";
+        for (m, s, b) in [
+            (Some(dir.as_path()), Some(sha), None),
+            (Some(dir.as_path()), None, Some(binding.as_path())),
+            (None, Some(sha), Some(binding.as_path())),
+            (Some(dir.as_path()), None, None),
+        ] {
+            assert_eq!(operator_v8(m, s, b), Err(together.into()));
+        }
+        assert_eq!(
+            operator_v8(Some(&dir), Some("not-a-hash"), Some(&binding)),
+            Err("operator RUSTY_V8_ARCHIVE_SHA256 is not a SHA-256".into())
+        );
+        let error = operator_v8(Some(&binding), Some(sha), Some(&binding)).expect_err("a file");
+        assert!(error.ends_with("is not a directory"), "{error}");
+        let outside =
+            std::env::temp_dir().join(format!("atomic-v8-outside-{}.rs", std::process::id()));
+        std::fs::write(&outside, "").expect("outside bindings");
+        let error = operator_v8(Some(&dir), Some(sha), Some(&outside)).expect_err("outside");
+        assert!(error.ends_with("are not a file in the mirror"), "{error}");
+        let _ = std::fs::remove_file(&outside);
+        // A mirror that is a link to itself is refused, not taken as absent.
+        let looped = dir.join("loop");
+        std::os::unix::fs::symlink(&looped, &looped).expect("self link");
+        let error = operator_v8(Some(&looped), Some(sha), Some(&binding)).expect_err("a loop");
+        assert!(error.starts_with("operator V8 mirror "), "{error}");
+        std::fs::remove_dir_all(&dir).expect("clean up");
+    }
 
     #[test]
     fn graph_command_slots_bound_concurrent_commands() {

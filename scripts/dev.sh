@@ -33,9 +33,12 @@
 #                         cache has less than this many GiB free (default 10; 0 turns it off)
 #   ATOMIC_TEST_*, RUST_LOG, RUST_BACKTRACE are passed through when set.
 #
+# The prebuilt V8 archive is verified against deps/v8.toml before the container starts
+# (scripts/v8-archive.sh) and read from ${ATOMIC_DEV_CACHE}/v8-mirror through RUSTY_V8_MIRROR,
+# with its pinned hash in RUSTY_V8_ARCHIVE_SHA256 and its bindings in RUSTY_V8_SRC_BINDING_PATH.
 #
 # Exit codes: the command's own, or
-#   1    the watcher could not be started
+#   1    the V8 archive failed verification, or the watcher could not be started
 #   2    bad usage
 #   75   ATOMIC_DEV_WAIT_LOCK exists, or the disk is too full, so nothing was started
 #   124  the command hit ATOMIC_DEV_TIMEOUT
@@ -289,6 +292,20 @@ for name in "${!ATOMIC_TEST_@}" RUST_LOG RUST_BACKTRACE; do
         env_flags+=(-e "${name}")
     fi
 done
+
+# The prebuilt V8 archive deps/v8.toml pins, verified on the host before the container starts
+# (fetched once, then read from the cache offline). A tampered or unpinned archive stops here.
+case "$(uname -m)" in
+    arm64 | aarch64) v8_target=aarch64-unknown-linux-gnu ;;
+    *) v8_target=x86_64-unknown-linux-gnu ;;
+esac
+if ! v8_env="$(GITHUB_ENV= "${ROOT}/scripts/v8-archive.sh" --mirror "${CACHE}/v8-mirror" --env-for /cache/v8-mirror "${v8_target}")"; then
+    echo "scripts/dev.sh: the V8 archive could not be verified, so nothing was started" >&2
+    exit 1
+fi
+while read -r v8_line; do
+    env_flags+=(-e "${v8_line}")
+done <<<"${v8_env}"
 
 mount_flags=()
 if [ -n "${ATOMIC_DEV_MOUNTS:-}" ]; then

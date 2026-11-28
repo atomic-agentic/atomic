@@ -1,1 +1,1 @@
-compiler-only-node-modules|crates/atomic-core/src/compiler_host.rs|modules.insert(format!("node:{name}"), module);|modules.insert("node:child_process".into(), module.clone()); modules.insert(format!("node:{name}"), module);|-p atomic-agentic-core --lib -- compiler_host::tests::no_other_module_can_be_imported
+compiler-only-node-modules|crates/atomic-core/src/compiler_host.rs|if url.as_str() != MAIN {|if url.as_str() != MAIN && false {|-p atomic-agentic-core --lib -- compiler_host::tests::no_other_module_can_be_imported

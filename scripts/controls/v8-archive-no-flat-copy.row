@@ -1,0 +1,1 @@
+v8-archive-no-flat-copy|crates/atomic-core/build/v8_archive.rs|if present(&flat)? {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_copy_at_the_mirror_top_level

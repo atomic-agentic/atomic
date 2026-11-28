@@ -31,7 +31,7 @@
 | **Script atom** | An exec atom whose separate script performs executable work. Astro frontmatter is interpreted configuration, never a module that runs. |
 | **Credential** | A named way for an atom's code to sign in to an outside service, defined in the manifest. For an AWS role, Atomic issues keys per step that expire in minutes. |
 | **Fetched values** | A script step's typed output, passed to a subsequent Astro atom as ordinary input and referenced in a workflow as `steps.<id>.output`. |
-| **Managed Deno** | A pinned runtime host outside project source, which Atomic downloads and verifies for atom code and scripts (v0.7). Atomic embeds its own Rust Astro compiler and Boa helper runtime. |
+| **Managed Deno** | A pinned runtime host outside project source, which Atomic downloads and verifies for atom code and scripts (v0.7). Atomic embeds its own Rust Astro compiler and V8 helper runtime. |
 | **Codex** | [OpenAI's open-source coding-agent foundation](../README.md#open-source-openai-codex-underneath-atomic-on-top) embedded by Atomic; hosted inference/search remain services. |
 | **durare** | The embedded durable execution engine used to checkpoint and recover workflows. |
 | **OpenTelemetry / OTEL** | Instrumentation and export conventions for traces, metrics and logs; compatible backends such as Datadog are optional. |

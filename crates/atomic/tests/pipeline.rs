@@ -4382,6 +4382,56 @@ fn a_run_started_on_another_helper_runtime_is_refused() {
     });
 }
 
+// A run atomic 0.2 started recorded a bare digest of its Boa helper runtime.
+// Its unfinished helper step does not resume on V8: the refusal names the
+// engine change, and the step does not run.
+#[test]
+fn a_run_started_on_the_boa_helper_runtime_is_refused_naming_the_engine_change() {
+    on_codex_runtime(async {
+        let dir = scratch("runtime-boa");
+        let project = project(&dir);
+        stamped(&project);
+        let boa = "4f".repeat(32);
+        let first = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u, recorded) = (dir.clone(), first.base_url(), boa.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-stamped",
+                "runtime-boa",
+                Some("pipeline:ran:stamp"),
+                "UTC",
+                &[("ATOMIC_TEST_HELPER_RUNTIME", recorded.as_str())],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+
+        let second = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), second.base_url());
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "runtime-boa", None))
+                .await
+                .expect("child");
+        assert!(status.success(), "the recovering process ended: {status}");
+        let error = std::fs::read_to_string(dir.join("error.txt")).expect("the run failed");
+        assert!(
+            error.contains(&format!(
+                "another helper runtime ({boa}, recorded by atomic 0.2 or earlier; atomic 0.2 ran helpers on Boa)"
+            )) && error.contains("cannot resume on this one (V8 ")
+                && error.contains(" through deno_core, "),
+            "{error}"
+        );
+        assert_eq!(second.calls(), 0, "the step did not run on this runtime");
+    });
+}
+
 // A helper step that already finished replays from its checkpoint on any
 // runtime: the runtime check guards running helpers, not reading results.
 #[test]
@@ -7444,6 +7494,10 @@ fn trial_cargo_selection() -> atomic_app::pipeline::TrialCargo {
     let home = std::env::var_os("CARGO_HOME").expect("pinned dev container CARGO_HOME");
     atomic_app::pipeline::TrialCargo::new(PathBuf::from(home).join("registry"), "1.95.0".into())
         .expect("pinned offline registry")
+        .with_v8(
+            atomic_app::pipeline::V8Mirror::from_operator(&|name| std::env::var(name).ok())
+                .expect("the operator's verified V8 mirror"),
+        )
 }
 
 #[test]
@@ -8042,6 +8096,7 @@ fn trial_cargo_disappeared_registry_refuses_before_model_call() {
         let cargo = atomic_app::pipeline::TrialCargo {
             registry: dir.join("missing-registry"),
             toolchain: "1.95.0".into(),
+            v8: None,
         };
         let rt = engine_built_with_trial(
             &dir,

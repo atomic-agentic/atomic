@@ -58,6 +58,36 @@ repository at the same path as on the host, and keeps cargo's registry and git
 cache in `~/.cache/atomic/dev`. Build output goes to `target/` in the
 repository as usual.
 
+### The prebuilt V8
+
+atomic links one V8, the one Codex pins, through `deno_core`, for the
+Astro compiler worker and the isolates captured TypeScript helpers run in. rusty_v8's build script normally downloads a
+prebuilt static library and checks nothing about it, so atomic pins each
+archive and its generated bindings by SHA-256 in
+[`deps/v8.toml`](../deps/v8.toml). `scripts/v8-archive.sh [TARGET]` fetches
+them once into a local mirror (`target/v8-mirror` unless given
+`--mirror`) and verifies them on every run. `scripts/dev.sh` verifies the
+archive on the host before the container starts, keeps its mirror in
+`~/.cache/atomic/dev/v8-mirror`, so builds work offline once it is cached,
+and gives the container `RUSTY_V8_MIRROR`, the archive's pinned hash in
+`RUSTY_V8_ARCHIVE_SHA256` and the pinned bindings in
+`RUSTY_V8_SRC_BINDING_PATH` (which rusty_v8 then reads in place rather than
+copying into its source directory); in CI, `scripts/v8-archive.sh` sets all
+three for the job's later steps. rusty_v8 checks the copy it takes against that hash. The
+repository has no Cargo configuration of its own, so a build without the
+mirror and the hash, a plain `cargo build` included, stops in `atomic-core`'s
+build script. A tampered file stops the build; delete it to fetch it again. `atomic-core`'s build script
+(`build/v8_archive.rs`) checks the mirrored archive and bindings against
+their pins for the V8 version `Cargo.lock` builds, and refuses a build
+without that hash; with `RUSTY_V8_MIRROR` unset, remote or a URL template;
+with a second copy at the mirror's top level; or with any of
+`RUSTY_V8_ARCHIVE`, `V8_FROM_SOURCE`, `RUSTY_V8_MIRROR_TAG`,
+`RUSTY_V8_MIRROR_FALLBACK`, `RUSTY_V8_SKIP_DOWNLOAD`,
+`RUSTY_V8_SRC_BINDING_URL`, `DOCS_RS` or `DENO_TRYBUILD` set, or with
+`RUSTY_V8_SRC_BINDING_PATH` naming anything but the pinned bindings in the
+mirror. It cannot see rusty_v8's own output directory, so it
+does not check files changed inside `target/`.
+
 ### Limits
 
 The container has a memory limit with no swap, a CPU limit and a time limit,
@@ -651,7 +681,7 @@ in turn:
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
 | Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M42a, M12, M35a, M39a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
-| Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
+| Build, lockfile and SBOM | `cargo build`; the doctests without the test features, which must include the compile-fail doctest showing that `ExecSandbox`'s loopback method is absent without its feature; `scripts/v8-archive-test.sh`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
 Pushes to main also run two macOS jobs in parallel. "Clippy (macos-15)" runs
@@ -858,16 +888,19 @@ scripts/dev.sh scripts/milestone-tests.sh
 Declarative atoms use `.atom.astro`. The production compiler assets are bundled
 under `crates/atomic-core/assets` and included in the binary. Running atoms needs
 no Deno, npm install or project `node_modules`: atomic starts itself as the
-compiler's child process (`__atomic-compiler`) and runs the bundled worker on its
-embedded Boa engine. Oxc parses TypeScript and transpiles captured helpers.
+compiler's child process (`__atomic-compiler`) and runs the bundled worker on the
+V8 it embeds through `deno_core` ([the prebuilt V8](#the-prebuilt-v8)). Oxc
+parses TypeScript and transpiles captured helpers.
 The tsz checker uses the captured sources, generated declarations and bundled
-ES2022 library. The compiler child has a cleared environment, 1 GiB allocation
-budgets for the heap and buffers, a 2.5 GiB writable-memory ceiling, a 32-second
+ES2022 library. The compiler child has a cleared environment, a 1 GiB V8 heap
+limit and a 1 GiB ArrayBuffer budget, a 2.5 GiB writable-memory ceiling, a 32-second
 CPU limit, no core files and a 30-second parent deadline. On macOS the parent
 enforces the memory ceiling as described below. Its
 host (`compiler_host/host.js`) gives the worker the protocol's stdin and stdout,
 stderr for its console, its exit status, native Astro parsing and TSX conversion,
-random bytes, SHA-256 and timers, and nothing else: no network, environment, filesystem or subprocess.
+TypeScript services, random bytes, SHA-256 and timers, and nothing else: no
+network, environment, filesystem, subprocess, WebAssembly, shared memory or
+resizable ArrayBuffers.
 atomic reads atom sources itself and sends them in the request, for loading as
 for rendering. Direct-run context checkpoints live outside the source tree.
 
@@ -891,8 +924,7 @@ hold it differently:
   the child is absent and the parent has yet to collect it. Each child also
   watches a private channel and exits if the supervisor disappears.
 
-The host allocation budgets (the heap and, for helpers, the buffer budget)
-are the same on both. The tests of the parent's limit run on Linux too,
+The V8 heap limits and ArrayBuffer budgets are the same on both. The tests of the parent's limit run on Linux too,
 where they put a small limit in place of the child's own
 (`child_memory::with_limit`).
 

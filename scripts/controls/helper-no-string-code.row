@@ -1,0 +1,1 @@
+helper-no-string-code|crates/atomic-core/src/helper_runtime.rs|set_allow_generation_from_strings(false);|set_allow_generation_from_strings(true);|-p atomic-agentic-core --lib -- helper_runtime::process::tests::code_cannot_be_generated_from_strings

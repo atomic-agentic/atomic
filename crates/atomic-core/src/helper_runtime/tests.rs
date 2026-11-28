@@ -51,7 +51,7 @@ fn graph() -> Captured {
                    export const oversized = () => "x".repeat(2_000_000);
                    export const shout = () => { throw new Error("y".repeat(100_000)); };
                    export const hostile = () => { throw { toString() { return "z".repeat(100_000); } }; };
-                   export const grow = () => { const kept = []; while (true) kept.push(String(kept.length).repeat(1024 * 1024)); };
+                   export const grow = () => { const kept = []; while (true) kept.push(new Array(100_000).fill(kept.length)); };
                    export const buffers = (count, size) => {
                      const kept = [];
                      for (let i = 0; i < count; i++) kept.push(new Uint8Array(size));
@@ -196,14 +196,18 @@ fn the_isolate_has_no_host_capabilities() {
     assert_eq!(extra, ["__atomicHost", "console"]);
 }
 
-// The prelude removes SharedArrayBuffer from the helper's globals.
+// Control: without the prelude's stripping, deno_core's operations,
+// WebAssembly and SharedArrayBuffer are reachable.
 #[test]
-fn without_stripping_shared_memory_is_reachable() {
+fn without_stripping_deno_core_globals_are_reachable() {
     let controls = Controls {
         strip_globals: false,
         ..Controls::default()
     };
     let out = call_without("capabilities", json!([]), controls).expect("the call succeeds");
+    assert_eq!(out["deno"], "object");
+    assert_eq!(out["bootstrap"], "object");
+    assert_eq!(out["wasm"], "object");
     assert_eq!(out["shared"], "function");
 }
 
@@ -212,6 +216,9 @@ fn console_output_is_accepted_and_discarded() {
     assert_eq!(call("print", json!([])), Ok(json!(1)));
 }
 
+// The module loader's `resolve` refuses an uncaptured import, so this test
+// (and its controls row, helper-uncaptured-module) shows that refusal and its
+// message; `load` refusing on its own is the next test's.
 #[test]
 fn imports_outside_the_capture_and_dynamic_imports_are_refused() {
     let escaping = captured(
@@ -234,6 +241,50 @@ fn imports_outside_the_capture_and_dynamic_imports_are_refused() {
     );
 }
 
+// A captured graph holds only atomic-helper modules; one keyed elsewhere is
+// refused before anything runs, even when the graph would import it.
+#[test]
+fn a_module_outside_the_helper_scheme_is_refused() {
+    let outside = captured(
+        ENTRY,
+        &[
+            (
+                ENTRY,
+                r#"import { x } from "file:///outside.js"; export const prepare = () => x;"#,
+            ),
+            ("file:///outside.js", "export const x = 1;"),
+        ],
+    );
+    assert_eq!(
+        invoke(&outside, "prepare", &json!([]), Limits::default(), CLOCK),
+        Err(Failure::Refused("invalid helper module URL".into()))
+    );
+}
+
+// `load` serves only captured modules, whatever `resolve` let through.
+#[test]
+fn the_loader_loads_only_captured_modules() {
+    let loader = Loader(graph().modules);
+    let load = |url: &str| {
+        let url = ModuleSpecifier::parse(url).expect("a URL");
+        let options = ModuleLoadOptions {
+            is_dynamic_import: false,
+            is_synchronous: false,
+            requested_module_type: deno_core::RequestedModuleType::None,
+        };
+        match loader.load(&url, None, options) {
+            ModuleLoadResponse::Sync(result) => result.map(|_| ()).map_err(|e| e.to_string()),
+            ModuleLoadResponse::Async(_) => Err("an asynchronous load".into()),
+        }
+    };
+    assert_eq!(load(LIB), Ok(()));
+    let error = load("atomic-helper:///uncaptured.js").expect_err("refused");
+    assert!(
+        error.contains("the helper has no module atomic-helper:///uncaptured.js"),
+        "{error}"
+    );
+}
+
 #[test]
 fn a_missing_export_or_a_non_json_result_fails() {
     assert!(matches!(
@@ -253,7 +304,7 @@ fn a_missing_export_or_a_non_json_result_fails() {
 fn input_is_frozen() {
     let error = call("mutate", json!([{ "value": "x" }])).expect_err("the call fails");
     assert!(
-        matches!(&error, Failure::Threw(text) if text.contains("non-writable property: value")),
+        matches!(&error, Failure::Threw(text) if text.contains("read only")),
         "{error:?}"
     );
 }
@@ -451,18 +502,20 @@ fn a_reused_isolate_leaks_module_state() {
 /// deadline begins, a hundred times what a call takes on an idle machine.
 #[test]
 fn fresh_isolates_cost_little_per_call() {
+    let mut isolate =
+        Isolate::new(&graph(), Limits::default(), CLOCK, Controls::default()).expect("isolate");
+    isolate
+        .call("prepare", &input())
+        .expect("the call succeeds");
+    let used = isolate
+        .runtime
+        .v8_isolate()
+        .get_heap_statistics()
+        .used_heap_size();
+    eprintln!("a fresh isolate's heap after one call: {used} bytes");
     assert!(
-        invoke(
-            &graph(),
-            "prepare",
-            &input(),
-            Limits {
-                heap_bytes: FRESH_HEAP_MAX,
-                ..Limits::default()
-            },
-            CLOCK
-        )
-        .is_ok()
+        used < FRESH_HEAP_MAX,
+        "a fresh isolate used {used} bytes of heap for one call"
     );
     let rounds = 20u32;
     let started = Instant::now();
@@ -548,33 +601,22 @@ fn child_process() {
     } else {
         ("grow", heap_limits())
     };
-    let finite = captured(
-        ENTRY,
-        &[(
-            ENTRY,
-            "export const grow = () => 'x'.repeat(16 << 20).length",
-        )],
-    );
-    let graph = if export == "spin" { graph() } else { finite };
-    let limits = Limits {
-        heap_bytes: 8 << 20,
-        ..limits
-    };
-    let result = process::supervised(&graph, export, &json!([]), limits, CLOCK, controls);
+    let result = process::supervised(&graph(), export, &json!([]), limits, CLOCK, controls);
     println!("survived: {result:?}");
 }
 
-// The heap budget terminates the child with a recognizable exit status.
+// Control: with the near-heap-limit callback on, the child survives heap
+// exhaustion; without it, V8 aborts the whole process.
 #[test]
 fn without_the_heap_callback_heap_exhaustion_aborts_the_process() {
     let (status, out) = run_child("none", Duration::from_secs(60));
     assert!(
-        status.and_then(|s| s.code()) == Some(crate::js_budget::HEAP_EXIT),
+        status.is_some_and(|status| status.success()) && out.contains("survived: Err(Heap)"),
         "{status:?} {out}"
     );
     let (status, out) = run_child("heap", Duration::from_secs(60));
     assert!(
-        status.is_some_and(|s| s.success()) && out.contains("survived: Ok"),
+        status.is_some_and(|status| !status.success()) && !out.contains("survived"),
         "{status:?} {out}"
     );
 }
@@ -689,10 +731,10 @@ fn formatting_the_current_time_and_legacy_dates_use_the_clock_and_utc() {
     assert_eq!(
         out,
         json!({
-            "formatted": "Thursday, November 19, 2026 at 8:30:00 AM",
-            "parts": null, "given": "1970",
-            "legacy": null, "constructed": null,
-            "zoned": 1_577_836_800_000u64, "own": null, "year": 70,
+            "formatted": "Thursday, November 19, 2026 at 8:30:00 AM UTC",
+            "parts": "2026", "given": "1970",
+            "legacy": 1_577_836_800_000u64, "constructed": 1_577_836_800_000u64,
+            "zoned": 1_577_836_800_000u64, "own": 0, "year": 70,
         })
     );
 }
@@ -703,8 +745,8 @@ fn formatting_uses_utc_and_en_us() {
     assert_eq!(
         out,
         json!({
-            "format": "12:00 AM", "resolved": "utc", "locale": "en-US", "local": "1/1/70, 12:00:00 AM",
-            "number": "1,234,567.5", "empty": ["1,234.5", "1/1/70, 12:00:00 AM", "I"], "unsupported": "1,234.5",
+            "format": "00:00", "resolved": "UTC", "locale": "en-US", "local": "1/1/1970, 12:00:00 AM",
+            "number": "1,234,567.5", "empty": ["1,234.5", "1/1/1970, 12:00:00 AM", "I"], "unsupported": "1,234.5",
         })
     );
 }
@@ -777,7 +819,10 @@ fn the_host_timezone_and_locale_do_not_reach_helpers() {
     let virtual_ = outputs("clock");
     assert!(virtual_.iter().all(|line| !line.is_empty()), "{virtual_:?}");
     assert_eq!(virtual_[0], virtual_[1]);
-    assert!(virtual_[0].contains(r#""legacy":null"#), "{virtual_:?}");
+    assert!(
+        virtual_[0].contains(r#""legacy":1577836800000"#),
+        "{virtual_:?}"
+    );
     let host = outputs("host-clock");
     assert_ne!(
         host[0], host[1],

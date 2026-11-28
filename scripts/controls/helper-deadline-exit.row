@@ -1,0 +1,1 @@
+helper-deadline-exit|crates/atomic-core/src/helper_runtime/process.rs|unsafe { libc::_exit(crate::child_exit::DEADLINE) }|()|-p atomic-agentic-core --lib -- helper_runtime::tests::a_synchronous_loop_is_interrupted_and_the_next_call_succeeds

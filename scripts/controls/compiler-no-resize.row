@@ -1,0 +1,1 @@
+compiler-no-resize|crates/atomic-core/src/compiler_host.rs|delete prototype.resize;|void prototype.resize;|-p atomic-agentic-core --lib -- compiler_host::tests::array_buffer_contents_are_bounded_and_wasm_is_absent

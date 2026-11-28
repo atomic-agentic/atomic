@@ -1,0 +1,1 @@
+v8-archive-refuse-binding-url|crates/atomic-core/build/v8_archive.rs|"RUSTY_V8_SRC_BINDING_URL",|"CONTROL_OFF_RUSTY_V8_SRC_BINDING_URL",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_binding_url

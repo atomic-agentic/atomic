@@ -205,109 +205,9 @@ version = "0.2.2"
 reason = "Biome at 4eadd575 requires a newer unicode-width than the pinned Codex lockfile for the native Astro TSX converter"
 
 [[exception]]
-crate = "arrayvec"
-version = "0.7.8"
-reason = "boa_engine 0.22.0 requires ^0.7.8 in the Rust authoring dependency graph"
-
-[[exception]]
 crate = "bincode"
 version = "2.0.1"
 reason = "tsz-core 0.1.75 requires ^2.0.1 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "bytemuck"
-version = "1.25.2"
-reason = "boa_engine 0.22.0 requires ^1.25.2 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "dashmap"
-version = "6.2.1"
-reason = "boa_engine 0.22.0 requires ^6.2.1 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_calendar"
-version = "2.3.0"
-reason = "boa_engine 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_calendar_data"
-version = "2.3.0"
-reason = "icu_calendar 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_collections"
-version = "2.3.0"
-reason = "icu_casemap 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_decimal"
-version = "2.3.0"
-reason = "boa_engine 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_decimal_data"
-version = "2.3.0"
-reason = "icu_decimal 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_locale"
-version = "2.3.1"
-reason = "boa_engine 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_locale_core"
-version = "2.4.0"
-reason = "boa_gc 0.22.0 requires ^2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_normalizer"
-version = "2.3.0"
-reason = "boa_engine 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_normalizer_data"
-version = "2.3.0"
-reason = "icu_normalizer 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_plurals"
-version = "2.3.0"
-reason = "boa_engine 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_plurals_data"
-version = "2.3.0"
-reason = "icu_plurals 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_properties"
-version = "2.3.0"
-reason = "boa_parser 0.22.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_properties_data"
-version = "2.3.0"
-reason = "icu_properties 2.3.0 requires ~2.3.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "icu_provider"
-version = "2.4.0"
-reason = "boa_engine 0.22.0 requires ^2.3.1 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "itoa"
-version = "1.0.19"
-reason = "boa_string 0.22.0 requires ^1.0.18 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "num-bigint"
-version = "0.5.1"
-reason = "boa_ast 0.22.0 requires ^0.5.1 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "num-integer"
-version = "0.1.47"
-reason = "boa_engine 0.22.0 requires ^0.1.47 in the Rust authoring dependency graph"
 
 [[exception]]
 crate = "object"
@@ -315,96 +215,11 @@ version = "0.39.1"
 reason = "ar_archive_writer 0.5.5 requires ^0.39 in the Rust authoring dependency graph"
 
 [[exception]]
-crate = "pastey"
-version = "0.2.3"
-reason = "boa_engine 0.22.0 requires ^0.2.3 in the Rust authoring dependency graph"
+crate = "bindgen"
+version = "0.70.1"
+reason = "v8x 149.4.0-rc.4 (deno_v8's alternative backend, locked but never built; deps/v8.toml) requires ^0.70"
 
 [[exception]]
-crate = "phf"
-version = "0.14.0"
-reason = "boa_interner 0.22.0 requires ^0.14.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "phf_generator"
-version = "0.14.0"
-reason = "phf_macros 0.14.0 requires ^0.14.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "phf_macros"
-version = "0.14.0"
-reason = "phf 0.14.0 requires ^0.14.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "phf_shared"
-version = "0.14.0"
-reason = "phf 0.14.0 requires ^0.14.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "portable-atomic"
-version = "1.15.0"
-reason = "boa_engine 0.22.0 requires ^1.15.0 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "rand"
-version = "0.10.4"
-reason = "boa_engine 0.22.0 requires ^0.10.2 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "syn"
-version = "3.0.10"
-reason = "boa_macros 0.22.0 requires ^3.0.4 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "synstructure"
-version = "0.14.0"
-reason = "boa_macros 0.22.0 requires ^0.14 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "temporal_rs"
-version = "0.2.6"
-reason = "boa_engine 0.22.0 requires ^0.2.6 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "timezone_provider"
-version = "0.2.6"
-reason = "boa_engine 0.22.0 requires ^0.2.6 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "tinystr"
-version = "0.8.5"
-reason = "boa_engine 0.22.0 requires ^0.8.4 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "writeable"
-version = "0.6.4"
-reason = "boa_engine 0.22.0 requires ^0.6.4 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "yoke"
-version = "0.8.4"
-reason = "boa_engine 0.22.0 requires ^0.8.3 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "yoke-derive"
-version = "0.8.4"
-reason = "yoke 0.8.4 requires ^0.8.4 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "zerofrom"
-version = "0.1.8"
-reason = "boa_engine 0.22.0 requires ^0.1.8 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "zerotrie"
-version = "0.2.5"
-reason = "icu_datetime 2.3.0 requires ^0.2.5 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "zerovec"
-version = "0.11.9"
-reason = "icu_calendar 2.3.0 requires ^0.11.7 in the Rust authoring dependency graph"
-
-[[exception]]
-crate = "zerovec-derive"
-version = "0.11.7"
-reason = "zerovec 0.11.9 requires ^0.11.7 in the Rust authoring dependency graph"
+crate = "rustc-hash"
+version = "1.1.0"
+reason = "bindgen 0.70.1 requires ^1"

@@ -552,7 +552,8 @@ impl Program {
         Self::current_helper_runtime()
     }
 
-    /// [`Program::helper_runtime`] for this build. Debug builds honour
+    /// [`Program::helper_runtime`] for this build: the helper engine and a
+    /// digest of the helper runtime and compiler. Debug builds honour
     /// `ATOMIC_TEST_HELPER_RUNTIME`, so tests can stand in for another
     /// release; release builds ignore it.
     pub fn current_helper_runtime() -> String {
@@ -565,7 +566,28 @@ impl Program {
         digest.update(crate::helper_runtime::identity().as_bytes());
         digest.update([0]);
         digest.update(COMPILER_HASH.as_bytes());
-        format!("{:x}", digest.finalize())
+        format!(
+            "{}:{:x}",
+            crate::helper_runtime::engine(),
+            digest.finalize()
+        )
+    }
+
+    /// A recorded helper runtime as a person reads it, naming its engine.
+    /// This build's are `<engine>:<digest>`; atomic 0.2 and earlier recorded
+    /// the digest alone, and 0.2 ran helpers on Boa.
+    pub fn describe_helper_runtime(identity: &str) -> String {
+        if let Some((engine, digest)) = identity.split_once(':')
+            && let Some(version) = engine.strip_prefix("v8 ")
+        {
+            return format!("V8 {version} through deno_core, {digest}");
+        }
+        if identity.len() == 64 && identity.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return format!(
+                "{identity}, recorded by atomic 0.2 or earlier; atomic 0.2 ran helpers on Boa"
+            );
+        }
+        identity.to_owned()
     }
 
     /// A stable fingerprint of the entry and all component bytes.

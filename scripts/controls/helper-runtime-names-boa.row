@@ -1,0 +1,1 @@
+helper-runtime-names-boa|crates/atomic-core/src/astro.rs|"{identity}, recorded by atomic 0.2 or earlier; atomic 0.2 ran helpers on Boa"|"{identity} /* CONTROL_OFF */"|-p atomic-agentic --test pipeline -- a_run_started_on_the_boa_helper_runtime_is_refused_naming_the_engine_change

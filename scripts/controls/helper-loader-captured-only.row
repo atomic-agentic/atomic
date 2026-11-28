@@ -1,0 +1,1 @@
+helper-loader-captured-only|crates/atomic-core/src/helper_runtime.rs|.get(url.as_str())|.get(self.0.keys().next().map_or(url.as_str(), String::as_str))|-p atomic-agentic-core --lib -- helper_runtime::tests::the_loader_loads_only_captured_modules

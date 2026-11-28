@@ -1,0 +1,1 @@
+v8-archive-refuse-docs-rs|crates/atomic-core/build/v8_archive.rs|"DOCS_RS",|"CONTROL_OFF_DOCS_RS",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_docs_build

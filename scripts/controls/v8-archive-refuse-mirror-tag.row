@@ -1,0 +1,1 @@
+v8-archive-refuse-mirror-tag|crates/atomic-core/build/v8_archive.rs|"RUSTY_V8_MIRROR_TAG",|"CONTROL_OFF_RUSTY_V8_MIRROR_TAG",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_mirror_tag

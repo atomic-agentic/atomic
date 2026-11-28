@@ -1,0 +1,1 @@
+helper-heap-terminate|crates/atomic-core/src/helper_runtime.rs|heap_handle.terminate_execution();|let _ = &heap_handle; // CONTROL_OFF|-p atomic-agentic-core --lib -- helper_runtime::tests::without_the_heap_callback_heap_exhaustion_aborts_the_process

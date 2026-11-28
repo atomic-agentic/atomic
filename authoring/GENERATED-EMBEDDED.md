@@ -1,7 +1,8 @@
 # Generated schema types and embedded Deno
 
 This note records the retired Deno embedding experiment. The production compiler
-uses native Rust and runs its worker and captured helpers on Boa.
+uses native Rust parsing and runs its worker and captured helpers on V8
+embedded through `deno_core`.
 
 ## Authoring
 
@@ -114,4 +115,4 @@ AST validation, meeting containment, score threshold and schema freshness.
 The separate native permission control also fails as required. Reports are
 written to ignored `results/generation.json` and `results/embedded.json`.
 
-The experiment left the combined SQLite dependency and standalone release packaging unresolved. Atomic subsequently adopted the Rust Astro compiler and Boa.
+The experiment left the combined SQLite dependency and standalone release packaging unresolved. Atomic subsequently adopted the Rust Astro compiler, ran it on Boa in v0.2, and returned to V8 through `deno_core` in v0.3.

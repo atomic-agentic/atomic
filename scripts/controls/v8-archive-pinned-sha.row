@@ -1,0 +1,1 @@
+v8-archive-pinned-sha|crates/atomic-core/build/v8_archive.rs|if !pinned_sha.eq_ignore_ascii_case(&pin.sha256) {|if false {|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_an_unpinned_archive_hash

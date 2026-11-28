@@ -10,7 +10,7 @@ CI saves target/ in its cache so that a job rebuilds only the workspace's own
 crates. Those rebuild in every job anyway, since a checkout gives every source
 file a new time, so their artifacts, the test binaries above all, would only
 make the cache larger. This keeps each profile's deps/, build/ and
-.fingerprint/ entries for dependencies, and removes the
+.fingerprint/ entries for dependencies and the V8 mirror, and removes the
 workspace's own entries (found by the hashes in their .fingerprint/
 directories), incremental state, linked binaries and everything else.
 
@@ -29,7 +29,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # What a profile directory keeps, and what target/ keeps beside the profiles.
 PROFILE_KEEPS = {"deps", "build", ".fingerprint"}
-TOP_KEEPS = {"CACHEDIR.TAG", ".rustc_info.json"}
+TOP_KEEPS = {"v8-mirror", "CACHEDIR.TAG", ".rustc_info.json"}
 
 
 def remove(path):

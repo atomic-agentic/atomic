@@ -20,7 +20,7 @@ Rust; generated TypeScript is an additional load-time and editor check.
 ## Run the implementation
 
 The compiler child parses Astro and converts it to TSX with native Rust libraries.
-Its Boa engine runs the declarative interpreter and captured TypeScript helpers. Oxc parses TypeScript and tsz checks types. The
+It runs the declarative interpreter, and each captured TypeScript helper call, on V8 embedded through `deno_core`. Oxc parses TypeScript and tsz checks types. The
 atomic binary contains everything a project needs to check or render.
 
 ```sh
@@ -69,7 +69,7 @@ success does not establish the state of a running VS Code GUI session.
 is disabled because whitespace is prompt content. Some execution sandboxes close
 subprocess pipes; an unreachable language server fails the probe rather than skipping.
 
-Helper calls use logical time, UTC and seeded randomness. Boa exposes the date and internationalization operations implemented by its pinned ICU4X data. Legacy date parsing and formatted strings can differ from the former runtime, and unavailable formatting methods raise ordinary helper errors.
+Helper calls use logical time, UTC and seeded randomness. V8 provides the date and internationalization operations of the ICU it bundles, with the default zone and locale set to UTC and `en-US`. Legacy date parsing and formatted strings can differ from atomic 0.2's Boa runtime.
 
-The production worker runs on Boa. Workflow-level durable context dispatch
+The production worker runs on V8 through `deno_core`. Workflow-level durable context dispatch
 and secret credential integration are separate tracked work.

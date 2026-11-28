@@ -344,18 +344,26 @@ fn no_other_module_can_be_imported() {
 
 #[test]
 fn a_heap_blow_up_is_refused_at_the_limit() {
-    let heap = 64 << 20;
+    let heap = 64 * 1024 * 1024;
+    // Within the limit, a compile allocates as it needs.
     assert_eq!(
         probe_with(
-            "return 'x'.repeat(1024).length;",
+            "const kept = []; for (let i = 0; i < 32; i++) kept.push(new Array(1 << 16).fill(i)); return kept.length;",
             &[(HEAP_ENV, heap.to_string())],
-            TIME_LIMIT
+            TIME_LIMIT,
         ),
-        Ok(json!(1024))
+        Ok(json!(32))
     );
     let started = Instant::now();
+    // Three times the limit, past what the limit grows to while a compile
+    // unwinds; a host without the limit would answer.
     let error = probe_with(
-        "return 'x'.repeat(80 << 20).length;",
+        &format!(
+            "const kept = []; let size = 0; \
+             while (size < {}) {{ kept.push(new Array(1 << 16).fill(size)); size += 8 << 16; }} \
+             return kept.length;",
+            3 * heap
+        ),
         &[(HEAP_ENV, heap.to_string())],
         TIME_LIMIT,
     )
@@ -467,6 +475,32 @@ fn console_output_stays_off_the_protocol() {
 #[test]
 fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
     assert_eq!(probe("return typeof WebAssembly;"), Ok(json!("undefined")));
+    // Memory V8 reserves outside the budget is not offered either: shared
+    // memory, and resizable buffers reached directly or from a prototype.
+    assert_eq!(
+        probe("return typeof SharedArrayBuffer;"),
+        Ok(json!("undefined"))
+    );
+    let resizable = refusal("new ArrayBuffer(8, { maxByteLength: 1024 }).maxByteLength");
+    assert!(
+        resizable.contains("no resizable ArrayBuffers"),
+        "{resizable}"
+    );
+    let inherited = refusal(
+        "new (Object.getPrototypeOf(new Uint8Array(1).buffer).constructor)(8, { maxByteLength: 1024 }).maxByteLength",
+    );
+    assert!(
+        inherited.contains("no resizable ArrayBuffers"),
+        "{inherited}"
+    );
+    assert_eq!(
+        probe("return typeof new ArrayBuffer(8).resize;"),
+        Ok(json!("undefined"))
+    );
+    assert_eq!(
+        probe("return new Uint8Array(new ArrayBuffer(8)).length;"),
+        Ok(json!(8))
+    );
     let heap = 8 << 20;
     let error = probe_with(
         "return new Uint8Array(9 << 20).length;",
@@ -474,8 +508,10 @@ fn array_buffer_contents_are_bounded_and_wasm_is_absent() {
         TIME_LIMIT,
     )
     .expect_err("buffer budget");
+    // The limit it reached is named: the ArrayBuffer budget, not the heap.
     assert!(
-        error.contains("the Astro compiler exceeded its memory limit"),
+        error.contains("the Astro compiler exceeded its memory limit")
+            && error.contains("the compile reached its ArrayBuffer budget"),
         "{error}"
     );
 }

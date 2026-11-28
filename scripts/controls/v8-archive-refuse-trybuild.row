@@ -1,0 +1,1 @@
+v8-archive-refuse-trybuild|crates/atomic-core/build/v8_archive.rs|"DENO_TRYBUILD",|"CONTROL_OFF_DENO_TRYBUILD",|-p atomic-agentic-core --lib -- v8_archive_tests::refuses_a_trybuild_build
