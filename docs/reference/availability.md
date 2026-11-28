@@ -307,8 +307,10 @@ a command, or another program atomic starts. On Linux, atomic uses
 `close_range`, or, on a kernel before 5.11, the list in `/proc/self/fd`; where
 it has neither, atomic does not start, and the helper does not start the
 command. Codex's process launcher also marks, as far as it can, what a turn's
-commands would inherit close-on-exec. On macOS atomic relies on
-the list in `/dev/fd`, which is not verified. Windows, where a process
+commands would inherit close-on-exec. On macOS atomic marks them from
+the list in `/dev/fd`. Tests on macOS show that an exec atom's command
+holds none of them, run on atomic's own backend or through a runner. That a
+turn's commands hold none on macOS is not yet tested. Windows, where a process
 inherits handles rather than descriptors, is not covered. A turn's commands run with no
 login shell; a `workspace-write` turn's `HOME` (and `ZDOTDIR`) is a private
 scratch directory of the attempt's own, a `read-only` turn's `HOME` is
