@@ -730,10 +730,18 @@ fn without_the_virtual_clock_helpers_read_the_host() {
 
 // The host's timezone and locale come from the process environment, so they
 // are varied in child processes: with the replacement every zone formats
-// alike; without it, they differ.
+// alike; without it, they differ. Only what the zone and locale decide is
+// compared for that: `escapes` formats the clock's own time, which, with the
+// host's clock, differs between two children whenever a second passes.
 #[test]
 fn the_host_timezone_and_locale_do_not_reach_helpers() {
-    let outputs = |control: &str| -> Vec<String> {
+    // The child's line that starts with `label`.
+    let line = |text: &str, label: &str| {
+        text.lines()
+            .find_map(|l| l.find(label).map(|at| l[at..].to_owned()))
+            .unwrap_or_default()
+    };
+    let outputs = |control: &str| -> Vec<(String, String)> {
         ["Asia/Kolkata", "America/Los_Angeles"]
             .iter()
             .map(|zone| {
@@ -767,20 +775,26 @@ fn the_host_timezone_and_locale_do_not_reach_helpers() {
                     .output()
                     .expect("the child runs");
                 let text = String::from_utf8_lossy(&out.stdout).into_owned();
-                text.find("zone: ")
-                    .and_then(|at| text[at..].lines().next())
-                    .unwrap_or_default()
-                    .to_owned()
+                (line(&text, "zone: "), line(&text, "escapes: "))
             })
             .collect()
     };
     let virtual_ = outputs("clock");
-    assert!(virtual_.iter().all(|line| !line.is_empty()), "{virtual_:?}");
+    assert!(
+        virtual_.iter().all(|(z, e)| !z.is_empty() && !e.is_empty()),
+        "{virtual_:?}"
+    );
     assert_eq!(virtual_[0], virtual_[1]);
-    assert!(virtual_[0].contains(r#""legacy":null"#), "{virtual_:?}");
+    assert!(virtual_[0].1.contains(r#""legacy":null"#), "{virtual_:?}");
     let host = outputs("host-clock");
+    assert!(host.iter().all(|(z, _)| !z.is_empty()), "{host:?}");
+    // On macOS the zone and locale the runtime starts with come from the
+    // system's settings rather than TZ, LANG and LC_ALL: there, without the
+    // replacement, both children resolved UTC and en-US, so varying the
+    // environment cannot show the control.
+    #[cfg(target_os = "linux")]
     assert_ne!(
-        host[0], host[1],
+        host[0].0, host[1].0,
         "the control shows the host zone reaching helpers"
     );
 }
@@ -798,5 +812,6 @@ fn zone_child() {
     let zone = clocked_call("zone", CLOCK, controls);
     let time = clocked_call("time", CLOCK, controls);
     let escapes = clocked_call("escapes", CLOCK, controls);
-    println!("zone: {zone} {} {} {escapes}", time["hours"], time["text"]);
+    println!("zone: {zone} {} {}", time["hours"], time["text"]);
+    println!("escapes: {escapes}");
 }
