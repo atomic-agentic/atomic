@@ -10,7 +10,10 @@
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
 //! fails the test.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#![cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    feature = "sandbox-tests"
+))]
 
 mod support;
 
@@ -70,6 +73,7 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
     std::fs::write(dir.join("project/probe.py"), PROBE).expect("probe");
     let state = dir.join("home/projects/p");
     std::fs::create_dir_all(&state).expect("state");
+    #[cfg(target_os = "linux")]
     std::os::unix::fs::symlink(
         env!("CARGO_BIN_EXE_atomic"),
         dir.join("bin/codex-linux-sandbox"),
@@ -125,25 +129,25 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
     std::os::unix::fs::symlink(&target, &link).expect("link");
     std::os::unix::fs::symlink(&kept, &place).expect("link");
     let after = run();
+    eprintln!("before: {before}\nafter: {after}");
+    let denied = |p: &Path| {
+        if cfg!(target_os = "macos") {
+            format!(
+                "PermissionError: [Errno 1] Operation not permitted: '{}'",
+                p.display()
+            )
+        } else {
+            format!(
+                "PermissionError: [Errno 13] Permission denied: '{}'",
+                p.display()
+            )
+        }
+    };
     for read in ["kept", "place"] {
-        let denied = format!(
-            "PermissionError: [Errno 13] Permission denied: '{}'",
-            if read == "kept" {
-                kept.display()
-            } else {
-                place.display()
-            }
-        );
-        assert_eq!(after[read], denied, "{read}: {after}");
+        let path = if read == "kept" { &kept } else { &place };
+        assert_eq!(after[read], denied(path), "{read}: {after}");
     }
-    assert_eq!(
-        after["target"],
-        format!(
-            "PermissionError: [Errno 13] Permission denied: '{}'",
-            target.display()
-        ),
-        "{after}"
-    );
+    assert_eq!(after["target"], denied(&target), "{after}");
     // Through the link, inside the denied place, there is nothing to read.
     assert!(
         after["link"]
@@ -153,24 +157,27 @@ fn a_link_made_after_the_list_is_denied_to_the_next_command() {
     );
     // Started again once already, as after it found a new link, a helper
     // that finds yet another does not run the command.
-    let other = dir.join("person/elsewhere/other");
-    std::fs::write(&other, "another key").expect("key");
-    std::os::unix::fs::symlink(&other, dir.join("person/.aws/config")).expect("link");
-    let mut again = confined.clone();
-    again
-        .env
-        .push(("ATOMIC_SANDBOX_RELISTED".into(), "1".into()));
-    let done =
-        atomic_exec::LocalBackend::run_in(atomic_exec::process::Group::Own, &again).expect("runs");
-    assert!(
-        !done.success(),
-        "ran: {}",
-        String::from_utf8_lossy(&done.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&done.stderr).contains("kept changing"),
-        "{}",
-        String::from_utf8_lossy(&done.stderr)
-    );
+    #[cfg(target_os = "linux")]
+    {
+        let other = dir.join("person/elsewhere/other");
+        std::fs::write(&other, "another key").expect("key");
+        std::os::unix::fs::symlink(&other, dir.join("person/.aws/config")).expect("link");
+        let mut again = confined.clone();
+        again
+            .env
+            .push(("ATOMIC_SANDBOX_RELISTED".into(), "1".into()));
+        let done = atomic_exec::LocalBackend::run_in(atomic_exec::process::Group::Own, &again)
+            .expect("runs");
+        assert!(
+            !done.success(),
+            "ran: {}",
+            String::from_utf8_lossy(&done.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&done.stderr).contains("kept changing"),
+            "{}",
+            String::from_utf8_lossy(&done.stderr)
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

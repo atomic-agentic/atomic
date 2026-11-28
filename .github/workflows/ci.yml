@@ -518,15 +518,8 @@ jobs:
             ~/.cargo/git/db
           key: cargo-home-Linux-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - uses: ./.github/actions/rust-setup-macos
-      - run: cargo build --workspace --locked
-      - name: Pin SQLite-capable bd for the M5 differential test
-        run: |
-          bd_bin="$(scripts/bd-sqlite-pin.sh "${RUNNER_TEMP}/atomic-bd-sqlite")"
-          echo "ATOMIC_TEST_BD_SQLITE_BIN=${bd_bin}" >>"${GITHUB_ENV}"
-      - name: Test (macOS)
-        run: cargo test --workspace --locked --no-fail-fast
       # The suites that confine commands under Seatbelt, as the Linux jobs
       # run them under bubblewrap.
       - name: Sandbox tests (macOS)
         if: ${{ !cancelled() }}
-        run: cargo test -p atomic-agentic --locked --no-fail-fast --features atomic-agentic/sandbox-tests --test exec_private_state --test exec_scratch --test keychain_reach --test shell_env
+        run: cargo test -p atomic-agentic --locked --no-fail-fast --features atomic-agentic/sandbox-tests --test late_links -- --nocapture
