@@ -4,7 +4,9 @@
 //! directory, its `HOME` and `TMPDIR`, nor what another backend of the
 //! project keeps in its scratch root, though it reads and writes its own:
 //! the project's scratch roots are denied to a confined command, its own
-//! directory apart, on the local backend and through a runner process.
+//! directory apart, on the local backend and through a runner process. And
+//! its own directories' names resolve, though the directories above them lie
+//! inside the denied root.
 //!
 //! On Linux it needs bubblewrap and unprivileged user namespaces, and on
 //! macOS Seatbelt, so it runs with the `sandbox-tests` feature; with the
@@ -64,14 +66,22 @@ try:
 except Exception as e:
     listed = type(e).__name__
 own = []
+resolves = []
 for var in ['HOME', 'TMPDIR']:
+    # Resolved as a careful script resolves a name: every directory on the
+    # way is looked at, those inside the denied scratch root too.
+    try:
+        os.path.realpath(os.environ[var], strict=True)
+        resolves.append('yes')
+    except OSError as e:
+        resolves.append(f'{var}: {e}')
     path = os.path.join(os.environ[var], 'mine-' + var)
     with open(path, 'w') as f:
         f.write('mine')
     with open(path) as f:
         own.append(f.read())
 json.dump({'found': found, 'sibling_found': sibling_found, 'listed': listed,
-           'own': ' '.join(own)}, sys.stdout)
+           'own': ' '.join(own), 'resolves': ' '.join(resolves)}, sys.stdout)
 "#;
 
 /// Write exec atom `name`, whose command runs `script`, with `env`
@@ -189,7 +199,7 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
                 root.display(),
                 sibling.display()
             ),
-            &["found", "sibling_found", "listed", "own"],
+            &["found", "sibling_found", "listed", "own", "resolves"],
         );
         std::os::unix::fs::symlink(
             env!("CARGO_BIN_EXE_atomic"),
@@ -272,6 +282,10 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
             assert_eq!(
                 probed["own"], "mine mine",
                 "{what}: the prober lost its own HOME or TMPDIR: {probed}"
+            );
+            assert_eq!(
+                probed["resolves"], "yes yes",
+                "{what}: the prober could not resolve its own HOME or TMPDIR: {probed}"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

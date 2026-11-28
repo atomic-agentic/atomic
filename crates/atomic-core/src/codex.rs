@@ -4285,9 +4285,29 @@ impl ExecSandbox {
         let launcher = argv
             .next()
             .ok_or_else(|| fail("Codex gave no command to run it under Seatbelt".into()))?;
+        let mut args: Vec<String> = argv.collect();
+        let ancestors = denied_ancestors(&profile, command);
+        if !ancestors.is_empty() {
+            // `-p <policy>` leads, then the policy's `-D` parameters.
+            if args.first().map(String::as_str) != Some("-p") || args.len() < 2 {
+                return Err(fail(
+                    "Codex wrote its Seatbelt command without a policy first".into(),
+                ));
+            }
+            for (index, ancestor) in ancestors.iter().enumerate() {
+                let key = format!("ATOMIC_DENIED_ANCESTOR_{index}");
+                args[1].push_str(&format!(
+                    "\n(allow file-read-metadata (literal (param \"{key}\")))"
+                ));
+                let value = ancestor
+                    .to_str()
+                    .ok_or_else(|| fail(format!("{} is not UTF-8", ancestor.display())))?;
+                args.insert(2 + index, format!("-D{key}={value}"));
+            }
+        }
         Ok(atomic_exec::Command {
             program: launcher,
-            args: argv.collect(),
+            args,
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
@@ -4295,6 +4315,52 @@ impl ExecSandbox {
             ..command.clone()
         })
     }
+}
+
+/// The directories inside a denied one that lie above a directory `command`
+/// is given (its working directory, and those it may write or read), each
+/// as named and as resolved.
+///
+/// Codex's Seatbelt policy denies a directory by leaving it out of what may
+/// be read, so a command cannot even `lstat` the directories on the way to
+/// its own scratch directory inside the denied state directory, and resolving
+/// that directory's name (`realpath`) fails. Linux's sandbox reopens that
+/// path, so there it resolves. Seatbelt is given their metadata alone: what
+/// is in them stays denied.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn denied_ancestors(profile: &PermissionProfile, command: &atomic_exec::Command) -> Vec<PathBuf> {
+    use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
+    let named_and_resolved = |path: &Path| {
+        let resolved = std::fs::canonicalize(path)
+            .ok()
+            .filter(|resolved| resolved != path);
+        std::iter::once(path.to_owned()).chain(resolved)
+    };
+    let denied: Vec<PathBuf> = profile
+        .file_system_sandbox_policy()
+        .entries
+        .iter()
+        .filter(|entry| entry.access == FileSystemAccessMode::Deny)
+        .filter_map(|entry| match &entry.path {
+            FileSystemPath::Path { path } => Some(path.to_path_buf()),
+            _ => None,
+        })
+        .flat_map(|path| named_and_resolved(&path).collect::<Vec<_>>())
+        .collect();
+    let given = std::iter::once(&command.cwd)
+        .chain(&command.writable)
+        .chain(&command.read_only);
+    let mut ancestors = std::collections::BTreeSet::new();
+    for dir in given {
+        for dir in named_and_resolved(dir) {
+            for ancestor in dir.ancestors().skip(1) {
+                if denied.iter().any(|d| ancestor.starts_with(d)) {
+                    ancestors.extend(named_and_resolved(ancestor));
+                }
+            }
+        }
+    }
+    ancestors.into_iter().collect()
 }
 
 impl atomic_exec::Confine for ExecSandbox {
